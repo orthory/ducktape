@@ -12,7 +12,7 @@ use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
 use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
-use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs};
+use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs, UnpinArgs};
 
 /// resolve the node for a verb running inside `dir`: the shared addressing
 /// ladder, with this checkout's `.duckfs` index as the ambient context rung —
@@ -37,9 +37,14 @@ fn url_for_dir(addr: &NodeAddr, dir: &Path) -> Result<String, CliError> {
 /// re-signs an unframed submit with the NODE's key. Carrying it into consensus
 /// needs the client to sign the FRAME (`/v1/submit/frame`), which is a wire
 /// decision, not this seam's.
-fn signing_node(addr: &NodeAddr, dir: &Path, key: Option<PathBuf>) -> Result<HttpNode, CliError> {
+fn signing_node(
+    addr: &NodeAddr,
+    dir: &Path,
+    key: Option<PathBuf>,
+    trust_node: bool,
+) -> Result<HttpNode, CliError> {
     let url = url_for_dir(addr, dir)?;
-    let node_key = crate::node_http::node_public_key(&url)
+    let node_key = crate::node_http::pinned_node_key(&url, trust_node)
         .map_err(|error| CliError::failed(error.to_string()))?;
     let ctx = crate::cred_cli::VerbCtx {
         addr: addr.clone(),
@@ -124,7 +129,7 @@ pub fn status(args: StatusArgs) -> Result<(), CliError> {
 pub fn commit(args: CommitArgs) -> Result<(), CliError> {
     let dir = args.dir.as_deref().unwrap_or(".");
     let dirp = Path::new(dir);
-    let node = signing_node(&args.addr, dirp, args.key)?;
+    let node = signing_node(&args.addr, dirp, args.key, args.trust_node)?;
     let opts = CommitOptions {
         auto_rebase: !args.no_rebase,
         paths: args.paths,
@@ -163,12 +168,28 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 
     // pin runs against a node directly (default `.` so a checkout's index can
     // supply the node, but `--node`/env win).
-    let node = signing_node(&args.addr, Path::new("."), args.key)?;
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
     node.pin(&args.snapshot, &args.name).map_err(|e| match e {
         ApiError::NotFound => CliError::failed("snapshot not found"),
         ApiError::Rejected(m) => CliError::failed(m),
         ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
     })?;
     println!("pinned {} as {}", args.snapshot, args.name);
+    Ok(())
+}
+
+/// `unpin <name>` — release a pin so gc can reclaim it once nothing else roots
+/// it. owner-gated at the module: only the pin's creator or `system` may
+/// release it.
+pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
+    use duckfs_client::api::{ApiError, NodeApi};
+
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
+    node.unpin(&args.name).map_err(|e| match e {
+        ApiError::NotFound => CliError::failed("pin not found"),
+        ApiError::Rejected(m) => CliError::failed(m),
+        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
+    })?;
+    println!("unpinned {}", args.name);
     Ok(())
 }

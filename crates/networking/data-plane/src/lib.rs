@@ -27,7 +27,8 @@
 //!
 //! Two service classes, two APIs, never unified:
 //! - **Datagram class** — unreliable, unordered, latency-first (voice).
-//!   Per-flow bounded queues, drop-oldest: late real-time data is dead data.
+//!   Per-flow queues bounded PER SENDING PEER, drop-oldest: late real-time
+//!   data is dead data, and one loud sender never evicts a quiet one.
 //! - **Stream class** — reliable, backpressured, throughput-with-headroom
 //!   (state sync, blob fetch). Every stream's writes draw from one global
 //!   bulk token bucket so bulk self-limits below the link and real-time

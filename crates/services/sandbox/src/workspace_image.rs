@@ -16,6 +16,7 @@
 //! core. Do not reach for faster storage to speed this up; the spec's *Build
 //! caches* section records the measurement and the conclusion drawn from it.
 
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -150,28 +151,65 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// walk `image` back out into `dest`, which is created if absent.
+/// walk `image` back out, REPLACING `dest` with the result.
+///
+/// `rdump` only ever adds: it copies the image's entries into its target and
+/// never removes an entry the target has that the image lacks. Dumping
+/// straight into `dest` would union the pre-run tree with the post-run one —
+/// every file a run deleted or renamed away would silently come back. So the
+/// dump lands in a fresh sibling directory first, and only once it succeeds
+/// does `dest` get replaced by a rename swap: a failed `rdump` leaves the
+/// pre-run tree at `dest` untouched instead of half-merged.
 pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
     let tool = crate::host_tools::find_system_tool("debugfs")
         .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
-    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    // `rdump / <dest>` lands the image root's entries DIRECTLY in dest — no
+    let fresh = sibling(dest, "readback");
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh).map_err(|e| format!("create {}: {e}", fresh.display()))?;
+    // `rdump / <fresh>` lands the image root's entries DIRECTLY in fresh — no
     // wrapper directory. Verified on a real tree: the round trip is
     // byte-identical, modes included, once `lost+found` is dropped.
     let out = Command::new(&tool)
         .arg("-R")
-        .arg(format!("rdump / {}", dest.display()))
+        .arg(format!("rdump / {}", fresh.display()))
         .arg(image)
         .output()
         .map_err(|e| format!("run debugfs: {e}"))?;
     if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&fresh);
         return Err(format!(
             "debugfs exited with {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    drop_lost_found(dest)
+    drop_lost_found(&fresh)?;
+    swap_in(dest, &fresh)
+}
+
+/// `<dest>-<tag>`, alongside `dest` rather than inside it so the swap below is
+/// a same-filesystem rename, not a cross-device copy.
+fn sibling(dest: &Path, tag: &str) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{tag}"));
+    dest.with_file_name(name)
+}
+
+/// replace `dest` with `fresh`: `dest` → `<dest>.pre`, `fresh` → `dest`,
+/// then drop `.pre`. A failure past this point leaves `.pre` on disk rather
+/// than losing the pre-run tree.
+fn swap_in(dest: &Path, fresh: &Path) -> Result<(), String> {
+    let pre = sibling(dest, "pre");
+    let _ = std::fs::remove_dir_all(&pre);
+    if dest.exists() {
+        std::fs::rename(dest, &pre).map_err(|e| format!("stash {}: {e}", dest.display()))?;
+    }
+    std::fs::rename(fresh, dest).map_err(|e| format!("install {}: {e}", dest.display()))?;
+    let _ = std::fs::remove_dir_all(&pre);
+    Ok(())
 }
 
 /// build the per-run READ-ONLY asset image: the context doc, the skills tree,
@@ -281,24 +319,140 @@ fn stage_whole(source: &Path, staging: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// copy a directory tree, preserving mode bits. Symlinks are followed rather
-/// than recreated: a link inside a staged tree would point at a HOST path that
-/// does not exist in the guest, which is a broken input rather than a preserved
-/// one.
+/// how deep a staged tree may nest before the rest of it is dropped. A skills
+/// tree is a handful of levels; the cap is what keeps a hostile one off the
+/// daemon's stack.
+const MAX_TREE_DEPTH: usize = 64;
+
+/// does `target`, read off the symlink at `entry`, resolve back inside `root`?
+///
+/// The tree being staged is a consensus-published duckfs checkout, so its
+/// symlink targets are written by the BUYER, not the operator. An absolute
+/// target names a host path (the operator's keystore, their ssh keys) and a
+/// `..` target walks out of the tree to the same effect; only a link that lands
+/// back inside the staged root means anything in the guest anyway, since that
+/// is the only tree the guest gets.
+///
+/// Purely lexical, and that is the point: it decides without touching the disk,
+/// so a target that does not exist yet (or races) cannot talk it into a yes.
+fn link_stays_inside(root: &Path, entry: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return false;
+    }
+    let Ok(relative) = entry.strip_prefix(root) else {
+        return false;
+    };
+    // start where the link itself lives, then walk its target from there.
+    let mut walked: Vec<Component<'_>> = match relative.parent() {
+        Some(parent) => parent.components().collect(),
+        None => Vec::new(),
+    };
+    for part in target.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if walked.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::Normal(name) => walked.push(Component::Normal(name)),
+            // a root or a windows prefix is an absolute target by another name.
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// what a walk of one staged tree refused, so the refusals are counted once
+/// rather than warned per entry: a tree of a thousand escaping links would
+/// otherwise evict the log ring that holds the run around it.
+struct StagedTree {
+    root: PathBuf,
+    /// (device, inode) of every directory already descended into. A cycle
+    /// cannot be built out of symlinks any more — none are followed — but a
+    /// walk that terminates by construction is cheaper than one that argues.
+    seen: std::collections::HashSet<(u64, u64)>,
+    escaping_links: u64,
+    too_deep: u64,
+}
+
+/// copy a directory tree, preserving mode bits.
+///
+/// Symlinks are NEVER followed: `symlink_metadata` decides every entry, and a
+/// link is recreated as a link only when its target stays inside the tree.
+/// Anything else — an absolute target, a `..` that escapes — is dropped, since
+/// following it would copy a host file the publisher named into an image the
+/// run reads.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    let mut tree = StagedTree {
+        root: from.to_path_buf(),
+        seen: std::collections::HashSet::new(),
+        escaping_links: 0,
+        too_deep: 0,
+    };
+    copy_dir(&mut tree, from, to, 0)?;
+    if tree.escaping_links > 0 {
+        tracing::warn!(
+            target: "ducktape::sandbox",
+            reason = "asset_link_escapes_root",
+            tree = %tree.root.display(),
+            count = tree.escaping_links,
+            "dropped symlinks whose target left the staged tree"
+        );
+    }
+    if tree.too_deep > 0 {
+        tracing::warn!(
+            target: "ducktape::sandbox",
+            reason = "asset_tree_too_deep",
+            tree = %tree.root.display(),
+            count = tree.too_deep,
+            depth = MAX_TREE_DEPTH,
+            "dropped subtrees below the depth cap"
+        );
+    }
+    Ok(())
+}
+
+fn copy_dir(tree: &mut StagedTree, from: &Path, to: &Path, depth: usize) -> Result<(), String> {
+    if depth > MAX_TREE_DEPTH {
+        tree.too_deep += 1;
+        return Ok(());
+    }
     std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
     let entries = std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
         let source = entry.path();
         let target = to.join(entry.file_name());
-        let meta = match std::fs::metadata(&source) {
+        let meta = match std::fs::symlink_metadata(&source) {
             Ok(meta) => meta,
-            // a dangling symlink in a skills tree is not worth failing a run
+            // an entry that vanished mid-walk is not worth failing a run
             Err(_) => continue,
         };
+        if meta.is_symlink() {
+            let Ok(link) = std::fs::read_link(&source) else {
+                continue;
+            };
+            if !link_stays_inside(&tree.root, &source, &link) {
+                tree.escaping_links += 1;
+                continue;
+            }
+            std::os::unix::fs::symlink(&link, &target)
+                .map_err(|e| format!("link {}: {e}", target.display()))?;
+            continue;
+        }
         if meta.is_dir() {
-            copy_tree(&source, &target)?;
+            let already_walked = !tree.seen.insert((meta.dev(), meta.ino()));
+            if already_walked {
+                continue;
+            }
+            copy_dir(tree, &source, &target, depth + 1)?;
+            continue;
+        }
+        // a fifo, socket or device node is not an input: opening one blocks the
+        // stage forever, and none of them mean anything to the guest.
+        if !meta.is_file() {
             continue;
         }
         std::fs::copy(&source, &target).map_err(|e| format!("copy {}: {e}", source.display()))?;
@@ -442,6 +596,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The regression this fix closes: `read_back` must REPLACE `dest`, not
+    /// merge into it. The image is built from a tree where the guest already
+    /// deleted `b` (a `git rm`, a "remove dead code" run); `dest` is the
+    /// ORIGINAL pre-run checkout, which still has `a` and `b` both. A naive
+    /// `rdump` into `dest` only adds entries, so `b` would survive the round
+    /// trip even though the guest removed it — read_back must make `dest`
+    /// match the image exactly.
+    #[test]
+    fn read_back_replaces_the_destination_instead_of_merging() {
+        if !have_e2fsprogs() {
+            return;
+        }
+        let root = scratch("replace-not-merge");
+
+        // The pre-run checkout: what `dest` looks like before the run.
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::fs::write(dest.join("a.txt"), b"keep").expect("a");
+        std::fs::write(dest.join("b.txt"), b"delete me").expect("b");
+
+        // The post-run guest tree: same as dest, minus `b` — the guest deleted
+        // it during the run. This is what gets built into the image.
+        let guest = root.join("guest");
+        std::fs::create_dir_all(&guest).expect("guest");
+        std::fs::write(guest.join("a.txt"), b"keep").expect("a");
+
+        let image = root.join("ws.img");
+        build(&guest, &image, sized_for(&guest).expect("size")).expect("build");
+
+        read_back(&image, &dest).expect("read back");
+
+        let mut names: Vec<String> = std::fs::read_dir(&dest)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.txt".to_string()],
+            "b.txt must not come back: read_back replaces dest, it does not merge into it"
+        );
+        assert_eq!(std::fs::read(dest.join("a.txt")).expect("a back"), b"keep");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A tree over the cap cannot be salvaged by retrying, so it is refused
     /// before anything is materialised on disk — and the refusal NAMES which
     /// of the run's two images it is about. There are two, they blow the cap
@@ -450,11 +650,21 @@ mod tests {
     /// tree that actually refused went unnamed.
     #[test]
     fn an_oversized_tree_is_refused_before_any_image_exists_and_names_itself() {
-        let refused = size_or_refuse("read-only inputs", Path::new("/run/assets"), MAX_WORKSPACE_BYTES + 1)
-            .expect_err("must refuse");
+        let refused = size_or_refuse(
+            "read-only inputs",
+            Path::new("/run/assets"),
+            MAX_WORKSPACE_BYTES + 1,
+        )
+        .expect_err("must refuse");
         assert!(refused.contains("over the"), "{refused}");
-        assert!(refused.contains("read-only inputs"), "names the tree: {refused}");
-        assert!(refused.contains("/run/assets"), "names the directory: {refused}");
+        assert!(
+            refused.contains("read-only inputs"),
+            "names the tree: {refused}"
+        );
+        assert!(
+            refused.contains("/run/assets"),
+            "names the directory: {refused}"
+        );
 
         size_or_refuse("workspace", Path::new("/run/ws"), MAX_WORKSPACE_BYTES)
             .expect("the cap itself is allowed");
@@ -500,5 +710,105 @@ mod tests {
         let root = scratch("floor");
         assert_eq!(sized_for(&root).expect("size"), MIN_WORKSPACE_BYTES);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The staged tree is a duckfs checkout, so its links are the publisher's.
+    /// A link out of the tree must not become a COPY of what it named: that is
+    /// how the operator's keystore ends up in a buyer's run.
+    #[test]
+    fn a_staged_link_out_of_the_tree_is_dropped_not_followed() {
+        let root = scratch("escaping-links");
+        let secret = root.join("secret.key");
+        std::fs::write(&secret, b"operator key material").expect("secret");
+        let from = root.join("skills");
+        std::fs::create_dir_all(from.join("sub")).expect("tree");
+        std::fs::write(from.join("real.md"), b"a skill").expect("file");
+        std::os::unix::fs::symlink(&secret, from.join("absolute")).expect("absolute link");
+        std::os::unix::fs::symlink("../../secret.key", from.join("sub/escape"))
+            .expect("dotdot link");
+        std::os::unix::fs::symlink("../real.md", from.join("sub/inside")).expect("in-tree link");
+
+        let to = root.join("staged");
+        copy_tree(&from, &to).expect("stage");
+
+        assert!(
+            to.join("absolute").symlink_metadata().is_err(),
+            "an absolute target names a host path, never a staged one"
+        );
+        assert!(
+            to.join("sub/escape").symlink_metadata().is_err(),
+            "a `..` target leaves the tree just as an absolute one does"
+        );
+        let staged_link = to
+            .join("sub/inside")
+            .symlink_metadata()
+            .expect("in-tree link stays");
+        assert!(
+            staged_link.is_symlink(),
+            "an in-tree link is preserved AS a link, not copied"
+        );
+        assert_eq!(
+            std::fs::read_link(to.join("sub/inside")).expect("target"),
+            Path::new("../real.md")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `loop -> ..` used to recurse until the daemon's stack or its disk gave
+    /// out, because the walk resolved it into a directory. Nothing is followed
+    /// now: the link is staged AS a link and the walk ends.
+    #[test]
+    fn a_self_referential_link_terminates_the_walk() {
+        let root = scratch("cycle");
+        let from = root.join("skills");
+        std::fs::create_dir_all(from.join("deep")).expect("tree");
+        std::fs::write(from.join("deep/leaf.md"), b"leaf").expect("leaf");
+        std::os::unix::fs::symlink("..", from.join("deep/loop")).expect("cycle link");
+
+        let to = root.join("staged");
+        copy_tree(&from, &to).expect("stage terminates");
+
+        assert!(
+            to.join("deep/leaf.md").is_file(),
+            "the real tree still lands"
+        );
+        let staged = to
+            .join("deep/loop")
+            .symlink_metadata()
+            .expect("the cycle is staged");
+        assert!(
+            staged.is_symlink(),
+            "a link back to the tree root is a link, never a copy of the tree"
+        );
+        assert_eq!(
+            std::fs::read_link(to.join("deep/loop")).expect("target"),
+            Path::new(".."),
+            "the target is recreated verbatim, not walked"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The predicate on its own: it is lexical, so it answers without the disk.
+    #[test]
+    fn link_stays_inside_admits_only_relative_in_tree_targets() {
+        let root = Path::new("/stage/skills");
+        let entry = root.join("sub/link");
+        assert!(link_stays_inside(root, &entry, Path::new("sibling.md")));
+        assert!(link_stays_inside(root, &entry, Path::new("../top.md")));
+        assert!(link_stays_inside(
+            root,
+            &entry,
+            Path::new("./deeper/../ok.md")
+        ));
+        assert!(!link_stays_inside(
+            root,
+            &entry,
+            Path::new("../../outside.md")
+        ));
+        assert!(!link_stays_inside(
+            root,
+            &entry,
+            Path::new("/home/op/.ducktape")
+        ));
     }
 }

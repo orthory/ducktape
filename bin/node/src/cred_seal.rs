@@ -21,11 +21,20 @@
 //! gateway base, which is the transport that carries `<handle>.duck` onto the
 //! overlay.
 
+// The verbs and their flags exist in EVERY build so the CLI surface (and the
+// shipped completions) never depends on how the binary was compiled; only the
+// bodies need the `verify` feature, and without it the verb refuses at
+// dispatch with the same sentence its help text carries.
+#[cfg(feature = "verify")]
 use anyhow::Context as _;
 
+#[cfg(feature = "verify")]
 use airlock::attest::{self, AttestMode, Measurement};
+#[cfg(feature = "verify")]
 use airlock::client::Gateway;
+#[cfg(feature = "verify")]
 use airlock::verify::{SnpProduct, SnpRoots, TdxRoots, TrustRoots, VcekSource};
+#[cfg(feature = "verify")]
 use airlock::wire::{CredentialKind, CredentialPayload};
 
 use crate::cred_cli::CredResult;
@@ -88,23 +97,20 @@ pub(crate) struct SealArgs {
     #[arg(long, value_name = "HEX")]
     measurement: String,
     /// a vendor login artifact to read the credential out of
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["access_token", "refresh_token"])]
+    #[arg(long, value_name = "PATH", conflicts_with = "token_stdin")]
     credentials: Option<std::path::PathBuf>,
     /// with --credentials: seal the artifact's CURRENT access token (no
-    /// rotation, so the owner's own login keeps working) or its refresh token
-    #[arg(
-        long,
-        value_name = "KIND",
-        default_value = "bearer",
-        requires = "credentials"
-    )]
+    /// rotation, so the owner's own login keeps working) or its refresh
+    /// token. With --token-stdin: which kind the piped token is.
+    #[arg(long, value_name = "KIND", default_value = "bearer")]
     cred_kind: SealKind,
-    /// seal a static access token directly (no rotation)
-    #[arg(long, value_name = "TOKEN", conflicts_with = "refresh_token")]
-    access_token: Option<String>,
-    /// seal an OAuth refresh token directly (rotates in-enclave)
-    #[arg(long, value_name = "TOKEN")]
-    refresh_token: Option<String>,
+    /// seal a bare token read from stdin (one line, no trailing newline) —
+    /// the `ducktape user` family's stdin-only rule for secrets: a live
+    /// vendor token never crosses argv, where it would leak into shell
+    /// history and `ps`/`/proc/<pid>/cmdline`. `--cred-kind` says whether the
+    /// piped line is a bearer access token or an OAuth refresh token.
+    #[arg(long, conflicts_with = "credentials")]
+    token_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -119,6 +125,31 @@ pub(crate) enum SealKind {
     Refresh,
 }
 
+#[cfg(not(feature = "verify"))]
+const NEEDS_VERIFY_BUILD: &str =
+    "this verb verifies a TEE quote and needs a `--features verify` build of ducktape";
+
+#[cfg(not(feature = "verify"))]
+pub(crate) fn cmd_inspect(
+    _gateway: GatewayArgs,
+    _attest_args: AttestArgs,
+    _node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> CredResult {
+    Err(NEEDS_VERIFY_BUILD.into())
+}
+
+#[cfg(not(feature = "verify"))]
+pub(crate) fn cmd_seal(
+    _gateway: GatewayArgs,
+    _attest_args: AttestArgs,
+    _seal: SealArgs,
+    _node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+    _stdin: &mut impl std::io::BufRead,
+) -> CredResult {
+    Err(NEEDS_VERIFY_BUILD.into())
+}
+
+#[cfg(feature = "verify")]
 impl AttestArgs {
     fn mode(&self) -> AttestMode {
         match self.attest {
@@ -159,6 +190,7 @@ impl AttestArgs {
 /// Build the gateway handle. Remote mode reads the node's own browser-gateway
 /// base — the transport that carries a `.duck` authority onto the overlay —
 /// rather than making the operator paste it.
+#[cfg(feature = "verify")]
 fn resolve_gateway(
     args: &GatewayArgs,
     node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
@@ -183,6 +215,7 @@ fn resolve_gateway(
 /// TOFU for bootstrap: in production the measurement comes from the audited
 /// build, not from the enclave being asked to describe itself. Printing it is a
 /// convenience for pinning, never a verification.
+#[cfg(feature = "verify")]
 pub(crate) fn cmd_inspect(
     gateway: GatewayArgs,
     attest_args: AttestArgs,
@@ -213,17 +246,19 @@ pub(crate) fn cmd_inspect(
 /// The credential is released ONLY after the quote proves the pinned
 /// measurement: seal_pk is trusted because [`airlock::verify::verify_quote`]
 /// verified the chain that binds it, never because the gateway asserted it.
+#[cfg(feature = "verify")]
 pub(crate) fn cmd_seal(
     gateway: GatewayArgs,
     attest_args: AttestArgs,
     seal: SealArgs,
     node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+    stdin: &mut impl std::io::BufRead,
 ) -> CredResult {
     // resolve everything local and fallible BEFORE the network: bad roots, a bad
     // measurement or an unreadable artifact must fail before a quote is fetched.
     let roots = attest_args.roots()?;
     let expected = Measurement::from_hex(&seal.measurement)?;
-    let credential = resolve_credential(&seal)?;
+    let credential = resolve_credential(&seal, stdin)?;
     let kind = match seal.vendor {
         VendorArg::Claude => CredentialKind::Claude,
         VendorArg::Codex => CredentialKind::Codex,
@@ -252,22 +287,30 @@ pub(crate) fn cmd_seal(
     Ok(())
 }
 
-/// Which secret to seal. Direct flags win; otherwise read the vendor artifact.
-fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std::error::Error>> {
-    if let Some(access_token) = seal.access_token.clone() {
-        return Ok(CredentialPayload::Bearer { access_token });
-    }
-    if let Some(refresh_token) = seal.refresh_token.clone() {
-        return Ok(CredentialPayload::Refresh {
-            refresh_token,
-            access_token: String::new(),
-            expires_at: 0,
+/// Which secret to seal. `--token-stdin` wins; otherwise read the vendor
+/// artifact. Both a bare token and the artifact are the same secret class —
+/// the difference is only where the bytes come from — so `stdin` is threaded
+/// here for the token case and unused otherwise.
+#[cfg(feature = "verify")]
+fn resolve_credential(
+    seal: &SealArgs,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<CredentialPayload, Box<dyn std::error::Error>> {
+    if seal.token_stdin {
+        let token = crate::userkey_cli::prompt_stdin_line(stdin, "token")?;
+        return Ok(match seal.cred_kind {
+            SealKind::Bearer => CredentialPayload::Bearer { access_token: token },
+            SealKind::Refresh => CredentialPayload::Refresh {
+                refresh_token: token,
+                access_token: String::new(),
+                expires_at: 0,
+            },
         });
     }
     let path = seal
         .credentials
         .as_ref()
-        .ok_or("give the secret: --credentials <path>, --access-token, or --refresh-token")?;
+        .ok_or("give the secret: --credentials <path> or --token-stdin")?;
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let json: serde_json::Value = serde_json::from_str(&raw).context("credentials json")?;
     let oauth = &json["claudeAiOauth"];
@@ -292,6 +335,7 @@ fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std:
 
 /// The `cred` family is a synchronous CLI; the airlock client is async. One
 /// current-thread runtime per verb, built where it is used.
+#[cfg(feature = "verify")]
 fn block_on<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> Result<T, Box<dyn std::error::Error>> {

@@ -13,8 +13,8 @@
 # It also publishes two gateway web-app routes (see ops/demo-gateway.mjs): a
 # NETWORK-hosted static site served from DuckFS, and a USER-hosted route that
 # proxies to a node-local server. The frameless /v1/submit lane stamps the
-# node's own validator key as the op origin, so the local daemon binds an
-# Identity account and publishes routes as itself — the same path the app takes.
+# node's own validator key as the op origin. Its account controls the model
+# user; the separate demo wallet signs and owns the gateway routes.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +31,6 @@ ID="${DEMO_WORKSPACE_ID:-demo}"
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
-ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
 USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
@@ -200,7 +199,7 @@ N=0
 submit(){ # submit <module> <payload-json>
   N=$((N+1))
   local body resp code
-  body=$(bun -e 'const [target,payload,origin]=process.argv.slice(1);console.log(JSON.stringify({target,payload:JSON.parse(payload),origin}))' "$1" "$2" "$ORIGIN") \
+  body=$(bun -e 'const [target,payload]=process.argv.slice(1);console.log(JSON.stringify({target,payload:JSON.parse(payload)}))' "$1" "$2") \
     || die "op #$N ($1): payload is not valid json"
   resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' \
     -H "x-ducktape-admin-token: $OPERATOR" -d "$body")
@@ -223,12 +222,12 @@ submit pages '{"insert_block":{"parent":"runbook","after":null,"block":{"id":"rb
 submit chat '{"create_channel":{"channel_id":"general","name":"General","post_policy":"open"}}'
 submit chat '{"create_channel":{"channel_id":"engineering","name":"Engineering","post_policy":"open"}}'
 submit chat '{"create_channel":{"channel_id":"product","name":"Product","post_policy":"open"}}'
-submit chat '{"post_message":{"channel_id":"general","message_id":"g1","blocks":[{"paragraph":[{"text":"Welcome to the demo network 👋","marks":[]}]}],"thread":null,"as_agent":null}}'
-submit chat '{"post_message":{"channel_id":"general","message_id":"g2","blocks":[{"paragraph":[{"text":"This whole workspace is seeded — messages, tasks, pages and an agent.","marks":[]}]}],"thread":null,"as_agent":null}}'
-submit chat '{"post_message":{"channel_id":"general","message_id":"g3","blocks":[{"paragraph":[{"text":"Nice, it even threads.","marks":[]}]}],"thread":1,"as_agent":null}}'
+submit chat '{"post_message":{"channel_id":"general","message_id":"g1","blocks":[{"paragraph":[{"text":"Welcome to the demo network 👋","marks":[]}]}],"thread":null}}'
+submit chat '{"post_message":{"channel_id":"general","message_id":"g2","blocks":[{"paragraph":[{"text":"This whole workspace is seeded — messages, tasks, pages and an agent.","marks":[]}]}],"thread":null}}'
+submit chat '{"post_message":{"channel_id":"general","message_id":"g3","blocks":[{"paragraph":[{"text":"Nice, it even threads.","marks":[]}]}],"thread":1}}'
 submit chat '{"add_reaction":{"channel_id":"general","seq":1,"emoji":"🦆"}}'
-submit chat '{"post_message":{"channel_id":"engineering","message_id":"e1","blocks":[{"paragraph":[{"text":"CI is green on dev.","marks":[]}]}],"thread":null,"as_agent":null}}'
-submit chat '{"post_message":{"channel_id":"product","message_id":"p1","blocks":[{"paragraph":[{"text":"Demo script for the deck is ready.","marks":[]}]}],"thread":null,"as_agent":null}}'
+submit chat '{"post_message":{"channel_id":"engineering","message_id":"e1","blocks":[{"paragraph":[{"text":"CI is green on dev.","marks":[]}]}],"thread":null}}'
+submit chat '{"post_message":{"channel_id":"product","message_id":"p1","blocks":[{"paragraph":[{"text":"Demo script for the deck is ready.","marks":[]}]}],"thread":null}}'
 
 # tasks — a small board with mixed statuses. both boards ride ONE wire envelope
 # (WorkMsg): task-board ops are wrapped `{"task":{…}}`, job-board ops `{"job":{…}}`.
@@ -238,10 +237,31 @@ submit tasks '{"task":{"create_task":{"task_id":"t3","title":"Fix flaky identity
 submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}'
 submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
-# agent — register a demo agent, watch general for @mentions, then mention it
-submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","recipe_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
-submit runs '{"watch_channel":{"channel_id":"general","policy":"mention"}}'
-submit chat '{"post_message":{"channel_id":"general","message_id":"g4","blocks":[{"paragraph":[{"text":"hey ","marks":[]},{"text":"@quackbot","marks":[{"mention":{"agent":{"module":"runs","agent_id":"quackbot"}}}]},{"text":" can you follow up?","marks":[]}]}],"thread":null,"as_agent":null}}'
+# model user — the operator account controls a keyless programmable account.
+# The recipe is emitted by the current binary, never copied into this script.
+query(){ # query <module> <query-json>
+  local body
+  body=$(bun -e 'const [target,query]=process.argv.slice(1);process.stdout.write(JSON.stringify({target,query:JSON.parse(query)}))' "$1" "$2") || die "invalid query"
+  curl -fsS "$URL/v1/query" -H 'content-type: application/json' -d "$body" || die "query failed"
+}
+NODE_BYTES=$(bun -e 'process.stdout.write(JSON.stringify([...Buffer.from(process.argv[1],"hex")]))' "$PUB")
+CONTROLLER=$(query identity "{\"of_key\":{\"key\":$NODE_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
+if [ -z "$CONTROLLER" ]; then
+  submit identity '{"create":{"name":"Demo operator","scheme":"ed25519"}}'
+  CONTROLLER=$(query identity "{\"of_key\":{\"key\":$NODE_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
+fi
+[ -n "$CONTROLLER" ] || die "the operator has no controller account"
+PROGRAM=$("$NODE_BIN" agent model-program quackbot) || die "cannot encode the default model program"
+PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{name:"Quackbot",program:await Bun.stdin.json()}}))') || die "invalid program"
+submit agent "$PROVISION"
+MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" | bun -e '
+  const matches=(await Bun.stdin.json()).accounts.filter(account=>account.name==="Quackbot" && account.control.program?.executor==="agent");
+  if(matches.length!==1) throw new Error("expected exactly one Quackbot program account");
+  process.stdout.write(String(matches[0].number));
+') || die "cannot resolve the model account"
+submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"mock-llm-1\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"]}}}}"
+MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:"@quackbot can you follow up?",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT")
+submit chat "$MENTION"
 
 # jobs — a job on the board. the job board shares the "tasks" target under the
 # WorkMsg `{"job":{…}}` arm (there is no separate "jobs" module).

@@ -7,8 +7,14 @@ use std::time::Duration;
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
 /// frame size — transfers are ranged/streamed, so no single message ever
-/// approaches it.
-pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
+/// approaches it. ONE shared cap with the operator-facing stage route
+/// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
+/// larger than what an operator could ever stage locally.
+pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
+/// one warning when the committed valset read first fails, then one per this
+/// many further drain passes, for a host query that keeps erroring (#1820).
+/// shared by the validator drain and the replica park loop.
+pub(crate) const VALSET_READ_WARN_EVERY: u64 = 600;
 /// how many source conversations a code-blob fetch tries before reporting
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
@@ -57,6 +63,12 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_B
 // (`sync::serve::encode_bounded_response`) — that is the last line; this pin
 // keeps the honest path from ever needing it.
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+// the replay window a manifest carries is the SAME window the drain enforces:
+// a joiner seating on a shallower one applies a re-proposed batch its peers
+// refuse. `statesync` does not link `node`, so the equality is pinned here,
+// where both are in scope. the window's wire cost rides under the cap above.
+const _: () = assert!(statesync::MAX_APPLIED_FRAMES == node::REPLAY_WINDOW_HEIGHTS);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES * 40 + (64 << 10));
 /// per-peer, per-second message quota on every mesh channel — and its burst.
 /// commonware sizes each channel's inbound mailbox to one burst from every
 /// peer the network may retain, and DROPS an inbound message when that
@@ -87,6 +99,10 @@ pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TI
 /// for block handling, not a pacer: finalized blocks drain (and pending ops
 /// flush) event-driven the moment they land.
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
+// the idle beat floor (`workspace_config::validate_block_time_ms`) is refused
+// below whatever this tick is — they MUST agree, or a founded network's floor
+// promises a beat the heartbeat still can't keep.
+const _: () = assert!(DRAIN_TICK.as_millis() as u64 == workspace_config::MIN_BLOCK_TIME_MS);
 /// the pace of `refresh_operations` (the /metrics exposition parse feeding
 /// status' consensus/storage sections): the status cell publishes boundary
 /// facts per drain pass, but the exposition parse is the pricey part and one

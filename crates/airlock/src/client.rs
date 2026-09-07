@@ -20,6 +20,17 @@ use crate::wire::{
     SessionResponse, WorkRef,
 };
 
+/// TCP+TLS connect deadline for a gateway client (#1668: `Gateway::local`/
+/// `remote` built a bare `reqwest::Client::new()` with no timeout at all, so a
+/// half-open path to the gateway hung forever). A live connect completes in
+/// well under a second.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Total request deadline. Every call this client makes (attestation fetch,
+/// the session handshake, a credential upload) is one small request/response —
+/// none of them stream a long-lived body — so a single total timeout, not a
+/// read/idle one, is the right shape here.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// What failed AFTER the gateway's response arrived.
 ///
 /// A caller classifying a failed handshake reads the `reqwest::Error` out of the
@@ -75,6 +86,17 @@ impl std::fmt::Display for SessionResponseFault {
     }
 }
 
+/// Build the gateway HTTP client with the timeouts above. `reqwest::Client::new()`
+/// panics internally on a build failure the same way; this keeps that behavior
+/// while adding the timeouts it lacked.
+fn gateway_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("build airlock gateway http client")
+}
+
 /// Topology-agnostic handle to a gateway.
 pub struct Gateway {
     base: String,
@@ -87,13 +109,13 @@ pub struct Gateway {
 impl Gateway {
     /// Local: Credential Provider == Computation Provider (same-machine loopback).
     pub fn local(host: String) -> Self {
-        Self { base: host, authority: None, http: reqwest::Client::new() }
+        Self { base: host, authority: None, http: gateway_http_client() }
     }
 
     /// Remote: reach `handle` (a duckdns name) through `via` (the local node's
     /// browser-gateway base URL), which routes it onto the overlay.
     pub fn remote(handle: String, via: String) -> Self {
-        Self { base: via, authority: Some(handle), http: reqwest::Client::new() }
+        Self { base: via, authority: Some(handle), http: gateway_http_client() }
     }
 
     pub fn url(&self, path: &str) -> String {

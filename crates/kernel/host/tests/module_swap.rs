@@ -5,8 +5,8 @@
 //! What must hold at the boundary `H`:
 //!   * the host's out-of-block `realize_module_swaps(H, src)` fetches the
 //!     committed target hash's bytes, verifies sha256, and swaps the component
-//!     KEEPING the host-owned state — the module's `root()` (and thus the
-//!     root-hash) is byte-identical across the swap itself;
+//!     KEEPING the host-owned state — the module's `root()` stays identical,
+//!     while the global root changes to bind the new deployment;
 //!   * the drain injects EXACTLY ONE System-origin modreg `Advance` in block `H`,
 //!     flipping the committed active hash into the root-hash (the consensus
 //!     commitment to the new code);
@@ -38,8 +38,12 @@ const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.comp
 /// `modules::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
+fn deployment(bytes: &[u8]) -> Vec<u8> {
+    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+}
+
 fn sha(bytes: &[u8]) -> Vec<u8> {
-    sha2::Sha256::digest(bytes).to_vec()
+    sha2::Sha256::digest(deployment(bytes)).to_vec()
 }
 
 /// the test-side `CodeSource`: a plain in-memory content-addressed map — the
@@ -48,7 +52,7 @@ struct MapSource(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl MapSource {
     fn with(components: &[&[u8]]) -> Self {
-        Self(components.iter().map(|c| (sha(c), c.to_vec())).collect())
+        Self(components.iter().map(|c| (sha(c), deployment(c))).collect())
     }
 }
 
@@ -75,8 +79,13 @@ fn host_with_wasm() -> Host {
         MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));
@@ -204,10 +213,10 @@ fn run_swap_scenario() -> (Host, StateRoot) {
         wasm_root_before,
         "the swap keeps the host-owned state: root is byte-identical"
     );
-    assert_eq!(
+    assert_ne!(
         host.root_hash(),
         root_hash_before,
-        "code is invisible to the root-hash: realization alone moves nothing"
+        "the global root binds the running deployment as well as its state"
     );
     // idempotent: a second realization at the same height is a no-op.
     realize(&mut host, H, &src).expect("re-realize is Ok");
@@ -313,8 +322,13 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut joiner_valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut joiner_valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(joiner_valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(joiner_valset.finish_seed()).expect("seed valset");
     joiner.register(Box::new(joiner_valset));
@@ -461,7 +475,7 @@ impl MeshSource {
     fn serving(served: &[&[u8]]) -> Self {
         Self {
             local: std::sync::Mutex::new(BTreeMap::new()),
-            remote: served.iter().map(|c| (sha(c), c.to_vec())).collect(),
+            remote: served.iter().map(|c| (sha(c), deployment(c))).collect(),
         }
     }
 
@@ -489,7 +503,7 @@ impl CodeSource for MeshSource {
             return Some(hit.clone());
         }
         let pulled = self.remote.get(code_hash)?;
-        let verified = sha(pulled) == code_hash;
+        let verified = sha2::Sha256::digest(pulled).as_slice() == code_hash;
         if !verified {
             return None; // content-addressed: an unverified pull is never published.
         }
@@ -631,4 +645,96 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// ALL-OR-NOTHING: two modules swap at the SAME height and this node has only
+/// the first one's bytes. The boundary must refuse having changed NOTHING —
+/// realizing the first would leave the node running `H`'s code over state still
+/// at `H - 1` (the drain turns the Err into a stall that never applies `H`) and
+/// answering queries from it.
+#[test]
+fn a_missing_second_module_realizes_neither() {
+    let mut host = host_with_wasm();
+    // a SECOND hot-swappable module, sorted AFTER `hello` in the roster — so the
+    // resolvable entry is reached first and, unguarded, would swap.
+    host.register(Box::new(
+        WasmModule::from_bytes("zz-hello", HELLO_V1).expect("load v1"),
+    ));
+    submit(
+        &mut host,
+        0,
+        Origin::System,
+        modules_msg(&ModulesMsg::RegisterModule {
+            module_id: "zz-hello".into(),
+            code_hash: sha(HELLO_V1),
+        }),
+    );
+    // hello -> the replacement (bytes present); zz-hello -> a hash whose bytes
+    // this node does not have. both arm at H.
+    let absent = sha(b"a component this node never received");
+    for (name, module_id, code_hash) in [
+        ("hello-replacement", "hello", sha(HELLO_REPLACEMENT)),
+        ("zz-replacement", "zz-hello", absent.clone()),
+    ] {
+        submit(
+            &mut host,
+            3,
+            Origin::System,
+            modules_msg(&ModulesMsg::ScheduleSwap {
+                name: name.into(),
+                module_id: module_id.into(),
+                activation_height: H,
+                code_hash: code_hash.clone(),
+            }),
+        );
+        submit(
+            &mut host,
+            4,
+            Origin::External(MEMBER.to_vec()),
+            modules_msg(&ModulesMsg::SwapReady {
+                name: name.into(),
+                module_id: module_id.into(),
+                code_hash,
+            }),
+        );
+    }
+
+    // the order the boundary walks: `hello` (resolvable) BEFORE `zz-hello`
+    // (absent) is what makes this a partial-realization test at all.
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
+    else {
+        panic!("expected ModuleStatus");
+    };
+    let ids: Vec<&str> = modules.iter().map(|m| m.module_id.as_str()).collect();
+    assert_eq!(ids, vec!["hello", "zz-hello"], "roster order");
+
+    let root0 = host.root_hash();
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    let err = realize(&mut host, H, &src).expect_err("the absent second entry fails closed");
+    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+
+    assert_eq!(
+        host.module_code_hash("hello"),
+        Some(sha(HELLO_V1)),
+        "the resolvable FIRST module must not have swapped — the boundary is all-or-nothing"
+    );
+    assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
+    assert_eq!(root0, host.root_hash(), "nothing moved the root-hash");
+
+    // Possession and a matching hash are insufficient: compiling the second
+    // deployment must also succeed before the first replacement takes effect.
+    let mut malformed = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    malformed
+        .0
+        .insert(absent, deployment(b"a component this node never received"));
+    realize(&mut host, H, &malformed).expect_err("invalid second component fails closed");
+    assert_eq!(host.module_code_hash("hello"), Some(sha(HELLO_V1)));
+    assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
+    assert_eq!(
+        root0,
+        host.root_hash(),
+        "a compile refusal applies neither swap"
+    );
 }

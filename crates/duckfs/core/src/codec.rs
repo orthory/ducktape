@@ -92,7 +92,7 @@ impl<'a> Reader<'a> {
     /// a `u64` length prefix followed by exactly that many utf-8 bytes. the
     /// length is bounded by the remaining input before any allocation, so a
     /// bogus length truncates rather than over-allocating.
-    pub(crate) fn string(&mut self) -> Result<String, String> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let len = self.u64()?;
         let len = usize::try_from(len).map_err(|_| format!("files: {} truncated", self.what))?;
         let end = self
@@ -100,10 +100,14 @@ impl<'a> Reader<'a> {
             .checked_add(len)
             .filter(|&end| end <= self.bytes.len())
             .ok_or_else(|| format!("files: {} truncated", self.what))?;
-        let value = std::str::from_utf8(&self.bytes[self.off..end])
-            .map_err(|_| format!("files: {} string is not utf-8", self.what))?;
+        let value = self.bytes[self.off..end].to_vec();
         self.off = end;
-        Ok(value.to_owned())
+        Ok(value)
+    }
+
+    pub(crate) fn string(&mut self) -> Result<String, String> {
+        String::from_utf8(self.bytes()?)
+            .map_err(|_| format!("files: {} string is not utf-8", self.what))
     }
 
     /// every byte must be accounted for — a decode that stops short of the

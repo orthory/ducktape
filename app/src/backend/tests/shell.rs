@@ -265,32 +265,92 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // `user:{hex}` — the previous fixture invented prefixed entries and
     // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
+    let my_passkey = [0xacu8; 32];
     let peer = [0xbbu8; 32];
+    // A seat taken with the person's passkey is the person's: the directory
+    // binds both keys to one account, and the roster recognises it.
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&me),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&my_passkey),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&peer),
+            BoundAccount {
+                number: 2,
+                name: "peer".into(),
+            },
+        ),
+    ]));
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
-                user: hex_encode(&me),
+                party: "acct:1".into(),
                 node: "0a0a".into(),
                 joined_at: 10,
             },
             chat::index::HuddleEntry {
-                user: hex_encode(&peer),
+                party: format!("user:{}", hex_encode(&peer)),
                 node: "0b0b".into(),
                 joined_at: 20,
             },
         ],
-        Some(&me),
-        &AuthorNames::default(),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
     assert!(!roster[1].is_you && !roster[1].is_agent);
+    assert_eq!(roster[0].label, "me");
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
     // The fan-out the live session polls for is this roster's NODE keys with
     // our own row removed — the hub admits and fans out by node identity, and
     // a set that carried our own key would aim this device's media at itself.
-    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
+    assert_eq!(
+        huddle_recipient_nodes(roster, None),
+        vec!["0b0b".to_string()]
+    );
+}
+
+#[test]
+fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
+    // A `node_proof` only proves ITS OWN user holds that node's key — nothing
+    // stops a stale or replayed roster row from naming a DIFFERENT user
+    // alongside THIS node's key. `is_you` alone would miss it (that row is
+    // not "mine"), and fanning media to your own node is a loopback echo.
+    let me = [0xaau8; 32];
+    let peer = [0xbbu8; 32];
+    let names = NameDirectory::new(BTreeMap::new());
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&me)),
+                node: "0a0a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&peer)),
+                node: "0a0a".into(),
+                joined_at: 20,
+            },
+        ],
+        ChatReader::new(Some(&me), &names),
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("0a0a")),
+        Vec::<String>::new(),
+        "the peer row names this device's own node — never fan media there"
+    );
 }
 
 #[test]
@@ -774,11 +834,9 @@ fn bell_severity_projects_the_kind_and_defaults_to_info() {
 fn bell_badge_takes_the_worst_unread_severity() {
     let item = |seq: i64, kind: &str, read: bool| BellItem {
         seq,
-        kind: kind.into(),
-        body: String::new(),
-        source: String::new(),
-        height: 0,
+        reason: kind.into(),
         read,
+        ..BellItem::default()
     };
 
     assert_eq!(
@@ -900,4 +958,37 @@ checkpoint_blocks = 32
         workspace_endpoint(&dir).as_deref(),
         Some("http://127.0.0.1:8844")
     );
+}
+
+#[test]
+fn membership_removal_preserves_the_exact_stored_party() {
+    let key = "ab".repeat(32);
+    assert_eq!(member_party("acct:42").unwrap(), ::chat::Party::Account(42));
+    assert_eq!(
+        member_party(&key).unwrap(),
+        ::chat::Party::Key(vec![0xab; 32])
+    );
+    assert_eq!(
+        member_party(&format!("user:{key}")).unwrap(),
+        ::chat::Party::Key(vec![0xab; 32])
+    );
+    assert!(member_party("module:chat").is_err());
+    assert!(member_party("acct:invalid").is_err());
+}
+
+#[test]
+fn bell_renders_attribution_relation_and_change_actor() {
+    let item = BellItem {
+        seq: 1,
+        change_seq: 4,
+        source: "chat/message/general:2".into(),
+        reason: "mention".into(),
+        kind: "transferred_in:7".into(),
+        actor: "account:9".into(),
+        height: 3,
+        read: false,
+    };
+    assert_eq!(bell_title(&item.reason), "Mention");
+    assert_eq!(bell_detail(&item), "transferred in:7 · account:9");
+    assert_eq!(bell_worst_severity(&[item]), "info");
 }

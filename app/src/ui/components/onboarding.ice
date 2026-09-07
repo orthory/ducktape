@@ -41,137 +41,168 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
     join_network_submit
     copy_onboarding_invite
     enter_console
+    drag_launch_window
+    close_launch_window
   box #root
     with
       w=fill
       h=fill
-      p=26.0
-      align-x=center
-      align-y=center
       bg=bg_wash
-    col gap=0.0
-      match step
-        HubStep.wallets
-          WalletsScreen #wallets
-            with
-              wallets
-              selected=wallet_selected
-              busy
-              error
-            forward
-              pick_wallet
-              unlock_submit
-              login_skip
-              go_restore
-        HubStep.password
-          PasswordScreen #password busy=busy error=error
-            forward
-              password_submit
-              go_restore
-              login_skip
-        // The two ceremony steps read the phrase the backend is holding
-        // rather than any app state — the words are never a reading this
-        // process keeps, and both screens are gone the moment it lets go.
-        HubStep.phrase
-          PhraseScreen #phrase
-            with
-              rows=phrase_rows()
-              busy
-            forward
-              phrase_written_down
-        HubStep.confirm
-          ConfirmPhraseScreen #confirm
-            with
-              prompt=recovery_prompt()
-              busy
-              error
-            forward
-              confirm_phrase_submit
-              show_phrase_again
-        HubStep.restore
-          RestoreScreen
-            with
-              busy=busy
-              error=error
-              phrase_empty=restore_empty
-            forward
-              restore_submit
-              go_login
-            phrase:
-              slot restore_phrase?
-        HubStep.networks
-          NetworksScreen #networks
-            with
-              networks
-              selected
-              hidden
-              busy
-              error
-              active_wallet=wallet_selected
-            forward
-              pick_network
-              open_network_submit
-              forget_network_submit
-              connect_remote_submit
-              restore_hidden_submit
-              go_join
-              go_wallets
-        HubStep.provisioning
-          ProvisioningScreen
-            with
-              name
-              steps
-              step_index
-              error
-        HubStep.live
-          LiveScreen
-            with
-              name
-              invite
-              height
-              peers_live=0
-              peers_total=0
-              tier
-              busy
-              error
-            forward
-              go_networks
-              copy_onboarding_invite
-              enter_console
-        HubStep.join
-          JoinScreen
-            with
-              busy=busy
-              error=error
-              invite_empty=join_empty
-            forward
-              go_networks
-              join_network_submit
-            invite:
-              slot join_invite?
-        HubStep.loading
-          col gap=0.0 align=center
-            text "…"
-              with
-                size=13.5
-                wrap=none
-                @text-hint
-        HubStep.account
-          WelcomeScreen name_draft<->name_draft #welcome
-            with
-              network
-              phase
-              qr
-              detail
-              left
-              busy
-              error
-            forward
-              welcome_create_submit
-              welcome_login_submit
-              welcome_desktop
-              welcome_cancel
-              welcome_skip
+    col w=fill h=fill
+      // THE RAIL THE TITLEBAR WAS. With `decorations false` (app.ice) this window
+      // has no OS strip, so this is the whole of its chrome: press-and-drag
+      // anywhere along it to move the window, and one × to close it. `mouse
+      // press` and not a button, because a drag has to start on the press — a
+      // button answers on release, by which time there is nothing to drag.
+      row
+        with
+          w=fill
+          h=34.0
+          align=center
+          px=10.0
+        mouse press=emit(drag_launch_window)
+          space w=fill h=34.0
+        button #launch-close -> emit(close_launch_window)
+          with
+            label="Close Ducktape"
+            @icon_action
+            @p-5px
+          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+          hovered bg=subtle text=fg
+          pressed bg=subtle text=fg
+          text "✕" size=12.5 font=ui
+      box
+        with
+          w=fill
+          h=fill
+          pl=26.0
+          pr=26.0
+          pb=26.0
+          align-x=center
+          align-y=center
+        col gap=0.0
+          match step
+            HubStep.wallets
+              WalletsScreen #wallets
+                with
+                  wallets
+                  selected=wallet_selected
+                  busy
+                  error
+                forward
+                  pick_wallet
+                  unlock_submit
+                  login_skip
+                  go_restore
+            HubStep.password
+              PasswordScreen #password busy=busy error=error
+                forward
+                  password_submit
+                  go_restore
+                  login_skip
+            // The two ceremony steps read the phrase the backend is holding
+            // rather than any app state — the words are never a reading this
+            // process keeps, and both screens are gone the moment it lets go.
+            HubStep.phrase
+              PhraseScreen #phrase
+                with
+                  rows=phrase_rows()
+                  busy
+                forward
+                  phrase_written_down
+            HubStep.confirm
+              ConfirmPhraseScreen #confirm
+                with
+                  prompt=recovery_prompt()
+                  busy
+                  error
+                forward
+                  confirm_phrase_submit
+                  show_phrase_again
+            HubStep.restore
+              RestoreScreen
+                with
+                  busy=busy
+                  error=error
+                  phrase_empty=restore_empty
+                forward
+                  restore_submit
+                  go_login
+                phrase:
+                  slot restore_phrase?
+            HubStep.networks
+              NetworksScreen #networks
+                with
+                  networks
+                  selected
+                  hidden
+                  busy
+                  error
+                  active_wallet=wallet_selected
+                forward
+                  pick_network
+                  open_network_submit
+                  forget_network_submit
+                  connect_remote_submit
+                  restore_hidden_submit
+                  go_join
+                  go_wallets
+            HubStep.provisioning
+              ProvisioningScreen
+                with
+                  name
+                  steps
+                  step_index
+                  error
+            HubStep.live
+              LiveScreen
+                with
+                  name
+                  invite
+                  height
+                  peers_live=0
+                  peers_total=0
+                  tier
+                  busy
+                  error
+                forward
+                  go_networks
+                  copy_onboarding_invite
+                  enter_console
+            HubStep.join
+              JoinScreen
+                with
+                  busy=busy
+                  error=error
+                  invite_empty=join_empty
+                forward
+                  go_networks
+                  join_network_submit
+                invite:
+                  slot join_invite?
+            HubStep.loading
+              col gap=0.0 align=center
+                text "…"
+                  with
+                    size=13.5
+                    wrap=none
+                    @text-hint
+            HubStep.account
+              WelcomeScreen name_draft<->name_draft #welcome
+                with
+                  network
+                  phase
+                  qr
+                  detail
+                  left
+                  busy
+                  error
+                forward
+                  welcome_create_submit
+                  welcome_login_submit
+                  welcome_desktop
+                  welcome_cancel
+                  welcome_skip
 
 // The brand plate every sign-in screen opens with.
 component HubBrand(title:str, caption:str)

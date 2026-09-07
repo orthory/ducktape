@@ -80,8 +80,8 @@
 //! objects, and reading them would break the determinism invariant above. so
 //! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
 //! a repo pins its owner — the Identity ACCOUNT principal the origin resolves
-//! to (see [`state::ForgeState::principal_of_origin`]; every key of one
-//! association, laptop or phone, collapses onto one account) — and only that
+//! to (every bound key resolves to its canonical account; an unbound key
+//! retains exact signer ownership) — and only that
 //! owner may move `main`/`dev` afterwards, whether by
 //! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
 //! FEATURE branches stay open to every member.
@@ -140,9 +140,9 @@ mod git;
 pub use git::{list_branches, pack_closure_many, pack_delta};
 pub mod oid;
 pub use oid::Oid;
-pub mod pushcert;
 #[cfg(feature = "native")]
 mod module;
+pub mod pushcert;
 pub mod refs;
 pub mod state;
 #[cfg(feature = "native")]
@@ -183,10 +183,13 @@ const MAX_REPO_NAME_LEN: usize = 64;
 /// normalize + validate a repo slug DETERMINISTICALLY (same input -> same
 /// decision on every validator, so it is safe as a consensus gate): empty ->
 /// `"default"`; otherwise it must be 1..=`MAX_REPO_NAME_LEN` bytes of
-/// `[a-z0-9._-]` and never `.`/`..` (those would escape or collide with the base
-/// dir as a path segment). a valid non-empty slug returns unchanged, so the map
-/// key equals the on-disk directory name. `pub`: bin/noded's git smart-HTTP
-/// layer shares this validator — the security-relevant check has ONE home.
+/// `[a-z0-9._-]` and never start with `.` (that collides with `.`/`..` as a
+/// path segment, AND with forge's own dot-prefixed state files — `.tracker.bin`,
+/// `.pending.bin`, `.stuck.txt`, `.snapshot-cache.bin` — that live in the same
+/// base dir; a repo named after one of those bricks every node's `commit_block`
+/// forever). a valid non-empty slug returns unchanged, so the map key equals
+/// the on-disk directory name. `pub`: bin/noded's git smart-HTTP layer shares
+/// this validator — the security-relevant check has ONE home.
 pub fn norm_repo(repo: &str) -> Result<String, Error> {
     if repo.is_empty() {
         return Ok(DEFAULT_REPO.to_string());
@@ -197,9 +200,9 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
             repo.len()
         )));
     }
-    if repo == "." || repo == ".." {
+    if repo.starts_with('.') {
         return Err(Error::Module(
-            "forge: repo name may not be '.' or '..'".into(),
+            "forge: repo name may not start with '.'".into(),
         ));
     }
     if !repo

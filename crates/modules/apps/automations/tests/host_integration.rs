@@ -7,7 +7,10 @@ use automations::{
     Action, AutomationsMsg, AutomationsQuery, AutomationsReply, RunRecord, Trigger, decode_reply,
     encode_msg, encode_query,
 };
-use chat::{AuthorRef, ChatEvent, encode_event};
+use chat::{
+    ChannelAccess, ChatEvent, ChatQuery, ChatReply, Party, decode_query as chat_decode_query,
+    encode_event, encode_reply as chat_encode_reply,
+};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -20,7 +23,8 @@ use tasks::{
 const AUTO: &str = "automations";
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
-const INBOX: &str = "inbox";
+const IDENTITY: &str = "identity";
+const ATTRIBUTION: &str = "attribution";
 
 /// a stand-in for chat that relays its payload to automations as a hook
 /// follow-up. because it is registered under the id "chat", the host stamps the
@@ -42,6 +46,18 @@ impl Module for RelayChat {
         });
         Ok(())
     }
+    /// the one read the relay serves: a rule owner's standing in a channel,
+    /// which the fire path consults before a rule may observe an event. this
+    /// stand-in has no channels, so it answers as an open one does — admitted.
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let ChatQuery::Access { .. } = chat_decode_query(req).map_err(Error::Module)? else {
+            return Err(Error::QueryUnsupported);
+        };
+        Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
+            may_read: true,
+            may_post: true,
+        })))
+    }
 }
 
 fn from_user(payload: Msg) -> (BlockContext, Msg) {
@@ -49,7 +65,7 @@ fn from_user(payload: Msg) -> (BlockContext, Msg) {
         BlockContext {
             height: 1,
             consensus_time: 100,
-            origin: Origin::External(b"operator".to_vec()),
+            origin: Origin::External(vec![9; 32]),
         },
         payload,
     )
@@ -66,7 +82,7 @@ fn create_rule_msg(rule_id: &str, trigger: Trigger, action: Action) -> Msg {
     }
 }
 
-fn chat_event_msg(channel: &str, seq: u64, author: AuthorRef) -> Msg {
+fn chat_event_msg(channel: &str, seq: u64, author: Party) -> Msg {
     Msg {
         target: CHAT.into(),
         payload: encode_event(&ChatEvent::MessagePosted {
@@ -108,26 +124,58 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
     }
 }
 
-fn genesis() -> Host {
+async fn genesis() -> Host {
     let auto = Automations::new(
         AUTO,
         Box::new(sdk_testkit::MemStore::new()),
         CHAT,
         TASKS,
-        INBOX,
+        IDENTITY,
+        ATTRIBUTION,
     );
-    Host::genesis(vec![
-        Box::new(Tasks::new(TASKS, Box::new(sdk_testkit::MemStore::new()))),
+    let mut host = Host::genesis(vec![
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "test".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(Tasks::new(
+            TASKS,
+            "identity",
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(RelayChat),
         Box::new(auto),
     ])
-    .expect("genesis")
+    .expect("genesis");
+    host.submit_at(
+        BlockContext {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(vec![9; 32]),
+        },
+        Msg {
+            target: "identity".into(),
+            payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                name: "Operator".into(),
+                scheme: identity::KeyScheme::Ed25519,
+            }),
+        },
+    )
+    .await
+    .expect("found owner");
+    host
 }
 
 #[test]
 fn user_post_fires_rule_and_creates_task_atomically() {
     block_on(async {
-        let mut host = genesis();
+        let mut host = genesis().await;
 
         // register a CreateTask rule.
         let (ctx, msg) = from_user(create_rule_msg(
@@ -153,7 +201,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),
                 },
-                chat_event_msg("general", 5, AuthorRef::User(vec![1; 4])),
+                chat_event_msg("general", 5, Party::Key(vec![1; 4])),
             )
             .await
             .expect("hook fires");
@@ -174,7 +222,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
 #[test]
 fn module_authored_post_does_not_fire() {
     block_on(async {
-        let mut host = genesis();
+        let mut host = genesis().await;
         let (ctx, msg) = from_user(create_rule_msg(
             "capture",
             Trigger {
@@ -196,7 +244,7 @@ fn module_authored_post_does_not_fire() {
                 consensus_time: 200,
                 origin: Origin::External(b"poster".to_vec()),
             },
-            chat_event_msg("general", 1, AuthorRef::Module("automations".into())),
+            chat_event_msg("general", 1, Party::Module("automations".into())),
         )
         .await
         .expect("no-fail arm");
@@ -211,7 +259,7 @@ fn module_authored_post_does_not_fire() {
 #[test]
 fn squatted_task_id_is_caught_by_probe_and_block_commits() {
     block_on(async {
-        let mut host = genesis();
+        let mut host = genesis().await;
         let (ctx, msg) = from_user(create_rule_msg(
             "capture",
             Trigger {
@@ -239,6 +287,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
                 payload: tasks::encode_task_msg(&tasks::TaskMsg::CreateTask {
                     task_id: "auto-general-5".into(),
                     title: "squatted".into(),
+                    owner: None,
                 }),
             },
         )
@@ -252,7 +301,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
                 consensus_time: 300,
                 origin: Origin::External(b"poster".to_vec()),
             },
-            chat_event_msg("general", 5, AuthorRef::User(vec![1; 4])),
+            chat_event_msg("general", 5, Party::Key(vec![1; 4])),
         )
         .await
         .expect("the squatted fire must not abort the block");
@@ -267,7 +316,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
 #[test]
 fn post_probe_collision_still_aborts_the_block() {
     block_on(async {
-        let mut host = genesis();
+        let mut host = genesis().await;
         // two rules composing the SAME task id fire on one event: both probes
         // run before either follow-up applies, so both pass and both emit —
         // the second follow-up then fails at tasks and the whole block aborts
@@ -297,7 +346,7 @@ fn post_probe_collision_still_aborts_the_block() {
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),
                 },
-                chat_event_msg("general", 5, AuthorRef::User(vec![1; 4])),
+                chat_event_msg("general", 5, Party::Key(vec![1; 4])),
             )
             .await
             .expect_err("the same-event id collision aborts the block");

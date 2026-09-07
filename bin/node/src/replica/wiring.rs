@@ -362,6 +362,7 @@ pub(super) async fn wire(
                         &namespace,
                         token,
                         keypair.public_key().0,
+                        nat_traversal::now_secs(),
                     ));
                     let token_nonce = token.nonce.to_vec();
                     let reach = reach.clone();

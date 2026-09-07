@@ -115,7 +115,11 @@ fn native_identity() -> Identity {
 }
 
 async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     for v in validators {
         valset.seed(v.clone()).await.expect("seed valset");
     }
@@ -126,7 +130,12 @@ async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
 /// a code registry with one seeded tenant, so UpdateModule has a module to
 /// re-code (mirrors bin/node's genesis-seeded registry).
 async fn seeded_registry() -> Modules {
-    let mut registry = Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
+    let mut registry = Modules::new(
+        "modules",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+        "governance",
+    );
     registry
         .seed("hello", vec![0xAA; 32])
         .await
@@ -539,7 +548,9 @@ async fn same_ops_inner(context: &deterministic::Context) {
             GovAction::UpdateModule {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
-                activation_height: 500,
+                // execute lands at height 16 below; 16 + 484 = 500, matching
+                // the pending.activation_height assertion further down.
+                activation_lead: 484,
                 code_hash: vec![0xBB; 32],
             },
             500,
@@ -726,7 +737,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: String::new(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 32],
                 },
                 5,
@@ -740,7 +751,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 8],
                 },
                 5,

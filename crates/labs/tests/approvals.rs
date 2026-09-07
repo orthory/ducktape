@@ -36,6 +36,7 @@ fn ctx(who: &[u8], validators: Vec<Vec<u8>>) -> TestCtx {
         consensus_time: 1_000,
         origin: Origin::External(who.to_vec()),
         me: "multisig".into(),
+        cause: sdk::Cause::Direct,
     })
     .on_query("valset", valset_reads(validators))
 }

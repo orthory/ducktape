@@ -12,17 +12,69 @@ use sdk::Msg;
 use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
-use crate::constants::{DRAIN_TICK, NOP_TARGET, WORKSPACE_CHECK_INTERVAL};
+use crate::constants::{DRAIN_TICK, NOP_TARGET, VALSET_READ_WARN_EVERY, WORKSPACE_CHECK_INTERVAL};
 use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes};
+use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_ms};
 
 /// One warning when the workspace mark goes missing, then one per this many
 /// further checks (`WORKSPACE_CHECK_INTERVAL` apart) for a filesystem that
 /// never accepts the rewrite.
 const MARK_LOST_WARN_EVERY: u64 = 600;
+
+/// how many consecutive checkpoints may defer `prune_oplog` for a warm sync
+/// lease before the checkpoint prunes anyway. an active syncer that never
+/// stops asking (or a peer that renews the lease every 10s forever) would
+/// otherwise pin the retained journal open indefinitely — the lease exists to
+/// protect one in-flight sync's boundary, not to suspend retention (#1814).
+/// a joiner still below the new floor gets `Error::RangePruned`, which the
+/// sync path already handles.
+const MAX_PRUNE_DEFERRALS: u32 = 3;
+
+/// the checkpoint's prune outcome — one discriminant covering floor
+/// readiness, sync-lease warmth, and the deferral cap together (see
+/// `MAX_PRUNE_DEFERRALS`).
+#[derive(Debug, PartialEq, Eq)]
+enum PruneAction {
+    /// the finalization floor hasn't passed this checkpoint yet: nothing to
+    /// prune.
+    NotDue,
+    /// the sync lease is warm and hasn't deferred past the cap: hold off.
+    Deferred,
+    /// the sync lease is warm but has deferred `MAX_PRUNE_DEFERRALS`
+    /// checkpoints running: prune anyway.
+    Forced,
+    /// the sync lease is not warm: prune normally.
+    Clear,
+}
+
+/// decide a checkpoint's prune action from the three governing facts. pure —
+/// the drain loop performs the actual prune/defer effects and counter update
+/// for whichever action this returns, so the decision itself is testable
+/// without a journal or a lease.
+fn decide_prune_action(
+    floor_passed: bool,
+    lease_active: bool,
+    deferral_cap_reached: bool,
+) -> PruneAction {
+    match (floor_passed, lease_active, deferral_cap_reached) {
+        (false, _, _) => PruneAction::NotDue,
+        (true, true, false) => PruneAction::Deferred,
+        (true, true, true) => PruneAction::Forced,
+        (true, false, _) => PruneAction::Clear,
+    }
+}
+
+/// how long a validator may seal NOTHING before the halt detector calls it a
+/// stall: 30 idle beats. an idle chain beats one nop block per `block_time`,
+/// so a window this wide cannot fire on ordinary jitter (a checkpoint, a slow
+/// disk, a view or two nullified while a peer reconnects) and still names a
+/// wedge in seconds rather than minutes.
+fn stall_window(cadence: consensus::Cadence) -> std::time::Duration {
+    cadence.block_time * 30
+}
 use crate::validator::code_announce::CodeVerdict;
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
@@ -120,6 +172,7 @@ impl ValidatorRuntime<'_> {
             reach_cmd,
             relay_tx,
             gate_outcomes,
+            join_requests,
             next_seq,
             prev_ckpt,
             signer,
@@ -140,14 +193,21 @@ impl ValidatorRuntime<'_> {
             blocks_since_checkpoint,
             checkpoint_not_before,
             last_written_root,
+            prune_deferrals,
             last_reach_view,
             pending_retarget,
             next_drain,
             delivery_wake_tx,
             real_work_parked,
+            last_seal,
+            stall_windows,
+            heartbeat_disabled,
+            cadence,
+            valset_read_failed_checks,
             ..
         } = self;
         let context = *context;
+        let cadence = *cadence;
         let checkpoint_blocks = *checkpoint_blocks;
 
         *next_drain = context.current() + DRAIN_TICK;
@@ -158,6 +218,14 @@ impl ValidatorRuntime<'_> {
         // restarts the node, which then re-joins via state sync.
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
+            // STALLED, not faulted: the block at that height designates module
+            // code this node cannot resolve yet. the frame is still at the
+            // front of the drain queue and the blocks ahead of it settled — so
+            // keep the tick, keep the state, and let the next drain retry
+            // (which is what re-runs the fetch). halting here would stop a
+            // chain that was only waiting for bytes; the node narrates the
+            // stall with its attempt count.
+            Err(node::Error::CodeStalled { applied, .. }) => applied,
             Err(e) => {
                 fatal!(label, "{e} — halting");
             }
@@ -183,6 +251,46 @@ impl ValidatorRuntime<'_> {
             .collect::<std::collections::BTreeSet<u64>>()
             .len() as u64;
         *blocks_since_checkpoint += sealed_heights;
+        // THE HALT DETECTOR. every way this loop can stop producing blocks is
+        // silent by construction: a release gate awaiting bytes delivers
+        // nothing, a pending FIFO that never empties makes the idle beat
+        // restamp forever, and neither logs a thing. so the ABSENCE of blocks
+        // is the event — one warn per stall window, carrying the state that
+        // names which wedge it is (#1766). the heartbeat is what guarantees a
+        // block per beat, so a node with it disabled (`make dev`) has no floor
+        // to measure against and is not watched.
+        let sealed_something = sealed_heights > 0;
+        if sealed_something {
+            *last_seal = context.current();
+            *stall_windows = 0;
+        } else {
+            let stalled_for = context
+                .current()
+                .duration_since(*last_seal)
+                .unwrap_or_default();
+            let stall_due = !*heartbeat_disabled && stalled_for >= stall_window(cadence);
+            if stall_due {
+                *stall_windows += 1;
+                // re-arm: the next warn is one full window later, so a wedge
+                // that never clears narrates itself at a bounded rate.
+                *last_seal = context.current();
+                tracing::warn!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    reason = "block_beat_stalled",
+                    windows = *stall_windows,
+                    stalled_ms = stalled_for.as_millis() as u64,
+                    epoch = orchestrator.epoch(),
+                    validators = orchestrator.current_members().len(),
+                    height = node.finalized().map_or(0, |f| f.height),
+                    pending_ops = node.pending_batch_len(),
+                    orderer_pending = node.orderer().pending_len(),
+                    gate_awaiting = node.orderer().min_unreleased_view().is_some(),
+                    gate_min_view = node.orderer().min_unreleased_view().unwrap_or(0),
+                    "no block sealed for a full stall window — the chain is not beating"
+                );
+            }
+        }
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
         let projections = project_block(&drained, node.take_system_dispatches(), blobs);
@@ -196,6 +304,14 @@ impl ValidatorRuntime<'_> {
             false => noded::BlockWake::TipOnly,
         };
         for projection in projections {
+            // NOTHING SEALED AT THIS HEIGHT — every frame in the batch was
+            // discarded by the cutover ceiling. There is no block here to
+            // project, and folding one would advance every module's watermark
+            // onto a height the NEW epoch is about to use (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let BlockProjection {
                 height,
                 dispatches,
@@ -226,7 +342,7 @@ impl ValidatorRuntime<'_> {
                 height,
                 record,
                 &dispatches,
-                &node.host().module_roots(),
+                node.host(),
             );
         }
         for d in drained {
@@ -301,13 +417,13 @@ impl ValidatorRuntime<'_> {
                     let window = read_valset_mesh_window(node.host()).await;
                     mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
-                super::settle_gate(gate_outcomes, gate.joiner, reply);
+                super::settle_gate(gate_outcomes, gate.joiner, reply, context.current());
                 continue;
             }
             // resolve a relayed hold FIRST: a relayed frame has no
             // local pending_submits entry, so this must precede the
             // `else { continue }` below or the wire Reply is lost.
-            if let Some((peer, _)) = pending_relays.remove(&d.id) {
+            if let Some((peers, _)) = pending_relays.remove(&d.id) {
                 let outcome = match d.disposition {
                     node::Disposition::Applied => relay::RelayOutcome::Applied {
                         height: d.height,
@@ -330,11 +446,14 @@ impl ValidatorRuntime<'_> {
                     frame_id: d.id,
                     outcome,
                 };
-                let _ = relay_tx.send(
-                    Recipients::One(peer),
-                    IoBuf::from(relay::encode_msg(&msg)),
-                    false,
-                );
+                // every courier that relayed this frame gets the SAME outcome.
+                for peer in peers {
+                    let _ = relay_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(relay::encode_msg(&msg)),
+                        false,
+                    );
+                }
             }
             // BEFORE the pending_submits lookup, deliberately. An op rejected in
             // consensus produced no record ANYWHERE: the submitter's own log says
@@ -365,10 +484,10 @@ impl ValidatorRuntime<'_> {
                     "op rejected in consensus"
                 );
             }
-            let Some((reply, _)) = pending_submits.remove(&d.id) else {
+            let Some((replies, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
-            let _ = reply.send(match d.disposition {
+            let outcome = match d.disposition {
                 node::Disposition::Applied => Ok(noded::BlockSummary {
                     height: d.height,
                     // the PER-BLOCK boundary this frame settled at
@@ -386,7 +505,12 @@ impl ValidatorRuntime<'_> {
                 // unreachable — filtered at the loop top — but
                 // stay total rather than panic.
                 node::Disposition::Discarded => continue,
-            });
+            };
+            // every caller that submitted this frame gets the SAME outcome:
+            // one FrameId is one consensus unit, however many asked for it.
+            for reply in replies {
+                let _ = reply.send(outcome.clone());
+            }
         }
         validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
@@ -399,7 +523,10 @@ impl ValidatorRuntime<'_> {
                 .map(|(k, _)| *k)
                 .collect();
             for k in expired {
-                if let Some((reply, _)) = pending_submits.remove(&k) {
+                let Some((replies, _)) = pending_submits.remove(&k) else {
+                    continue;
+                };
+                for reply in replies {
                     let _ = reply.send(Err(
                         "timed out awaiting finalization — re-query on the next block".into(),
                     ));
@@ -417,14 +544,17 @@ impl ValidatorRuntime<'_> {
                 .map(|(k, _)| *k)
                 .collect();
             for k in expired {
-                if let Some((peer, _)) = pending_relays.remove(&k) {
-                    let msg = relay::RelayMsg::Reply {
-                        frame_id: k,
-                        outcome: relay::RelayOutcome::Refused {
-                            detail: "timed out awaiting finalization — re-query on the next block"
-                                .into(),
-                        },
-                    };
+                let Some((peers, _)) = pending_relays.remove(&k) else {
+                    continue;
+                };
+                let msg = relay::RelayMsg::Reply {
+                    frame_id: k,
+                    outcome: relay::RelayOutcome::Refused {
+                        detail: "timed out awaiting finalization — re-query on the next block"
+                            .into(),
+                    },
+                };
+                for peer in peers {
                     let _ = relay_tx.send(
                         Recipients::One(peer),
                         IoBuf::from(relay::encode_msg(&msg)),
@@ -457,10 +587,34 @@ impl ValidatorRuntime<'_> {
                                 .into(),
                             terminal: false,
                         },
+                        now,
                     );
                 }
             }
         }
+        // sweep gate outcomes settled more than a join window ago — on the
+        // SAME beat as the held-gate expiry just above, no new timer. keyed
+        // on `INVITE_JOIN_WINDOW_MS` (the same clock the invite-peer tunnel
+        // table itself ages uncovered entries out by, `merge_invite_layer` in
+        // netstack-machine): a joiner has that long to retransmit before its
+        // outcome — `Admitted` included — is dead weight. Expiring `Admitted`
+        // is safe: a joiner that reappears later just re-runs the gate, and
+        // `on_gate_forward`'s V9 arm answers Admitted again for free (a
+        // committed-state read, no consensus round).
+        crate::reachability_plane::sweep_gate_outcomes(
+            &mut gate_outcomes.lock().expect("gate outcomes lock"),
+            context.current(),
+            std::time::Duration::from_millis(reachability::INVITE_JOIN_WINDOW_MS),
+        );
+        // same reasoning, same beat, for the join-request map: a joiner that
+        // stops retransmitting (a rejected Redeem, or it just gave up) would
+        // otherwise sit there forever — the only other prune is the read-time
+        // retain in `on_rpc` for a joiner that GAINED standing.
+        crate::rpc::sweep_join_requests(
+            join_requests,
+            unix_ms(),
+            reachability::INVITE_JOIN_WINDOW_MS,
+        );
         // publish each newly-applied boundary to ws subscribers
         // (send only errs when nobody is subscribed — fine). the
         // drain loop above already folded each block into the
@@ -517,8 +671,308 @@ impl ValidatorRuntime<'_> {
             }
         }
 
-        // periodic checkpoint: snapshot the in-memory cohort and
-        // prune the op journal below the PREVIOUS checkpoint once
+        // the VALSET ORCHESTRATION step: observe the finalized
+        // membership projection; a change schedules a deterministic
+        // cutover (arming the discard ceiling), and crossing the
+        // cutover view tears the engine down and respawns it over
+        // the set read AT the boundary. the observation barrier
+        // guarantees this tick's last view IS the changing block's
+        // view when membership moved.
+        if let Some(engine_view) = node.last_engine_view() {
+            // tick the reachability plane's freshness clock.
+            // engine views are EPOCH-LOCAL (they reset at every
+            // cutover), so convert to the absolute app-height
+            // clock (`epoch_base + view`) — the regime the boot
+            // Retarget's `view_base` put the plane's advert and
+            // handshake expiries in.
+            if let Some(cmd) = &reach_cmd {
+                let absolute_view = orchestrator.app_height(engine_view);
+                if last_reach_view.is_none_or(|v| v < absolute_view) {
+                    // NON-BLOCKING: the plane is not consensus. a
+                    // full command queue (a wedged or slow plane)
+                    // sheds this tick — the next drain beat carries
+                    // a fresher one — instead of stalling the loop
+                    // behind an actor that may never drain.
+                    let _ =
+                        cmd.try_send(reachability::ReachabilityCommand::ViewTick(absolute_view));
+                    *last_reach_view = Some(absolute_view);
+                }
+                // flush a staged cutover Retarget (see
+                // `pending_retarget`) — MUST eventually land, so
+                // it retries every beat rather than being shed.
+                if let Some(event) = pending_retarget.take()
+                    && let Err(tokio::sync::mpsc::error::TrySendError::Full(
+                        reachability::ReachabilityCommand::Retarget(event),
+                    )) = cmd.try_send(reachability::ReachabilityCommand::Retarget(event))
+                {
+                    *pending_retarget = Some(event);
+                }
+            }
+            // sync the mesh window at the same frozen read point: any
+            // committed membership change — a sibling member's grant, a
+            // governance leave/revoke — widens or narrows the mesh NOW, at
+            // its generation index; the epoch cutover below stays an
+            // engine/channel concern. monotonic bookkeeping makes the
+            // no-change case a silent no-op.
+            let committed_window = read_valset_mesh_window(node.host()).await;
+            mesh_window.track_new(mesh_oracle, mesh_book, &committed_window);
+            match read_valset_members(node.host()).await {
+                Err(e) => {
+                    // a failed read is NOT an observation: feeding it to
+                    // `observe_members` as an empty set would arm a bogus
+                    // cutover no other validator armed (#1820). skip the
+                    // cutover step this tick and retry next block.
+                    *valset_read_failed_checks += 1;
+                    let attempts = *valset_read_failed_checks;
+                    let speak = attempts == 1 || attempts.is_multiple_of(VALSET_READ_WARN_EVERY);
+                    if speak {
+                        tracing::warn!(
+                            target: "ducktape::consensus",
+                            node = %label,
+                            reason = "valset_read_failed",
+                            attempts,
+                            error = %e,
+                            "committed valset read failed; skipping the cutover step this tick"
+                        );
+                    }
+                }
+                Ok(members_raw) if members_raw.is_empty() => {
+                    // a successful read that comes back EMPTY is the
+                    // impossible state the boot path already fatals on (see
+                    // `wiring.rs`'s empty mesh-window check) — never a
+                    // demotion, and never fed to `observe_members` either.
+                    fatal!(
+                        label,
+                        reason = "valset_read_empty",
+                        "committed valset query returned an empty set — an \
+                         unreadable valset must never read as an observation \
+                         of an empty one"
+                    );
+                }
+                Ok(members_raw) => {
+                    *valset_read_failed_checks = 0;
+                    let observed: Vec<ed25519::PublicKey> = members_raw
+                        .iter()
+                        .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+                        .collect();
+                    // the RESIDENT projection, read at the same frozen
+                    // point: a grant/revoke arms the same single cutover
+                    // slot (mesh admission is epoch-scoped).
+                    let residents_raw = read_valset_residents(node.host()).await;
+                    let observed_residents: Vec<ed25519::PublicKey> = residents_raw
+                        .iter()
+                        .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+                        .collect();
+                    let mut actions =
+                        EpochActions::new(orchestrator, engine_view, observed, observed_residents);
+                    if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
+                        tracing::info!(
+                            target: "ducktape::consensus",
+                            node = %label,
+                            observed_view = cutover.observed_view(),
+                            next_epoch = cutover.next_epoch(),
+                            cutover_view = cutover.cutover_view(),
+                            "membership change observed"
+                        );
+                        node.set_view_ceiling(cutover.cutover_view());
+                    }
+                    if let Some(plan) = actions.respawn() {
+                        let members = plan.valset().consensus_members();
+                        let member_bytes: Vec<Vec<u8>> =
+                            members.iter().map(|k| k.as_ref().to_vec()).collect();
+                        let plan_residents: Vec<ed25519::PublicKey> = plan
+                            .valset()
+                            .transport_members()
+                            .difference(members)
+                            .cloned()
+                            .collect();
+                        let plan_resident_bytes: Vec<Vec<u8>> =
+                            plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
+                        // no mesh track here: the TRANSPORT union was already
+                        // tracked at its GENERATION index by the window sync
+                        // above, the moment the membership change committed —
+                        // CUTOVER_DELAY views before this cutover. the epoch
+                        // plane below (books, channels, engine) follows now.
+                        // the gateway plane serves (and admits) exactly
+                        // who the mesh tracks — follow the cutover.
+                        if let Some(book) = &gateway_book {
+                            book.peers()
+                                .set_peers(plan.valset().transport_members().iter());
+                        }
+                        // the media planes authenticate inbound by the same
+                        // tracked set — follow the re-track too, so a
+                        // just-added member's huddle media is admitted.
+                        if let Some(peers) = &media_peers {
+                            peers.set_peers(plan.valset().transport_members().iter());
+                        }
+                        // the blob code lane's peer book follows the same
+                        // cutover — a fetch after a membership change asks
+                        // the members that actually exist.
+                        *blob_peers.write().expect("blob peers lock") =
+                            plan.valset().transport_members().iter().cloned().collect();
+                        // the reachability plane retunnels for the new
+                        // member set the moment transport admits it —
+                        // with the epoch's resident tier as the pre-warm
+                        // standbys, so a registered joiner's tunnels
+                        // assemble ahead of its activation cutover.
+                        // cutover_app_height IS the new epoch's absolute
+                        // view at engine view 0 — the raw engine_view
+                        // here would be epoch-local, a different clock
+                        // than the ViewTicks above and the boot
+                        // Retarget's view_base.
+                        if reach_cmd.is_some() {
+                            // STAGED, not sent inline: the flush below
+                            // (every drain beat) try_sends it, so a plane
+                            // whose queue is full delays retunneling by
+                            // beats — it can never stall the cutover or
+                            // the loop.
+                            *pending_retarget = Some(reachability::MeshEpochEvent {
+                                epoch: plan.epoch(),
+                                members: members.iter().cloned().collect(),
+                                standbys: plan_residents.clone(),
+                                current_view: plan.cutover_app_height(),
+                            });
+                        }
+                        if !members.contains(&signer.public_key()) {
+                            tracing::info!(
+                                target: "ducktape::consensus",
+                                node = %label,
+                                epoch = plan.epoch(),
+                                "demoted from the validator set; halting"
+                            );
+                            std::process::exit(0);
+                        }
+                        let participants: Set<ed25519::PublicKey> =
+                            Set::try_from(members.iter().cloned().collect::<Vec<_>>())
+                                .expect("orchestrator membership has no duplicates");
+                        // a fresh epoch: new store (pins of the torn-down
+                        // epoch die with it), genesis floor.
+                        let orderer = epoch_spawner
+                            .spawn(plan.epoch(), participants, ContentStore::new(), None)
+                            .await;
+                        // the fresh engine must keep draining event-driven —
+                        // re-install the finalization delivery wake on its inbox.
+                        orderer.set_delivery_wake(delivery_wake_tx.clone());
+                        match node
+                            .cutover(
+                                orderer,
+                                plan.epoch(),
+                                plan.cutover_app_height(),
+                                &member_bytes,
+                                &plan_resident_bytes,
+                            )
+                            .await
+                        {
+                            // the accept contract crossing the boundary:
+                            // every locally-accepted op the old epoch
+                            // never resolved was re-proposed into the
+                            // new engine.
+                            Ok(carried) if carried > 0 => {
+                                // carried ops are real parked work in the fresh
+                                // engine — keep the leader-nudge escort walking them.
+                                *real_work_parked = true;
+                                tracing::info!(
+                                    target: "ducktape::consensus",
+                                    node = %label,
+                                    carried,
+                                    epoch = plan.epoch(),
+                                    "accepted ops carried across the cutover"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                fatal!(label, "{e} — halting");
+                            }
+                        }
+                        // checkpoint IMMEDIATELY: the manifest must record
+                        // the new epoch's participant set (the journal's
+                        // cutover record alone covers only the crash
+                        // window until this write lands).
+                        let pos = node.sink_mut().oplog_pos().await;
+                        let captured = Manifest::capture(
+                            node.host(),
+                            node.finalized().map(|f| f.height),
+                            orchestrator.epoch(),
+                            orchestrator.epoch_base(),
+                            participant_bytes(orchestrator),
+                            resident_bytes(orchestrator),
+                            None,
+                            pos,
+                            *next_seq,
+                        )
+                        // the replay guard rides every checkpoint (see
+                        // `recovery::Manifest::applied_frames`).
+                        .map(|m| m.with_replay_window(node.replay_window()));
+                        let post_cutover_started = context.current();
+                        match captured {
+                            Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                Ok(()) => {
+                                    *blocks_since_checkpoint = 0;
+                                    *prev_ckpt = (m.height, pos);
+                                    *last_written_root = Some(m.root_hash);
+                                }
+                                Err(e) => tracing::warn!(
+                                    target: "ducktape::recovery",
+                                    node = %label,
+                                    error = %e,
+                                    "post-cutover checkpoint write failed; the cutover journal record \
+                                     covers a restart"
+                                ),
+                            },
+                            Err(e) => tracing::warn!(
+                                target: "ducktape::recovery",
+                                node = %label,
+                                error = %e,
+                                "post-cutover checkpoint capture failed; the cutover journal record \
+                                 covers a restart"
+                            ),
+                        }
+                        // THE CUTOVER CHECKPOINT IS NOT GATED — a restart must land on
+                        // the new epoch's boundary — but it costs the loop exactly what
+                        // the periodic one does, so it is charged the same cooldown.
+                        // Otherwise the periodic branch fires immediately after it and
+                        // the node pays twice back to back.
+                        let post_cutover_cost = context
+                            .current()
+                            .duration_since(post_cutover_started)
+                            .unwrap_or_default();
+                        *checkpoint_not_before =
+                            cooldown_until(context.current(), post_cutover_cost);
+                        tracing::info!(
+                            target: "ducktape::consensus",
+                            node = %label,
+                            epoch = plan.epoch(),
+                            validators = members.len(),
+                            base_height = plan.cutover_app_height(),
+                            "cutover complete: epoch {} with {} validators",
+                            plan.epoch(),
+                            members.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        // periodic checkpoint: AFTER the orchestration step, and that order is
+        // correctness, not tidiness. The manifest records
+        // `pending_cutover_view` off the orchestrator, and a valset change
+        // drained in THIS pass arms the cutover in `observe_members` above —
+        // so a checkpoint written before it lands on the changing block's own
+        // height carrying `None`. On restart `derive_pending_boot` then has
+        // nothing to re-arm from either (its fallback scans only blocks ABOVE
+        // the manifest height, seeded with the already-changed valset root),
+        // no view ceiling is set, and the node applies the very views its
+        // peers discarded and cuts over one view late — a silent fork. The
+        // observation barrier makes that alignment exact, not unlikely: the
+        // drain breaks right after the batch that moved the valset root.
+        //
+        // Nothing here is owed to the cutover pass: the respawn branch above
+        // writes its own unconditional post-cutover manifest and zeroes
+        // `blocks_since_checkpoint`, so this branch simply does not fire on
+        // that pass.
+        //
+        // It also snapshots the in-memory cohort and
+        // prunes the op journal below the PREVIOUS checkpoint once
         // the persisted floor has passed it (pruned frames must
         // never be needed to resolve a re-reported finalization).
         // A BLOCK COUNT ALONE CANNOT EXPRESS WHAT A CHECKPOINT COSTS. 32 blocks
@@ -563,13 +1017,21 @@ impl ValidatorRuntime<'_> {
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                 pos,
                 *next_seq,
+                // the root `f.height` SEALED. the host can be AHEAD of it (a
+                // code-swap realization that stalls before applying a block
+                // still moved the registry), and a manifest labelled with this
+                // height but carrying that root is one recovery fatals on.
+                Some(f.root_hash),
                 || {
                     context
                         .current()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                 },
-            );
+            )
+            // the replay guard rides every checkpoint (see
+            // `recovery::Manifest::applied_frames`).
+            .map(|(m, cost)| (m.with_replay_window(node.replay_window()), cost));
             let captured_at = context.current();
             match captured {
                 Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {
@@ -583,26 +1045,60 @@ impl ValidatorRuntime<'_> {
                                 if prev_ckpt.0.is_none_or(|h| fc.height >= h)
                         );
                         let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
-                        if floor_passed && lease_active {
-                            // a syncer is actively pulling from this node:
-                            // pruning now would yank its boundary away and put
-                            // it on the rebootstrap treadmill. defer — the
-                            // next checkpoint prunes once the lease lapses.
-                            tracing::debug!(
-                                target: "ducktape::statesync",
-                                node = %label,
-                                reason = "sync_lease_active",
-                                "oplog prune deferred"
-                            );
-                        } else if floor_passed
-                            && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
-                        {
-                            tracing::warn!(
-                                target: "ducktape::recovery",
-                                node = %label,
-                                error = %e,
-                                "oplog prune failed"
-                            );
+                        let deferral_cap_reached = *prune_deferrals >= MAX_PRUNE_DEFERRALS;
+                        let action =
+                            decide_prune_action(floor_passed, lease_active, deferral_cap_reached);
+                        match action {
+                            PruneAction::NotDue => {}
+                            PruneAction::Deferred => {
+                                // a syncer is actively pulling from this node:
+                                // pruning now would yank its boundary away and
+                                // put it on the rebootstrap treadmill. defer —
+                                // the next checkpoint prunes once the lease
+                                // lapses, up to the deferral cap.
+                                *prune_deferrals += 1;
+                                tracing::debug!(
+                                    target: "ducktape::statesync",
+                                    node = %label,
+                                    reason = "sync_lease_active",
+                                    deferrals = *prune_deferrals,
+                                    "oplog prune deferred"
+                                );
+                            }
+                            PruneAction::Forced => {
+                                // the lease is still warm, but it has stalled
+                                // pruning for MAX_PRUNE_DEFERRALS checkpoints
+                                // running: prune anyway. an in-flight sync
+                                // below the new floor gets `RangePruned`,
+                                // which it already handles.
+                                *prune_deferrals = 0;
+                                tracing::warn!(
+                                    target: "ducktape::statesync",
+                                    node = %label,
+                                    reason = "sync_lease_deferral_cap",
+                                    cap = MAX_PRUNE_DEFERRALS,
+                                    "oplog prune forced past warm sync lease"
+                                );
+                                if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
+                                    tracing::warn!(
+                                        target: "ducktape::recovery",
+                                        node = %label,
+                                        error = %e,
+                                        "oplog prune failed"
+                                    );
+                                }
+                            }
+                            PruneAction::Clear => {
+                                *prune_deferrals = 0;
+                                if let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await {
+                                    tracing::warn!(
+                                        target: "ducktape::recovery",
+                                        node = %label,
+                                        error = %e,
+                                        "oplog prune failed"
+                                    );
+                                }
+                            }
                         }
                         *prev_ckpt = (m.height, pos);
                         let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
@@ -649,252 +1145,6 @@ impl ValidatorRuntime<'_> {
                 .duration_since(checkpoint_started)
                 .unwrap_or_default();
             *checkpoint_not_before = cooldown_until(context.current(), attempt);
-        }
-
-        // the VALSET ORCHESTRATION step: observe the finalized
-        // membership projection; a change schedules a deterministic
-        // cutover (arming the discard ceiling), and crossing the
-        // cutover view tears the engine down and respawns it over
-        // the set read AT the boundary. the observation barrier
-        // guarantees this tick's last view IS the changing block's
-        // view when membership moved.
-        if let Some(engine_view) = node.last_engine_view() {
-            // tick the reachability plane's freshness clock.
-            // engine views are EPOCH-LOCAL (they reset at every
-            // cutover), so convert to the absolute app-height
-            // clock (`epoch_base + view`) — the regime the boot
-            // Retarget's `view_base` put the plane's advert and
-            // handshake expiries in.
-            if let Some(cmd) = &reach_cmd {
-                let absolute_view = orchestrator.app_height(engine_view);
-                if last_reach_view.is_none_or(|v| v < absolute_view) {
-                    // NON-BLOCKING: the plane is not consensus. a
-                    // full command queue (a wedged or slow plane)
-                    // sheds this tick — the next drain beat carries
-                    // a fresher one — instead of stalling the loop
-                    // behind an actor that may never drain.
-                    let _ =
-                        cmd.try_send(reachability::ReachabilityCommand::ViewTick(absolute_view));
-                    *last_reach_view = Some(absolute_view);
-                }
-                // flush a staged cutover Retarget (see
-                // `pending_retarget`) — MUST eventually land, so
-                // it retries every beat rather than being shed.
-                if let Some(event) = pending_retarget.take()
-                    && let Err(tokio::sync::mpsc::error::TrySendError::Full(
-                        reachability::ReachabilityCommand::Retarget(event),
-                    )) = cmd.try_send(reachability::ReachabilityCommand::Retarget(event))
-                {
-                    *pending_retarget = Some(event);
-                }
-            }
-            // sync the mesh window at the same frozen read point: any
-            // committed membership change — a sibling member's grant, a
-            // governance leave/revoke — widens or narrows the mesh NOW, at
-            // its generation index; the epoch cutover below stays an
-            // engine/channel concern. monotonic bookkeeping makes the
-            // no-change case a silent no-op.
-            let committed_window = read_valset_mesh_window(node.host()).await;
-            mesh_window.track_new(mesh_oracle, mesh_book, &committed_window);
-            let members_raw = read_valset_members(node.host()).await;
-            let mut observed: Vec<ed25519::PublicKey> = Vec::new();
-            for key in &members_raw {
-                if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                    observed.push(pk);
-                }
-            }
-            // the RESIDENT projection, read at the same frozen
-            // point: a grant/revoke arms the same single cutover
-            // slot (mesh admission is epoch-scoped).
-            let residents_raw = read_valset_residents(node.host()).await;
-            let mut observed_residents: Vec<ed25519::PublicKey> = Vec::new();
-            for key in &residents_raw {
-                if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                    observed_residents.push(pk);
-                }
-            }
-            let mut actions =
-                EpochActions::new(orchestrator, engine_view, observed, observed_residents);
-            if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
-                tracing::info!(
-                    target: "ducktape::consensus",
-                    node = %label,
-                    observed_view = cutover.observed_view(),
-                    next_epoch = cutover.next_epoch(),
-                    cutover_view = cutover.cutover_view(),
-                    "membership change observed"
-                );
-                node.set_view_ceiling(cutover.cutover_view());
-            }
-            if let Some(plan) = actions.respawn() {
-                let members = plan.valset().consensus_members();
-                let member_bytes: Vec<Vec<u8>> =
-                    members.iter().map(|k| k.as_ref().to_vec()).collect();
-                let plan_residents: Vec<ed25519::PublicKey> = plan
-                    .valset()
-                    .transport_members()
-                    .difference(members)
-                    .cloned()
-                    .collect();
-                let plan_resident_bytes: Vec<Vec<u8>> =
-                    plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
-                // no mesh track here: the TRANSPORT union was already
-                // tracked at its GENERATION index by the window sync
-                // above, the moment the membership change committed —
-                // CUTOVER_DELAY views before this cutover. the epoch
-                // plane below (books, channels, engine) follows now.
-                // the gateway plane serves (and admits) exactly
-                // who the mesh tracks — follow the cutover.
-                if let Some(book) = &gateway_book {
-                    book.peers()
-                        .set_peers(plan.valset().transport_members().iter());
-                }
-                // the media planes authenticate inbound by the same
-                // tracked set — follow the re-track too, so a
-                // just-added member's huddle media is admitted.
-                if let Some(peers) = &media_peers {
-                    peers.set_peers(plan.valset().transport_members().iter());
-                }
-                // the blob code lane's peer book follows the same
-                // cutover — a fetch after a membership change asks
-                // the members that actually exist.
-                *blob_peers.write().expect("blob peers lock") =
-                    plan.valset().transport_members().iter().cloned().collect();
-                // the reachability plane retunnels for the new
-                // member set the moment transport admits it —
-                // with the epoch's resident tier as the pre-warm
-                // standbys, so a registered joiner's tunnels
-                // assemble ahead of its activation cutover.
-                // cutover_app_height IS the new epoch's absolute
-                // view at engine view 0 — the raw engine_view
-                // here would be epoch-local, a different clock
-                // than the ViewTicks above and the boot
-                // Retarget's view_base.
-                if reach_cmd.is_some() {
-                    // STAGED, not sent inline: the flush below
-                    // (every drain beat) try_sends it, so a plane
-                    // whose queue is full delays retunneling by
-                    // beats — it can never stall the cutover or
-                    // the loop.
-                    *pending_retarget = Some(reachability::MeshEpochEvent {
-                        epoch: plan.epoch(),
-                        members: members.iter().cloned().collect(),
-                        standbys: plan_residents.clone(),
-                        current_view: plan.cutover_app_height(),
-                    });
-                }
-                if !members.contains(&signer.public_key()) {
-                    tracing::info!(
-                        target: "ducktape::consensus",
-                        node = %label,
-                        epoch = plan.epoch(),
-                        "demoted from the validator set; halting"
-                    );
-                    std::process::exit(0);
-                }
-                let participants: Set<ed25519::PublicKey> =
-                    Set::try_from(members.iter().cloned().collect::<Vec<_>>())
-                        .expect("orchestrator membership has no duplicates");
-                // a fresh epoch: new store (pins of the torn-down
-                // epoch die with it), genesis floor.
-                let orderer = epoch_spawner
-                    .spawn(plan.epoch(), participants, ContentStore::new(), None)
-                    .await;
-                // the fresh engine must keep draining event-driven —
-                // re-install the finalization delivery wake on its inbox.
-                orderer.set_delivery_wake(delivery_wake_tx.clone());
-                match node
-                    .cutover(
-                        orderer,
-                        plan.epoch(),
-                        plan.cutover_app_height(),
-                        &member_bytes,
-                        &plan_resident_bytes,
-                    )
-                    .await
-                {
-                    // the accept contract crossing the boundary:
-                    // every locally-accepted op the old epoch
-                    // never resolved was re-proposed into the
-                    // new engine.
-                    Ok(carried) if carried > 0 => {
-                        // carried ops are real parked work in the fresh
-                        // engine — keep the leader-nudge escort walking them.
-                        *real_work_parked = true;
-                        tracing::info!(
-                            target: "ducktape::consensus",
-                            node = %label,
-                            carried,
-                            epoch = plan.epoch(),
-                            "accepted ops carried across the cutover"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        fatal!(label, "{e} — halting");
-                    }
-                }
-                // checkpoint IMMEDIATELY: the manifest must record
-                // the new epoch's participant set (the journal's
-                // cutover record alone covers only the crash
-                // window until this write lands).
-                let pos = node.sink_mut().oplog_pos().await;
-                let captured = Manifest::capture(
-                    node.host(),
-                    node.finalized().map(|f| f.height),
-                    orchestrator.epoch(),
-                    orchestrator.epoch_base(),
-                    participant_bytes(orchestrator),
-                    resident_bytes(orchestrator),
-                    None,
-                    pos,
-                    *next_seq,
-                );
-                let post_cutover_started = context.current();
-                match captured {
-                    Ok(m) => match node.sink_mut().write_manifest(&m).await {
-                        Ok(()) => {
-                            *blocks_since_checkpoint = 0;
-                            *prev_ckpt = (m.height, pos);
-                            *last_written_root = Some(m.root_hash);
-                        }
-                        Err(e) => tracing::warn!(
-                            target: "ducktape::recovery",
-                            node = %label,
-                            error = %e,
-                            "post-cutover checkpoint write failed; the cutover journal record \
-                             covers a restart"
-                        ),
-                    },
-                    Err(e) => tracing::warn!(
-                        target: "ducktape::recovery",
-                        node = %label,
-                        error = %e,
-                        "post-cutover checkpoint capture failed; the cutover journal record \
-                         covers a restart"
-                    ),
-                }
-                // THE CUTOVER CHECKPOINT IS NOT GATED — a restart must land on
-                // the new epoch's boundary — but it costs the loop exactly what
-                // the periodic one does, so it is charged the same cooldown.
-                // Otherwise the periodic branch fires immediately after it and
-                // the node pays twice back to back.
-                let post_cutover_cost = context
-                    .current()
-                    .duration_since(post_cutover_started)
-                    .unwrap_or_default();
-                *checkpoint_not_before = cooldown_until(context.current(), post_cutover_cost);
-                tracing::info!(
-                    target: "ducktape::consensus",
-                    node = %label,
-                    epoch = plan.epoch(),
-                    validators = members.len(),
-                    base_height = plan.cutover_app_height(),
-                    "cutover complete: epoch {} with {} validators",
-                    plan.epoch(),
-                    members.len()
-                );
-            }
         }
 
         // the state-driven pumps, each its own method below: block
@@ -1223,22 +1473,42 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             code_signaller,
+            index,
             blob_client,
             blobs,
+            code_registry,
             fetch_done_tx,
             fetch_done_rx,
             ..
         } = self;
-        // reap finished fetch tasks first, so a failed fetch retries.
-        while let Ok(digest) = fetch_done_rx.try_recv() {
-            code_signaller.fetching.remove(&digest);
+        // reap finished fetch tasks first, so a failed fetch retries — on a
+        // BACKOFF, and speaking only on the first failure and every Nth after
+        // it. Nobody serving these bytes is the steady state, not a blip: the
+        // peer book may be empty (refused synchronously) and the module never
+        // clears a pending swap, so an unpaced retry+warn here is a permanent
+        // ~10/s log bomb that evicts the ring an operator restarted to read.
+        // The warn lives HERE rather than in the task because this is where
+        // the attempt counter — the actual diagnosis — is.
+        while let Ok((digest, failure)) = fetch_done_rx.try_recv() {
+            let Some(error) = failure else {
+                code_signaller.fetch_succeeded(&digest);
+                continue;
+            };
+            let attempt = code_signaller.fetch_failed(&digest);
+            if !attempt.speak {
+                continue;
+            }
+            tracing::warn!(
+                target: "ducktape::modules",
+                node = %label,
+                reason = "code_fetch_unserved",
+                digest = %crate::config::hex_bytes(&digest),
+                attempts = attempt.attempts,
+                error = %error,
+                "pending-swap code fetch failed"
+            );
         }
-        if !orchestrator
-            .current_members()
-            .contains(&signer.public_key())
-        {
-            return;
-        }
+        code_signaller.tick_fetch_backoff();
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
@@ -1247,6 +1517,21 @@ impl ValidatorRuntime<'_> {
         else {
             return;
         };
+        // the code plane's push admission gate reads THIS set (#1833): a
+        // digest nothing here names any more is refused before any staging.
+        // reclaim rides the same registry-change point — whatever fell out
+        // (a cancelled/replaced swap, or a module's `code_hash` that moved
+        // on) is forgotten, so an unreferenced blob does not outlive the
+        // registry entry that once justified it.
+        for digest in code_registry.update(crate::code_plane::code_blobs_referenced(&modules)) {
+            blobs.forget(&digest);
+        }
+        if !orchestrator
+            .current_members()
+            .contains(&signer.public_key())
+        {
+            return;
+        }
         // residency is a VERIFYING read (content re-hashed on the disk path)
         // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
         // == committed hash AND "this binary can instantiate them" AND "this
@@ -1264,13 +1549,16 @@ impl ValidatorRuntime<'_> {
         // per pending swap per boot — `decide` latches the verdict, loadable
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
-        let actions = code_signaller.decide(&modules, |module_id, digest| {
+        let height = node.finalized().map_or(0, |f| f.height);
+        let actions = code_signaller.decide(height, &modules, |module_id, digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            let realizable = wasm_host::WasmModule::declared_shape(&bytes)
-                .map_err(|e| e.to_string())
-                .and_then(|shape| noded::compose::check_realizable(module_id, &shape));
+            let realizable = noded::compose::validate_deployment(module_id, &bytes, index)
+                .and_then(|()| {
+                    node.check_module_replacement(module_id, &bytes)
+                        .map_err(|error| error.to_string())
+                });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line
@@ -1297,9 +1585,10 @@ impl ValidatorRuntime<'_> {
             let client = blob_client.clone();
             let blobs = blobs.clone();
             let done = fetch_done_tx.clone();
-            let label = label.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::blob_fetch::fetch_blob(
+                // the OUTCOME goes back to the pump, which owns the attempt
+                // counter, the backoff and the (latched) warning.
+                let failure = crate::blob_fetch::fetch_blob(
                     &client,
                     &blobs,
                     &digest,
@@ -1307,16 +1596,8 @@ impl ValidatorRuntime<'_> {
                     crate::constants::BLOB_FETCH_ATTEMPTS,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        digest = %crate::config::hex_bytes(&digest),
-                        error = %e,
-                        "pending-swap code fetch failed"
-                    );
-                }
-                let _ = done.send(digest);
+                .err();
+                let _ = done.send((digest, failure));
             });
         }
         for (key, msg) in actions.signals {
@@ -1562,6 +1843,59 @@ pub(crate) async fn saga_next_expiry(host: &host::Host) -> Option<u64> {
 }
 
 #[cfg(test)]
+mod prune_cadence_tests {
+    use super::{MAX_PRUNE_DEFERRALS, PruneAction, decide_prune_action};
+
+    /// no floor, no lease warmth, no cap ever overrides "nothing to prune yet".
+    #[test]
+    fn floor_not_passed_never_prunes() {
+        assert_eq!(decide_prune_action(false, true, true), PruneAction::NotDue);
+        assert_eq!(
+            decide_prune_action(false, false, false),
+            PruneAction::NotDue
+        );
+    }
+
+    /// a cold lease prunes normally once the floor has passed, regardless of
+    /// a stale deferral count.
+    #[test]
+    fn cold_lease_prunes_once_the_floor_passes() {
+        assert_eq!(decide_prune_action(true, false, false), PruneAction::Clear);
+        assert_eq!(decide_prune_action(true, false, true), PruneAction::Clear);
+    }
+
+    /// #1814: a warm lease defers for up to `MAX_PRUNE_DEFERRALS` consecutive
+    /// checkpoints, then the 4th checkpoint prunes anyway — the counter never
+    /// suspends retention forever.
+    #[test]
+    fn a_warm_lease_defers_up_to_the_cap_then_prunes_on_the_next_checkpoint() {
+        let mut prune_deferrals: u32 = 0;
+        let mut actions = Vec::new();
+        // four consecutive checkpoints, all under a floor that has passed and
+        // a lease that never lapses.
+        for _ in 0..4 {
+            let deferral_cap_reached = prune_deferrals >= MAX_PRUNE_DEFERRALS;
+            let action = decide_prune_action(true, true, deferral_cap_reached);
+            match action {
+                PruneAction::Deferred => prune_deferrals += 1,
+                PruneAction::Forced | PruneAction::Clear => prune_deferrals = 0,
+                PruneAction::NotDue => {}
+            }
+            actions.push(action);
+        }
+        assert_eq!(
+            actions,
+            vec![
+                PruneAction::Deferred,
+                PruneAction::Deferred,
+                PruneAction::Deferred,
+                PruneAction::Forced,
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod block_cadence_tests {
     use super::{HeartbeatAction, eager_flush_due, heartbeat_action};
 
@@ -1756,5 +2090,36 @@ mod block_cadence_tests {
                 }
             }
         }
+    }
+}
+
+/// The one ordering in `drain_pass` that is correctness rather than taste,
+/// guarded at the source.
+#[cfg(test)]
+mod drain_order_lint {
+    /// A CHECKPOINT MUST NOT BE CAPTURED BEFORE THE PASS HAS OBSERVED THE
+    /// MEMBERSHIP IT IS RECORDING. `Manifest::capture_timed` writes
+    /// `pending_cutover_view` off the orchestrator, and a valset change drained
+    /// in this pass arms that cutover in `observe_members`. Captured first, a
+    /// checkpoint landing on the changing block's own height records `None`,
+    /// and the boot-time re-arm scan cannot see the change either (it reads
+    /// only blocks above the manifest height, seeded with the already-changed
+    /// valset root) — so the restart arms no ceiling, applies the views its
+    /// peers discarded, and cuts over one view late into a silent fork.
+    #[test]
+    fn the_periodic_checkpoint_is_captured_after_the_membership_observation() {
+        let src = include_str!("drain.rs");
+        let observed = src
+            .find("actions.observe_members()")
+            .expect("the drain observes membership");
+        let captured = src
+            .find("Manifest::capture_timed")
+            .expect("the drain captures a periodic checkpoint");
+        assert!(
+            observed < captured,
+            "the periodic checkpoint must be captured AFTER the valset \
+             orchestration step, or a checkpoint on a valset-changing block \
+             loses the cutover it armed"
+        );
     }
 }

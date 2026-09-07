@@ -1,5 +1,5 @@
 use super::*;
-use agent::{ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED};
+use crate::{ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED};
 use pages::PageMsg;
 
 fn page_trigger_thread() -> pages::ThreadView {
@@ -7,7 +7,7 @@ fn page_trigger_thread() -> pages::ThreadView {
         thread: pages::Thread {
             id: "thread-1".into(),
             target: "b-p".into(),
-            opener: pages::AuthorRef::User(vec![4; 32]),
+            opener: pages::Party::Key(vec![4; 32]),
             created_at: 1,
             anchor: None,
             resolved: false,
@@ -15,9 +15,10 @@ fn page_trigger_thread() -> pages::ThreadView {
             comment_ids: vec!["comment-1".into()],
         },
         comments: vec![pages::Comment {
+            mentions: vec![2],
             id: "comment-1".into(),
             thread_id: "thread-1".into(),
-            author: pages::AuthorRef::User(vec![4; 32]),
+            author: pages::Party::Key(vec![4; 32]),
             text: "@bot review".into(),
             created_at: 1,
             edited_at: None,
@@ -34,21 +35,27 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
         .with_files_module("files")
         .with_pages_module("pages");
     let mut engage_ctx = CaptureCtx::new()
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_page("p1", page_blocks("p1", "Spec"))
         .with_page_thread(page_trigger_thread());
-    let engagement = Msg {
-        target: "runs".into(),
-        payload: tagging_encode_event(&EngagementEvent {
-            source: "pages".into(),
-            container: "thread-1".into(),
-            content_seq: 1,
-            author: Author::User(vec![4; 32]),
-            tags: vec![agent_tag("bot")],
-        }),
-    };
-    exec(&mut m, &mut engage_ctx, &engagement).unwrap();
+    m.models = registry.clone();
+    let run_id = page_run_id_for("thread-1", 1, "bot");
+    let budget = SiblingReadBudget::default();
+    let model = registry.get("bot").unwrap();
+    let prepared =
+        block_on(m.prepare_page_dispatch(&engage_ctx, model, &run_id, "thread-1", 1, &budget))
+            .unwrap();
+    m.stage_dispatch_run(
+        &mut engage_ctx,
+        &run_id,
+        "bot".into(),
+        page_channel_id("thread-1"),
+        1,
+        RunOrigin::Program(2),
+        prepared,
+        BTreeMap::new(),
+    );
     commit(&mut m);
 
     let run_id = page_run_id_for("thread-1", 1, "bot");
@@ -76,7 +83,6 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
         text,
         anchor,
         mentions,
-        as_agent,
         ..
     } = &replies[0]
     else {
@@ -87,7 +93,42 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
     assert_eq!(text, "Reviewed.");
     assert!(mentions.is_empty());
     assert!(anchor.is_none());
-    assert_eq!(as_agent.as_deref(), Some("bot"));
+}
+
+#[test]
+fn inline_page_composer_keeps_the_exact_source_when_page_context_is_bounded() {
+    let registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    let model = registry.get("bot").unwrap();
+    let mut module = module().with_pages_module("pages");
+    module.models = registry.clone();
+    let mut blocks = page_with_block_count(1024, &"x".repeat(4096));
+    let target = blocks.last_mut().unwrap();
+    target.text = "Review this exact final block".into();
+    let target_id = target.id.clone();
+    let ctx = CaptureCtx::new()
+        .with_program_origin()
+        .with_registry(&registry)
+        .with_page("plan", blocks);
+    let prepared = block_on(module.prepare_page_block_dispatch(
+        &ctx,
+        model,
+        "inline-run",
+        &target_id,
+        &SiblingReadBudget::default(),
+    ))
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = payload["context"].as_str().unwrap();
+    assert!(context.len() <= inject::PAGE_CONTEXT_BYTES);
+    assert!(context.contains("page context truncated at 64 KiB"));
+    let conversation = payload["conversation"].as_str().unwrap();
+    assert!(conversation.contains(&target_id));
+    assert!(conversation.contains("Review this exact final block"));
+    assert_eq!(
+        ctx.page_query_count(),
+        1,
+        "composition stops when its context is full"
+    );
 }
 
 // ---- the pages effects lane (M2) ---------------------------------------------
@@ -100,8 +141,8 @@ fn awaiting_pages_run(actions: &[&str], caps: &[&str]) -> (RunsModule, Registry,
     let mut registry = registry(&[("bot", actions)]);
     registry.get_mut("bot").unwrap().caps.pages_write =
         caps.iter().map(|s| s.to_string()).collect();
-    let mut m = watched(TurnPolicy::All, &registry).with_pages_module("pages");
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry).with_pages_module("pages");
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     (m, registry, run_id_for("general", 2, "bot"))
 }
@@ -144,7 +185,11 @@ fn assert_delivered(m: &mut RunsModule, run_id: &str) {
         .into_iter()
         .find(|r| r.run_id == run_id)
         .expect("a terminal record");
-    assert_eq!(record.outcome, RunOutcome::Delivered, "the run delivers");
+    assert_eq!(
+        record.outcome,
+        RunOutcome::ResultAccepted,
+        "the run delivers"
+    );
 }
 
 #[test]
@@ -165,7 +210,6 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
         text,
         anchor,
         mentions,
-        as_agent,
     } = &msgs[0]
     else {
         panic!("expected AddComment, got {:?}", msgs[0]);
@@ -180,11 +224,6 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
     assert_eq!(text, "looks good");
     assert!(anchor.is_none());
     assert!(mentions.is_empty());
-    assert_eq!(
-        as_agent.as_deref(),
-        Some("bot"),
-        "the comment is agent-attributed"
-    );
     assert_delivered(&mut m, &run_id);
 }
 
@@ -320,7 +359,7 @@ fn set_checked_requires_a_todo_block_and_carries_no_attribution() {
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], PageMsg::SetChecked { block_id, checked: true } if block_id == "b-t"),
-        "SetChecked carries no as_agent — origin-gated only: {:?}",
+        "SetChecked prepares the selected block operation: {:?}",
         msgs[0]
     );
     assert!(
@@ -423,22 +462,11 @@ fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
     let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
     registry.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
     let mut m = module().with_pages_module("pages");
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(&registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: channel.clone(),
-            policy: TurnPolicy::All,
-        }),
-    )
-    .unwrap();
+    m.models = registry.clone();
     commit(&mut m);
     let mut ctx = CaptureCtx::new()
         .at(2)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript(&channel, transcript(2));
     exec(&mut m, &mut ctx, &engagement(&channel, 2, vec![])).unwrap();
@@ -488,8 +516,8 @@ fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
         r.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
         r
     };
-    let mut m = watched(TurnPolicy::All, &registry);
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry);
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
     let mut ctx = delivery_ctx(&registry);

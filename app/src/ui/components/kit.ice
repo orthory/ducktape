@@ -445,7 +445,7 @@ component RoleMarker(role:str)
               font=code_semibold
               @text-warning
 
-// An agent registry row: who it is, what capability it holds, who owns it, and
+// A Runs model row: who it is, what capability it holds, who owns it, and
 // whether it is live. The artifact lists agents — it does not card them.
 component AgentCard(agent:AgentRow)
   col #root w=fill
@@ -965,16 +965,16 @@ component BellBody(item:BellItem)
     // state instead says the same blue for a failure and a mention. Read vs
     // unread is the plate and the pulse; the hue is the severity either way.
     if item.read
-      StillDot plate=7.0 tone=bell_severity(item.kind)
+      StillDot plate=7.0 tone=bell_severity(item.reason)
     if !item.read
-      PulseDot plate=7.0 tone=bell_severity(item.kind)
+      PulseDot plate=7.0 tone=bell_severity(item.reason)
     col w=fill gap=3.0
       row
         with
           w=fill
           gap=7.0
           align=center
-        text bell_title(item.kind)
+        text bell_title(item.reason)
           with
             w=fill
             size=12.0
@@ -1001,7 +1001,7 @@ component BellBody(item:BellItem)
               wrap=none
               font=code_semibold
               @text-info
-      text item.body
+      text bell_detail(item)
         with
           w=fill
           size=12.0

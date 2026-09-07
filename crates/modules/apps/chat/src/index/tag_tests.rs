@@ -20,6 +20,8 @@ fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
     match msg {
         ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
             seq: read_u64(map, &seq_key(channel_id)) + 1,
+            actor: crate::Party::Key(b"jess".to_vec()),
+            key_mentions: Vec::new(),
         }),
         ChatMsg::EditMessage {
             channel_id, seq, ..
@@ -27,9 +29,22 @@ fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
             let row = read_row(map, &msg_key(channel_id, *seq))
                 .expect("row reads")
                 .expect("edited row exists");
-            encode_assigned(&ChatAssigned::Edited { rev: row.rev + 1 })
+            encode_assigned(&ChatAssigned::Edited {
+                rev: row.rev + 1,
+                actor: crate::Party::Key(b"jess".to_vec()),
+                key_mentions: Vec::new(),
+            })
         }
-        _ => Vec::new(),
+        ChatMsg::AddReaction { .. }
+        | ChatMsg::RemoveReaction { .. }
+        | ChatMsg::JoinHuddle { .. }
+        | ChatMsg::LeaveHuddle { .. } => encode_assigned(&ChatAssigned::Participant {
+            actor: crate::Party::Key(b"jess".to_vec()),
+            participant: crate::Party::Key(b"jess".to_vec()),
+        }),
+        _ => encode_assigned(&ChatAssigned::Actor {
+            actor: crate::Party::Key(b"jess".to_vec()),
+        }),
     }
 }
 
@@ -50,7 +65,6 @@ fn post(channel: &str, id: &str, text: &str) -> ChatMsg {
         message_id: id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
-        as_agent: None,
     }
 }
 
@@ -201,7 +215,6 @@ fn code_blocks_and_link_spans_do_not_index_tags() {
                 Block::paragraph("#yes"),
             ],
             thread: None,
-            as_agent: None,
         },
     );
 

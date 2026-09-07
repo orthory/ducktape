@@ -218,7 +218,7 @@ on account_probed(next)
     AccountProbe.found
       task window open console -> console_opened _
     AccountProbe.missing
-      network_name = network_label(account_name, rpc)
+      network_name = network_label(hub_chain_id, rpc)
       ceremony_phase = ""
       ceremony_qr = ""
       ceremony_detail = ""
@@ -369,7 +369,10 @@ on console_opened(id)
   status = "Connecting…"
   error = ""
   connected_rpc = rpc
-  network_name = network_label(account_name, connected_rpc)
+  // Which chain this endpoint serves is the NODE's answer (`node_facts_loaded`);
+  // the previous connection's is not it. Until it lands the title is the host.
+  network_chain_id = ""
+  network_name = network_label(network_chain_id, connected_rpc)
   hydration_generation = hydration_generation + 1
   connect_generation = connect_generation + 1
   hydration_retry_attempt = 0

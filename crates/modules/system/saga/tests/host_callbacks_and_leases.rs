@@ -315,7 +315,11 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
         // three (genesis-seeded) validators; the saga module assigns each
         // attempt over the valset and enforces the lease strictly.
         let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
-        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+        let mut valset = Valset::new(
+            "valset",
+            Box::new(sdk_testkit::MemStore::new()),
+            "governance",
+        );
         for key in &keys {
             valset.seed(key.clone()).await.expect("seed valset");
         }

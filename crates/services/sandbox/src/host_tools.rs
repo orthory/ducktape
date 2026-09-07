@@ -1,9 +1,9 @@
 //! finding the host binaries the sandbox shells out to.
 //!
-//! `PATH` alone is not enough for an unprivileged process: `nft` ships in
-//! `/usr/sbin` and `mke2fs` in `/sbin`, neither of which a non-root login shell
-//! usually carries. A probe that only walked `PATH` would refuse a host that
-//! can in fact run everything.
+//! `PATH` alone is not enough for an unprivileged process: `mke2fs` ships in
+//! `/sbin` and `debugfs` in `/usr/sbin`, neither of which a non-root login
+//! shell usually carries. A probe that only walked `PATH` would refuse a host
+//! that can in fact run everything.
 
 use std::path::{Path, PathBuf};
 
@@ -65,12 +65,12 @@ mod tests {
 
     #[test]
     fn a_tool_only_in_sbin_is_still_found() {
-        // `nft` is the canonical case: /usr/sbin on every distro, and absent
-        // from an unprivileged PATH.
-        let on_path = find_on_path("nft");
-        let anywhere = find_system_tool("nft");
+        // `debugfs` is the canonical case: /usr/sbin on every distro, and
+        // absent from an unprivileged PATH.
+        let on_path = find_on_path("debugfs");
+        let anywhere = find_system_tool("debugfs");
         if anywhere.is_none() {
-            return; // host without nftables; nothing to assert
+            return; // host without e2fsprogs; nothing to assert
         }
         assert!(
             anywhere.is_some(),

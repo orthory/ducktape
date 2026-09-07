@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "ab_glyph"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "owned_ttf_parser",
+]
+
+[[package]]
+name = "ab_glyph_rasterizer"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,8 +114,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-cryptography",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -158,18 +174,19 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
- "capability",
  "commonware-runtime",
- "duckdns",
+ "dispatch 0.1.0",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
- "saga",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "statesync",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -711,6 +728,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "attribution"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "commonware-runtime",
+ "ducktape-module-sdk",
+ "futures",
+ "identity",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "serde_json",
+ "statesync",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "authpage"
 version = "0.1.0"
 dependencies = [
@@ -737,13 +772,14 @@ name = "automations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
  "chat",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
- "inbox",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1224,6 +1260,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "calloop"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
+dependencies = [
+ "bitflags 2.13.0",
+ "polling",
+ "rustix 1.1.4",
+ "slab",
+ "tracing",
+]
+
+[[package]]
+name = "calloop-wayland-source"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95a66a987056935f7efce4ab5668920b5d0dac4a7c99991a67395f13702ddd20"
+dependencies = [
+ "calloop 0.13.0",
+ "rustix 0.38.44",
+ "wayland-backend",
+ "wayland-client",
+]
+
+[[package]]
+name = "calloop-wayland-source"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "138efcf0940a02ebf0cc8d1eff41a1682a46b431630f4c52450d6265876021fa"
+dependencies = [
+ "calloop 0.14.4",
+ "rustix 1.1.4",
+ "wayland-backend",
+ "wayland-client",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1239,8 +1312,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1375,17 +1448,23 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
+ "borsh",
+ "commonware-cryptography",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
+ "futures",
  "host",
+ "identity",
  "index-guest",
+ "keyscheme",
+ "pages",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tempfile",
  "unicode-normalization",
 ]
@@ -1518,6 +1597,15 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "clipboard_wayland"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "003f886bc4e2987729d10c1db3424e7f80809f3fc22dbc16c685738887cb37b8"
+dependencies = [
+ "smithay-clipboard",
 ]
 
 [[package]]
@@ -2005,13 +2093,13 @@ dependencies = [
 name = "compute-service"
 version = "0.1.0"
 dependencies = [
- "agent",
  "async-trait",
  "dispatch 0.1.0",
  "futures",
  "host",
  "provider-host",
  "run-envelope",
+ "runs",
  "saga",
  "sdk",
  "serde",
@@ -2600,9 +2688,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-queue"
-version = "0.3.13"
+version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2619,9 +2707,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.22"
+version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crunchy"
@@ -3067,8 +3155,8 @@ name = "directory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -3113,15 +3201,18 @@ name = "dispatch"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
+ "identity",
  "saga",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "statesync",
 ]
 
@@ -3171,6 +3262,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "downcast-rs"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3215,6 +3312,7 @@ dependencies = [
  "files",
  "futures",
  "glob",
+ "percent-encoding",
  "reqwest 0.12.28",
  "sdk",
  "sdk-testkit",
@@ -3259,6 +3357,7 @@ dependencies = [
  "cpal",
  "design",
  "dispatch 0.1.0",
+ "duckfs-core",
  "ducktape-home",
  "ducktape-rpc",
  "forge",
@@ -3284,6 +3383,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",
+ "runs",
  "saga",
  "sdk",
  "serde",
@@ -3308,6 +3408,16 @@ dependencies = [
 [[package]]
 name = "ducktape-home"
 version = "0.1.0"
+
+[[package]]
+name = "ducktape-module-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "duckfs-core",
+ "sdk",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "ducktape-rpc"
@@ -3607,12 +3717,15 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "base64 0.22.1",
+ "commonware-cryptography",
  "duckfs-core",
  "duckfs-disk",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde_json",
@@ -3815,13 +3928,14 @@ name = "forge"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "base64 0.22.1",
  "blobstore",
  "chat",
+ "ducktape-module-sdk",
  "forge",
  "futures",
  "git2",
- "guest-adapter",
  "host",
  "identity",
  "keyscheme",
@@ -4004,8 +4118,8 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "duckdns",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "identity",
  "sdk",
  "sdk-testkit",
@@ -4202,8 +4316,8 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "modules",
@@ -4318,16 +4432,6 @@ dependencies = [
  "ff 0.14.0",
  "rand_core 0.10.1",
  "subtle",
-]
-
-[[package]]
-name = "guest-adapter"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "duckfs-core",
- "sdk",
- "wit-bindgen",
 ]
 
 [[package]]
@@ -4583,9 +4687,11 @@ dependencies = [
  "acl",
  "agent",
  "async-trait",
+ "attribution",
  "automations",
  "base64 0.22.1",
  "blobstore",
+ "borsh",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -4601,8 +4707,10 @@ dependencies = [
  "greeter",
  "identity",
  "inbox",
+ "index-guest",
  "keyscheme",
  "kv",
+ "module-artifact",
  "modules",
  "p256 0.13.2",
  "pages",
@@ -4613,7 +4721,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tracing",
@@ -5066,8 +5173,8 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "k256",
  "keyscheme",
  "p256 0.13.2",
@@ -5149,11 +5256,12 @@ name = "inbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
- "host",
+ "identity",
  "inbox",
  "index-guest",
  "sdk",
@@ -5186,6 +5294,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "wasmtime",
 ]
 
 [[package]]
@@ -5505,6 +5614,7 @@ dependencies = [
  "ducktape-home",
  "rand 0.8.6",
  "tempfile",
+ "tracing",
  "zeroize",
 ]
 
@@ -5567,7 +5677,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "sdk",
  "sdk-testkit",
@@ -5856,6 +5966,7 @@ version = "0.1.0"
 dependencies = [
  "data-plane",
  "opus-rs",
+ "rand 0.8.6",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5967,12 +6078,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-artifact"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "modules"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
  "sdk",
  "sdk-testkit",
@@ -6108,11 +6228,13 @@ name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "blake3",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "crossbeam-channel",
  "lru 0.18.1",
+ "rand 0.8.6",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
@@ -6245,10 +6367,12 @@ dependencies = [
  "keyscheme",
  "kv",
  "libc",
+ "modules",
  "node",
  "saga",
  "sdk",
  "sdk-testkit",
+ "sha2 0.10.9",
  "statesync",
  "tempfile",
  "thiserror 2.0.18",
@@ -6268,6 +6392,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
+ "attribution",
  "authpage",
  "axum",
  "base64 0.22.1",
@@ -6309,6 +6434,7 @@ dependencies = [
  "kv",
  "libc",
  "media-service",
+ "module-artifact",
  "modules",
  "nat-traversal",
  "nettest",
@@ -6330,7 +6456,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -6356,11 +6481,13 @@ dependencies = [
  "agent",
  "agent-service",
  "async-trait",
+ "attribution",
  "axum",
  "base64 0.22.1",
  "blobstore",
  "borsh",
  "bytes",
+ "capability",
  "chat",
  "commonware-codec",
  "commonware-cryptography",
@@ -6382,6 +6509,7 @@ dependencies = [
  "keyscheme",
  "kv",
  "media-service",
+ "module-artifact",
  "modules",
  "nettest",
  "node",
@@ -6396,7 +6524,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -6415,10 +6542,11 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "async-trait",
+ "attribution",
  "base64 0.22.1",
  "commonware-runtime",
- "dispatch 0.1.0",
  "duckfs-client",
  "futures",
  "git2",
@@ -6427,8 +6555,6 @@ dependencies = [
  "nettest",
  "node",
  "noded",
- "runs",
- "saga",
  "sdk",
  "serde_json",
  "sha2 0.10.9",
@@ -7208,6 +7334,8 @@ name = "overlay-net"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake2",
+ "chacha20poly1305 0.10.1",
  "commonware-runtime",
  "data-plane",
  "defguard_boringtun",
@@ -7217,6 +7345,15 @@ dependencies = [
  "tokio",
  "tracing",
  "wireguard",
+]
+
+[[package]]
+name = "owned_ttf_parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]
@@ -7271,9 +7408,11 @@ name = "pages"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -7281,7 +7420,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tempfile",
  "tokio",
 ]
@@ -8555,15 +8693,19 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "async-trait",
+ "attribution",
  "base64 0.22.1",
+ "borsh",
+ "capability",
  "chat",
  "commonware-runtime",
  "dispatch 0.1.0",
+ "ducktape-module-sdk",
  "files",
  "forge",
  "futures",
- "guest-adapter",
  "host",
+ "identity",
  "pages",
  "saga",
  "sdk",
@@ -8572,8 +8714,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
+ "valset",
 ]
 
 [[package]]
@@ -8754,8 +8896,8 @@ dependencies = [
  "borsh",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "index-guest",
  "sdk",
@@ -8823,6 +8965,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8849,10 +8997,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sctk-adwaita"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6277f0217056f77f1d8f49f2950ac6c278c0d607c45f5ee99328d792ede24ec"
+dependencies = [
+ "ab_glyph",
+ "log",
+ "memmap2",
+ "smithay-client-toolkit 0.19.2",
+ "tiny-skia",
+]
+
+[[package]]
 name = "sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9308,6 +9470,69 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
 
 [[package]]
+name = "smithay-client-toolkit"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3457dea1f0eb631b4034d61d4d8c32074caa6cd1ab2d59f2327bd8461e2c0016"
+dependencies = [
+ "bitflags 2.13.0",
+ "calloop 0.13.0",
+ "calloop-wayland-source 0.3.0",
+ "cursor-icon",
+ "libc",
+ "log",
+ "memmap2",
+ "rustix 0.38.44",
+ "thiserror 1.0.69",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-csd-frame",
+ "wayland-cursor",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "xkeysym",
+]
+
+[[package]]
+name = "smithay-client-toolkit"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0512da38f5e2b31201a93524adb8d3136276fa4fe4aafab4e1f727a82b534cc0"
+dependencies = [
+ "bitflags 2.13.0",
+ "calloop 0.14.4",
+ "calloop-wayland-source 0.4.1",
+ "cursor-icon",
+ "libc",
+ "log",
+ "memmap2",
+ "rustix 1.1.4",
+ "thiserror 2.0.18",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-csd-frame",
+ "wayland-cursor",
+ "wayland-protocols",
+ "wayland-protocols-experimental",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "xkeysym",
+]
+
+[[package]]
+name = "smithay-clipboard"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71704c03f739f7745053bde45fa203a46c58d25bc5c4efba1d9a60e9dba81226"
+dependencies = [
+ "libc",
+ "smithay-client-toolkit 0.20.0",
+ "wayland-backend",
+]
+
+[[package]]
 name = "smol_str"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9350,6 +9575,7 @@ dependencies = [
  "bytemuck",
  "fastrand",
  "js-sys",
+ "memmap2",
  "ndk 0.9.0",
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -9362,6 +9588,9 @@ dependencies = [
  "tiny-xlib",
  "tracing",
  "wasm-bindgen",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-sys",
  "web-sys",
  "windows-sys 0.61.2",
  "x11rb",
@@ -9466,6 +9695,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9631,22 +9861,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tagging"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "futures",
- "guest-adapter",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "statesync",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9669,10 +9883,12 @@ name = "tasks"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -10771,6 +10987,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
  "sdk",
  "sdk-testkit",
@@ -10951,6 +11168,7 @@ name = "wasm-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "module-artifact",
  "sdk",
  "sdk-testkit",
  "sha2 0.10.9",
@@ -11307,6 +11525,141 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayland-backend"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
+dependencies = [
+ "cc",
+ "downcast-rs",
+ "rustix 1.1.4",
+ "scoped-tls",
+ "smallvec",
+ "wayland-sys",
+]
+
+[[package]]
+name = "wayland-client"
+version = "0.31.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
+dependencies = [
+ "bitflags 2.13.0",
+ "rustix 1.1.4",
+ "wayland-backend",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-csd-frame"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625c5029dbd43d25e6aa9615e88b829a5cad13b2819c4ae129fdbb7c31ab4c7e"
+dependencies = [
+ "bitflags 2.13.0",
+ "cursor-icon",
+ "wayland-backend",
+]
+
+[[package]]
+name = "wayland-cursor"
+version = "0.31.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
+dependencies = [
+ "rustix 1.1.4",
+ "wayland-client",
+ "xcursor",
+]
+
+[[package]]
+name = "wayland-protocols"
+version = "0.32.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
+dependencies = [
+ "bitflags 2.13.0",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-experimental"
+version = "20250721.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40a1f863128dcaaec790d7b4b396cc9b9a7a079e878e18c47e6c2d2c5a8dcbb1"
+dependencies = [
+ "bitflags 2.13.0",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-misc"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e9567599ef23e09b8dad6e429e5738d4509dfc46b3b21f32841a304d16b29c8"
+dependencies = [
+ "bitflags 2.13.0",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-plasma"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91"
+dependencies = [
+ "bitflags 2.13.0",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols-wlr"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
+dependencies = [
+ "bitflags 2.13.0",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-scanner"
+version = "0.31.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
+dependencies = [
+ "proc-macro2",
+ "quick-xml",
+ "quote",
+]
+
+[[package]]
+name = "wayland-sys"
+version = "0.31.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
+dependencies = [
+ "dlib",
+ "log",
+ "once_cell",
+ "pkg-config",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11567,6 +11920,7 @@ checksum = "d5654226305eaf2dde8853fb482861d28e5dcecbbd40cb88e8393d94bb80d733"
 dependencies = [
  "clipboard-win",
  "clipboard_macos",
+ "clipboard_wayland",
  "clipboard_x11",
  "raw-window-handle",
  "thiserror 2.0.18",
@@ -11949,12 +12303,13 @@ version = "0.30.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
 dependencies = [
+ "ahash",
  "android-activity",
  "atomic-waker",
  "bitflags 2.13.0",
  "block2 0.5.1",
  "bytemuck",
- "calloop",
+ "calloop 0.13.0",
  "cfg_aliases",
  "concurrent-queue",
  "core-foundation 0.9.4",
@@ -11963,6 +12318,7 @@ dependencies = [
  "dpi",
  "js-sys",
  "libc",
+ "memmap2",
  "ndk 0.9.0",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -11974,11 +12330,17 @@ dependencies = [
  "raw-window-handle",
  "redox_syscall 0.4.1",
  "rustix 0.38.44",
+ "sctk-adwaita",
+ "smithay-client-toolkit 0.19.2",
  "smol_str",
  "tracing",
  "unicode-segmentation",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-plasma",
  "web-sys",
  "web-time",
  "windows-sys 0.52.0",
@@ -12155,6 +12517,7 @@ dependencies = [
  "ducktape-home",
  "governance",
  "identity",
+ "module-artifact",
  "nat-traversal",
  "rand 0.8.6",
  "reachability",
@@ -12251,6 +12614,12 @@ dependencies = [
  "spki 0.7.3",
  "tls_codec",
 ]
+
+[[package]]
+name = "xcursor"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 
 [[package]]
 name = "xkbcommon-dl"

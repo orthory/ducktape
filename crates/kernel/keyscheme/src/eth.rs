@@ -166,8 +166,11 @@ mod tests {
         assert!(!KeyScheme::Secp256k1.verify(&pk, NS, preimage, &proof));
     }
 
+    /// the uncompressed SEC1 form of the SAME key: recovery would compare the
+    /// same curve point and pass, so only the canonical-encoding gate stops it
+    /// — one key, one byte string, or the key index is not a uniqueness index.
     #[test]
-    fn uncompressed_pubkey_is_accepted_too() {
+    fn the_uncompressed_spelling_of_a_key_is_refused() {
         let sk = eth_key(6);
         let uncompressed = sk
             .verifying_key()
@@ -177,7 +180,10 @@ mod tests {
         assert_eq!(uncompressed.len(), 65);
         let preimage = b"sec1-test";
         let proof = eth_proof(&sk, NS, preimage);
-        assert!(KeyScheme::Secp256k1.verify(&uncompressed, NS, preimage, &proof));
+        assert!(!KeyScheme::Secp256k1.pubkey_wellformed(&uncompressed));
+        assert!(!KeyScheme::Secp256k1.verify(&uncompressed, NS, preimage, &proof));
+        // the compressed spelling of the same key still verifies that proof.
+        assert!(KeyScheme::Secp256k1.verify(&eth_pubkey(&sk), NS, preimage, &proof));
     }
 
     #[test]

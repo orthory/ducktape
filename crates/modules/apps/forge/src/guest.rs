@@ -33,9 +33,19 @@
 //! on a rejected op the `?` short-circuits BEFORE any state save or object
 //! put, so the host aborts the block with nothing staged — the native
 //! reject-then-`abort_block` sequence.
+//!
+//! ## the genesis-config chain id — #1773
+//!
+//! forge's per-network parameter is the CHAIN ID [`crate::pushcert::signer`]
+//! checks a push certificate's nonce against. the odb
+//! twin of identity's store-seeded `__config`: the shape above declares the
+//! `chain_id` key, `noded::compose`'s `odb_genesis_config` resolves it against
+//! the network's bindings and hands it to `WasmModule::over_odb`, which
+//! serves it alongside [`REFS_KEY`] on the state lane — every dispatch reads
+//! it back through [`ducktape_module_sdk::genesis_chain_id`].
 
-use guest_adapter::{Guest, WitCtx, block_on, host};
-use sdk::Error;
+use ducktape_module_sdk::error_to_wit as to_wit_error;
+use ducktape_module_sdk::{Guest, WitCtx, block_on, host};
 
 use crate::state::{
     BlockScratch, ForgeState, Image, REF_TARGET_KIND, decode_block_scratch, decode_image,
@@ -58,16 +68,6 @@ const BLOCK_SCRATCH_KEY: &[u8] = b"__block_refs";
 /// where issue/PR discussion follow-ups go — the chat module every production
 /// node registers beside forge (the native lanes pass the same id).
 const CHAT_MODULE: &str = "chat";
-
-/// map an inner sdk error onto the wit surface — `Module` is the native
-/// rejection verbatim (the INVERSE of the host's `to_wit_error`), so a
-/// rejection reads identically whether forge ran native or wasm.
-fn to_wit_error(e: Error) -> host::Error {
-    match e {
-        Error::Module(m) => host::Error::Rejected(m),
-        other => host::Error::Rejected(other.to_string()),
-    }
-}
 
 /// re-enter the block: the chained image (missing = genesis, empty) and the
 /// scratch so far (missing = the block's first dispatch). a malformed value
@@ -92,8 +92,16 @@ fn load() -> Result<(ForgeState, BlockScratch), host::Error> {
 /// the block boundary (dropping the scratch) or discards both on abort.
 fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
     let (mut state, before) = load()?;
+    let chain_id = ducktape_module_sdk::genesis_chain_id("forge")?;
     let mut ctx = WitCtx::new();
-    block_on(state.apply(&mut ctx, &payload, Some(CHAT_MODULE))).map_err(to_wit_error)?;
+    block_on(state.apply(
+        &mut ctx,
+        &payload,
+        Some(CHAT_MODULE),
+        Some("attribution"),
+        &chain_id,
+    ))
+    .map_err(to_wit_error)?;
     for target in state.ref_targets_since(&before) {
         host::object_put(REF_TARGET_KIND, &encode_ref_target(&target));
     }
@@ -111,14 +119,35 @@ fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
 struct Component;
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// an odb port: the host wraps this component over the git substrate it
-    /// provides for the module's id.
+    /// provides for the module's id, seeding the `chain_id` genesis-config
+    /// key [`pushcert::signer`](crate::pushcert::signer) checks a push
+    /// certificate's nonce against.
     fn shape() -> host::ModuleShape {
-        guest_adapter::odb_shape()
+        host::ModuleShape {
+            config: vec![sdk::genesis_config::CHAIN_ID.into()],
+            ..ducktape_module_sdk::odb_shape()
+        }
     }
 
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         execute(payload)
+    }
+
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Unsupported)
     }
 
     /// UNREACHABLE for the odb backing: the kernel serves `query` host-side
@@ -131,4 +160,4 @@ impl Guest for Component {
     }
 }
 
-guest_adapter::export_module!(Component);
+ducktape_module_sdk::export_module!(Component);

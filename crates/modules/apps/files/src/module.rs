@@ -9,11 +9,10 @@ use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
 use duckfs_core::store::{MemRefs, MemStore, ObjectStore, RefsStore};
 use duckfs_core::{
-    FilesMsg, GC_PERIOD_BLOCKS, Kind, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
-    decode_sync_req, encode_reply, encode_sync_resp,
+    GC_PERIOD_BLOCKS, Kind, ObjectId, decode_query, decode_sync_req, encode_reply, encode_sync_resp,
 };
 use duckfs_disk::{DiskRefs, DiskStore};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 
 /// gc is due at `height` iff `height` has crossed into a new
 /// [`GC_PERIOD_BLOCKS`]-wide window since the last swept height (`watermark`).
@@ -424,67 +423,7 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let env = ctx.env().clone();
-        // the acting identity is origin-derived, never taken from the payload.
-        let actor = env.origin.actor_string();
-        // the watch origin gate treats system as a module origin: it may register a
-        // watch for ANY module_id (the `actor == "system"` branch of the gate lets
-        // it through), so system must map to `is_module = true`. an external
-        // submitter is not a module and cannot register watches at all.
-        let is_module = matches!(env.origin, Origin::Module(_) | Origin::System);
-        match msg.payload.first() {
-            Some(&PUTBLOB_FRAME_TAG) => self
-                .fs
-                .putblob(&actor, env.height, &msg.payload[1..])
-                .map_err(Error::Module),
-            _ => match decode_msg(&msg.payload).map_err(Error::Module)? {
-                FilesMsg::Commit {
-                    base_snapshot,
-                    message,
-                    changes,
-                } => {
-                    let notifications = self
-                        .fs
-                        .commit(
-                            &actor,
-                            env.height,
-                            env.consensus_time,
-                            base_snapshot,
-                            message,
-                            changes,
-                        )
-                        .map_err(Error::Module)?;
-                    // watch fan-out: each notification becomes a follow-up msg at
-                    // the watching module, re-dispatched after this execute returns
-                    // (never a reentrant call). the payload is the task-9
-                    // `duckfs_notify` JSON shape.
-                    for n in notifications {
-                        let payload = n.payload();
-                        ctx.emit_msg(Msg {
-                            target: n.module_id,
-                            payload,
-                        });
-                    }
-                    Ok(())
-                }
-                FilesMsg::Pin { snapshot, name } => self
-                    .fs
-                    .pin(&actor, env.height, snapshot, name)
-                    .map_err(Error::Module),
-                FilesMsg::Unpin { name } => self
-                    .fs
-                    .unpin(&actor, env.height, name)
-                    .map_err(Error::Module),
-                FilesMsg::Watch { prefix, module_id } => self
-                    .fs
-                    .watch(&actor, env.height, is_module, prefix, module_id)
-                    .map_err(Error::Module),
-                FilesMsg::Unwatch { prefix, module_id } => self
-                    .fs
-                    .unwatch(&actor, env.height, is_module, prefix, module_id)
-                    .map_err(Error::Module),
-            },
-        }
+        crate::adapter::apply_op(&mut self.fs, ctx, &msg.payload).await
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {

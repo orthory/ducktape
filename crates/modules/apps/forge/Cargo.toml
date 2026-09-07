@@ -13,9 +13,9 @@ default = ["native"]
 # the wasm tenant, snapshot packing, and materialization.
 native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:wasm-host"]
 # the wasm-guest port: the pure `ForgeState` core over the host state lane +
-# object plane. non-default and wasm-only (the guest-adapter bindings compile
+# object plane. non-default and wasm-only (the ducktape-module-sdk bindings compile
 # only for wasm32-unknown-unknown).
-guest = ["dep:guest-adapter"]
+guest = ["dep:ducktape-module-sdk"]
 # the git-history/packfile builder (`forge::testkit`). no extra deps beyond
 # the substrate, but gating keeps it out of the shipped binary, exactly as
 # identity/noded do with theirs.
@@ -35,11 +35,12 @@ sha2 = { workspace = true }
 # chat's WIRE TYPES only: forge opens one hidden discussion channel per
 # issue/PR (`forge:<repo>:<n>`) and posts state-change system lines into it via
 # emit_msg follow-ups — the same seam runs/automations use. forge reuses
-# chat's AuthorRef so the app renders forge authors through the same path.
+# chat's Party so the app renders forge authors through the same path.
 chat = { workspace = true }
+attribution = { workspace = true }
 # identity's WIRE TYPES only: forge resolves a ref-moving origin to the account
 # it belongs to, so the SAME human's node-key `git push` and user-key app merge
-# land on one owner principal (see `ForgeState::principal_of_origin`).
+# land on one owner principal (see `ForgeState::authority_of_origin`).
 identity = { workspace = true }
 # `git push --signed`: the push certificate's OpenSSH signature is verified
 # in consensus (`pushcert::signer`), by every validator.
@@ -57,7 +58,7 @@ wasm-host = { workspace = true, optional = true }
 # wasm-only, behind `guest`: the port harness (WitCtx / host imports). a
 # standalone-workspace path crate, pulled only when the `guest` feature builds
 # for wasm32 — never by the native gate.
-guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+ducktape-module-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 # forge's OWN integration tests need `forge::testkit`, and a crate does not

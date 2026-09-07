@@ -232,16 +232,21 @@ pub fn validate_headers(headers: &[ProxyHeader], kind: &str) -> Result<(), Strin
         // underscore names here is what stops an `X-Duck-Caller-Account` /
         // `x_duck_caller_account` spoof from ever reaching the forward step —
         // the proxy alone mints the authenticated `x-duck-*` headers.
-        if header.name.is_empty()
+        let first_bad_byte = header
+            .name
+            .bytes()
+            .position(|byte| !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+        let malformed_name = header.name.is_empty()
             || header.name.len() > MAX_HEADER_NAME_BYTES
-            || !header
-                .name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
+            || first_bad_byte.is_some();
+        if malformed_name {
+            // The name is remote input and need not be ASCII or bounded, so it
+            // is described, never echoed: an echoed name lands in a failure
+            // detail that gets byte-bounded, and in the node's log ring.
+            let offset = first_bad_byte.map_or_else(|| "none".to_string(), |at| at.to_string());
             return Err(format!(
-                "gateway proxy: malformed {kind} header name {:?}",
-                header.name
+                "gateway proxy: malformed {kind} header name (len {}, first invalid byte at {offset})",
+                header.name.len()
             ));
         }
         if header.name.starts_with("x-duck-") {
@@ -328,6 +333,21 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
 mod tests {
     use super::*;
     use crate::{MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement, RouteTarget};
+
+    /// The name is remote input; the refusal describes it and never carries
+    /// its bytes, so the detail downstream stays ASCII and bounded.
+    #[test]
+    fn a_malformed_header_name_is_described_not_echoed() {
+        let headers = vec![ProxyHeader {
+            name: "€".repeat(200),
+            value: "v".into(),
+        }];
+        let error = validate_headers(&headers, "request").expect_err("non-token name is refused");
+        assert!(error.is_ascii(), "the refusal echoed peer bytes: {error}");
+        assert!(!error.contains('€'));
+        assert!(error.contains("len 600"), "names the length: {error}");
+        assert!(error.contains("first invalid byte at 0"), "{error}");
+    }
 
     fn record() -> RouteRecord {
         RouteRecord {

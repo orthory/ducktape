@@ -23,6 +23,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use attribution::{Actor, AttributionMsg, AttributionUpdate, ObjectRef, Reason, Relation};
+use chat::Party;
 use identity::{IdentityQuery, IdentityReply};
 use sdk::{Ctx, Error, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -30,16 +32,24 @@ use sha2::{Digest, Sha256};
 use crate::codec::{self, Reader};
 use crate::oid::{OID_RAW_LEN, Oid};
 use crate::refs::{INTEGRATION_BRANCH, RepoState, StagedRef, is_protected_branch, norm_branch};
-use crate::tracker::{self, Tracker, author_from_origin, parse_hex_oid};
+use crate::tracker::{self, Tracker, parse_hex_oid};
 use crate::{
-    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, PushCert, RefUpdate, ReviewVerdict, decode_msg,
-    norm_repo,
+    ForgeMsg, ItemKind, MAX_BRANCHES_PER_REPO, MAX_REFS_PER_PUSH, MAX_REPOS_PER_OWNER, PushCert,
+    RefUpdate, ReviewVerdict, decode_msg, norm_repo,
 };
 
 /// the Identity module's genesis-constant id — the account registry every
 /// forge principal resolves through. mirrors `bin/node/src/host_state.rs`'s
 /// `IDENTITY_MODULE_ID`; it is not a per-network choice, so it is not a knob.
 const IDENTITY_MODULE: &str = "identity";
+
+/// Call completions retain these exact bytes. A typed result fixes field order
+/// even when native and guest builds select different serde_json map features.
+#[derive(serde::Serialize)]
+struct CreatedItem<'a> {
+    number: u64,
+    repo: &'a str,
+}
 
 /// the domain tag folding the tracker's canonical-bytes hash into the root
 /// preimage — separates it from the branch material.
@@ -143,12 +153,13 @@ fn parse_hex_digest(s: &str) -> Result<[u8; 32], Error> {
 /// principal that owns the repo. every other branch is open to any member.
 fn require_owner_for_protected(
     repo: &str,
-    owner: &[u8],
-    principal: &[u8],
+    owner: &Party,
+    authority: &Authority,
     updates: &[RefUpdate],
 ) -> Result<(), Error> {
     let moves_protected = updates.iter().any(|u| is_protected_branch(&u.ref_name));
-    if moves_protected && owner != principal {
+    let unauthorized = moves_protected && !authority.owns(owner);
+    if unauthorized {
         return Err(Error::Module(format!(
             "forge: only the owner of repo {repo:?} may move a protected branch"
         )));
@@ -181,6 +192,15 @@ fn stage_updates(
             new.is_some().then(|| digest.unwrap()),
         )?;
     }
+    // the branch ceiling reads the map this push would PUBLISH, so a delete
+    // always passes and a push that both deletes and creates is judged on its
+    // net effect. the branch map IS the count — no counter to persist.
+    let live_branches = state.published_refs().len();
+    if live_branches > MAX_BRANCHES_PER_REPO {
+        return Err(Error::Module(format!(
+            "forge: repo is at its branch cap ({MAX_BRANCHES_PER_REPO}); delete a branch first"
+        )));
+    }
     Ok(())
 }
 
@@ -188,11 +208,51 @@ fn stage_updates(
 /// normalized slug, SORTED so `root()` composes order-independently), the
 /// COMMITTED tracker, and the block-scratch tracker (clone-on-write on the
 /// first tracker mutation of a block; swapped in at commit, dropped at abort).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ForgeState {
     pub repos: BTreeMap<String, RepoState>,
     pub tracker: Tracker,
     pub staged_tracker: Option<Tracker>,
+}
+
+/// Canonical account identity and the actual authenticated proof are distinct.
+/// In a signed push the proof is the certificate signer, never its relay node.
+struct Authority {
+    party: Party,
+    proof: Origin,
+}
+
+impl Authority {
+    fn owns(&self, owner: &Party) -> bool {
+        match owner {
+            Party::Key(key) => matches!(&self.proof, Origin::External(signer) if signer == key),
+            Party::Account(_) | Party::Module(_) | Party::System => &self.party == owner,
+        }
+    }
+}
+
+fn attributed_actor(party: &Party) -> Actor {
+    match party {
+        Party::Account(account) => Actor::Account(*account),
+        Party::Key(key) => Actor::Key(key.clone()),
+        Party::Module(module) => Actor::Module(module.clone()),
+        Party::System => Actor::System,
+    }
+}
+
+fn party_relation(party: &Party, reason: Reason, detail: Vec<u8>) -> Option<Relation> {
+    party.account().map(|recipient| Relation {
+        recipient,
+        reason,
+        detail,
+    })
+}
+
+fn source_object(kind: &str, address: impl serde::Serialize) -> ObjectRef {
+    ObjectRef {
+        kind: kind.into(),
+        object: serde_json::to_string(&address).expect("source address serializes"),
+    }
 }
 
 impl ForgeState {
@@ -243,22 +303,57 @@ impl ForgeState {
         ctx: &mut dyn Ctx,
         payload: &[u8],
         chat_target: Option<&str>,
+        attribution_target: Option<&str>,
+        chain_id: &str,
+    ) -> Result<(), Error> {
+        let msg = decode_msg(payload).map_err(Error::Module)?;
+        let authority = match &msg {
+            ForgeMsg::PushRefs {
+                repo,
+                updates,
+                cert,
+                ..
+            } => {
+                let name = norm_repo(repo)?;
+                Self::push_authority(ctx, chain_id, &name, cert.as_ref(), updates).await?
+            }
+            ForgeMsg::MergePr { .. } => Self::ref_authority(ctx).await?,
+            _ => Self::authority_of_origin(ctx).await?,
+        };
+        let before = self.clone();
+        let applied = async {
+            self.apply_op(ctx, msg, chat_target, &authority).await?;
+            self.publish_attribution(ctx, attribution_target, &before, &authority)
+        }
+        .await;
+        if applied.is_err() {
+            *self = before;
+        }
+        applied
+    }
+
+    async fn apply_op(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        msg: ForgeMsg,
+        chat_target: Option<&str>,
+        authority: &Authority,
     ) -> Result<(), Error> {
         let now = ctx.env().consensus_time;
-        match decode_msg(payload).map_err(Error::Module)? {
+        match msg {
             ForgeMsg::PushRefs {
                 repo,
                 updates,
                 pack_digest,
-                cert,
+                cert: _,
             } => {
                 let name = norm_repo(&repo)?;
-                let principal = Self::push_principal(ctx, &name, cert.as_ref(), &updates).await?;
-                self.stage_push_refs(&name, principal, updates, pack_digest)
+                self.settle_owner(ctx, &name).await?;
+                self.stage_push_refs(&name, authority, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
                 let name = norm_repo(&repo)?;
-                let author = author_from_origin(&ctx.env().origin)?;
+                let author = authority.party.clone();
                 let number = self.staged_tracker_mut().open_item(
                     &name,
                     ItemKind::Issue,
@@ -271,6 +366,10 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
+                ctx.set_output(sdk::wire::encode(&CreatedItem {
+                    number,
+                    repo: &name,
+                }));
                 Ok(())
             }
             ForgeMsg::OpenPr {
@@ -281,7 +380,7 @@ impl ForgeState {
                 target_branch,
             } => {
                 let name = norm_repo(&repo)?;
-                let author = author_from_origin(&ctx.env().origin)?;
+                let author = authority.party.clone();
                 let target = if target_branch.is_empty() {
                     INTEGRATION_BRANCH.to_string()
                 } else {
@@ -320,6 +419,10 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
+                ctx.set_output(sdk::wire::encode(&CreatedItem {
+                    number,
+                    repo: &name,
+                }));
                 Ok(())
             }
             ForgeMsg::EditItem {
@@ -329,17 +432,28 @@ impl ForgeState {
                 body,
             } => {
                 let name = norm_repo(&repo)?;
-                let editor = author_from_origin(&ctx.env().origin)?;
+                let author = self
+                    .tracker_view()
+                    .get(&name, number)
+                    .ok_or_else(|| {
+                        Error::Module(format!("forge: no item #{number} in repo {name}"))
+                    })?
+                    .summary
+                    .author;
+                if !authority.owns(&author) {
+                    return Err(Error::Module(
+                        "forge: only the item author may edit it".into(),
+                    ));
+                }
                 self.staged_tracker_mut()
-                    .edit_item(&name, number, &editor, title, body, now)
+                    .edit_item(&name, number, &author, title, body, now)
             }
             ForgeMsg::SetItemState { repo, number, open } => {
                 let name = norm_repo(&repo)?;
                 // DELIBERATELY open to any authenticated member: closing and
                 // reopening is triage, `Merged` is terminal and refused below,
-                // and the inverse op is one message away. the binding is here
-                // for its AUTHENTICATION effect only.
-                let _closer = author_from_origin(&ctx.env().origin)?;
+                // and the inverse op is one message away. apply has already
+                // authenticated the origin before any state is staged.
                 if let Some(verb) = self
                     .staged_tracker_mut()
                     .set_state(&name, number, open, now)?
@@ -363,7 +477,6 @@ impl ForgeState {
                 pack_digest,
             } => {
                 let name = norm_repo(&repo)?;
-                let principal = Self::principal_of_origin(ctx).await?;
                 let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
                 let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
                 let merge = parse_hex_oid(&merge_oid, "merge_oid")?;
@@ -371,7 +484,8 @@ impl ForgeState {
 
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
-                self.require_merge_owner(&name, &target, &principal)?;
+                self.settle_owner(ctx, &name).await?;
+                self.require_merge_authorized(&name, &target, number, authority)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
                 // under the merger, and the merge must have been computed
@@ -401,7 +515,7 @@ impl ForgeState {
                 comments,
             } => {
                 let name = norm_repo(&repo)?;
-                let author = author_from_origin(&ctx.env().origin)?;
+                let author = authority.party.clone();
                 self.staged_tracker_mut().submit_review(
                     &name,
                     number,
@@ -471,51 +585,78 @@ impl ForgeState {
         }
     }
 
-    /// the PRINCIPAL a ref-moving op speaks for.
-    ///
-    /// every ref-move door signs with a USER key (`git push` through the
-    /// node's smart-HTTP lane carries the user's signed frame, the app's merge
-    /// is user-signed too), and Identity collapses every key of one
-    /// association onto ONE account principal
-    /// ([`identity::account_principal`]) — so the same human pushes from a
-    /// laptop key and merges the PR from a phone key.
-    ///
-    /// a key Identity knows nothing about is its OWN principal. that keeps a
-    /// single-operator or identity-less network self-consistent and does not
-    /// widen the gate: an account-less key still only ever matches itself,
-    /// and an account principal (8 bytes) never collides with a key.
-    async fn principal_of_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
-        let Origin::External(key) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "forge: a ref-moving op requires an authenticated external origin".into(),
-            ));
-        };
+    async fn authority_of_key(ctx: &dyn Ctx, key: Vec<u8>) -> Result<Authority, Error> {
         if key.is_empty() {
             return Err(Error::Module(
-                "forge: a ref-moving op requires an authenticated external origin".into(),
+                "forge: operations require an authenticated origin".into(),
             ));
         }
-        let account = Self::identity_account(ctx, key).await?;
-        Ok(account.map_or_else(|| key.clone(), identity::account_principal))
+        let account = Self::identity_account(ctx, &key).await?;
+        let party = account.map_or_else(|| Party::Key(key.clone()), Party::Account);
+        Ok(Authority {
+            party,
+            proof: Origin::External(key),
+        })
     }
 
-    /// the principal a PUSH speaks for: with a push certificate, the SSH key
-    /// that signed it (its account, when it has one) — `git push --signed`
-    /// through any node, verified here by every validator; without one, the
-    /// frame origin ([`Self::principal_of_origin`]).
-    async fn push_principal(
+    async fn authority_of_origin(ctx: &dyn Ctx) -> Result<Authority, Error> {
+        let origin = &ctx.env().origin;
+        match origin {
+            Origin::External(key) => Self::authority_of_key(ctx, key.clone()).await,
+            Origin::Program(account) => Ok(Authority {
+                party: Party::Account(*account),
+                proof: origin.clone(),
+            }),
+            Origin::Module(module) => Ok(Authority {
+                party: Party::Module(module.clone()),
+                proof: origin.clone(),
+            }),
+            Origin::System => Err(Error::Module(
+                "forge: tracker ops require an authenticated origin".into(),
+            )),
+        }
+    }
+
+    async fn ref_authority(ctx: &dyn Ctx) -> Result<Authority, Error> {
+        match &ctx.env().origin {
+            Origin::External(_) | Origin::Program(_) => Self::authority_of_origin(ctx).await,
+            Origin::Module(_) | Origin::System => Err(Error::Module(
+                "forge: a ref-moving op requires an authenticated person".into(),
+            )),
+        }
+    }
+
+    /// Certificate possession proves the signer authorized these exact refs,
+    /// repo and network nonce. Its relay origin contributes no ownership.
+    async fn push_authority(
         ctx: &dyn Ctx,
+        chain_id: &str,
         repo: &str,
         cert: Option<&PushCert>,
         updates: &[RefUpdate],
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Authority, Error> {
         let Some(cert) = cert else {
-            return Self::principal_of_origin(ctx).await;
+            return Self::ref_authority(ctx).await;
         };
-        let signer = crate::pushcert::signer(cert, repo, updates)
+        let signer = crate::pushcert::signer(cert, chain_id, repo, updates)
             .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
-        let account = Self::identity_account(ctx, &signer).await?;
-        Ok(account.map_or(signer, identity::account_principal))
+        Self::authority_of_key(ctx, signer).await
+    }
+
+    /// An unregistered key's repository follows that key onto its account.
+    /// This is one-way: removing the key after settlement never restores its
+    /// ownership. Stage before each ref ownership check so a refused operation
+    /// or aborted block also discards the transition and its source report.
+    async fn settle_owner(&mut self, ctx: &dyn Ctx, repo: &str) -> Result<(), Error> {
+        let Some(Party::Key(owner)) = self.tracker_view().owner(repo).cloned() else {
+            return Ok(());
+        };
+        let Some(number) = Self::identity_account(ctx, &owner).await? else {
+            return Ok(());
+        };
+        self.staged_tracker_mut()
+            .claim_owner(repo, Party::Account(number));
+        Ok(())
     }
 
     /// stage an atomic multi-branch push: validate the update list, settle
@@ -534,11 +675,13 @@ impl ForgeState {
     /// the push that BIRTHS a repo pins its owner; afterwards only that owner
     /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
     /// member — the GitHub flow this module documents, and what the dogfood
-    /// loop's second node pushes under its own key.
+    /// loop's second node pushes under its own key. a raw-key owner follows
+    /// its key onto an account the first time Identity knows it
+    /// ([`Self::settle_owner`], run by the caller before this).
     fn stage_push_refs(
         &mut self,
         name: &str,
-        principal: Vec<u8>,
+        authority: &Authority,
         updates: Vec<RefUpdate>,
         pack_digest: Option<Vec<u8>>,
     ) -> Result<(), Error> {
@@ -571,9 +714,19 @@ impl ForgeState {
         // one discriminant: the repo either has an owner or this push births it.
         // the CAS runs AFTER, so a stale prev_oid from the rightful owner still
         // reports the non-fast-forward, not an authorization refusal.
-        match self.tracker_view().owner(name).map(<[u8]>::to_vec) {
-            None => self.staged_tracker_mut().claim_owner(name, principal),
-            Some(owner) => require_owner_for_protected(name, &owner, &principal, &updates)?,
+        match self.tracker_view().owner(name).cloned() {
+            None => {
+                let owned = self.tracker_view().repos_owned_by(&authority.party);
+                if owned >= MAX_REPOS_PER_OWNER {
+                    return Err(Error::Module(format!(
+                        "forge: you already own {MAX_REPOS_PER_OWNER} repos; a repo cannot be \
+                         released, so no more may be birthed"
+                    )));
+                }
+                self.staged_tracker_mut()
+                    .claim_owner(name, authority.party.clone())
+            }
+            Some(owner) => require_owner_for_protected(name, &owner, authority, &updates)?,
         }
 
         // a repo the push BIRTHS is only inserted once EVERY CAS succeeded —
@@ -595,21 +748,156 @@ impl ForgeState {
         }
     }
 
-    /// refuse a merge onto a PROTECTED target branch from anyone but the repo
-    /// owner. `MergePr` is a SECOND raw ref-move door: `merge_oid` is
-    /// client-computed and its parentage is unverifiable in consensus, and
-    /// `OpenPr` lets any member open a PR onto `main` — so gating `PushRefs`
-    /// alone would close nothing.
-    fn require_merge_owner(&self, name: &str, target: &str, principal: &[u8]) -> Result<(), Error> {
-        if !is_protected_branch(target) {
-            return Ok(());
+    /// gate a `MergePr`. `MergePr` is a SECOND raw ref-move door: `merge_oid`
+    /// is client-computed and its parentage is unverifiable in consensus, and
+    /// `OpenPr` lets any member open a PR onto any target — so gating
+    /// `PushRefs` alone would close nothing.
+    ///
+    /// a PROTECTED target keeps the stricter, unchanged rule: the repo owner
+    /// only. every other target opens to whoever forge already vouches for
+    /// independently of `SubmitReview` — the PR's author, or the repo owner.
+    ///
+    /// `SubmitReview` has no standing gate (any account may review any PR)
+    /// and forge has no collaborator/member list to check a reviewer against,
+    /// so a review's author is NOT sound merge standing (#1760): admitting
+    /// `reviewers.contains(actor)` here let a stranger file one throwaway
+    /// review, then merge with the very next op. this is the smallest sound
+    /// rule available without inventing a membership list forge doesn't
+    /// have: reviews are still stored and shown, they just don't unlock a
+    /// merge.
+    fn require_merge_authorized(
+        &self,
+        name: &str,
+        target: &str,
+        number: u64,
+        authority: &Authority,
+    ) -> Result<(), Error> {
+        let owner = self.tracker_view().owner(name);
+        let is_owner = owner.is_some_and(|owner| authority.owns(owner));
+        if is_protected_branch(target) {
+            return if is_owner {
+                Ok(())
+            } else {
+                Err(Error::Module(format!(
+                    "forge: only the owner of repo {name:?} may merge onto protected branch \
+                     {target:?}"
+                )))
+            };
         }
-        if self.tracker_view().owner(name) != Some(principal) {
+        let author = self.tracker_view().pr_author(name, number)?;
+        let may_merge = authority.owns(&author) || is_owner;
+        if !may_merge {
             return Err(Error::Module(format!(
-                "forge: only the owner of repo {name:?} may merge onto protected branch \
-                 {target:?}"
+                "forge: only pull request #{number}'s author or the owner of repo {name:?} may \
+                 merge it"
             )));
         }
+        Ok(())
+    }
+
+    /// Reports are derived from the accepted source mutation, before any
+    /// publication leaves its atomic unit. The revision is inside the tracker
+    /// image, so ODB adoption, per-dispatch reload and snapshots preserve it.
+    fn publish_attribution(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        target: Option<&str>,
+        before: &Self,
+        authority: &Authority,
+    ) -> Result<(), Error> {
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let mut reports = Vec::new();
+        for (repo, tracker) in &self.tracker_view().repos {
+            let previous = before.tracker_view().repos.get(repo);
+            let previous_owner = previous.and_then(|tracker| tracker.owner.as_ref());
+            if tracker.owner.as_ref() != previous_owner {
+                let relations = tracker
+                    .owner
+                    .as_ref()
+                    .and_then(|owner| party_relation(owner, Reason::Ownership, Vec::new()))
+                    .into_iter()
+                    .collect();
+                reports.push((source_object("repo", repo), relations));
+            }
+            for (number, item) in &tracker.items {
+                let previous_item = previous.and_then(|tracker| tracker.items.get(number));
+                if previous_item == Some(item) {
+                    continue;
+                }
+                let mut relations: Vec<_> =
+                    party_relation(&item.author, Reason::Authorship, Vec::new())
+                        .into_iter()
+                        .collect();
+                let reviewers: BTreeSet<_> = item
+                    .reviews
+                    .iter()
+                    .filter_map(|review| review.author.account())
+                    .collect();
+                relations.extend(reviewers.into_iter().map(|recipient| Relation {
+                    recipient,
+                    reason: Reason::Credit,
+                    detail: Vec::new(),
+                }));
+                reports.push((source_object("item", (repo, number)), relations));
+                let old_reviews = previous_item.map_or(0, |item| item.reviews.len());
+                for (index, review) in item.reviews.iter().enumerate().skip(old_reviews) {
+                    let relations = party_relation(&review.author, Reason::Authorship, Vec::new())
+                        .into_iter()
+                        .collect();
+                    reports.push((
+                        source_object("review", (repo, number, index + 1)),
+                        relations,
+                    ));
+                }
+            }
+        }
+        for (repo, state) in &self.repos {
+            for (branch, fate) in &state.staged {
+                let already_staged = before
+                    .repos
+                    .get(repo)
+                    .is_some_and(|state| state.staged.contains_key(branch));
+                if already_staged {
+                    continue;
+                }
+                let relations = match fate {
+                    StagedRef::Packed(head, _) => party_relation(
+                        &authority.party,
+                        Reason::Defined("ref_writer".into()),
+                        head.as_bytes().to_vec(),
+                    )
+                    .into_iter()
+                    .collect(),
+                    StagedRef::Delete => Vec::new(),
+                };
+                reports.push((source_object("ref", (repo, branch)), relations));
+            }
+        }
+        if reports.is_empty() {
+            return Ok(());
+        }
+        let revision = self
+            .tracker_view()
+            .source_revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Module("forge: source revision exhausted".into()))?;
+        self.staged_tracker_mut().source_revision = revision;
+        let updates = reports
+            .into_iter()
+            .map(|(object, relations)| AttributionUpdate {
+                object,
+                revision,
+                actor: attributed_actor(&authority.party),
+                relations,
+                transfers: Vec::new(),
+            })
+            .collect();
+        ctx.emit_msg(sdk::Msg {
+            target: target.into(),
+            payload: attribution::encode_msg(&AttributionMsg::AttributeBatch { updates }),
+        });
         Ok(())
     }
 
@@ -1035,9 +1323,15 @@ pub fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, Error> {
 
 #[cfg(test)]
 mod tests {
+    fn key_authority(byte: u8) -> super::Authority {
+        super::Authority {
+            party: chat::Party::Key(vec![byte]),
+            proof: sdk::Origin::External(vec![byte]),
+        }
+    }
     use super::*;
     use crate::tracker_iface::ItemKind;
-    use chat::AuthorRef;
+    use chat::Party;
 
     fn oid(c: char) -> Oid {
         Oid::from_hex(&c.to_string().repeat(40)).unwrap()
@@ -1067,7 +1361,7 @@ mod tests {
                 ItemKind::Issue,
                 "t".into(),
                 String::new(),
-                AuthorRef::User(vec![1]),
+                Party::Key(vec![1]),
                 1,
                 None,
             )
@@ -1241,5 +1535,98 @@ mod tests {
         let mut extra = encode_ref_target(&target);
         extra.push(0);
         assert!(decode_ref_target(&extra).is_err());
+    }
+
+    /// a single-branch create/delete push, the shape both cap tests drive.
+    fn update(branch: &str, prev: Option<Oid>, new: Option<Oid>) -> Vec<RefUpdate> {
+        vec![RefUpdate {
+            ref_name: branch.into(),
+            prev_oid: prev.map(|o| o.as_bytes().to_vec()),
+            new_oid: new.map(|o| o.as_bytes().to_vec()),
+        }]
+    }
+
+    #[test]
+    fn one_principal_may_not_birth_repos_without_bound() {
+        // nothing releases an owner, so an uncapped birth path grows every
+        // validator's tracker, root preimage and on-disk repo count forever.
+        let mut state = ForgeState::default();
+        let digest = Some(vec![7u8; 32]);
+        for i in 0..MAX_REPOS_PER_OWNER {
+            state
+                .stage_push_refs(
+                    &format!("r{i}"),
+                    &key_authority(1),
+                    update("main", None, Some(oid('a'))),
+                    digest.clone(),
+                )
+                .unwrap();
+        }
+        let refused = state
+            .stage_push_refs(
+                "one-too-many",
+                &key_authority(1),
+                update("main", None, Some(oid('a'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("you already own"),
+            "the cap+1-th birth is refused: {refused}"
+        );
+        // the ceiling is per OWNER, not per network.
+        state
+            .stage_push_refs(
+                "someone-else",
+                &key_authority(2),
+                update("main", None, Some(oid('a'))),
+                digest,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_push_may_not_grow_a_repo_past_its_branch_cap() {
+        let full: BTreeMap<String, Oid> = (0..MAX_BRANCHES_PER_REPO)
+            .map(|i| (format!("b{i}"), oid('a')))
+            .collect();
+        let mut state = ForgeState::default();
+        state
+            .repos
+            .insert("alpha".into(), RepoState::with_refs(full));
+        state.tracker.claim_owner("alpha", Party::Key(vec![1]));
+        let digest = Some(vec![7u8; 32]);
+
+        let refused = state
+            .stage_push_refs(
+                "alpha",
+                &key_authority(1),
+                update("new", None, Some(oid('c'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("branch cap"),
+            "the cap+1-th branch is refused: {refused}"
+        );
+        // the host drops every staged fate of a rejected block (`abort_block`).
+        state.repos.get_mut("alpha").unwrap().abort();
+        // a delete is always allowed — it is the only way back under the cap.
+        state
+            .stage_push_refs(
+                "alpha",
+                &key_authority(1),
+                update("b0", Some(oid('a')), None),
+                None,
+            )
+            .unwrap();
+        state
+            .stage_push_refs(
+                "alpha",
+                &key_authority(1),
+                update("new", None, Some(oid('c'))),
+                digest,
+            )
+            .unwrap();
     }
 }

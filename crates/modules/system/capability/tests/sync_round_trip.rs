@@ -25,6 +25,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: height,
         origin,
         me: "capability".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 

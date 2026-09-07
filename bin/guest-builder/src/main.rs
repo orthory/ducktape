@@ -1,75 +1,93 @@
-//! `guest-builder` — build a module crate's `ducktape:module` component
-//! without a checked-in packaging crate.
+//! `guest-builder` — build one module's wasm guest out of the platform
+//! repository at a revision.
 //!
-//! a ported module carries its whole guest surface itself: a `src/guest.rs`
-//! behind a wasm-only `guest` feature (the dispatch shell + the component
-//! export). what used to be a per-module `crates/guests/<id>-wasm` crate is
-//! pure packaging — a cdylib manifest, a one-line lib, a standalone
-//! `[workspace]` table, and the wasm32 dep patches — identical across modules.
-//! this tool synthesizes that packaging into a scratch workspace, builds it
-//! for `wasm32-unknown-unknown`, and componentizes the result:
+//! a module carries its whole guest surface itself: a `src/guest.rs` behind a
+//! wasm-only `guest` feature (the dispatch shell + the component export) over
+//! the module SDK (`crates/module-sdk`). packaging that as a cdylib is
+//! identical across modules — a manifest, a one-line lib, a `[workspace]`
+//! table, the wasm32 patch set — so none of it is checked in: this tool
+//! synthesizes it into a scratch workspace, builds for
+//! `wasm32-unknown-unknown`, componentizes, and writes the artifact:
 //!
 //! ```text
-//! guest-builder <module-dir> [--out <component.wasm>]
-//!               [--scratch <dir>] [--platform-root <dir>]
+//! guest-builder <module-dir> [--index] [--rev <sha>]
+//!               [--out <artifact.wasm>] [--scratch <dir>]
 //! ```
 //!
-//! the synthesized workspace is EPHEMERAL by design — the committed artifact
-//! is the canonical bytes (`wasm-modules-check` guards the copies), so
-//! regenerating the packaging loses nothing. its `Cargo.lock` is the one thing
-//! that must NOT be scratch state: [`synthesize`] seeds it from the platform
-//! checkout's committed lock on every run, so the guest graph inherits the
-//! resolution the host already reviewed. Unseeded, cargo re-resolves the
-//! wasm32 graph against the live registry each synthesis, and a crates.io
-//! publish between two rebuilds moves the component bytes with no source
-//! change. `wasm-modules-check` cannot catch that — it compares the committed
-//! copies to each other, and a sweep refreshes them together — so the shift
-//! lands as an unexplained artifact diff nobody can attribute.
+//! the shell's ONE dependency is the module, reached out of the platform
+//! repository as a git source ([`PLATFORM_GIT`]) at the revision the shell
+//! lock pins — never out of the checkout in place. that is what makes a module
+//! independently buildable and its bytes reproducible: the build inputs are
+//! the module's revision, its lock, and the toolchain — the rust channel
+//! `rust-toolchain.toml` pins and the componentizer [`WASM_TOOLS_VERSION`]
+//! pins — and nothing else.
 //!
-//! the standalone workspace is what keeps wasm32 dep resolution, feature
-//! unification, and the `[patch.crates-io]` stubs (getrandom, blst) out of the
-//! host workspace; the patch set is applied uniformly — cargo warns "unused
-//! patch" for modules whose graphs never pull those crates, which is expected
-//! and harmless. the stubs are wasm-only, so they are also the crates the seed
-//! does not pin: cargo resolves them fresh against the patch paths and trims
-//! the host entries the guest graph never reaches.
+//! * every platform crate the module reads (the SDK, a sibling's wire types,
+//!   the wasm32 patch stubs) resolves inside that one git source at that one
+//!   revision — a path dependency inside a git checkout IS the git source —
+//!   so a module's platform is one revision by construction.
+//! * a git source's location is no part of a symbol hash (a path dependency's
+//!   absolute location is), so bytes do not depend on where a checkout lives.
+//!   the directory cargo unpacks the revision into is remapped out of panic
+//!   paths by [`remap_flags`].
+//! * the shell names the module WITHOUT a `rev`: cargo hashes a git reference
+//!   as written into `-C metadata`, so a revision in the manifest would change
+//!   every symbol name — and every artifact's bytes — on every commit. the
+//!   revision lives in the lock, which is not hashed, so a module rebuilt
+//!   at a later revision that changed none of the sources it compiles yields
+//!   byte-identical output.
+//! * the shell lock is the module's `guest.lock`, committed beside its
+//!   artifacts: the record of the revision and the registry versions an
+//!   artifact came from, and the seed of the next build, so a crates.io
+//!   publish between two rebuilds does not move the bytes. a canonical build
+//!   writes artifact and lock together; `--out` writes the artifact alone.
 //!
-//! that scratch workspace also holds `tree/` — a snapshot of the platform
-//! checkout — and the build compiles THAT, never the checkout in place. The
-//! committed artifact is therefore identical from any checkout path, which the
-//! copies alone never were: cargo hashes a path package's absolute location
-//! into `-C metadata` and so into every symbol name unless the package sits
-//! under the workspace being built. See [`synthesize`] and [`remap_flags`].
-//!
-//! `--platform-root` points at the ducktape checkout supplying `guest-adapter`
-//! and the patch crates; it defaults to the checkout this binary was built
-//! from, so in-tree use (`cargo run -p guest-builder`) needs no flags and an
-//! out-of-tree module directory is buildable by passing its path.
+//! the revision defaults to the checkout's HEAD and must be reachable at
+//! [`PLATFORM_GIT`]: push before building. uncommitted inputs anywhere in the
+//! resolved platform graph (including the SDK and sibling packages) are
+//! refused, since the build would silently compile HEAD instead.
 //!
 //! `--index` builds the module's INDEX guest instead: the fluentabi mapper
 //! behind the crate's `index-guest` feature (a `src/index_guest.rs` — see the
-//! index-guest crate). same synthesis, different feature, and the artifact
-//! stays core wasm (`index.wasm`, no componentize step): the fluent31 engine
+//! index-guest crate). same shell, a second member, and the artifact stays
+//! core wasm (`index.wasm`, no componentize step): the fluent31 engine
 //! executes plain wasm32 modules, not components.
+//!
+//! a module authored outside this repository needs none of this: its crate is
+//! the cdylib, it pins `ducktape-module-sdk` and the patch stubs by git
+//! revision in its own manifest, and plain cargo + `wasm-tools component new`
+//! build it.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Command};
 
-/// the platform checkout, copied under the scratch workspace root — see
-/// [`snapshot`] for why the build compiles the copy and not the checkout.
-const TREE: &str = "tree";
+/// the platform repository every shell reaches the module and the platform
+/// crates through. a constant, not the checkout's remote: the URL is part of
+/// every symbol hash, so two builders spelling it differently would produce
+/// different bytes for the same revision.
+const PLATFORM_GIT: &str = "https://github.com/orthory/ducktape";
 
-const USAGE: &str = "usage: guest-builder <module-dir> [--index] \
-     [--out <artifact.wasm>] [--scratch <dir>] [--platform-root <dir>]";
+/// the componentizer every committed component came out of. see
+/// [`refuse_other_componentizer`] for why it is pinned rather than floating;
+/// `the_workflows_install_the_pinned_componentizer` keeps CI in step with it.
+const WASM_TOOLS_VERSION: &str = include_str!("../../../wasm-tools.version").trim_ascii();
 
-/// which of a module's two guests to package. the consensus component and the
-/// index mapper share the synthesis pipeline; everything mode-specific —
-/// contract feature, artifact name, whether the cdylib is componentized —
+/// how to get it, carried in every message that names it.
+fn install_wasm_tools() -> String {
+    format!("cargo install wasm-tools --locked --version {WASM_TOOLS_VERSION}")
+}
+
+const USAGE: &str = "usage: guest-builder <module-dir> [--index] [--rev <sha>] \
+     [--out <artifact.wasm>] [--scratch <dir>]";
+
+/// which of a module's two guests to build. the consensus component and the
+/// index mapper share the shell; everything guest-specific — contract
+/// feature, shell member, artifact name, whether the cdylib is componentized —
 /// hangs off this one discriminant.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum GuestKind {
     /// the `ducktape:module` consensus component (`guest` feature).
     Component,
@@ -78,6 +96,8 @@ enum GuestKind {
 }
 
 impl GuestKind {
+    const ALL: [GuestKind; 2] = [GuestKind::Component, GuestKind::Index];
+
     fn feature(self) -> &'static str {
         match self {
             GuestKind::Component => "guest",
@@ -92,10 +112,10 @@ impl GuestKind {
         }
     }
 
-    /// suffix of the synthesized packaging crate (and its scratch dir).
-    fn shell_suffix(self) -> &'static str {
+    /// the shell workspace member (and the cdylib's name suffix) for this guest.
+    fn member(self) -> &'static str {
         match self {
-            GuestKind::Component => "wasm",
+            GuestKind::Component => "component",
             GuestKind::Index => "index",
         }
     }
@@ -104,13 +124,13 @@ impl GuestKind {
         match self {
             GuestKind::Component => format!(
                 "module `{name}` declares no `guest` feature — the port lives in the \
-                 module crate (a `src/guest.rs` behind `guest = [\"dep:guest-adapter\"]`); \
+                 module crate (a `src/guest.rs` behind `guest = [\"dep:ducktape-module-sdk\"]`); \
                  see crates/modules/apps/tasks for the shape"
             ),
             GuestKind::Index => format!(
                 "module `{name}` declares no `index-guest` feature — the index mapper \
                  lives in the module crate (a `src/index_guest.rs` behind \
-                 `index-guest = [\"dep:index-guest\"]`); see crates/modules/apps/tasks \
+                 `index-guest = [\"index_guest/guest\"]`); see crates/modules/apps/tasks \
                  for the shape"
             ),
         }
@@ -126,35 +146,71 @@ fn main() {
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let kind = args.kind;
+    let platform_root = default_platform_root()?;
     let module_dir = canonical(&args.module_dir)?;
-    let platform_root = match args.platform_root {
-        Some(root) => canonical(&root)?,
-        None => default_platform_root()?,
+    let module = read_module(&platform_root, &module_dir)?;
+    let declares_requested_guest = module.guests.contains(&kind);
+    if !declares_requested_guest {
+        return Err(kind.missing_feature_hint(&module.name));
+    }
+
+    let rev = match &args.rev {
+        Some(rev) => rev.clone(),
+        None => head(&platform_root)?,
     };
-    let module = read_module(&module_dir, kind)?;
 
     let scratch = match args.scratch {
         Some(dir) => dir,
-        None => platform_root.join("target/guest-builder").join(format!(
-            "{}-{}",
-            module.name,
-            kind.shell_suffix()
-        )),
+        None => platform_root
+            .join("target/guest-builder")
+            .join(&module.name),
     };
-    synthesize(&scratch, &module_dir, &module.name, &platform_root, kind)?;
-    build(&scratch, &remap_flags(&module_dir, &scratch))?;
-
-    let out = match args.out {
-        Some(path) => path,
-        None => module_dir.join(kind.artifact()),
-    };
-    let cdylib = cdylib_path(&scratch, &module.name, kind);
-    match kind {
-        GuestKind::Component => componentize(&cdylib, &out)?,
-        GuestKind::Index => copy_cdylib(&cdylib, &out)?,
+    eprintln!(
+        "guest-builder: {} {} at {rev}",
+        module.name,
+        kind.artifact()
+    );
+    seed_lock(&scratch, &module_dir)?;
+    let graph = pin(&scratch, &module, PLATFORM_GIT, &rev)?;
+    let checkout = checkout_root(&graph, &module)?;
+    let builds_head = args.rev.is_none();
+    if builds_head {
+        let inputs = platform_inputs(&graph, &checkout, PLATFORM_GIT)?;
+        refuse_modified_sources(&platform_root, &inputs)?;
     }
+    build(
+        &scratch,
+        &module.name,
+        kind,
+        &remap_flags(&scratch, &checkout),
+    )?;
+
+    let cdylib = cdylib_path(&scratch, &module.name, kind);
+    // the canonical artifact and its lock are written together: the lock is
+    // the record of THOSE bytes. a one-off `--out` build leaves the module
+    // directory untouched, so a check that rebuilds every guest keeps the
+    // tree clean.
+    let out = match args.out {
+        Some(path) => {
+            write_artifact(kind, &cdylib, &path)?;
+            path
+        }
+        None => {
+            let canonical = module_dir.join(kind.artifact());
+            write_artifact(kind, &cdylib, &canonical)?;
+            record_lock(&scratch, &module_dir)?;
+            canonical
+        }
+    };
     println!("{}", out.display());
     Ok(())
+}
+
+fn write_artifact(kind: GuestKind, cdylib: &Path, out: &Path) -> Result<(), String> {
+    match kind {
+        GuestKind::Component => componentize(cdylib, out),
+        GuestKind::Index => copy_cdylib(cdylib, out),
+    }
 }
 
 // ============================================================================
@@ -164,30 +220,29 @@ fn run() -> Result<(), String> {
 struct Args {
     module_dir: PathBuf,
     kind: GuestKind,
+    rev: Option<String>,
     out: Option<PathBuf>,
     scratch: Option<PathBuf>,
-    platform_root: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut module_dir = None;
     let mut kind = GuestKind::Component;
+    let mut rev = None;
     let mut out = None;
     let mut scratch = None;
-    let mut platform_root = None;
 
     let mut argv = env::args().skip(1);
     while let Some(arg) = argv.next() {
         let flag_value = |argv: &mut dyn Iterator<Item = String>| {
             argv.next()
-                .map(PathBuf::from)
                 .ok_or_else(|| format!("{arg} needs a value\n{USAGE}"))
         };
         match arg.as_str() {
             "--index" => kind = GuestKind::Index,
-            "--out" => out = Some(flag_value(&mut argv)?),
-            "--scratch" => scratch = Some(flag_value(&mut argv)?),
-            "--platform-root" => platform_root = Some(flag_value(&mut argv)?),
+            "--rev" => rev = Some(flag_value(&mut argv)?),
+            "--out" => out = Some(PathBuf::from(flag_value(&mut argv)?)),
+            "--scratch" => scratch = Some(PathBuf::from(flag_value(&mut argv)?)),
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown flag {flag}\n{USAGE}"));
             }
@@ -207,25 +262,39 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         module_dir,
         kind,
+        rev,
         out,
         scratch,
-        platform_root,
     })
 }
 
 // ============================================================================
-// module introspection — name + the `guest` feature contract
+// module introspection — name, place in the repository, declared guests
 // ============================================================================
 
 struct Module {
     name: String,
+    /// the module directory relative to the platform root: its place in the
+    /// repository, which is where the build reads it from.
+    path: PathBuf,
+    /// the guests the crate declares, by contract feature.
+    guests: Vec<GuestKind>,
 }
 
-/// read the module's package name via `cargo metadata` and verify it declares
-/// the requested guest's contract feature. a module without it has no such
-/// port to build, so fail with the wiring instruction rather than a
-/// downstream compile error.
-fn read_module(module_dir: &Path, kind: GuestKind) -> Result<Module, String> {
+/// read the module's package name and contract features via `cargo metadata`
+/// on the working-tree manifest. the build compiles the repository, so the
+/// module must be in it; a crate outside the platform checkout is an
+/// out-of-tree module, which is its own cdylib and needs no shell.
+fn read_module(platform_root: &Path, module_dir: &Path) -> Result<Module, String> {
+    let Ok(path) = module_dir.strip_prefix(platform_root) else {
+        return Err(format!(
+            "{} is outside the platform checkout {} — guest-builder builds the modules of \
+             this repository; a module authored elsewhere is its own cdylib crate pinning \
+             ducktape-module-sdk by git revision, built with cargo and wasm-tools directly",
+            module_dir.display(),
+            platform_root.display()
+        ));
+    };
     let manifest = module_dir.join("Cargo.toml");
     let output = Command::new(cargo())
         .args([
@@ -266,69 +335,205 @@ fn read_module(module_dir: &Path, kind: GuestKind) -> Result<Module, String> {
             manifest.display()
         ));
     };
-
-    let has_contract_feature = pkg["features"].get(kind.feature()).is_some();
-    if !has_contract_feature {
-        return Err(kind.missing_feature_hint(name));
-    }
+    let guests = GuestKind::ALL
+        .into_iter()
+        .filter(|kind| pkg["features"].get(kind.feature()).is_some())
+        .collect();
     Ok(Module {
         name: name.to_string(),
+        path: path.to_path_buf(),
+        guests,
     })
 }
 
-// ============================================================================
-// synthesis — the packaging workspace every module shares
-// ============================================================================
+/// the checkout's HEAD: the revision a build without `--rev` compiles.
+fn head(platform_root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(platform_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| format!("running git rev-parse: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD in {}: {}",
+            platform_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
-/// write the scratch packaging workspace: a cdylib crate whose only dependency
-/// is the module (the contract feature on, native off) plus the uniform wasm32
-/// patch set, over a `Cargo.lock` seeded from the platform checkout's own.
-/// regenerated on every run — nothing here is hand-maintained state.
-///
-/// The seed is what makes a rebuild reproducible in TIME, the way the snapshot
-/// below makes it reproducible across PATHS. Without it the guest workspace
-/// starts from no lock and cargo resolves the wasm32 graph against the live
-/// registry, so the same source rebuilt after any crates.io publish can produce
-/// different bytes. The host lock pins everything the host already resolved;
-/// the build runs without `--locked` so cargo can still trim it to the guest
-/// graph and resolve the wasm-only patch stubs the host never sees.
-///
-/// Every path dependency is reached through [`snapshot`] — `tree/...`, INSIDE
-/// the scratch workspace — because cargo hashes a path package's location into
-/// its `-C metadata`, and thus into every symbol name, relative to the
-/// workspace root when the package sits under it and ABSOLUTELY when it does
-/// not. Depending on the checkout directly is what made two checkouts of the
-/// same source produce different bytes; no rustc flag can undo it, since the
-/// hash is cargo's and is fixed before rustc runs.
-fn synthesize(
-    scratch: &Path,
-    module_dir: &Path,
-    name: &str,
-    platform_root: &Path,
-    kind: GuestKind,
-) -> Result<(), String> {
-    let src = scratch.join("src");
-    fs::create_dir_all(&src).map_err(|e| format!("creating {}: {e}", src.display()))?;
-    snapshot(platform_root, &scratch.join(TREE))?;
+/// Every local source used by the platform graph must agree with HEAD. The
+/// generated artifacts and lock are outputs, so a rebuild may rewrite them.
+fn refuse_modified_sources(platform_root: &Path, inputs: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let mut changed = BTreeSet::new();
+    for args in [
+        vec!["diff", "--name-only", "-z", "HEAD", "--"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(platform_root)
+            .args(args)
+            .args(inputs)
+            .args([
+                ":(exclude)**/component.wasm",
+                ":(exclude)**/index.wasm",
+                ":(exclude)**/guest.lock",
+            ])
+            .output()
+            .map_err(|e| format!("checking platform sources: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "checking platform sources: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        changed.extend(
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| String::from_utf8_lossy(path).into_owned()),
+        );
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "uncommitted platform build inputs: {} — the guest compiles HEAD; commit and push these sources first (or pass --rev to build a specific revision)",
+        changed.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
 
-    // an out-of-tree module is not ours to relocate: it keeps its own path, and
-    // with it the checkout-dependence this snapshot exists to remove.
-    let module_path = match module_dir.strip_prefix(platform_root) {
-        Ok(rel) => format!("{TREE}/{}", rel.display()),
-        Err(_) => module_dir.display().to_string(),
+/// Cargo's resolved platform packages include the SDK, sibling wire types,
+/// and active patch crates. Workspace manifests and build configuration are
+/// inputs even though Cargo does not report them as packages.
+fn platform_inputs(
+    graph: &serde_json::Value,
+    checkout: &Path,
+    git: &str,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut inputs = BTreeSet::from([
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("rust-toolchain.toml"),
+        PathBuf::from(".cargo"),
+    ]);
+    let source_prefix = format!("git+{git}?");
+    let Some(packages) = graph["packages"].as_array() else {
+        return Err("cargo metadata has no packages".to_string());
     };
-    let stubs = format!("{TREE}/crates/guests/stubs");
-    let blst = format!("{TREE}/patches/blst");
-    let feature = kind.feature();
-    let suffix = kind.shell_suffix();
-    let manifest = format!(
+    for package in packages {
+        let from_platform = package["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with(&source_prefix));
+        if !from_platform {
+            continue;
+        }
+        let Some(manifest) = package["manifest_path"].as_str() else {
+            return Err("platform package has no manifest path".to_string());
+        };
+        let path = Path::new(manifest)
+            .strip_prefix(checkout)
+            .map_err(|e| format!("platform package outside its checkout: {manifest}: {e}"))?;
+        let Some(directory) = path.parent() else {
+            return Err(format!("platform manifest has no directory: {manifest}"));
+        };
+        inputs.insert(directory.to_path_buf());
+    }
+    Ok(inputs)
+}
+
+// ============================================================================
+// synthesis — the shell workspace every module shares
+// ============================================================================
+
+/// write the shell workspace: one cdylib member per guest the module
+/// declares, each depending on the module alone (its contract feature on,
+/// defaults off) out of the platform git source, plus the uniform wasm32 patch
+/// set from the same source. regenerated on every run — nothing here is
+/// hand-maintained state, except the lock, which is seeded from the module's
+/// committed `guest.lock` when there is one.
+fn synthesize(scratch: &Path, module: &Module, source: &str) -> Result<(), String> {
+    for kind in &module.guests {
+        let member = scratch.join(kind.member());
+        let src = member.join("src");
+        fs::create_dir_all(&src).map_err(|e| format!("creating {}: {e}", src.display()))?;
+        write(
+            &member.join("Cargo.toml"),
+            &member_manifest(&module.name, *kind, source),
+        )?;
+        write(&src.join("lib.rs"), &member_lib(&module.name))?;
+    }
+    write(
+        &scratch.join("Cargo.toml"),
+        &workspace_manifest(&module.guests, source),
+    )
+}
+
+fn seed_lock(scratch: &Path, module_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(scratch).map_err(|e| format!("creating {}: {e}", scratch.display()))?;
+    let lock = scratch.join("Cargo.lock");
+    let committed = module_dir.join("guest.lock");
+    let Err(error) = fs::copy(&committed, &lock) else {
+        return Ok(());
+    };
+    let seed_is_absent = error.kind() == std::io::ErrorKind::NotFound;
+    if !seed_is_absent {
+        return Err(format!(
+            "seeding lock from {}: {error}",
+            committed.display()
+        ));
+    }
+    // A first build has no seed. A previous scratch lock is never an input.
+    let Err(error) = fs::remove_file(&lock) else {
+        return Ok(());
+    };
+    let scratch_lock_is_absent = error.kind() == std::io::ErrorKind::NotFound;
+    if scratch_lock_is_absent {
+        return Ok(());
+    }
+    Err(format!("removing scratch lock: {error}"))
+}
+
+fn workspace_manifest(guests: &[GuestKind], source: &str) -> String {
+    let members: Vec<String> = guests
+        .iter()
+        .map(|kind| format!("\"{}\"", kind.member()))
+        .collect();
+    format!(
         r#"# synthesized by guest-builder — do not edit; regenerated on every build.
-# the packaging shell only: the module logic and its guest port live in the
-# module crate (feature "{feature}"). this standalone workspace gives the cdylib
-# its own wasm32 dep resolution, feature unification, and patch set — none of
-# which may leak into the host workspace.
+# the packaging shell only: the module logic and its guest ports live in the
+# module crate, read out of the platform repository at the revision the lock
+# pins. one member per guest the module declares.
+[workspace]
+members = [{members}]
+resolver = "2"
+
+# the uniform wasm32 patch set (crates/module-sdk/stubs in the platform
+# repository, at the module's own revision): applied to every guest; cargo's
+# "unused patch" warning on a module whose graph never pulls one of these
+# crates is expected and harmless.
+[patch.crates-io]
+getrandom-02 = {{ package = "getrandom", version = "0.2", {source} }}
+getrandom-03 = {{ package = "getrandom", version = "0.3", {source} }}
+getrandom-04 = {{ package = "getrandom", version = "0.4", {source} }}
+blst = {{ {source} }}
+"#,
+        members = members.join(", ")
+    )
+}
+
+/// The member manifest uses an explicit revision during resolution, then
+/// source alone during compilation: rustc must never hash a written selector.
+fn member_manifest(name: &str, kind: GuestKind, source: &str) -> String {
+    let feature = kind.feature();
+    let member = kind.member();
+    format!(
+        r#"# synthesized by guest-builder — do not edit; regenerated on every build.
 [package]
-name = "{name}-{suffix}"
+name = "{name}-{member}"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -337,130 +542,108 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-{name} = {{ path = "{module_path}", default-features = false, features = ["{feature}"] }}
-
-# `exclude` is load-bearing: without it THIS workspace claims the snapshot's
-# crates, and their `workspace = true` inheritance resolves against this bare
-# table instead of the platform manifest one directory down.
-[workspace]
-exclude = ["{TREE}"]
-
-# the uniform wasm32 patch set (see crates/guests/stubs and patches/blst):
-# applied to every synthesized guest; cargo's "unused patch" warning on
-# modules whose graphs never pull these crates is expected and harmless.
-[patch.crates-io]
-getrandom = {{ path = "{stubs}/getrandom-02" }}
-getrandom-03 = {{ package = "getrandom", path = "{stubs}/getrandom-03" }}
-getrandom-04 = {{ package = "getrandom", path = "{stubs}/getrandom-04" }}
-blst = {{ path = "{blst}" }}
+{name} = {{ {source}, default-features = false, features = ["{feature}"] }}
 "#
-    );
-    let lib = format!(
+    )
+}
+
+fn member_lib(name: &str) -> String {
+    format!(
         "// synthesized by guest-builder — link the module crate for its guest export.\n\
          extern crate {} as _;\n",
         snake(name)
-    );
-
-    write(&scratch.join("Cargo.toml"), &manifest)?;
-    write(&src.join("lib.rs"), &lib)?;
-
-    // rewritten every run, never merged: the host lock IS the intended
-    // resolution, so a scratch lock left over from an older one is drift.
-    let host_lock = platform_root.join("Cargo.lock");
-    fs::copy(&host_lock, scratch.join("Cargo.lock"))
-        .map(|_| ())
-        .map_err(|e| format!("seeding the guest lock from {}: {e}", host_lock.display()))
+    )
 }
 
-/// refresh `<scratch>/tree` with a copy of the platform checkout's TRACKED
-/// files — the source the guest build actually compiles, and the reason its
-/// bytes do not depend on where the checkout lives.
-///
-/// The list comes from `git ls-files`, never from walking the directory: the
-/// tracked set IS the build input set — the committed artifacts rebuild
-/// byte-identically from it, which is the proof that nothing gitignored is an
-/// input — while the directory around it is mostly not: gitignored bulk (a
-/// `node_modules/`, a stray `target/`) runs to hundreds of MB, and a
-/// `make wasm-modules` sweep would tar all of it into each of its 22 scratch
-/// dirs. Walking is also unstable: a live writer rewriting a cache dir makes
-/// GNU tar exit 1 with "file changed as we read it" and aborts the sweep
-/// half-refreshed.
-///
-/// tar rather than a hand-rolled walk: it carries symlinks (`CLAUDE.md`,
-/// `.claude/skills`) and mtimes over verbatim, and the mtimes are what keep the
-/// next build incremental. A tracked file deleted from the working tree fails
-/// the snapshot with tar naming it — a checkout missing a build input cannot
-/// honestly build.
-fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
-    // wiped first: tar overwrites, it never removes, so a file deleted from the
-    // checkout would otherwise live on in here forever.
-    if tree.exists() {
-        fs::remove_dir_all(tree).map_err(|e| format!("clearing {}: {e}", tree.display()))?;
-    }
-    fs::create_dir_all(tree).map_err(|e| format!("creating {}: {e}", tree.display()))?;
-    let tracked = tracked_files(platform_root)?;
-
-    // NUL-separated names on stdin: no quoting, no splitting on whitespace, and
-    // no name mistaken for an option.
-    let mut pack = Command::new("tar")
-        .args(["-cf", "-", "-C"])
-        .arg(platform_root)
-        .args(["--null", "-T", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("running tar: {e}"))?;
-    let (Some(mut names), Some(packed)) = (pack.stdin.take(), pack.stdout.take()) else {
-        return Err("tar produced no name/archive stream".to_string());
-    };
-    // the extractor has to be draining the archive while we are still feeding
-    // names — both pipes are bounded, so writing the whole list first deadlocks.
-    let mut unpack = Command::new("tar")
-        .args(["-xf", "-", "-C"])
-        .arg(tree)
-        .stdin(packed)
-        .spawn()
-        .map_err(|e| format!("running tar: {e}"))?;
-    let fed = names.write_all(&tracked);
-    drop(names);
-    let packing = pack.wait().map_err(|e| format!("waiting on tar: {e}"))?;
-    let unpacking = unpack.wait().map_err(|e| format!("waiting on tar: {e}"))?;
-    if !packing.success() || !unpacking.success() {
-        return Err(format!(
-            "snapshotting {} into {} failed — tar named the offending path above; \
-             a tracked file missing from the working tree is the usual cause",
-            platform_root.display(),
-            tree.display()
-        ));
-    }
-    // checked after the exit statuses: a tar that died on a missing file closes
-    // the pipe, and its own message is the better diagnosis than our EPIPE.
-    fed.map_err(|e| format!("feeding the file list to tar: {e}"))
-}
-
-/// the checkout's tracked paths, NUL-separated, ready for `tar --null -T -`.
-fn tracked_files(platform_root: &Path) -> Result<Vec<u8>, String> {
-    let listed = Command::new("git")
-        .arg("-C")
-        .arg(platform_root)
-        .args(["ls-files", "-z"])
+/// Resolve against the requested revision from the first lookup, including
+/// a module that does not exist on the repository's default branch. The
+/// explicit selector is removed from both manifests and lock before rustc
+/// runs: only the lock's precise commit may vary between identical builds.
+fn pin(scratch: &Path, module: &Module, git: &str, rev: &str) -> Result<serde_json::Value, String> {
+    let locked_source = format!("git = {git:?}");
+    let revision_source = format!("{locked_source}, rev = {rev:?}");
+    synthesize(scratch, module, &revision_source)?;
+    let output = Command::new(cargo())
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "wasm32-unknown-unknown",
+        ])
+        .current_dir(scratch)
         .output()
-        .map_err(|e| format!("running git ls-files: {e}"))?;
-    if !listed.status.success() {
+        .map_err(|e| format!("resolving guest dependencies: {e}"))?;
+    if !output.status.success() {
         return Err(format!(
-            "git ls-files in {}: {}",
-            platform_root.display(),
-            String::from_utf8_lossy(&listed.stderr).trim()
+            "resolving {} at {rev} from {git} failed (push the revision first): {}",
+            module.name,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    if listed.stdout.is_empty() {
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parsing cargo metadata output: {e}"))?;
+    let lock = scratch.join("Cargo.lock");
+    let content = fs::read_to_string(&lock).map_err(|e| format!("reading resolved lock: {e}"))?;
+    let selected_source = format!("git+{git}?rev={rev}");
+    let precise_source = format!("git+{git}");
+    // Cargo uses this source ID in package entries and disambiguated dependency
+    // strings. Normalize every occurrence so they continue to name one source.
+    write(&lock, &content.replace(&selected_source, &precise_source))?;
+    synthesize(scratch, module, &locked_source)?;
+    Ok(graph)
+}
+
+/// Locate the platform checkout from the module's resolved manifest.
+fn checkout_root(meta: &serde_json::Value, module: &Module) -> Result<PathBuf, String> {
+    let is_the_module_from_git = |pkg: &&serde_json::Value| {
+        let named = pkg["name"].as_str() == Some(module.name.as_str());
+        let from_git = pkg["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("git+"));
+        named && from_git
+    };
+    let Some(pkg) = meta["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(is_the_module_from_git)
+    else {
         return Err(format!(
-            "{} tracks no files — --platform-root must be a git checkout, since \
-             the snapshot is its tracked file set",
-            platform_root.display()
+            "{} is not in the shell's resolved graph as a git package",
+            module.name
+        ));
+    };
+    let Some(manifest_path) = pkg["manifest_path"].as_str() else {
+        return Err(format!(
+            "{}: manifest path missing from metadata",
+            module.name
+        ));
+    };
+    checkout_root_of(Path::new(manifest_path), &module.path)
+}
+
+/// the checkout a git package's manifest sits in: its manifest path minus the
+/// module's place in the repository.
+fn checkout_root_of(manifest_path: &Path, module_path: &Path) -> Result<PathBuf, String> {
+    let module_manifest = module_path.join("Cargo.toml");
+    let depth = module_manifest.components().count();
+    let Some(root) = manifest_path.ancestors().nth(depth) else {
+        return Err(format!(
+            "{} is shallower than {}",
+            manifest_path.display(),
+            module_manifest.display()
+        ));
+    };
+    let sits_at_its_repository_place = root.join(&module_manifest) == manifest_path;
+    if !sits_at_its_repository_place {
+        return Err(format!(
+            "{} does not end in {}",
+            manifest_path.display(),
+            module_manifest.display()
         ));
     }
-    Ok(listed.stdout)
+    Ok(root.to_path_buf())
 }
 
 // ============================================================================
@@ -470,43 +653,47 @@ fn tracked_files(platform_root: &Path) -> Result<Vec<u8>, String> {
 /// `--remap-path-prefix` mappings that keep every builder-local absolute path
 /// out of the artifact's CONTENT — panic locations name their source file, so
 /// without these the bytes carry the builder's `/home/<user>/...` around
-/// forever. Half of path-independence; [`synthesize`]'s snapshot is the other
-/// half (symbol names). `ops/wasm-repro-check.sh` and the host-path scan in
+/// forever. `ops/wasm-repro-check.sh` and the host-path scan in
 /// `make wasm-modules-check` are the gates.
 ///
-/// The scratch mapping covers the snapshot with it, so the platform checkout
-/// needs no mapping of its own — the build never names it.
-fn remap_flags(module_dir: &Path, scratch: &Path) -> String {
+/// the checkout mapping is last on purpose: the checkout sits under
+/// CARGO_HOME and rustc takes the LAST matching mapping, so the
+/// revision-specific `git/checkouts/<repo>-<hash>/<rev>` directory becomes the
+/// stable `/ducktape` — the same token at every revision — instead of a path
+/// that would move the bytes on every commit.
+fn remap_flags(scratch: &Path, checkout: &Path) -> String {
     let home = env::var("HOME").unwrap_or_default();
     let tool_home =
         |key: &str, dir: &str| env::var(key).unwrap_or_else(|_| format!("{home}/{dir}"));
     let mappings = [
         (tool_home("CARGO_HOME", ".cargo"), "/cargo"),
         (tool_home("RUSTUP_HOME", ".rustup"), "/rustup"),
-        (scratch.display().to_string(), "/ducktape"),
-        // an out-of-tree module is compiled where it lies (see `synthesize`).
-        (module_dir.display().to_string(), "/module"),
+        (scratch.display().to_string(), "/guest-builder"),
+        (checkout.display().to_string(), "/ducktape"),
     ];
     let flags: Vec<String> = mappings
         .iter()
         .map(|(from, to)| format!("--remap-path-prefix={from}={to}"))
         .collect();
     // the ENCODED form's separator: plain `RUSTFLAGS` splits on whitespace, so
-    // a checkout path containing a space would tear one flag into two.
+    // a path containing a space would tear one flag into two.
     flags.join("\x1f")
 }
 
-fn build(scratch: &Path, rustflags: &str) -> Result<(), String> {
+fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result<(), String> {
+    let member = format!("{name}-{}", kind.member());
     let status = Command::new(cargo())
-        // deliberately NOT `--locked`, though [`synthesize`] seeds the lock:
-        // the scratch graph is a strict SUBSET of the host workspace's (one
-        // cdylib over one module, no app/node/test deps), so cargo must prune
-        // ~1000 entries out of the seeded lock, and a prune is a lock update
-        // `--locked` refuses outright ("cannot update the lock file ...
-        // because --locked was passed"). Seeding already carries the
-        // reproducibility: cargo reuses a locked version wherever the entry
-        // survives the prune, so nothing re-resolves against the live registry.
-        .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
+        // `--locked`: the lock is complete after `pin`, and the bytes are
+        // only reproducible if this build changes nothing in it.
+        .args([
+            "build",
+            "--locked",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+            "-p",
+            &member,
+        ])
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         // the encoded form wins over the plain one, but an inherited
         // `RUSTFLAGS` would be a confusing dead passenger.
@@ -521,6 +708,7 @@ fn build(scratch: &Path, rustflags: &str) -> Result<(), String> {
 }
 
 fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
+    refuse_other_componentizer()?;
     let status = Command::new("wasm-tools")
         .arg("component")
         .arg("new")
@@ -528,11 +716,36 @@ fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(out)
         .status()
-        .map_err(|e| format!("running wasm-tools (cargo install wasm-tools): {e}"))?;
+        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
     if !status.success() {
         return Err(format!("componentizing {} failed", cdylib.display()));
     }
     Ok(())
+}
+
+/// the componentizer writes the component's own sections, and they move
+/// between releases: 1.253 and 1.258 spell `target_features` differently, so
+/// one cdylib becomes two artifacts. that makes `wasm-tools` a build input
+/// exactly like the rust channel, and `cargo install wasm-tools` floats to the
+/// newest release — a box that ran it last week and a CI runner that runs it
+/// today disagree on every component. pinned here because this is the one
+/// place every gated artifact is componentized.
+fn refuse_other_componentizer() -> Result<(), String> {
+    let output = Command::new("wasm-tools")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
+    let installed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let pinned = format!("wasm-tools {WASM_TOOLS_VERSION}");
+    let is_the_pinned_componentizer = output.status.success() && installed == pinned;
+    if is_the_pinned_componentizer {
+        return Ok(());
+    }
+    Err(format!(
+        "{installed} componentizes to different bytes than {pinned}, which every \
+         committed component came out of:\n    {}",
+        install_wasm_tools()
+    ))
 }
 
 /// an index guest ships as the built cdylib itself — fluentabi is core wasm,
@@ -543,10 +756,19 @@ fn copy_cdylib(cdylib: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("copying {} to {}: {e}", cdylib.display(), out.display()))
 }
 
+/// the shell lock, written back beside the module as its `guest.lock`: the
+/// record of what the artifact was built from, and the seed of the next build.
+fn record_lock(scratch: &Path, module_dir: &Path) -> Result<(), String> {
+    let lock = module_dir.join("guest.lock");
+    fs::copy(scratch.join("Cargo.lock"), &lock)
+        .map(|_| ())
+        .map_err(|e| format!("recording the shell lock as {}: {e}", lock.display()))
+}
+
 fn cdylib_path(scratch: &Path, name: &str, kind: GuestKind) -> PathBuf {
     scratch
         .join("target/wasm32-unknown-unknown/release")
-        .join(format!("{}_{}.wasm", snake(name), kind.shell_suffix()))
+        .join(format!("{}_{}.wasm", snake(name), kind.member()))
 }
 
 // ============================================================================
@@ -558,12 +780,12 @@ fn cargo() -> String {
     env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
 }
 
-/// the ducktape checkout this binary was built from — the default source of
-/// guest-adapter and the patch crates for in-tree use.
+/// the ducktape checkout this binary was built from: the source of the
+/// default revision, and the tree a module directory must sit in.
 fn default_platform_root() -> Result<PathBuf, String> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let Some(root) = manifest_dir.parent().and_then(Path::parent) else {
-        return Err("cannot derive the platform root; pass --platform-root".to_string());
+        return Err("cannot derive the platform root from the build location".to_string());
     };
     canonical(root)
 }
@@ -589,49 +811,394 @@ fn write(path: &Path, content: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// the versions a lock pins for one crate name, in file order.
-    fn pinned(lock: &str, crate_name: &str) -> Vec<String> {
-        lock.split("[[package]]")
-            .filter(|entry| entry.contains(&format!("\nname = \"{crate_name}\"\n")))
-            .filter_map(|entry| {
-                entry
-                    .lines()
-                    .find_map(|line| line.strip_prefix("version = \""))
-            })
-            .map(|version| version.trim_end_matches('"').to_string())
-            .collect()
+    /// every workflow that componentizes must install the pinned
+    /// componentizer, or the runner refuses the build it was added to run.
+    /// two places, one version: this is what keeps them one.
+    #[test]
+    fn the_workflows_install_the_pinned_componentizer() {
+        let root = default_platform_root().unwrap();
+        let install = r#"cargo install wasm-tools --locked --version "$(cat wasm-tools.version)""#;
+        for workflow in ["pr.yml", "guest-wasm-mac-smoke.yml"] {
+            let path = root.join(".github/workflows").join(workflow);
+            let text = fs::read_to_string(&path).unwrap();
+            let installs_wasm_tools = text.contains("cargo install wasm-tools");
+            if !installs_wasm_tools {
+                continue;
+            }
+            assert!(
+                text.contains(install),
+                "{workflow} installs a componentizer other than the pinned one:\n    {install}"
+            );
+        }
     }
 
-    /// synthesis must hand the scratch workspace the host's resolution. an
-    /// unseeded guest workspace re-resolves its wasm32 graph against the live
-    /// registry on every run, so a crates.io publish between two rebuilds
-    /// silently moves the component bytes of a module whose source nobody
-    /// touched.
+    /// a written git reference is hashed into every symbol name, so the shell
+    /// must name the module by source alone and leave the revision to the lock.
     #[test]
-    fn synthesis_seeds_the_host_lock() {
-        let platform_root = default_platform_root().expect("platform root");
-        let scratch = tempfile::tempdir().expect("scratch dir");
-        let module_dir = platform_root.join("crates/modules/apps/tasks");
-        synthesize(
-            scratch.path(),
-            &module_dir,
-            "tasks",
-            &platform_root,
+    fn the_shell_names_the_module_by_source_alone() {
+        let manifest = member_manifest(
+            "chat",
             GuestKind::Component,
-        )
-        .expect("synthesize");
-
-        let host = fs::read_to_string(platform_root.join("Cargo.lock")).expect("host lock");
-        let seeded =
-            fs::read_to_string(scratch.path().join("Cargo.lock")).expect("seeded scratch lock");
-
-        // serde is in both graphs, so the host pin is the guest pin.
-        let host_serde = pinned(&host, "serde");
-        assert!(!host_serde.is_empty(), "host lock pins no serde");
-        assert_eq!(
-            pinned(&seeded, "serde"),
-            host_serde,
-            "seeded lock must carry the host's serde pin"
+            &format!("git = {PLATFORM_GIT:?}"),
         );
+        assert!(manifest.contains(
+            "chat = { git = \"https://github.com/orthory/ducktape\", default-features = false, features = [\"guest\"] }"
+        ));
+        assert!(!manifest.contains("rev ="));
+        assert!(!manifest.contains("branch ="));
+        assert!(manifest.contains("name = \"chat-component\""));
+    }
+
+    #[test]
+    fn the_workspace_has_one_member_per_declared_guest() {
+        let both = workspace_manifest(
+            &[GuestKind::Component, GuestKind::Index],
+            &format!("git = {PLATFORM_GIT:?}"),
+        );
+        assert!(both.contains("members = [\"component\", \"index\"]"));
+        let component_only =
+            workspace_manifest(&[GuestKind::Component], &format!("git = {PLATFORM_GIT:?}"));
+        assert!(component_only.contains("members = [\"component\"]"));
+        // the patch stubs ride the same source, with no reference either
+        assert!(both.contains("getrandom-02 = { package = \"getrandom\", version = \"0.2\", git = \"https://github.com/orthory/ducktape\" }"));
+        assert!(!both.contains("rev ="));
+    }
+
+    /// rustc takes the last matching mapping, and the checkout lives under
+    /// CARGO_HOME: the checkout's stable token must come after CARGO_HOME's.
+    #[test]
+    fn the_checkout_mapping_comes_after_cargo_home() {
+        let flags = remap_flags(
+            Path::new("/scratch"),
+            Path::new("/home/u/.cargo/git/checkouts/ducktape-1234/abcdef0"),
+        );
+        let flags: Vec<&str> = flags.split('\x1f').collect();
+        let cargo_home = flags
+            .iter()
+            .position(|f| f.ends_with("=/cargo"))
+            .expect("cargo home mapping");
+        let checkout = flags
+            .iter()
+            .position(|f| f.ends_with("=/ducktape"))
+            .expect("checkout mapping");
+        assert!(checkout > cargo_home, "{flags:?}");
+        assert_eq!(
+            flags[checkout],
+            "--remap-path-prefix=/home/u/.cargo/git/checkouts/ducktape-1234/abcdef0=/ducktape"
+        );
+    }
+
+    #[test]
+    fn the_checkout_root_is_the_manifest_minus_the_repository_place() {
+        let root = checkout_root_of(
+            Path::new("/home/u/.cargo/git/checkouts/ducktape-1234/abcdef0/crates/modules/apps/chat/Cargo.toml"),
+            Path::new("crates/modules/apps/chat"),
+        )
+        .expect("root");
+        assert_eq!(
+            root,
+            Path::new("/home/u/.cargo/git/checkouts/ducktape-1234/abcdef0")
+        );
+
+        let wrong_place = checkout_root_of(
+            Path::new("/somewhere/else/tasks/Cargo.toml"),
+            Path::new("crates/modules/apps/chat"),
+        );
+        assert!(wrong_place.is_err());
+    }
+
+    fn scratch() -> tempfile::TempDir {
+        let root = default_platform_root()
+            .unwrap()
+            .join("target/guest-builder-tests");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::tempdir_in(root).unwrap()
+    }
+
+    fn run_command(command: &mut Command) -> std::process::Output {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = run_command(Command::new("git").arg("-C").arg(repo).args(args));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn fixture_file(root: &Path, path: &str, content: &str) {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    fn platform_fixture(root: &Path) -> (Module, String, String) {
+        fs::create_dir_all(root).unwrap();
+        git(root, &["init", "--initial-branch=base"]);
+        git(root, &["config", "user.name", "Guest builder test"]);
+        git(
+            root,
+            &["config", "user.email", "guest-builder@example.invalid"],
+        );
+        fixture_file(root, ".gitignore", "target/\n");
+        fixture_file(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"shared\"]\nresolver = \"2\"\n",
+        );
+        fixture_file(
+            root,
+            "shared/Cargo.toml",
+            "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        fixture_file(root, "shared/src/lib.rs", "pub fn value() -> u32 { 1 }\n");
+        for (directory, name, version) in [
+            ("random02", "getrandom", "0.2.17"),
+            ("random03", "getrandom", "0.3.4"),
+            ("random04", "getrandom", "0.4.3"),
+            ("blst", "blst", "0.3.16"),
+        ] {
+            fixture_file(
+                root,
+                &format!("stubs/{directory}/Cargo.toml"),
+                &format!(
+                    "[package]\nname = {name:?}\nversion = {version:?}\nedition = \"2021\"\n[workspace]\n"
+                ),
+            );
+            fixture_file(root, &format!("stubs/{directory}/src/lib.rs"), "");
+        }
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Base without the new module",
+            ],
+        );
+        // A second source with the same package name forces Cargo to spell
+        // source IDs in dependency entries as well as package records.
+        let other = root.parent().unwrap().join("other-shared");
+        fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "--initial-branch=base"]);
+        git(&other, &["config", "user.name", "Guest builder test"]);
+        git(
+            &other,
+            &["config", "user.email", "guest-builder@example.invalid"],
+        );
+        fixture_file(
+            &other,
+            "Cargo.toml",
+            "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        );
+        fixture_file(&other, "src/lib.rs", "pub fn value() -> u32 { 2 }\n");
+        git(&other, &["add", "."]);
+        git(
+            &other,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Independent shared package",
+            ],
+        );
+        git(root, &["switch", "-c", "module"]);
+        fixture_file(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"shared\", \"module\"]\nresolver = \"2\"\n",
+        );
+        fixture_file(
+            root,
+            "module/Cargo.toml",
+            "[package]\nname = \"new-module\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nguest = []\n[dependencies]\nshared = { path = \"../shared\" }\n",
+        );
+        let manifest = root.join("module/Cargo.toml");
+        let mut content = fs::read_to_string(&manifest).unwrap();
+        content.push_str(&format!(
+            "other-shared = {{ package = \"shared\", git = \"file://{}\" }}\n",
+            other.display()
+        ));
+        fs::write(manifest, content).unwrap();
+        fixture_file(
+            root,
+            "module/src/lib.rs",
+            "pub fn value() -> u32 { shared::value() }\n",
+        );
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Introduce a guest on its branch",
+            ],
+        );
+        let rev = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["switch", "base"]);
+        let module = Module {
+            name: "new-module".into(),
+            path: "module".into(),
+            guests: vec![GuestKind::Component],
+        };
+        (module, format!("file://{}", root.display()), rev)
+    }
+
+    #[test]
+    fn first_build_resolves_a_package_absent_from_the_default_branch() {
+        let work = scratch();
+        let repo = work.path().join("platform");
+        let (module, url, rev) = platform_fixture(&repo);
+        let shell = work.path().join("shell");
+        fixture_file(
+            &shell,
+            "Cargo.lock",
+            "stale scratch state must not seed a first build",
+        );
+        seed_lock(&shell, &repo.join("module")).unwrap();
+        assert!(!shell.join("Cargo.lock").exists());
+        let graph = pin(&shell, &module, &url, &rev).unwrap();
+        let checkout = checkout_root(&graph, &module).unwrap();
+        assert!(checkout.join("module/src/lib.rs").is_file());
+        let lock = fs::read_to_string(shell.join("Cargo.lock")).unwrap();
+        assert!(lock.contains(&format!("git+{url}#{rev}")));
+        assert!(!lock.contains("?rev="));
+        assert!(
+            !fs::read_to_string(shell.join("component/Cargo.toml"))
+                .unwrap()
+                .contains("rev =")
+        );
+        run_command(Command::new(cargo()).current_dir(&shell).args([
+            "check",
+            "--locked",
+            "--target",
+            "wasm32-unknown-unknown",
+        ]));
+        assert_eq!(lock, fs::read_to_string(shell.join("Cargo.lock")).unwrap());
+    }
+
+    #[test]
+    fn resolved_inputs_refuse_shared_staged_and_untracked_sources() {
+        let work = scratch();
+        let repo = work.path().join("platform");
+        let (module, url, rev) = platform_fixture(&repo);
+        let shell = work.path().join("shell");
+        let graph = pin(&shell, &module, &url, &rev).unwrap();
+        let checkout = checkout_root(&graph, &module).unwrap();
+        let inputs = platform_inputs(&graph, &checkout, &url).unwrap();
+        assert!(inputs.contains(Path::new("shared")));
+        git(&repo, &["switch", "module"]);
+        refuse_modified_sources(&repo, &inputs).unwrap();
+        for path in [
+            "module/component.wasm",
+            "module/index.wasm",
+            "module/guest.lock",
+            "unrelated/src/lib.rs",
+        ] {
+            fixture_file(&repo, path, "not a source in this guest's graph");
+        }
+        refuse_modified_sources(&repo, &inputs).unwrap();
+        fixture_file(&repo, "shared/src/lib.rs", "pub fn value() -> u32 { 2 }\n");
+        assert!(
+            refuse_modified_sources(&repo, &inputs)
+                .unwrap_err()
+                .contains("shared/src/lib.rs")
+        );
+        git(&repo, &["add", "shared/src/lib.rs"]);
+        assert!(
+            refuse_modified_sources(&repo, &inputs)
+                .unwrap_err()
+                .contains("shared/src/lib.rs")
+        );
+        git(
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Change shared source",
+            ],
+        );
+        fixture_file(&repo, "shared/src/new.rs", "pub const VALUE: u32 = 3;\n");
+        assert!(
+            refuse_modified_sources(&repo, &inputs)
+                .unwrap_err()
+                .contains("shared/src/new.rs")
+        );
+        fs::remove_file(repo.join("shared/src/new.rs")).unwrap();
+        fixture_file(
+            &repo,
+            ".cargo/config.toml",
+            "[build]\nincremental = false\n",
+        );
+        assert!(
+            refuse_modified_sources(&repo, &inputs)
+                .unwrap_err()
+                .contains(".cargo/config.toml")
+        );
+    }
+
+    #[test]
+    fn both_macros_compile_with_only_the_module_sdk_platform_dependency() {
+        let work = scratch();
+        let sdk = default_platform_root().unwrap().join("crates/module-sdk");
+        fixture_file(
+            work.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"store\", \"snapshot\"]\nresolver = \"2\"\n",
+        );
+        let implementation = r#"
+use ducktape_module_sdk::sdk;
+struct Example;
+#[async_trait::async_trait(?Send)]
+impl sdk::Module for Example {
+    fn id(&self) -> sdk::ModuleId { "example".into() }
+    fn root(&self) -> sdk::StateRoot { sdk::StateRoot([0; 32]) }
+    async fn execute(&mut self, _ctx: &mut dyn sdk::Ctx, _msg: &sdk::Msg) -> Result<(), sdk::Error> { Ok(()) }
+}
+"#;
+        for kind in ["store", "snapshot"] {
+            fixture_file(
+                work.path(),
+                &format!("{kind}/Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"{kind}-macro-check\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n[dependencies]\nducktape-module-sdk = {{ path = {sdk:?} }}\nasync-trait = \"0.1\"\n"
+                ),
+            );
+            let snapshot = match kind {
+                "snapshot" => {
+                    r#"
+impl Example {
+    fn snapshot(&self) -> Vec<u8> { Vec::new() }
+    fn install(&mut self, _bytes: &[u8], _root: sdk::StateRoot) -> Result<(), sdk::Error> { Ok(()) }
+}
+"#
+                }
+                _ => "",
+            };
+            fixture_file(
+                work.path(),
+                &format!("{kind}/src/lib.rs"),
+                &format!(
+                    "{implementation}\n{snapshot}\nducktape_module_sdk::{kind}_guest! {{ id: \"example\", module: Example, shape: ducktape_module_sdk::map_shape(), new: Example }}\n"
+                ),
+            );
+        }
+        run_command(Command::new(cargo()).current_dir(work.path()).args([
+            "check",
+            "--workspace",
+            "--target",
+            "wasm32-unknown-unknown",
+        ]));
     }
 }

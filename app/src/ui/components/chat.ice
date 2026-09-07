@@ -499,12 +499,16 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         hovered bg=muted_bg text=fg border=brand_line
         pressed bg=muted_bg text=fg border=brand
 
-component MessageContents(message:ChatMessage)
+// `surface` is which list this row lives in. It is a prop and not something
+// the component works out, because the SAME contents draw in the stream and in
+// the thread rail, and a copy range must never span the two — see `CopySurface`.
+component MessageContents(message:ChatMessage, surface:CopySurface)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_message_link(str)
+    press_message(i64, CopySurface)
   col w=fill
     row
       with
@@ -566,9 +570,14 @@ component MessageContents(message:ChatMessage)
                   font=code_medium
                   @text-muted
             space w=fill
-        MessageBody message=message
-          forward
-            open_message_link
+        // A PRESS ON THE PROSE PICKS A COPY RANGE. Plain, it starts one at
+        // this message; with ⇧ held it moves the far end of the one already
+        // open. It is a `mouse press` and not a button because the body is
+        // rich text with its own links — a button here would swallow them.
+        mouse press=emit(press_message, message.seq, surface)
+          MessageBody message=message
+            forward
+              open_message_link
         // `· edited` ANNOTATES THE MESSAGE, NOT THE RUN. It lived inside the
         // `show_author` header, so in a run of five messages only the first
         // could ever say it had been edited — and runs are most of a busy
@@ -680,7 +689,7 @@ component MessageContents(message:ChatMessage)
                 h=6.0
                 style=icon_tint("muted")
                 opacity=1.0
-component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -688,6 +697,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
     open_message_link(str)
+    press_message(i64, CopySurface)
   col w=fill
     if message.show_author
       space w=1.0 h=14.0
@@ -708,65 +718,83 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
         r=9.0
         open=menu_open
       stack w=fill
-        if message.deleted
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=transparent
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
-        // Selection is a tint, not a ring — see the QA note in the stream. The
-        // tint is `selected_row`, the one plate that means "the row you are on":
-        // a menu-open or deep-linked message is that row, exactly as a chosen
-        // channel or an open file is. It read `brand_bg` until the reaction chip
-        // moved onto the same token and vanished on it.
-        if !message.deleted && selected
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=selected_row
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
-        if !message.deleted && !selected
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=transparent
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
+        // ONE PLATE, ONE MATCH. This was three `if` arms over the same box
+        // differing in a single colour, so a third reading (the copy range)
+        // would have been a fourth copy of them. The plate is the decision,
+        // `message_plate` makes it once, and the colours stay in `theme.ice`,
+        // which is the only place that holds a palette.
+        //
+        // Selection is a tint, not a ring — see the QA note in the stream.
+        // `selected_row` is the one plate that means "the row you are on": a
+        // menu-open or deep-linked message is that row, exactly as a chosen
+        // channel or an open file is. It read `brand_bg` until the reaction
+        // chip moved onto the same token and vanished on it. A row in the copy
+        // range wears the lighter `brand_wash` — it is a run, and a run painted
+        // in the "you are here" plate would say the reader is on all of them.
+        //
+        // THE PRESS THAT PICKS A COPY RANGE sits on the prose and nothing
+        // else. Wrapping the whole row would put it under the ♡ and the ⋯, and
+        // a reaction click would drag the range along with it; the body is
+        // also exactly what the copy lifts, so the thing you press is the
+        // thing you get.
+        match message_plate(message.deleted, selected, in_range)
+          RowPlate.plain
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=transparent
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.timeline
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
+          RowPlate.selected
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=selected_row
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.timeline
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
+          RowPlate.ranged
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=brand_wash
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.timeline
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
       col w=fill
         if !message.deleted && !message.pending
           box
@@ -894,13 +922,14 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
+    press_message(i64, CopySurface)
     open_message_link(str)
   col w=fill
     if message.show_author
@@ -914,61 +943,66 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool)
         r=9.0
         open=menu_open
       stack w=fill
-        if message.deleted
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=transparent
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
-        // Same `selected_row` tint as the stream — see the note in MessageCard.
-        if !message.deleted && selected
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=selected_row
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
-        if !message.deleted && !selected
-          box
-            with
-              w=fill
-              pl=7.0
-              pr=7.0
-              pt=4.0
-              pb=4.0
-              bg=transparent
-              border=transparent
-              border-w=1.0
-              r=9.0
-            MessageContents message=message
-              forward
-                add_reaction_at
-                remove_reaction_at
-                open_thread_for
-                open_message_link
+        // Same plate, same match — `message_plate` gives the same answer the
+        // stream's card asks for, so a reply reads exactly like a message.
+        match message_plate(message.deleted, selected, in_range)
+          RowPlate.plain
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=transparent
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.thread
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
+          RowPlate.selected
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=selected_row
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.thread
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
+          RowPlate.ranged
+            box
+              with
+                w=fill
+                pl=7.0
+                pr=7.0
+                pt=4.0
+                pb=4.0
+                bg=brand_wash
+                border=transparent
+                border-w=1.0
+                r=9.0
+              MessageContents message=message surface=CopySurface.thread
+                forward
+                  add_reaction_at
+                  remove_reaction_at
+                  open_thread_for
+                  open_message_link
+                  press_message
       col w=fill
         if !message.deleted && !message.pending
           box

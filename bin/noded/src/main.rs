@@ -34,8 +34,7 @@ use noded::bundle::{DirCodeSource, qmdb_stores};
 use noded::compose::{Admissions, Bindings, Boot, Substrates, compose};
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
-    hex_root,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, StreamHub, block_row, hex_root,
 };
 use sdk::{Event, Msg, Origin};
 use topology::TOPOLOGY;
@@ -45,8 +44,6 @@ use topology::TOPOLOGY;
 /// composer; status reports list the host's live set, which grows with the
 /// modules registry's admissions.
 const MODULE_IDS: &[&str] = topology::SIM_BASE;
-
-mod echo_oracle;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
@@ -102,7 +99,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // this daemon runs no network, so its index guests come from the same
     // founding set its components do, not from a genesis.
     let index = noded::open_index_store(&storage, MODULE_IDS)?;
-    noded::converge_index_guests(&index, &noded::IndexGuests::from_dir(&modules_dir, MODULE_IDS)?)?;
 
     let log_ring = noded::LogRing::default();
     noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
@@ -250,7 +246,6 @@ fn run_node(
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(
-            MODULE_IDS,
             &code,
             &mut stores,
             &substrates,
@@ -264,6 +259,7 @@ fn run_node(
         .await
         .expect("noded genesis composes");
         host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
+        noded::converge_host_modules(&index, &host).expect("deployed index guests converge");
 
         tracing::info!(
             target: "ducktape::consensus",
@@ -299,9 +295,8 @@ fn run_node(
 
         // NO in-process compute plane: dispatch work is executed by the
         // standalone compute daemon, which reaches this node over its own /v1
-        // surface like any other client. What is left here is the reactor seam
-        // itself (plus the debug echo the e2e drives).
-        let workers = echo_oracle::workers();
+        // surface like any other client. The local reactor drains only the
+        // committed onchain delivery and program-call queues.
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
@@ -359,7 +354,6 @@ fn run_node(
                 } => {
                     let result = submit_and_drain(
                         &mut host,
-                        &workers,
                         &mut height,
                         &index,
                         &op_blobs,
@@ -386,7 +380,6 @@ fn run_node(
                         Ok((origin, msg)) => {
                             submit_and_drain(
                                 &mut host,
-                                &workers,
                                 &mut height,
                                 &index,
                                 &op_blobs,
@@ -427,13 +420,12 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// commit the caller's op, then drain worker follow-ups (each its own block).
+/// commit the caller's op, then drain committed onchain work (each its own block).
 /// the returned summary is the block that INCLUDED the caller's op — follow-up
 /// blocks reach clients over the ws stream, not this reply.
 #[allow(clippy::too_many_arguments)]
 async fn submit_and_drain(
     host: &mut Host,
-    workers: &[Box<dyn host::worker::Worker>],
     height: &mut u64,
     index: &IndexStore,
     blobs: &noded::blobs::BlobHandle,
@@ -452,10 +444,9 @@ async fn submit_and_drain(
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
         };
 
-    // the shared reactor loop settles worker follow-ups through this lane's own
-    // 1-op-1-block submit path (each its own block), nudging a stranded dispatch
-    // mailbox and bounding a self-retriggering worker.
-    let mut lane = OracleLane {
+    // The reactor nudges committed delivery and call queues through this
+    // lane's block boundary, bounding programs that retrigger themselves.
+    let mut lane = PendingLane {
         host: &mut *host,
         height: &mut *height,
         index,
@@ -463,7 +454,7 @@ async fn submit_and_drain(
         stream_hub,
         metrics,
     };
-    let unclaimed = match host::worker::drive(workers, events, &mut lane).await {
+    let unclaimed = match host::worker::drive(&[], events, &mut lane).await {
         Ok(unclaimed) => unclaimed,
         Err(host::worker::Error::Fatal(err)) => {
             tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
@@ -484,11 +475,9 @@ async fn submit_and_drain(
     Ok(included)
 }
 
-/// the noded submit lane behind the shared reactor [`host::worker::drive`]: each
-/// worker follow-up commits as its own block through [`submit_one`] under the
-/// oracle origin. a deterministic rejection is logged and skipped (the oracle's
-/// result never landed); only a fatal block-boundary fault propagates.
-struct OracleLane<'a> {
+/// The local reactor can only nudge committed onchain queues. It has no
+/// external workers or provider identity; each nudge commits as a system op.
+struct PendingLane<'a> {
     host: &'a mut Host,
     height: &'a mut u64,
     index: &'a IndexStore,
@@ -498,7 +487,7 @@ struct OracleLane<'a> {
 }
 
 #[async_trait::async_trait(?Send)]
-impl host::worker::Lane for OracleLane<'_> {
+impl host::worker::Lane for PendingLane<'_> {
     async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, host::worker::Error> {
         match submit_one(
             self.host,
@@ -507,7 +496,7 @@ impl host::worker::Lane for OracleLane<'_> {
             self.blobs,
             self.stream_hub,
             self.metrics,
-            Origin::External(ORACLE_ORIGIN.to_vec()),
+            Origin::System,
             follow,
         )
         .await
@@ -518,7 +507,7 @@ impl host::worker::Lane for OracleLane<'_> {
                 tracing::warn!(
                     target: "ducktape::modules",
                     error = %err,
-                    "worker follow-up REJECTED — the oracle's result never landed"
+                    "pending-work nudge rejected"
                 );
                 Ok(Vec::new())
             }
@@ -526,7 +515,20 @@ impl host::worker::Lane for OracleLane<'_> {
     }
 
     async fn pending(&self) -> bool {
-        self.host.has_pending_deliveries().await
+        match self.host.has_pending_work().await {
+            Ok(pending) => pending,
+            // an unreadable queue fails the next block closed on its own; the
+            // pump does not manufacture one.
+            Err(e) => {
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %e,
+                    reason = "pending_work_unreadable",
+                    "could not read the committed queues"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -563,6 +565,10 @@ fn publish_status(
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,
+        // the embedded daemon never arms a `ConsensusTimePolicy` either —
+        // height-is-time, same as the validator/replica lanes.
+        consensus_time: height,
+        consensus_time_unit: noded::ConsensusTimeUnit::Height,
         modules,
         // the embedded daemon has no mesh identity — clients treat an empty
         // key as "no peer-routed features here".
@@ -653,7 +659,7 @@ async fn submit_one(
         consensus_time,
         record,
         &out.dispatches,
-        &host.module_roots(),
+        host,
     );
 
     // fan the block out live after the derived index had its chance to

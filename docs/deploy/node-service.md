@@ -109,13 +109,11 @@ dt node list                              # the chain id the instance names
 
 `node init`/`node join` probe the host and write the `[sandbox]` table when
 `/dev/kvm` opens; a host that gained KVM later runs `dt node sandbox` once.
-Firecracker, `mke2fs`, `debugfs` AND `nft` must be on the service's `PATH`
+Firecracker, `mke2fs` AND `debugfs` must be on the service's `PATH`
 — `/usr/local/bin`, `/usr/sbin` and `/sbin` are searched
-(`crates/services/sandbox/src/host_tools.rs`). `nft` is not optional: the
-Firecracker backend lists it unconditionally (`sandbox.rs`,
-`required_tools`) and the compute/agent daemon refuses to boot without it
-(`nft is not executable on PATH`), tap-networked run or not — install
-`nftables` alongside `e2fsprogs`.
+(`crates/services/sandbox/src/host_tools.rs`); the compute/agent daemon
+refuses to boot without them (`sandbox.rs`, `required_tools`) — install
+`e2fsprogs`.
 
 ## Enable and start
 

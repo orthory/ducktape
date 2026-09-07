@@ -72,17 +72,22 @@ on fs_failed(cause)
 on fs_new_name_changed(next)
   fs_new_name = next
 
+// EVERY WRITE ASKS THE MODULE'S RULE FIRST (`files_write_gate`): a root or
+// another member's home refuses here, in the module's words, instead of
+// after a signed round trip.
 on fs_mkdir_submit
   return if fs_loading || !connected || empty(trim(fs_new_name))
+  error = files_write_gate(fs_path, settings_user_key)
+  return if !empty(error)
   fs_loading = true
-  error = ""
-  run every files_mkdir(connected_rpc, fs_child(fs_path, trim(fs_new_name))) -> fs_wrote _ | fs_write_failed _
+  run every files_mkdir(connected_rpc, password, fs_child(fs_path, trim(fs_new_name))) -> fs_wrote _ | fs_write_failed _
 
 on fs_new_file_submit
   return if fs_loading || !connected || empty(trim(fs_new_name))
+  error = files_write_gate(fs_path, settings_user_key)
+  return if !empty(error)
   fs_loading = true
-  error = ""
-  run every files_write_text(connected_rpc, fs_child(fs_path, trim(fs_new_name)), "") -> fs_wrote _ | fs_write_failed _
+  run every files_write_text(connected_rpc, password, fs_child(fs_path, trim(fs_new_name)), "") -> fs_wrote _ | fs_write_failed _
 
 on fs_arm_delete(path)
   fs_delete_target = path
@@ -92,9 +97,10 @@ on fs_disarm_delete
 
 on fs_delete_submit
   return if fs_loading || !connected || empty(fs_delete_target)
+  error = files_write_gate(fs_parent(fs_delete_target), settings_user_key)
+  return if !empty(error)
   fs_loading = true
-  error = ""
-  run every files_remove(connected_rpc, fs_delete_target) -> fs_wrote _ | fs_write_failed _
+  run every files_remove(connected_rpc, password, fs_delete_target) -> fs_wrote _ | fs_write_failed _
 
 on fs_begin_edit
   return if fs_preview_binary || empty(fs_preview_path)
@@ -106,11 +112,12 @@ on fs_cancel_edit
 
 on fs_save_edit
   return if fs_loading || !connected || !fs_editing || empty(fs_preview_path)
+  error = files_write_gate(fs_parent(fs_preview_path), settings_user_key)
+  return if !empty(error)
   fs_loading = true
   fs_editing = false
   fs_preview_text = editor_text(fs_editor)
-  error = ""
-  run every files_write_text(connected_rpc, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
+  run every files_write_text(connected_rpc, password, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
 
 on fs_wrote(_result)
   fs_new_name = ""
@@ -127,9 +134,10 @@ on fs_write_failed(cause)
 
 on fs_file_dropped(path)
   return if shell_tab != ShellTab.files || fs_loading || !connected
+  error = files_write_gate(fs_path, settings_user_key)
+  return if !empty(error)
   fs_loading = true
-  error = ""
-  run every files_upload(connected_rpc, fs_path, path) -> fs_wrote _ | fs_write_failed _
+  run every files_upload(connected_rpc, password, fs_path, path) -> fs_wrote _ | fs_write_failed _
 
 on fs_show_diff(from)
   return if fs_loading || !connected

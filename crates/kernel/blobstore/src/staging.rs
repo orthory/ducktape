@@ -2,26 +2,39 @@
 //! ever holding it whole in memory.
 //!
 //! a [`StagedBlob`] is an exclusive, append-only writer for one expected
-//! `(digest, len)`. bytes stream into `<root>/staging/<hex>` and fold into a
-//! running sha256 as they land; [`StagedBlob::finish`] verifies length and
-//! hash and only then publishes the file under its content-addressed name
-//! (atomic rename) — bytes are never addressable before they verify, so a
-//! crashed or lying transfer can never leave a file whose name misdescribes
-//! its content. rootless (in-memory) stores stage into a plain buffer so the
-//! API is uniform for tests and embedders.
+//! `(digest, len)`. bytes stream into `<root>/staging/<hex>`;
+//! [`StagedBlob::finish`] re-reads the FILE, verifies its length and hash, and
+//! only then publishes it under its content-addressed name (atomic rename) —
+//! bytes are never addressable before they verify, so a crashed or lying
+//! transfer can never leave a file whose name misdescribes its content.
+//! rootless (in-memory) stores stage into a plain buffer so the API is uniform
+//! for tests and embedders.
 //!
-//! resume: re-opening a digest's staging slot rebuilds the running hash from
-//! the bytes already on disk and reports the high-water [`StagedBlob::offset`]
-//! for the sender to continue from. exclusivity is the CALLER's admission
-//! contract — one live transfer per digest — the slot itself only ever
-//! appends.
+//! the file, not the stream, is what verifies: a running hash only ever sees
+//! what ONE writer appended, and the bytes that get renamed are whatever is on
+//! disk. that gap is why exclusivity is the STORE's, not the caller's: the
+//! staging slot for a digest has one live [`StagedBlob`] at a time, and a
+//! second opener is refused [`StageError::AlreadyStaging`]. the code plane's
+//! push and the mesh fetch lane both stage committed digests, and each was
+//! guarding only against itself.
+//!
+//! resume: re-opening a digest's staging slot continues from the high-water
+//! [`StagedBlob::offset`] the bytes already on disk give.
 
 use std::io::{Read as _, Seek as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::{BlobHandle, hex};
+use crate::{BlobHandle, hex, sha256};
+
+/// how long an abandoned staging file stays resumable. past it the partial is
+/// garbage: no sender is coming back for it, and nothing else on the node ever
+/// asks for a file under the staging name. this is what bounds the disk a
+/// dropped (or deliberately abandoned) transfer can leave behind — a live
+/// transfer keeps its file's mtime fresh, so only the dead ones age out.
+pub const STAGING_RESUME_WINDOW: Duration = Duration::from_secs(600);
 
 /// blobs at or below this size are cached in the store's memory map on put /
 /// get; larger blobs live on disk only (persistent stores) so a 1 GB
@@ -35,6 +48,8 @@ pub enum StageError {
     Length { expected: u64, got: u64 },
     /// the finished bytes do not hash to the declared digest.
     HashMismatch,
+    /// another writer holds this digest's staging slot.
+    AlreadyStaging,
     /// the staging file could not be written / published.
     Io(std::io::Error),
 }
@@ -46,6 +61,7 @@ impl std::fmt::Display for StageError {
                 write!(f, "staged length {got} does not match declared {expected}")
             }
             Self::HashMismatch => write!(f, "staged bytes do not hash to the declared digest"),
+            Self::AlreadyStaging => write!(f, "another writer holds this digest's staging slot"),
             Self::Io(e) => write!(f, "staging io: {e}"),
         }
     }
@@ -67,32 +83,50 @@ enum Sink {
     Memory(Vec<u8>),
 }
 
-/// an exclusive append-only staging slot for one expected `(digest, len)`.
-pub struct StagedBlob {
+/// the digest's staging slot, held for as long as its writer lives. dropping
+/// it — on `finish`, on `abort`, or when a transfer's task dies — is what lets
+/// the next writer in.
+struct StagingClaim {
     store: BlobHandle,
     digest: [u8; 32],
+}
+
+impl Drop for StagingClaim {
+    fn drop(&mut self) {
+        self.store.release_staging(&self.digest);
+    }
+}
+
+/// an exclusive append-only staging slot for one expected `(digest, len)`.
+pub struct StagedBlob {
+    claim: StagingClaim,
     expected_len: u64,
-    hasher: Sha256,
     written: u64,
     sink: Sink,
 }
 
 impl BlobHandle {
-    /// open — or resume — the staging slot for `digest`/`len`. on a
-    /// persistent store an existing staging file's bytes are folded back into
-    /// the running hash and appending continues from [`StagedBlob::offset`];
-    /// a leftover file longer than `len` (a superseded transfer under a lying
-    /// length) is discarded and staging restarts clean.
+    /// open — or resume — the staging slot for `digest`/`len`. exclusive: a
+    /// digest already being staged answers [`StageError::AlreadyStaging`]. on
+    /// a persistent store appending continues from [`StagedBlob::offset`],
+    /// the length of the file already there; a leftover file longer than `len`
+    /// (a superseded transfer under a lying length) is discarded and staging
+    /// restarts clean.
     pub fn stage(&self, digest: [u8; 32], len: u64) -> Result<StagedBlob, StageError> {
-        let root = self.persistence_root();
-        let (sink, hasher, written) = match root {
-            None => (Sink::Memory(Vec::new()), Sha256::new(), 0),
+        if !self.claim_staging(digest) {
+            return Err(StageError::AlreadyStaging);
+        }
+        // from here every exit releases the claim: it lives in the guard.
+        let claim = StagingClaim {
+            store: self.clone(),
+            digest,
+        };
+        let (sink, written) = match self.persistence_root() {
+            None => (Sink::Memory(Vec::new()), 0),
             Some(root) => {
                 let dir = root.join("staging");
                 std::fs::create_dir_all(&dir)?;
                 let path = dir.join(hex(&digest));
-                let mut hasher = Sha256::new();
-                let mut written = 0u64;
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -100,32 +134,86 @@ impl BlobHandle {
                     .write(true)
                     .open(&path)?;
                 let existing = file.metadata()?.len();
-                if existing > len {
+                let resumable = if existing > len {
                     file.set_len(0)?;
+                    0
                 } else {
-                    // rebuild the running hash over the resumable prefix.
-                    let mut buf = vec![0u8; 256 * 1024];
-                    loop {
-                        let n = file.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buf[..n]);
-                        written += n as u64;
-                    }
-                }
+                    existing
+                };
                 file.seek(std::io::SeekFrom::End(0))?;
-                (Sink::Disk { file, path }, hasher, written)
+                (Sink::Disk { file, path }, resumable)
             }
         };
         Ok(StagedBlob {
-            store: self.clone(),
-            digest,
+            claim,
             expected_len: len,
-            hasher,
             written,
             sink,
         })
+    }
+}
+
+/// delete every staging file under `root` that has not been touched within
+/// `keep_within` and that `live` does not name, and report how many went. a
+/// partial nobody resumed inside the window is bytes no lane will ever ask for
+/// again; a partial a writer holds is never the sweep's, whatever its mtime.
+pub(crate) fn sweep_staging_dir(
+    root: &Path,
+    keep_within: Duration,
+    live: &std::collections::HashSet<String>,
+) -> std::io::Result<usize> {
+    let dir = root.join("staging");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // no staging directory means nothing was ever staged here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if live.contains(&entry.file_name().to_string_lossy().to_string()) {
+            continue;
+        }
+        let abandoned = meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= keep_within);
+        if !meta.is_file() || !abandoned {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                swept += 1;
+                tracing::debug!(
+                    target: "ducktape::blobstore",
+                    reason = "staging_abandoned",
+                    file = %entry.file_name().to_string_lossy(),
+                    bytes = meta.len(),
+                    "reclaimed an abandoned staging file"
+                );
+            }
+            Err(error) => tracing::warn!(
+                target: "ducktape::blobstore",
+                reason = "staging_sweep_failed",
+                file = %entry.file_name().to_string_lossy(),
+                error = %error,
+                "cannot reclaim an abandoned staging file"
+            ),
+        }
+    }
+    Ok(swept)
+}
+
+impl BlobHandle {
+    /// reclaim abandoned staging files — see [`sweep_staging_dir`]. a rootless
+    /// store stages into memory and has nothing to sweep.
+    pub fn sweep_staging(&self, keep_within: Duration) -> std::io::Result<usize> {
+        match self.persistence_root() {
+            None => Ok(0),
+            Some(root) => sweep_staging_dir(&root, keep_within, &self.staged_names()),
+        }
     }
 }
 
@@ -150,25 +238,31 @@ impl StagedBlob {
             Sink::Disk { file, .. } => file.write_all(bytes)?,
             Sink::Memory(buf) => buf.extend_from_slice(bytes),
         }
-        self.hasher.update(bytes);
         self.written = next;
         Ok(())
     }
 
-    /// verify length + hash, then publish: the staging file renames onto its
-    /// content-addressed name (or the buffer inserts via the store's put).
-    /// on any error the staging bytes are kept for resume — the caller
-    /// decides between retry and [`StagedBlob::abort`].
-    pub fn finish(self) -> Result<[u8; 32], StageError> {
+    /// verify length + hash OF THE FILE, then publish: the staging file
+    /// renames onto its content-addressed name (or the buffer inserts via the
+    /// store's put). the bytes re-read here are the bytes that get renamed —
+    /// a running hash over what this writer appended would attest to something
+    /// else entirely if the file were ever truncated or holed underneath it.
+    /// on a length shortfall the staging bytes are kept for resume; a hash
+    /// mismatch is never resumable and drops them.
+    pub fn finish(mut self) -> Result<[u8; 32], StageError> {
         if self.written != self.expected_len {
             return Err(StageError::Length {
                 expected: self.expected_len,
                 got: self.written,
             });
         }
-        let got: [u8; 32] = self.hasher.finalize().into();
-        if got != self.digest {
-            // a hash mismatch is never resumable — drop the poisoned bytes.
+        let digest = self.claim.digest;
+        let (got, on_disk) = match &mut self.sink {
+            Sink::Disk { file, .. } => hash_whole_file(file)?,
+            Sink::Memory(buf) => (sha256(buf), buf.len() as u64),
+        };
+        let verified = on_disk == self.expected_len && got == digest;
+        if !verified {
             if let Sink::Disk { path, .. } = &self.sink {
                 let _ = std::fs::remove_file(path);
             }
@@ -178,13 +272,13 @@ impl StagedBlob {
             Sink::Disk { file, path } => {
                 file.sync_all()?;
                 drop(file);
-                self.store.publish_staged(&self.digest, &path)?;
+                self.claim.store.publish_staged(&digest, &path)?;
             }
             Sink::Memory(buf) => {
-                self.store.put_chunk(buf);
+                self.claim.store.put_chunk(buf);
             }
         }
-        Ok(self.digest)
+        Ok(digest)
     }
 
     /// discard the staged bytes (a refused or superseded transfer).
@@ -192,6 +286,22 @@ impl StagedBlob {
         if let Sink::Disk { path, .. } = &self.sink {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// the whole file's sha256 and its length, read from offset 0.
+fn hash_whole_file(file: &mut std::fs::File) -> std::io::Result<([u8; 32], u64)> {
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut read = 0u64;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok((hasher.finalize().into(), read));
+        }
+        hasher.update(&buf[..n]);
+        read += n as u64;
     }
 }
 
@@ -247,6 +357,78 @@ mod tests {
             store.get_chunk(&digest).as_deref(),
             Some(payload.as_slice())
         );
+    }
+
+    #[test]
+    fn one_digest_has_exactly_one_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        let digest = sha(b"contested");
+
+        let first = store.stage(digest, 9).unwrap();
+        assert!(
+            matches!(store.stage(digest, 9), Err(StageError::AlreadyStaging)),
+            "a second writer took the same staging file"
+        );
+        // a different digest is a different slot, and finishing frees this one.
+        store.stage(sha(b"elsewhere"), 4).unwrap().abort();
+        first.abort();
+        store.stage(digest, 9).unwrap().abort();
+    }
+
+    #[test]
+    fn finish_hashes_the_file_not_the_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        let payload = b"the true bytes".to_vec();
+        let digest = sha(&payload);
+        let path = root.path().join("staging").join(hex(&digest));
+
+        let mut slot = store.stage(digest, payload.len() as u64).unwrap();
+        slot.append(&payload).unwrap();
+        // the file is holed under the writer — exactly what a second lane
+        // truncating the shared staging file does. the writer's own running
+        // hash saw only the true bytes; the FILE is what publishes.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+
+        assert!(matches!(slot.finish(), Err(StageError::HashMismatch)));
+        assert!(!store.has_chunk(&digest), "holed bytes were published");
+        assert!(!path.exists(), "the poisoned partial was kept");
+    }
+
+    #[test]
+    fn an_abandoned_partial_survives_its_window_and_is_swept_past_it() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = sha(b"long gone");
+        let path = root.path().join("staging").join(hex(&digest));
+        {
+            let store = BlobHandle::persistent(root.path()).unwrap();
+            let mut slot = store.stage(digest, 9).unwrap();
+            slot.append(b"long").unwrap();
+        }
+        assert!(path.is_file(), "a dropped transfer keeps its partial");
+
+        // a fresh partial is resumable, so re-opening the store keeps it.
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        assert_eq!(store.sweep_staging(STAGING_RESUME_WINDOW).unwrap(), 0);
+        assert!(path.is_file());
+        drop(store);
+
+        // past the window nothing will ever resume it, and a store opened over
+        // the root (a node boot) reclaims it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - STAGING_RESUME_WINDOW - Duration::from_secs(60))
+            .unwrap();
+        let _store = BlobHandle::persistent(root.path()).unwrap();
+        assert!(!path.exists(), "the stale partial was not reclaimed");
     }
 
     #[test]

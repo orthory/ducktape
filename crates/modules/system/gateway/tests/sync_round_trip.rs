@@ -49,6 +49,7 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
 /// sibling the parity proof exercises for real.
 fn account_view(founder: &Ed) -> AccountView {
     AccountView {
+        control: identity::Control::Keys,
         number: ACCOUNT,
         name: "founder".into(),
         keys: vec![KeyView {
@@ -71,6 +72,7 @@ fn ctx(height: u64, founder: &Ed) -> TestCtx {
         consensus_time: height,
         origin: Origin::External(ed_pub(founder)),
         me: "gateway".into(),
+        cause: sdk::Cause::Direct,
     })
     .on_query("identity", move |req| {
         match identity_decode_query(req).map_err(Error::Module)? {

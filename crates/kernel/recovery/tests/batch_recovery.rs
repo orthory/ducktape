@@ -260,7 +260,7 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         {
             use node::BlockSink as _;
             node.sink_mut()
-                .pre_apply(sealed_height + 1, &batch)
+                .pre_apply(sealed_height + 1, &batch, &host::PreparedWork::default())
                 .await
                 .expect("wal record");
         }

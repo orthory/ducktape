@@ -1,5 +1,5 @@
-//! e2e for `ducktape fs` against an in-process files-only node (see
-//! `support/mod.rs`). the read verbs are driven as a real subprocess over the
+//! e2e for `ducktape fs` against an in-process files node (see
+//! `fs_support/mod.rs`). the read verbs are driven as a real subprocess over the
 //! node's http surface; seeding rides the `duckfs-client` engine (checkout →
 //! write → commit), the same path the CLI's own working-copy verbs use.
 

@@ -8,10 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{any, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -98,6 +98,17 @@ async fn boot_upstream() -> String {
     let app = Router::new()
         .route("/oauth/token", post(oauth))
         .route("/v1/messages", post(messages))
+        .with_state(Arc::new(MockUpstream::default()));
+    spawn(app).await
+}
+
+/// Like [`boot_upstream`], but `/v1/messages` answers ANY method — used to
+/// prove a bodyless request (a GET) reaches the upstream at all, which a
+/// POST-only mock can't distinguish from "the method itself was rejected".
+async fn boot_upstream_any_method() -> String {
+    let app = Router::new()
+        .route("/oauth/token", post(oauth))
+        .route("/v1/messages", any(messages))
         .with_state(Arc::new(MockUpstream::default()));
     spawn(app).await
 }
@@ -230,7 +241,8 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
         .await
         .unwrap();
-    let sealed_body = bodyseal::seal_request(&keys, br#"{"secret":"prompt"}"#);
+    let aad = bodyseal::request_aad("POST", "/v1/messages");
+    let sealed_body = bodyseal::seal_request(&keys, &aad, br#"{"secret":"prompt"}"#);
     assert!(
         !sealed_body.windows(6).any(|w| w == b"prompt"),
         "the wire body must not contain the plaintext"
@@ -306,6 +318,141 @@ async fn a_sealed_session_refuses_a_plaintext_body() {
         reqwest::StatusCode::BAD_REQUEST,
         "a stolen bearer without the body key must be useless"
     );
+}
+
+/// **A sealed session seals EVERY request, bodyless ones included.** A bare
+/// GET carrying only the stolen bearer — the exact thing a path host or a
+/// browser-gateway hop can observe — must not spend the credential; a GET
+/// whose (empty) body is properly sealed must.
+#[tokio::test]
+async fn a_sealed_session_requires_a_sealed_body_even_on_a_bodyless_get() {
+    use airlock::bodyseal;
+
+    let upstream = boot_upstream_any_method().await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &airlock::wire::CredentialPayload::Refresh {
+            refresh_token: "ref-seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let (token, keys) = gw
+        .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
+
+    // A bare GET with only the bearer and no seal header — a stolen bearer
+    // alone can produce exactly this — must be refused.
+    let bare = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bare.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a stolen bearer must buy nothing, even on a bodyless GET"
+    );
+
+    // The same GET, with an empty plaintext sealed under the handshake keys
+    // (the AEAD tag alone, no payload), must be admitted — the caller proved
+    // possession of the keys, which a bearer thief lacks.
+    let aad = bodyseal::request_aad("GET", "/v1/messages");
+    let sealed_empty = bodyseal::seal_request(&keys, &aad, b"");
+    let sealed = reqwest::Client::new()
+        .get(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
+        .body(sealed_empty)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sealed.status(),
+        reqwest::StatusCode::OK,
+        "a sealed empty body must be admitted like any other sealed request"
+    );
+}
+
+/// The gateway's own `DefaultBodyLimit` must match the broker's
+/// `MAX_REQUEST_BYTES`, not axum's implicit 2 MiB default — a sealed body
+/// between the two (3 MiB) must reach the upstream, not 413 at the router.
+#[tokio::test]
+async fn a_3mib_sealed_body_reaches_proxy_inner() {
+    use airlock::bodyseal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let plaintext = vec![7u8; 3 * 1024 * 1024];
+    let seen_len = Arc::new(AtomicUsize::new(0));
+    let seen = seen_len.clone();
+    let app = Router::new()
+        .route("/oauth/token", post(oauth))
+        .route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.store(body.len(), Ordering::SeqCst);
+                    ([("content-type", "text/event-stream")], "data: OK\n\n").into_response()
+                }
+            }),
+        )
+        // The MOCK upstream is a plain axum router and would otherwise apply
+        // the SAME 2 MiB default this test exists to prove the gateway no
+        // longer imposes — raise it so a 413 here can only mean the gateway
+        // itself rejected the body.
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .with_state(Arc::new(MockUpstream::default()));
+    let upstream = spawn(app).await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &airlock::wire::CredentialPayload::Refresh {
+            refresh_token: "ref-seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let (token, keys) = gw
+        .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
+        .await
+        .unwrap();
+    let aad = bodyseal::request_aad("POST", "/v1/messages");
+    let sealed_body = bodyseal::seal_request(&keys, &aad, &plaintext);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
+        .body(sealed_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a 3 MiB sealed body must reach the upstream, not 413 at axum's 2 MiB default"
+    );
+    assert_eq!(seen_len.load(Ordering::SeqCst), plaintext.len());
 }
 
 #[tokio::test]
@@ -537,6 +684,65 @@ async fn sessions_route_to_the_named_credential() {
     let seen_b = round_trip_via(&gw, &gateway_url, &seal_pk, "b").await;
     assert_eq!(seen_a, "Bearer tok-a");
     assert_eq!(seen_b, "Bearer tok-b");
+}
+
+/// `ducktape user cred remove` deletes the store dir and commits the tombstone,
+/// after which the store loader reports the name ABSENT. Every session already
+/// holding a token for it must stop drawing on the credential right then — the
+/// gateway used to keep the parsed entry (live access + refresh token) and go
+/// on proxying to the vendor for the rest of an hour's TTL and 4096 requests,
+/// so the operator watched the removal "work" while the credential was still
+/// being spent.
+#[tokio::test]
+async fn a_removed_credential_stops_serving_the_sessions_already_open_on_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let upstream = boot_echo_upstream().await;
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    // The store, as the gateway sees it: holding the credential until the
+    // operator removes it, and answering `Absent` from then on.
+    let removed = Arc::new(AtomicBool::new(false));
+    let store = removed.clone();
+    let reload: airlock::server::ReloadCredential = Arc::new(move |_name: &str| {
+        match store.load(Ordering::SeqCst) {
+            true => airlock::server::StoreLoad::Absent,
+            false => airlock::server::StoreLoad::Unchanged,
+        }
+    });
+    let (app, _) = server::build_self_host_reloadable(
+        self_host_cfg(Some(kp), upstream.clone(), String::new()),
+        vec![("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
+            access_token: "tok-a".into(),
+        })],
+        None,
+        reload,
+    )
+    .unwrap();
+    let gateway_url = spawn(app).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let token = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap();
+    let proxied = || {
+        reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/messages"))
+            .bearer_auth(&token)
+            .body("{}")
+            .send()
+    };
+    let before = proxied().await.unwrap();
+    assert_eq!(before.status(), reqwest::StatusCode::OK);
+    assert_eq!(before.text().await.unwrap(), "Bearer tok-a");
+
+    removed.store(true, Ordering::SeqCst);
+
+    // The same session token, unexpired and with budget left over.
+    let after = proxied().await.unwrap();
+    assert_eq!(
+        after.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a removed credential must not be spendable by an outstanding session"
+    );
 }
 
 #[tokio::test]

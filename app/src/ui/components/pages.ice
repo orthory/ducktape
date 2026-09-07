@@ -129,9 +129,8 @@ component PageSearchResult(hit:PageSearchHit)
 // TWO PARTS OF THE ARTIFACT CARD ARE NOT DRAWN, because nothing on the wire
 // carries them and a plausible one would be a lie:
 //   * the AGENT badge and the square plate — `PageComment`/`PageCommentThread`
-//     carry a flattened author STRING, and `page_author_name` throws the
-//     `AuthorRef::Agent` variant away (backend.rs:5213). Every plate is drawn
-//     as a person until the discriminant survives the boundary.
+//     carry a display name. Account authorship alone does not identify the
+//     account's control mode, so this projection uses the person plate.
 //   * the relative timestamp and the anchor quote. NOT because the wire lacks
 //     them — `ThreadRow` carries both `anchor` and `created_at`
 //     (crates/modules/apps/pages/src/index.rs) — but because

@@ -17,11 +17,26 @@
 //! -n git`). The smart-HTTP bridge puts text + signature on the op as
 //! [`PushCert`]; every validator then checks, in this order: the SSHSIG
 //! verifies for the key it embeds; the certificate's update list IS the op's
-//! (a cert cannot be borrowed to authorize different moves); the nonce names
-//! this repo. The nonce is `<chain id>/<repo>`; the chain half is checked by
-//! the bridge (which knows its chain — `Env` carries none), the repo half
-//! here. Freshness is not a concern: a certificate names exact old→new
-//! moves, so a replay is a no-op CAS.
+//! (a cert cannot be borrowed to authorize different moves); the nonce is
+//! EXACTLY `<this chain's id>/<repo>`. Freshness is not a concern: a
+//! certificate names exact old→new moves, so a replay is a no-op CAS.
+//!
+//! ## the chain half — #1761 / #1773
+//!
+//! the bridge ALSO checks the nonce, by exact string equality
+//! (`git_http.rs`'s `parse_push_commands`) — but the bridge is not on the
+//! trust path: `PushRefs` is an ordinary op, so any account with
+//! `/v1/submit/frame` standing can carry a certificate lifted from a
+//! DIFFERENT ducktape network straight past the bridge, and every validator
+//! must re-verify the same check consensus can compute unaided. that needs
+//! consensus to know ITS OWN chain id — the same genesis-config seam
+//! `identity`/`gateway`/`runs` bind their chain id through
+//! (`sdk::genesis_config`, `ducktape_module_sdk::genesis_chain_id`) — which now
+//! reaches an `Odb`-backed module too (`noded::compose`'s `odb_genesis_config`,
+//! #1773): forge's [`crate::guest`] shape declares the `chain_id` config key,
+//! so every dispatch reads it back and [`signer`] checks the FULL nonce
+//! against `nonce(chain_id, repo)` — no half-measure, no chain pinned off the
+//! first certificate this forge instance happens to see.
 
 use crate::PushCert;
 use crate::oid::Oid;
@@ -37,16 +52,10 @@ pub struct Certificate {
     pub updates: Vec<RefUpdate>,
 }
 
-/// the nonce a node advertises for `repo`: `<chain id>/<repo>`.
+/// the nonce a node advertises for `repo`, and the one consensus requires a
+/// certificate's nonce to equal exactly: `<chain id>/<repo>`.
 pub fn nonce(chain_id: &str, repo: &str) -> String {
     format!("{chain_id}/{repo}")
-}
-
-/// does `nonce` end in `/<repo>` — the half consensus can check.
-pub fn nonce_names_repo(nonce: &str, repo: &str) -> bool {
-    nonce
-        .strip_suffix(repo)
-        .is_some_and(|head| head.ends_with('/'))
 }
 
 /// the certificate text git would write for `updates` under `nonce` — the
@@ -133,10 +142,18 @@ fn oid_field(hex: &str) -> Result<Option<Vec<u8>>, String> {
     Ok((!oid.is_zero()).then(|| oid.as_bytes().to_vec()))
 }
 
-/// the SSH key that signed `cert` for THIS push: the SSHSIG verifies for the
-/// key it embeds, the certificate's updates equal `updates` as a set, and its
-/// nonce names `repo`. The 32 raw ed25519 key bytes — a member key's form.
-pub fn signer(cert: &PushCert, repo: &str, updates: &[RefUpdate]) -> Result<Vec<u8>, String> {
+/// the SSH key that signed `cert` for THIS push on THIS chain — the SSHSIG
+/// verifies for the key it embeds, the certificate's updates equal `updates`
+/// as a set, and its nonce is EXACTLY `nonce(chain_id, repo)`. The 32 raw
+/// ed25519 key bytes are a member key's form. a certificate minted for a
+/// different chain id, or a different repo, is refused here regardless of
+/// whether this forge instance has ever accepted a certified push before.
+pub fn signer(
+    cert: &PushCert,
+    chain_id: &str,
+    repo: &str,
+    updates: &[RefUpdate],
+) -> Result<Vec<u8>, String> {
     let sig = keyscheme::sshsig::parse(&cert.sshsig)?;
     let verified = keyscheme::sshsig::verify_ed25519(
         &sig.pubkey,
@@ -148,9 +165,10 @@ pub fn signer(cert: &PushCert, repo: &str, updates: &[RefUpdate]) -> Result<Vec<
         return Err("push certificate signature does not verify".into());
     }
     let certificate = parse(&cert.cert)?;
-    if !nonce_names_repo(&certificate.nonce, repo) {
+    let expected = nonce(chain_id, repo);
+    if certificate.nonce != expected {
         return Err(format!(
-            "push certificate nonce {:?} does not name repo {repo:?}",
+            "push certificate nonce {:?} does not match this network's {expected:?}",
             certificate.nonce
         ));
     }
@@ -209,7 +227,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             cert: CERT.as_bytes().to_vec(),
             sshsig: dearmor(ARMORED).unwrap(),
         };
-        let key = signer(&cert, "lab", &[main_birth()]).unwrap();
+        let key = signer(&cert, "chain-a", "lab", &[main_birth()]).unwrap();
         assert_eq!(
             key,
             keyscheme::sshsig::authorized_key(
@@ -218,25 +236,31 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             .unwrap()
         );
         assert!(
-            signer(&cert, "other", &[main_birth()])
+            signer(&cert, "chain-a", "other", &[main_birth()])
                 .unwrap_err()
                 .contains("nonce")
+        );
+        assert!(
+            signer(&cert, "chain-z", "lab", &[main_birth()])
+                .unwrap_err()
+                .contains("nonce"),
+            "a certificate minted for a different chain is refused, not replayed onto this one"
         );
         let mut moved = main_birth();
         moved.ref_name = "dev".into();
         assert!(
-            signer(&cert, "lab", &[moved])
+            signer(&cert, "chain-a", "lab", &[moved])
                 .unwrap_err()
                 .contains("ref updates")
         );
         let mut extra = vec![main_birth(), main_birth()];
         extra[1].ref_name = "feature".into();
-        assert!(signer(&cert, "lab", &extra).is_err());
+        assert!(signer(&cert, "chain-a", "lab", &extra).is_err());
         let mut forged = cert.clone();
         forged.cert.push(b'\n');
         forged.cert.extend_from_slice(b"0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/dev\n");
         assert!(
-            signer(&forged, "lab", &[main_birth()])
+            signer(&forged, "chain-a", "lab", &[main_birth()])
                 .unwrap_err()
                 .contains("does not verify")
         );
@@ -265,17 +289,14 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             cert: text.clone(),
         };
         let reordered: Vec<RefUpdate> = updates.iter().rev().cloned().collect();
-        assert_eq!(
-            signer(&cert, "lab", &reordered).unwrap(),
-            ssh_pubkey(&sk),
-            "order-free"
-        );
+        let key = signer(&cert, "chain-b", "lab", &reordered).unwrap();
+        assert_eq!(key, ssh_pubkey(&sk), "order-free");
         let under_ducktape = PushCert {
             sshsig: sshsig(&sk, keyscheme::sshsig::DUCKTAPE_SSH_NS, &text),
             cert: text,
         };
         assert!(
-            signer(&under_ducktape, "lab", &updates).is_err(),
+            signer(&under_ducktape, "chain-b", "lab", &updates).is_err(),
             "namespace `git` only"
         );
 
@@ -296,8 +317,6 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
                 .unwrap_err()
                 .contains("sha1 hex")
         );
-        assert!(nonce_names_repo("chain/lab", "lab"));
-        assert!(!nonce_names_repo("chainlab", "lab"));
-        assert!(!nonce_names_repo("chain/lab", "ab"));
+        assert_eq!(nonce("chain", "lab"), "chain/lab");
     }
 }

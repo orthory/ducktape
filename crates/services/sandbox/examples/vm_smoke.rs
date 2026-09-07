@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use sandbox_host::firecracker_api::{self, VmConfig};
 use sandbox_host::guest_manifest::RunManifest;
 use sandbox_host::guest_paths::GUEST_WORKSPACE;
+use sandbox_host::microvm::ScratchDir;
 use sandbox_host::{MicroVm, Vmm};
 
 fn parse_args() -> Result<(PathBuf, PathBuf, Vmm), String> {
@@ -25,9 +26,7 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vmm), String> {
     let mut vmm = Vmm::platform_default();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| format!("{flag} needs a value"))?;
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--kernel" => kernel = Some(PathBuf::from(value)),
             "--rootfs" => rootfs = Some(PathBuf::from(value)),
@@ -64,12 +63,15 @@ async fn smoke() -> Result<(), String> {
     let workdir = std::env::temp_dir().join(format!("dt-smoke-ws-{}", std::process::id()));
     std::fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
     std::fs::write(workdir.join("input.txt"), b"from the host\n").map_err(|e| e.to_string())?;
-    let run_dir = std::env::temp_dir().join(format!("dt-vm-{slot}"));
+    // owned by guards until the VM exists: a smoke run that fails to boot
+    // must leave no scratch behind either.
+    let run_scratch = ScratchDir::create(std::env::temp_dir().join(format!("dt-vm-{slot}")))?;
     let socket_base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let socket_dir = socket_base.join(format!("dt-vm-{slot}"));
-    std::fs::create_dir_all(&socket_dir).map_err(|e| e.to_string())?;
+    let socket_scratch = ScratchDir::create(socket_base.join(format!("dt-vm-{slot}")))?;
+    let run_dir = run_scratch.path().to_path_buf();
+    let socket_dir = socket_scratch.path().to_path_buf();
 
     let cfg = VmConfig {
         vmm,
@@ -92,10 +94,7 @@ async fn smoke() -> Result<(), String> {
             "-c".into(),
             "cat input.txt && echo smoke > vm-smoke.txt && echo guest-side-ok".into(),
         ],
-        env: vec![(
-            "PATH".into(),
-            "/usr/sbin:/usr/bin:/sbin:/bin".into(),
-        )],
+        env: vec![("PATH".into(), "/usr/sbin:/usr/bin:/sbin:/bin".into())],
         cwd: GUEST_WORKSPACE.into(),
         mounts: firecracker_api::manifest_mounts(&cfg),
         tunnel_ports: vec![],
@@ -103,6 +102,9 @@ async fn smoke() -> Result<(), String> {
     };
 
     let (vm, mut io) = MicroVm::boot(&run_dir, &workdir, &[], &cfg, &manifest).await?;
+    // the VM's own Drop removes both directories from here.
+    run_scratch.disarm();
+    socket_scratch.disarm();
 
     // no stdin for this run; dropping the handle sends the EOF frame.
     drop(io.stdin);

@@ -209,6 +209,12 @@ pub(super) async fn resume(
         None => OrderedNode::with_sink(host, orderer, recovery),
     };
     node.set_code_source(code_source);
+    // RESTORE the replay guard from the journal suffix the replay just
+    // walked: a restarted validator must keep refusing the batches it already
+    // journaled, or it applies a re-proposed one its running peers refuse.
+    if let Some(rec) = resumed {
+        node.seed_replay_window(rec.applied_frames.iter().copied());
+    }
     // the observation barrier: every drain batch ends AT a block that
     // moves the valset root, so the orchestration step below observes a
     // membership change at exactly its block's view — the same view on
@@ -282,6 +288,7 @@ pub(super) async fn resume(
             payload: encode_task_msg(&TaskMsg::CreateTask {
                 task_id: format!("k{n}"),
                 title: format!("node-{n}"),
+                owner: None,
             }),
         };
         node.submit(signer, 0, op).await.expect("submit op");

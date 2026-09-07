@@ -708,7 +708,7 @@ pub fn fold_live_chat(
         active_channel_archived = channel.archived;
         active_channel_members_only = channel.members_only;
     }
-    let seated = channel_members.iter().any(|member| member.key == me);
+    let seated = seated_in(&channel_members, &me);
     let post_refusal = if active_channel_archived {
         "channel_archived".into()
     } else if active_channel_members_only && !seated {
@@ -839,25 +839,23 @@ pub(crate) async fn folded_update(
     };
     match module {
         "chat" => {
-            let current_user = local_user_key().await;
+            // THE DIRECTORY AS LAST READ, NOT A FRESH READ: this is inside the
+            // live decoder fold, where a query would freeze every subscriber
+            // for as long as the node's select loop is busy (issue #1018). It
+            // is warm by the connect that opened this stream.
+            let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
-            // THE CACHED DIRECTORY, NOT A FRESH READ: this is inside the live
-            // decoder fold, where a query would freeze every subscriber for as
-            // long as the node's select loop is busy (issue #1018). It is warm
-            // by the connect that opened this stream.
-            let names = cached_account_names();
             // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
             // and a DM used to reach nothing but the in-app bell, which is
             // worth nothing behind another window. Pure decision, cached
             // reads, no query — see `notify`.
-            notify_chat_op(&payload, op.origin.id.as_deref(), &names);
+            notify_chat_op(&payload, op.assigned.as_ref(), facts.names());
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                current_user.as_deref(),
-                &names,
+                facts.reader(),
                 op.height,
             );
             let delta = match folded {
@@ -896,16 +894,18 @@ pub(crate) async fn folded_update(
             })
         }
         "inbox" => {
-            // the same derivation `local_member` uses: the bell folds only the
-            // ops naming THIS user's queue, and a queue is named for its owner.
-            let member = local_member().await?;
+            // Stream folds use the cached identity directory, with no RPC read.
+            let facts = ReaderFacts::current().await;
+            let key = facts.reader().key?;
+            let account = facts.names().account_of(&hex_encode(key))?;
             let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = inbox::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                &member,
+                account,
+                "attribution",
             );
             match folded {
                 Ok(Some(bell)) => Some(LiveUpdate {
@@ -985,16 +985,7 @@ pub(crate) async fn folded_update(
         // At these rates it is the right trade: no fold to keep correct, and
         // nothing at all on a block that does not touch them.
         //
-        // `runs` rides here for a different reason than the rest: NOTHING ON
-        // SCREEN DRAWS A RUN. The fact it feeds lives in another module's
-        // projection — an `AgentRow.live` is `agents_with_a_run_in_flight`
-        // reading `runs`' pending register, joined onto a row `agent` owns
-        // (`backend/node.rs`) — so there is no local state for a fold to fold
-        // INTO and the op can only be a signal to refetch the agents
-        // projection. It commits at agent-TURN rate (a run claimed, a run
-        // finished), which is the same human rate as the others, so the trade
-        // above holds. Without it the Forge seat's live dot had no off-tab
-        // refresh path at all and stayed dark until Agents was opened.
+        // Model configuration and run activity both refresh the Agents view.
         "valset" | "governance" | "identity" | "agent" | "runs" | "files" => {
             Some(live_plane(module, height))
         }
@@ -1005,6 +996,7 @@ pub(crate) async fn folded_update(
 fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
     match kind {
         ducktape_rpc::StreamOriginKind::External => "external",
+        ducktape_rpc::StreamOriginKind::Program => "program",
         ducktape_rpc::StreamOriginKind::Module => "module",
         ducktape_rpc::StreamOriginKind::System => "system",
     }
@@ -1027,8 +1019,8 @@ pub(crate) async fn load_channel_row(
     channel_id: &str,
 ) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let facts = load_channel_facts(&rpc, channel_id, None).await?;
-    Ok(facts.map(|(channel, _roster)| channel))
+    let room = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
+    Ok(room.map(|(channel, _roster)| channel))
 }
 
 /// One scoped catch-up load, flag-selected per plane: the chat slices
@@ -1185,19 +1177,10 @@ pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bo
     kind == crate::LiveKind::Plane && module == want
 }
 
-/// Did this live update touch the AGENTS projection — from either module?
-///
-/// TWO MODULES, ONE ROW. `agent` owns the registration and `runs` owns the
-/// liveness: `AgentRow.live` is `agents_with_a_run_in_flight` reading `runs`'
-/// pending register, joined on in `load_agents`. So a run starting or ending
-/// changes what the Forge seat's dot draws while `agent` commits nothing at
-/// all — the reason the dot went dark for a whole turn once the tab move
-/// stopped refetching off-tab.
-///
-/// Named rather than spelled inline for the same reason [`plane_live_hit`] is:
-/// the Ice checker cannot type a subscription payload's field inside a `let`.
+/// Model configuration/activity and current controller names feed the Agents
+/// projection through runs and identity respectively.
 pub fn agents_plane_hit(kind: crate::LiveKind, module: String) -> bool {
-    kind == crate::LiveKind::Plane && (module == "agent" || module == "runs")
+    kind == crate::LiveKind::Plane && matches!(module.as_str(), "runs" | "identity")
 }
 
 /// The planes discriminant for [`live_resync_load`].
@@ -1335,8 +1318,8 @@ pub fn keep_members(
 /// for the five folds that used to spell it out in four lines each.
 ///
 /// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
-/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
-/// other room and every other screen — that is what they are FOR — so reading
+/// THE HUDDLE'S. The huddle window follows you onto every other room and
+/// every other screen — that is what it is FOR — so reading
 /// "am I in a huddle" off the room you happen to be looking at answered no the
 /// moment you clicked a second channel. And that answer is not cosmetic:
 /// `huddle_joined` is the media leg's subscription gate, so a channel click cut
@@ -1684,13 +1667,10 @@ pub async fn load_chat_hit(
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
-        let current_user = local_user_key().await;
+        let facts = ReaderFacts::current().await;
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![
-            root,
-            chat_message(reply, current_user.as_deref(), &account_names(&rpc).await),
-        ];
+        chat.thread_messages = vec![root, chat_message(reply, facts.reader())];
         Ok(chat)
     }
     .await
@@ -1783,7 +1763,7 @@ pub async fn create_channel(
 /// One peer of the DM directory. There is no `status`: presence has no source
 /// anywhere in the product, and a dot that always reads "offline" is a lie.
 ///
-/// `is_agent` is always false today — see [`load_dm_peers`].
+/// `is_agent` identifies a keyless program account from its control record.
 ///
 /// `channel_id` is the pair's deterministic two-party channel id
 /// (`dm_channel_id(me, key)`), computed once at load time rather than at
@@ -1804,120 +1784,16 @@ pub struct DmPeersData {
     pub peers: Vec<DmPeer>,
 }
 
-/// THE ACCOUNT DIRECTORY EVERY AUTHORED ROW IS NAMED AGAINST, cached for the
-/// process and keyed by the endpoint it was read from.
-///
-/// A chat row carries `user:{hex}` and nothing else — the module stamps a KEY,
-/// because a key is what signed the frame — while the name that key registered
-/// lives in the identity module's own store. Nothing joined the two, so the
-/// timeline printed `user bf431c5d…` at a person the DIRECT list one pane over
-/// was already calling "orthory".
-///
-/// It is a CACHE and not a per-load read for the reason `local_user_key` is
-/// one: this is consulted once per rendered row, on every load and every folded
-/// live delta, and the answer changes only when someone registers or renames an
-/// account. `load_dm_peers` is what refreshes it — that load already pages every
-/// account for its own rows, and the live stream re-runs it on every identity
-/// op (`LiveKind.plane`), so the directory follows a rename without a query of
-/// its own.
-static ACCOUNT_NAMES: tokio::sync::RwLock<Option<(String, AuthorNames)>> =
-    tokio::sync::RwLock::const_new(None);
-
-/// The directory for this endpoint, read from the identity module when the
-/// cache is cold or holds another node's answer. An identity module that cannot
-/// answer yet (a resident still joining) yields an empty directory — hex names,
-/// corrected by the `dm_peers` refresh the first identity op triggers.
-pub(crate) async fn account_names(rpc: &RpcClient) -> AuthorNames {
-    let origin = rpc.origin().to_string();
-    let cached = ACCOUNT_NAMES.read().await.clone();
-    if let Some((cached_origin, names)) = cached
-        && cached_origin == origin
-    {
-        return names;
-    }
-    let Ok(names) = read_account_names(rpc).await else {
-        return AuthorNames::default();
-    };
-    *ACCOUNT_NAMES.write().await = Some((origin, names.clone()));
-    names
-}
-
-/// The cached directory WITHOUT filling it — for the two callers that cannot
-/// wait on a round trip: the synchronous optimistic mint, and the live stream's
-/// decoder fold, where a `/v1/query` freezes every subscriber for as long as the
-/// node's select loop is busy (issue #1018). Cold reads as an empty directory;
-/// the connect's chat load warms it before either can run.
-pub(crate) fn cached_account_names() -> AuthorNames {
-    ACCOUNT_NAMES
-        .try_read()
-        .ok()
-        .and_then(|cached| cached.as_ref().map(|(_origin, names)| names.clone()))
-        .unwrap_or_default()
-}
-
-async fn read_account_names(rpc: &RpcClient) -> Result<AuthorNames, String> {
-    let reply: IdentityReply = rpc
-        .query(
-            "identity",
-            &IdentityQuery::All {
-                from: 0,
-                limit: identity::MAX_QUERY_LIMIT,
-            },
-        )
-        .await?;
-    let IdentityReply::Accounts(accounts) = reply else {
-        return Err("the identity module returned the wrong reply".to_string());
-    };
-    Ok(account_names_of(&accounts))
-}
-
-/// EVERY key of an account answers to that account's name: a person with a
-/// phone and a laptop signs with two keys and is one name in the timeline.
-pub(crate) fn account_names_of(accounts: &[AccountView]) -> AuthorNames {
-    AuthorNames::new(accounts.iter().flat_map(|account| {
-        account
-            .keys
-            .iter()
-            .map(|key| (hex_encode(&key.pubkey), account.name.clone()))
-    }))
-}
-
-/// The people this device can open a DM with, one row per identity account.
-///
-/// Registered agents are NOT here: a DM is a chat channel seated on public
-/// KEYS, and an agent id is an arbitrary string that [`open_dm`]'s
-/// `public_key()` would reject outright. Until an agent is addressable as a
-/// channel member, an agent row in this directory would be a button that
-/// cannot work.
-///
-/// The row is keyed on the account NUMBER (decimal), so every key of a
-/// multi-device account reaches the same row, and the channel id hashes the
-/// PAIR OF ACCOUNT NUMBERS so both ends of one DM land on the same room.
+/// One DM peer per identity account, including keyless program accounts.
+/// The row and deterministic channel are keyed by account number, so a new
+/// device on either account reaches the same room.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await;
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: identity::MAX_QUERY_LIMIT,
-                },
-            )
-            .await?;
-        let accounts = match reply {
-            IdentityReply::Accounts(accounts) => accounts,
-            IdentityReply::Account(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
-        // THE DIRECTORY RIDES THIS LOAD. It is the same page of accounts the
-        // author names are read from, and this load re-runs on every identity op
-        // — so a rename reaches the timeline with no query of its own. See
-        // `ACCOUNT_NAMES`.
-        *ACCOUNT_NAMES.write().await =
-            Some((client.origin().to_string(), account_names_of(&accounts)));
+        // The same read that refreshes the name directory: an identity op
+        // reloads this directory, and every label on screen moves with it.
+        let accounts = read_accounts(&client).await?;
         // self is the account THIS key is a member of (a key holds at most one).
         let is_mine = |account: &AccountView| {
             me.as_ref()
@@ -1933,6 +1809,10 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 continue;
             }
             let key = account.number.to_string();
+            let is_agent = matches!(
+                account.control,
+                identity::Control::Program { .. } | identity::Control::Revoked { .. }
+            );
             let name = account.name;
             let channel_id = my_number
                 .as_ref()
@@ -1940,7 +1820,7 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 .unwrap_or_default();
             peers.push(DmPeer {
                 initials: initials_of(&name),
-                is_agent: false,
+                is_agent,
                 key,
                 name,
                 channel_id,
@@ -2036,8 +1916,8 @@ pub fn no_dm_peer() -> DmPeer {
 }
 
 /// Open the DM with one peer (an account number): resolve the deterministic
-/// channel when it exists, else create it members-only and seat every key of
-/// the peer's account plus this device's, then load it.
+/// channel when it exists, else create it with the two accounts as members,
+/// then load it. Account membership follows each account's current keys.
 ///
 /// NOT confidential. `MembersOnly` gates who may POST; every node replicates
 /// the channel's plaintext, so a DM is a two-person room, not a private one.
@@ -2046,8 +1926,8 @@ pub fn no_dm_peer() -> DmPeer {
 /// Fails with a generation for the reason [`load_channel_window`] gives: this
 /// is one of the three routes that move the reader between rooms, and a
 /// superseded failure must not land under the room she is in now. The writes it
-/// makes are idempotent by construction — `dm_channel_id` is deterministic and
-/// `SetMembership` is a set — so `committed` had nothing to warn about.
+/// makes are idempotent by construction: `CreateDmChannel` derives the
+/// deterministic channel id and seats both accounts in the same transaction.
 pub async fn open_dm(
     rpc: String,
     password: String,
@@ -2068,7 +1948,7 @@ pub async fn open_dm(
             .await?;
         let mine = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -2084,51 +1964,37 @@ pub async fn open_dm(
             .await?;
         let account = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
         let account = account.ok_or_else(|| format!("account {number} does not exist"))?;
         let peer_name = account.name;
-        // every key of both accounts is seated, so any device of either end
-        // reads and posts in the room.
-        let my_keys = mine.keys.into_iter().map(|key| key.pubkey);
-        let peer_keys = account.keys.into_iter().map(|key| key.pubkey);
-        let members: Vec<Vec<u8>> = my_keys.chain(peer_keys).collect();
+        // The DM op, not a plain `CreateChannel` naming a `dm-` id: the module
+        // reserves that shape and refuses it from anything but this op, which
+        // resolves the creator's own account and derives the very id computed
+        // above (`dm_channel_id(mine, peer)`), members-only by construction.
         signed_write(
             &client,
             "chat",
-            chat::encode_msg(&ChatMsg::CreateChannel {
-                channel_id: channel_id.clone(),
+            chat::encode_msg(&ChatMsg::CreateDmChannel {
+                counterpart: number,
                 name: peer_name.clone(),
-                post_policy: PostPolicy::MembersOnly,
             }),
             password.clone(),
         )
         .await?;
-        let seated = members
-            .iter()
-            .map(|key| {
-                let handle = hex_encode(key);
+        let names = names();
+        let seated = [mine.number, number]
+            .into_iter()
+            .map(|account| {
+                let handle = format!("acct:{account}");
                 ChatMember {
-                    label: short_label(&handle),
+                    label: names.member_label(&handle),
                     key: handle,
                 }
             })
             .collect();
-        for member in members {
-            signed_write(
-                &client,
-                "chat",
-                chat::encode_msg(&ChatMsg::SetMembership {
-                    channel_id: channel_id.clone(),
-                    user: member,
-                    member: true,
-                }),
-                password.clone(),
-            )
-            .await?;
-        }
         let data = load_chat_data(&client, Some(&channel_id)).await?;
         let mut data = landed_on_channel(data, channel_id, peer_name, true, seated);
         data.generation = generation;
@@ -2142,7 +2008,8 @@ pub async fn open_dm(
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when
-/// she may. A members-only channel she is not seated in refuses her post.
+/// she may. A members-only channel she is not seated in refuses her post; a
+/// seat is hers under any key of her account ([`seated_in`]).
 pub fn post_gate(
     archived: bool,
     members_only: bool,
@@ -2152,7 +2019,7 @@ pub fn post_gate(
     if archived {
         return "channel_archived".into();
     }
-    let seated = members.iter().any(|member| member.key == me);
+    let seated = seated_in(&members, &me);
     if members_only && !seated {
         return "members_only".into();
     }

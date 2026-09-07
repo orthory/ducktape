@@ -41,6 +41,8 @@ fn test_manifest(
         residents: vec![],
         floor_cert,
         entries: vec![],
+        applied_frames: vec![],
+        pending_cutover_view: None,
     }
 }
 
@@ -478,19 +480,75 @@ fn suffix_installer_rejects_mismatched_served_seal() {
 
         let served = statesync::FinalizedFrame {
             height: 1,
-            frame,
+            frame: node::encode_batch(&[frame]),
             disposition: statesync::FrameDisposition::Applied,
             roots: expected_host.module_roots(),
             root_hash: StateRoot([0xA5; sdk::ROOT_LEN]),
         };
         let mut host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let err = apply_verified_suffix_frame(&mut host, &served, &host::NoCodeSource)
-            .await
-            .expect_err("served seal mismatch must abort");
+        let prepared = host.prepare_work(served.height).await.expect("prepare");
+        let err = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut host::NoWitness,
+        )
+        .await
+        .expect_err("served seal mismatch must abort");
         assert!(
             err.contains("served seal"),
             "unexpected mismatch error: {err}"
         );
+    });
+}
+
+#[test]
+fn suffix_catchup_refuses_to_commit_without_its_execution_witness() {
+    struct RefuseWitness;
+    #[async_trait::async_trait(?Send)]
+    impl host::CommitWitness for RefuseWitness {
+        async fn record(&mut self, height: u64, witness: &host::Witness) -> Result<(), String> {
+            assert_eq!(height, 1);
+            assert!(!witness.units.is_empty());
+            Err("witness storage unavailable".into())
+        }
+    }
+
+    commonware_runtime::deterministic::Runner::default().start(|_| async move {
+        let signer = ed25519::PrivateKey::from_seed(77);
+        let frame = node::encode_frame(
+            &signer,
+            0,
+            &Msg {
+                target: "directory".into(),
+                payload: encode_msg(&DirMsg::Set {
+                    key: "k".into(),
+                    value: "v".into(),
+                }),
+            },
+        );
+        let mut host = fresh_directory_host();
+        let before = host.root_hash();
+        let served = statesync::FinalizedFrame {
+            height: 1,
+            frame: node::encode_batch(&[frame]),
+            disposition: statesync::FrameDisposition::Applied,
+            roots: host.module_roots(),
+            root_hash: before,
+        };
+        let prepared = host.prepare_work(1).await.unwrap();
+        let error = apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut RefuseWitness,
+        )
+        .await
+        .expect_err("an unjournaled execution must not commit");
+        assert!(error.contains("witness storage unavailable"), "{error}");
+        assert_eq!(host.root_hash(), before);
     });
 }
 
@@ -509,21 +567,80 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
         let mut recovery = Recovery::open(context.child("post_catchup_ok"))
             .await
             .expect("open recovery");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
-            .await
-            .expect("catch up");
+        let store = consensus::ContentStore::new();
+        let applied =
+            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None, &store)
+                .await
+                .expect("catch up");
 
         assert_eq!(applied.applied, 2);
         assert_eq!(host.root_hash(), expected.root_hash());
         assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
         assert_eq!(dir_value(&host, "b").await.as_deref(), Some("2"));
         let journaled = recovery
-            .read_finalized_frames(0, 2)
+            .read_finalized_frames(0, 2, usize::MAX)
             .await
             .expect("read frames");
         assert_eq!(journaled.len(), 2);
         assert_eq!(journaled[0].height, 1);
         assert_eq!(journaled[1].height, 2);
+    });
+}
+
+#[test]
+fn suffix_catchup_recovers_a_matching_unsealed_execution() {
+    commonware_runtime::deterministic::Runner::default().start(|context| async move {
+        let signer = ed25519::PrivateKey::from_seed(83);
+        let mut expected_host = fresh_directory_host();
+        let served =
+            served_directory_frame(&mut expected_host, &signer, 1, 0, dir_set("a", "1")).await;
+        let mut host = fresh_directory_host();
+        let base =
+            Manifest::capture(&host, None, 0, 0, vec![test_me()], vec![], None, 0, 1).unwrap();
+        let mut recovery = Recovery::open(context.child("before_suffix_seal"))
+            .await
+            .unwrap();
+        recovery.write_manifest(&base).await.unwrap();
+        let prepared = host.prepare_work(served.height).await.unwrap();
+        recovery
+            .pre_apply_catchup(
+                &served.frame,
+                &prepared,
+                &node::BlockSeal {
+                    height: served.height,
+                    disposition: node::Disposition::Applied,
+                    roots: served.roots.clone(),
+                    root_hash: served.root_hash,
+                },
+            )
+            .await
+            .unwrap();
+        apply_verified_suffix_frame(
+            &mut host,
+            &served,
+            prepared,
+            &host::NoCodeSource,
+            &mut recovery,
+        )
+        .await
+        .unwrap();
+        drop(host);
+        drop(recovery);
+
+        let mut recovery = Recovery::open(context.child("after_suffix_crash"))
+            .await
+            .unwrap();
+        let mut host = fresh_directory_host();
+        let recovered = recovery.recover(&mut host, &base).await.unwrap();
+        assert_eq!(recovered.height, Some(1));
+        assert_eq!(recovered.root_hash, served.root_hash);
+        assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
+        let frames = recovery
+            .read_finalized_frames(0, 1, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].root_hash, served.root_hash);
     });
 }
 
@@ -549,6 +666,8 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             residents: vec![],
             floor_cert: Some(vec![1, 2, 3]),
             entries: vec![],
+            applied_frames: vec![],
+            pending_cutover_view: None,
         };
 
         let mut host = mixed_durability_host(durable_store.clone(), 0);
@@ -559,9 +678,11 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             .write_manifest(&base_manifest)
             .await
             .expect("write base manifest");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-            .await
-            .expect("catch up");
+        let store = consensus::ContentStore::new();
+        let applied =
+            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
+                .await
+                .expect("catch up");
 
         assert_eq!(applied.applied, 1);
         assert_eq!(
@@ -592,27 +713,56 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
 
 #[test]
 fn suffix_catchup_aborts_on_mismatched_served_seal() {
-    let executor = commonware_runtime::deterministic::Runner::default();
-    executor.start(|context| async move {
-        let signer = ed25519::PrivateKey::from_seed(79);
-        let mut expected = fresh_directory_host();
-        let mut served =
-            served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
-        served.root_hash = test_root(0xA5);
+    enum Mismatch {
+        Disposition,
+        Roots,
+        Hash,
+    }
+    for mismatch in [Mismatch::Disposition, Mismatch::Roots, Mismatch::Hash] {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let signer = ed25519::PrivateKey::from_seed(79);
+            let mut expected = fresh_directory_host();
+            let mut served =
+                served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+            match mismatch {
+                Mismatch::Disposition => served.disposition = statesync::FrameDisposition::Rejected,
+                Mismatch::Roots => served.roots[0].1 = test_root(0xA5),
+                Mismatch::Hash => served.root_hash = test_root(0xA5),
+            }
 
-        let mut host = fresh_directory_host();
-        let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
-            .await
-            .expect("open recovery");
-        let err = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-            .await
-            .expect_err("seal mismatch must abort");
+            let mut host = fresh_directory_host();
+            let base = Manifest::capture(&host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
+                .expect("base manifest");
+            let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
+                .await
+                .expect("open recovery");
+            recovery.write_manifest(&base).await.unwrap();
+            let store = consensus::ContentStore::new();
+            let err =
+                apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
+                    .await
+                    .expect_err("seal mismatch must abort");
+            assert!(err.contains("served seal"), "{err}");
+            assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
+            drop(host);
+            drop(recovery);
 
-        assert!(
-            err.contains("served seal"),
-            "unexpected mismatch error: {err}"
-        );
-    });
+            let mut reopened = Recovery::open(context.child("reopen_mismatched_catchup"))
+                .await
+                .unwrap();
+            let mut restarted = fresh_directory_host();
+            let error = reopened.recover(&mut restarted, &base).await.unwrap_err();
+            assert!(matches!(error, recovery::Error::Verify(_)), "{error}");
+            assert!(error.to_string().contains("served seal"), "{error}");
+            assert!(
+                reopened
+                    .read_finalized_frames(0, 1, usize::MAX)
+                    .await
+                    .is_err(),
+                "recovery must not publish the failed suffix as finalized history"
+            );
+        });
+    }
 }
 
 #[test]
@@ -624,7 +774,8 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         let mut recovery = Recovery::open(context.child("post_catchup_noop"))
             .await
             .expect("open recovery");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
+        let store = consensus::ContentStore::new();
+        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None, &store)
             .await
             .expect("noop catch up");
 
@@ -632,10 +783,120 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         assert_eq!(host.root_hash(), before);
         assert!(
             recovery
-                .read_finalized_frames(5, 5)
+                .read_finalized_frames(5, 5, usize::MAX)
                 .await
                 .expect("empty range")
                 .is_empty()
+        );
+    });
+}
+
+#[test]
+fn suffix_catchup_accepts_a_height_gap_from_a_discarded_view() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let signer = ed25519::PrivateKey::from_seed(82);
+        let mut expected = fresh_directory_host();
+        // heights 1 and 3, skipping 2: the cutover ceiling discards a
+        // straggler view on every honest node, so a real suffix can skip a
+        // height without any block being omitted. strictly increasing, in
+        // range, is the whole shape a healthy suffix must hold — see the
+        // comment on `apply_suffix_frames`.
+        let served_1 =
+            served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+        let served_3 =
+            served_directory_frame(&mut expected, &signer, 3, 1, dir_set("b", "2")).await;
+
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("post_catchup_gap"))
+            .await
+            .expect("open recovery");
+        let store = consensus::ContentStore::new();
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            3,
+            vec![served_1, served_3],
+            None,
+            &store,
+        )
+        .await
+        .expect("a skipped-view gap must not be refused");
+        assert_eq!(applied.applied, 2);
+        assert_eq!(host.root_hash(), expected.root_hash());
+    });
+}
+
+/// a `SyncClient` that always answers the manifest request with a fixed,
+/// canned manifest — enough to drive `catch_up_suffix_frames`'s trust gate
+/// without a real server.
+#[derive(Clone)]
+struct FixedManifestClient {
+    manifest: statesync::Manifest,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for FixedManifestClient {
+    fn request(
+        &self,
+        _req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let manifest = self.manifest.clone();
+        async move { Ok(statesync::SyncResponse::Manifest(manifest)) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for FixedManifestClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("catchup_unanchored_tip"))
+            .await
+            .expect("open recovery");
+        let rotations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let client = FixedManifestClient {
+            // a served tip naming a participant set this node never trusted —
+            // the "3 keys plus the victim's" shape #1815 describes.
+            manifest: test_manifest_with_participants(1, test_root(1), None, vec![vec![9u8; 32]]),
+            rotations: rotations.clone(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let store = consensus::ContentStore::new();
+        let err = crate::sync::catchup::catch_up_suffix_frames(
+            &client,
+            &mut recovery,
+            &mut host,
+            None,
+            0,
+            1,
+            b"ns",
+            anchor,
+            &store,
+        )
+        .await
+        .expect_err("a tip naming an unanchored participant set must be refused");
+        assert!(
+            matches!(err, crate::sync::catchup::SuffixCatchupError::Retry(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unanchored tip must rotate away from the source that served it"
         );
     });
 }
@@ -646,9 +907,11 @@ fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRec
     vec![host::DispatchRecord {
         module: "directory".into(),
         origin: origin.clone(),
+        cause: sdk::Cause::Direct,
         payload: payload.to_vec(),
         emitted_msgs: 0,
         emitted_events: 0,
+        output: None,
         assigned: Vec::new(),
     }]
 }
@@ -696,6 +959,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
     let fold_row = sealed_frame_block_row(
         &fold_blobs,
         &recovery::FoldedBlock {
+            host: &host::Host::new(),
             height: 7,
             frame: &batch,
             disposition: node::Disposition::Applied,
@@ -747,6 +1011,7 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
             sealed_frame_block_row(
                 &blobs,
                 &recovery::FoldedBlock {
+                    host: &host::Host::new(),
                     height: 3,
                     frame,
                     disposition: node::Disposition::Applied,
@@ -778,6 +1043,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
     let row = sealed_frame_block_row(
         &blobs,
         &recovery::FoldedBlock {
+            host: &host::Host::new(),
             height: 5,
             frame: &batch,
             disposition: node::Disposition::Rejected,

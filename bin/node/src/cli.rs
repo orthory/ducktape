@@ -59,7 +59,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
         key: args.key,
     };
     let base = ctx.http_base()?;
-    let node_key = crate::node_http::node_public_key(&base)?;
+    let node_key = crate::node_http::pinned_node_key(&base, args.trust_node)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
 
@@ -102,9 +102,10 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (a number or a
-/// display name — the same resolution `user cred grant` takes). A number
-/// resolves offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account NUMBER (the same
+/// authority resolution `cred grant` takes — a display name is refused, never
+/// matched: it is freely rewritable and not unique, and this decision is
+/// whose workload the node runs). A number resolves offline.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -113,9 +114,9 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
-        &base, input,
-    )?))
+    Ok(AdmitTarget::Account(
+        crate::account_cli::resolve_account_authority(&base, input)?,
+    ))
 }
 
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {
@@ -499,7 +500,7 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// — found a network: mint the chain-id, write the descriptor + node config,
 /// seed the genesis validator set with this identity, and PIN the genesis wasm
 /// set — every component and index guest in `--modules` is composed into
-/// `<workspace>/genesis`, whose hash (and every component's) is in the
+/// `<workspace>/genesis`, whose hash (and every deployment's) is in the
 /// descriptor. Every flag is optional:
 /// the generated config defaults to a WORKING node — overlay advertise, and
 /// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
@@ -524,16 +525,17 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(src) => src,
         None => config::modules_dir()?,
     };
-    let genesis = config::Genesis::compose(
-        &founding_set,
-        &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-    )
-    .map_err(|e| {
+    let genesis = config::Genesis::compose(&founding_set).map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
     })?;
+    // discovery above only checked filenames, ids, and the mapper/component
+    // framing — a zero-byte or truncated artifact decodes fine and would
+    // otherwise mint a network that never boots (#1840). Compile every
+    // component and mapper now, before anything is written.
+    config::validate_founding_set(&founding_set, &genesis)?;
     let genesis_bytes = genesis.encode();
     let genesis_hash = config::sha256(&genesis_bytes);
-    let hashes = genesis.component_hashes();
+    let hashes = genesis.module_hashes();
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
@@ -631,8 +633,12 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("network {chain_id} initialized in {}", dir.display());
     eprintln!(
         "genesis: {} components and {} index guests from {} written to {}",
-        genesis.components.len(),
-        genesis.index_guests.len(),
+        genesis.modules.len(),
+        genesis
+            .modules
+            .iter()
+            .filter(|module| genesis.index_guest(&module.id).is_some())
+            .count(),
         founding_set.display(),
         config::genesis_path(&dir).display()
     );
@@ -667,8 +673,12 @@ fn install_joiner_genesis(
     )?;
     eprintln!(
         "genesis: {} components and {} index guests written to {}",
-        genesis.components.len(),
-        genesis.index_guests.len(),
+        genesis.modules.len(),
+        genesis
+            .modules
+            .iter()
+            .filter(|module| genesis.index_guest(&module.id).is_some())
+            .count(),
         config::genesis_path(dir).display()
     );
     Ok(())
@@ -775,10 +785,13 @@ pub(crate) fn mint_invite_blob(
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
     let has_coordinated_reach = descriptor.has_coordinated_reach()?;
-    if let Some(addr) = &dial_hint {
-        descriptor.add_bootstrap(&key.public_key(), addr);
+    let descriptor_changed = match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        None => false,
+    };
+    if descriptor_changed {
+        descriptor.save(&descriptor_path)?;
     }
-    descriptor.save(&descriptor_path)?;
 
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the
@@ -1006,7 +1019,7 @@ fn account_of_key(addr: &str, key: &[u8]) -> Result<Option<u64>, String> {
     )?;
     match decode_reply(&raw)? {
         IdentityReply::Account(account) => Ok(account.map(|account| account.number)),
-        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err("expected an Account reply from identity".into())
         }
     }
@@ -1450,10 +1463,23 @@ pub(super) fn drive_proposal_ceremony(
         }
         None => {
             let prefix: String = pubkey_hex.chars().take(16).collect();
+            // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
+            // walks the OPEN roster, but a settled proposal's record is kept
+            // forever under its id — so an id missing from that list can still
+            // be taken by an earlier ceremony for the same key. Reusing one
+            // makes every wait below adopt that stale record: `await_proposal`
+            // sees it the instant it is asked, `cast_yes_once` returns early on
+            // its settled status, `Execute` is skipped, and the verb reports
+            // the PREVIOUS ceremony's outcome while this one votes on nothing
+            // (a re-grant that silently changes no state — #1766).
             let id = (0u64..)
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
+                .find_map(|candidate| match read_proposal(node.rpc(), &candidate) {
+                    Ok(None) => Some(Ok(candidate)),
+                    Ok(Some(_)) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .expect("the id space is unbounded")?;
             signer.submit(
                 node.rpc(),
                 &GovMsg::Propose {
@@ -1911,9 +1937,9 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // read BEFORE anything lands on disk: a mistyped path is refused with
     // nothing written, like a bad blob.
     let genesis_bytes = match &args.genesis {
-        Some(file) => Some(
-            std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?,
-        ),
+        Some(file) => {
+            Some(std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?)
+        }
         None => None,
     };
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
@@ -2176,9 +2202,10 @@ mod tests {
         );
     }
 
-    /// a module verb must JOIN the founder's open proposal even though every
-    /// member computed its own activation height, so the matcher — not action
-    /// equality — decides which fields identify "the same proposal".
+    /// a module verb must JOIN the founder's open proposal by whichever
+    /// fields ITS OWN matcher cares about, not full action equality — a
+    /// caller whose matcher ignores a field (here, `activation_lead`) still
+    /// finds the right open proposal among unrelated ones.
     #[test]
     fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
         use super::open_proposal_matching;
@@ -2202,9 +2229,8 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                // the founder computed 61; this member computes 60 below —
-                // the matcher must join anyway.
-                activation_height: 61,
+                // a lead the matcher below does not compare against.
+                activation_lead: 61,
                 code_hash: hash.clone(),
             },
         );
@@ -2214,7 +2240,7 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
@@ -2224,13 +2250,13 @@ mod tests {
             GovAction::RegisterModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
         let views = vec![settled, other, founders];
-        // the second member computed height 61, not 60 — equality on the whole
-        // action would never join the founder's proposal.
+        // the matcher below cares only about module_id and code_hash — a
+        // different activation_lead must not stop it from joining "founders".
         let matches = |a: &GovAction| {
             matches!(a, GovAction::UpdateModule { module_id, code_hash, .. }
                 if module_id == "hello" && *code_hash == hash)

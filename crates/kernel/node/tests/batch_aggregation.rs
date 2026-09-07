@@ -20,7 +20,10 @@ use directory::Directory;
 use directory::{DirMsg, encode_msg};
 use futures::executor::block_on;
 use host::Host;
-use node::{BlockSeal, BlockSink, Disposition, MAX_BATCH_BYTES, OrderedNode, RoundOrderer};
+use node::{
+    BlockSeal, BlockSink, Disposition, MAX_BATCH_BYTES, MAX_BATCH_MEMBERS, OrderedNode,
+    RoundOrderer,
+};
 use sdk::Msg;
 
 fn sk(seed: u64) -> ed25519::PrivateKey {
@@ -60,7 +63,15 @@ impl BlockSink for SealRecorder {
     async fn pin(&mut self, _frame: &[u8]) -> Result<(), node::Error> {
         Ok(())
     }
-    async fn pre_apply(&mut self, _height: u64, _frame: &[u8]) -> Result<(), node::Error> {
+    async fn pre_apply(
+        &mut self,
+        _height: u64,
+        _frame: &[u8],
+        _prepared: &host::PreparedWork,
+    ) -> Result<(), node::Error> {
+        Ok(())
+    }
+    async fn witness(&mut self, _height: u64, _witness: &host::Witness) -> Result<(), node::Error> {
         Ok(())
     }
     fn seal(
@@ -236,5 +247,32 @@ fn flush_greedily_splits_pending_into_multiple_capped_batches() {
         assert_eq!(recorded.len(), 2, "two batches -> two seals");
         assert_eq!(recorded[0].height, 0);
         assert_eq!(recorded[1].height, 1);
+    });
+}
+
+// the MEMBER cap, beside the byte cap: tiny ops are ~155 bytes, so the byte cap
+// alone would let ~6.8k of them into one block — and every member is one
+// isolation unit the host may have to replay. one flush of `MAX_BATCH_MEMBERS +
+// 1` tiny ops therefore produces TWO batches.
+#[test]
+fn flush_caps_the_member_count_not_only_the_bytes() {
+    block_on(async {
+        let seals = SealRecorder::default();
+        let mut node = OrderedNode::with_sink(genesis(), RoundOrderer::new(), seals.clone());
+        let signer = sk(4);
+
+        for seq in 0..=MAX_BATCH_MEMBERS {
+            node.submit(&signer, seq as u64, dir_set(&format!("k{seq}"), "v"))
+                .await
+                .expect("submit");
+        }
+        assert_eq!(node.pending_batch_len(), MAX_BATCH_MEMBERS + 1);
+
+        assert_eq!(
+            node.flush_batch().await.expect("flush"),
+            2,
+            "the member cap splits the flush, far below the byte cap"
+        );
+        assert_eq!(node.pending_batch_len(), 0);
     });
 }

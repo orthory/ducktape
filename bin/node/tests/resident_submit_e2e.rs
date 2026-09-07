@@ -15,7 +15,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use chat::{
-    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg,
+    Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg,
     encode_query,
 };
 use common::{Cluster, NetworkShapeCluster};
@@ -146,7 +146,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     );
     assert_eq!(
         author,
-        AuthorRef::User(common::unhex(&friend_key)),
+        Party::Key(common::unhex(&friend_key)),
         "authorship is the resident's key, not the injecting validator's"
     );
 
@@ -323,7 +323,6 @@ fn post(id: &str, text: &str) -> ChatMsg {
         message_id: id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
-        as_agent: None,
     }
 }
 

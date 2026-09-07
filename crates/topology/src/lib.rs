@@ -1,47 +1,20 @@
-//! The module composition topology — ONE source for the module id universe
-//! and the named genesis selections every composer draws from.
+//! Build presets for the founding sets staged beside the binaries.
 //!
-//! No composer keeps a hand-counted id list of its own: the id universe lives
-//! in one [`ModuleTopology`] value, and each backend's genesis set is a NAMED
-//! SELECTION validated against it — [`PRODUCTION`] for the node, [`SIM_BASE`]
-//! and [`SIM_VALSET`] for simnode.
-//!
-//! A row says WHICH module and WHERE ITS CODE COMES FROM, nothing more. What a
-//! module needs from the host to run — the substrate its state lives on, the
-//! network config it seeds, its query mode, whether it ships an index guest —
-//! is the module's own declaration: a wasm component's `shape` export
-//! (`wasm_host::Shape`) and its crate's `src/index_guest.rs`. A table here
-//! that repeated those would be a second source of truth that cannot be
-//! caught being wrong, and it would hold nothing for a module the registry
-//! admits after genesis.
-//!
-//! Inter-module wiring is NOT here either: a module's guest compiles in the
-//! siblings it reads, so the guest is the wiring.
-//!
-//! This is a plan, NOT a root-hash. Every backend instantiates it through the
-//! ONE composer (`noded::compose`) — each spec's `code` decides wasm component
-//! or native struct, identically for node, noded and simnode — but their roots
-//! still differ, because a root is composed from a SELECTION and its genesis
-//! bindings, not from this catalog. One topology never means one root-hash — it
-//! means one place the module SET (and the drift guard on it) lives.
-//!
-//! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
-//! the kernel (`host`) knows nothing of the product modules composed over it.
+//! [`PRODUCTION`] names the default `modules/` directory; [`SIM_BASE`] and
+//! [`SIM_VALSET`] name the simulator selections in `sim-modules/`. This catalog
+//! decides which files a build stages. It does not restrict the module ids or
+//! optional mappers an operator's genesis or a live registry admission may use.
+//! Every runtime module, including `modules` and `valset`, is Wasm and declares
+//! its own backing, configuration keys, and query mode through `shape`.
 
-/// Where a module's CODE comes from: compiled into the binary, or a wasm
-/// component the modules registry can swap at a height boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Code {
-    Native,
-    Wasm,
-}
-
-/// A single module in the composition universe.
+/// One module in the build catalog.
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// Where this module's code comes from.
-    pub code: Code,
+    /// Whether this module's crate carries an index guest (`src/index_guest.rs`,
+    /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). This is a build
+    /// consistency check; operator-supplied directories discover their own files.
+    pub has_index_guest: bool,
 }
 
 /// The module composition topology: the id universe and the three named
@@ -63,12 +36,18 @@ impl ModuleTopology {
         self.modules.iter().find(|m| m.id == id)
     }
 
-    /// the `code == Wasm` ids of `selection`, in selection order.
+    /// Component ids in a build preset, in the preset's order.
     pub fn wasm_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
+        selection.to_vec()
+    }
+
+    /// Mapper ids in a build preset. Arbitrary founding directories discover
+    /// their own mappers independently of this catalog.
+    pub fn index_guest_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
         selection
             .iter()
             .copied()
-            .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
+            .filter(|id| self.spec(id).is_some_and(|m| m.has_index_guest))
             .collect()
     }
 }
@@ -76,14 +55,14 @@ impl ModuleTopology {
 const fn wasm(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
-        code: Code::Wasm,
+        has_index_guest: false,
     }
 }
 
-const fn native(id: &'static str) -> ModuleSpec {
+const fn wasm_indexed(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
-        code: Code::Native,
+        has_index_guest: true,
     }
 }
 
@@ -92,30 +71,28 @@ const fn native(id: &'static str) -> ModuleSpec {
 const MODULES: &[ModuleSpec] = &[
     wasm("acl"),
     wasm("agent"),
+    wasm("attribution"),
     wasm("automations"),
     wasm("capability"),
-    wasm("chat"),
+    wasm_indexed("chat"),
     wasm("dispatch"),
     wasm("files"),
     wasm("forge"),
     wasm("gateway"),
     wasm("governance"),
     wasm("identity"),
-    wasm("inbox"),
-    native("kv"),
-    native("modules"),
-    wasm("pages"),
+    wasm_indexed("inbox"),
+    wasm("kv"),
+    wasm("modules"),
+    wasm_indexed("pages"),
     wasm("runs"),
-    wasm("saga"),
-    wasm("tagging"),
-    wasm("tasks"),
-    native("valset"),
+    wasm_indexed("saga"),
+    wasm_indexed("tasks"),
+    wasm("valset"),
 ];
 
-/// node's production genesis set (19) — every node runs exactly these, so the
-/// set is in the root-hash. A module here is consensus
-/// state forever; experiments live unwired in `crates/labs` and appear in no
-/// selection.
+/// Default founding set (19). An operator may compose a different set with
+/// `node init --modules`; each network pins the resulting deployments.
 pub const PRODUCTION: &[&str] = &[
     "pages",
     "chat",
@@ -127,7 +104,7 @@ pub const PRODUCTION: &[&str] = &[
     "saga",
     "capability",
     "dispatch",
-    "tagging",
+    "attribution",
     "tasks",
     "identity",
     // the MERGED gateway owns the whole `.duck` name -> AccountId -> route
@@ -152,7 +129,7 @@ pub const SIM_BASE: &[&str] = &[
     // reproduce production's provider gate.
     "capability",
     "dispatch",
-    "tagging",
+    "attribution",
     "tasks",
     "inbox",
     "automations",
@@ -174,7 +151,7 @@ pub const SIM_BASE: &[&str] = &[
 /// host-injected once-per-block boundary `Advance` ride every block.
 pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "modules"];
 
-/// The one topology value composers read.
+/// The catalog the build staging code reads.
 pub const TOPOLOGY: ModuleTopology = ModuleTopology {
     modules: MODULES,
     production: PRODUCTION,
@@ -211,16 +188,45 @@ mod tests {
         assert_eq!(
             sorted(PRODUCTION),
             sorted(&[
-                "acl", "agent", "automations", "capability", "chat", "dispatch",
-                "files", "forge", "gateway", "governance", "identity", "inbox",
-                "modules", "pages", "runs", "saga", "tagging", "tasks", "valset",
+                "acl",
+                "agent",
+                "automations",
+                "capability",
+                "chat",
+                "dispatch",
+                "files",
+                "forge",
+                "gateway",
+                "governance",
+                "identity",
+                "inbox",
+                "modules",
+                "pages",
+                "runs",
+                "saga",
+                "attribution",
+                "tasks",
+                "valset",
             ])
         );
         assert_eq!(
             sorted(SIM_BASE),
             sorted(&[
-                "agent", "automations", "capability", "chat", "dispatch", "files", "forge",
-                "gateway", "identity", "inbox", "pages", "runs", "saga", "tagging", "tasks",
+                "agent",
+                "automations",
+                "capability",
+                "chat",
+                "dispatch",
+                "files",
+                "forge",
+                "gateway",
+                "identity",
+                "inbox",
+                "pages",
+                "runs",
+                "saga",
+                "attribution",
+                "tasks",
             ])
         );
         assert_eq!(
@@ -246,7 +252,10 @@ mod tests {
     fn sim_base_and_valset_are_disjoint() {
         let base: BTreeSet<&str> = SIM_BASE.iter().copied().collect();
         for id in SIM_VALSET {
-            assert!(!base.contains(id), "sim_valset id {id} is already in sim_base");
+            assert!(
+                !base.contains(id),
+                "sim_valset id {id} is already in sim_base"
+            );
         }
     }
 
@@ -255,7 +264,11 @@ mod tests {
     #[test]
     fn universe_and_selections_cover_each_other() {
         let universe: BTreeSet<&str> = MODULES.iter().map(|m| m.id).collect();
-        assert_eq!(universe.len(), MODULES.len(), "the module universe has a duplicate id");
+        assert_eq!(
+            universe.len(),
+            MODULES.len(),
+            "the module universe has a duplicate id"
+        );
 
         let used: BTreeSet<&str> = PRODUCTION
             .iter()
@@ -275,22 +288,20 @@ mod tests {
         assert!(TOPOLOGY.spec("not-a-module").is_none());
     }
 
-    /// The `code` column is consensus-adjacent: a wrong `code` sends a native
-    /// module to the wasm loader, or a wasm tenant to a constructor the
-    /// composer does not have.
     #[test]
-    fn code_column_pins_the_natives() {
-        let native: Vec<&str> = MODULES
-            .iter()
-            .filter(|m| m.code == Code::Native)
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(sorted(&native), ["kv", "modules", "valset"]);
+    fn wasm_ids_preserves_the_preset_order() {
+        assert_eq!(TOPOLOGY.wasm_ids(SIM_VALSET), SIM_VALSET);
     }
 
+    /// pins today's index-guest-shipping set — the same 5 crates that carry
+    /// `src/index_guest.rs` and that `crates/noded/build.rs` cross-checks this
+    /// flag against at every build.
     #[test]
-    fn wasm_ids_selects_only_wasm_specs_in_selection_order() {
-        let ids = TOPOLOGY.wasm_ids(SIM_VALSET);
-        assert_eq!(ids, ["acl", "governance"]);
+    fn index_guest_ids_selects_only_the_declared_shippers() {
+        let ids = TOPOLOGY.index_guest_ids(PRODUCTION);
+        assert_eq!(
+            sorted(&ids),
+            sorted(&["chat", "inbox", "pages", "saga", "tasks"])
+        );
     }
 }

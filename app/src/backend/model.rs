@@ -883,3 +883,153 @@ fn operator_token_for(origin: &str) -> Option<String> {
     let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
+
+// ============================================================================
+// THE COPY RANGE — a run of messages, addressed by the two seqs at its ends.
+//
+// This app had no way to copy a message's TEXT at all: the action menu offers
+// `Copy message link` and nothing else, so quoting a conversation anywhere
+// meant retyping it. There is no cross-widget text selection to reach for —
+// iced has none, and the timeline's hover is deliberately draw-time (see the
+// note on `MessageCard`), so a drag that tracked the cursor across rows would
+// cost a route and a full rebuild per row crossed, which is exactly the
+// per-hover round trip `DiffRow` refuses. The unit is therefore the message,
+// not the character, and the gesture is a click plus a shift-click.
+//
+// The ends are seqs, not indices: history PREPENDS, so an index is stale the
+// moment an older page merges in, while a seq names the same message forever.
+// Neither end is required to be the earlier one — the anchor is where the
+// reader started, which is as often the newest row as the oldest.
+//
+// A row's own reading is pure arithmetic on those two seqs, with no list at
+// all: the rows a `lazy` memo lends to a cached row do not include the
+// timeline, and asking for one there would unmemo the whole scrollback. The
+// list is needed only where the text is actually lifted.
+// ============================================================================
+
+/// Where a press left the copy range: the anchor it keeps, the head it moved,
+/// and the surface both address.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CopyRange {
+    pub anchor: i64,
+    pub head: i64,
+    pub surface: crate::CopySurface,
+}
+
+/// The range's ends in order, or `None` when there is no range.
+fn range_seqs(anchor: i64, head: i64) -> Option<(i64, i64)> {
+    (anchor > 0 && head > 0).then(|| (anchor.min(head), anchor.max(head)))
+}
+
+/// True for a row inside the copy range, which is what draws its tint. The
+/// surface is half the answer: a thread reply and a timeline row draw their
+/// seqs from the SAME channel sequence, so a reply can fall numerically inside
+/// a range the reader drew in the stream behind it. Without this it would
+/// light up in a range whose copy never included it.
+pub fn seq_in_copy_range(
+    seq: i64,
+    anchor: i64,
+    head: i64,
+    surface: crate::CopySurface,
+    mine: crate::CopySurface,
+) -> bool {
+    if surface != mine {
+        return false;
+    }
+    range_seqs(anchor, head).is_some_and(|(low, high)| seq >= low && seq <= high)
+}
+
+/// The rows of `messages` the range covers, oldest first.
+fn range_rows(messages: &[ChatMessage], anchor: i64, head: i64) -> Vec<&ChatMessage> {
+    let Some((low, high)) = range_seqs(anchor, head) else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter(|message| message.seq >= low && message.seq <= high)
+        .collect()
+}
+
+/// How many messages the range covers in this surface's list. Zero is "no
+/// range here", which is what each copy bar is gated on — a bar has no empty
+/// reading, and only the surface the range was drawn in has a non-zero one.
+pub fn copy_range_count(messages: &[ChatMessage], anchor: i64, head: i64) -> i64 {
+    range_rows(messages, anchor, head).len() as i64
+}
+
+/// The range as plain text, oldest first: one `author: body` entry per
+/// message, blank-line separated so a multi-line body stays readable when it
+/// lands in an editor. A deleted or empty row contributes nothing — its body
+/// is gone, and a placeholder would be a line the reader never wrote.
+pub fn copy_range_text(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
+    range_rows(messages, anchor, head)
+        .into_iter()
+        .filter(|message| !message.deleted && !message.body.trim().is_empty())
+        .map(|message| format!("{}: {}", message.author, message.body.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The toast the copy raises, counting what actually reached the clipboard.
+pub fn copy_range_toast(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
+    match copy_range_count(messages, anchor, head) {
+        1 => "Message copied".to_owned(),
+        count => format!("{count} messages copied"),
+    }
+}
+
+/// Whichever list the range was drawn in — the surface decides, so the chord
+/// lifts the same rows the bar is counting.
+pub fn copy_range_rows(
+    timeline: &[ChatMessage],
+    thread: &[ChatMessage],
+    surface: crate::CopySurface,
+) -> Vec<ChatMessage> {
+    match surface {
+        crate::CopySurface::Timeline => timeline.to_vec(),
+        crate::CopySurface::Thread => thread.to_vec(),
+        crate::CopySurface::Nowhere => Vec::new(),
+    }
+}
+
+/// Where a click lands the range. A plain click starts a new one-message range
+/// here; a shift-click keeps the anchor and moves the far end — the gesture
+/// every list in every desktop app already answers. A shift-click in the OTHER
+/// surface starts fresh rather than drawing a range across both.
+///
+/// A PENDING ROW IS NOT AN END. A message still in flight carries a negative
+/// seq (`chat::client` numbers pending rows down from -1), and a range with one
+/// at either end covers no rows at all: the bar — which holds the only Clear
+/// button — would vanish while the ⌘C route, armed on the anchor, stayed armed
+/// with nothing to disarm it. So a press on one clears the range instead.
+pub fn copy_range_after_press(
+    anchor: i64,
+    surface: crate::CopySurface,
+    seq: i64,
+    pressed_in: crate::CopySurface,
+    extending: bool,
+) -> CopyRange {
+    let settled = seq > 0;
+    if !settled {
+        return CopyRange {
+            anchor: 0,
+            head: 0,
+            surface: crate::CopySurface::Nowhere,
+        };
+    }
+    let anchored = extending && anchor > 0 && surface == pressed_in;
+    CopyRange {
+        anchor: if anchored { anchor } else { seq },
+        head: seq,
+        surface: pressed_in,
+    }
+}
+
+/// The copy bar's own count line. It has no zero reading — the bar is gated on
+/// a non-zero count — so this never has to spell an empty range.
+pub fn copy_range_label(count: i64) -> String {
+    match count {
+        1 => "1 message selected".to_owned(),
+        count => format!("{count} messages selected"),
+    }
+}

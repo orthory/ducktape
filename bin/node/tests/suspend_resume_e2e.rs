@@ -160,6 +160,5 @@ fn post(id: &str, text: &str) -> ChatMsg {
         message_id: id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
-        as_agent: None,
     }
 }

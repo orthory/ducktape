@@ -168,8 +168,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
 /// plausible in the ui while staying identical across runs.
-const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
-const SIM_BLOCK_MS: u64 = 1_000;
+pub const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
+pub const SIM_BLOCK_MS: u64 = 1_000;
 
 /// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.
@@ -383,7 +383,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // checkout that built it has that set.
     let modules_dir = match modules_dir {
         Some(dir) => dir,
-        None => workspace_config::modules_dir()?,
+        None => workspace_config::sim_modules_dir()?,
     };
 
     // the status module list and the index tier both extend only under valset
@@ -413,10 +413,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // the sim runs the SAME wasm index guests as the real daemons, from the
     // same founding set its components came from.
     let index = noded::open_index_store(&storage, &module_ids)?;
-    noded::converge_index_guests(
-        &index,
-        &noded::IndexGuests::from_dir(&modules_dir, &module_ids)?,
-    )?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder
@@ -488,7 +484,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
                 valset_keys,
                 invite_binding,
                 public_key,
-                module_ids,
                 cmd_rx,
                 control_rx,
                 stream_hub,
@@ -791,7 +786,6 @@ fn run_sim(
     valset_keys: Vec<Vec<u8>>,
     invite_binding: Vec<u8>,
     public_key: String,
-    module_ids: Vec<&'static str>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
     stream_hub: StreamHub,
@@ -811,7 +805,6 @@ fn run_sim(
         // registries seeded from the sim's bindings. governance composes as
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
-        let selection: &[&'static str] = &module_ids;
         let substrates = Substrates {
             forge_repo,
             duckfs_dir,
@@ -823,7 +816,6 @@ fn run_sim(
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(
-            selection,
             &code,
             &mut stores,
             &substrates,
@@ -836,6 +828,7 @@ fn run_sim(
         .await
         .expect("sim genesis composes");
         host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
+        noded::converge_host_modules(&index, &host).expect("deployed index guests converge");
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -1154,6 +1147,11 @@ impl Sim {
         // lane, so `project_block` fills it (where the old direct-host path left
         // it empty).
         for projection in noded::projection::project_block(&drained, system, &self.blobs) {
+            // a height that sealed nothing is not a block: never fold one (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let time = ConsensusTimePolicy::Epoch {
                 base_ms: SIM_EPOCH_MS,
                 block_ms: SIM_BLOCK_MS,
@@ -1165,7 +1163,7 @@ impl Sim {
                 time,
                 projection.record,
                 &projection.dispatches,
-                &self.node.host().module_roots(),
+                self.node.host(),
             );
             if let Some(root_hash) = projection.sealed_hash {
                 self.stream_hub.publish_block(
@@ -1350,10 +1348,13 @@ impl Sim {
                 id,
             })
             .collect();
+        let height = self.height();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
-            height: self.height(),
+            height,
+            consensus_time: self.node.stamp_consensus_time(height),
+            consensus_time_unit: self.node.consensus_time_policy().into(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
             // key as "no peer-routed features here" (no huddle voice). the
@@ -1431,7 +1432,20 @@ impl worker::Lane for AutoLane<'_> {
     }
 
     async fn pending(&self) -> bool {
-        self.sim.node.host().has_pending_deliveries().await
+        match self.sim.node.host().has_pending_work().await {
+            Ok(pending) => pending,
+            // an unreadable queue fails the next block closed on its own; the
+            // pump does not manufacture one.
+            Err(e) => {
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %e,
+                    reason = "pending_work_unreadable",
+                    "could not read the committed queues"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -1472,6 +1486,7 @@ fn proposer_hex(origin: &Origin) -> String {
     match origin {
         Origin::External(key) => hex_bytes(key),
         Origin::Module(id) => format!("module:{id}"),
+        Origin::Program(account) => format!("acct:{account}"),
         Origin::System => "system".into(),
     }
 }

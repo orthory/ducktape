@@ -1,7 +1,7 @@
 //! the module-code staging lane: the operator end of wasm code distribution.
 //!
-//! `POST /v1/admin/module-code/stage` ingests a code artifact (a wasm
-//! component, later a quack capsule) into this node's content-addressed blob
+//! `POST /v1/admin/module-code/stage` ingests a canonical module artifact
+//! (a Wasm component and optional mapper) into this node's content-addressed blob
 //! store and — unless `?fanout=false` — hands the digest to the node's
 //! code-plane fan-out, which pushes the bytes to every member and collects
 //! per-peer receipts. the response is the digest (what a governance
@@ -71,12 +71,12 @@ struct StageReply {
 /// — already sits at 82% of that. The next module to cross it would have been
 /// un-stageable behind an opaque tower error carrying no reason token.
 ///
-/// 16 MiB is ~9x that artifact: room for a debug-info-heavy component or a
-/// quack capsule without another silent cliff, while still BOUNDING an ingest
+/// 16 MiB is ~9x that artifact: room for a component and its mapper, while
+/// still BOUNDING an ingest
 /// this route fans out to every member over the code plane. Disabling the limit
 /// would be strictly worse than refusing — one operator-credentialed caller
 /// could drive an unbounded local buffer and an unbounded network fan-out.
-pub(crate) const MAX_MODULE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MODULE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
 /// a refusal carrying a stable snake_case `reason` beside the message — the
 /// admin namespace's body shape (`admin::refuse`), so an operator's client
@@ -126,6 +126,9 @@ pub(crate) async fn stage_module_code(
     };
     if body.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty artifact body");
+    }
+    if let Err(error) = module_artifact::ModuleArtifactRef::decode(&body) {
+        return error_response(StatusCode::BAD_REQUEST, &error);
     }
     let len = body.len() as u64;
     // ingest-by-value: the operator upload buffers once here, then lives on

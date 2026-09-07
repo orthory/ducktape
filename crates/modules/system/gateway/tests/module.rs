@@ -36,6 +36,7 @@ impl TestCtx {
                 consensus_time: 1,
                 origin: Origin::External(origin),
                 me: "gateway".into(),
+                cause: sdk::Cause::Direct,
             },
             accounts,
         }
@@ -78,6 +79,7 @@ fn pubkey(signer: &ed25519::PrivateKey) -> Vec<u8> {
 
 fn account(number: u64, signer: &ed25519::PrivateKey) -> AccountView {
     AccountView {
+        control: identity::Control::Keys,
         number,
         name: "Alice".into(),
         keys: vec![KeyView {
@@ -560,4 +562,55 @@ fn first_registration_wins_and_owner_gates_mutations() {
     .unwrap();
     block_on(module.commit_block()).unwrap();
     assert!(query_credential(&module, "a").is_none());
+}
+
+#[test]
+fn same_owner_reregistration_carries_existing_grants_forward() {
+    let node_a = vec![1; 32];
+    let signer_a = ed25519::PrivateKey::from_seed(101);
+    let signer_b = ed25519::PrivateKey::from_seed(201);
+    let account_a = account(1, &signer_a);
+    let account_b = account(2, &signer_b);
+    let mut context = TestCtx::new(
+        pubkey(&signer_a),
+        BTreeMap::from([
+            (pubkey(&signer_a), account_a.clone()),
+            (pubkey(&signer_b), account_b.clone()),
+        ]),
+    );
+    let mut module = gateway();
+
+    // owner A registers "a", then grants B use of it.
+    context.act_as(pubkey(&signer_a));
+    execute(
+        &mut module,
+        &mut context,
+        signed_set_credential(&signer_a, credential("a", account_a.number, node_a.clone())),
+    )
+    .unwrap();
+    execute(
+        &mut module,
+        &mut context,
+        signed_grant(&signer_a, account_a.number, "a", account_b.number),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    assert!(credential_use_allowed(
+        &query_credential(&module, "a").unwrap(),
+        account_b.number
+    ));
+
+    // owner A re-registers the same name (e.g. a rotated token) with a
+    // fresh, grant-free statement: the committed grant must survive.
+    execute(
+        &mut module,
+        &mut context,
+        signed_set_credential(&signer_a, credential("a", account_a.number, node_a)),
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    assert!(credential_use_allowed(
+        &query_credential(&module, "a").unwrap(),
+        account_b.number
+    ));
 }

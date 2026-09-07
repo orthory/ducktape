@@ -27,15 +27,16 @@
 
 use std::collections::BTreeMap;
 
-use chat::AuthorRef;
-use sdk::{Error, Msg, Origin};
+use chat::Party;
+use sdk::{Error, Msg};
 
 use crate::codec::{self, Reader};
 use crate::oid::{OID_RAW_LEN, Oid};
 use crate::tracker_iface::{
-    DiffSide, ItemDetail, ItemKind, ItemState, ItemSummary, MAX_BODY_BYTES, MAX_PATH_BYTES,
-    MAX_REVIEW_COMMENT_BYTES, MAX_REVIEW_COMMENTS, MAX_REVIEWS_PER_ITEM, MAX_TITLE_BYTES,
-    ReviewComment, ReviewVerdict, ReviewView, channel_id_for,
+    DiffSide, ItemDetail, ItemKind, ItemState, ItemSummary, MAX_BODY_BYTES,
+    MAX_OPEN_ITEMS_PER_ACTOR, MAX_OPEN_ITEMS_PER_REPO, MAX_PATH_BYTES, MAX_REVIEW_COMMENT_BYTES,
+    MAX_REVIEW_COMMENTS, MAX_REVIEWS_PER_ITEM, MAX_TITLE_BYTES, ReviewComment, ReviewVerdict,
+    ReviewView, channel_id_for,
 };
 
 /// the canonical-bytes header: magic + layout version. the disk file, the
@@ -50,7 +51,7 @@ pub struct Item {
     pub kind: ItemKind,
     pub title: String,
     pub body: String,
-    pub author: AuthorRef,
+    pub author: Party,
     pub state: ItemState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -103,9 +104,19 @@ pub struct RepoTracker {
     /// may move a protected branch (`main`/`dev`) afterwards. see
     /// [`crate::state::ForgeState::stage_push_refs`] for why authorization is
     /// the whole of protected-branch safety.
-    pub owner: Option<Vec<u8>>,
+    pub owner: Option<Party>,
     /// the LAST assigned number; 0 = none yet. the next item gets `+1`.
     pub last_number: u64,
+    /// how many items in [`Self::items`] are currently `Open` — what
+    /// [`crate::tracker_iface::MAX_OPEN_ITEMS_PER_REPO`] is checked against.
+    /// maintained alongside every state transition rather than recomputed by
+    /// scanning `items`, which only ever grows (there is no delete op).
+    pub open_count: u64,
+    /// each author's share of [`Self::open_count`] — what
+    /// [`crate::tracker_iface::MAX_OPEN_ITEMS_PER_ACTOR`] is checked against.
+    /// an entry is removed once its count reaches zero, so this map never
+    /// outgrows `open_count`.
+    pub open_by_author: BTreeMap<Party, u64>,
     pub items: BTreeMap<u64, Item>,
 }
 
@@ -113,40 +124,9 @@ pub struct RepoTracker {
 /// canonical encoding iterates in key order).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Tracker {
+    /// Source revisions survive ref deletion, image re-entry, and recovery.
+    pub source_revision: u64,
     pub repos: BTreeMap<String, RepoTracker>,
-}
-
-/// derive the item author from the dispatch origin — the same posture as
-/// chat: authorship is NEVER a payload field.
-///
-/// a MODULE is a FIRST-CLASS author, not a second-class one. `runs` opens the
-/// pull request that publishes a finished agent run (`runs/src/sink.rs`
-/// `emit_sink`), and the host stamps that follow-up `Origin::Module("runs")`
-/// — refusing it does not "keep items member-only", it errors the emitted op
-/// and aborts the whole delivery block. the module id is trustworthy because
-/// the host synthesizes `Origin::Module` in exactly ONE place, from the
-/// module that just ran, and a frame cannot express a second op that picks
-/// its own id (the deleted continuation lane). both halves are pinned by
-/// `node/tests/no_continuation_lane.rs`.
-///
-/// two origins are refused, for two different reasons:
-/// - an EMPTY external id is the pre-consensus probe, never an authenticated
-///   submitter.
-/// - `Origin::System` has no producer that can reach here: the host stamps it
-///   only on its two once-per-block injections (`modules::Advance` and
-///   `dispatch::DeliverPending`), neither of which targets forge. an
-///   unreachable arm stays refused rather than minting an unowned item.
-pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {
-    match origin {
-        Origin::External(id) if id.is_empty() => Err(Error::Module(
-            "forge: tracker ops require an authenticated origin".into(),
-        )),
-        Origin::External(id) => Ok(AuthorRef::User(id.clone())),
-        Origin::Module(m) => Ok(AuthorRef::Module(m.clone())),
-        Origin::System => Err(Error::Module(
-            "forge: tracker ops require an authenticated origin".into(),
-        )),
-    }
 }
 
 fn check_len(field: &str, s: &str, max: usize) -> Result<(), Error> {
@@ -178,25 +158,74 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
     Oid::from_hex(&s.to_ascii_lowercase())
 }
 
+/// refuse an open/reopen once the repo or the author is at its OPEN-item
+/// ceiling. named so the two caps this crate enforces (a repo cap, and an
+/// author's share of it) read as one decision at every call site.
+fn require_open_slot(rt: &RepoTracker, author: &Party, repo: &str) -> Result<(), Error> {
+    if rt.open_count as usize >= MAX_OPEN_ITEMS_PER_REPO {
+        return Err(Error::Module(format!(
+            "forge: repo {repo:?} is at its open-item cap ({MAX_OPEN_ITEMS_PER_REPO}); close or \
+             merge one first"
+        )));
+    }
+    let actor_open = rt.open_by_author.get(author).copied().unwrap_or(0);
+    if actor_open as usize >= MAX_OPEN_ITEMS_PER_ACTOR {
+        return Err(Error::Module(format!(
+            "forge: you already have {MAX_OPEN_ITEMS_PER_ACTOR} open items in repo {repo:?}; \
+             close or merge one first"
+        )));
+    }
+    Ok(())
+}
+
+/// record that `author` just opened (or reopened) an item — the
+/// [`RepoTracker::open_by_author`] half of [`require_open_slot`]'s ceiling.
+fn note_author_opened(rt: &mut RepoTracker, author: &Party) {
+    *rt.open_by_author.entry(author.clone()).or_insert(0) += 1;
+}
+
+/// record that `author`'s item just closed or merged, pruning the entry at
+/// zero so the map never outgrows the live open count.
+fn note_author_closed(rt: &mut RepoTracker, author: &Party) {
+    use std::collections::btree_map::Entry;
+    if let Entry::Occupied(mut e) = rt.open_by_author.entry(author.clone()) {
+        *e.get_mut() -= 1;
+        if *e.get() == 0 {
+            e.remove();
+        }
+    }
+}
+
 impl Tracker {
     /// LOAD-BEARING: a repo owner is consensus state, so an owner alone must
     /// make the tracker non-empty. otherwise `compose_state_root` skips the
     /// tracker fold and the owner becomes UNAUTHENTICATED state — a joiner
     /// could install a snapshot naming any owner it liked.
     pub fn is_empty(&self) -> bool {
-        self.repos
-            .values()
-            .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
+        self.source_revision == 0
+            && self
+                .repos
+                .values()
+                .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
     }
 
     /// the principal that owns `repo`, if a push has birthed it.
-    pub fn owner(&self, repo: &str) -> Option<&[u8]> {
-        self.repos.get(repo).and_then(|r| r.owner.as_deref())
+    pub fn owner(&self, repo: &str) -> Option<&Party> {
+        self.repos.get(repo).and_then(|r| r.owner.as_ref())
+    }
+
+    /// how many repos `principal` already owns — derived from the tracker the
+    /// owner entries already live in, so the cap needs no counter of its own.
+    pub fn repos_owned_by(&self, principal: &Party) -> usize {
+        self.repos
+            .values()
+            .filter(|r| r.owner.as_ref() == Some(principal))
+            .count()
     }
 
     /// pin the owner of the repo this block's push is BIRTHING. the caller has
     /// already established that the repo has none.
-    pub fn claim_owner(&mut self, repo: &str, principal: Vec<u8>) {
+    pub fn claim_owner(&mut self, repo: &str, principal: Party) {
         self.repos.entry(repo.to_string()).or_default().owner = Some(principal);
     }
 
@@ -224,7 +253,7 @@ impl Tracker {
         kind: ItemKind,
         title: String,
         body: String,
-        author: AuthorRef,
+        author: Party,
         now: u64,
         branches: Option<(String, String)>,
     ) -> Result<u64, Error> {
@@ -232,12 +261,15 @@ impl Tracker {
         check_len("body", &body, MAX_BODY_BYTES)?;
         debug_assert_eq!(matches!(kind, ItemKind::Pr), branches.is_some());
         let rt = self.repos.entry(repo.to_string()).or_default();
+        require_open_slot(rt, &author, repo)?;
         let number = rt.last_number + 1;
         rt.last_number = number;
         let (source_branch, target_branch) = match branches {
             Some((s, t)) => (Some(s), Some(t)),
             None => (None, None),
         };
+        rt.open_count += 1;
+        note_author_opened(rt, &author);
         rt.items.insert(
             number,
             Item {
@@ -264,7 +296,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        editor: &AuthorRef,
+        editor: &Party,
         title: Option<String>,
         body: Option<String>,
         now: u64,
@@ -297,8 +329,18 @@ impl Tracker {
         open: bool,
         now: u64,
     ) -> Result<Option<&'static str>, Error> {
-        let item = self.item_mut(repo, number)?;
-        if item.state == ItemState::Merged {
+        let rt = self
+            .repos
+            .get_mut(repo)
+            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+        let (current_state, author) = {
+            let item = rt
+                .items
+                .get(&number)
+                .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+            (item.state, item.author.clone())
+        };
+        if current_state == ItemState::Merged {
             return Err(Error::Module(
                 "forge: a merged pull request cannot change state".into(),
             ));
@@ -308,18 +350,39 @@ impl Tracker {
         } else {
             ItemState::Closed
         };
-        if item.state == target {
+        if current_state == target {
             return Ok(None);
         }
+        // reopening claims a slot back exactly like a fresh `OpenIssue`/
+        // `OpenPr` — the same two caps apply, so a closed item cannot reopen
+        // past a repo or an author's ceiling.
+        if open {
+            require_open_slot(rt, &author, repo)?;
+        }
+        let item = rt.items.get_mut(&number).expect("checked above");
         item.state = target;
         item.updated_at = now;
+        if open {
+            rt.open_count += 1;
+            note_author_opened(rt, &author);
+        } else {
+            rt.open_count -= 1;
+            note_author_closed(rt, &author);
+        }
         Ok(Some(if open { "reopened" } else { "closed" }))
     }
 
     /// mark an open PR merged, recording the merge commit. the ref CAS (target
     /// and source head checks) is the caller's job — it owns the refs.
     pub fn merge_pr(&mut self, repo: &str, number: u64, merge: Oid, now: u64) -> Result<(), Error> {
-        let item = self.item_mut(repo, number)?;
+        let rt = self
+            .repos
+            .get_mut(repo)
+            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
+        let item = rt
+            .items
+            .get_mut(&number)
+            .ok_or_else(|| Error::Module(format!("forge: no item #{number} in repo {repo}")))?;
         if item.kind != ItemKind::Pr {
             return Err(Error::Module(format!(
                 "forge: item #{number} is an issue, not a pull request"
@@ -333,6 +396,9 @@ impl Tracker {
         item.state = ItemState::Merged;
         item.merge_oid = Some(merge);
         item.updated_at = now;
+        let author = item.author.clone();
+        rt.open_count -= 1;
+        note_author_closed(rt, &author);
         Ok(())
     }
 
@@ -345,7 +411,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        author: AuthorRef,
+        author: Party,
         verdict: ReviewVerdict,
         body: String,
         commit_oid: &str,
@@ -417,6 +483,28 @@ impl Tracker {
         ))
     }
 
+    /// a PR's author — the merge-authorization input
+    /// `ForgeState::require_merge_authorized` reads for an unprotected target.
+    /// unlike [`Self::pr_branches`] this does not require the PR still be
+    /// open: a merge's tracker-side gate already runs `pr_branches` first, and
+    /// the same author owns a re-check without a second open-state error.
+    ///
+    /// `SubmitReview` has no standing gate of its own (any account may review
+    /// any PR, #1760) and forge carries no collaborator/member list, so a
+    /// submitted review's author is NOT sound merge standing — a stranger's
+    /// self-filed review must never unlock `MergePr`. reviews are still
+    /// stored and shown (`ItemDetail::reviews`); they just no longer feed
+    /// authorization.
+    pub fn pr_author(&self, repo: &str, number: u64) -> Result<Party, Error> {
+        let item = self.item(repo, number)?;
+        if item.kind != ItemKind::Pr {
+            return Err(Error::Module(format!(
+                "forge: item #{number} is an issue, not a pull request"
+            )));
+        }
+        Ok(item.author.clone())
+    }
+
     /// mint the next system-message id for an item's discussion channel.
     pub fn next_sys_message_id(&mut self, repo: &str, number: u64) -> Result<String, Error> {
         let item = self.item_mut(repo, number)?;
@@ -447,12 +535,17 @@ impl Tracker {
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = TRACKER_MAGIC.to_vec();
+        codec::put_u64(&mut out, self.source_revision);
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
-            // an EMPTY owner is `None`: an empty principal is never a valid
-            // origin, so the two can never be confused.
-            codec::put_bytes(&mut out, rt.owner.as_deref().unwrap_or_default());
+            match &rt.owner {
+                None => codec::put_u8(&mut out, 0),
+                Some(owner) => {
+                    codec::put_u8(&mut out, 1);
+                    encode_author(&mut out, owner);
+                }
+            }
             codec::put_u64(&mut out, rt.last_number);
             codec::put_u32(&mut out, rt.items.len() as u32);
             for item in rt.items.values() {
@@ -469,13 +562,16 @@ impl Tracker {
                 Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
             })?;
         let mut r = Reader::new(body);
+        let source_revision = r.u64()?;
         let repo_count = r.u32()?;
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
             let name = r.str_()?;
-            let owner_len = r.u32()? as usize;
-            let owner = r.take(owner_len)?;
-            let owner = (!owner.is_empty()).then(|| owner.to_vec());
+            let owner = match r.u8()? {
+                0 => None,
+                1 => Some(decode_author(&mut r)?),
+                _ => return Err(Error::Module("forge tracker: invalid owner tag".into())),
+            };
             let last_number = r.u64()?;
             let item_count = r.u32()?;
             let mut items = BTreeMap::new();
@@ -490,12 +586,25 @@ impl Tracker {
                     return Err(Error::Module("forge tracker: duplicate item number".into()));
                 }
             }
+            // `open_count`/`open_by_author` are not wire fields: they are a
+            // pure function of `items`' states, derived here rather than
+            // trusted from bytes so the two can never drift apart.
+            let mut open_count = 0u64;
+            let mut open_by_author: BTreeMap<Party, u64> = BTreeMap::new();
+            for item in items.values() {
+                if item.state == ItemState::Open {
+                    open_count += 1;
+                    *open_by_author.entry(item.author.clone()).or_insert(0) += 1;
+                }
+            }
             if repos
                 .insert(
                     name,
                     RepoTracker {
                         owner,
                         last_number,
+                        open_count,
+                        open_by_author,
                         items,
                     },
                 )
@@ -509,41 +618,40 @@ impl Tracker {
                 "forge tracker: trailing bytes after the container".into(),
             ));
         }
-        Ok(Self { repos })
+        Ok(Self {
+            source_revision,
+            repos,
+        })
     }
 }
 
-fn encode_author(out: &mut Vec<u8>, a: &AuthorRef) {
+fn encode_author(out: &mut Vec<u8>, a: &Party) {
     match a {
-        AuthorRef::User(id) => {
+        Party::Key(id) => {
             codec::put_u8(out, 0);
             codec::put_bytes(out, id);
         }
-        AuthorRef::Agent { module, agent_id } => {
+        Party::Account(account) => {
             codec::put_u8(out, 1);
-            codec::put_str(out, module);
-            codec::put_str(out, agent_id);
+            codec::put_u64(out, *account);
         }
-        AuthorRef::Module(m) => {
+        Party::Module(m) => {
             codec::put_u8(out, 2);
             codec::put_str(out, m);
         }
-        AuthorRef::System => codec::put_u8(out, 3),
+        Party::System => codec::put_u8(out, 3),
     }
 }
 
-fn decode_author(r: &mut Reader) -> Result<AuthorRef, Error> {
+fn decode_author(r: &mut Reader) -> Result<Party, Error> {
     Ok(match r.u8()? {
         0 => {
             let len = r.u32()? as usize;
-            AuthorRef::User(r.take(len)?.to_vec())
+            Party::Key(r.take(len)?.to_vec())
         }
-        1 => AuthorRef::Agent {
-            module: r.str_()?,
-            agent_id: r.str_()?,
-        },
-        2 => AuthorRef::Module(r.str_()?),
-        3 => AuthorRef::System,
+        1 => Party::Account(r.u64()?),
+        2 => Party::Module(r.str_()?),
+        3 => Party::System,
         t => return Err(Error::Module(format!("forge tracker: bad author tag {t}"))),
     })
 }
@@ -733,7 +841,6 @@ pub fn system_line_msg(
             message_id,
             blocks: vec![chat::Block::paragraph(text)],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -742,8 +849,8 @@ pub fn system_line_msg(
 mod tests {
     use super::*;
 
-    fn user(b: u8) -> AuthorRef {
-        AuthorRef::User(vec![b; 4])
+    fn user(b: u8) -> Party {
+        Party::Key(vec![b; 4])
     }
 
     #[test]
@@ -876,7 +983,7 @@ mod tests {
             ItemKind::Pr,
             "pr".into(),
             "prbody".into(),
-            AuthorRef::Module("runs".into()),
+            Party::Module("runs".into()),
             2,
             Some(("feature/x".into(), "main".into())),
         )
@@ -933,5 +1040,130 @@ mod tests {
         )
         .unwrap();
         assert!(!t2.is_empty());
+    }
+
+    // the per-repo cap: with no delete op, OPEN items would otherwise grow
+    // unbounded. spread across many authors so the per-actor cap below never
+    // trips first.
+    #[test]
+    fn repo_open_item_cap_refuses_until_one_closes() {
+        let mut t = Tracker::default();
+        for i in 0..MAX_OPEN_ITEMS_PER_REPO as u64 {
+            t.open_item(
+                "demo",
+                ItemKind::Issue,
+                format!("item {i}"),
+                String::new(),
+                user((i % 256) as u8),
+                i,
+                None,
+            )
+            .unwrap();
+        }
+        let err = t
+            .open_item(
+                "demo",
+                ItemKind::Issue,
+                "one too many".into(),
+                String::new(),
+                user(0),
+                1_000_000,
+                None,
+            )
+            .expect_err("repo is at its open-item cap");
+        assert!(err.to_string().contains("open-item cap"), "{err}");
+
+        // a different repo is unaffected — the cap is per-repo.
+        t.open_item(
+            "other",
+            ItemKind::Issue,
+            "fine".into(),
+            String::new(),
+            user(0),
+            1_000_000,
+            None,
+        )
+        .unwrap();
+
+        // closing one item in "demo" frees exactly one slot.
+        t.set_state("demo", 1, false, 1_000_001).unwrap();
+        t.open_item(
+            "demo",
+            ItemKind::Issue,
+            "fits now".into(),
+            String::new(),
+            user(0),
+            1_000_002,
+            None,
+        )
+        .unwrap();
+        let err = t
+            .open_item(
+                "demo",
+                ItemKind::Issue,
+                "one too many again".into(),
+                String::new(),
+                user(0),
+                1_000_003,
+                None,
+            )
+            .expect_err("full again");
+        assert!(err.to_string().contains("open-item cap"), "{err}");
+    }
+
+    // the per-actor cap: one account cannot crowd out the whole repo even
+    // though the repo cap has room left.
+    #[test]
+    fn actor_open_item_cap_refuses_until_one_closes() {
+        let mut t = Tracker::default();
+        for i in 0..MAX_OPEN_ITEMS_PER_ACTOR as u64 {
+            t.open_item(
+                "demo",
+                ItemKind::Issue,
+                format!("item {i}"),
+                String::new(),
+                user(1),
+                i,
+                None,
+            )
+            .unwrap();
+        }
+        let err = t
+            .open_item(
+                "demo",
+                ItemKind::Issue,
+                "one too many".into(),
+                String::new(),
+                user(1),
+                1_000_000,
+                None,
+            )
+            .expect_err("this actor is at their share of the cap");
+        assert!(err.to_string().contains("you already have"), "{err}");
+
+        // a DIFFERENT actor still has room — the cap is per-actor, not global.
+        t.open_item(
+            "demo",
+            ItemKind::Issue,
+            "someone else".into(),
+            String::new(),
+            user(2),
+            1_000_001,
+            None,
+        )
+        .unwrap();
+
+        // closing user(1)'s item #1 frees exactly their own slot back.
+        t.set_state("demo", 1, false, 1_000_002).unwrap();
+        t.open_item(
+            "demo",
+            ItemKind::Issue,
+            "fits now".into(),
+            String::new(),
+            user(1),
+            1_000_003,
+            None,
+        )
+        .unwrap();
     }
 }

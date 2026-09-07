@@ -9,6 +9,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+module-artifact = { workspace = true }
 sdk = { workspace = true }
 wasmtime = { workspace = true }
 sha2 = { workspace = true }

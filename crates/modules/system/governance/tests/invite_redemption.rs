@@ -83,7 +83,7 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
 /// a host with governance (invite-wired) gating a valset seeded with members
 /// 1 and 2.
 async fn gov_host() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset
         .seed(key_bytes(&keypair(1)))
         .await
@@ -282,7 +282,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
 #[test]
 fn a_network_without_a_binding_refuses_redemption() {
     block_on(async {
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset
             .seed(key_bytes(&keypair(1)))
             .await

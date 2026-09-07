@@ -19,8 +19,8 @@
 //!   colluding install can never smuggle a non-canonical image past the root
 //!   check because a non-canonical image simply does not decode.
 //!
-//! there is no version byte: the frame is a fixed five-field shape (head flag,
-//! then four counted sections) that is never empty, so it self-separates from
+//! there is no version byte: the frame is a fixed shape (head flag,
+//! four counted sections, then the source revision) that is never empty, so it self-separates from
 //! zero-length input, and layout changes ride the flag-day reset rule (fresh
 //! genesis, no migrations) rather than an in-band version.
 
@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::Actor;
 use crate::codec::{Reader, push_string, push_u32};
 use crate::objects::{Kind, ObjectId};
 use crate::wire::{
@@ -39,7 +40,7 @@ use crate::wire::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinEntry {
     pub snapshot: ObjectId,
-    pub owner: String,
+    pub owner: Actor,
 }
 
 /// a staged (putblob'd) chunk awaiting a commit that references it: who staged
@@ -47,7 +48,7 @@ pub struct PinEntry {
 /// (the deterministic, op-stream-driven staging sweep keys on this).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Staged {
-    pub owner: String,
+    pub owner: Actor,
     pub len: u64,
     pub expires_at: u64,
 }
@@ -58,6 +59,8 @@ pub struct Staged {
 /// chunks; `watches` is the set of (prefix, module_id) subscriptions.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Refs {
+    /// Source-owned revision, preserved even when every named object is removed.
+    pub source_revision: u64,
     pub head: Option<ObjectId>,
     pub window: VecDeque<ObjectId>,
     pub pins: BTreeMap<String, PinEntry>,
@@ -76,6 +79,7 @@ pub struct Refs {
 /// staging : u32 count ‖ count × (digest ‖ owner ‖ len u64 ‖ expires_at u64)
 ///                                                            -- digest order
 /// watches : u32 count ‖ count × (prefix ‖ module_id)        -- tuple order
+/// source_revision : u64
 /// ```
 pub fn encode_refs(r: &Refs) -> Vec<u8> {
     let mut out = Vec::new();
@@ -104,14 +108,14 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
     for (name, pin) in &r.pins {
         push_string(&mut out, name);
         out.extend_from_slice(&pin.snapshot);
-        push_string(&mut out, &pin.owner);
+        pin.owner.encode_into(&mut out);
     }
 
     // staging: BTreeMap keyed by the 32-byte digest, ascending.
     push_u32(&mut out, r.staging.len() as u32);
     for (digest, staged) in &r.staging {
         out.extend_from_slice(digest);
-        push_string(&mut out, &staged.owner);
+        staged.owner.encode_into(&mut out);
         out.extend_from_slice(&staged.len.to_le_bytes());
         out.extend_from_slice(&staged.expires_at.to_le_bytes());
     }
@@ -123,6 +127,7 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
         push_string(&mut out, module_id);
     }
 
+    out.extend_from_slice(&r.source_revision.to_le_bytes());
     out
 }
 
@@ -130,12 +135,12 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
 /// gates in `fs.rs` and [`encoded_refs_len`] count with these, so the image cap
 /// ([`MAX_REFS_IMAGE_BYTES`]) is enforced without encoding the whole image on
 /// every op — and the layout has exactly one description: [`encode_refs`].
-pub fn pin_entry_len(name: &str, owner: &str) -> usize {
-    8 + name.len() + 32 + 8 + owner.len()
+pub fn pin_entry_len(name: &str, owner: &Actor) -> usize {
+    8 + name.len() + 32 + owner.encoded_len()
 }
 
-pub fn staged_entry_len(owner: &str) -> usize {
-    32 + 8 + owner.len() + 8 + 8
+pub fn staged_entry_len(owner: &Actor) -> usize {
+    32 + owner.encoded_len() + 8 + 8
 }
 
 pub fn watch_entry_len(prefix: &str, module_id: &str) -> usize {
@@ -162,7 +167,7 @@ pub fn encoded_refs_len(r: &Refs) -> usize {
         .iter()
         .map(|(prefix, module_id)| watch_entry_len(prefix, module_id))
         .sum::<usize>();
-    head + window + pins + staging + watches
+    head + window + pins + staging + watches + 8
 }
 
 /// strict decode of an [`encode_refs`] image; anything non-canonical rejects.
@@ -197,7 +202,7 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
     for _ in 0..pin_count {
         let name = r.string()?;
         let snapshot = r.bytes32()?;
-        let owner = r.string()?;
+        let owner = Actor::decode(&mut r)?;
         // strictly ascending names keep the image canonical: no duplicate and no
         // reordered pair can produce a second valid preimage of the same refs.
         if pins
@@ -216,7 +221,7 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
     let mut staging: BTreeMap<ObjectId, Staged> = BTreeMap::new();
     for _ in 0..staging_count {
         let digest = r.bytes32()?;
-        let owner = r.string()?;
+        let owner = Actor::decode(&mut r)?;
         let len = r.u64()?;
         let expires_at = r.u64()?;
         if staging
@@ -252,8 +257,10 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
         watches.insert(entry);
     }
 
+    let source_revision = r.u64()?;
     r.finish()?;
     Ok(Refs {
+        source_revision,
         head,
         window,
         pins,
@@ -332,7 +339,10 @@ mod block_objects_tests {
     fn block_objects_round_trip_empty_and_multi_entry() {
         // empty index: a lone count of 0, decodes back to the empty map.
         let empty = BTreeMap::new();
-        assert_eq!(decode_block_objects(&encode_block_objects(&empty)).unwrap(), empty);
+        assert_eq!(
+            decode_block_objects(&encode_block_objects(&empty)).unwrap(),
+            empty
+        );
 
         // multi-entry across kinds; decode re-canonicalizes into the same map.
         let mut index = BTreeMap::new();
@@ -350,12 +360,20 @@ mod block_objects_tests {
         let mut bytes = encode_block_objects(&index);
         // corrupt the kind tag byte (right after the 32-byte id, after the u32 count).
         bytes[4 + 32] = 0xEE;
-        assert!(decode_block_objects(&bytes).unwrap_err().contains("unknown kind tag"));
+        assert!(
+            decode_block_objects(&bytes)
+                .unwrap_err()
+                .contains("unknown kind tag")
+        );
 
         // trailing bytes reject at finish.
         let mut trailing = encode_block_objects(&index);
         trailing.push(0);
-        assert!(decode_block_objects(&trailing).unwrap_err().contains("trailing bytes"));
+        assert!(
+            decode_block_objects(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
     }
 }
 
@@ -378,13 +396,13 @@ mod refs_image_tests {
             "release".into(),
             PinEntry {
                 snapshot: [4; 32],
-                owner: "ext:aabb".into(),
+                owner: crate::Actor::Key(vec![0xaa, 0xbb]),
             },
         );
         r.staging.insert(
             [5; 32],
             Staged {
-                owner: "ext:ccdd".into(),
+                owner: crate::Actor::Key(vec![0xcc, 0xdd]),
                 len: 7,
                 expires_at: 9,
             },

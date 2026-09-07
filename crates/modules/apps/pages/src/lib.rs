@@ -73,10 +73,9 @@ mod index_guest;
 use std::collections::BTreeMap;
 
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
-    StateRoot, StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
+    StateSyncHandle,
 };
-use tagging::{TagEvent, TaggingMsg};
 
 mod block_ops;
 mod comment_ops;
@@ -88,6 +87,24 @@ mod store;
 mod text_ranges;
 
 use error::{PageError, to_page_err};
+
+/// The current account is a canonical actor, while an original signed key
+/// retains authority over records it created before joining an account.
+struct Authority {
+    actor: Party,
+    origin: sdk::Origin,
+}
+
+impl Authority {
+    fn owns(&self, owner: &Party) -> bool {
+        match owner {
+            Party::Key(key) => {
+                matches!(&self.origin, sdk::Origin::External(signer) if signer == key)
+            }
+            Party::Account(_) | Party::Module(_) | Party::System => owner == &self.actor,
+        }
+    }
+}
 
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
@@ -112,6 +129,29 @@ pub const MAX_PAGE_TITLE_LEN: usize = 512;
 /// This keeps every valid preorder cursor page comfortably below the wasm
 /// host's store-read ceiling while leaving far more nesting than the UI uses.
 pub const MAX_PAGE_DEPTH: usize = 64;
+
+/// client-minted id length cap (consensus constant) for a page id
+/// (`CreatePage`) or any block id (`InsertBlock`) — the same wedge class the
+/// comment ids guard against (see `id_is_index_safe`, interface.rs), but for
+/// the page-enumeration index instead of a comment thread/target index. a
+/// page id ALSO becomes an index entry, so without this cap a handful of
+/// oversized ids reach [`MAX_BLOCK_LEN`] and abort `CreatePage`/`InsertBlock`
+/// for every account, forever (nothing else can shrink the index).
+pub const MAX_PAGE_ID_BYTES: usize = 128;
+/// same cap, applied to every `InsertBlock` id (page-creating or not): a
+/// non-page block id never enters the index, but it is still a client-minted
+/// key stored forever, so it gets the same bound as a page id.
+pub const MAX_BLOCK_ID_BYTES: usize = MAX_PAGE_ID_BYTES;
+
+/// hard cap on the number of pages the enumeration index may ever hold.
+/// `index_add` re-serializes the WHOLE index on every insert (store.rs), so
+/// this bounds its worst case: each entry serializes as `"id":"parent",`
+/// with both id and parent at most [`MAX_PAGE_ID_BYTES`] (128) bytes, i.e. at
+/// most 1+128+1 + 1 + 1+128+1 + 1 = 262 bytes; `MAX_PAGES` (2048) × 262 B ≈
+/// 524 KiB, comfortably under [`MAX_BLOCK_LEN`] (768 KiB). global rather than
+/// per-author: it is the smaller diff, and it is what actually bounds the
+/// shared index's size regardless of how many distinct accounts contribute.
+pub const MAX_PAGES: usize = 2048;
 
 /// the reserved logical key under which the page-enumeration INDEX rides in
 /// the same store. its value is a serialized sorted map from every page block
@@ -139,9 +179,9 @@ pub struct Pages {
     /// `commit_block`; NOT in `root()` until then. store key is
     /// `sha256(block_id)`, owned by [`StagedStore`].
     staged: StagedStore,
-    /// Optional engagement router. Tests/minimal registries may leave it
-    /// unwired; production reports each newly-added comment after staging it.
-    tagging: Option<ModuleId>,
+    /// Source-owned block and comment attribution, wired in production.
+    attribution: Option<ModuleId>,
+    identity: Option<ModuleId>,
 }
 
 #[cfg(test)]

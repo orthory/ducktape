@@ -61,7 +61,7 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
 }
 
 /// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
-/// runs in flight, not `AgentStatus::Active`: Active is the registration
+/// runs in flight, not `runs::ModelStatus::Active`: Active is the registration
 /// default and would report every registered agent as busy forever.
 pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     if !connected || rows.is_empty() {
@@ -251,17 +251,6 @@ fn registry_active_entry() -> Option<serde_json::Value> {
 /// hint on a demo-seeded machine.
 pub(crate) fn registry_active_workspace() -> Option<String> {
     demo_registry()?.get("active")?.as_str().map(str::to_string)
-}
-
-/// The active workspace's name, from the CLI's registry. The app and
-/// the CLI name the same workspace, so the titlebar says `demo`, not an IP.
-fn active_workspace_name() -> Option<String> {
-    let workspace = registry_active_entry()?;
-    workspace
-        .get("name")
-        .or_else(|| workspace.get("id"))
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
 }
 
 /// The active workspace's http endpoint, from the same registry the titlebar
@@ -594,27 +583,22 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
     Ok(write_prefs(&prefs))
 }
 
-/// The titlebar's chain label: the workspace serving the CONNECTED endpoint
-/// (the launch window may have picked any known network, so the registry's
-/// `active` cannot answer), then the demo registry's name, then the bound
-/// account, then the endpoint's host, then the product name.
-pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
-    let connected = workspace_at(rpc.as_ref()).map(|(chain_id, _)| {
-        let named = chain_id.split('#').next().unwrap_or_default();
-        match named.is_empty() {
-            true => chain_id,
-            false => named.to_string(),
-        }
-    });
-    if let Some(workspace) = connected {
-        return workspace;
-    }
-    if let Some(workspace) = active_workspace_name() {
-        return workspace;
-    }
-    let named = account_name.as_ref().trim();
+/// The titlebar's network label: the NAME PART of the connected node's chain
+/// id (`name#hash`), the one fact every member of a network shares. Until the
+/// node has said which chain it serves, the endpoint's host stands in, and
+/// with no endpoint the product name does.
+///
+/// Nothing device-local feeds this: the CLI registry only knows the
+/// workspaces this machine created, and an account name is one person's,
+/// not the network's.
+pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
+    let chain_id = chain_id.as_ref().trim();
+    let named = chain_id.split('#').next().unwrap_or_default();
     if !named.is_empty() {
         return named.to_string();
+    }
+    if !chain_id.is_empty() {
+        return chain_id.to_string();
     }
     let host = rpc
         .as_ref()
@@ -868,11 +852,6 @@ pub(crate) fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// A module payload in its wire form — `sdk::wire` is serde_json bytes.
-pub(crate) fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
-    serde_json::to_vec(payload).unwrap_or_default()
-}
-
 /// The first grapheme of a display name, upper-cased, for an avatar plate.
 /// The single-glyph avatar label for a name — EMPTY when there is no name.
 ///
@@ -889,14 +868,16 @@ pub fn initial_of(name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The local user's inbox queue, when a key exists.
-///
-/// An inbox member IS an origin's actor string (`sdk::Origin::actor_string`),
-/// and the module now refuses a MarkRead/Clear naming any queue but the
-/// submitter's own — so this is not a display handle, it is the identity the
-/// signed frame will carry. It must be derived, never spelled.
-pub(crate) async fn local_member() -> Option<String> {
-    local_user_key()
-        .await
-        .map(|key| sdk::Origin::External(key).actor_string())
+/// The account controlled by the actual local signer, read at the write edge.
+pub(crate) async fn local_account(rpc: &RpcClient) -> Result<Option<u64>, String> {
+    let Some(key) = local_user_key().await else {
+        return Ok(None);
+    };
+    let reply: identity::IdentityReply = rpc
+        .query("identity", &identity::IdentityQuery::OfKey { key })
+        .await?;
+    let identity::IdentityReply::Account(account) = reply else {
+        return Err("the identity module returned the wrong reply".to_string());
+    };
+    Ok(account.map(|account| account.number))
 }

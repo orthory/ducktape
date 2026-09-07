@@ -1,6 +1,7 @@
-# fetch git dependencies (fluent31) with the git CLI instead of libgit2:
-# a `url.insteadOf` rewrite to ssh breaks cargo's built-in fetcher, while the
-# real git binary picks up the usual ssh agent/keys.
+# fetch git dependencies (fluent31, and this repository itself — guest-builder
+# reads every module out of it at a revision) with the git CLI instead of
+# libgit2: a `url.insteadOf` rewrite to ssh breaks cargo's built-in fetcher,
+# while the real git binary picks up the usual ssh agent/keys.
 [net]
 git-fetch-with-cli = true
 

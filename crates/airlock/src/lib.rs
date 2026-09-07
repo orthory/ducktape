@@ -7,6 +7,16 @@
 //! the handshake (`client::Gateway`), shared by `broker-host` and
 //! `ducktape user cred`.
 
+/// The proxy body cap shared by every hop of the airlock lane: the broker
+/// layers this same limit on its own inbound routes (`broker-host`'s
+/// `MAX_REQUEST_BYTES`, which re-exports this constant) before it ever seals
+/// and forwards to the gateway, so the gateway's own `DefaultBodyLimit`
+/// (`server::assemble`) must match it exactly — a smaller gateway cap 413s
+/// what the broker already accepted. The route policy's 16 MiB
+/// (`gateway::MAX_REQUEST_BODY_BYTES`) is a separate, looser ceiling one hop
+/// further out and is not required to match this one.
+pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 mod aead;
 pub mod attest;
 pub mod bodyseal;

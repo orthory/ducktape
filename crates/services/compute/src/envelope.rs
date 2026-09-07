@@ -63,7 +63,7 @@ struct WireEnvelope {
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     /// the committed `duckfs_read` verdict on the global skill library: the
-    /// composer asks the agent's record (`agent::AgentRecord::library_readable`)
+    /// composer asks the agent's record (`runs::ModelRecord::library_readable`)
     /// and states the answer here, because the host has no consensus registry to
     /// ask. required (the composer always states it) — an envelope that never
     /// stated the grant cannot have earned it, and the paragraph it gates would

@@ -7,7 +7,7 @@
 //! store carrying one reserved key — [`CONFIG_KEY`] (`__config`), beside the
 //! guest adapter's `__state`/`__root` convention — whose value is the
 //! canonical encoding produced by [`encode_config`]. the guest reads it back
-//! each dispatch (`guest_adapter::load_config`), decodes it with
+//! each dispatch (`ducktape_module_sdk::load_config`), decodes it with
 //! [`decode_config`], and constructs the native module with those parameters.
 //!
 //! the config is CONSENSUS STATE: identical on every node of a network, part

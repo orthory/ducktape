@@ -107,7 +107,7 @@ fn delegate(run: &Run, args: &Value) -> Result<Value> {
     };
     run.delegate(
         arg_str(args, "request_id")?,
-        agent::DelegationRequest {
+        runs::DelegationRequest {
             agent_id: arg_str(args, "agent_id")?,
             instruction: arg_str(args, "instruction")?,
             skills,

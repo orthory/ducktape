@@ -209,11 +209,7 @@ pub async fn files_preview(
 }
 
 /// The text preview: the first 64 KiB, branded binary on a control byte.
-async fn files_text(
-    rpc: &RpcClient,
-    path: String,
-    generation: i64,
-) -> Result<FsPreview, String> {
+async fn files_text(rpc: &RpcClient, path: String, generation: i64) -> Result<FsPreview, String> {
     let reply = rpc
         .files_get("read", &[("path", path.as_str()), ("len", "65536")])
         .await?;
@@ -293,7 +289,11 @@ pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option
         let reply = rpc
             .files_get(
                 "read",
-                &[("path", path), ("offset", offset.as_str()), ("len", page_len.as_str())],
+                &[
+                    ("path", path),
+                    ("offset", offset.as_str()),
+                    ("len", page_len.as_str()),
+                ],
             )
             .await?;
         let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
@@ -362,31 +362,38 @@ async fn files_head(rpc: &RpcClient) -> Result<Option<String>, String> {
     Ok(refs["head"].as_str().map(str::to_string))
 }
 
-/// One files commit through the node's commit lane.
+/// One commit, SIGNED BY THE PERSON. The files module records a frame's
+/// verified signer as the commit's author and charges `/home/<owner>/**`
+/// authority to it, so a person's commit rides the same signed-frame lane as
+/// every other op this device's key makes. The unsigned `/v1/files/commit`
+/// lane writes as the NODE — a daemon's authority over a daemon's home,
+/// never a person's over theirs.
 async fn files_commit_one(
     rpc: &RpcClient,
+    password: String,
     message: String,
     change: serde_json::Value,
 ) -> Result<(), String> {
     let head = files_head(rpc).await?;
-    rpc.files_post(
-        "commit",
-        &serde_json::json!({
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "commit": {
             "base_snapshot": head,
             "message": message,
             "changes": [change],
-        }),
-    )
-    .await?;
+        }
+    }))
+    .map_err(|error| format!("files commit does not serialize: {error}"))?;
+    signed_write(rpc, "files", payload, password).await?;
     Ok(())
 }
 
 /// Create a directory.
-pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
+pub async fn files_mkdir(rpc: String, password: String, path: String) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("mkdir {path}"),
             serde_json::json!({ "mkdir": { "path": path } }),
         )
@@ -398,11 +405,12 @@ pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
 }
 
 /// Remove a file or whole subtree.
-pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
+pub async fn files_remove(rpc: String, password: String, path: String) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("rm {path}"),
             serde_json::json!({ "rm": { "path": path } }),
         )
@@ -414,11 +422,17 @@ pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
 }
 
 /// Write a text file (create or replace) as inline content.
-pub async fn files_write_text(rpc: String, path: String, text: String) -> Result<bool, AppError> {
+pub async fn files_write_text(
+    rpc: String,
+    password: String,
+    path: String,
+    text: String,
+) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("write {path}"),
             serde_json::json!({
                 "put": {
@@ -439,7 +453,12 @@ pub async fn files_write_text(rpc: String, path: String, text: String) -> Result
 /// Upload a local file dropped onto the window into the current directory:
 /// small files ride inline; larger ones stage 1 MiB chunks then commit a
 /// chunk list. The dropped path never leaves this device — only bytes do.
-pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<bool, AppError> {
+pub async fn files_upload(
+    rpc: String,
+    password: String,
+    dir: String,
+    dropped: String,
+) -> Result<bool, AppError> {
     // the node refuses to serve back any object larger than files_http's
     // MAX_OBJECT_BYTES, and every staged MiB is a consensus block — a cap
     // HERE turns "drop a video, drive 300 blocks, node RSS grows by 300 MB"
@@ -470,18 +489,29 @@ pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<b
             .map_err(|error| format!("cannot read {dropped}: {error}"))?;
         let rpc = rpc_client(&rpc)?;
         let target = fs_child(dir, name.clone());
-        let content = match bytes.len() as u64 <= 256 * 1024 {
+        // The module's own bounds: what a commit may carry inline, and the
+        // size of one staged chunk.
+        let rides_inline = bytes.len() <= duckfs_core::MAX_INLINE_COMMIT_BYTES;
+        let chunk_size =
+            usize::try_from(duckfs_core::CHUNK_SIZE).expect("a duckfs chunk fits in memory");
+        let content = match rides_inline {
             true => serde_json::json!({ "inline": { "b64": base64_encode(&bytes) } }),
             false => {
+                // A staged chunk is a raw-bytes write charged to the person,
+                // so each one is signed the way the commit below is.
+                let staging = rpc
+                    .clone()
+                    .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
                 let mut chunks = Vec::new();
-                for chunk in bytes.chunks(1024 * 1024) {
-                    chunks.push(rpc.files_stage(chunk.to_vec()).await?);
+                for chunk in bytes.chunks(chunk_size) {
+                    chunks.push(staging.files_stage(chunk.to_vec()).await?);
                 }
                 serde_json::json!({ "chunks": { "size": bytes.len() as u64, "chunks": chunks } })
             }
         };
         files_commit_one(
             &rpc,
+            password,
             format!("upload {name}"),
             serde_json::json!({
                 "put": { "path": target, "exec": false, "meta": {}, "content": content }
@@ -569,6 +599,29 @@ pub fn fs_child(path: String, name: String) -> String {
     let name = name.trim().trim_matches('/');
     let dir = path.trim_end_matches('/');
     format!("{dir}/{name}")
+}
+
+/// Preview the files module's authority rule using the cached account and
+/// actual signing key. The module resolves identity again when the write lands.
+pub fn files_write_gate(dir: String, me: String) -> String {
+    if me.is_empty() {
+        return String::new();
+    }
+    let key = match public_key(&me, "user key") {
+        Ok(key) => key,
+        Err(reason) => return reason,
+    };
+    let authority = duckfs_core::Authority::External {
+        key,
+        account: names().account_of(&me),
+    };
+    let entry = fs_child(dir, "entry".into());
+    let checked = duckfs_core::paths::canonical(&entry)
+        .and_then(|segments| duckfs_core::paths::check_authority(&authority, &segments));
+    match checked {
+        Ok(()) => String::new(),
+        Err(reason) => reason.trim_start_matches("files: ").to_string(),
+    }
 }
 
 /// Minimal base64 (standard alphabet, padded) — the files read lane's wire.

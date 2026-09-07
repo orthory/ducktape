@@ -309,6 +309,30 @@ pub(crate) async fn files_pin(
     }
 }
 
+/// DELETE /v1/files/pin/{name} — release a pin so gc can reclaim it once
+/// nothing else roots it. owner-gated at the module (`Fs::unpin`): the pin's
+/// creator or `system` may release it; anyone else's attempt is the module's
+/// verbatim 400.
+pub(crate) async fn files_unpin(
+    State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let origin = acting_origin(signed.as_deref());
+    let payload = encode_msg(&FilesMsg::Unpin { name });
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "unpin",
+        origin = to_hex(&origin),
+        bytes = payload.len(),
+        "files op"
+    );
+    match files_submit(&handle, "unpin", origin, payload).await {
+        Ok(block) => Json(block).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 /// the json body of POST /v1/files/watch.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -153,7 +153,11 @@ marker). Consequences:
 - **A stolen bearer alone is useless**: the enclave refuses plaintext bodies
   on a sealed session, and a plaintext success reply is refused by the broker
   as forgery. Missing Final marker = authenticated truncation (aborts, never a
-  clean EOF).
+  clean EOF). The request AEAD's associated data binds the HTTP method and
+  path+query (`bodyseal::request_aad`), so a relay holding a live bearer plus
+  a captured sealed blob cannot redirect it to a different method or endpoint
+  — the tag fails to open under mismatched AAD. Headers stay unbound; the
+  gateway's own denylist (`proxy_inner`) is the only header rule.
 - The sandbox is unmodified — the broker terminates the AEAD.
 - Session revocation = gateway restart (the token-signing and seal keys are
   memory-only, so every outstanding token and body key dies with the process);

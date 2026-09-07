@@ -16,6 +16,9 @@
 //! host leaves here wired: the admissions factory over the node's canonical
 //! substrates, and an index database for every module it runs.
 
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
@@ -32,10 +35,11 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbSource},
 };
+#[cfg(test)]
 use topology::PRODUCTION;
 use wasm_host::Backing;
 
-use noded::{IndexGuests, converge_index_guests, index_host_modules};
+use noded::{converge_host_modules, index_host_modules};
 
 use crate::config::{
     Genesis, GenesisModules, GenesisSource, component_path, hex_bytes, install_genesis,
@@ -95,7 +99,8 @@ impl host::CodeSource for BlobCodeSource {
 
 /// what [`hydrate_from_disk`] found on disk.
 enum Hydrated {
-    /// every component is in the blob store and every index guest converged.
+    /// Every genesis deployment is in the blob store; composition installs
+    /// mappers from the actual running deployments.
     Installed,
     /// the workspace genesis file is absent — a joiner before its first
     /// fetch — and nothing was installed. `hash` is the descriptor's pin the
@@ -117,10 +122,9 @@ fn hydrate_from_disk(
     index: &indexer::IndexStore,
     genesis: &GenesisModules,
 ) -> Result<Hydrated, String> {
-    let guests = match &genesis.source {
+    match &genesis.source {
         GenesisSource::FoundingSet(dir) => {
             seed_founding_set(blobs, dir, &genesis.hashes)?;
-            IndexGuests::from_dir(dir, PRODUCTION)?
         }
         GenesisSource::Workspace { file, hash } => {
             let Some(loaded) = seed_workspace_genesis(blobs, file, hash, &genesis.hashes)? else {
@@ -134,10 +138,9 @@ fn hydrate_from_disk(
                 .parent()
                 .ok_or_else(|| format!("{} has no workspace directory", file.display()))?;
             loaded.materialize(&modules_path(workspace))?;
-            IndexGuests::from_genesis(&loaded)
         }
     };
-    converge_index_guests(index, &guests)?;
+    index_host_modules(index, genesis.hashes.keys().map(String::as_str))?;
     Ok(Hydrated::Installed)
 }
 
@@ -242,17 +245,19 @@ fn seed_workspace_genesis(
         verify_genesis(&bytes, hash, want).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // the VERIFYING query: seeding is what heals a corrupt component, and a
+        // stat-shaped "present" would skip exactly the file that needs it.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         // verified above: every id in `want` is a component hashing to `digest`.
         let component = genesis
-            .component(id)
+            .artifact(id)
             .expect("verified genesis carries every module");
         blobs.put_chunk(component.to_vec());
         seeded += 1;
     }
-    if !blobs.has_chunk(hash) {
+    if !blobs.has_verified_chunk(hash) {
         blobs.put_chunk(bytes);
     }
     // a lifecycle fact: bytes entered the store (a restart over a seeded store
@@ -282,12 +287,12 @@ fn seed_founding_set(
 ) -> Result<(), String> {
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // verifying, for the same reason as the genesis seed above.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         let path = component_path(dir, id);
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("module {id}: read {}: {e} — fail-closed", path.display()))?;
+        let bytes = workspace_config::read_module_artifact(dir, id)?.encode();
         let got: [u8; 32] = sha2::Sha256::digest(&bytes).into();
         let matches_descriptor = got == *digest;
         if !matches_descriptor {
@@ -356,13 +361,12 @@ fn wire(
         substrates,
         &net.compose(),
     )));
-    index_host_modules(index, host.module_roots().iter().map(|(id, _)| id.as_str()))
+    converge_host_modules(index, host)
 }
 
-/// the PRODUCTION module set at block zero — genesis state, identical on every
-/// node (a different set, or different component bytes, composes a different
-/// root-hash and the network forks at genesis): the topology's production
-/// selection over the bundle's components, valset seeded with the genesis
+/// The workspace's module set at block zero, authenticated by its genesis
+/// deployment hashes. Every component initializes through the same Wasm
+/// lifecycle, with valset consuming the genesis
 /// validators and the modules registry with the descriptor's code hashes.
 pub(super) async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
@@ -386,7 +390,6 @@ pub(super) async fn genesis_host(
     let mut stores = qmdb_stores(context);
     let substrates = disk_substrates(forge_repo, duckfs_dir, blobs);
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &substrates,
@@ -400,6 +403,23 @@ pub(super) async fn genesis_host(
     .map_err(|e| format!("genesis compose: {e}"))?;
     wire(&mut host, context, &substrates, &net, index)?;
     Ok(host)
+}
+
+/// Validate the executable roster before opening any module state.
+fn module_codes<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<BTreeMap<String, [u8; 32]>, String> {
+    let mut codes = BTreeMap::new();
+    for (id, hash) in entries {
+        workspace_config::validate_module_id(id)?;
+        let hash = hash
+            .try_into()
+            .map_err(|_| format!("module {id} has no 32-byte executable commitment"))?;
+        if codes.insert(id.to_owned(), hash).is_some() {
+            return Err(format!("duplicate executable commitment for {id}"));
+        }
+    }
+    Ok(codes)
 }
 
 /// the RESTORE twin of [`genesis_host`]: the disk substrates (qmdb stores,
@@ -436,13 +456,18 @@ pub(super) async fn restore_host(
     let height = manifest.height.unwrap_or(0);
     let substrates = disk_substrates(forge_repo, duckfs_dir, blobs);
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &substrates,
         &net.compose(),
         Boot::Reopen {
             height,
+            codes: &module_codes(
+                manifest
+                    .codes
+                    .iter()
+                    .map(|(id, hash)| (id.as_str(), hash.as_slice())),
+            )?,
             snapshots: &mut snapshots,
         },
     )
@@ -522,14 +547,85 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
     }
 }
 
+/// intern a runtime-child / metric label as a process-wide `&'static str`: a
+/// repeat call with the same text returns the SAME leaked string instead of
+/// leaking a new one. `sync_all_modules` re-enters forever on a resident
+/// whose boundary sync keeps failing (`replica/park.rs`'s retry loop never
+/// bails while `resident_standing`), so a per-call label here must not leak —
+/// only a genuinely new label (a module id never seen before) costs a leak.
+fn intern_label(name: &str) -> &'static str {
+    static LABELS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let cache = LABELS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut cache = cache.lock().unwrap();
+    if let Some(existing) = cache.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    cache.insert(leaked);
+    leaked
+}
+
+/// why a boundary sync did not produce a host.
+#[derive(Debug)]
+pub(super) enum SyncModulesError {
+    /// the SOURCE's own manifest says one of its modules cannot be
+    /// transferred at all (`PayloadKind::Unsupported`: the serving node could
+    /// not prepare a sync handle for it). that is a stable fact about the
+    /// source, not about this attempt — no refetch of its manifest turns it
+    /// into a transferable boundary — so the caller rotates instead of
+    /// retrying.
+    SourceDegraded(String),
+    /// everything else: a transfer that may well complete on the next attempt
+    /// (a moved qmdb target, a busy peer, a dropped chunk).
+    Failed(String),
+}
+
+impl SyncModulesError {
+    /// the stable snake_case token the failure logs and metrics carry.
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::SourceDegraded(_) => "source_degraded_module",
+            Self::Failed(_) => "sync_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for SyncModulesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceDegraded(module) => {
+                write!(f, "source cannot transfer module {module} at this boundary")
+            }
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for SyncModulesError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+/// the source-degraded refusal for `manifest`, if it carries one — the whole
+/// decision, so it is testable without a peer.
+fn undeliverable_boundary(manifest: &statesync::Manifest) -> Option<SyncModulesError> {
+    manifest
+        .undeliverable_module()
+        .map(|module| SyncModulesError::SourceDegraded(module.to_string()))
+}
+
 /// rebuild EVERY module of the modules registry's roster from a peer's
 /// statesync service at `manifest`'s boundary and compose them into a
 /// [`Host`], verified against the manifest's root-hash. the disk substrates
 /// land under their canonical ids in this process's storage root — this IS
 /// the node's state afterwards, not a scratch copy. `attempt` disambiguates
-/// runtime child labels across retries (a busy source moves its qmdb targets
-/// past the captured boundary; the caller refetches the manifest and tries
-/// again, and metrics labels must not collide). every wasm tenant joins on
+/// scratch DIRECTORIES on disk across retries (a busy source moves its qmdb
+/// targets past the captured boundary; the caller refetches the manifest and
+/// tries again) — the runtime child / metric LABELS stay attempt-independent
+/// and interned (`intern_label`), since a resident retries this forever and a
+/// label per attempt would leak and grow `/metrics` without bound. every wasm
+/// tenant joins on
 /// the code the registry designates for the boundary, fetched off the blob
 /// plane (the mesh behind it) and hash-checked by the composer.
 pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetch::SourceRotate>(
@@ -540,7 +636,16 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     substrates: NodeSubstrates<'_>,
     attempt: usize,
     genesis: &GenesisModules,
-) -> Result<Host, String> {
+) -> Result<Host, SyncModulesError> {
+    // BEFORE a byte moves: a module this source cannot transfer makes the
+    // whole boundary unbuildable (the composite root-hash gate below is over
+    // the WHOLE roster), and every lane below would discover it as its own
+    // opaque, retryable-looking failure — a store tenant as "missing pinned
+    // resolver target", a map tenant as a snapshot fetch the source cannot
+    // answer. read it off the manifest and let the caller rotate.
+    if let Some(degraded) = undeliverable_boundary(manifest) {
+        return Err(degraded);
+    }
     let NodeSubstrates {
         forge_repo,
         duckfs_dir,
@@ -561,14 +666,13 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
             .ok_or_else(|| format!("module {module} missing from the manifest"))?
             .root)
     };
-    let scratch_context = context.child(Box::leak(
-        format!("sync_scratch_a{attempt}").into_boxed_str(),
-    ));
+    let scratch_context = context.child(intern_label("sync_scratch"));
     // the runtime labels its children with static strings, and the resolver
     // lane names its module the same way; a module id comes off the registry
-    // as a `String`, so each is leaked once per attempt — a bounded handful.
-    let static_label =
-        |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
+    // as a `String`, so this interns rather than leaking a fresh string on
+    // every call — `sync_all_modules` retries forever on a resident whose
+    // boundary sync keeps failing, and a leak per attempt is a leak forever.
+    let static_label = intern_label;
     let pinned_target = |module: &'static str| -> Result<statesync::qmdb::SyncTarget, String> {
         let entry = manifest
             .entry(module)
@@ -604,7 +708,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         let module = module.to_string();
         async move {
             let root = root?;
-            let bytes = fetch_snapshot(&client, boundary, &module)
+            let bytes = fetch_snapshot(&client, boundary, &module, statesync::MAX_SNAPSHOT_BYTES)
                 .await
                 .map_err(|e| format!("{module} snapshot: {e}"))?;
             Ok::<_, String>((bytes, root))
@@ -662,7 +766,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     );
     let mut stores = |module: &str| -> BoxFut<'_, Result<Box<dyn sdk::MerkleStore>, String>> {
         let module = static_label(module);
-        let child = scratch_context.child(static_label(&format!("{module}_scratch_a{attempt}")));
+        let child = scratch_context.child(static_label(&format!("{module}_scratch")));
         let target = fetch_target(module);
         Box::pin(async move {
             let (target, resolver) = target.await?;
@@ -685,13 +789,18 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     };
     let bindings = net.compose();
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &disk_substrates(forge_repo, files_scratch.dir(), blobs.clone()),
         &bindings,
         Boot::Reopen {
             height: manifest.height,
+            codes: &module_codes(manifest.entries.iter().map(|entry| {
+                (
+                    entry.module_id.as_str(),
+                    entry.code_hash.as_deref().unwrap_or_default(),
+                )
+            }))?,
             snapshots: &mut snapshots,
         },
     )
@@ -702,11 +811,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // runs by construction — a missing module composes a different root-hash
     // and the join fails its final check.
     if host.root_hash() != manifest.root_hash {
-        return Err(format!(
+        return Err(SyncModulesError::Failed(format!(
             "composed {} != manifest {}",
             hex(&host.root_hash()),
             hex(&manifest.root_hash)
-        ));
+        )));
     }
     // the composite gate passed — promote files' scratch into the canonical
     // `duckfs_dir` (verify-then-replace refs + content-addressed object merge,
@@ -742,11 +851,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     host.register(Box::new(canonical_files));
     // re-check THE property against the canonical-backed composition.
     if host.root_hash() != manifest.root_hash {
-        return Err(format!(
+        return Err(SyncModulesError::Failed(format!(
             "canonical duckfs reopen composed {} != manifest {}",
             hex(&host.root_hash()),
             hex(&manifest.root_hash)
-        ));
+        )));
     }
     wire(&mut host, context, &canonical_substrates, &net, index)?;
     Ok(host)
@@ -764,7 +873,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "e996a7408b4338ffd82fb3a715382deee2f845aca9a28ceffb65b5b700d07442";
+        "4b131d1ccd22ddf98fa71598c6da14a1d8b6e66b01c3ed2429ce9b2198593f7c";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -795,7 +904,7 @@ mod tests {
     /// never embedded.
     fn fixture_genesis() -> GenesisModules {
         let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = crate::config::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
+        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
             .expect("founding set");
         GenesisModules {
             hashes,
@@ -879,6 +988,7 @@ mod tests {
                 consensus_time: 0,
                 origin,
                 me: "modules".into(),
+                cause: sdk::Cause::Direct,
             })
             .on_query("valset", one_member.clone())
         };
@@ -916,8 +1026,12 @@ mod tests {
             ),
             (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry =
-            Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
+        let mut registry = Modules::new(
+            "modules",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "governance",
+        );
         futures::executor::block_on(async {
             for (origin, height, m) in steps {
                 let mut ctx = ctx(origin, height);
@@ -953,6 +1067,7 @@ mod tests {
             consensus_time: 0,
             origin: sdk::Origin::System,
             me: "modules".into(),
+            cause: sdk::Cause::Direct,
         });
         let reply = futures::executor::block_on(registry.query_with(&ctx, &req)).expect("status");
         let Ok(modules::ModulesReply::ModuleStatus { modules: roster }) =
@@ -986,26 +1101,13 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// the topology's `code` column is what the loader branches on; if it
-    /// disagrees with what the composed host actually runs, a native module is
-    /// sent to the wasm loader (or a wasm tenant is never reconciled).
     #[test]
-    fn topology_code_column_matches_the_composed_host() {
-        let in_production_and_native = |m: &topology::ModuleSpec| {
-            PRODUCTION.contains(&m.id) && m.code == topology::Code::Native
-        };
-        let mut native_by_topology: Vec<String> = topology::TOPOLOGY
-            .modules
-            .iter()
-            .filter(|m| in_production_and_native(m))
-            .map(|m| m.id.to_string())
-            .collect();
-        native_by_topology.sort_unstable();
-        let (_ids, _root, native_by_host) = genesis_facts();
-        assert_eq!(native_by_host, native_by_topology);
-        // both sides go empty together if the last native module ever leaves
-        // PRODUCTION, so anchor the pin on the ids themselves as well.
-        assert_eq!(native_by_host, ["modules", "valset"]);
+    fn every_default_module_runs_wasm_including_the_registries() {
+        let (_ids, _root, natives) = genesis_facts();
+        assert!(
+            natives.is_empty(),
+            "the binary must construct no native modules: {natives:?}"
+        );
     }
 
     /// a workspace genesis seeds every component into the blob store and
@@ -1018,15 +1120,14 @@ mod tests {
     fn a_workspace_genesis_seeds_and_serves_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
         let genesis = Genesis {
-            components: vec![workspace_config::Artifact {
+            modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: b"pages-bytes".to_vec(),
+                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
             }],
-            index_guests: vec![],
         };
         let bytes = genesis.encode();
         let hash = workspace_config::genesis::sha256(&bytes);
-        let want = genesis.component_hashes();
+        let want = genesis.module_hashes();
         let file = workspace_config::genesis_path(dir.path());
 
         let blobs = blobstore::BlobHandle::default();
@@ -1080,7 +1181,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            sha2::Sha256::digest(b"pages-bytes").into(),
+            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");
@@ -1117,7 +1218,7 @@ mod tests {
     /// ## the mechanism, because it surprises everyone once
     ///
     /// What this covers is wider than the module SET. The composer's modules registry
-    /// seed commits `sha256(component.wasm)` — the descriptor's hash — for
+    /// seed commits each deployment hash — the descriptor's commitment — for
     /// every wasm tenant into the modules registry's MerkleStore, so each
     /// guest's CODE DIGEST is consensus state itself. That means a module's
     /// SOURCE is consensus-relevant the moment its component is rebuilt — even
@@ -1157,6 +1258,78 @@ mod tests {
              consensus state, so `make wasm-modules` moves this hash even when \
              the source change was cosmetic:\n\
              \x20 git diff origin/dev --name-only crates/modules/ crates/guests/ crates/examples/"
+        );
+    }
+
+    /// `sync_all_modules` re-enters forever on a resident whose boundary sync
+    /// keeps failing (`replica/park.rs`'s retry loop only bails when NOT
+    /// `resident_standing`), so a label leaked per attempt grows without
+    /// bound. Two lookups over the same module set must return the SAME
+    /// leaked string — i.e. add nothing new to the interner — not a fresh
+    /// leak each time.
+    #[test]
+    fn intern_label_reuses_existing_leak_for_repeat_module_ids() {
+        let module_set = ["directory", "governance", "modules", "files"];
+
+        let first_attempt: Vec<&'static str> = module_set
+            .iter()
+            .map(|module| intern_label(module))
+            .collect();
+        let second_attempt: Vec<&'static str> = module_set
+            .iter()
+            .map(|module| intern_label(module))
+            .collect();
+
+        for (a, b) in first_attempt.iter().zip(second_attempt.iter()) {
+            assert!(
+                std::ptr::eq(*a, *b),
+                "a repeat label lookup for the same module id leaked a new string \
+                 instead of returning the interned one"
+            );
+        }
+    }
+
+    /// a source serving a boundary it cannot transfer is refused BEFORE the
+    /// sync spends a genesis fetch, an object possession loop and every store
+    /// rebuild on it — and the refusal names the module and carries the
+    /// rotation's reason token.
+    #[test]
+    fn a_degraded_source_module_refuses_the_boundary() {
+        let entry = |id: &str, kind| statesync::ManifestEntry {
+            module_id: id.into(),
+            root: StateRoot([1u8; 32]),
+            code_hash: None,
+            kind,
+            resolver_target: None,
+        };
+        let manifest = |entries| statesync::Manifest {
+            height: 9,
+            root_hash: StateRoot([2u8; 32]),
+            epoch: 1,
+            view_base: 0,
+            participants: vec![],
+            residents: vec![],
+            floor_cert: None,
+            entries,
+            applied_frames: vec![],
+            pending_cutover_view: None,
+        };
+        let degraded = undeliverable_boundary(&manifest(vec![
+            entry("valset", statesync::PayloadKind::Resolver),
+            entry("kv", statesync::PayloadKind::Unsupported),
+        ]))
+        .expect("an Unsupported entry refuses the boundary");
+        assert_eq!(degraded.reason(), "source_degraded_module");
+        assert!(
+            degraded.to_string().contains("kv"),
+            "the refusal names the module: {degraded}"
+        );
+        assert!(
+            undeliverable_boundary(&manifest(vec![
+                entry("valset", statesync::PayloadKind::Resolver),
+                entry("kv", statesync::PayloadKind::Snapshot),
+            ]))
+            .is_none()
         );
     }
 }

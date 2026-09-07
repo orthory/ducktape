@@ -167,7 +167,7 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
         assert!(!ok, "{}", outputs(&runs));
         assert!(
             out.contains(
-                "--after 2 cannot schedule anything: activation must exceed height+MIN_SWAP_LEAD (3)"
+                "--after 2 cannot schedule anything: activation must exceed execute-height+MIN_SWAP_LEAD (3)"
             ),
             "{out}"
         );
@@ -181,4 +181,94 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
     ]);
     assert!(!status.contains("hello"), "{status}");
     assert_no_proposals(&cluster, 0);
+}
+
+#[test]
+fn register_carries_a_mapper_and_update_can_remove_it() {
+    let cluster = three_validators();
+    let component = fixture("pages");
+    let mapper = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/modules/apps/pages/index.wasm"
+    );
+    let artifact = module_artifact::ModuleArtifact {
+        component: std::fs::read(&component).unwrap(),
+        index: Some(std::fs::read(mapper).unwrap()),
+    };
+    let indexed = common::hex(&artifact.hash());
+    let runs = run_on_each(
+        &cluster,
+        &[
+            "module", "register", "notebook", &component, "--index", mapper, "--after", AFTER,
+        ],
+    );
+    assert_ceremony_scheduled(&runs, "notebook");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "notebook deployment active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "notebook").filter(|hash| *hash == indexed),
+        );
+    }
+    cluster.submit(
+        0,
+        "notebook",
+        br#"{"create_page":{"page_id":"first","title":"First"}}"#,
+    );
+    let query = serde_json::json!({"list_pages": {}});
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "the admitted mapper serves the page",
+            Duration::from_secs(60),
+            || {
+                let (status, body) =
+                    cluster.http(idx, "POST", "/v1/index/notebook/view", Some(&query));
+                let serves_view = status == 200;
+                if !serves_view {
+                    return None;
+                }
+                let pages = body["pages"]["pages"].as_array()?;
+                (pages.len() == 1).then_some(())
+            },
+        );
+    }
+    let bare = sha256_hex(&component);
+    assert_ne!(bare, indexed);
+    let runs = run_on_each(
+        &cluster,
+        &["module", "update", "notebook", &component, "--after", AFTER],
+    );
+    assert_ceremony_scheduled(&runs, "notebook");
+    for idx in 0..3 {
+        cluster.await_committed(
+            idx,
+            "mapper removal active",
+            Duration::from_secs(180),
+            || active_hash(&cluster, idx, "notebook").filter(|hash| *hash == bare),
+        );
+        cluster.await_committed(
+            idx,
+            "the removed mapper no longer serves",
+            Duration::from_secs(60),
+            || {
+                let (status, _) =
+                    cluster.http(idx, "POST", "/v1/index/notebook/view", Some(&query));
+                (status == 404).then_some(())
+            },
+        );
+        let page = cluster
+            .query(
+                idx,
+                "notebook",
+                br#"{"get_page":{"page_id":"first","limit":16}}"#,
+            )
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&page).unwrap();
+        assert!(
+            !page["page"].is_null(),
+            "component state survived mapper removal: {page}"
+        );
+    }
 }

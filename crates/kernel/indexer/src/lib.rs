@@ -18,7 +18,7 @@
 //!
 //! - **the host writer** (this crate, [`IndexStore::apply_block`], called by
 //!   the node's block loop): writes one borsh [`OpRow`] per dispatch under
-//!   `op/{height:016x}/{seq:04x}` plus the watermark, one atomic batch per
+//!   `op/{height:016x}/{seq:08x}` plus the watermark, one atomic batch per
 //!   module per block. NO domain logic lives host-side.
 //! - **the fold** (the module's index guest, installed IN the module's
 //!   database as fluentabi module `"index"`): a changes-mode trigger
@@ -46,7 +46,7 @@
 //! vouches for the DERIVED ROWS and only moves when ops arrive. guest code
 //! itself lives in the engine's own reserved 0x00 keyspace — invisible to
 //! scans and wiped by nothing this crate does; every node converges its own
-//! into each database from the guests its genesis carries ([`IndexStore::converge`]).
+//! into each database from the running module deployments ([`IndexStore::converge`]).
 //!
 //! alongside the per-module databases the store keeps ONE internal blocks
 //! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
@@ -57,9 +57,14 @@
 //! [`IndexStore::get`] / [`IndexStore::view`]) — fluent31's `Db` is
 //! `Send + Sync`, so the http layer reads concurrently with both writers.
 //!
-//! failure policy: a host-write error POISONS the store (writes refuse, reads
+//! failure policy: a host-write error POISONS THE STORE (writes refuse, reads
 //! keep serving) rather than skipping a block — a silent gap would break the
-//! watermark's contiguity promise. a guest-fold error never poisons: the
+//! watermark's contiguity promise. A rejected mapper (bad bytes, missing a
+//! required role or export) instead poisons ONLY ITS OWN MODULE — deployment
+//! goes `Failed`, its fold and views refuse until it is reconverged — because
+//! every other module's database went through convergence clean; the
+//! store-wide flag is reserved for the engine itself leaving a database in a
+//! state no caller declared. A guest-fold error never poisons either: the
 //! engine retains the events and retries, and the backlog is observable.
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
@@ -73,12 +78,12 @@
 //! the source's own op rows below it ([`IndexStore::write_backfill_rows`] +
 //! [`IndexStore::set_backfill_floor`], the joiner's inline join-seam walk).
 //!
-//! a MAPPER change is the other way derived rows go stale, and it needs no
-//! boundary: the op feed is still there. [`converge_guest`] clears the derived
+//! A mapper changes at its module's deployment activation. The op feed stays
+//! available: [`converge_guest`] clears the derived
 //! keyspace and re-drives the fold over the rows the database already holds,
 //! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
-//! never what the feed saw. that re-drive completes before [`IndexStore::open`]
-//! returns, so no reader ever sees the cleared keyspace.
+//! never what the feed saw. Readers wait for replacement and refold to finish
+//! under the deployment guard, at boot and at live activation.
 //!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
@@ -132,14 +137,26 @@ const CLEAR_FLUSH_EVERY: usize = 1024;
 const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 /// how long a fold drain may sit at the SAME pending count before it is called
 /// stuck. not a total budget — a long backlog drains as long as it needs, as
-/// long as it keeps shrinking (see [`drain_fold`]).
+/// long as it keeps shrinking (see [`drain_fold`]). shrunk under `cfg(test)`
+/// so a test that drives a genuinely wedged fold to its stall costs
+/// milliseconds, not a minute of every test run.
+#[cfg(not(test))]
 const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const FOLD_DRAIN_STALL: Duration = Duration::from_millis(200);
 /// ceiling on [`drain_fold`]'s poll backoff. every poll costs a queue count,
 /// so a long drain must not ask a thousand times a second.
 const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
+/// hard cap on one scan page's total key+value bytes (#1809): `MAX_SCAN_LIMIT`
+/// bounds ROW COUNT, but ordinary duckfs traffic puts megabyte stage chunks in
+/// op payloads, so a full-width page of those is gigabytes. [`collect_page`]
+/// stops adding rows once the running total would exceed this, always
+/// keeping at least the first row so a single oversized row still pages
+/// (never wedges) — the cursor resumes from there like any other partial page.
+pub const MAX_INDEX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 /// background fsync cadence for the index databases. the tier is rebuildable,
 /// so a bounded loss window buys memory-speed block application; fluent31
 /// recovery truncates a torn tail, never corrupts.
@@ -179,6 +196,21 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// whether a converge failure is the GUEST's fault — bad bytes, or missing
+/// the role/memory export readiness requires — rather than the engine's.
+/// [`Error::View`] is `converge_guest`'s own readiness rejection;
+/// `fluent31::Error::Wasm` is a compile or install-time rejection of the
+/// same candidate bytes. Everything else (`Io`, `Corruption`, `Conflict`,
+/// `Closed`, `Background`, `ProvenanceMismatch`, `Gone`, `JournalGap`) is the
+/// engine leaving the database in a state no caller declared, which is a
+/// store-wide concern.
+fn is_guest_rejection(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::View(_) | Error::Engine(fluent31::Error::Wasm(_))
+    )
+}
 
 // ============================================================================
 // the block-ops input — plain data, mapped by the node layer from its block
@@ -271,6 +303,21 @@ pub struct FoldStatus {
     pub last_error: Option<String>,
 }
 
+enum DeploymentState {
+    Ready {
+        code_hash: Option<Vec<u8>>,
+    },
+    /// `rejected_hash` is the sha256 of the guest bytes `converge_guest`
+    /// refused, when the refusal was the GUEST's fault (`is_guest_rejection`)
+    /// — `converge_module` short-circuits on a later attempt with the exact
+    /// same bytes instead of paying a cranelift compile for a mapper that
+    /// will fail for the identical reason every time. `None` for a module
+    /// with no guest, or a failure the engine caused rather than the bytes.
+    Failed {
+        rejected_hash: Option<[u8; 32]>,
+    },
+}
+
 /// one module's open database plus its guest's declared roles.
 ///
 /// the roles are what the LAST converge established — read back from the
@@ -279,6 +326,8 @@ pub struct FoldStatus {
 /// converge, which is why they are atomics on a shared handle.
 struct ModuleIndex {
     db: Arc<Db>,
+    /// Readers wait until mapper replacement and its refold finish together.
+    deployment: RwLock<DeploymentState>,
     /// the guest exports `on_apply` — a fold trigger is registered.
     has_fold: AtomicBool,
     /// the guest exports `query` — [`IndexStore::view`] routes to it.
@@ -286,6 +335,17 @@ struct ModuleIndex {
 }
 
 impl ModuleIndex {
+    fn read_deployment(&self) -> Result<RwLockReadGuard<'_, DeploymentState>> {
+        let guard = self
+            .deployment
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *guard {
+            DeploymentState::Ready { .. } => Ok(guard),
+            DeploymentState::Failed { .. } => Err(Error::Poisoned),
+        }
+    }
+
     fn folds(&self) -> bool {
         self.has_fold.load(Ordering::Acquire)
     }
@@ -294,10 +354,24 @@ impl ModuleIndex {
         self.has_view.load(Ordering::Acquire)
     }
 
+    fn query(&self, req: &[u8]) -> Result<Vec<u8>> {
+        let supports_view = self.views();
+        if !supports_view {
+            return Err(Error::ViewUnsupported);
+        }
+        self.db.query(GUEST_NAME, req).map_err(view_error)
+    }
+
     fn set_roles(&self, has_fold: bool, has_view: bool) {
         self.has_fold.store(has_fold, Ordering::Release);
         self.has_view.store(has_view, Ordering::Release);
     }
+}
+
+/// A view and its advisory watermark, read from the same deployed mapper.
+pub struct IndexedView {
+    pub bytes: Vec<u8>,
+    pub folded: Option<(u64, u32)>,
 }
 
 /// the per-module index store: one fluent31 database per module the host
@@ -403,6 +477,7 @@ impl IndexStore {
         let (has_fold, has_view) = installed_roles(&db)?;
         let module = ModuleIndex {
             db,
+            deployment: RwLock::new(DeploymentState::Ready { code_hash: None }),
             has_fold: AtomicBool::new(has_fold),
             has_view: AtomicBool::new(has_view),
         };
@@ -426,9 +501,101 @@ impl IndexStore {
     /// database already holding these bytes (the marker says so).
     pub fn converge(&self, modules: &[IndexModule]) -> Result<()> {
         for spec in modules {
-            let m = self.module(spec.id)?;
-            let (has_fold, has_view) = converge_guest(&m.db, spec)?;
-            m.set_roles(has_fold, has_view);
+            let module = self.module(spec.id)?;
+            self.converge_module(&module, spec, None)?;
+        }
+        Ok(())
+    }
+
+    /// Converge a deployment whose identity the caller has authenticated.
+    /// That hash commits both component and mapper. An unchanged identity
+    /// needs only a shared guard: no Wasm hashing, database read, or wait for
+    /// an active view on the ordinary per-block path.
+    pub fn converge_deployment(&self, spec: &IndexModule, code_hash: &[u8]) -> Result<()> {
+        let module = self.module(spec.id)?;
+        {
+            let deployment = module
+                .deployment
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let unchanged = matches!(&*deployment,
+                DeploymentState::Ready { code_hash: Some(current) } if current == code_hash);
+            if unchanged {
+                return Ok(());
+            }
+        }
+        self.converge_module(&module, spec, Some(code_hash))
+    }
+
+    fn converge_module(
+        &self,
+        module: &ModuleIndex,
+        spec: &IndexModule,
+        code_hash: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut deployment = module
+            .deployment
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let candidate_hash = spec.guest.map(|bytes| sha2::Sha256::digest(bytes).into());
+        let unchanged_rejection = matches!(
+            &*deployment,
+            DeploymentState::Failed { rejected_hash } if *rejected_hash == candidate_hash
+        );
+        if unchanged_rejection {
+            // the exact bytes that failed last time, offered again (a stuck
+            // deployment reconverges every block until an operator ships
+            // different ones, per `converge_host_modules`): short-circuit
+            // rather than pay a cranelift compile that can only fail the
+            // same way again.
+            return Err(Error::View(
+                "index guest previously rejected; unchanged since".into(),
+            ));
+        }
+        let (has_fold, has_view) = match converge_guest(&module.db, spec) {
+            Ok(roles) => roles,
+            Err(error) => {
+                // a rejected GUEST (bad bytes, missing role/memory export)
+                // is this module's problem alone — `read_deployment` already
+                // refuses its own reads and writes until it reconverges. only
+                // the engine itself misbehaving (an io/corruption/background
+                // failure out of the db calls `converge_guest` makes) is
+                // store-wide: every OTHER database went through those same
+                // calls clean, so one that didn't may be in a state no other
+                // module's fold or view can be trusted to see through.
+                let is_guest_rejection = is_guest_rejection(&error);
+                let rejected_hash = is_guest_rejection.then_some(candidate_hash).flatten();
+                *deployment = DeploymentState::Failed { rejected_hash };
+                if !is_guest_rejection {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
+        module.set_roles(has_fold, has_view);
+        *deployment = DeploymentState::Ready {
+            code_hash: code_hash.map(<[u8]>::to_vec),
+        };
+        Ok(())
+    }
+
+    /// Compile candidate mapper bytes without installing them or changing
+    /// data. Readiness must cover exactly what `converge`'s eventual
+    /// `install_module` will require — fluent31's own gate (pinned, cannot
+    /// expose the check itself) also requires a `memory` export, so a mapper
+    /// missing one must be refused HERE, not at activation.
+    pub fn validate_guest(&self, bytes: &[u8]) -> Result<()> {
+        let roles = self.blocks.wasm_entries(bytes)?;
+        let maps_or_queries = roles
+            .iter()
+            .any(|role| role == "on_apply" || role == "query");
+        if !maps_or_queries {
+            return Err(Error::View(
+                "index guest must export on_apply or query".into(),
+            ));
+        }
+        if !exports_memory(bytes)? {
+            return Err(Error::View("index guest must export `memory`".into()));
         }
         Ok(())
     }
@@ -444,6 +611,21 @@ impl IndexStore {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// whether `module`'s last converge left it `Failed` — its own reads and
+    /// writes refuse until it reconverges. lets a caller that reconverges
+    /// every block (a stuck deployment never becomes NOT-running) tell a
+    /// brand new rejection from the same one it already logged: `false` for
+    /// an unknown module id, since the actual converge call is what surfaces
+    /// `UnknownModule`.
+    pub fn is_module_failed(&self, module: &str) -> bool {
+        self.modules().get(module).is_some_and(|m| {
+            matches!(
+                *m.deployment.read().unwrap_or_else(PoisonError::into_inner),
+                DeploymentState::Failed { .. }
+            )
+        })
     }
 
     fn module(&self, module: &str) -> Result<Arc<ModuleIndex>> {
@@ -820,11 +1002,21 @@ impl IndexStore {
             // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
             // cleared keyspace serves "no such page" for every page, which is
             // indistinguishable from a workspace that lost its documents.
-            refold_feed(&m.db, module)?;
+            //
+            // the marker goes back up EITHER WAY. #1725: a failed refold (the
+            // guest's own fold rejecting a row, surfaced as `FoldStuck`) used
+            // to leave `meta/guest` absent on the error path — so the NEXT
+            // open found no marker, replayed the whole feed from scratch, hit
+            // the identical failure, and refused to open at all. Restoring it
+            // here regardless of outcome leaves the module's own fold trigger
+            // — still registered, still holding its backlog — as the one
+            // place this failure is visible (`fold_status`), exactly like a
+            // guest stuck at converge.
+            let folded = refold_feed(&m.db, module);
             if let Some(marker) = marker {
                 m.db.put(META_GUEST, marker)?;
             }
-            Ok(())
+            folded
         })();
         self.poison_on_err("refold", out)
     }
@@ -853,7 +1045,9 @@ impl IndexStore {
 
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db(module)?.get(key)?)
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        Ok(m.db.get(key)?)
     }
 
     /// one page of keys under `prefix`, strictly after cursor `after` when
@@ -866,7 +1060,9 @@ impl IndexStore {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Page> {
-        let db = self.db(module)?;
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        let db = &m.db;
         let (lo, hi) = scan_bounds(prefix, after);
         let snap = db.snapshot();
         let iter = db.iter_at(Some(&lo), hi.as_deref(), false, &snap)?;
@@ -880,10 +1076,24 @@ impl IndexStore {
     /// stale but consistent.
     pub fn view(&self, module: &str, req: &[u8]) -> Result<Vec<u8>> {
         let m = self.module(module)?;
-        if !m.views() {
-            return Err(Error::ViewUnsupported);
-        }
-        m.db.query(GUEST_NAME, req).map_err(view_error)
+        let _deployment = m.read_deployment()?;
+        m.query(req)
+    }
+
+    /// Read the advisory tip before the view while holding one deployment
+    /// guard. A replacement cannot put an old mapper's tip on a new view.
+    /// An unreadable tip means unknown; it never prevents serving the view.
+    pub fn view_with_tip(&self, module: &str, req: &[u8]) -> Result<IndexedView> {
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        let folded =
+            m.db.get(FOLD_TIP.as_bytes())
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(index_guest::decode_fold_tip);
+        let bytes = m.query(req)?;
+        Ok(IndexedView { bytes, folded })
     }
 
     /// a live feed of committed writes in `[lo, hi)` on one module's
@@ -898,6 +1108,23 @@ impl IndexStore {
     ) -> Result<fluent31::Subscription> {
         Ok(self.db(module)?.subscribe(lo, hi)?)
     }
+}
+
+/// whether candidate module bytes export a `memory` — the other half of
+/// fluent31's `install_module` gate (rev 76ba1867,
+/// `crates/fluent31/src/wasm/mod.rs:181-203`), which readiness must match:
+/// a mapper exporting a role entry point but no memory compiles fine here
+/// and then fails at activation, taking the module down at that block.
+/// fluent31 does not expose this check itself, so it is replicated against
+/// a throwaway engine — read-only export inspection, never executed.
+fn exports_memory(bytes: &[u8]) -> Result<bool> {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, bytes)
+        .map_err(|error| Error::View(format!("compile: {error}")))?;
+    let exports_memory = module
+        .get_export("memory")
+        .is_some_and(|export| export.memory().is_some());
+    Ok(exports_memory)
 }
 
 /// map a view invocation's engine error onto the tier's surface: a guest
@@ -985,7 +1212,9 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         if installed {
             db.uninstall_module(GUEST_NAME)?;
         }
-        if marker.is_some() {
+        let had_guest = marker.is_some() || installed;
+        if had_guest {
+            clear_derived(db)?;
             db.delete(META_GUEST)?;
         }
         return Ok((false, false));
@@ -1000,6 +1229,13 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let roles = db.wasm_entries(bytes)?;
     let has_fold = roles.iter().any(|r| r == "on_apply");
     let has_view = roles.iter().any(|r| r == "query");
+    let has_supported_role = has_fold || has_view;
+    if !has_supported_role {
+        return Err(Error::View(
+            "index guest must export on_apply or query".into(),
+        ));
+    }
+
     // the feed goes down FIRST: its pending events describe the previous
     // mapper's work, and `delete_trigger` discards them with the registration
     // — the same clean slate a boundary stamp takes, minus the amnesia.
@@ -1007,8 +1243,8 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         db.delete_trigger(FOLD_TRIGGER)?;
     }
     db.install_module(GUEST_NAME, bytes)?;
+    clear_derived(db)?;
     if has_fold {
-        clear_derived(db)?;
         create_fold_trigger(db)?;
         // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
         // trigger runner folds them behind it. Returning here would hand the
@@ -1019,11 +1255,33 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         // answer is worse than a slow boot: it is indistinguishable from a
         // workspace that lost its documents.
         //
-        // `Err` here refuses the OPEN, matching what a broken artifact already
-        // does at `wasm_entries` above: a guest that cannot fold its own feed
-        // has no read model to serve, and saying so beats serving nothing
-        // quietly.
-        refold_feed(db, spec.id)?;
+        // a `FoldStuck` here does NOT refuse the open: the derived tier is
+        // node-local and rebuildable (module docs at the top of this file),
+        // so one module's guest rejecting its own feed must not take the
+        // whole node down with it — #1725 was exactly that, a step further
+        // (the marker left absent so the NEXT boot replayed the identical
+        // failure into a boot abort). The module is left exactly as stuck as
+        // `drain_fold` found it: its fold trigger stays registered, still
+        // holding its backlog, and `IndexStore::fold_status` reports the
+        // pending count and the recorded error — the same surface a stuck
+        // live fold already uses. Anything else here IS the engine itself
+        // failing and still refuses the open, exactly as a broken artifact
+        // does at `wasm_entries` above.
+        match refold_feed(db, spec.id) {
+            Ok(()) => {}
+            Err(err @ Error::FoldStuck(_)) => {
+                tracing::warn!(
+                    target: "ducktape::index",
+                    reason = "converge_refold_stuck",
+                    module = spec.id,
+                    error = %err,
+                    "index guest could not fold its own feed at converge; its fold trigger \
+                     stays registered with the backlog as the honest state — see fold_status \
+                     — while the node boots and every other module indexes normally"
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -1034,6 +1292,60 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// one drain poll's verdict against the progress/stall rule, pulled out of
+/// [`drain_fold`]'s loop so it is testable without driving the engine:
+/// pending strictly below every count seen so far is [`DrainVerdict::Progress`]
+/// (resets the stall clock); anything else is [`DrainVerdict::Stuck`] only
+/// once the clock has run past `stall_budget`, and merely
+/// [`DrainVerdict::Waiting`] before that.
+///
+/// #1726: a recorded `last_error` plays NO part in this decision. fluent31
+/// sets it on the FIRST failed attempt and clears it only on the next
+/// SUCCESSFUL drain (100ms→6.4s backoff between attempts), so an error that
+/// is about to be retried into success is not evidence of anything by
+/// itself — only a backlog that has genuinely stopped shrinking is. a guest
+/// `Fail` the engine will retry forever still surfaces as `Stuck`, just not
+/// before the stall budget has had its say.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainVerdict {
+    Progress,
+    Stuck,
+    Waiting,
+}
+
+fn drain_verdict(
+    pending: u64,
+    fewest_pending: u64,
+    since_progress: Duration,
+    stall_budget: Duration,
+) -> DrainVerdict {
+    if pending < fewest_pending {
+        DrainVerdict::Progress
+    } else if since_progress >= stall_budget {
+        DrainVerdict::Stuck
+    } else {
+        DrainVerdict::Waiting
+    }
+}
+
+/// the message a stuck drain gives up with: the module, how much is still
+/// queued, and — when the engine ever recorded one — the last error it saw.
+/// that error need not be WHY the queue stopped shrinking (fluent31 only
+/// clears it on the next successful drain, so a since-resolved transient
+/// error can still be sitting there when a different jam is the real cause),
+/// so it rides along as context, never as the verdict.
+fn fold_stuck_message(module: &str, pending: u64, last_error: Option<&str>) -> String {
+    let stall_secs = FOLD_DRAIN_STALL.as_secs();
+    match last_error {
+        Some(err) => {
+            format!(
+                "{module}: {pending} events pending, no progress for {stall_secs}s (last error: {err})"
+            )
+        }
+        None => format!("{module}: {pending} events pending, no progress for {stall_secs}s"),
+    }
 }
 
 /// block until one module's fold trigger has nothing queued: fluent31 drains
@@ -1070,18 +1382,25 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
         if trigger.pending == 0 {
             return Ok(());
         }
-        if let Some(err) = trigger.last_error {
-            return Err(Error::FoldStuck(format!("{module}: {err}")));
-        }
-        if trigger.pending < fewest_pending {
-            fewest_pending = trigger.pending;
-            since_progress = std::time::Instant::now();
-        } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
-            return Err(Error::FoldStuck(format!(
-                "{module}: {} events pending, no progress for {}s",
-                trigger.pending,
-                FOLD_DRAIN_STALL.as_secs()
-            )));
+        let verdict = drain_verdict(
+            trigger.pending,
+            fewest_pending,
+            since_progress.elapsed(),
+            FOLD_DRAIN_STALL,
+        );
+        match verdict {
+            DrainVerdict::Progress => {
+                fewest_pending = trigger.pending;
+                since_progress = std::time::Instant::now();
+            }
+            DrainVerdict::Stuck => {
+                return Err(Error::FoldStuck(fold_stuck_message(
+                    module,
+                    trigger.pending,
+                    trigger.last_error.as_deref(),
+                )));
+            }
+            DrainVerdict::Waiting => {}
         }
         std::thread::sleep(poll);
         poll = (poll * 2).min(FOLD_DRAIN_POLL_MAX);
@@ -1153,7 +1472,7 @@ fn refold_feed(db: &Db, module: &str) -> Result<()> {
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
-/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+/// order — which for `op/{height:016x}/{seq:08x}` IS block-and-drain order.
 fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);
@@ -1209,14 +1528,21 @@ fn scan_bounds(prefix: &[u8], after: Option<&[u8]>) -> (Vec<u8>, Option<Vec<u8>>
 /// drain up to `limit` (clamped) pairs out of an iterator into a [`Page`].
 fn collect_page(iter: fluent31::DbIterator, limit: usize) -> Result<Page> {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
-    let mut entries = Vec::new();
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut has_more = false;
+    let mut page_bytes = 0usize;
     for kv in iter {
         let (key, value) = kv?;
         if entries.len() == limit {
             has_more = true;
             break;
         }
+        let row_bytes = key.len() + value.len();
+        if !entries.is_empty() && page_bytes + row_bytes > MAX_INDEX_PAGE_BYTES {
+            has_more = true;
+            break;
+        }
+        page_bytes += row_bytes;
         entries.push((key, value));
     }
     let next_after = (has_more && !entries.is_empty())

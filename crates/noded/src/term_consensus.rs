@@ -1,91 +1,16 @@
-//! PR2 — the CONSENSUS command source for shared terminal sessions.
+//! Shared-terminal commands arrive as ordered, authenticated chat messages.
+//! The node creates a public `term-<session_id>` channel under its own signer.
+//! Losing that create race is safe only after confirming the existing owner
+//! against that same key or its current identity account.
 //!
-//! PR1 gave a `Shared` session an ordered, origin-attributed command lane fed by
-//! a node-local ws op (`ClientMsg::TermCommand` -> [`crate::term::TerminalSessions::enqueue_command`]).
-//! That lane trusts a caller-supplied `origin` string and orders commands only
-//! within one node. PR2 makes the command source CONSENSUS: a member submits a
-//! command as an origin-SIGNED, totally-ORDERED, durable chat message; consensus
-//! signs + orders + persists it for free; and the node that OWNS the pty projects
-//! the committed messages into it, in sequence, attributed to the cryptographically
-//! verified author.
+//! The projector admits only commands from the channel owner. Account owners
+//! use canonical account authorship; historical key owners require the exact
+//! authenticated current content origin. Another key joining the account never inherits a
+//! historical key's terminal grant. Module/system ownership cannot start a
+//! projector. Tombstones never execute.
 //!
-//! ## Why chat, and why no new module
-//!
-//! A new consensus module changes the genesis root-hash — a flag day that kills
-//! every existing network. So we reuse the CHAT module, already in genesis and
-//! already an ordered, origin-signed, durable per-channel append log: a shared
-//! session's command lane IS a dedicated chat channel, a submitted command IS a
-//! chat message. This mirrors forge's hidden `forge:<repo>:<n>` discussion
-//! channels (`crates/modules/apps/forge/src/tracker_iface.rs`).
-//!
-//! ## Channel scheme (see the resolution note on [`session_channel`])
-//!
-//! `term-<session_id>`, a NON-colon id, created by the host node under its own
-//! key (an external `User` origin) with an OPEN post policy. A colon id
-//! (`term:<id>`) would be self-hiding — chat reserves colon ids to
-//! module/system origins and the app's `isModuleChannel` hides them — but a
-//! RUNNING node cannot mint one: `NodeCommand::Submit` signs with the node key
-//! (a `User` origin) on `bin/node` (see `bin/node/.../ingress.rs on_http`), and
-//! chat's `validate_channel_namespace` forbids a `User` origin any colon id.
-//! System origin is genesis/catch-up only, unreachable from a live submit lane.
-//! So the node creates a non-colon channel it CAN author, `PostPolicy::Open`
-//! keeps the log readable and writable as ordinary chat (external `User`
-//! authors pass the open policy; `validate_channel_namespace` is not consulted
-//! on `PostMessage`) while the DRIVER gate below decides what reaches the pty,
-//! and the app hides it via an `isModuleChannel` extension that also matches
-//! `term-<hex>`.
-//!
-//! ## Authorization: the pty is driven by the channel's OWNER
-//!
-//! Posting to `term-<id>` is open — the channel is a public, committed log and
-//! its id is not a secret (it lands in chat state and is enumerable). DRIVING
-//! the pty is not: [`project_message`] feeds a committed message to the pty
-//! only when its cryptographically verified author equals the channel's
-//! `owner`, and every other post is refused with `command_not_channel_owner`.
-//!
-//! `Channel.owner` is the right anchor and it needs nothing new. Chat sets it
-//! from the SIGNED author at `CreateChannel` (`chat/src/lib.rs` `stage_channel`)
-//! and already enforces it for rename/archive (`check_channel_admin`) — it is
-//! the tree's existing answer to "who owns this channel". Because
-//! [`ensure_channel`] is submitted by the node that owns the pty, the owner IS
-//! that host, on both binaries and with no node-key plumbing: `bin/node` signs
-//! with its node key, `bin/noded` with its configured origin, and the projector
-//! reads back whichever one consensus recorded.
-//!
-//! **The gate is here, not on the post policy, and that is deliberate.**
-//! `SetMembership` IS author-gated now — chat routes it through
-//! `check_channel_admin`, so only the channel's owner writes the roster — which
-//! means a multi-driver participant set has become expressible. It is still not
-//! adopted here, for a reason that is a product decision rather than a missing
-//! primitive: a `Shared` session spends the HOST's own env credential, which
-//! carries no grant record and therefore no grantee, so widening the driver set
-//! widens who spends the operator's personal subscription. Until that question
-//! is answered the rightful set stays ONE — the owner — and it is enforced
-//! where the effect happens rather than where the bytes become durable.
-//! `JoinHuddle` under an open policy remains self-service, so a huddle roster
-//! is not a candidate for this gate either.
-//!
-//! What this does NOT change: the node-local ws `TermCommand` lane
-//! (`crate::stream::handle_term_command`) still drives the same FIFO with a
-//! caller-supplied `origin`. That lane is trusted-local by construction — it
-//! rides the same surface as `/v1/submit`, and a local process can already read
-//! the node's key off disk — so it is gated by reachability, not by this.
-//!
-//! ## Why a projector, not a `host::worker::Worker`
-//!
-//! The obvious shape — a worker that decodes a committed `ChatEvent::MessagePosted`
-//! event — does not work: chat emits `MessagePosted` via `ctx.emit_msg` to
-//! registered HOOK MODULES (a within-block dispatch), never as an `sdk::Event`
-//! on the worker seam (`crates/modules/apps/chat/src/lib.rs` has NO `emit_event`). A
-//! channel with no hooks emits nothing to observe, and a hook target must be a
-//! real registered module — which PR2 must not add. So the worker seam never
-//! sees a chat post. Instead we do what `bin/node`'s dispatch reactor already
-//! does for its off-loop work (`resident_dispatch.rs`): read COMMITTED state.
-//! A per-session background task queries committed chat over the ordinary
-//! command lane (`NodeCommand::Query`, exactly like every HTTP read) and drives
-//! new messages into the pty. It runs on the http/axum task, NOT the consensus
-//! loop, so the query never re-enters and never deadlocks — and the SAME
-//! `create_session` handler wires it on both `bin/noded` and `bin/node`.
+//! The node-local terminal lane and the committed-message polling schedule
+//! remain separate: this module supplies the consensus-ordered command source.
 
 use std::time::Duration;
 
@@ -138,18 +63,13 @@ pub fn command_text(blocks: &[chat::Block]) -> String {
     parts.join("\n")
 }
 
-/// render a verified chat author into the display-grade `origin` string the
-/// command lane records (mirrors the tags/index author rendering). This is the
-/// CRYPTOGRAPHICALLY verified author derived from the committed frame's signed
-/// origin — never a caller-supplied claim — which is what resolves the spec's
-/// spoofable-origin finding: a `User` author's key bytes render to hex, so the
-/// app can map them to a bound display name exactly as it does elsewhere.
-fn render_author(author: &chat::AuthorRef) -> String {
+/// The canonical author displayed beside an accepted terminal command.
+fn render_author(author: &chat::Party) -> String {
     match author {
-        chat::AuthorRef::User(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
-        chat::AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        chat::AuthorRef::Module(id) => format!("module:{id}"),
-        chat::AuthorRef::System => "system".to_string(),
+        chat::Party::Key(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        chat::Party::Account(number) => format!("acct:{number}"),
+        chat::Party::Module(id) => format!("module:{id}"),
+        chat::Party::System => "system".to_string(),
     }
 }
 
@@ -162,16 +82,16 @@ struct Projected {
     text: String,
 }
 
-/// true when a committed message's verified author IS the channel owner — the
-/// driver gate. Only a `User` author can be one: chat mints `Channel.owner`
-/// from `AuthorRef::User` bytes and leaves it `None` for module/system-minted
-/// channels, so no module, agent, or system origin can ever match one.
-fn author_is_owner(author: &chat::AuthorRef, owner: &[u8]) -> bool {
-    match author {
-        chat::AuthorRef::User(user) => user == owner,
-        chat::AuthorRef::Agent { .. } | chat::AuthorRef::Module(_) | chat::AuthorRef::System => {
-            false
+/// Account owners share their account's authority. A historical key owner
+/// still requires the actual signer of the post, even after it joins an account.
+/// Module and system owners never grant authority over the operator's PTY.
+fn author_is_owner(head: &chat::MessageHead, owner: &chat::Party) -> bool {
+    match owner {
+        chat::Party::Account(number) => head.author == chat::Party::Account(*number),
+        chat::Party::Key(owner_key) => {
+            matches!(&head.content_origin, sdk::Origin::External(key) if key == owner_key)
         }
+        chat::Party::Module(_) | chat::Party::System => false,
     }
 }
 
@@ -185,12 +105,15 @@ fn author_is_owner(author: &chat::AuthorRef, owner: &[u8]) -> bool {
 /// - `command_not_channel_owner` — the verified author is not this channel's
 ///   owner, i.e. not the node that owns the pty. THIS is the gate: the channel
 ///   is open to post to, and open to read, but only its owner drives.
-fn project_message(view: &chat::MessageView, owner: &[u8]) -> Result<Projected, &'static str> {
+fn project_message(
+    view: &chat::MessageView,
+    owner: &chat::Party,
+) -> Result<Projected, &'static str> {
     let is_tombstone = view.head.deleted;
     if is_tombstone {
         return Err("command_deleted");
     }
-    let from_owner = author_is_owner(&view.head.author, owner);
+    let from_owner = author_is_owner(&view.head, owner);
     if !from_owner {
         return Err("command_not_channel_owner");
     }
@@ -200,53 +123,147 @@ fn project_message(view: &chat::MessageView, owner: &[u8]) -> Result<Projected, 
     })
 }
 
-/// the channel's owner, or the stable reason there is none to gate on. FAILS
-/// CLOSED on both: a projector that cannot name the owner drives nothing.
-///
-/// - `channel_unreadable` — the channel record is absent (a create that never
-///   committed) or the query itself failed.
-/// - `channel_unowned` — the record exists with no owner, which for a
-///   `term-<id>` channel is impossible by construction (a live node can only
-///   author a `User` origin, and chat owns every user-created channel) and so
-///   means the id was squatted by a module/system-minted channel.
-fn channel_owner(channel: Option<chat::Channel>) -> Result<Vec<u8>, &'static str> {
+/// A missing channel is unreadable. Module/system ownership supplies no
+/// operator authority, so it is treated as unowned by the terminal lane.
+fn channel_owner(channel: Option<chat::Channel>) -> Result<chat::Party, &'static str> {
     let Some(channel) = channel else {
         return Err("channel_unreadable");
     };
-    channel.owner.ok_or("channel_unowned")
+    match channel.owner {
+        owner @ (chat::Party::Account(_) | chat::Party::Key(_)) => Ok(owner),
+        chat::Party::Module(_) | chat::Party::System => Err("channel_unowned"),
+    }
 }
 
-/// ensure the session's command channel exists (idempotent). Submits a chat
-/// `CreateChannel` under the node's own key with an OPEN post policy — the log
-/// is public; [`project_message`] is what decides which post drives the pty. On
-/// `bin/node` the origin bytes are ignored and the node key signs; on
-/// `bin/noded` they become the external author — either way a `User` origin
-/// authoring a non-colon id, which chat accepts, and which becomes the
-/// `Channel.owner` the projector gates on. An already-existing channel (a
-/// retry) is success.
-pub(crate) async fn ensure_channel(handle: &NodeHandle, channel: &str) -> Result<(), String> {
+/// what [`ensure_channel`] learned about the session's command channel.
+///
+/// A plain `Result<(), String>` used to treat "already exists" as success
+/// outright — which is exactly the hole #1746 closes: "already exists" means
+/// somebody else's `CreateChannel` won a race for this id, and that somebody
+/// might not be this node. `Squatted` and `Failed` get different treatment
+/// from [`crate::term::create_local`]: a squat is fatal to a `Shared` session
+/// (closed, never silently driven by whoever squatted it), while a transient
+/// failure degrades to the node-local ws command lane, exactly as before.
+pub(crate) enum EnsureChannelOutcome {
+    /// the channel exists AND this node's own account is its `owner` — safe
+    /// for [`spawn_projector`] to trust.
+    Ready,
+    /// the channel exists under a DIFFERENT owner. Carries the stable reason
+    /// [`confirm_ownership`] resolved it to.
+    Squatted(&'static str),
+    /// neither of the above — an actor/transport failure, never an
+    /// authorization outcome. Carries the raw (free-form) detail.
+    Failed(String),
+}
+
+/// ensure the session's command channel exists AND this node owns it
+/// (idempotent). Submits a chat `CreateChannel` under the node's own key with
+/// an OPEN post policy — the log is public; [`project_message`] is what
+/// decides which post drives the pty. On `bin/node` the origin bytes are
+/// ignored and the node key signs; on `bin/noded` they become the external
+/// author — either way a `User` origin authoring a non-colon id, which chat
+/// accepts, and which becomes the `Channel.owner` the projector gates on.
+///
+/// "already exists" used to be treated as success outright: a member watching
+/// this session's chunk fanout learns its id and can `CreateChannel` the same
+/// `term-<id>` first, and if that commit lands ahead of this node's own, this
+/// node's create loses the race — but the caller has no way to tell "I already
+/// had it" from "someone else already has it" from the error string alone. So
+/// a race loss is followed by [`confirm_ownership`], which asks the one
+/// question that matters: is the channel that already exists OURS.
+pub(crate) async fn ensure_channel(handle: &NodeHandle, channel: &str) -> EnsureChannelOutcome {
     let (reply, rx) = futures::channel::oneshot::channel();
     let payload = chat::encode_msg(&chat::ChatMsg::CreateChannel {
         channel_id: channel.to_string(),
         name: channel.to_string(),
         post_policy: chat::PostPolicy::Open,
     });
-    handle
+    let sent = handle
         .send(NodeCommand::Submit {
             target: chat::DEFAULT_CHAT_TARGET.to_string(),
             payload,
             origin: crate::DEFAULT_ORIGIN.as_bytes().to_vec(),
             reply,
         })
+        .await;
+    if sent.is_err() {
+        return EnsureChannelOutcome::Failed("actor gone".to_string());
+    }
+    match rx.await {
+        Err(_) => EnsureChannelOutcome::Failed("reply dropped".to_string()),
+        Ok(Ok(_)) => EnsureChannelOutcome::Ready,
+        // a concurrent create raced us to the same id: the channel is there,
+        // but "there" is not "ours" — confirm it before trusting it.
+        Ok(Err(reason)) if reason.contains("already exists") => {
+            confirm_ownership(handle, channel).await
+        }
+        Ok(Err(reason)) => EnsureChannelOutcome::Failed(reason),
+    }
+}
+
+/// This node's actual signing key, read from local status.
+///
+/// Mirrors the origin resolution [`ensure_channel`]'s doc describes: `bin/node`
+/// signs a `Submit` with its own node key regardless of the `origin` field, and
+/// that key is exactly `NodeStatus.public_key` (`bin/node/src/boot/mesh.rs`
+/// derives both from the same signer) — published once at boot, so reading it
+/// back here costs nothing that reaching consensus would. A daemon with no mesh
+/// identity (the embedded local daemon, `bin/noded`) publishes an empty
+/// `public_key`, and on that path the origin field IS the author: the literal
+/// [`crate::DEFAULT_ORIGIN`] bytes `ensure_channel` submits.
+fn self_key(handle: &NodeHandle) -> Vec<u8> {
+    let public_key = handle.status_cell().current().public_key;
+    match crate::term::decode_node_key(&public_key) {
+        Some(bytes) => bytes.to_vec(),
+        None => crate::DEFAULT_ORIGIN.as_bytes().to_vec(),
+    }
+}
+
+/// prove this node's own account owns `channel` after losing the create race
+/// for it — a READ, not a write: `query_channel` is the same `ChatQuery::Channel`
+/// point read [`projector_loop`] already trusts, so this asks it the one
+/// question that matters BEFORE the projector ever spawns, instead of after.
+/// No new chat op and no new query shape — `Channel.owner` was always the
+/// right anchor, the missing piece was comparing it against something.
+async fn confirm_ownership(handle: &NodeHandle, channel: &str) -> EnsureChannelOutcome {
+    let record = match query_channel(handle, channel).await {
+        Ok(record) => record,
+        Err(reason) => return EnsureChannelOutcome::Failed(reason),
+    };
+    let owner = match channel_owner(record) {
+        Ok(owner) => owner,
+        Err(_) => return EnsureChannelOutcome::Squatted("channel_owned_by_another_account"),
+    };
+    let key = self_key(handle);
+    let owns_channel = match owner {
+        chat::Party::Key(owner) => owner == key,
+        chat::Party::Account(owner) => match account_of_key(handle, key).await {
+            Ok(account) => account == Some(owner),
+            Err(reason) => return EnsureChannelOutcome::Failed(reason),
+        },
+        chat::Party::Module(_) | chat::Party::System => false,
+    };
+    if owns_channel {
+        return EnsureChannelOutcome::Ready;
+    }
+    EnsureChannelOutcome::Squatted("channel_owned_by_another_account")
+}
+
+async fn account_of_key(handle: &NodeHandle, key: Vec<u8>) -> Result<Option<u64>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(NodeCommand::Query {
+            target: "identity".into(),
+            req: identity::encode_query(&identity::IdentityQuery::OfKey { key }),
+            reply,
+        })
         .await
         .map_err(|_| "actor gone".to_string())?;
-    match rx.await.map_err(|_| "reply dropped".to_string())? {
-        Ok(_) => Ok(()),
-        // a concurrent/retried create raced us to the same id: the channel is
-        // there, which is all we needed.
-        Err(reason) if reason.contains("already exists") => Ok(()),
-        Err(reason) => Err(reason),
-    }
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    let identity::IdentityReply::Account(account) = identity::decode_reply(&bytes)? else {
+        return Err("unexpected identity reply".into());
+    };
+    Ok(account.map(|account| account.number))
 }
 
 /// query committed chat for the session channel's messages with `seq >= from_seq`,
@@ -399,15 +416,88 @@ async fn projector_loop(handle: NodeHandle, session_id: String, channel: String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat::{AuthorRef, Block, MessageHead, MessageView, Span};
+    use chat::{Block, MessageHead, MessageView, Party, Span};
+    use futures::StreamExt as _;
 
-    fn view(seq: u64, author: AuthorRef, blocks: Vec<Block>, deleted: bool) -> MessageView {
+    fn committed_block() -> crate::BlockSummary {
+        crate::BlockSummary {
+            height: 1,
+            root_hash: "ab".repeat(32),
+        }
+    }
+
+    /// a stand-in chat actor for [`ensure_channel`]/[`confirm_ownership`]:
+    /// answers `CreateChannel` with `create_reply` (the first-create outcome)
+    /// and `ChatQuery::Channel` with a record owned by `existing_owner` —
+    /// [`confirm_ownership`]'s READ, reached only after a create loss. Every
+    /// other op panics — these are the only two `ensure_channel`'s path ever
+    /// issues.
+    fn spawn_chat_actor(
+        mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
+        create_reply: Result<(), &'static str>,
+        existing_owner: Option<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.next().await {
+                match cmd {
+                    NodeCommand::Submit { payload, reply, .. } => {
+                        match chat::decode_msg(&payload).expect("a chat op") {
+                            chat::ChatMsg::CreateChannel { .. } => {
+                                let _ = reply.send(
+                                    create_reply
+                                        .map(|()| committed_block())
+                                        .map_err(|reason| reason.to_string()),
+                                );
+                            }
+                            other => panic!("ensure_channel submitted an unexpected op: {other:?}"),
+                        }
+                    }
+                    NodeCommand::Query { req, reply, .. } => {
+                        let chat::ChatQuery::Channel { channel_id } =
+                            chat::decode_query(&req).expect("a chat query")
+                        else {
+                            panic!("confirm_ownership queried something other than Channel");
+                        };
+                        let record = existing_owner.clone().map(|owner| chat::Channel {
+                            id: channel_id.clone(),
+                            name: channel_id,
+                            created_at: 0,
+                            head_seq: 0,
+                            post_policy: chat::PostPolicy::Open,
+                            hooks: Vec::new(),
+                            pinned: Vec::new(),
+                            huddle: Vec::new(),
+                            owner: chat::Party::Key(owner),
+                            revision: 1,
+                            archived: false,
+                        });
+                        let _ =
+                            reply.send(Ok(chat::encode_reply(&chat::ChatReply::Channel(record))));
+                    }
+                    NodeCommand::SubmitFrame { .. } => {
+                        panic!("ensure_channel used SubmitFrame unexpectedly")
+                    }
+                }
+            }
+        })
+    }
+
+    fn view(seq: u64, author: Party, blocks: Vec<Block>, deleted: bool) -> MessageView {
+        let origin = match &author {
+            Party::Account(number) => sdk::Origin::Program(*number),
+            Party::Key(key) => sdk::Origin::External(key.clone()),
+            Party::Module(module) => sdk::Origin::Module(module.clone()),
+            Party::System => sdk::Origin::System,
+        };
         MessageView {
             channel_id: "term-0000000000000001".into(),
             seq,
             head: MessageHead {
                 message_id: format!("m{seq}"),
+                origin: origin.clone(),
+                content_origin: origin,
                 author,
+                revision: 1,
                 blocks,
                 created_at: 0,
                 rev: 0,
@@ -466,7 +556,8 @@ mod tests {
             hooks: Vec::new(),
             pinned: Vec::new(),
             huddle: Vec::new(),
-            owner,
+            owner: owner.map_or(Party::System, Party::Key),
+            revision: 1,
             archived: false,
         }
     }
@@ -474,13 +565,8 @@ mod tests {
     #[test]
     fn the_channel_owner_drives_the_pty() {
         let projected = project_message(
-            &view(
-                1,
-                AuthorRef::User(HOST.into()),
-                command_blocks("pwd"),
-                false,
-            ),
-            &HOST,
+            &view(1, Party::Key(HOST.into()), command_blocks("pwd"), false),
+            &Party::Key(HOST.into()),
         )
         .expect("the owner's command projects");
         assert_eq!(projected.text, "pwd");
@@ -497,27 +583,85 @@ mod tests {
         // projector is the only thing between it and a live pty spending the
         // host's own subscription. Mutating `author_is_owner` to `true` reddens
         // this and nothing else.
-        let stranger = AuthorRef::User(vec![0x99, 0x99]);
+        let stranger = Party::Key(vec![0x99, 0x99]);
         assert_eq!(
-            project_message(&view(1, stranger, command_blocks("rm -rf /"), false), &HOST),
+            project_message(
+                &view(1, stranger, command_blocks("rm -rf /"), false),
+                &Party::Key(HOST.into())
+            ),
             Err("command_not_channel_owner"),
         );
     }
 
     #[test]
-    fn no_module_agent_or_system_author_drives_a_session() {
-        // an owner is always `AuthorRef::User` bytes, so no non-user origin can
-        // equal one — asserted per kind so a new `AuthorRef` variant has to be
-        // routed here rather than silently defaulting open.
+    fn a_non_key_origin_cannot_use_a_historical_key_grant() {
+        // A program account does not inherit the controller's historical key
+        // grant. Module and system messages do not carry signing-key evidence.
         for author in [
-            AuthorRef::Module("chat".into()),
-            AuthorRef::Agent {
-                module: "runs".into(),
-                agent_id: "a1".into(),
-            },
-            AuthorRef::System,
+            Party::Module("chat".into()),
+            Party::Account(7),
+            Party::System,
         ] {
-            assert!(!author_is_owner(&author, &HOST));
+            assert!(!author_is_owner(
+                &view(1, author, command_blocks("pwd"), false).head,
+                &Party::Key(HOST.into())
+            ));
+        }
+    }
+
+    #[test]
+    fn historical_key_ownership_requires_the_original_signer_after_admission() {
+        let mut post = view(1, Party::Account(7), command_blocks("pwd"), false);
+        let owner = Party::Key(HOST.into());
+        post.head.origin = sdk::Origin::External(HOST.into());
+        post.head.content_origin = post.head.origin.clone();
+        let projected = project_message(&post, &owner).expect("the original key retains its grant");
+        assert_eq!(
+            projected.origin, "acct:7",
+            "display retains the actual account author"
+        );
+        for origin in [
+            sdk::Origin::External(vec![99]),
+            sdk::Origin::Program(7),
+            sdk::Origin::Module("runs".into()),
+        ] {
+            post.head.content_origin = origin;
+            post.head.edited_at = Some(1);
+            assert_eq!(
+                project_message(&post, &owner),
+                Err("command_not_channel_owner")
+            );
+        }
+    }
+
+    #[test]
+    fn account_ownership_accepts_only_its_canonical_author() {
+        let owner = Party::Account(7);
+        for key in [HOST.to_vec(), vec![99]] {
+            let mut post = view(1, Party::Account(7), command_blocks("pwd"), false);
+            post.head.origin = sdk::Origin::External(key);
+            post.head.content_origin = post.head.origin.clone();
+            assert!(project_message(&post, &owner).is_ok());
+        }
+        for author in [
+            Party::Account(8),
+            Party::Key(HOST.into()),
+            Party::Module("chat".into()),
+            Party::System,
+        ] {
+            assert_eq!(
+                project_message(&view(1, author, command_blocks("pwd"), false), &owner),
+                Err("command_not_channel_owner")
+            );
+        }
+        for owner in [Party::Module("chat".into()), Party::System] {
+            assert_eq!(
+                project_message(
+                    &view(1, owner.clone(), command_blocks("pwd"), false),
+                    &owner
+                ),
+                Err("command_not_channel_owner")
+            );
         }
     }
 
@@ -527,8 +671,8 @@ mod tests {
         // running an empty redaction would be wrong.
         assert_eq!(
             project_message(
-                &view(2, AuthorRef::User(HOST.into()), Vec::new(), true),
-                &HOST
+                &view(2, Party::Key(HOST.into()), Vec::new(), true),
+                &Party::Key(HOST.into())
             ),
             Err("command_deleted"),
         );
@@ -542,24 +686,173 @@ mod tests {
         assert_eq!(channel_owner(Some(channel(None))), Err("channel_unowned"));
         assert_eq!(
             channel_owner(Some(channel(Some(HOST.into())))),
-            Ok(HOST.to_vec()),
+            Ok(Party::Key(HOST.to_vec())),
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_channel_is_ready_on_a_fresh_create() {
+        let (handle, rx, _hub) = NodeHandle::channel();
+        let actor = spawn_chat_actor(rx, Ok(()), None);
+        assert!(matches!(
+            ensure_channel(&handle, "term-0000000000000001").await,
+            EnsureChannelOutcome::Ready
+        ));
+        drop(handle);
+        actor.await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn ensure_channel_confirms_ownership_after_losing_the_create_race() {
+        // the create lost the race ("already exists"), but the READ back says
+        // the existing channel's owner is `DEFAULT_ORIGIN` — the same account
+        // `NodeHandle::channel()`'s bare test handle (no mesh identity)
+        // resolves to. This node's own account already IS the channel's
+        // owner. Ready, same as a fresh create — and no write was made.
+        let (handle, rx, _hub) = NodeHandle::channel();
+        let actor = spawn_chat_actor(
+            rx,
+            Err("channel already exists: term-0000000000000001"),
+            Some(crate::DEFAULT_ORIGIN.as_bytes().to_vec()),
+        );
+        assert!(matches!(
+            ensure_channel(&handle, "term-0000000000000001").await,
+            EnsureChannelOutcome::Ready
+        ));
+        drop(handle);
+        actor.await.expect("actor task");
+    }
+
+    /// **#1746, the regression.** A create loss ("already exists") used to be
+    /// treated as success outright, with no check of who actually won it — so
+    /// a member who pre-squatted `term-<id>` became the session's command
+    /// author. Now the READ-back owner is compared against this node's own
+    /// account, and a mismatch surfaces as `Squatted`, which `create_local`
+    /// closes the session on rather than spawning a projector that would
+    /// trust the squatter as `Channel.owner`.
+    #[tokio::test]
+    async fn ensure_channel_refuses_a_channel_squatted_by_another_account() {
+        let (handle, rx, _hub) = NodeHandle::channel();
+        let actor = spawn_chat_actor(
+            rx,
+            Err("channel already exists: term-0000000000000001"),
+            Some(vec![0x99, 0x99]),
+        );
+        assert!(matches!(
+            ensure_channel(&handle, "term-0000000000000001").await,
+            EnsureChannelOutcome::Squatted("channel_owned_by_another_account")
+        ));
+        drop(handle);
+        actor.await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn existing_account_owner_is_checked_against_the_actual_signers_current_account() {
+        for resolved in [Some(7), Some(8), None] {
+            let (handle, mut rx, _hub) = NodeHandle::channel();
+            handle.status_cell().publish(crate::NodeStatus {
+                public_key: "ab".repeat(32),
+                ..Default::default()
+            });
+            let actor = tokio::spawn(async move {
+                let NodeCommand::Query { target, req, reply } =
+                    rx.next().await.expect("channel query")
+                else {
+                    panic!("only reads are allowed");
+                };
+                assert_eq!(target, "chat");
+                assert!(matches!(
+                    chat::decode_query(&req).unwrap(),
+                    chat::ChatQuery::Channel { .. }
+                ));
+                let mut owned = channel(None);
+                owned.owner = Party::Account(7);
+                reply
+                    .send(Ok(chat::encode_reply(&chat::ChatReply::Channel(Some(
+                        owned,
+                    )))))
+                    .unwrap();
+                let NodeCommand::Query { target, req, reply } =
+                    rx.next().await.expect("identity query")
+                else {
+                    panic!("only reads are allowed");
+                };
+                assert_eq!(target, "identity");
+                assert_eq!(
+                    identity::decode_query(&req).unwrap(),
+                    identity::IdentityQuery::OfKey {
+                        key: vec![0xab; 32]
+                    }
+                );
+                let account = resolved.map(|number| identity::AccountView {
+                    number,
+                    name: String::new(),
+                    control: identity::Control::Keys,
+                    keys: vec![identity::KeyView {
+                        scheme: identity::KeyScheme::Ed25519,
+                        pubkey: vec![0xab; 32],
+                        label: None,
+                        added_at: 0,
+                    }],
+                    avatar: None,
+                    bio: None,
+                    updated_at: 0,
+                });
+                reply
+                    .send(Ok(identity::encode_reply(
+                        &identity::IdentityReply::Account(account),
+                    )))
+                    .unwrap();
+            });
+            let result = confirm_ownership(&handle, "term-0000000000000001").await;
+            match resolved {
+                Some(7) => assert!(matches!(result, EnsureChannelOutcome::Ready)),
+                Some(_) | None => assert!(matches!(
+                    result,
+                    EnsureChannelOutcome::Squatted("channel_owned_by_another_account")
+                )),
+            }
+            actor.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_channel_passes_through_a_transient_failure() {
+        // NOT an authorization outcome — an actor/transport failure never
+        // reaches `confirm_ownership` and must not be mistaken for a squat.
+        let (handle, rx, _hub) = NodeHandle::channel();
+        let actor = spawn_chat_actor(rx, Err("host busy"), None);
+        assert!(matches!(
+            ensure_channel(&handle, "term-0000000000000001").await,
+            EnsureChannelOutcome::Failed(reason) if reason == "host busy"
+        ));
+        drop(handle);
+        actor.await.expect("actor task");
+    }
+
+    #[test]
+    fn self_key_falls_back_to_default_origin_with_no_mesh_identity() {
+        // the bare test handle publishes no `NodeStatus` (empty `public_key`)
+        // — the embedded-local-daemon shape `ensure_channel`'s doc describes.
+        let (handle, _rx, _hub) = NodeHandle::channel();
+        assert_eq!(self_key(&handle), crate::DEFAULT_ORIGIN.as_bytes());
+    }
+
+    #[test]
+    fn self_key_reads_the_published_mesh_identity_when_present() {
+        let (handle, _rx, _hub) = NodeHandle::channel();
+        handle.status_cell().publish(crate::NodeStatus {
+            public_key: "ab".repeat(32),
+            ..Default::default()
+        });
+        assert_eq!(self_key(&handle), vec![0xab; 32]);
     }
 
     #[test]
     fn render_author_covers_every_kind() {
-        assert_eq!(render_author(&AuthorRef::User(vec![0x01, 0xff])), "01ff");
-        assert_eq!(
-            render_author(&AuthorRef::Agent {
-                module: "runs".into(),
-                agent_id: "a1".into()
-            }),
-            "agent:runs/a1"
-        );
-        assert_eq!(
-            render_author(&AuthorRef::Module("chat".into())),
-            "module:chat"
-        );
-        assert_eq!(render_author(&AuthorRef::System), "system");
+        assert_eq!(render_author(&Party::Key(vec![0x01, 0xff])), "01ff");
+        assert_eq!(render_author(&Party::Account(7)), "acct:7");
+        assert_eq!(render_author(&Party::Module("chat".into())), "module:chat");
+        assert_eq!(render_author(&Party::System), "system");
     }
 }

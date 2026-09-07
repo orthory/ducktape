@@ -364,8 +364,13 @@ fn find_walk(
             }
             acc.out.push(entry_info(store, &child, entry)?);
         }
-        // descend only into subtrees that can still hold a prefix match.
-        if entry.kind == EntryKind::Dir && subtree_may_match(&child, acc.prefix) {
+        // descend only into subtrees that can still hold a prefix match AND a
+        // path after the cursor — the latter is what keeps a page from
+        // re-walking the whole already-emitted region (issue #1803).
+        if entry.kind == EntryKind::Dir
+            && subtree_may_match(&child, acc.prefix)
+            && subtree_after(&child, acc.after)
+        {
             find_walk(store, Some(entry.id), &child, acc)?;
         }
     }
@@ -469,9 +474,10 @@ struct GrepAcc<'a> {
 
 /// DFS in full-path order. files under the prefix and strictly after the cursor
 /// are scan candidates; symlinks are never scanned; directories are never
-/// scanned but are descended when they can still hold a matching path (a dir may
-/// sit before the cursor yet hold files after it, so the cursor gates FILES, not
-/// descent).
+/// scanned themselves but are descended when they can still hold a matching
+/// path AND a path after the cursor — [`subtree_after`] prunes a subtree whose
+/// entire range already precedes the cursor, so a resumed page does not re-walk
+/// the already-emitted region (issue #1803).
 fn grep_walk(
     store: &Store,
     dir_tree: Option<ObjectId>,
@@ -496,7 +502,9 @@ fn grep_walk(
             // a needle in a symlink TARGET is not a file hit — files only.
             EntryKind::Symlink => {}
             EntryKind::Dir => {
-                if subtree_may_match(&child, acc.prefix) {
+                // same descent prune as `find_walk` (issue #1803): a subtree
+                // entirely before `cursor` cannot hold an unscanned file.
+                if subtree_may_match(&child, acc.prefix) && subtree_after(&child, acc.cursor) {
                     grep_walk(store, Some(entry.id), &child, acc)?;
                 }
             }
@@ -781,6 +789,34 @@ fn path_after(path: &str, cursor: Option<&str>) -> bool {
     }
 }
 
+/// can `child`'s subtree still hold a path strictly after `cursor`, in the same
+/// segment-wise order [`path_after`] compares in? used at DESCENT time (unlike
+/// `path_after`, which gates EMISSION), so both `find_walk` and `grep_walk`
+/// prune a whole subtree instead of re-walking it just to skip every entry in
+/// it at emit time — the fix for the quadratic paging in issue #1803.
+///
+/// walk `child`'s segments against `cursor`'s: the first differing segment
+/// decides. `Less` there means `child` (and everything under it — a descendant
+/// path only ever adds MORE segments, never changes an earlier one) sorts
+/// entirely before `cursor`, so the whole subtree is already-emitted territory
+/// and can be skipped. `Greater` means the subtree is entirely past `cursor`.
+/// Exhausting `child`'s segments without a difference means `child` is a
+/// segment-prefix of (or equal to) `cursor` — the cursor lands inside (or at)
+/// this subtree, which can still hold an unemitted descendant.
+fn subtree_after(child: &str, cursor: Option<&str>) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    for (c, a) in child.split('/').zip(cursor.split('/')) {
+        match c.cmp(a) {
+            Ordering::Less => return false,
+            Ordering::Greater => return true,
+            Ordering::Equal => continue,
+        }
+    }
+    true
+}
+
 /// truncate a string to at most `max_bytes` bytes on a char boundary — grep hit
 /// text is capped at [`MAX_GREP_LINE_BYTES`] so a pathological long line cannot
 /// bloat a reply.
@@ -895,5 +931,46 @@ fn wire_kind(kind: EntryKind) -> EntryKindWire {
         EntryKind::File => EntryKindWire::File,
         EntryKind::Dir => EntryKindWire::Dir,
         EntryKind::Symlink => EntryKindWire::Symlink,
+    }
+}
+
+#[cfg(test)]
+mod subtree_after_tests {
+    use super::subtree_after;
+
+    #[test]
+    fn no_cursor_always_descends() {
+        assert!(subtree_after("/a/b", None));
+    }
+
+    #[test]
+    fn subtree_entirely_before_cursor_is_pruned() {
+        // "b" < "z" at the first segment: nothing under "/a/b" can be after
+        // "/a/z/anything".
+        assert!(!subtree_after("/a/b", Some("/a/z/anything")));
+    }
+
+    #[test]
+    fn subtree_entirely_after_cursor_is_kept() {
+        assert!(subtree_after("/a/z", Some("/a/b/anything")));
+    }
+
+    #[test]
+    fn cursor_equal_to_the_subtree_root_still_descends() {
+        // descendants of "/a/b" all sort strictly after "/a/b" itself.
+        assert!(subtree_after("/a/b", Some("/a/b")));
+    }
+
+    #[test]
+    fn cursor_nested_inside_the_subtree_still_descends() {
+        // "/a/b" is a segment-prefix of the cursor: the cursor lands inside it.
+        assert!(subtree_after("/a/b", Some("/a/b/c/d")));
+    }
+
+    #[test]
+    fn subtree_nested_past_a_shorter_cursor_still_descends() {
+        // the cursor "/a/b" is a segment-prefix of the deeper subtree: every
+        // path under "/a/b/c" sorts after "/a/b" itself.
+        assert!(subtree_after("/a/b/c", Some("/a/b")));
     }
 }

@@ -70,6 +70,41 @@ enum PickGate
   read_only
   probe
 
+// What the status item's "Open" has to do. Since closing a window no longer
+// ends the process, the daemon can be up with nothing tracked — and then there
+// is no window to raise, so the row has to open one.
+enum WindowSummon
+  open
+  raise
+
+// WHICH PLATE A MESSAGE ROW WEARS. `selected_row` is the one plate in the app
+// that means "the row you are on"; `brand_wash` is deliberately lighter,
+// because a copy range is a RUN and painting five rows in the you-are-here
+// plate would say the reader is on all five.
+enum RowPlate
+  plain
+  selected
+  ranged
+
+// WHERE A COPY RANGE WAS DRAWN. A thread reply and a timeline row take their
+// seqs from the SAME channel sequence, so a reply can fall numerically inside
+// a range the reader drew in the stream behind it. The surface is what keeps
+// the two apart: a row lights up only for a range drawn where it lives, and
+// the chord lifts the same rows the bar is counting.
+enum CopySurface
+  nowhere
+  timeline
+  thread
+
+// The command chords this app answers, as one discriminant. macOS binds ⌘Q and
+// ⌘W through an app menu this app does not have, so it reads them itself — and
+// they differ only in the letter, which is exactly the shape one enum and one
+// match are for.
+enum CommandChord
+  ignored
+  quit
+  close_window
+
 // The account probe's answer for the picked network's chain.
 enum AccountProbe
   found
@@ -86,6 +121,19 @@ enum CeremonyPhase
 enum WelcomeDoor
   create
   login
+
+// SETTINGS' GROUPS, as the one thing the screen branches on. Settings was a
+// single reflowing grid of eight cards, so one topic (identity, its keys, the
+// seat that signs with them) landed in whichever column the width happened to
+// give it, and the destructive act sat at the bottom of the same list as the
+// theme switch. Each variant is one group of settings, and the danger zone is
+// a place you go rather than a card you scroll past.
+enum SettingsPane
+  general
+  network
+  account
+  security
+  danger
 
 enum NodeTab
   overview

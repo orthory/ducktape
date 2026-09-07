@@ -4,7 +4,9 @@
 //!
 //! * the **task board** (assigned-list kind): ordered human task lists. writes
 //!   go via [`TaskMsg`]; reads via [`TaskQuery`] -> [`TaskReply`]. no claims,
-//!   no origin-derived identity -- a plain shared list.
+//!   but [`Task::owner`] IS origin-derived identity, the same convention the
+//!   job board uses for `submitter`/`worker`: `UpdateStatus` and `DeleteTask`
+//!   are gated to the task's owner.
 //! * the **job board** (first-claim kind): a consensus-native work board. a
 //!   submitter posts a job, any worker claims it, exactly one claim wins by
 //!   consensus order, the claimant processes off-platform and reports a result.
@@ -17,6 +19,8 @@
 //! board-prefixed `encode_task_*`/`encode_job_*` helpers wrap a board message
 //! in that envelope, so a caller keeps building `TaskMsg`/`JobsMsg` values.
 
+pub use attribution::Actor as Party;
+use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
 
 // ---- task board wire (assigned-list kind) ---------------------------------
@@ -35,15 +39,35 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
+    /// Stable owning account, or the authenticated non-account creator.
+    pub owner: Party,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
+/// write intents against the task board. `owner` is normally derived from the
+/// dispatch origin at create time, the job board's `submitter` convention --
+/// [`TaskMsg::CreateTask::owner`] is the one deliberate exception.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskMsg {
-    CreateTask { task_id: String, title: String },
+    /// create a task. refused once the owner already owns
+    /// [`crate::MAX_OPEN_TASKS_PER_OWNER`] tasks, or the board is at
+    /// [`crate::MAX_TASKS`].
+    CreateTask {
+        task_id: String,
+        title: String,
+        /// A module may assign another existing account; other origins may
+        /// name only their own account. None derives ownership from origin.
+        #[serde(default)]
+        owner: Option<AccountNumber>,
+    },
+    /// move a task's status. gated to [`Task::owner`] -- anyone else's op
+    /// fails the block.
     UpdateStatus { task_id: String, status: TaskStatus },
+    /// remove a task's record entirely and free its board slot. gated to
+    /// [`Task::owner`], the board's only way to recede from [`crate::MAX_TASKS`].
+    DeleteTask { task_id: String },
 }
 
 /// the task board's reads. BOTH are bounded: `Get` is one record, `List` one
@@ -54,7 +78,9 @@ pub enum TaskMsg {
 pub enum TaskQuery {
     /// one task by id — the existence/point read another module's `execute`
     /// path wants. an absent id answers `Task(None)`.
-    Get { task_id: String },
+    Get {
+        task_id: String,
+    },
     /// one page in ascending id order: at most `limit` tasks (clamped into
     /// `1..=`[`crate::MAX_LIST_LIMIT`]) whose ids sort strictly after `after`.
     /// page by handing the last returned id back as the next `after`.
@@ -68,6 +94,9 @@ pub enum TaskQuery {
         #[serde(default)]
         after: Option<String>,
     },
+    OwnerOpenCount {
+        owner: Party,
+    },
 }
 
 /// replies to [`TaskQuery`].
@@ -76,6 +105,7 @@ pub enum TaskQuery {
 pub enum TaskReply {
     Task(Option<Task>),
     Tasks(Vec<Task>),
+    OwnerOpenCount(u64),
 }
 
 // ---- job board wire (first-claim kind) ------------------------------------
@@ -105,7 +135,7 @@ impl JobStatus {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
-    pub worker: String,
+    pub worker: Party,
     pub claimed_at_height: u64,
     pub lease_views: u64,
 }
@@ -125,10 +155,7 @@ pub struct Job {
     pub job_id: String,
     pub kind: String,
     pub spec: String,
-    /// origin-derived submitter identity (module id verbatim, `ext:` +
-    /// lowercase-hex external key, or "system"). set by the module, never
-    /// carried on the wire.
-    pub submitter: String,
+    pub submitter: Party,
     pub status: JobStatus,
     /// total number of successful claims over this job's life.
     pub attempt: u64,
@@ -185,7 +212,7 @@ pub enum JobsEvent {
     Submitted {
         job_id: String,
         kind: String,
-        submitter: String,
+        submitter: Party,
         spec: String,
         spec_hash: Vec<u8>,
     },
@@ -337,4 +364,19 @@ pub fn encode_job_event(e: &JobsEvent) -> Vec<u8> {
 
 pub fn decode_job_event(b: &[u8]) -> Result<JobsEvent, String> {
     sdk::wire::decode(b)
+}
+
+/// Resolved identity stamped on applied operations for derived indexes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkAssigned {
+    Task { actor: Party, owner: Party },
+    Job { actor: Party },
+}
+
+pub fn encode_assigned(assigned: &WorkAssigned) -> Vec<u8> {
+    sdk::wire::encode(assigned)
+}
+pub fn decode_assigned(bytes: &[u8]) -> Result<WorkAssigned, String> {
+    sdk::wire::decode(bytes)
 }

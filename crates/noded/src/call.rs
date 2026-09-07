@@ -189,14 +189,46 @@ pub enum PresenceServerControl {
     },
 }
 
+/// the longest channel/page id this node will accept on a realtime ws upgrade
+/// — mirrors the bound `presence_ws` already put on `page`, now shared so
+/// `call_ws` carries the same ceiling.
+const MAX_REALTIME_ID_BYTES: usize = 256;
+
+/// the ws frame/message ceiling on `/v1/call/ws` and `/v1/presence/ws` —
+/// larger than [`crate::stream::MAX_WS_MESSAGE_BYTES`] because this leg alone
+/// carries a captured VP8 camera frame (`CallClientControl`/binary video):
+/// `RATE_LADDER_KBPS`'s top rung (1200 kbps, `media_service::video::control`)
+/// budgets ~5 KiB/frame at 30 fps, and a keyframe runs several times that —
+/// 1 MiB leaves that headroom with more than 10x to spare while staying two
+/// orders of magnitude under tungstenite's unbounded 64 MiB default.
+const MAX_CALL_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct CallParams {
     channel: String,
+    /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]),
+    /// presented as a query param because the upgrade itself — not a later ws
+    /// frame — is the thing being admitted. The SAME secret the `/v1/ws`
+    /// `Subscribe.token` and `ServiceAttach` already ask for; see
+    /// [`crate::stream::Admission::Workspace`].
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PresenceParams {
     page: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// Has this caller proved it can read the node's own workspace? The realtime
+/// hub hands out live mic/camera/cursor bytes to whoever opens the socket —
+/// the same class of bytes `run-output:`/`term:` gate behind
+/// [`crate::stream::Admission::Workspace`] — so these two upgrades stand on
+/// the identical proof rather than staying `Lane::Open`.
+fn admitted(handle: &NodeHandle, token: Option<&str>) -> bool {
+    token.is_some_and(|token| handle.workspace_secret_matches(token))
 }
 
 pub(crate) async fn call_ws(
@@ -210,10 +242,19 @@ pub(crate) async fn call_ws(
             "calls are not available on this node (no mesh call hub)",
         );
     };
-    if params.channel.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "channel must not be empty");
+    if params.channel.is_empty() || params.channel.len() > MAX_REALTIME_ID_BYTES {
+        return error_response(StatusCode::BAD_REQUEST, "channel must be 1..256 bytes");
     }
-    upgrade.on_upgrade(move |socket| call_session(socket, call, params.channel))
+    if !admitted(&handle, params.token.as_deref()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "call requires this node's workspace secret (token query param)",
+        );
+    }
+    upgrade
+        .max_message_size(MAX_CALL_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_CALL_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| call_session(socket, call, params.channel))
 }
 
 /// pump one huddle's audio, camera video, and call control between the webview
@@ -363,10 +404,19 @@ pub(crate) async fn presence_ws(
             "presence is not available on this node (no mesh realtime hub)",
         );
     };
-    if params.page.is_empty() || params.page.len() > 256 {
+    if params.page.is_empty() || params.page.len() > MAX_REALTIME_ID_BYTES {
         return error_response(StatusCode::BAD_REQUEST, "page must be 1..256 bytes");
     }
-    upgrade.on_upgrade(move |socket| presence_session(socket, call, params.page))
+    if !admitted(&handle, params.token.as_deref()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "presence requires this node's workspace secret (token query param)",
+        );
+    }
+    upgrade
+        .max_message_size(MAX_CALL_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_CALL_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| presence_session(socket, call, params.page))
 }
 
 async fn presence_session(mut socket: WebSocket, call: CallLane, page_id: String) {
@@ -440,5 +490,50 @@ async fn presence_session(mut socket: WebSocket, call: CallLane, page_id: String
                 None => break,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
+
+    /// a handle whose terminal plane minted [`TEST_SECRET`] — the same
+    /// workspace-secret shape [`crate::stream::Admission::Workspace`] gates on,
+    /// which is exactly what `call_ws`/`presence_ws` now reuse.
+    fn handle_with_secret() -> NodeHandle {
+        let (handle, _cmds, _hub) = NodeHandle::channel();
+        handle.with_terminals(crate::term::TerminalSessions::new(
+            crate::term::TermRing::default(),
+            crate::term::TermCommandRing::default(),
+            Some(TEST_SECRET.into()),
+        ))
+    }
+
+    /// #1715: a caller presenting no token, or the wrong one, is not admitted
+    /// — the same "wrong is as good as absent" rule the ws topic gate proves.
+    #[test]
+    fn admitted_requires_the_exact_workspace_secret() {
+        let handle = handle_with_secret();
+        assert!(!admitted(&handle, None), "no token must not admit");
+        assert!(
+            !admitted(&handle, Some("not-the-secret")),
+            "a wrong token must not admit"
+        );
+        assert!(
+            admitted(&handle, Some(TEST_SECRET)),
+            "the exact workspace secret must admit"
+        );
+    }
+
+    /// a node with no workspace (no terminal plane, no minted secret) admits
+    /// nobody — fails closed, never open, on the one huddle/presence upgrade
+    /// path that used to check nothing at all.
+    #[test]
+    fn admitted_fails_closed_on_a_node_with_no_workspace_secret() {
+        let (bare, _cmds, _hub) = NodeHandle::channel();
+        assert!(!admitted(&bare, Some(TEST_SECRET)));
+        assert!(!admitted(&bare, None));
     }
 }

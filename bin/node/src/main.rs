@@ -65,9 +65,8 @@ mod config;
 mod constants;
 mod cred_cli;
 // the enclave-operator verbs (`user cred inspect|seal`) — real TEE quote
-// verification, the opt-in `verify` feature. `cred_cli` gates the two
-// subcommands that reach this module behind the same feature.
-#[cfg(feature = "verify")]
+// verification behind the opt-in `verify` feature. The verbs and their flags
+// exist in every build; without the feature they refuse at dispatch.
 mod cred_seal;
 mod drain_actions;
 mod executors;
@@ -80,6 +79,7 @@ mod host_reads;
 mod host_resources;
 mod host_state;
 mod join_gate;
+mod known_nodes;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
@@ -557,6 +557,7 @@ fn run_node(
         // the owner-gated admin namespace resolves ownership against this node's
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice.
         node_key: signer.public_key().as_ref().to_vec(),
+        signer: signer.clone(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;
 

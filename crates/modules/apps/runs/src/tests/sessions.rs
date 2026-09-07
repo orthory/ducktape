@@ -1,5 +1,5 @@
 use super::*;
-use agent::{ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT};
+use crate::{ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT};
 use pages::PageMsg;
 
 // ---- the agent session lane --------------------------------------------------
@@ -21,8 +21,8 @@ fn awaiting_session_run(actions: &[&str], caps: &[&str]) -> (RunsModule, Registr
     let mut registry = registry(&[("bot", actions)]);
     registry.get_mut("bot").unwrap().caps.pages_write =
         caps.iter().map(|s| s.to_string()).collect();
-    let mut m = watched(TurnPolicy::All, &registry).with_pages_module("pages");
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry).with_pages_module("pages");
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     (m, registry, run_id_for("general", 2, "bot"))
 }
@@ -108,8 +108,8 @@ fn with_open_delegating_session(budget: u32) -> (RunsModule, Registry, String) {
     ]);
     registry.get_mut("bot").unwrap().caps.subagent_budget = budget;
     registry.get_mut("worker").unwrap().caps.subagent_budget = budget;
-    let mut m = watched(TurnPolicy::All, &registry);
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry);
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(ASSIGNEE.to_vec()));
@@ -328,7 +328,7 @@ fn call_ids_are_idempotent_and_completed_calls_release_the_root_slot() {
     }
     assert_eq!(
         sessions(&m)[0].actions,
-        (MAX_DELEGATIONS_PER_RUN + 1) as u32
+        (MAX_DELEGATIONS_PER_RUN + 2) as u32
     );
     let mut joiner = module();
     joiner.install(&m.snapshot(), m.root()).unwrap();
@@ -604,10 +604,9 @@ fn only_the_bound_session_key_may_act() {
 }
 
 #[test]
-fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
-    // the emitted op rides THIS module's origin, which is what lets pages (and
-    // chat) refine `as_agent` into AuthorRef::Agent { module: runs, agent_id } —
-    // the attribution the frameless lane could never produce.
+fn a_granted_action_prepares_one_program_comment_proposal() {
+    // This validator probe exposes the prepared payload; the real-host
+    // programmable_model tests prove the Program call and canonical author.
     let (mut m, registry, run_id) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     exec(&mut m, &mut ctx, &act(&run_id, comment("b-p"))).unwrap();
@@ -619,13 +618,12 @@ fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
         comment_id,
         target,
         text,
-        as_agent,
         ..
     } = &msgs[0]
     else {
         panic!("expected AddComment, got {:?}", msgs[0]);
     };
-    assert_eq!(as_agent.as_deref(), Some("bot"), "agent-attributed");
+
     assert_eq!(target, "b-p");
     assert_eq!(text, "looks good");
     // the session lane's id space is DISJOINT from the settle path's: the
@@ -755,7 +753,7 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
     );
     assert!(ctx.chat_msgs().is_empty());
 
-    // with the grant, the agent speaks — module origin + as_agent.
+    // With the grant, validation prepares a post for the program to execute.
     let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST_MESSAGE], &[]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     exec(&mut m, &mut ctx, &act(&run_id, post)).unwrap();
@@ -768,18 +766,17 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
         message_id,
         blocks,
         thread,
-        as_agent,
     } = &msgs[0]
     else {
         panic!("expected PostMessage, got {:?}", msgs[0]);
     };
     assert_eq!(channel_id, "general");
-    assert_eq!(as_agent.as_deref(), Some("bot"), "agent-attributed");
+
     assert_eq!(*thread, None);
     assert_eq!(blocks, &vec![Block::paragraph("still working on it")]);
     assert_eq!(
         *message_id,
-        format!("agent/{run_id}/post/s0"),
+        post_message_id(&run_id, "s0"),
         "deterministic, and never the run's ONE reply id"
     );
     assert_ne!(*message_id, reply_message_id(&run_id));
@@ -871,7 +868,7 @@ fn the_session_prunes_on_every_settle_path() {
         let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
         let err = exec(&mut m, &mut ctx, &act(&run_id, comment("b-p"))).unwrap_err();
         assert!(
-            matches!(&err, Error::Module(reason) if reason.contains("no open agent session")),
+            matches!(&err, Error::Module(reason) if reason.contains("run is not in flight")),
             "{what}: a settled run's key must not act: {err:?}"
         );
     }
@@ -939,8 +936,14 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
     let (m, ..) = with_open_session(&[ACTION_CHAT_POST], &[]);
 
     // an orphaned session: the same session, but the pending section is empty.
-    let orphaned =
-        crate::state::encode_committed(&m.watches, &BTreeMap::new(), &m.sessions, &m.delegations);
+    let orphaned = crate::state::encode_committed(
+        &m.receipts.snapshot(),
+        m.next_action_item,
+        &BTreeMap::new(),
+        &m.sessions,
+        &m.delegations,
+        &m.models,
+    );
     let err = module().install(&orphaned, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("names no in-flight run")),
@@ -959,10 +962,168 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
             (run_id.clone(), s)
         })
         .collect();
-    let forged = crate::state::encode_committed(&m.watches, &m.pending, &stunted, &m.delegations);
+    let forged = crate::state::encode_committed(
+        &m.receipts.snapshot(),
+        m.next_action_item,
+        &m.pending,
+        &stunted,
+        &m.delegations,
+        &m.models,
+    );
     let err = module().install(&forged, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("32-byte ed25519 key")),
         "{err:?}"
     );
+}
+
+/// the node the lease MOVED to (a `ReassignRun`, or a saga expiry re-leasing
+/// the run on its own).
+const NEW_ASSIGNEE: [u8; 32] = [0x11; 32];
+
+#[test]
+fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
+    const NEW_SESSION_KEY: [u8; 32] = [0x22; 32];
+    let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST_MESSAGE], &[]);
+    let reassigned = |origin: Origin| {
+        CaptureCtx::new()
+            .at(6)
+            .with_origin(origin)
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_lease_holder(&run_id, &NEW_ASSIGNEE)
+    };
+    let post = AgentAction::PostMessage {
+        channel_id: "general".into(),
+        text: "still here".into(),
+        thread: None,
+    };
+
+    // the ex-holder's key is still bound, and still refused: its authority was
+    // the lease, and the lease left.
+    let mut ctx = reassigned(Origin::External(SESSION_KEY.to_vec()));
+    let err = exec(&mut m, &mut ctx, &act(&run_id, post.clone())).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.chat_msgs().is_empty(), "{:?}", ctx.chat_msgs());
+    assert_eq!(sessions(&m)[0].session_key, SESSION_KEY.to_vec());
+
+    // the node actually executing the run now opens its own session,
+    // REPLACING the stranded one.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap();
+    commit(&mut m);
+    let live = sessions(&m);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].session_key, NEW_SESSION_KEY.to_vec());
+    assert_eq!(live[0].holder, NEW_ASSIGNEE.to_vec());
+
+    // and the new holder cannot re-open on top of its own live session.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("already has an open agent session")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_moved_lease_stops_the_old_session_from_delegating() {
+    let (mut m, registry, run_id) = with_open_delegating_session(2);
+    let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+        .with_lease_holder(&run_id, &NEW_ASSIGNEE);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty());
+    assert!(delegations(&m, &run_id).is_empty());
+}
+
+#[test]
+fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
+    // the callee's dispatch carries the CALLER's transcript to a provider the
+    // callee's owner runs, so that owner's read standing is the gate.
+    let (mut m, mut registry, run_id) = with_open_delegating_session(2);
+    let private = |registry: &Registry| {
+        session_ctx(registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+            .with_members_only("general", vec![9; 32])
+    };
+
+    registry.get_mut("worker").unwrap().owner = RunOrigin::External(vec![8; 32]);
+    let mut ctx = private(&registry);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("may not read the caller's channel")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty(), "no transcript leaves");
+    assert!(delegations(&m, &run_id).is_empty());
+
+    // an owner who can read the channel dispatches as before.
+    registry.get_mut("worker").unwrap().owner = RunOrigin::External(vec![9; 32]);
+    let mut ctx = private(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser-allowed", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    assert_eq!(ctx.dispatch_msgs().len(), 1);
+}
+
+#[test]
+fn the_run_authority_query_answers_the_ceiling_the_read_plane_must_apply() {
+    let authority_of = |m: &RunsModule, run_id: &str| {
+        let reply = block_on(m.query(&encode_query(&RunsQuery::RunAuthority {
+            run_id: run_id.into(),
+        })))
+        .unwrap();
+        match runs_decode_reply(&reply).unwrap() {
+            RunsReply::RunAuthority(view) => view,
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    };
+
+    let (mut m, registry, caller_run) = with_open_delegating_session(2);
+    // an ordinary run is ceilinged by nothing but its agent's own record.
+    let plain = authority_of(&m, &caller_run).expect("the caller is in flight");
+    assert_eq!(plain.agent_id, "bot");
+    assert_eq!(plain.authority, None);
+
+    let mut ctx = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&caller_run, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    // the delegated run carries the caller's frozen grant.
+    let callee_run = delegations(&m, &caller_run)[0].callee_run_id.clone();
+    let scoped = authority_of(&m, &callee_run).expect("the callee is in flight");
+    assert_eq!(scoped.agent_id, "worker");
+    let ceiling = scoped.authority.expect("a delegated run carries a ceiling");
+    assert_eq!(ceiling.allowed_actions, vec![ACTION_CHAT_POST.to_string()]);
+
+    // a run nobody is executing proves no ceiling — the read plane must refuse.
+    assert_eq!(authority_of(&m, "chat\u{1f}general\u{1f}9\u{1f}bot"), None);
 }

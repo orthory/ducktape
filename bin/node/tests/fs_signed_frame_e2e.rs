@@ -13,6 +13,7 @@ mod support;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use commonware_cryptography::{Signer as _, ed25519};
+use duckfs_client::api::NodeApi as _;
 use support::Harness;
 
 /// minimal raw http/1.1 exchange with an explicit content-type — (status, body).
@@ -58,7 +59,8 @@ fn commit_payload(path: &str, message: &str, bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
     let h = Harness::start();
-    let port = h.node_url()
+    let port = h
+        .node_url()
         .rsplit(':')
         .next()
         .and_then(|p| p.parse::<u16>().ok())
@@ -79,7 +81,13 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
             payload,
         },
     );
-    let (status, body) = http(port, "POST", "/v1/submit/frame", "application/octet-stream", &frame);
+    let (status, body) = http(
+        port,
+        "POST",
+        "/v1/submit/frame",
+        "application/octet-stream",
+        &frame,
+    );
     assert_eq!(
         status,
         200,
@@ -88,13 +96,22 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
     );
 
     // the history records the SIGNER as the author.
-    let (status, body) = http(port, "GET", "/v1/files/history?limit=8", "application/json", b"");
+    let (status, body) = http(
+        port,
+        "GET",
+        "/v1/files/history?limit=8",
+        "application/json",
+        b"",
+    );
     assert_eq!(status, 200);
     let history: serde_json::Value = serde_json::from_slice(&body).expect("history json");
-    let author = history["snapshots"][0]["author"]
-        .as_str()
-        .expect("author string");
-    assert_eq!(author, actor, "the commit's author is the frame's verified signer");
+    let author: duckfs_core::Actor =
+        serde_json::from_value(history["snapshots"][0]["author"].clone()).expect("typed author");
+    assert_eq!(
+        author,
+        duckfs_core::Actor::Key(signer.public_key().as_ref().to_vec()),
+        "the commit's author is the frame's verified signer"
+    );
 
     // the negative half: the unsigned convenience lane writes as ext:noded,
     // which has NO authority over this signer's home subtree — rejected.
@@ -136,6 +153,108 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
     );
     let n = tampered.len();
     tampered[n - 70] ^= 0x01; // flip a payload byte behind the signature
-    let (status, _) = http(port, "POST", "/v1/submit/frame", "application/octet-stream", &tampered);
+    let (status, _) = http(
+        port,
+        "POST",
+        "/v1/submit/frame",
+        "application/octet-stream",
+        &tampered,
+    );
     assert_eq!(status, 400, "a tampered frame is refused");
+}
+
+#[test]
+fn admitted_signer_keeps_its_key_home_and_records_the_account_author() {
+    let h = Harness::start();
+    let port = h
+        .node_url()
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("harness port");
+    let signer = ed25519::PrivateKey::from_seed(19);
+    let key = signer.public_key().as_ref().to_vec();
+    let home = format!("/home/ext:{}/note.txt", noded::hex_bytes(&key));
+    let submit = |target: &str, payload: Vec<u8>, seq| {
+        let frame = node::encode_frame(
+            &signer,
+            seq,
+            &sdk::Msg {
+                target: target.into(),
+                payload,
+            },
+        );
+        let (status, body) = http(
+            port,
+            "POST",
+            "/v1/submit/frame",
+            "application/octet-stream",
+            &frame,
+        );
+        assert_eq!(
+            status,
+            200,
+            "signed {target}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    };
+    submit(
+        "files",
+        commit_payload(&home, "before admission", b"key"),
+        1,
+    );
+    submit(
+        "identity",
+        identity::encode_msg(&identity::IdentityMsg::Create {
+            name: "file-writer".into(),
+            scheme: identity::KeyScheme::Ed25519,
+        }),
+        2,
+    );
+    let request = serde_json::to_vec(&serde_json::json!({
+        "target": "identity",
+        "query": identity::IdentityQuery::OfKey { key: key.clone() },
+    }))
+    .expect("account query");
+    let (status, body) = http(port, "POST", "/v1/query", "application/json", &request);
+    assert_eq!(status, 200);
+    let identity::IdentityReply::Account(Some(account)) =
+        identity::decode_reply(&body).expect("account reply")
+    else {
+        panic!("signer has an account");
+    };
+    // Admission changes the canonical author, while this exact signer keeps
+    // authority over the key home it created before joining the account.
+    let refs = h.files().refs().expect("committed files head");
+    let mut admitted_commit: serde_json::Value =
+        serde_json::from_slice(&commit_payload(&home, "after admission", b"account"))
+            .expect("commit json");
+    admitted_commit["commit"]["base_snapshot"] = serde_json::json!(refs.head);
+    submit(
+        "files",
+        serde_json::to_vec(&admitted_commit).expect("admitted commit"),
+        3,
+    );
+    let (status, body) = http(
+        port,
+        "GET",
+        "/v1/files/history?limit=8",
+        "application/json",
+        b"",
+    );
+    assert_eq!(status, 200);
+    let history: serde_json::Value = serde_json::from_slice(&body).expect("history json");
+    let authors: Vec<duckfs_core::Actor> = history["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .map(|snapshot| serde_json::from_value(snapshot["author"].clone()).expect("typed author"))
+        .collect();
+    assert_eq!(
+        authors,
+        [
+            duckfs_core::Actor::Account(account.number),
+            duckfs_core::Actor::Key(key)
+        ]
+    );
 }

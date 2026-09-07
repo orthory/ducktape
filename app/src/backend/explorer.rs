@@ -193,6 +193,56 @@ pub fn palette_key_action(
     "none".into()
 }
 
+/// Is the command modifier down? The cheap half of the quit chord: it is read
+/// off the modifier stream to ARM the key-press route, so an ordinary keystroke
+/// never publishes one. It asks the same `command()` [`quit_chord`] judges by —
+/// Command on a Mac, Control elsewhere — because arming on one modifier and
+/// judging on another yields a chord that can never fire.
+pub fn command_held(modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers.command()
+}
+
+/// Is ⇧ down right now? A press carries no modifiers of its own, so the chat's
+/// shift-click reads the arming this fills instead of the app growing a second
+/// key route to learn the same fact.
+pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers.shift()
+}
+
+/// Which command chord this press is (⌘Q / ⌘W, Ctrl off a Mac), or none. The
+/// ONE answer, so the chords live in a single place rather than re-spelled at
+/// each use site — macOS binds both through an app menu this app does not have,
+/// so it reads them itself.
+///
+/// Both key readings, like the palette's toggle: the physical code is what a
+/// Dvorak or AZERTY layout still calls Q or W, and the logical character is
+/// what a layout that remaps the code actually types.
+pub fn command_chord(
+    logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+) -> crate::CommandChord {
+    use iced::keyboard::key::{Code, Physical};
+    if !modifiers.command() {
+        return crate::CommandChord::Ignored;
+    }
+    let quit = physical == Physical::Code(Code::KeyQ) || types_letter(&logical, "q");
+    if quit {
+        return crate::CommandChord::Quit;
+    }
+    let close_window = physical == Physical::Code(Code::KeyW) || types_letter(&logical, "w");
+    if close_window {
+        return crate::CommandChord::CloseWindow;
+    }
+    crate::CommandChord::Ignored
+}
+
+/// The letter a press actually types, after the layout has had its say — the
+/// other half of the physical code in every chord above.
+fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
+    matches!(logical, iced::keyboard::Key::Character(typed) if typed.eq_ignore_ascii_case(letter))
+}
+
 /// The transient layer currently over the console's content — the TOPMOST one
 /// only — or `""` when the content itself is the frontmost thing on screen.
 /// The order IS the z-order.
@@ -422,4 +472,22 @@ pub fn canonical_endpoint(input: String) -> String {
     rpc_client(configured)
         .map(|rpc| rpc.origin().to_string())
         .unwrap_or_else(|_| configured.to_string())
+}
+
+/// Is this press ⌘C? Its own question, not an arm on [`command_chord`]: the
+/// route that asks it exists ONLY while a copy range is open, so ⌘C costs
+/// nothing on a screen with no selection, and the quit/close chord — which is
+/// armed by ⌘ alone, on every screen — keeps a vocabulary of two.
+///
+/// It reaches that route only when no widget captured the press (the
+/// subscription is `status=ignored`), so a caret in a composer or a field with
+/// its own selection keeps its own copy, exactly as it should.
+pub fn is_copy_chord(
+    logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+) -> bool {
+    use iced::keyboard::key::{Code, Physical};
+    modifiers.command()
+        && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
 }

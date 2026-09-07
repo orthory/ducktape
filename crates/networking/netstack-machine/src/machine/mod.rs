@@ -1324,6 +1324,65 @@ mod invite_layer_tests {
         );
         assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS + 1);
     }
+
+    /// A byte-identical re-intro (same key, same observed endpoint) changes
+    /// nothing on the interface: it settles the reply directly and never
+    /// pays for a second `WgApply`. A re-intro with a moved endpoint is a
+    /// real change and still pushes.
+    #[test]
+    fn an_identical_re_intro_settles_without_a_push() {
+        let mut machine = machine();
+        let first = intro(&mut machine, 2, 1_000);
+        assert!(
+            first
+                .iter()
+                .any(|effect| matches!(effect, Effect::WgApply { .. })),
+            "the first intro installs the peer and pushes"
+        );
+        assert_eq!(refusal(&first), None);
+
+        let replay = intro(&mut machine, 2, 1_500);
+        assert!(
+            !replay
+                .iter()
+                .any(|effect| matches!(effect, Effect::WgApply { .. })),
+            "a byte-identical re-intro never pushes the interface"
+        );
+        assert!(
+            replay.iter().any(|effect| matches!(
+                effect,
+                Effect::ReplyInstall {
+                    outcome: Ok(()),
+                    ..
+                }
+            )),
+            "the replay still settles the install reply"
+        );
+        assert_eq!(
+            machine.driver.invite_peers[&binding::identity_of(&joiner(2))].installed_at_ms,
+            1_500,
+            "the join-window clock refreshes even on the free path"
+        );
+
+        // a moved endpoint is a real change: it still pushes.
+        let moved = machine
+            .step(
+                Event::InstallInvitePeer {
+                    token: CmdToken(2),
+                    peer: joiner(2),
+                    wireguard_public_key: X25519PublicKey([2; 32]),
+                    endpoint: SocketAddr::from(([8, 8, 8, 2], 51_821)),
+                },
+                2_000,
+            )
+            .unwrap();
+        assert!(
+            moved
+                .iter()
+                .any(|effect| matches!(effect, Effect::WgApply { .. })),
+            "a changed endpoint still pushes"
+        );
+    }
 }
 
 #[cfg(test)]

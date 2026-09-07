@@ -45,6 +45,7 @@ fn a_non_standing_peer_is_refused_statesync() {
         &encode_task_msg(&TaskMsg::CreateTask {
             task_id: "secret".into(),
             title: "chain-state".into(),
+            owner: None,
         }),
     );
     cluster.await_committed(
@@ -60,7 +61,7 @@ fn a_non_standing_peer_is_refused_statesync() {
                 .and_then(|raw| decode_task_reply(&raw).ok())
                 .and_then(|r| match r {
                     TaskReply::Task(task) => task.filter(|t| t.title == "chain-state").map(|_| ()),
-                    TaskReply::Tasks(_) => None,
+                    TaskReply::Tasks(_) | TaskReply::OwnerOpenCount(_) => None,
                 })
         },
     );

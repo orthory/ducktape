@@ -4,12 +4,66 @@
 //! check here is a clock read plus one or two ed25519 verifications against
 //! public keys.
 
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
 use smallvec::SmallVec;
 
 use crate::NodeKey;
+
+/// Bucket width (seconds) for the return-routability cookie: a `Register` for
+/// a key with no live mapping must echo a cookie minted for `from` at the
+/// CURRENT or PREVIOUS bucket — wide enough that a bind-then-register that
+/// straddles a bucket boundary never spuriously fails, narrow enough that a
+/// captured cookie is useless within a couple of minutes.
+const COOKIE_EPOCH_SECS: u64 = 60;
+
+/// Deterministic byte encoding of a `SocketAddr` for the cookie MAC input.
+/// Any injective, stable mapping works here — this one just reuses `Display`,
+/// which already varies by IP family and port.
+fn addr_bytes(addr: SocketAddr) -> String {
+    addr.to_string()
+}
+
+/// The coordinator's boot-random cookie-minting key. A stateless
+/// return-routability proof: `BindResponse` hands the caller
+/// `keyed_hash(key, src ‖ epoch_minute)`, and a first-seen (or expired)
+/// `Register` must echo one that verifies for its OWN observed source at the
+/// current or previous minute. Nothing here is persisted — a coordinator
+/// restart simply invalidates every outstanding cookie, which only costs a
+/// fresh joiner one extra `BindRequest` round trip.
+pub struct CookieKey([u8; 32]);
+
+impl CookieKey {
+    /// A fresh key drawn from the OS RNG at coordinator boot.
+    #[cfg(feature = "runtime")]
+    pub fn boot_random() -> Self {
+        use rand::RngCore as _;
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        Self(key)
+    }
+
+    fn mac(&self, src: SocketAddr, epoch: u64) -> [u8; 32] {
+        let mut msg = addr_bytes(src).into_bytes();
+        msg.extend_from_slice(&epoch.to_be_bytes());
+        *blake3::keyed_hash(&self.0, &msg).as_bytes()
+    }
+
+    /// Mint a cookie for `src` valid at `now`'s bucket.
+    pub fn mint(&self, src: SocketAddr, now: u64) -> [u8; 32] {
+        self.mac(src, now / COOKIE_EPOCH_SECS)
+    }
+
+    /// Does `cookie` verify for `src` at `now`'s bucket or the one before it?
+    /// The previous bucket is accepted so a cookie minted just before a
+    /// boundary still verifies immediately after it.
+    pub fn verify(&self, src: SocketAddr, now: u64, cookie: &[u8; 32]) -> bool {
+        let epoch = now / COOKIE_EPOCH_SECS;
+        *cookie == self.mac(src, epoch) || *cookie == self.mac(src, epoch.saturating_sub(1))
+    }
+}
 
 /// PoP signing namespace: `sign(COORD_REQ_NS, inner_request_bytes ‖ timestamp)`.
 pub const COORD_REQ_NS: &[u8] = b"ducktape-coord-req-v1";

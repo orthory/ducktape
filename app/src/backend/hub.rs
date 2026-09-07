@@ -289,6 +289,50 @@ pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> ic
     }
 }
 
+/// What the status item's "Open" row has to do, as the discriminant the
+/// handler branches on once. Closing a window no longer ends the process, so
+/// the daemon can be running with both slots empty — and [`window_target`] on
+/// an empty slot names a FRESH id, whose focus is a no-op, which would make a
+/// raise-only row do nothing at all. With nothing tracked, open.
+pub fn tray_open_action(
+    console: Option<iced::window::Id>,
+    onboarding: Option<iced::window::Id>,
+) -> crate::WindowSummon {
+    match console.is_none() && onboarding.is_none() {
+        true => crate::WindowSummon::Open,
+        false => crate::WindowSummon::Raise,
+    }
+}
+
+/// Put the call's window in front of you: open one when none is up, raise the
+/// one that is. The LIVE pill means exactly this, and does not know or care
+/// which case it is in.
+///
+/// Closing that window is NOT leaving, so this is the ordinary way back into a
+/// call that is still running behind your work.
+pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
+    match huddle.is_none() {
+        true => crate::WindowSummon::Open,
+        false => crate::WindowSummon::Raise,
+    }
+}
+
+/// Does this close end the process? Only where the daemon has nowhere else to
+/// live: on a Mac it goes on in the status item with no window at all, but off
+/// macOS there is no status item (`ui-lang-runtime`'s tray is a no-op there),
+/// so a window is the only handle on the process and closing the last one
+/// must leave — a daemon nobody can reach is a leak, not a menu-bar app. The
+/// huddle window is deliberately not a survivor: a lone call window never
+/// keeps the daemon alive after its console is gone.
+pub fn last_window_closed_exits(
+    console: Option<iced::window::Id>,
+    onboarding: Option<iced::window::Id>,
+) -> bool {
+    let has_status_item = cfg!(target_os = "macos");
+    let a_window_remains = console.is_some() || onboarding.is_some();
+    !has_status_item && !a_window_remains
+}
+
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
     current: Option<iced::window::Id>,

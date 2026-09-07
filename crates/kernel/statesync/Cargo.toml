@@ -38,6 +38,7 @@ commonware-p2p = { workspace = true }
 data-plane = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 futures = "0.3"
+tracing = { workspace = true }
 
 [dev-dependencies]
 kv = { workspace = true }

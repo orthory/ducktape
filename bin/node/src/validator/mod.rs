@@ -202,6 +202,12 @@ pub(crate) async fn run_validator(
     )
     .await;
 
+    // the digests the modules registry currently names — shared between the
+    // code plane's push admission gate and the drain's readiness pump, which
+    // refreshes it from the registry read it already performs each tick
+    // (#1833). constructed unconditionally: the drain loop always carries
+    // one, whether or not this node hosts a code plane to admit pushes into.
+    let code_registry = crate::code_plane::CodeRegistry::default();
     if let Some(peers) = &media_peers {
         let me: [u8; 32] = signer
             .public_key()
@@ -248,6 +254,7 @@ pub(crate) async fn run_validator(
             planes.clone(),
             blobs.clone(),
             code_stage_requests,
+            code_registry.clone(),
         );
     }
 
@@ -398,6 +405,7 @@ pub(crate) async fn run_validator(
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         sync_state_rx,
@@ -505,6 +513,8 @@ pub(crate) async fn run_promoted(
         prev_ckpt,
         mesh_window,
         mesh_book,
+        replay_window,
+        pending_cutover_view,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -594,6 +604,10 @@ pub(crate) async fn run_promoted(
     if let Some(book) = &media_peers {
         book.set_peers(transport.iter());
     }
+    // the digests the modules registry currently names — see the fresh-boot
+    // path's identical construction (#1833); constructed unconditionally so
+    // the drain loop always carries one.
+    let code_registry = crate::code_plane::CodeRegistry::default();
     // the module-code plane — the one overlay plane a parked node never
     // hosts. voice/agent/term planes carried over live.
     if let Some(book) = &media_peers {
@@ -611,6 +625,7 @@ pub(crate) async fn run_promoted(
             planes.clone(),
             blobs.clone(),
             code_stage_requests,
+            code_registry.clone(),
         );
     }
 
@@ -757,6 +772,8 @@ pub(crate) async fn run_promoted(
         view_base,
     );
     node.set_code_source(code_source);
+    // the replay guard crosses the promotion seam with the state it guards.
+    node.seed_replay_window(replay_window);
     // the observation barrier (see engine::resume): every drain batch ends
     // AT a valset-moving block, so cutovers arm at the same view on every
     // validator.
@@ -767,8 +784,18 @@ pub(crate) async fn run_promoted(
         resident_keys.clone(),
         epoch,
         view_base,
-        None,
+        pending_cutover_view,
     );
+    if let Some(ceiling) = pending_cutover_view {
+        node.set_view_ceiling(ceiling);
+        tracing::info!(
+            target: "ducktape::consensus",
+            node = %label,
+            cutover_view = ceiling,
+            epoch = epoch + 1,
+            "pending cutover re-armed at promotion"
+        );
+    }
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Validating);
     tracing::info!(
         event = "node_phase_transition",
@@ -792,6 +819,7 @@ pub(crate) async fn run_promoted(
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         sync_state_rx,
@@ -972,6 +1000,19 @@ pub(crate) struct PromotionBaton {
     pub(crate) mesh_window: crate::mesh_window::MeshWindowTracker,
     /// the mesh address book, carried with the tracker for the same reason.
     pub(crate) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
+    /// the replica node's replay window at the promotion boundary. it must
+    /// cross the seam: the seat writes a checkpoint here, so the journal
+    /// suffix a restart would restore from is empty, and a seat that started
+    /// with an empty window would apply a replayed batch its peers refuse.
+    pub(crate) replay_window: Vec<(u64, node::FrameId)>,
+    /// a valset change already committed but not yet cut over at this
+    /// boundary — the replica's own armed cutover carried through promotion
+    /// (a fresh-epoch seat is a cutover itself, so it arms none), or a synced
+    /// boundary's [`statesync::Manifest::pending_cutover_view`] on a cold
+    /// admission. the seated orchestrator resumes with this exact ceiling
+    /// instead of observing the already-changed valset itself and arming a
+    /// LATER one (#1821).
+    pub(crate) pending_cutover_view: Option<u64>,
 }
 
 /// one epoch's slot in the [`LaneBank`].

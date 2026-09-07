@@ -47,18 +47,23 @@ pub(crate) fn run(cmd: WalletCmd) -> CommandResult {
 }
 
 fn cmd_new(duck: &Path, name: &str, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    let (words, pubkey) = wallet_new(duck, name, stdin)?;
+    let (words, pubkey, activated) = wallet_new(duck, name, stdin)?;
     println!("{words}");
     println!("{pubkey}");
+    if !activated {
+        println!("wallet minted but not activated — run `ducktape wallet use {name}`");
+    }
     Ok(())
 }
 
-/// mint core — returns (mnemonic, pubkey-hex) so tests assert both.
+/// mint core — returns (mnemonic, pubkey-hex, activated) so tests assert all
+/// three; `activated` is false only when the mint succeeded but the pointer
+/// write did not (see `wallet::create`'s doc comment).
 fn wallet_new(
     duck: &Path,
     name: &str,
     stdin: &mut impl std::io::BufRead,
-) -> Result<(String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String, bool), Box<dyn std::error::Error>> {
     let password = userkey_cli::prompt_stdin_line(stdin, "password")?;
     Ok(wallet::create(duck, name, &password)?)
 }
@@ -135,9 +140,10 @@ mod tests {
 
         // new: mnemonic line then pubkey line; first wallet becomes active.
         let mut stdin = Cursor::new("password-123\n");
-        let (words, pubkey) = wallet_new(duck, "alice", &mut stdin).unwrap();
+        let (words, pubkey, activated) = wallet_new(duck, "alice", &mut stdin).unwrap();
         assert_eq!(words.split_whitespace().count(), 24);
         assert_eq!(pubkey.len(), 64);
+        assert!(activated);
         assert_eq!(keystore::wallet::active_name(duck).as_deref(), Some("alice"));
 
         // a second new does NOT steal active.

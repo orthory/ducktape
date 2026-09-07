@@ -192,22 +192,36 @@ pub fn node_log_timeline<'a>(
         family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
         ..Font::DEFAULT
     };
-    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
-        text("LIVE")
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.success)
-            .into()
-    } else {
-        button(
-            text(format!("RESUME · {} NEW", inspection.unread_count))
-                .size(10)
-                .font(mono),
-        )
-        .padding([3, 7])
-        .on_press(LogTimelineEvent::ResumeTail)
-        .into()
+    // ALWAYS A BUTTON, NEVER A BUTTON-OR-A-TEXT. A `button` carries widget
+    // state and a `text` carries none, so alternating the two at one position
+    // hands iced a state slot whose type changed under it — `Tree`'s downcast
+    // then aborts the process (`iced_core widget/tree.rs`), and this position
+    // flips the moment a line arrives while the reader is scrolled back. The
+    // resting state is the same button with no `on_press`, which is how iced
+    // spells "not pressable", and the label carries the difference.
+    let following_tail = inspection.following_tail;
+    let tail_label = match following_tail {
+        true => "LIVE".to_owned(),
+        false => format!("RESUME · {} NEW", inspection.unread_count),
     };
+    let tail_color = match following_tail {
+        true => DARK.palette.success,
+        false => DARK.palette.foreground,
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> =
+        button(text(tail_label).size(10).font(mono).color(tail_color))
+            .padding([3, 7])
+            .style(move |theme, status| match following_tail {
+                // resting: the word IS the status, so it wears no chrome
+                true => button::Style {
+                    background: None,
+                    text_color: DARK.palette.success,
+                    ..button::text(theme, status)
+                },
+                false => button::secondary(theme, status),
+            })
+            .on_press_maybe((!following_tail).then_some(LogTimelineEvent::ResumeTail))
+            .into();
     let header = row![
         text("NODE LOG")
             .size(10)
@@ -222,65 +236,70 @@ pub fn node_log_timeline<'a>(
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
-    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
-        let message = if state.lines.is_empty() {
-            "Waiting for the node's log ring…"
-        } else {
-            "No lines match this filter."
-        };
+    // THE LIST IS ALWAYS MOUNTED, and the empty note rides ON it rather than
+    // instead of it. `log_timeline` is a stateful virtual list and the note is
+    // a plain container: swapping one for the other at this position is the
+    // crash above, and this position swaps the FIRST time a line arrives —
+    // which is every visit to this tab. A stack keeps both children present
+    // with stable types; the note draws nothing when its text is empty.
+    let empty_note = match (state.visible.is_empty(), state.lines.is_empty()) {
+        (false, _) => "",
+        (true, true) => "Waiting for the node's log ring…",
+        (true, false) => "No lines match this filter.",
+    };
+    let timeline: iced::Element<'_, NodeLogTimelineEvent> = log_timeline(
+        &state.timeline,
+        &state.visible,
+        node_log_timeline_config(),
+        "Node log",
+        |line| line.cursor.clone(),
+        |line| line.line.clone(),
+        |_, line, _selected| {
+            let parts = split_log_line(line.line.clone());
+            let level_color = match parts.level.as_str() {
+                "ERROR" => DARK.palette.destructive,
+                "WARN" => DARK.palette.warning,
+                "INFO" => DARK.palette.success,
+                "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
+                _ => Color::TRANSPARENT,
+            };
+            row![
+                // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
+                // need ~158 px; 150 let the tail paint over the level.
+                text(parts.time)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.muted_foreground)
+                    .width(170),
+                text(parts.level)
+                    .size(11)
+                    .font(mono)
+                    .color(level_color)
+                    .width(48),
+                text(parts.message)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.foreground),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        },
+        |event| event,
+        &DARK,
+    );
+    let body = iced::widget::stack![
+        timeline,
         container(
-            text(message)
+            text(empty_note)
                 .size(12)
                 .font(mono)
                 .color(DARK.palette.muted_foreground),
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-    } else {
-        log_timeline(
-            &state.timeline,
-            &state.visible,
-            node_log_timeline_config(),
-            "Node log",
-            |line| line.cursor.clone(),
-            |line| line.line.clone(),
-            |_, line, _selected| {
-                let parts = split_log_line(line.line.clone());
-                let level_color = match parts.level.as_str() {
-                    "ERROR" => DARK.palette.destructive,
-                    "WARN" => DARK.palette.warning,
-                    "INFO" => DARK.palette.success,
-                    "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
-                    _ => Color::TRANSPARENT,
-                };
-                row![
-                    // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
-                    // need ~158 px; 150 let the tail paint over the level.
-                    text(parts.time)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.muted_foreground)
-                        .width(170),
-                    text(parts.level)
-                        .size(11)
-                        .font(mono)
-                        .color(level_color)
-                        .width(48),
-                    text(parts.message)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.foreground),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center)
-                .into()
-            },
-            |event| event,
-            &DARK,
-        )
-    };
+        .center_y(Length::Fill),
+    ];
     container(column![header, body].spacing(10))
         .width(Length::Fill)
         .height(Length::Fill)
@@ -404,7 +423,10 @@ pub fn split_log_line(line: String) -> LogParts {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (trim_time_to_millis(first), fields.next().unwrap_or_default()),
+        true => (
+            trim_time_to_millis(first),
+            fields.next().unwrap_or_default(),
+        ),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -1026,7 +1048,7 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One registered agent, rendered from its registry record and live-run fact.
+/// One configured model, rendered with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
@@ -1034,10 +1056,10 @@ pub struct AgentRow {
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// the external key shortened for display, else the origin's variant tag.
+    /// The current controller of the model's programmable account.
     pub owner_handle: String,
     /// this agent holds a RUN in flight right now — the runs module's pending
-    /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
+    /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
     pub skill_count: i64,
@@ -1050,71 +1072,67 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// The owner origin rendered as a handle. An external origin carries raw key
-/// bytes; a module/system origin reads as its own name.
-fn agent_owner_handle(owner: &serde_json::Value) -> String {
-    let Some(tagged) = owner.as_object() else {
-        return owner.as_str().unwrap_or_default().to_string();
-    };
-    let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
-    };
-    if variant != "external" {
-        return payload.as_str().unwrap_or(variant.as_str()).to_string();
-    }
-    short_label(&hex_encode(&json_bytes(payload)))
-}
-
-/// Load the agent roster from the canonical registry.
+/// Load model configurations with current account controllers and run activity.
+/// The model's registration origin does not change when control transfers.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
-        let working = agents_with_a_run_in_flight(&client).await;
-        let agents = reply["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let reply: runs::RunsReply = client
+            .query(
+                "runs",
+                &runs::RunsQuery::Model {
+                    query: runs::ModelQuery::Agents,
+                },
+            )
+            .await?;
+        let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
+            return Err("the runs module returned the wrong model roster reply".into());
+        };
+        let (accounts, working) =
+            tokio::join!(read_accounts(&client), agents_with_a_run_in_flight(&client));
+        let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
-            .map(|record| {
-                let status = tagged_name(&record["status"]);
-                let owner_handle = agent_owner_handle(&record["owner"]);
-                let name = record["display_name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                let caps = &record["caps"];
-                let has_subagent_grant = caps["subagent_budget"].as_i64().unwrap_or(0) > 0;
-                let cap_count = [
-                    "forge_read",
-                    "forge_push",
-                    "duckfs_read",
-                    "duckfs_write",
-                    "tools",
-                    "secrets",
-                    "pages_write",
-                ]
-                .into_iter()
-                .map(|field| caps[field].as_array().map_or(0, Vec::len))
-                .sum::<usize>()
-                    + usize::from(has_subagent_grant);
-                let id = record["agent_id"].as_str().unwrap_or_default().to_string();
-                AgentRow {
-                    live: working.contains(&id),
-                    initials: initials_of(&name),
-                    capability: record["capability"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    skill_count: count_i64(record["skills"].as_array().map_or(0, Vec::len)),
-                    cap_count: count_i64(cap_count),
-                    id,
-                    name,
-                    status,
-                    owner_handle,
-                }
+            .filter_map(|account| match account.control {
+                identity::Control::Program { controller, .. }
+                | identity::Control::Revoked { controller } => Some((account.number, controller)),
+                identity::Control::Keys => None,
             })
             .collect();
+        let names = names();
+        let agents = records
+            .into_iter()
+            .map(|record| {
+                let status = match record.status {
+                    runs::ModelStatus::Active => "active",
+                    runs::ModelStatus::Paused => "paused",
+                }
+                .to_string();
+                let controller = controllers
+                    .get(&record.account)
+                    .ok_or_else(|| "the model account has no program controller".to_string())?;
+                let owner_handle = author_display(&format!("acct:{controller}"), &names);
+                let caps = &record.caps;
+                let cap_count = caps.forge_read.len()
+                    + caps.forge_push.len()
+                    + caps.duckfs_read.len()
+                    + caps.duckfs_write.len()
+                    + caps.tools.len()
+                    + caps.secrets.len()
+                    + caps.pages_write.len()
+                    + usize::from(caps.subagent_budget > 0);
+                Ok(AgentRow {
+                    live: working.contains(&record.agent_id),
+                    initials: initials_of(&record.display_name),
+                    capability: record.capability,
+                    skill_count: count_i64(record.skills.len()),
+                    cap_count: count_i64(cap_count),
+                    id: record.agent_id,
+                    name: record.display_name,
+                    status,
+                    owner_handle,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(AgentsData { generation, agents })
     }
     .await
@@ -1219,15 +1237,12 @@ pub async fn set_agent_status(
     async {
         let agent_id = required_id(agent_id, "agent")?;
         let rpc = rpc_client(&rpc)?;
-        // `AgentMsg` is snake_case-tagged serde over `sdk::wire` (plain JSON);
-        // the app does not depend on the agent crate, so the two owner-gated
-        // verbs are written as their wire form.
-        let verb = match paused {
-            true => "pause_agent",
-            false => "resume_agent",
+        let operation = match paused {
+            true => runs::ModelMsg::PauseModel { agent_id },
+            false => runs::ModelMsg::ResumeModel { agent_id },
         };
-        let payload = serde_json::json!({ verb: { "agent_id": agent_id } });
-        signed_write(&rpc, "agent", encode_wire(&payload), password).await
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
     }
     .await
     .map_err(app_error)?;
@@ -1302,7 +1317,9 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             .await?;
         let account = match reply {
             identity::IdentityReply::Account(account) => account,
-            identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -1482,14 +1499,23 @@ async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
         .await?;
     match reply {
         identity::IdentityReply::Gen(generation) => Ok(generation),
-        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
+        identity::IdentityReply::Account(_)
+        | identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }
 }
 
+/// How long a consent this app mints stays spendable, in blocks —
+/// `consensus_time` is a block height and a validator network heartbeats about
+/// once a second, so this is roughly a day. There is no revoke op: this window
+/// IS how a mis-issued ticket dies.
+const CONSENT_TTL: u64 = 86_400;
+
 /// The `AddKey` this device consents to for `new_key` (of `scheme`) at its
-/// current generation.
+/// current generation, into THIS device's account, spendable for
+/// [`CONSENT_TTL`] blocks.
 async fn consented_add_key(
     client: &RpcClient,
     password: String,
@@ -1499,12 +1525,27 @@ async fn consented_add_key(
     label: Option<String>,
 ) -> Result<identity::IdentityMsg, String> {
     let generation = key_generation(client, new_key).await?;
-    let authorizer = sign_add_key_consent(password, chain_id, scheme, new_key, generation).await?;
+    let account = own_account(client).await?.number;
+    let expires_at = consent_expiry(client).await?;
+    let authorizer = sign_add_key_consent(
+        password, chain_id, scheme, new_key, generation, account, expires_at,
+    )
+    .await?;
     Ok(identity::IdentityMsg::AddKey {
         scheme,
         label,
         authorizer,
     })
+}
+
+/// The `expires_at` a consent minted right now carries.
+async fn consent_expiry(client: &RpcClient) -> Result<u64, String> {
+    Ok(client
+        .status()
+        .await
+        .map_err(|error| error.to_string())?
+        .height
+        + CONSENT_TTL)
 }
 
 /// The account this device's key belongs to, by the canonical resolver.
@@ -1523,7 +1564,9 @@ async fn own_account(client: &RpcClient) -> Result<identity::AccountView, String
 fn account_reply(reply: identity::IdentityReply) -> Result<Option<identity::AccountView>, String> {
     match reply {
         identity::IdentityReply::Account(account) => Ok(account),
-        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+        identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_)
+        | identity::IdentityReply::Gen(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }
@@ -1670,9 +1713,11 @@ pub async fn link_wallet(
     Ok(true)
 }
 
-/// Admit THIS device into an account by a passkey's consent: the assertion
-/// over this key's `AddKey` preimage IS the consent, its `userHandle` names
-/// the account, and this device signs the frame (the key being admitted).
+/// Admit THIS device into an account by a passkey's consent. TWO browser
+/// touches: a consent names the account it admits into, and only the passkey
+/// knows which that is — touch 1 asks (`userHandle`), touch 2 is the assertion
+/// over this key's `AddKey` preimage for that account. This device signs the
+/// frame (the key being admitted).
 pub async fn login_with_passkey(
     rpc: String,
     password: String,
@@ -1688,17 +1733,33 @@ pub async fn login_with_passkey(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent =
-            browser_ceremony(authpage::login_request(&chain_id, &device_key, generation)).await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
+        let number =
+            authpage::assertion_account(&browser_ceremony(authpage::account_request()).await?)?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = browser_ceremony(authpage::login_request(
+            &chain_id,
+            &device_key,
+            generation,
+            number,
+            expires_at,
+        ))
+        .await?;
+        let (_, proof) = authpage::login_consent(&consent)?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            label,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await
     }
     .await
@@ -1978,8 +2039,10 @@ async fn add_passkey_steps(
     Ok(())
 }
 
-/// Admit THIS device by a passkey's consent given on the phone: one QR. The
-/// phone half of `login_with_passkey`.
+/// Admit THIS device by a passkey's consent given on the phone: two QRs, one
+/// per touch — the first asks the passkey which account it speaks for, the
+/// second is the consent, bound to that account. The phone half of
+/// `login_with_passkey`.
 pub fn login_by_qr(
     rpc: String,
     password: String,
@@ -1993,23 +2056,40 @@ pub fn login_by_qr(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent = qr_ceremony(
+        let named = qr_ceremony(
             authpage::AUTH_PAGE,
-            authpage::login_request(&chain_id, &device_key, generation),
+            authpage::account_request(),
             "Confirm with the passkey that belongs to your account.",
             &mut tx,
         )
         .await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
-        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let number = authpage::assertion_account(&named)?;
+        step(&mut tx, CeremonyStep::working("Reading the account…")).await?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, None, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = qr_ceremony(
+            authpage::AUTH_PAGE,
+            authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
+            "Confirm once more to admit this device to the account.",
+            &mut tx,
+        )
+        .await?;
+        let (_, proof) = authpage::login_consent(&consent)?;
+        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            None,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await?;
         Ok(())
     })
@@ -2097,6 +2177,8 @@ mod account_ticket_tests {
             identity::KeyScheme::Ed25519,
             &new_key,
             3,
+            11,
+            900,
         );
         let ticket = add_key_ticket(&identity::IdentityMsg::AddKey {
             scheme: identity::KeyScheme::Ed25519,
@@ -2115,24 +2197,30 @@ mod account_ticket_tests {
         assert_eq!(scheme, identity::KeyScheme::Ed25519);
         assert_eq!(label.as_deref(), Some("phone"));
         assert_eq!(authorizer.key, member().public_key().as_ref());
-        let preimage = |generation| {
+        assert_eq!(authorizer.account, 11);
+        assert_eq!(authorizer.expires_at, 900);
+        let preimage = |generation, account, expires_at| {
             identity::add_key_preimage(
                 "chain-a",
                 identity::KeyScheme::Ed25519,
                 &new_key,
                 generation,
+                account,
+                expires_at,
             )
         };
-        let verifies = |generation| {
+        let verifies = |generation, account, expires_at| {
             identity::KeyScheme::Ed25519.verify(
                 &authorizer.key,
                 identity::IDENTITY_ADD_KEY_NS,
-                &preimage(generation),
+                &preimage(generation, account, expires_at),
                 &authorizer.proof,
             )
         };
-        assert!(verifies(3), "the consent is over the minted generation");
-        assert!(!verifies(4), "and is single-use");
+        assert!(verifies(3, 11, 900), "the consent is over the minted terms");
+        assert!(!verifies(4, 11, 900), "and is single-use");
+        assert!(!verifies(3, 12, 900), "account-bound");
+        assert!(!verifies(3, 11, 901), "expiry-bound");
         assert_eq!(
             add_key_ticket_bytes(&format!("  {ticket}\n")).unwrap(),
             ticket.as_bytes(),

@@ -966,14 +966,20 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
     assert_eq!(app.dm_peers_generation, dm + 1);
 
     plane(&mut app, "agent");
-    assert_eq!(app.agents_generation, agents + 1);
+    assert_eq!(
+        app.agents_generation,
+        agents + 1,
+        "identity refreshes model controller names"
+    );
 
-    // AND `runs` FEEDS THE SAME PROJECTION. `AgentRow.live` — the Forge seat's
-    // dot — is read from the runs module's pending register, so a run
-    // starting or ending changes a row while `agent` commits nothing. Its op
-    // is the dot's ONLY off-tab signal.
+    // Model configuration and active runs share the runs plane. Generic
+    // program changes do not change the model roster.
     plane(&mut app, "runs");
-    assert_eq!(app.agents_generation, agents + 2, "runs feeds agents too");
+    assert_eq!(
+        app.agents_generation,
+        agents + 2,
+        "runs owns model configuration and liveness"
+    );
     assert_eq!(app.account_generation, account + 1, "and nothing else");
 
     plane(&mut app, "files");
@@ -981,7 +987,7 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
 
     // A module with no plane of its own moves nothing.
     let before = app.members_generation;
-    plane(&mut app, "tagging");
+    plane(&mut app, "attribution");
     assert_eq!(
         app.members_generation, before,
         "an unrouted module is inert"

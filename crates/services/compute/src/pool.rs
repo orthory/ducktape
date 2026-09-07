@@ -339,35 +339,42 @@ impl DispatchPool {
                 let attempt_owner = attempt_guard;
                 let admission = {
                     let admission = async {
-                        let reservation = match job.admission {
-                            AdmissionPolicy::Queue => {
-                                let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
-                                let Some(reservation) = ledger
-                                    .reserve_when_available(
-                                        &reservation_key,
-                                        &job.demands,
-                                        &cancellation,
-                                    )
-                                    .await
-                                else {
-                                    return Err(
-                                        "attempt cancelled while waiting for resources".into()
-                                    );
-                                };
-                                reservation
-                            }
-                            AdmissionPolicy::FailFast => {
-                                let mut attempts = inflight.lock().expect("attempts lock");
-                                let Some(running) = attempts.get_mut(&key) else {
+                        // `run()` already stashed a converted Accept claim (or a
+                        // FailFast reservation) on the attempt before spawning;
+                        // only a job with neither — a directly pinned lease that
+                        // was never announced — waits for capacity here.
+                        let already_reserved = {
+                            let mut attempts = inflight.lock().expect("attempts lock");
+                            attempts
+                                .get_mut(&key)
+                                .and_then(|running| running.reservation.take())
+                        };
+                        let reservation = match already_reserved {
+                            Some(reservation) => reservation,
+                            None => match job.admission {
+                                AdmissionPolicy::Queue => {
+                                    let reservation_key =
+                                        format!("{}:{}", job.saga_id, job.attempt);
+                                    let Some(reservation) = ledger
+                                        .reserve_when_available(
+                                            &reservation_key,
+                                            &job.demands,
+                                            &cancellation,
+                                        )
+                                        .await
+                                    else {
+                                        return Err(
+                                            "attempt cancelled while waiting for resources".into(),
+                                        );
+                                    };
+                                    reservation
+                                }
+                                AdmissionPolicy::FailFast => {
                                     return Err(
                                         "attempt disappeared before resource admission".into()
                                     );
-                                };
-                                running
-                                    .reservation
-                                    .take()
-                                    .expect("fail-fast reservation is acquired before spawn")
-                            }
+                                }
+                            },
                         };
                         {
                             let mut attempts = inflight.lock().expect("attempts lock");
@@ -856,7 +863,7 @@ impl Worker for DispatchPool {
                 Ok(WorkOutcome::Handled(None))
             }
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
-            Gated::Execute(job) => {
+            Gated::Execute(mut job) => {
                 let key: AttemptKey = (job.saga_id.clone(), job.attempt);
                 // Insert before spawning so an assigned job that fits total
                 // capacity is retained while it waits for current occupancy.
@@ -875,7 +882,14 @@ impl Worker for DispatchPool {
                     return Ok(WorkOutcome::Handled(None));
                 }
                 let cancellation = RunCancellation::new();
-                let reservation = if job.admission == AdmissionPolicy::FailFast {
+                // A job carrying its own Accept's pending claim converts it
+                // directly — the demands are already reserved, so re-reserving
+                // here would either double-count them or race the window
+                // between the two. Only a job with no claim (FailFast, or a
+                // directly pinned lease that was never announced) reserves now.
+                let reservation = if let Some(claimed) = job.claimed.take() {
+                    Some(claimed)
+                } else if job.admission == AdmissionPolicy::FailFast {
                     let reservation_key = format!("{}:{}", job.saga_id, job.attempt);
                     let Some(reservation) = self.ledger.try_reserve(&reservation_key, &job.demands)
                     else {

@@ -115,6 +115,9 @@ mod tests {
             frag_index,
             frag_count,
             ts_ms: frame_no,
+            // the reassembler is per (peer, epoch) lane state: its owner
+            // rebuilds it on an epoch change, so one value throughout here.
+            epoch: 1,
         }
     }
 

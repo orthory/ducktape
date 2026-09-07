@@ -121,8 +121,8 @@ fn shares_view(sim: &Sim) -> Value {
 /// one filler block — advances the logical clock without touching membership.
 fn filler(sim: &Sim) {
     sim.submit_ok(
-        "inbox",
-        json!({ "deliver": { "member": "filler", "kind": "tick", "body": "walk" } }),
+        "dispatch",
+        serde_json::json!({ "nudge": {} }),
         Some("filler"),
     );
 }

@@ -19,6 +19,7 @@ name = "ducktape"
 path = "src/main.rs"
 
 [dependencies]
+module-artifact = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 # terminal styling for the operator verbs. Both already ride in on clap's own
@@ -54,7 +55,7 @@ capability = { workspace = true }
 provider-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
-tagging = { workspace = true }
+attribution = { workspace = true }
 agent-service = { workspace = true }
 compute-service = { workspace = true }
 forge = { workspace = true }

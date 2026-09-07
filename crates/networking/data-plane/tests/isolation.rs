@@ -249,6 +249,68 @@ async fn overflowing_flow_drops_only_itself() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn one_sender_burst_never_evicts_another_senders_frame() {
+    // A huddle's camera flow: every participant sends on it, and one video
+    // frame is a burst of up to 96 fragments. Three of them landing before
+    // the consumer gets a turn is 288 fragments against a 256 budget — with
+    // a flow-wide bound the earliest senders' fragments are shed, their
+    // frames never reassemble, and the keyframe requests that follow burst
+    // the same queue again. Per-sender shedding is what stops that.
+    const SENDERS: usize = 3;
+    const FRAGS: u8 = 96;
+    let hub = peer(9);
+    let senders: Vec<PeerId> = (1..=SENDERS as u8).map(peer).collect();
+
+    let net = SimNet::new();
+    let admission = Arc::new(TestAdmission::default());
+    let flow = FlowId::derive(b"video-channel:huddle");
+    admission.allow(hub, Service::Video, flow);
+    for sender in &senders {
+        net.set_link(*sender, hub, LINK);
+        admission.allow(*sender, Service::Video, flow);
+    }
+
+    let hub_flow = DataPlane::new(net.endpoint(hub), admission.clone(), config(600_000))
+        .datagram_flow(Service::Video, flow, DatagramPolicy { max_queued: 256 })
+        .unwrap();
+    let sender_flows: Vec<_> = senders
+        .iter()
+        .map(|sender| {
+            DataPlane::new(net.endpoint(*sender), admission.clone(), config(600_000))
+                .datagram_flow(Service::Video, flow, DatagramPolicy { max_queued: 256 })
+                .unwrap()
+        })
+        .collect();
+
+    // Interleaved keyframe bursts, with nobody draining the hub (its loop is
+    // busy awaiting its own fan-out — the window this bug lives in).
+    for frag in 0..FRAGS {
+        for (i, sender) in sender_flows.iter().enumerate() {
+            sender.send_to(hub, &[i as u8, frag]).await.unwrap();
+        }
+    }
+    sleep(Duration::from_millis(500)).await;
+
+    let mut received: Vec<Vec<u8>> = vec![Vec::new(); SENDERS];
+    for _ in 0..SENDERS * FRAGS as usize {
+        let (from, payload) = timeout(Duration::from_millis(50), hub_flow.recv())
+            .await
+            .expect("every fragment queued");
+        let sender = senders.iter().position(|p| *p == from).expect("known peer");
+        assert_eq!(payload[0] as usize, sender, "payload names its sender");
+        received[sender].push(payload[1]);
+    }
+    for (sender, frags) in received.iter().enumerate() {
+        let whole_frame: Vec<u8> = (0..FRAGS).collect();
+        assert_eq!(
+            *frags, whole_frame,
+            "sender {sender} lost fragments to a neighbour's burst"
+        );
+    }
+    assert_eq!(hub_flow.dropped(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn rogue_traffic_never_reaches_consumers() {
     let (a, b, rogue) = (peer(1), peer(2), peer(3));
     let net = SimNet::new();

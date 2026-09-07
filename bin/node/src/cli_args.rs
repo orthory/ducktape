@@ -101,6 +101,10 @@ pub struct LogFilterArgs {
     /// the user key that signs the request (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 /// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
@@ -141,9 +145,11 @@ pub enum WorkCmd {
 /// one account, or the literal `anyone`.
 #[derive(Debug, clap::Args)]
 pub struct WorkTargetArgs {
-    /// an account number, a display name, or the literal `anyone`. `anyone`
-    /// admits every network member — and lets a stranger's workload draw on
-    /// every credential this node has been granted.
+    /// an account NUMBER, or the literal `anyone`. `anyone` admits every
+    /// network member — and lets a stranger's workload draw on every
+    /// credential this node has been granted. A display name is refused: it
+    /// is freely rewritable and not unique, so it cannot name who this node
+    /// trusts (look the number up with `ducktape account show`).
     pub target: String,
     #[command(flatten)]
     pub selector: Selector,
@@ -391,6 +397,15 @@ fn source_workspace(source: WorkspaceSource) -> Result<PathBuf, String> {
 /// workspace that answers on it. Kept beside the forward lookup so both spell
 /// the base the same way through [`trim_base`]: a normalization that drifted
 /// apart would silently match nothing.
+/// public door onto [`workspace_serving`] for a caller that already has the
+/// resolved http base in hand (a signing verb pinning the node's identity —
+/// see `bin/node/src/node_http.rs::pinned_node_key`) and needs to ask "is this
+/// address one of MY OWN registered nodes", independent of which rung of the
+/// ladder produced it.
+pub fn workspace_for_base(base: &str) -> Result<PathBuf, String> {
+    workspace_serving(base)
+}
+
 fn workspace_serving(base: &str) -> Result<PathBuf, String> {
     let matches = config::list_workspaces()?
         .into_iter()
@@ -559,7 +574,7 @@ pub struct InitArgs {
         long,
         value_name = "MS",
         default_value_t = config::DEFAULT_BLOCK_TIME_MS,
-        value_parser = clap::value_parser!(u64).range(1..),
+        value_parser = clap::value_parser!(u64).range(config::MIN_BLOCK_TIME_MS..),
     )]
     pub block_time_ms: u64,
     #[command(flatten)]
@@ -709,6 +724,34 @@ mod tests {
         assert_eq!(ttl_of(&["probe", "invite", "--ttl-days", "365"]), 365);
         assert!(parse(&["probe", "invite", "--ttl-days", "0"]).is_err());
         assert!(parse(&["probe", "invite", "--ttl-days", "366"]).is_err());
+    }
+
+    /// `init --block-time-ms` is refused below the drain-tick floor at parse
+    /// time, mirroring `workspace_config::validate_block_time_ms` — the CLI
+    /// and the descriptor boundary must refuse the exact same beats.
+    #[test]
+    fn init_block_time_ms_is_floored_at_the_drain_tick() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+        let block_time_of = |argv: &[&str]| match parse(argv).expect("parses").op {
+            OpCmd::Init(args) => args.block_time_ms,
+            other => panic!("not an init: {other:?}"),
+        };
+
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo"]),
+            config::DEFAULT_BLOCK_TIME_MS
+        );
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo", "--block-time-ms", "100"]),
+            config::MIN_BLOCK_TIME_MS
+        );
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "99"]).is_err());
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "0"]).is_err());
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,
