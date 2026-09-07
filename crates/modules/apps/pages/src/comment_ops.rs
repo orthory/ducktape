@@ -431,11 +431,26 @@ impl Pages {
                 thread_id,
                 resolved,
             } => {
+                // WHO first, then WHAT, same rule as `MoveCommentThread`: the
+                // thread's opener may always resolve/re-open it, and so may
+                // anyone `may_edit` admits on the page that owns the thread's
+                // target block — a page editor cleaning up their own page's
+                // threads, not just the person who opened one.
                 let author = author_from_origin(origin)?;
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
+                let block = self
+                    .load_block(&thread.target)
+                    .await
+                    .map_err(|_| PageError::Corrupt)?
+                    .ok_or(PageError::Corrupt)?;
+                let may_resolve =
+                    thread.opener == author || self.may_edit(&block.page, &author).await?;
+                if !may_resolve {
+                    return Err(PageError::NotAuthor);
+                }
                 thread.resolved = resolved;
                 thread.resolved_by = if resolved { Some(author) } else { None };
                 self.store_thread(&thread)
