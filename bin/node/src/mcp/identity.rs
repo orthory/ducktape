@@ -16,15 +16,14 @@
 //! refusal comes back as the module's own words.
 //!
 //! a frame's origin is its verified public key. The endpoint accepts only
-//! `AgentAction` and `DelegateRun` for its exact run id, so its bearer token is
-//! not a general-purpose signer even if the child reads its environment.
+//! `RunsMsg::AgentAction` for its exact run id, so its bearer token is not a
+//! general-purpose signer even if the child reads its environment.
 //!
 //! READS are still gated here, against the committed caps (`forge_read`,
 //! `duckfs_read`) — they cross no consensus op to be checked by, and `/v1/query`
 //! is ambient to any local process anyway.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use runs::{CapRequest, ModelRecord};
 use serde_json::json;
@@ -37,7 +36,7 @@ pub const ENV_WORKSPACE: &str = "DUCKTAPE_RUN_WORKSPACE";
 pub const ENV_SKILLS: &str = "DUCKTAPE_RUN_SKILLS";
 pub const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
-/// the run this session is bound to — the `run_id` every `AgentAction` names.
+/// the run this session is bound to — the `run_id` every action names.
 pub const ENV_RUN_ID: &str = "DUCKTAPE_RUN_ID";
 const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
 const ENV_PROVIDER_CONTROL_TOKEN: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
@@ -74,8 +73,6 @@ pub struct Run {
     /// under its program account.
     action: Option<ActionControl>,
     provider_control: Option<ProviderControl>,
-    /// monotonic within the process — the tail of every minted id.
-    ids: AtomicU64,
 }
 
 impl Run {
@@ -92,7 +89,6 @@ impl Run {
             run_id: std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty()),
             action: ActionControl::from_env(),
             provider_control: ProviderControl::from_env(),
-            ids: AtomicU64::new(0),
         }
     }
 
@@ -102,44 +98,20 @@ impl Run {
         self.run_id.as_deref()
     }
 
-    /// Apply one action mid-run through this run's scoped host signer.
+    /// Propose one catalog action mid-run through this run's scoped host
+    /// signer, under the caller's idempotency key, and return its committed
+    /// receipt.
     ///
-    /// there is NO permission check here. the runs module makes it, on every
-    /// validator, against the agent's committed grant — and its refusal is what
-    /// comes back. a second gate in this process could only ever drift from the
-    /// one that actually decides.
-    pub fn act(&self, action: runs::AgentAction) -> Result<serde_json::Value> {
-        self.submit_runs(runs::RunsMsg::AgentAction {
-            run_id: self.run_id().unwrap_or_default().to_string(),
-            action,
-        })
-    }
-
-    pub fn delegate(
+    /// there is NO permission check here, and no decoding of the envelope. the
+    /// runs module makes both, on every validator, against the catalog it owns
+    /// and the agent's committed grant — and its refusal is what comes back. a
+    /// second gate in this process could only ever drift from the one that
+    /// actually decides.
+    pub fn act(
         &self,
         request_id: String,
-        request: runs::DelegationRequest,
+        action: runs::ActionEnvelope,
     ) -> Result<serde_json::Value> {
-        self.submit_runs(runs::RunsMsg::DelegateRun {
-            run_id: self.run_id().unwrap_or_default().to_string(),
-            request_id,
-            request,
-        })
-    }
-
-    pub fn delegations(&self) -> Result<serde_json::Value> {
-        let run_id = self.run_id().ok_or_else(|| {
-            NodeError::Rejected(format!(
-                "this server is not bound to a run ({ENV_RUN_ID} is unset)"
-            ))
-        })?;
-        self.node.query(
-            TARGET_RUNS,
-            json!({"delegations": {"caller_run_id": run_id}}),
-        )
-    }
-
-    fn submit_runs(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
         self.action
             .as_ref()
             .ok_or_else(|| {
@@ -147,7 +119,11 @@ impl Run {
                     "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset), so writing is refused"
                 ))
             })?
-            .submit(message)
+            .submit(runs::RunsMsg::AgentAction {
+                run_id: self.run_id().unwrap_or_default().to_string(),
+                request_id,
+                action,
+            })
     }
 
     /// Ask the host-local controller for more silent provider time. The model
@@ -254,28 +230,6 @@ impl Run {
                 describe(cap)
             ))
         })
-    }
-
-    /// a fresh id for a client-minted key (a chat message, a task, a pages
-    /// thread/comment). unique by construction within a process, and across
-    /// processes by the nanosecond stamp.
-    ///
-    /// deliberately NOT the runs module's deterministic derivation: those ids
-    /// must be identical on every replaying validator, because the op is minted
-    /// IN consensus. this op is minted host-side by one process and submitted
-    /// once, so it needs uniqueness, not reproducibility. a collision is not
-    /// silent — the module rejects a squatted id and the agent sees why.
-    // ponytail: nanos+counter, no hashing, no uuid dep. two servers minting in
-    // the same nanosecond on one node would collide; the module rejects that
-    // loudly rather than corrupting anything, and a real uuid is the upgrade if
-    // it ever actually happens.
-    pub fn mint(&self, kind: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let n = self.ids.fetch_add(1, Ordering::Relaxed);
-        format!("mcp/{kind}/{nanos:x}/{n}")
     }
 }
 
@@ -519,7 +473,6 @@ mod tests {
             run_id: Some(node),
             action: None,
             provider_control: None,
-            ids: AtomicU64::new(0),
         }
     }
 

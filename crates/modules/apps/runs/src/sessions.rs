@@ -16,16 +16,17 @@
 //! The lease holder opens the session. Only its bound signer may propose work,
 //! and a moved or expired lease fences subsequent proposals. Completed target
 //! outcomes remain reportable after the session or account authority changes.
-use super::pages_effects::is_pages_action;
-use super::response::is_duckfs_action;
+use super::action_requests::{Invocation, Prepared};
+use super::catalog::Operation;
+use super::response::ReplyPosts;
 use super::{
-    AgentAction, AgentResponse, AgentSession, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
+    ActionEnvelope, AgentResponse, AgentSession, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
-    MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, ModelStatus, Origin, RunAuthority, RunOrigin, RunsModule,
-    SESSION_KEY_LEN, SiblingReadBudget, delegated_run_id_for, delegation_id_for,
-    dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_source,
+    MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_DELEGATIONS_PER_RUN, ModelStatus,
+    Origin, PendingState, RunAuthority, RunOrigin, RunsModule, SESSION_KEY_LEN, SiblingReadBudget,
+    delegated_run_id_for, delegation_id_for, dispatch_decode_reply, dispatch_encode_query,
+    dispatch_id_for, page_source,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -103,61 +104,27 @@ impl RunsModule {
         Ok(())
     }
 
+    /// admit ONE live action, signed by the run's bound session key. the
+    /// caller's `request_id` is the idempotency key: a replay with the same
+    /// envelope bytes answers with the existing receipt, a replay with
+    /// different bytes is refused, and a fresh id stages exactly one proposal.
     pub(super) async fn agent_action(
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
-        action: AgentAction,
+        request_id: String,
+        envelope: ActionEnvelope,
     ) -> Result<(), Error> {
-        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
-            return Err(Error::Module("run is not in flight".into()));
-        };
-        let Some(session) = self.session(&run_id).cloned() else {
-            return Err(Error::Module("run session is not open".into()));
-        };
-        let generation = self.active_generation(&*ctx, entry.account).await?;
-        if generation != entry.generation {
-            return Err(Error::Module("run program authority changed".into()));
-        }
-        let mut effects = super::action_requests::EffectsCtx {
-            inner: ctx,
-            messages: Vec::new(),
-        };
-        self.prepare_agent_action(&mut effects, run_id.clone(), action)
-            .await?;
-        let [message]: [sdk::Msg; 1] =
-            std::mem::take(&mut effects.messages)
-                .try_into()
-                .map_err(|_| {
-                    Error::Module("one tool action must prepare exactly one target message".into())
-                })?;
-        let request_id = crate::action_request_id(&run_id, session.actions);
-        self.stage_action_request(
-            &entry,
-            request_id.clone(),
-            super::action_requests::RequestScope::Session {
-                lease: session.lease,
-            },
-            message,
-        )
-        .await?;
-        effects.inner.set_output(sdk::wire::encode(
-            &serde_json::json!({"request_id": request_id}),
-        ));
-        Ok(())
-    }
-
-    /// apply ONE agent action, signed by the run's bound session key.
-    async fn prepare_agent_action(
-        &mut self,
-        ctx: &mut dyn Ctx,
-        run_id: String,
-        action: AgentAction,
-    ) -> Result<(), Error> {
+        crate::validate_request_id(&request_id).map_err(Error::Module)?;
         let Origin::External(submitter) = &ctx.env().origin else {
             return Err(Error::Module(
                 "an agent action must be signed by the run's session key".into(),
             ));
+        };
+        // a settled run has no lease, no agent working, and nothing a session
+        // could legitimately write; the session map is pruned with it.
+        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
+            return Err(Error::Module(format!("run is not in flight: {run_id}")));
         };
         let Some(session) = self.session(&run_id).cloned() else {
             return Err(Error::Module(format!(
@@ -174,84 +141,43 @@ impl RunsModule {
             )));
         }
         self.session_holds_lease(&*ctx, &run_id, &session).await?;
-        // the session is pruned with its run, so a live session implies a live
-        // run — but the two are separate maps, and a check that costs nothing is
-        // cheaper than an invariant that only holds by argument.
-        let dispatch_id = dispatch_id_for(&run_id);
-        let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
-            return Err(Error::Module(format!("run is not in flight: {run_id}")));
-        };
+        let generation = self.active_generation(&*ctx, entry.account).await?;
+        if generation != entry.generation {
+            return Err(Error::Module("run program authority changed".into()));
+        }
+        let id = crate::action_request_id(&run_id, &request_id);
+        let envelope_digest = envelope.digest();
+        if let Some(existing) = self.action_request(&id).await? {
+            let same_bytes = existing
+                .invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.envelope_digest == envelope_digest);
+            if !same_bytes {
+                return Err(Error::Module(
+                    "request_id was already used for a different action".into(),
+                ));
+            }
+            ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
+            return Ok(());
+        }
         if session.actions >= MAX_ACTIONS_PER_SESSION {
             return Err(Error::Module(format!(
                 "session for run {run_id} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions"
             )));
         }
         let lane = Lane::Session(session.actions);
-
-        // THE SAME VALIDATOR the settle path runs, on a one-action response:
-        // grant + caps + every probe that keeps an emitted follow-up from being
-        // rejected by its target. a pages action passes through it untouched (the
-        // pages gate is its own, below); anything else is fully checked here.
-        let validated = self
-            .validate_response(
-                &*ctx,
-                &run_id,
-                &entry,
-                lane,
-                AgentResponse {
-                    reply_blocks: Vec::new(),
-                    actions: vec![action.clone()],
-                    commit_message: None,
-                },
-            )
-            .await
-            .map_err(Error::Module)?;
-
-        if is_pages_action(&action) {
-            let pages = self
-                .pages
-                .clone()
-                .ok_or_else(|| Error::Module("no pages module is configured".into()))?;
-            let agent = self
-                .agent_for_run(&*ctx, &entry)
-                .await
-                .map_err(Error::Module)?
-                .ok_or_else(|| {
-                    Error::Module(format!("agent is not registered: {}", entry.agent_id))
-                })?;
-            // THE SAME pages gate the settle path applies — grant, cap, target
-            // resolution, id safety, freshness probes — but its `Err` is
-            // returned to the submitter instead of degrading to a breadcrumb.
-            // `already_staged` is 0: this op emits exactly one follow-up, and a
-            // sibling op's comment is already visible to these probes (each root
-            // op's follow-ups drain before the next op executes).
-            let msg = self
-                .pages_action_msg(&*ctx, &pages, &agent, &run_id, &lane.slot(0), &action, 0)
-                .await
-                .map_err(Error::Module)?;
-            ctx.emit_msg(msg);
-        } else if is_duckfs_action(&action) {
-            let agent = self
-                .agent_for_run(&*ctx, &entry)
-                .await
-                .map_err(Error::Module)?
-                .ok_or_else(|| {
-                    Error::Module(format!("agent is not registered: {}", entry.agent_id))
-                })?;
-            // THE SAME duckfs gate the settle path applies — grant,
-            // shape/cap/permission, the per-path base probe — but its `Err` is
-            // returned to the submitter instead of degrading to a breadcrumb.
-            let msg = self
-                .duckfs_write_msg(&*ctx, &agent, &action)
-                .await
-                .map_err(Error::Module)?;
-            ctx.emit_msg(msg);
-        } else {
-            // Capture the prepared intent; the account program executes it later.
-            self.emit_response(ctx, &run_id, &entry, lane, validated)
-                .await;
-        }
-
+        let prepared = self
+            .prepare_agent_action(&*ctx, &run_id, &request_id, &entry, lane, &envelope)
+            .await?;
+        self.stage_action_request(
+            &entry,
+            id.clone(),
+            super::action_requests::RequestScope::Session {
+                lease: session.lease.clone(),
+            },
+            prepared,
+        )
+        .await?;
         // spend the budget. the counter is committed state: it is both the audit
         // record and the id salt the NEXT action mints from, so it must move on
         // every applied action and on no refused one (a refusal is an `Err`, and
@@ -263,79 +189,130 @@ impl RunsModule {
                 ..session
             }),
         );
+        ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
         Ok(())
     }
 
-    pub(super) async fn delegate_run(
-        &mut self,
-        ctx: &mut dyn Ctx,
-        run_id: String,
-        request_id: String,
-        request: DelegationRequest,
-        _budget: &SiblingReadBudget,
-    ) -> Result<(), Error> {
-        let Some(session) = self.session(&run_id).cloned() else {
-            return Err(Error::Module("run session closed".into()));
-        };
-        if ctx.env().origin != Origin::External(session.session_key.clone()) {
-            return Err(Error::Module(
-                "only the bound session key may propose delegation".into(),
-            ));
-        }
-        self.session_holds_lease(&*ctx, &run_id, &session).await?;
-        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
-            return Err(Error::Module("run is not in flight".into()));
-        };
-        let generation = self.active_generation(&*ctx, entry.account).await?;
-        if generation != entry.generation {
-            return Err(Error::Module("run program authority changed".into()));
-        }
-        if session.actions >= MAX_ACTIONS_PER_SESSION {
-            return Err(Error::Module("session action budget exhausted".into()));
-        }
-        if sdk::wire::encode(&request).len() > MAX_DELEGATIONS_BYTES {
-            return Err(Error::Module(
-                "delegation request exceeds the byte bound".into(),
-            ));
-        }
-        let id = crate::delegation_action_id(&run_id, &request_id);
-        let payload = crate::encode_msg(&crate::RunsMsg::ExecuteDelegation {
-            run_id: run_id.clone(),
-            request_id,
-            request,
-        });
-        if let Some(existing) = self.action_request(&id).await? {
-            let exact = existing.view.payload
-                == sdk::wire::decode::<serde_json::Value>(&payload).map_err(Error::Module)?;
-            if !exact {
-                return Err(Error::Module(
-                    "request_id was already used for a different agent call".into(),
-                ));
+    /// ONE live operation as the exact message the account's program will
+    /// execute. THE SAME VALIDATOR the settle path runs, on a one-action
+    /// response — grant, caps, lane admission and every probe that keeps an
+    /// emitted follow-up from being rejected by its target — followed by THE
+    /// SAME per-lane gate, except that every `Err` is returned to the
+    /// submitter instead of degrading to a breadcrumb.
+    async fn prepare_agent_action(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        request_id: &str,
+        entry: &PendingState,
+        lane: Lane,
+        envelope: &ActionEnvelope,
+    ) -> Result<Prepared, Error> {
+        let validated = self
+            .validate_response(
+                ctx,
+                run_id,
+                entry,
+                lane,
+                AgentResponse {
+                    reply_blocks: Vec::new(),
+                    actions: vec![envelope.clone()],
+                    commit_message: None,
+                },
+            )
+            .await
+            .map_err(Error::Module)?;
+        let [operation]: [Operation; 1] = validated
+            .operations
+            .try_into()
+            .map_err(|_| Error::Module("one action validates as one operation".into()))?;
+        let slot = lane.slot(0);
+        // `posts` starts empty: this op emits exactly one follow-up, and a
+        // sibling op's post is already committed and visible to the probes.
+        let mut posts = ReplyPosts::default();
+        let prepared = match &operation {
+            Operation::PagesComment { .. } | Operation::PagesSetChecked { .. } => {
+                let agent = self.registered_agent(ctx, entry).await?;
+                self.pages_operation_msg(ctx, &agent, entry, run_id, &slot, &operation, &mut posts)
+                    .await
             }
-            ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
-            return Ok(());
-        }
-        self.stage_action_request(
-            &entry,
-            id.clone(),
-            super::action_requests::RequestScope::Session {
-                lease: session.lease.clone(),
-            },
+            Operation::DuckfsWriteText { .. } => {
+                let agent = self.registered_agent(ctx, entry).await?;
+                self.duckfs_write_msg(ctx, &agent, &operation).await
+            }
+            Operation::AgentCall {
+                agent_id,
+                instruction,
+                skills,
+            } => Ok(self.agent_call_msg(run_id, request_id, agent_id, instruction, skills)),
+            Operation::Reply { .. }
+            | Operation::ChatPost { .. }
+            | Operation::JobsComment { .. }
+            | Operation::TasksCreate { .. }
+            | Operation::TasksUpdateStatus { .. } => {
+                self.conversational_msg(ctx, run_id, entry, &slot, &operation, &mut posts)
+                    .await
+            }
+            Operation::ModulesUpdate(_) => Err(format!(
+                "{} is not available in the {} lane",
+                operation.name(),
+                lane.kind_name()
+            )),
+        };
+        let mut prepared = prepared.map_err(Error::Module)?;
+        // the proposal is pinned to the operation's catalog schema and to the
+        // exact envelope bytes the caller's request_id now names.
+        prepared.receipt.invocation = Some(Invocation {
+            schema_digest: operation.schema_digest(),
+            envelope_digest: envelope.digest(),
+        });
+        Ok(prepared)
+    }
+
+    /// the run's agent, which every per-lane gate reads its grant and caps
+    /// from.
+    async fn registered_agent(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+    ) -> Result<super::ModelRecord, Error> {
+        self.agent_for_run(ctx, entry)
+            .await
+            .map_err(Error::Module)?
+            .ok_or_else(|| Error::Module(format!("agent is not registered: {}", entry.agent_id)))
+    }
+
+    /// an `agent.call` as the program call that starts the caller/callee
+    /// edge: runs calls itself under the account's program origin, where
+    /// `execute_delegation` re-checks the call against the live registry.
+    fn agent_call_msg(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        agent_id: &str,
+        instruction: &str,
+        skills: &[String],
+    ) -> Prepared {
+        let delegation_id = delegation_id_for(run_id, request_id);
+        Prepared::new(
             sdk::Msg {
                 target: self.id.clone(),
-                payload,
+                payload: crate::encode_msg(&crate::RunsMsg::ExecuteDelegation {
+                    run_id: run_id.into(),
+                    request_id: request_id.into(),
+                    request: DelegationRequest {
+                        agent_id: agent_id.into(),
+                        instruction: instruction.into(),
+                        skills: skills.to_vec(),
+                    },
+                }),
             },
-        )
-        .await?;
-        self.pending_sessions.insert(
-            run_id,
-            Some(AgentSession {
-                actions: session.actions + 1,
-                ..session
+            crate::OP_AGENT_CALL,
+            serde_json::json!({
+                "delegation_id": delegation_id,
+                "callee_agent_id": agent_id,
             }),
-        );
-        ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
-        Ok(())
+        )
     }
 
     /// Start one caller/callee edge while the caller is live. This deliberately
@@ -375,14 +352,7 @@ impl RunsModule {
                 "agent calls currently require a chat or Forge run".into(),
             ));
         }
-        if request_id.is_empty()
-            || request_id.len() > MAX_DELEGATION_REQUEST_ID_BYTES
-            || super::contains_run_separator(&request_id)
-        {
-            return Err(Error::Module(format!(
-                "request_id must be 1..={MAX_DELEGATION_REQUEST_ID_BYTES} bytes and contain no reserved separator"
-            )));
-        }
+        crate::validate_request_id(&request_id).map_err(Error::Module)?;
         let delegation_id = delegation_id_for(&run_id, &request_id);
         if let Some(existing) = self.delegation(&delegation_id) {
             return if existing.view.caller_run_id == run_id && existing.request == request {

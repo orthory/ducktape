@@ -180,17 +180,15 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                         "runs",
                         &runs::RunsMsg::AgentAction {
                             run_id: run.run_id.clone(),
-                            action: runs::AgentAction::SetPageChecked {
-                                block: "todo".into(),
-                                checked: true,
-                            },
+                            request_id: "tick".into(),
+                            action: set_page_checked("todo", true),
                         },
                     ),
                 )
                 .await;
             network.drain().await;
             let receipt = network
-                .action(&runs::action_request_id(&run.run_id, 0))
+                .action(&runs::action_request_id(&run.run_id, "tick"))
                 .await;
             assert!(
                 matches!(
@@ -222,10 +220,8 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                             "runs",
                             &runs::RunsMsg::AgentAction {
                                 run_id: run.run_id.clone(),
-                                action: runs::AgentAction::Reply {
-                                    text: text.into(),
-                                    destination: None,
-                                },
+                                request_id: text.into(),
+                                action: reply(text),
                             },
                         ),
                     )
@@ -401,20 +397,10 @@ fn a_comment_trigger_replies_in_its_thread_and_can_choose_another_destination() 
                 ),
             )
             .await;
-        for (text, destination) in [
-            ("Answering the comment.", None),
-            (
-                "Leaving a note on the todo.",
-                Some(runs::ReplyDestination::Page {
-                    target: "todo".into(),
-                }),
-            ),
-            (
-                "Back to the review.",
-                Some(runs::ReplyDestination::PageThread {
-                    thread_id: "review".into(),
-                }),
-            ),
+        for (request_id, action) in [
+            ("answer", reply("Answering the comment.")),
+            ("note", page_comment("todo", "Leaving a note on the todo.")),
+            ("back", page_thread_comment("review", "Back to the review.")),
         ] {
             network
                 .submit(
@@ -423,10 +409,8 @@ fn a_comment_trigger_replies_in_its_thread_and_can_choose_another_destination() 
                         "runs",
                         &runs::RunsMsg::AgentAction {
                             run_id: run.run_id.clone(),
-                            action: runs::AgentAction::Reply {
-                                text: text.into(),
-                                destination: destination.map(Into::into),
-                            },
+                            request_id: request_id.into(),
+                            action,
                         },
                     ),
                 )

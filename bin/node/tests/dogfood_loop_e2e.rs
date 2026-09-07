@@ -1,7 +1,7 @@
 //! Real-validator agent loop: issue mention, sandboxed work, host commit and
 //! push, program-authored progress and final replies, then a Forge PR.
 //!
-//! The scripted provider calls `ducktape_reply` through the real MCP server
+//! The scripted provider calls `ducktape_action` (`reply`) through the real MCP server
 //! inside Firecracker. It records the MCP receipt and its detached Git HEAD
 //! in the workspace; the test reads both from the host-pushed commit.
 //! Subsequent runs in the PR channel prove branch continuation and PR reuse.
@@ -108,7 +108,11 @@ impl DogfoodProvider {
             serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
             serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-                "name":"ducktape_reply","arguments":{"text":PROGRESS}
+                "name":"ducktape_action","arguments":{
+                    "operation":"reply",
+                    "input":{"content":[{"type":"text","text":PROGRESS}]},
+                    "request_id":"progress"
+                }
             }}),
         ]
         .map(|request| request.to_string())
@@ -141,7 +145,7 @@ fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP response"))
         .find(|response| response["id"] == 1)
-        .expect("the VM called ducktape_reply");
+        .expect("the VM called ducktape_action");
     assert_ne!(reply["result"]["isError"], true, "{reply}");
     assert!(reply.get("error").is_none(), "{reply}");
     let line = git_stdout(checkout, &["show", &format!("{commit}:{HEAD_FILE}")]);

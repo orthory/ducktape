@@ -1,232 +1,91 @@
-//! Each write tool proposes one action through its run's scoped host endpoint.
-//! Runs validates the session, lease and model grant. The account's program
-//! executes the prepared target message, and the endpoint waits for its committed
-//! outcome before returning. The private session signer stays on the host.
+//! The one write entry point. `ducktape_action` carries a catalog envelope —
+//! an operation name, an optional target, an input — and the caller's
+//! `request_id` through this run's scoped host endpoint. Runs decodes the
+//! envelope against the schemas it owns, validates the session, lease and model
+//! grant, and the account's program executes the prepared target message; the
+//! endpoint waits for the committed receipt before returning it. The private
+//! session signer stays on the host, and this binary interprets nothing: adding
+//! an operation to the runs catalog needs no change here.
 
 use serde_json::{Value, json};
 
-use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
-use tasks::TaskStatus;
+use runs::ActionEnvelope;
 
-use super::{Tool, arg_bool, arg_str, opt_u64, schema};
+use super::{Tool, arg_str};
 use crate::mcp::identity::Run;
 use crate::mcp::node::{NodeError, Result};
 
 pub(super) fn tools() -> Vec<Tool> {
-    vec![
-        Tool {
-            name: "ducktape_reply",
-            description: "Reply to this run's source as the agent's program account: a chat thread, \
-                          Pages block/comment thread, or job discussion. Omit destination to answer \
-                          where you were called; supply it to choose somewhere else. Chat replies \
-                          require chat.post; explicit chat destinations require chat.post_message. \
-                          Pages requires pages.comment and pages_write; jobs requires jobs.comment. \
-                          Use for progress, questions or updates during a live run.",
-            schema: reply_schema,
-            handler: reply,
-        },
-        Tool {
-            name: "ducktape_chat_post",
-            description: "Post a message to a chat channel. Use this to report progress or ask a \
-                          question while you work — you do not have to save everything for your \
-                          final answer. Requires the chat.post_message action.",
-            schema: || {
-                schema(&[
-                    ("channel_id", "string", true, "The channel to post in."),
-                    ("text", "string", true, "The message text."),
-                    (
-                        "thread",
-                        "integer",
-                        false,
-                        "The sequence number of a message to reply to, making this a thread reply.",
-                    ),
-                ])
-            },
-            handler: chat_post,
-        },
-        Tool {
-            name: "ducktape_task_create",
-            description: "Create a task. Requires the tasks.create action.",
-            schema: || schema(&[("title", "string", true, "The task title.")]),
-            handler: task_create,
-        },
-        Tool {
-            name: "ducktape_task_status",
-            description: "Move a task to open, in_progress, or done. Requires the \
-                          tasks.update_status action.",
-            schema: || {
-                schema(&[
-                    ("task_id", "string", true, "The task to move."),
-                    ("status", "string", true, "One of: open, in_progress, done."),
-                ])
-            },
-            handler: task_status,
-        },
-        Tool {
-            name: "ducktape_page_comment",
-            description: "Comment on a page or on one block of a page. The target is a page id \
-                          or a block id from ducktape_page. Requires the pages.comment action \
-                          and the owning page in your pages_write caps.",
-            schema: || {
-                schema(&[
-                    (
-                        "target",
-                        "string",
-                        true,
-                        "The page id or block id to anchor the comment to.",
-                    ),
-                    ("text", "string", true, "The comment text."),
-                ])
-            },
-            handler: page_comment,
-        },
-        Tool {
-            name: "ducktape_page_check",
-            description: "Tick or untick a todo block on a page. Requires the pages.set_checked \
-                          action and the owning page in your pages_write caps.",
-            schema: || {
-                schema(&[
-                    ("block_id", "string", true, "The todo block to flip."),
-                    ("checked", "boolean", true, "Whether the todo is done."),
-                ])
-            },
-            handler: page_check,
-        },
-        Tool {
-            name: "ducktape_duckfs_write_text",
-            description: "Write one small UTF-8 text file under a granted DuckFS prefix. Requires \
-                          the duckfs.write_text action and a duckfs_write prefix containing the \
-                          path. The tool fetches the current DuckFS refs head and signs it into \
-                          the action as the CAS base.",
-            schema: || {
-                schema(&[
-                    ("path", "string", true, "Absolute DuckFS path to write."),
-                    ("text", "string", true, "UTF-8 text content to write."),
-                ])
-            },
-            handler: duckfs_write_text,
-        },
-    ]
+    vec![Tool {
+        name: "ducktape_action",
+        description: "Propose one write as this run's program account. operation names an entry \
+                      of the catalog ducktape_actions lists (reply, chat.post_message, \
+                      tasks.create, tasks.update_status, pages.comment, pages.set_checked, \
+                      jobs.comment, duckfs.write_text, agent.call); target and input follow that \
+                      entry's schemas — reply takes no target and answers where this run was \
+                      called. request_id is your idempotency key within this run: the same id \
+                      with the same bytes returns the same receipt, the same id with different \
+                      bytes is refused. Ducktape validates the grant and caps on every \
+                      validator and returns the committed receipt; a refusal names what you \
+                      lack and does not become allowed on retry.",
+        schema: action_schema,
+        handler: action,
+    }]
 }
 
-fn reply_schema() -> Value {
-    let mut value = schema(&[("text", "string", true, "The reply text.")]);
-    value["properties"]["destination"] = json!({
+fn action_schema() -> Value {
+    json!({
         "type": "object",
-        "description": "Omit to answer the source. Otherwise supply kind and its coordinates: chat (channel_id, optional thread), page (target), page_thread (thread_id), or job (job_id). Runs validates the destination and its grant.",
-        "properties": {"kind": {"type":"string"}},
-        "required": ["kind"],
-        "additionalProperties": true
-    });
-    value
+        "properties": {
+            "operation": {
+                "type": "string",
+                "description": "A catalog operation name from ducktape_actions.",
+            },
+            "target": {
+                "type": "object",
+                "description": "The destination the operation acts on, per its catalog target schema. Omit for operations that take none.",
+            },
+            "input": {
+                "type": "object",
+                "description": "The operation's input, per its catalog input schema.",
+            },
+            "request_id": {
+                "type": "string",
+                "description": "Your idempotency key for this write within the run.",
+            },
+        },
+        "required": ["operation", "input", "request_id"],
+        "additionalProperties": false,
+    })
 }
 
-fn reply_destination(args: &Value) -> Result<Option<Value>> {
-    let Some(destination) = args.get("destination") else {
-        return Ok(None);
+/// The envelope exactly as the caller shaped it. Nothing is decoded here: the
+/// catalog is the module's, and its refusal names the field it could not read.
+fn envelope(args: &Value) -> Result<ActionEnvelope> {
+    let operation = arg_str(args, "operation")?;
+    let target = match args.get("target") {
+        None | Some(Value::Null) => None,
+        Some(target @ Value::Object(_)) => Some(target.clone()),
+        Some(_) => {
+            return Err(NodeError::Rejected(
+                "this tool needs an object \"target\" argument when one is given".into(),
+            ));
+        }
     };
-    let shaped = destination.is_object() && destination.get("kind").is_some_and(Value::is_string);
-    if !shaped {
-        return Err(NodeError::Rejected(
-            "reply destination needs an object with a string kind".into(),
-        ));
-    }
-    Ok(Some(destination.clone()))
+    let input = match args.get("input") {
+        Some(input @ Value::Object(_)) => input.clone(),
+        _ => {
+            return Err(NodeError::Rejected(
+                "this tool needs an object \"input\" argument".into(),
+            ));
+        }
+    };
+    Ok(ActionEnvelope::new(operation, target, input))
 }
 
-fn reply(run: &Run, args: &Value) -> Result<Value> {
-    run.act(AgentAction::Reply {
-        text: arg_str(args, "text")?,
-        destination: reply_destination(args)?,
-    })
-}
-
-fn chat_post(run: &Run, args: &Value) -> Result<Value> {
-    run.act(AgentAction::PostMessage {
-        channel_id: arg_str(args, "channel_id")?,
-        text: arg_str(args, "text")?,
-        thread: opt_u64(args, "thread"),
-    })
-}
-
-fn task_create(run: &Run, args: &Value) -> Result<Value> {
-    // the task id is the ONE id the agent supplies: `AgentAction::CreateTask`
-    // carries it in the payload (the response path has the model invent it), so
-    // unlike the pages/chat ids — which runs derives deterministically in
-    // consensus — this one is minted host-side and rides the committed op as
-    // plain data. every validator sees the same bytes, so determinism holds.
-    let task_id = run.mint("task");
-    run.act(AgentAction::CreateTask {
-        task_id: task_id.clone(),
-        title: arg_str(args, "title")?,
-    })?;
-    // hand the id back: it is the only thing the agent cannot derive itself, and
-    // ducktape_task_status needs it.
-    Ok(json!({"task_id": task_id}))
-}
-
-fn task_status(run: &Run, args: &Value) -> Result<Value> {
-    let status = task_status_of(&arg_str(args, "status")?)?;
-    run.act(AgentAction::UpdateTaskStatus {
-        task_id: arg_str(args, "task_id")?,
-        // the wire name of a `tasks::TaskStatus` — parsed here purely so a
-        // near-miss ("Done") is answered with the three real names instead of
-        // burning a consensus round-trip to be told the same thing.
-        status: status_wire_name(status).to_string(),
-    })
-}
-
-fn page_comment(run: &Run, args: &Value) -> Result<Value> {
-    run.act(AgentAction::AddPageComment {
-        target: arg_str(args, "target")?,
-        body: arg_str(args, "text")?,
-    })
-}
-
-fn page_check(run: &Run, args: &Value) -> Result<Value> {
-    run.act(AgentAction::SetPageChecked {
-        block: arg_str(args, "block_id")?,
-        checked: arg_bool(args, "checked")?,
-    })
-}
-
-fn duckfs_write_text(run: &Run, args: &Value) -> Result<Value> {
-    let path = arg_str(args, "path")?;
-    let text = arg_str(args, "text")?;
-    if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
-        return Err(NodeError::Rejected(format!(
-            "text is {} bytes; the cap is {MAX_DUCKFS_WRITE_TEXT_BYTES}",
-            text.len()
-        )));
-    }
-    let refs = run.node.files("refs", &[])?;
-    let base_snapshot = refs.get("head").and_then(Value::as_str).map(str::to_string);
-    run.act(AgentAction::DuckfsWriteText {
-        path,
-        text,
-        base_snapshot,
-    })
-}
-
-fn task_status_of(status: &str) -> Result<TaskStatus> {
-    match status {
-        "open" => Ok(TaskStatus::Open),
-        "in_progress" => Ok(TaskStatus::InProgress),
-        "done" => Ok(TaskStatus::Done),
-        other => Err(NodeError::Rejected(format!(
-            "{other:?} is not a task status; use open, in_progress, or done"
-        ))),
-    }
-}
-
-/// the wire name `tasks::TaskStatus` serializes to — the string
-/// `AgentAction::UpdateTaskStatus` carries.
-fn status_wire_name(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Open => "open",
-        TaskStatus::InProgress => "in_progress",
-        TaskStatus::Done => "done",
-    }
+fn action(run: &Run, args: &Value) -> Result<Value> {
+    let request_id = arg_str(args, "request_id")?;
+    run.act(request_id, envelope(args)?)
 }
 
 #[cfg(test)]
@@ -234,89 +93,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_host_preserves_destinations_for_the_module_to_interpret() {
-        assert_eq!(reply_destination(&json!({"text":"hello"})).unwrap(), None);
-        // A newer module can accept this without a tool-binary update.
-        let destination = json!({"kind":"future_source","object":"item","coordinates":{"part":3}});
+    fn the_envelope_is_carried_opaque_with_an_optional_target() {
+        let with_target = envelope(&json!({
+            "operation": "chat.post_message",
+            "target": {"channel_id": "general", "thread": 3},
+            "input": {"content": [{"type": "text", "text": "hi"}]},
+            "request_id": "r1",
+        }))
+        .unwrap();
+        assert_eq!(with_target.operation, "chat.post_message");
         assert_eq!(
-            reply_destination(&json!({"destination":destination.clone()})).unwrap(),
-            Some(destination)
+            with_target.target,
+            Some(json!({"channel_id": "general", "thread": 3}))
         );
-        for destination in [json!(null), json!([]), json!({"kind":1})] {
-            assert!(reply_destination(&json!({"destination":destination})).is_err());
-        }
+        // an operation this binary has never heard of still travels: the
+        // catalog that decides is the module's.
+        let unknown = envelope(&json!({
+            "operation": "future.op",
+            "input": {"anything": true},
+            "request_id": "r2",
+        }))
+        .unwrap();
+        assert_eq!(unknown.target, None);
+        assert_eq!(unknown.input, json!({"anything": true}));
     }
 
     #[test]
-    fn task_status_parses_exactly_the_three_wire_names() {
-        assert_eq!(task_status_of("open").unwrap(), TaskStatus::Open);
-        assert_eq!(
-            task_status_of("in_progress").unwrap(),
-            TaskStatus::InProgress
-        );
-        assert_eq!(task_status_of("done").unwrap(), TaskStatus::Done);
-        let err = task_status_of("Done").unwrap_err();
-        assert!(
-            matches!(&err, NodeError::Rejected(m) if m.contains("open, in_progress, or done")),
-            "a near-miss must say what the three names are, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn the_status_wire_names_round_trip_through_the_action() {
-        // the action carries the status as a STRING, and tasks decodes it back
-        // into its own enum. if these two names ever drift, an agent's
-        // "done" silently becomes a rejected op — so pin the round trip.
-        for (name, status) in [
-            ("open", TaskStatus::Open),
-            ("in_progress", TaskStatus::InProgress),
-            ("done", TaskStatus::Done),
+    fn malformed_arguments_are_refused_by_name() {
+        for (args, needle) in [
+            (json!({"input": {}, "request_id": "r"}), "operation"),
+            (json!({"operation": "reply", "request_id": "r"}), "input"),
+            (
+                json!({"operation": "reply", "input": {}, "target": "general", "request_id": "r"}),
+                "target",
+            ),
         ] {
-            assert_eq!(status_wire_name(task_status_of(name).unwrap()), name);
-            assert_eq!(
-                serde_json::to_value(status).unwrap(),
-                Value::String(name.into()),
-                "the tasks module's own wire name must match"
-            );
-        }
-    }
-
-    #[test]
-    fn every_write_tool_maps_to_a_known_action() {
-        // the invariant the whole plane rests on: the tools are not a second,
-        // wider permission vocabulary than the one an owner grants and consensus
-        // enforces. every KNOWN_ACTION that an agent can *invoke* has a tool, and
-        // every tool names its action so a denied agent can say what it lacks.
-        //
-        // Module deployment requires the committed output produced at run end.
-        let described: Vec<&str> = tools().iter().map(|t| t.description).collect();
-        for action in runs::KNOWN_ACTIONS {
-            let final_only = matches!(action, runs::ACTION_MODULES_UPDATE);
-            if final_only {
-                assert!(
-                    !described
-                        .iter()
-                        .any(|description| description.contains(&format!("{action} ")))
-                );
-                continue;
-            }
+            let error = envelope(&args).unwrap_err();
             assert!(
-                described.iter().any(|d| d.contains(action)),
-                "no write tool is gated on the {action} action — either the tool is missing or \
-                 the plane has drifted from KNOWN_ACTIONS"
+                matches!(&error, NodeError::Rejected(m) if m.contains(needle)),
+                "{args} -> {error:?}"
             );
         }
+        let error = action(&Run::from_env(), &json!({"operation": "reply", "input": {}})).unwrap_err();
+        assert!(matches!(&error, NodeError::Rejected(m) if m.contains("request_id")));
     }
 
     #[test]
-    fn chat_post_requires_the_wider_grant_not_the_reply_grant() {
-        // the escalation guard, asserted at the tool surface: holding chat.post
-        // ("you may answer me") must NOT be what unlocks posting into arbitrary
-        // channels. that is chat.post_message, and an owner has to grant it.
-        let chat = tools()
-            .into_iter()
-            .find(|t| t.name == "ducktape_chat_post")
-            .expect("the chat tool");
-        assert!(chat.description.contains(runs::ACTION_CHAT_POST_MESSAGE));
+    fn the_schema_requires_exactly_the_envelope_and_its_key() {
+        let schema = action_schema();
+        assert_eq!(
+            schema["required"],
+            json!(["operation", "input", "request_id"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["target"]["type"], "object");
+        // the operation is free text on purpose: an enum here would be a second
+        // catalog that drifts from the one consensus enforces.
+        assert!(schema["properties"]["operation"].get("enum").is_none());
     }
 }

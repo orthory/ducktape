@@ -8,9 +8,7 @@ use support::*;
 fn response(task: Option<&str>) -> Vec<u8> {
     let response = runs::AgentResponse {
         reply_blocks: Vec::new(),
-        actions: task.into_iter().map(|id| runs::AgentAction::CreateTask {
-            task_id: id.into(), title: "From model result".into(),
-        }).collect(),
+        actions: task.into_iter().map(|id| create_task(id, "From model result")).collect(),
         commit_message: None,
     };
     sdk::wire::encode(&serde_json::json!({
@@ -195,10 +193,8 @@ fn job_runs_post_live_and_final_replies_under_the_program_account() {
                     "runs",
                     &runs::RunsMsg::AgentAction {
                         run_id: run.run_id.clone(),
-                        action: runs::AgentAction::Reply {
-                            text: "Working on this job.".into(),
-                            destination: None,
-                        },
+                        request_id: "progress".into(),
+                        action: reply("Working on this job."),
                     },
                 ),
             )
