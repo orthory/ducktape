@@ -586,6 +586,12 @@ pub enum ReplyDestination {
     },
 }
 
+impl From<ReplyDestination> for serde_json::Value {
+    fn from(destination: ReplyDestination) -> Self {
+        serde_json::to_value(destination).expect("reply destinations serialize")
+    }
+}
+
 impl ReplyDestination {
     /// Explicit chat destinations require the wider posting grant.
     pub fn required_action(&self) -> &'static str {
@@ -606,7 +612,8 @@ pub enum AgentAction {
     Reply {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        destination: Option<ReplyDestination>,
+        /// Interpreted by the replaceable Runs module, not the host tool binary.
+        destination: Option<serde_json::Value>,
     },
     /// Result-only: paths are resolved in the run's host-pushed forge commit.
     UpdateModule(crate::ModuleUpdateSpec),

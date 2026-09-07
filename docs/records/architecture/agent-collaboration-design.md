@@ -81,7 +81,10 @@ or the job discussion. Live, final and failure replies use the same resolver
 and execute as the program account. An action-only final response keeps its
 actions without inventing another source reply.
 
-An explicit destination selects `chat` (channel_id, optional thread), `page`
+The host forwards the destination object without decoding a modality enum.
+Runs owns its schema, resolution and permission checks, so a module can add a
+destination without changing the executor or the tool binary. The current
+module accepts `chat` (channel_id, optional thread), `page`
 (target), `page_thread` (thread_id), or `job` (job_id). Source chat replies require
 `chat.post`; explicit chat destinations require `chat.post_message`. Pages
 replies require `pages.comment` and the owning page in `pages_write`. Job replies

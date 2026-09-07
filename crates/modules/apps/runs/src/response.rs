@@ -932,11 +932,12 @@ impl RunsModule {
         entry: &PendingState,
         slot: &str,
         blocks: &[ReplyBlock],
-        destination: Option<&ReplyDestination>,
+        destination: Option<&serde_json::Value>,
         posts: &mut ReplyPosts,
     ) -> Result<Msg, String> {
         let resolved = match destination {
-            Some(destination) => destination.clone(),
+            Some(destination) => serde_json::from_value::<ReplyDestination>(destination.clone())
+                .map_err(|error| format!("invalid reply destination: {error}"))?,
             None => entry.reply_destination()?,
         };
         let agent = self

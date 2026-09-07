@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES, ReplyDestination};
+use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use tasks::TaskStatus;
 
 use super::{Tool, arg_bool, arg_str, opt_u64, schema};
@@ -112,24 +112,26 @@ pub(super) fn tools() -> Vec<Tool> {
 fn reply_schema() -> Value {
     let mut value = schema(&[("text", "string", true, "The reply text.")]);
     value["properties"]["destination"] = json!({
-        "description": "Omit to reply to the committed source; set to choose a destination.",
-        "oneOf": [
-            {"type":"object","properties":{"kind":{"const":"chat"},"channel_id":{"type":"string"},"thread":{"type":"integer","minimum":1}},"required":["kind","channel_id"],"additionalProperties":false},
-            {"type":"object","properties":{"kind":{"const":"page"},"target":{"type":"string"}},"required":["kind","target"],"additionalProperties":false},
-            {"type":"object","properties":{"kind":{"const":"page_thread"},"thread_id":{"type":"string"}},"required":["kind","thread_id"],"additionalProperties":false},
-            {"type":"object","properties":{"kind":{"const":"job"},"job_id":{"type":"string"}},"required":["kind","job_id"],"additionalProperties":false}
-        ]
+        "type": "object",
+        "description": "Omit to answer the source. Otherwise supply kind and its coordinates: chat (channel_id, optional thread), page (target), page_thread (thread_id), or job (job_id). Runs validates the destination and its grant.",
+        "properties": {"kind": {"type":"string"}},
+        "required": ["kind"],
+        "additionalProperties": true
     });
     value
 }
 
-fn reply_destination(args: &Value) -> Result<Option<ReplyDestination>> {
+fn reply_destination(args: &Value) -> Result<Option<Value>> {
     let Some(destination) = args.get("destination") else {
         return Ok(None);
     };
-    serde_json::from_value(destination.clone())
-        .map(Some)
-        .map_err(|error| NodeError::Rejected(format!("invalid reply destination: {error}")))
+    let shaped = destination.is_object() && destination.get("kind").is_some_and(Value::is_string);
+    if !shaped {
+        return Err(NodeError::Rejected(
+            "reply destination needs an object with a string kind".into(),
+        ));
+    }
+    Ok(Some(destination.clone()))
 }
 
 fn reply(run: &Run, args: &Value) -> Result<Value> {
@@ -232,24 +234,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reply_destinations_are_typed_and_cannot_supply_an_author() {
+    fn the_host_preserves_destinations_for_the_module_to_interpret() {
         assert_eq!(reply_destination(&json!({"text":"hello"})).unwrap(), None);
-        for destination in [
-            json!({"kind":"chat","channel_id":"general","thread":1}),
-            json!({"kind":"page","target":"spec"}),
-            json!({"kind":"page_thread","thread_id":"review"}),
-            json!({"kind":"job","job_id":"build"}),
-        ] {
-            let parsed = reply_destination(&json!({"destination":destination.clone()}))
-                .unwrap()
-                .unwrap();
-            assert_eq!(serde_json::to_value(parsed).unwrap(), destination);
-        }
-        for destination in [
-            json!({"kind":"chat","channel_id":"general","author":1}),
-            json!({"kind":"job","thread_id":"wrong"}),
-            json!({"kind":"missing"}),
-        ] {
+        // A newer module can accept this without a tool-binary update.
+        let destination = json!({"kind":"future_source","object":"item","coordinates":{"part":3}});
+        assert_eq!(
+            reply_destination(&json!({"destination":destination.clone()})).unwrap(),
+            Some(destination)
+        );
+        for destination in [json!(null), json!([]), json!({"kind":1})] {
             assert!(reply_destination(&json!({"destination":destination})).is_err());
         }
     }

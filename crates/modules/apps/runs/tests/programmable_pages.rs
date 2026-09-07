@@ -425,7 +425,7 @@ fn a_comment_trigger_replies_in_its_thread_and_can_choose_another_destination() 
                             run_id: run.run_id.clone(),
                             action: runs::AgentAction::Reply {
                                 text: text.into(),
-                                destination,
+                                destination: destination.map(Into::into),
                             },
                         },
                     ),

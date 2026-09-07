@@ -1378,7 +1378,7 @@ fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
                 &run,
                 AgentAction::Reply {
                     text: "hello".into(),
-                    destination: Some(destination),
+                    destination: Some(destination.into()),
                 },
             ),
         )
@@ -1398,9 +1398,12 @@ fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
             &run,
             AgentAction::Reply {
                 text: "hello".into(),
-                destination: Some(crate::ReplyDestination::Page {
-                    target: "b-p".into(),
-                }),
+                destination: Some(
+                    crate::ReplyDestination::Page {
+                        target: "b-p".into(),
+                    }
+                    .into(),
+                ),
             },
         ),
     )
@@ -1421,9 +1424,12 @@ fn a_reply_batch_counts_page_comments_before_emitting_any() {
         .with_page_thread(thread);
     let reply = AgentAction::Reply {
         text: "hello".into(),
-        destination: Some(crate::ReplyDestination::PageThread {
-            thread_id: "review".into(),
-        }),
+        destination: Some(
+            crate::ReplyDestination::PageThread {
+                thread_id: "review".into(),
+            }
+            .into(),
+        ),
     };
     let entry = m.pending_entry(&dispatch_id_for(&run)).unwrap();
     let response = AgentResponse {
@@ -1435,4 +1441,33 @@ fn a_reply_batch_counts_page_comments_before_emitting_any() {
         block_on(m.validate_response(&ctx, &run, entry, Lane::Settle, response)).unwrap_err();
     assert!(error.contains("thread is full"), "{error}");
     assert!(ctx.page_msgs().is_empty());
+}
+
+#[test]
+fn reply_destination_validation_stays_in_the_module() {
+    for destination in [
+        serde_json::json!({"kind":"chat", "channel_id":"general", "author":1}),
+        serde_json::json!({"kind":"job", "thread_id":"wrong"}),
+        serde_json::json!({"kind":"unknown"}),
+    ] {
+        let (mut m, registry, run) = with_open_session(&crate::KNOWN_ACTIONS, &["*"]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                    destination: Some(destination),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("invalid reply destination"));
+        assert_eq!(sessions(&m)[0].actions, 0);
+        assert!(
+            ctx.chat_msgs().is_empty() && ctx.page_msgs().is_empty() && ctx.job_msgs().is_empty()
+        );
+    }
 }
