@@ -1875,11 +1875,26 @@ where
         // shared past the `&mut self` journal borrows below (see the field doc).
         let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
+        // the disk cohort: per-block-durable substrates, which recover
+        // themselves by reopening their own store (see the forward pre-scan
+        // below). read once — the seed and the pre-scan must agree on it.
+        let disk_cohort = host.block_durable_ids();
         // a module the composer adopted EMPTY (admitted after the checkpoint,
         // so the manifest never captured it) has no root above; its pre-root
         // is what it holds right now, so the block that activates it — and
         // may carry its first op — is found `at_pre`, never torn.
+        //
+        // that premise holds ONLY for the in-memory cohort. a per-block-durable
+        // module's seat is never empty: it reopens its own canonical store,
+        // already at the crash tip's root. seeding THAT as its pre-root makes
+        // the activating block look `at_pre`, and the torn branch would
+        // re-commit the block into a store that already holds it — moving its
+        // op-log root and fail-stopping the boot at the final recompose. so the
+        // disk cohort is left UNSEEDED here and placed by its own durable floor.
         for (id, root) in host.module_roots() {
+            if disk_cohort.contains(&id) {
+                continue;
+            }
             expected.entry(id).or_insert(root);
         }
         let mut tip_height: Option<u64> = manifest.height;
@@ -1928,7 +1943,6 @@ where
         // recovery never heals from a nearest/approximate record. a mis-read
         // root could only mis-seed a floor and trip the final root-hash
         // recompose (fail-stop), never fork.
-        let disk_cohort = host.block_durable_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
         if !disk_cohort.is_empty() {
             for record in &records {
