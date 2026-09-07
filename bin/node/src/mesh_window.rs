@@ -257,6 +257,7 @@ mod tests {
             signer,
             b"depth-pin",
             "127.0.0.1:0".parse().unwrap(),
+            crate::constants::MAX_PEERS_PER_SET,
             1 << 20,
         );
         assert_eq!(

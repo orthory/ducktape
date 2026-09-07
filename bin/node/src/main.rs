@@ -84,6 +84,7 @@ mod known_nodes;
 mod main_tests;
 mod mcp;
 mod mesh_book;
+mod mesh_lanes;
 mod mesh_window;
 mod module_cli;
 mod netstack_governance;

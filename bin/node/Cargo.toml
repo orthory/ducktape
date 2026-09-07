@@ -146,6 +146,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
+# `Unreliable<Feedback>` is the return type of commonware-p2p's `CheckedSender::send`,
+# which `mesh_lanes`'s epoch-stamping sender wraps.
+commonware-actor = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-codec = { workspace = true }

@@ -130,7 +130,7 @@ impl Module for ResolverBackedModule {
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::ResolverBacked {
             backend: "qmdb".into(),
-            detail: "requires a manifest-pinned sync target plus DbResolver".into(),
+            detail: "requires a manifest-pinned sync target plus a sync Source".into(),
         })
     }
 
@@ -211,7 +211,7 @@ fn snapshot_capture_uses_the_finalized_root_hash_boundary() {
             resolver.state_sync,
             StateSyncHandle::ResolverBacked {
                 backend: "qmdb".into(),
-                detail: "requires a manifest-pinned sync target plus DbResolver".into(),
+                detail: "requires a manifest-pinned sync target plus a sync Source".into(),
             },
         );
         assert!(

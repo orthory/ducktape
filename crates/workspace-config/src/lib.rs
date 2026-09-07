@@ -361,7 +361,7 @@ impl NetworkDescriptor {
         hasher.update(self.genesis.trim().to_ascii_lowercase().as_bytes());
         hasher.update(b"\nblock_time_ms=");
         hasher.update(self.block_time_ms.to_string().as_bytes());
-        let digest = hasher.finalize();
+        let (_, digest) = hasher.finalize();
         // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
         // admitted key that leaves the fingerprint unchanged, resurrecting
         // the silent stale-descriptor fork this exists to prevent).

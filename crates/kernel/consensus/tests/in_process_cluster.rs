@@ -101,7 +101,7 @@ fn full_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
-        success_rate: 1.0,
+        success_rate: commonware_utils::probability!(1.0),
     }
 }
 
@@ -132,6 +132,7 @@ async fn build_cluster(
         simulated::Config {
             max_size: 1024 * 1024,
             disconnect_on_block: true,
+            max_peers_per_set: NZUsize!(32),
             tracked_peer_sets: NZUsize!(1),
         },
         participants.clone(),
@@ -142,7 +143,7 @@ async fn build_cluster(
     // register each validator's mesh carrier: the sim arm bundles the five channel
     // pairs (vote/cert/resolver/payload/fetch) + the oracle's provider/blocker,
     // registered up front (before any engine starts) exactly as the production boot
-    // path pre-registers its channel bank.
+    // path registers its five fixed engine lanes.
     let quota = Quota::per_second(NZU32!(128));
     let mut carriers: HashMap<ed25519::PublicKey, SimMesh<deterministic::Context>> = HashMap::new();
     for v in participants.iter() {

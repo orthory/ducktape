@@ -111,8 +111,7 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        bank_base,
-        channel_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_tx,
@@ -158,9 +157,7 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        // mutable for the boot catch-up below: a re-bootstrap blackholes the
-        // bank below the boundary's epoch before the engine seats on it.
-        mut channel_bank,
+        lanes,
         gateway_book,
         blob_peers,
         blob_client,
@@ -194,8 +191,7 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        bank_base,
-        channel_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_rx,
@@ -290,7 +286,6 @@ pub(crate) async fn run_validator(
         &context,
         &index,
         &mut recovery,
-        &mut channel_bank,
         &metrics,
         &signer,
         &namespace,
@@ -309,7 +304,7 @@ pub(crate) async fn run_validator(
         signer.clone(),
         namespace.clone(),
         label.clone(),
-        channel_bank,
+        lanes,
         cadence,
     );
     // with the serve lane wired, realize code-registry swaps through the
@@ -483,9 +478,7 @@ pub(crate) async fn run_promoted(
     use commonware_codec::DecodeExt as _;
     use commonware_utils::ordered::Set;
 
-    use crate::constants::{
-        BLOB_FETCH_ATTEMPTS, CUTOVER_DELAY, EPOCH_CHANNEL_BANK, MAX_MODULE_CODE_BYTES,
-    };
+    use crate::constants::{BLOB_FETCH_ATTEMPTS, CUTOVER_DELAY, MAX_MODULE_CODE_BYTES};
     use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
     use crate::util::fatal;
 
@@ -500,7 +493,7 @@ pub(crate) async fn run_promoted(
         participants: participant_bytes,
         residents: resident_bytes,
         floor,
-        mut lane_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_tx,
@@ -555,15 +548,6 @@ pub(crate) async fn run_promoted(
     // travels in the baton), and the run loop's drain syncs the window
     // every pass from here on.
     let mesh_oracle = oracle.clone();
-    if !lane_bank.covers(epoch) {
-        fatal!(
-            label,
-            "seat epoch {epoch} is outside the pre-registered lane bank \
-             ({EPOCH_CHANNEL_BANK}) — restart; boot re-banks from the \
-             promotion checkpoint"
-        );
-    }
-    lane_bank.blackhole_below(epoch, &context);
 
     // the validator-only serve lanes over the reclaimed sync channel: the
     // statesync server (joiners sync from this node now) and the blob
@@ -738,15 +722,17 @@ pub(crate) async fn run_promoted(
         ),
     ));
 
-    // THE SEAT: the engine over the seat epoch's claimed lanes, wrapped
-    // around the carried host + journal at the promotion boundary.
+    // THE SEAT: the engine over the five fixed lanes, retargeted at the seat
+    // epoch, wrapped around the carried host + journal at the promotion
+    // boundary. The parked drains that fed the fold driver end here — the
+    // retarget drops their mailboxes.
     let mut epoch_spawner = engine::EpochSpawner::new(
         &context,
         oracle,
         signer.clone(),
         namespace.clone(),
         label.clone(),
-        lane_bank,
+        lanes,
         cadence,
     );
     let floor_bytes = floor
@@ -852,7 +838,7 @@ pub(crate) async fn run_promoted(
     .await;
 }
 
-type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
+pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
 pub(crate) type MeshSender = commonware_p2p::authenticated::lookup::Sender<
     commonware_cryptography::ed25519::PublicKey,
     OverlayCtx,
@@ -860,99 +846,6 @@ pub(crate) type MeshSender = commonware_p2p::authenticated::lookup::Sender<
 pub(crate) type MeshReceiver =
     commonware_p2p::authenticated::lookup::Receiver<commonware_cryptography::ed25519::PublicKey>;
 pub(crate) type MeshChannel = (MeshSender, MeshReceiver);
-pub(crate) type EpochChannels = (
-    MeshChannel,
-    MeshChannel,
-    MeshChannel,
-    MeshChannel,
-    MeshChannel,
-);
-
-/// one engine lane whose receiver is currently owned by a parked drainer
-/// task: `stop` revokes the drainer, which hands the receiver back over
-/// `handback`. the sender was never given away — it rides here.
-pub(crate) struct ReclaimableLane {
-    pub(crate) tx: MeshSender,
-    pub(crate) stop: futures::channel::oneshot::Sender<()>,
-    pub(crate) handback: futures::channel::oneshot::Receiver<MeshReceiver>,
-}
-
-impl ReclaimableLane {
-    /// own `lane` behind a revocable drainer task: every received frame is
-    /// handed to `on_frame` (an unread lane would jam its peer connection),
-    /// until a claim revokes the drainer and takes the lane back for an
-    /// engine. the task exits silently on mesh shutdown — a claim can never
-    /// follow that, the process is already unwinding.
-    pub(crate) fn drain(
-        context: &commonware_runtime::tokio::Context,
-        kind: &str,
-        channel: u64,
-        lane: MeshChannel,
-        mut on_frame: impl FnMut(Vec<u8>) + Send + 'static,
-    ) -> Self {
-        use commonware_p2p::Receiver as _;
-        use commonware_runtime::{Spawner as _, Supervisor as _};
-        use futures::FutureExt as _;
-        let (tx, mut rx) = lane;
-        let (stop_tx, mut stop_rx) = futures::channel::oneshot::channel::<()>();
-        let (handback_tx, handback_rx) = futures::channel::oneshot::channel();
-        let label: &'static str = Box::leak(format!("{kind}_{channel}").into_boxed_str());
-        context.child(label).spawn(move |_ctx| async move {
-            loop {
-                futures::select_biased! {
-                    _ = stop_rx => {
-                        let _ = handback_tx.send(rx);
-                        return;
-                    }
-                    frame = rx.recv().fuse() => {
-                        let Ok((_peer, msg)) = frame else { return };
-                        on_frame(msg.into());
-                    }
-                }
-            }
-        });
-        Self {
-            tx,
-            stop: stop_tx,
-            handback: handback_rx,
-        }
-    }
-
-    /// revoke the drainer and take the lane. the drainer's in-flight
-    /// `recv()` future is dropped when the stop wins its select — an eaten
-    /// frame there is covered by the lanes' own loss tolerance (a shed cert
-    /// re-anchors off the next one's parent linkage, a shed payload
-    /// backfills over the Frames lane, votes rebroadcast per view).
-    async fn claim(self) -> MeshChannel {
-        let ReclaimableLane { tx, stop, handback } = self;
-        let _ = stop.send(());
-        let rx = handback
-            .await
-            .expect("a revoked lane drainer hands its receiver back");
-        (tx, rx)
-    }
-}
-
-/// one epoch's five reclaimable engine lanes, in `engine_channels` order.
-pub(crate) struct DrainingSlot {
-    pub(crate) vote: ReclaimableLane,
-    pub(crate) certificate: ReclaimableLane,
-    pub(crate) resolver: ReclaimableLane,
-    pub(crate) payload: ReclaimableLane,
-    pub(crate) fetch: ReclaimableLane,
-}
-
-impl DrainingSlot {
-    async fn claim(self) -> EpochChannels {
-        (
-            self.vote.claim().await,
-            self.certificate.claim().await,
-            self.resolver.claim().await,
-            self.payload.claim().await,
-            self.fetch.claim().await,
-        )
-    }
-}
 
 /// everything the parked replica hands the validator role at its promotion
 /// seat — the in-process replacement for the retired exec reboot. produced
@@ -978,7 +871,9 @@ pub(crate) struct PromotionBaton {
     /// the epoch base (cold admission); a fresh-epoch seat starts from the
     /// epoch's genesis floor.
     pub(crate) floor: Option<recovery::FloorCert>,
-    pub(crate) lane_bank: LaneBank,
+    /// the five fixed engine lanes, carried with their demux tasks: parked
+    /// they feed the fold driver, and the seat retargets them at its epoch.
+    pub(crate) lanes: crate::mesh_lanes::EngineLanes,
     pub(crate) sync_tx: MeshSender,
     pub(crate) sync_rx: MeshReceiver,
     pub(crate) relay_tx: MeshSender,
@@ -1015,109 +910,43 @@ pub(crate) struct PromotionBaton {
     pub(crate) pending_cutover_view: Option<u64>,
 }
 
-/// one epoch's slot in the [`LaneBank`].
-pub(crate) enum LaneSlot {
-    /// registered before `network.start()` and never touched since — a
-    /// fresh validator's future epochs. claim is immediate.
-    Banked(EpochChannels),
-    /// owned by parked drainer tasks (the replica's bank): claim revokes
-    /// each drainer and collects the receivers.
-    Draining(DrainingSlot),
-    /// this epoch's engine (or a below-resume blackhole) took the lanes.
-    Spent,
-}
-
-/// the pre-registered per-epoch engine-lane bank, shared by both roles: a
-/// fresh validator banks untouched channel pairs, a parked replica banks
-/// revocable drainers, and every engine spawn claims through the same seam.
-/// `EPOCH_CHANNEL_BANK` bounds membership changes per process RUN — the
-/// bank re-arms from the checkpoint epoch on the next boot.
-pub(crate) struct LaneBank {
-    base: u64,
-    slots: Vec<LaneSlot>,
-}
-
-impl LaneBank {
-    pub(crate) fn new(base: u64, slots: Vec<LaneSlot>) -> Self {
-        Self { base, slots }
-    }
-
-    pub(crate) fn covers(&self, epoch: u64) -> bool {
-        epoch >= self.base && epoch < self.base + self.slots.len() as u64
-    }
-
-    /// take epoch's lanes for its engine. a claim outside the bank or on a
-    /// spent slot is a boot-configuration bug the caller turns into its own
-    /// fatal — `None` here, no policy.
-    pub(crate) async fn claim(&mut self, epoch: u64) -> Option<EpochChannels> {
-        let index = epoch.checked_sub(self.base)? as usize;
-        let slot = std::mem::replace(self.slots.get_mut(index)?, LaneSlot::Spent);
-        match slot {
-            LaneSlot::Banked(channels) => Some(channels),
-            LaneSlot::Draining(draining) => Some(draining.claim().await),
-            LaneSlot::Spent => None,
-        }
-    }
-
-    /// retire every epoch below `resume_epoch`: banked slots get plain
-    /// blackhole drainers (a lagging peer still gossips there, and an
-    /// unread lane would jam its connection); draining slots already have
-    /// drainers — they just keep running.
-    pub(crate) fn blackhole_below(
-        &mut self,
-        resume_epoch: u64,
-        context: &commonware_runtime::tokio::Context,
-    ) {
-        use commonware_p2p::Receiver as _;
-        use commonware_runtime::{Spawner as _, Supervisor as _};
-        for epoch in self.base..resume_epoch.min(self.base + self.slots.len() as u64) {
-            let index = (epoch - self.base) as usize;
-            let keep_draining = matches!(self.slots[index], LaneSlot::Draining(_));
-            if keep_draining {
-                continue;
-            }
-            let slot = std::mem::replace(&mut self.slots[index], LaneSlot::Spent);
-            let LaneSlot::Banked(channels) = slot else {
-                continue;
-            };
-            let (vote, cert, res, payload, fetch) = channels;
-            for (suffix, (_tx, mut rx)) in [
-                ("vote", vote),
-                ("cert", cert),
-                ("resolver", res),
-                ("payload", payload),
-                ("fetch", fetch),
-            ] {
-                let label: &'static str =
-                    Box::leak(format!("blackhole_e{epoch}_{suffix}").into_boxed_str());
-                context
-                    .child(label)
-                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-            }
-        }
-    }
-}
-
-/// the mesh-carrier REAL arm: one epoch's pre-registered mesh channels
-/// (a [`LaneBank`] slot) + the [`lookup::Oracle`] the resolver keys on.
-/// This is the `authenticated::lookup` network's per-spawn transport bundle —
-/// the lookup `Network` (`MeshHead`) registers the channels into the bank
-/// before start, and this bundles one slot with the oracle at the point
-/// [`engine`](self::engine) consumes it, feeding
+/// the mesh-carrier REAL arm: one epoch's seat on the five FIXED engine lanes
+/// (`mesh_lanes`) + the [`lookup::Oracle`] the resolver keys on. This is the
+/// `authenticated::lookup` network's per-spawn transport bundle — the lookup
+/// `Network` (`MeshHead`) registers the five channels once, before start, and
+/// this retargets their demuxes at one epoch's engine, feeding
 /// [`consensus::SimplexOrderer::spawn_with_carrier`] the identical values the
 /// loose-channel spawn took before the seam.
 pub(super) struct DiscoveryMesh {
-    vote: Option<MeshChannel>,
-    certificate: Option<MeshChannel>,
-    resolver: Option<MeshChannel>,
-    payload: Option<MeshChannel>,
-    fetch: Option<MeshChannel>,
+    vote: Option<Lane>,
+    certificate: Option<Lane>,
+    resolver: Option<Lane>,
+    payload: Option<Lane>,
+    fetch: Option<Lane>,
     oracle: lookup::Oracle<ed25519::PublicKey>,
 }
 
+type Lane = (
+    crate::mesh_lanes::EpochSender,
+    crate::mesh_lanes::LaneMailbox,
+);
+
 impl DiscoveryMesh {
-    pub(super) fn new(slot: EpochChannels, oracle: lookup::Oracle<ed25519::PublicKey>) -> Self {
-        let (vote, certificate, resolver, payload, fetch) = slot;
+    /// seat `epoch`'s engine on the five lanes. Every earlier engine's
+    /// mailboxes are dropped here, so nothing that arrives from now on can
+    /// reach a torn-down predecessor.
+    pub(super) fn new(
+        epoch: u64,
+        lanes: &crate::mesh_lanes::EngineLanes,
+        oracle: lookup::Oracle<ed25519::PublicKey>,
+    ) -> Self {
+        let crate::mesh_lanes::SeatedLanes {
+            vote,
+            certificate,
+            resolver,
+            payload,
+            fetch,
+        } = lanes.seat(epoch);
         Self {
             vote: Some(vote),
             certificate: Some(certificate),
@@ -1130,26 +959,26 @@ impl DiscoveryMesh {
 }
 
 impl consensus::MeshCarrier for DiscoveryMesh {
-    type Sender = MeshSender;
-    type Receiver = MeshReceiver;
+    type Sender = crate::mesh_lanes::EpochSender;
+    type Receiver = crate::mesh_lanes::LaneMailbox;
     type Provider = lookup::Oracle<ed25519::PublicKey>;
     type Blocker = lookup::Oracle<ed25519::PublicKey>;
 
-    fn vote(&mut self) -> MeshChannel {
+    fn vote(&mut self) -> Lane {
         self.vote.take().expect("vote channel taken once")
     }
-    fn certificate(&mut self) -> MeshChannel {
+    fn certificate(&mut self) -> Lane {
         self.certificate
             .take()
             .expect("certificate channel taken once")
     }
-    fn resolver(&mut self) -> MeshChannel {
+    fn resolver(&mut self) -> Lane {
         self.resolver.take().expect("resolver channel taken once")
     }
-    fn payload(&mut self) -> MeshChannel {
+    fn payload(&mut self) -> Lane {
         self.payload.take().expect("payload channel taken once")
     }
-    fn fetch(&mut self) -> MeshChannel {
+    fn fetch(&mut self) -> Lane {
         self.fetch.take().expect("fetch channel taken once")
     }
     fn provider(&self) -> lookup::Oracle<ed25519::PublicKey> {

@@ -54,6 +54,7 @@ fn a_single_validator_finalizes_sequential_blocks() {
             simulated::Config {
                 max_size: 1024 * 1024,
                 disconnect_on_block: true,
+                max_peers_per_set: NZUsize!(32),
                 tracked_peer_sets: NZUsize!(1),
             },
             vec![me.clone()],

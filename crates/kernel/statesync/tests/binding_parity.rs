@@ -348,6 +348,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
             simulated::Config {
                 max_size: 1024 * 1024,
                 disconnect_on_block: true,
+                max_peers_per_set: NZUsize!(32),
                 tracked_peer_sets: NZUsize!(1),
             },
             vec![server.clone(), joiner.clone()],
@@ -358,7 +359,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
         let link = Link {
             latency: Duration::from_millis(2),
             jitter: Duration::from_millis(0),
-            success_rate: 1.0,
+            success_rate: commonware_utils::probability!(1.0),
         };
         oracle
             .add_link(server.clone(), joiner.clone(), link.clone())

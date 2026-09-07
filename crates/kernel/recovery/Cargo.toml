@@ -12,7 +12,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
-commonware-codec = "2026.5.0"
+commonware-codec = { workspace = true }
 commonware-utils = { workspace = true }
 futures = "0.3"
 

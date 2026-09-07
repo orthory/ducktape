@@ -343,7 +343,7 @@ pub(super) async fn park(
     let ReplicaChannels {
         context,
         replica_store,
-        lane_bank,
+        lanes,
         mut head_wake,
         mut cert_bridge,
         sync_tx,
@@ -1300,7 +1300,7 @@ pub(super) async fn park(
                             }
                         }
                         match node_r.orderer_mut().observe_finalization(
-                            &mut rand::rngs::OsRng,
+                            &mut commonware_utils::sys_rng(),
                             scheme,
                             &anchor.finalization,
                         ) {
@@ -2015,7 +2015,7 @@ pub(super) async fn park(
                 // the seat boundary IS the fresh epoch's base — its floor
                 // is the epoch genesis floor, exactly a validator cutover.
                 floor: None,
-                lane_bank,
+                lanes,
                 sync_tx,
                 sync_rx,
                 relay_tx,
@@ -2116,16 +2116,6 @@ pub(super) async fn park(
             mesh_window.track_new(oracle, &mesh_book, &committed_window);
         }
         if tip.epoch > last_tip_epoch {
-            if !lane_bank.covers(tip.epoch) {
-                tracing::warn!(
-                    target: "ducktape::reachability",
-                    node = %label,
-                    epoch = tip.epoch,
-                    channel_bank = EPOCH_CHANNEL_BANK,
-                    reason = "epoch_outside_channel_bank",
-                    "expect reconnect churn while parked"
-                );
-            }
             if gateway_book.is_some() || media_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
@@ -2820,7 +2810,7 @@ pub(super) async fn park(
         participants: boundary.participants.clone(),
         residents: boundary.residents.clone(),
         floor,
-        lane_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_tx,
