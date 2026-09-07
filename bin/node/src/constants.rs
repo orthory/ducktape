@@ -76,13 +76,22 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES
 /// boundary a single sender can rely on — `relay::MAX_RELAY_BLOB_BYTES` is
 /// pinned so one offer plus every chunk of a max-size pack fits inside it.
 pub(crate) const MESH_QUOTA_BURST: usize = 128;
-/// the most distinct identities one tracked peer set may carry. a set is a
-/// generation's validators plus residents (each tier capped at
-/// `valset::MAX_MEMBERS`) plus this node's descriptor extras; commonware
-/// PANICS on a set over this cap and sizes every mailbox by it, so it is a
-/// ceiling on membership, not a tuning knob.
+/// the most distinct identities one tracked peer set may carry — a set is a
+/// generation's validators plus residents plus this node's descriptor extras,
+/// plus the local identity, which commonware counts whether or not it is in
+/// the set. tracking a bigger set PANICS, so this is a ceiling on membership.
+///
+/// it is ALSO the mailbox multiplier, and THAT is what pins the number: every
+/// registered channel PREALLOCATES
+/// `MAX_PEERS_PER_SET * tracked_peer_sets(4) * MESH_QUOTA_BURST` message
+/// slots, and a validator registers `EPOCH_CHANNEL_BANK * 5` lanes plus the
+/// service channels — over 300 of them — before it reaches genesis. measured
+/// on this node, each unit of this cap costs ~83 MB of resident boot memory.
+/// so a cap at `valset::MAX_MEMBERS` never boots (~190 GB), and every unit
+/// here is paid 300 times over. cutting `EPOCH_CHANNEL_BANK` or giving the
+/// banked consensus lanes their own smaller burst buys headroom back.
 pub(crate) const MAX_PEERS_PER_SET: std::num::NonZeroUsize =
-    std::num::NonZeroUsize::new(2 * valset::MAX_MEMBERS + 256).unwrap();
+    std::num::NonZeroUsize::new(16).unwrap();
 /// per-read/write deadline for every mesh socket — the OS arm gets it via
 /// `with_read_write_timeout` at boot, and it IS the overlay seam's own
 /// `IO_TIMEOUT` (aliased, not copied, so the arms cannot drift). see the
