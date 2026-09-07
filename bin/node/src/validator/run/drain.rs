@@ -1520,9 +1520,8 @@ impl ValidatorRuntime<'_> {
         // the code plane's push admission gate reads THIS set (#1833): a
         // digest nothing here names any more is refused before any staging.
         // reclaim rides the same registry-change point — whatever fell out
-        // (a cancelled/replaced swap, or a module's `code_hash` that moved
-        // on) is forgotten, so an unreferenced blob does not outlive the
-        // registry entry that once justified it.
+        // (a cancelled/replaced pending swap) is forgotten. Activation history
+        // remains referenced because checkpoint restore and replay use it.
         for digest in code_registry.update(crate::code_plane::code_blobs_referenced(&modules)) {
             blobs.forget(&digest);
         }

@@ -272,7 +272,6 @@ extern crate::backend
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str
-  pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
@@ -416,7 +415,6 @@ extern crate::backend
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   pure members_is_admin(rows:&[MemberRow]) -> bool
   pure member_tier(rows:&[MemberRow]) -> str
-  pure filter_members(rows:&[MemberRow], filter:MembersFilter) -> [MemberRow]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])

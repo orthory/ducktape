@@ -76,7 +76,7 @@ struct StageReply {
 /// this route fans out to every member over the code plane. Disabling the limit
 /// would be strictly worse than refusing — one operator-credentialed caller
 /// could drive an unbounded local buffer and an unbounded network fan-out.
-pub const MAX_MODULE_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub use node_work::MAX_STAGED_BLOB_BYTES as MAX_MODULE_ARTIFACT_BYTES;
 
 /// a refusal carrying a stable snake_case `reason` beside the message — the
 /// admin namespace's body shape (`admin::refuse`), so an operator's client

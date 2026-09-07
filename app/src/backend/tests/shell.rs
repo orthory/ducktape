@@ -212,10 +212,6 @@ fn the_roster_answers_admin_tier_and_filters() {
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
     assert_eq!(member_tier(&answered_without_this_node), "guest");
-    assert_eq!(filter_members(&rows, MembersFilter::Agents).len(), 1);
-    assert_eq!(filter_members(&rows, MembersFilter::Humans).len(), 2);
-    assert_eq!(filter_members(&rows, MembersFilter::Validators).len(), 1);
-    assert_eq!(filter_members(&rows, MembersFilter::All).len(), 3);
 }
 
 /// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the

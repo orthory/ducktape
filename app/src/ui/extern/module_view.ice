@@ -10,3 +10,8 @@ extern crate::module_view
   pure gov_intent(event:&ModuleViewEvent) -> GovIntent
   pure gov_event_proposal(event:&ModuleViewEvent) -> str
   pure gov_event_approves(event:&ModuleViewEvent) -> bool
+  component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
+  component agents_view(dark:bool, connected:bool, answered:bool, rows:&[AgentRow]) -> ModuleViewEvent
+  pure roster_intent(event:&ModuleViewEvent) -> RosterIntent
+  pure event_text(event:&ModuleViewEvent, field:&str) -> str
+  pure event_flag(event:&ModuleViewEvent, field:&str) -> bool

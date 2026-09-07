@@ -582,9 +582,10 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     let pr_channel = pr.channel_id.clone();
     assert_eq!(pr_channel, format!("forge:{REPO}:{pr_number}"));
 
-    // The terminal-runs ring carries the receipt: branch@commit + PR number.
-    let record = cluster.await_committed(0, "run 1 in the terminal-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_1)
+    // The run settles before the program's PR receipt is committed. Wait for
+    // that receipt, even when the forge PR itself is already visible.
+    let record = cluster.await_committed(0, "run 1 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_1).filter(|record| record.pr_number.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 1 is clean: {record:?}");
@@ -633,8 +634,8 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     assert_eq!(child_pr.summary.state, forge::ItemState::Open);
     assert_eq!(child_pr.summary.title, ISSUE_TITLE);
     assert_eq!(child_pr.target_branch.as_deref(), Some(WORK_BRANCH));
-    let record = cluster.await_committed(0, "run 2 in the terminal-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_2)
+    let record = cluster.await_committed(0, "run 2 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_2).filter(|record| record.pr_number.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 2 is clean: {record:?}");
@@ -719,8 +720,8 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         2,
         "the duplicate guard reuses the child PR for the continued session"
     );
-    let record = cluster.await_committed(0, "run 3 in the terminal-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_3)
+    let record = cluster.await_committed(0, "run 3 has its PR receipt", FINALIZE, || {
+        run_record(&cluster, 0, &run_3).filter(|record| record.pr_number.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 3 is clean: {record:?}");

@@ -331,6 +331,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                         .build()
                         .expect("app-surface tokio runtime")
                         .block_on(async move {
+                            noded::node_work::spawn(http_handle.clone(), "runs".into());
                             if let Some(listener) = gateway_listener {
                                 let listener = tokio::net::TcpListener::from_std(listener)
                                     .expect("adopt gateway browser listener");

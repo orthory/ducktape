@@ -36,8 +36,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
 ## Sandbox (microVM) hosts
 
-- `build-guest-rootfs.sh` — builds the guest kernel + rootfs image a Linux
-  host's Firecracker sandbox boots each run from.
+- `build-guest-rootfs.sh` — builds the shared kernel and rootfs for Firecracker
+  (Linux) or vz (macOS). Linux installs the pinned Rust and wasm-tools through
+  `guest-rust-tools.sh` by default; `ROOTFS_SETUP` selects a custom setup.
 - `macos-preflight.sh` — checks a macOS host for everything the vz backend
   needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
   target, the entitled `bin/duck-vz-shim` on PATH, the guest kernel + rootfs)
