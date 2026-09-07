@@ -70,11 +70,25 @@ enum PickGate
   read_only
   probe
 
-// What the status item's "Open" has to do. Since closing a window no longer
-// ends the process, the daemon can be up with nothing tracked — and then there
-// is no window to raise, so the row has to open one.
+// Open-or-raise for a window whose open state means "put it in front of me",
+// nothing more — the huddle's call window. The status item's own "Open" row
+// needs a third answer (`TrayOpen`, below): a connected network with nothing
+// tracked must reopen the CONSOLE, not this pair, so it gets its own type
+// instead of forcing a meaningless third arm onto this match.
 enum WindowSummon
   open
+  raise
+
+// What the status item's "Open" row has to do. Closing a window no longer
+// ends the process, so the daemon can be connected with nothing tracked — an
+// ordinary state, not "never signed in". Routing that through the LAUNCH
+// window resets `hub_step` to the network picker (`onboarding_opened` always
+// re-runs `hub_state()`), sending a connected user back to network selection
+// for merely closing the console (#1782); routing it through the console
+// instead reconnects from `rpc` the way a fresh pick does.
+enum TrayOpen
+  launch
+  console
   raise
 
 // WHICH PLATE A MESSAGE ROW WEARS. `selected_row` is the one plate in the app
