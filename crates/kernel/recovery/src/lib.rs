@@ -1154,6 +1154,7 @@ where
                 partition: PARTITION_OPLOG.into(),
                 items_per_section: NonZeroU64::new(64).expect("nonzero"),
                 write_buffer: NonZeroUsize::new(1024).expect("nonzero"),
+                replay_buffer: NonZeroUsize::new(1 << 16).expect("nonzero"),
                 compression: None,
                 codec_config: (RangeCfg::from(0..=MAX_RECORD_FIELD_LEN), ()),
                 page_cache,
