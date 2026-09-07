@@ -24,7 +24,11 @@ impl ValidatorRuntime<'_> {
             self.node.finalized_view().unwrap_or(0),
             members.len() as u64,
             reachable,
-            (self.node.pending_batch_len() + self.node.orderer().pending_len()) as u64,
+            // CUSTODY, not the flush queue: `pending_batch` empties on every
+            // flush while the frames it held are still unresolved, so a gauge
+            // reading it reported ~0 for a mempool at its cap. custody is what
+            // `node::MAX_CUSTODY_FRAMES` bounds and what a flood fills.
+            (self.node.custody_len() + self.node.orderer().pending_len()) as u64,
         );
         self.metrics.update_storage(
             self.prev_ckpt.0.unwrap_or_default(),
@@ -407,10 +411,14 @@ impl ValidatorRuntime<'_> {
         } = self;
         let now = context.current();
 
-        // only the blob-offer door reads standing (pack fanout is node-key
-        // business: members ∪ residents). ordinary submits carry no standing
-        // read at all — the frame signature is the whole door.
-        let needs_node_standing = matches!(msg, relay::RelayMsg::BlobOffer { .. });
+        // both intake doors read standing (members ∪ residents): a blob offer
+        // to bound the pack fanout, and a submit to bound consensus custody —
+        // the RELAYING peer must be a node this network committed to, even
+        // though the frame it carries may be signed by any key at all.
+        let needs_node_standing = matches!(
+            msg,
+            relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
+        );
         let (members_now, residents_now) = if needs_node_standing {
             (
                 read_valset_members(node.host()).await.unwrap_or_default(),
@@ -432,7 +440,13 @@ impl ValidatorRuntime<'_> {
             } => match node.submit_frame(frame).await {
                 Ok(id) => {
                     debug_assert_eq!(id, frame_id);
-                    pending_relays.insert(id, (peer, now + SUBMIT_HOLD));
+                    // APPEND: the same frame relayed twice is one consensus
+                    // unit, and both couriers are owed the same answer.
+                    pending_relays
+                        .entry(id)
+                        .or_insert_with(|| (Vec::new(), now + SUBMIT_HOLD))
+                        .0
+                        .push(peer);
                 }
                 Err(e) => relay_runtime::send_reply(
                     relay_tx,
@@ -451,7 +465,13 @@ impl ValidatorRuntime<'_> {
             } => match node.submit_frame(frame).await {
                 Ok(id) => {
                     debug_assert_eq!(id, frame_id);
-                    pending_submits.insert(id, (reply, deadline));
+                    // APPEND: the same frame submitted twice is one consensus
+                    // unit, and every caller holding its id is owed the answer.
+                    pending_submits
+                        .entry(id)
+                        .or_insert_with(|| (Vec::new(), deadline))
+                        .0
+                        .push(reply);
                 }
                 Err(e) => {
                     let _ = reply.send(Err(format!("submit failed: {e}")));
@@ -506,7 +526,13 @@ impl ValidatorRuntime<'_> {
             })) => match node.submit_frame(frame).await {
                 Ok(id) => {
                     debug_assert_eq!(id, frame_id);
-                    pending_submits.insert(id, (reply, deadline));
+                    // APPEND: the same frame submitted twice is one consensus
+                    // unit, and every caller holding its id is owed the answer.
+                    pending_submits
+                        .entry(id)
+                        .or_insert_with(|| (Vec::new(), deadline))
+                        .0
+                        .push(reply);
                 }
                 Err(e) => {
                     let _ = reply.send(Err(format!("submit failed: {e}")));

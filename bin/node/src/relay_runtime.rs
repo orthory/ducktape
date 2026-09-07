@@ -559,18 +559,19 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Submit { frame } => {
-                let frame_id = match relay::verify_relay_submit(&frame) {
-                    Ok(id) => id,
-                    Err(detail) => {
-                        send_reply(
-                            relay_tx,
-                            &peer,
-                            node::frame_id(&frame),
-                            relay::RelayOutcome::Refused { detail },
-                        );
-                        return None;
-                    }
-                };
+                let frame_id =
+                    match relay::verify_relay_submit(&frame, peer.as_ref(), members, residents) {
+                        Ok(id) => id,
+                        Err(detail) => {
+                            send_reply(
+                                relay_tx,
+                                &peer,
+                                node::frame_id(&frame),
+                                relay::RelayOutcome::Refused { detail },
+                            );
+                            return None;
+                        }
+                    };
                 if let Some(digest) = relay::required_blob_digest(&frame)
                     && !self.blobs.has_chunk(&digest)
                 {

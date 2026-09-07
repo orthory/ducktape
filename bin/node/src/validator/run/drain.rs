@@ -423,7 +423,7 @@ impl ValidatorRuntime<'_> {
             // resolve a relayed hold FIRST: a relayed frame has no
             // local pending_submits entry, so this must precede the
             // `else { continue }` below or the wire Reply is lost.
-            if let Some((peer, _)) = pending_relays.remove(&d.id) {
+            if let Some((peers, _)) = pending_relays.remove(&d.id) {
                 let outcome = match d.disposition {
                     node::Disposition::Applied => relay::RelayOutcome::Applied {
                         height: d.height,
@@ -446,11 +446,14 @@ impl ValidatorRuntime<'_> {
                     frame_id: d.id,
                     outcome,
                 };
-                let _ = relay_tx.send(
-                    Recipients::One(peer),
-                    IoBuf::from(relay::encode_msg(&msg)),
-                    false,
-                );
+                // every courier that relayed this frame gets the SAME outcome.
+                for peer in peers {
+                    let _ = relay_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(relay::encode_msg(&msg)),
+                        false,
+                    );
+                }
             }
             // BEFORE the pending_submits lookup, deliberately. An op rejected in
             // consensus produced no record ANYWHERE: the submitter's own log says
@@ -481,10 +484,10 @@ impl ValidatorRuntime<'_> {
                     "op rejected in consensus"
                 );
             }
-            let Some((reply, _)) = pending_submits.remove(&d.id) else {
+            let Some((replies, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
-            let _ = reply.send(match d.disposition {
+            let outcome = match d.disposition {
                 node::Disposition::Applied => Ok(noded::BlockSummary {
                     height: d.height,
                     // the PER-BLOCK boundary this frame settled at
@@ -502,7 +505,12 @@ impl ValidatorRuntime<'_> {
                 // unreachable — filtered at the loop top — but
                 // stay total rather than panic.
                 node::Disposition::Discarded => continue,
-            });
+            };
+            // every caller that submitted this frame gets the SAME outcome:
+            // one FrameId is one consensus unit, however many asked for it.
+            for reply in replies {
+                let _ = reply.send(outcome.clone());
+            }
         }
         validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
@@ -515,7 +523,10 @@ impl ValidatorRuntime<'_> {
                 .map(|(k, _)| *k)
                 .collect();
             for k in expired {
-                if let Some((reply, _)) = pending_submits.remove(&k) {
+                let Some((replies, _)) = pending_submits.remove(&k) else {
+                    continue;
+                };
+                for reply in replies {
                     let _ = reply.send(Err(
                         "timed out awaiting finalization — re-query on the next block".into(),
                     ));
@@ -533,14 +544,17 @@ impl ValidatorRuntime<'_> {
                 .map(|(k, _)| *k)
                 .collect();
             for k in expired {
-                if let Some((peer, _)) = pending_relays.remove(&k) {
-                    let msg = relay::RelayMsg::Reply {
-                        frame_id: k,
-                        outcome: relay::RelayOutcome::Refused {
-                            detail: "timed out awaiting finalization — re-query on the next block"
-                                .into(),
-                        },
-                    };
+                let Some((peers, _)) = pending_relays.remove(&k) else {
+                    continue;
+                };
+                let msg = relay::RelayMsg::Reply {
+                    frame_id: k,
+                    outcome: relay::RelayOutcome::Refused {
+                        detail: "timed out awaiting finalization — re-query on the next block"
+                            .into(),
+                    },
+                };
+                for peer in peers {
                     let _ = relay_tx.send(
                         Recipients::One(peer),
                         IoBuf::from(relay::encode_msg(&msg)),

@@ -25,6 +25,19 @@ pub(super) type ValidatorNode = node::OrderedNode<
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
+/// held app-surface submit replies, keyed by the submitted frame's content
+/// address: every caller that submitted THIS frame, and the instant the first
+/// of them stops waiting. a list because one FrameId is one consensus unit
+/// however many callers submitted it — replacing the entry would drop the
+/// first caller's reply for an op that finalized.
+type PendingSubmits = std::collections::HashMap<
+    node::FrameId,
+    (
+        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>>,
+        std::time::SystemTime,
+    ),
+>;
+
 /// a join gate held open awaiting its `Redeem` frame's consensus fate. the
 /// member submitted the redemption and holds the joiner's outcome
 /// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
@@ -204,15 +217,9 @@ struct ValidatorRuntime<'a> {
     expected: usize,
     applied: usize,
     converged: bool,
-    pending_submits: std::collections::HashMap<
-        node::FrameId,
-        (
-            futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::SystemTime,
-        ),
-    >,
+    pending_submits: PendingSubmits,
     pending_relays:
-        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::SystemTime)>,
+        std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
     /// keyed by frame id (the settle-then-answer seam, resolved in `on_drain`).
     pending_gates: std::collections::HashMap<node::FrameId, GatePending>,
@@ -352,21 +359,22 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // frame's content address, resolved when the frame drains (or expired
     // after SUBMIT_HOLD), plus the last block height published to ws
     // subscribers.
+    //
+    // a LIST of callers per frame, not one: the same signed frame submitted
+    // twice is ONE consensus unit (custody is keyed by FrameId), and a second
+    // insert that replaced the first sender would drop that caller's reply on
+    // the floor — a 503 for an op that finalized. every caller holding the
+    // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
-    let pending_submits: std::collections::HashMap<
-        node::FrameId,
-        (
-            futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::SystemTime,
-        ),
-    > = std::collections::HashMap::new();
+    let pending_submits: PendingSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
-    // local holds, expired on the same SUBMIT_HOLD budget. the peer is where
-    // the Reply goes.
+    // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
+    // the Reply goes — a list for the same reason, since two residents can
+    // relay one frame.
     let pending_relays: std::collections::HashMap<
         node::FrameId,
-        (ed25519::PublicKey, std::time::SystemTime),
+        (Vec<ed25519::PublicKey>, std::time::SystemTime),
     > = std::collections::HashMap::new();
     // join gates held open awaiting their Redeem frame's consensus fate, and
     // the joiner→frame in-flight index that dedups a re-Request while settling.

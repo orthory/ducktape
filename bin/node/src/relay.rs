@@ -6,15 +6,17 @@
 //! a frame that references a node-local forge pack first fans that pack out to
 //! EVERY current validator in bounded, content-addressed chunks; only after all
 //! validators acknowledge the bytes does one validator take consensus custody.
-//! the SENDING peer's transport identity is deliberately NOT consulted:
-//! mesh admission and submit authorization are separate facts, and a
-//! peer-vs-origin gate would fork this lane apart from the validator's local
-//! HTTP submit lane. the frame's OWN signature is the authorization
-//! AND the whole door: it binds (origin, seq, target, payload) to the origin
-//! key, so forgery is impossible, and a byte-identical replay collapses in the
-//! consensus lane's exactly-once digest gate. the door adds NO standing
-//! policy — any key's validly signed frame enters consensus, the same
-//! contract as a validator's local HTTP submit lane. who may do WHAT is
+//! the frame's OWN signature is the AUTHORSHIP: it binds
+//! (origin, seq, target, payload) to the origin key, so forgery is impossible,
+//! and a byte-identical replay collapses in the consensus lane's exactly-once
+//! digest gate. authorship is not admission, though — the RELAYING peer must
+//! itself hold committed node standing (member or resident), exactly as
+//! `verify_blob_offer` requires of a blob offer. consensus custody is a bounded
+//! resource, and a door open to every mesh peer is a door open to anyone who
+//! reaches the mesh. the check is on the COURIER, never on the frame's origin:
+//! a resident relays frames signed by keys with no standing at all (an agent's
+//! per-run session key), and every one of them still enters consensus on the
+//! same contract as a validator's local HTTP submit lane. who may do WHAT is
 //! per-module policy, decided deterministically inside the state machine (the
 //! acl module's dispatch gate plus each module's own origin checks), never at
 //! the transport door. the validator takes consensus custody via
@@ -217,22 +219,42 @@ impl BlobAssembly {
 
 /// the validator's door check, pure so it is testable without a mesh: the
 /// frame must decode AND verify (the kernel checks the signature binds
-/// origin/seq/target/payload), and its origin must be `Origin::External`.
-/// that is the WHOLE door — no standing set is consulted. any key's validly
-/// signed frame enters consensus here, exactly as it would on a validator's
-/// local HTTP submit lane; the two lanes deliberately carry one contract.
-/// the sending peer is DELIBERATELY not an argument: mesh admission and
-/// submit authorization are separate facts, and a peer-vs-origin check would
-/// fork the two submit lanes apart. authorization is per-module policy resolved
-/// deterministically at dispatch (the acl module's gate plus each module's
-/// own origin checks), never a transport-door decision — a door-side policy
-/// would only fork the two submit lanes apart again.
-pub fn verify_relay_submit(frame: &[u8]) -> Result<node::FrameId, String> {
+/// origin/seq/target/payload), its origin must be `Origin::External`, and the
+/// RELAYING peer must hold committed node standing — a member or a resident.
+///
+/// the standing check is on the COURIER, not on the frame's author: this lane
+/// exists precisely so a key with no standing (an agent's per-run session key,
+/// a wallet, a passkey) can submit through a node that has some, and its ops
+/// enter consensus on the same contract as a validator's local HTTP submit
+/// lane. what the check buys is the bound: consensus custody is finite
+/// (`node::MAX_CUSTODY_FRAMES`) and a door open to every mesh peer lets anyone
+/// who reaches the mesh fill it. authorization for the OP stays per-module
+/// policy resolved deterministically at dispatch (the acl module's gate plus
+/// each module's own origin checks), never a transport-door decision.
+pub fn verify_relay_submit(
+    frame: &[u8],
+    peer: &[u8],
+    members: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(_) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
+    if !holds_node_standing(peer, members, residents) {
+        return Err("relaying peer holds no committed node standing".into());
+    }
     Ok(node::frame_id(frame))
+}
+
+/// is this raw key a committed member or resident? the ONE standing predicate
+/// both relay doors read, so a courier and a blob offeror are judged by the
+/// same set.
+fn holds_node_standing(key: &[u8], members: &[Vec<u8>], residents: &[Vec<u8>]) -> bool {
+    members
+        .iter()
+        .chain(residents)
+        .any(|standing| standing.as_slice() == key)
 }
 
 /// Blob offers may originate from a standing resident or a current validator
@@ -248,11 +270,7 @@ pub fn verify_blob_offer(
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("blob offers carry an external origin".into());
     };
-    if !members
-        .iter()
-        .chain(residents)
-        .any(|key| key.as_slice() == origin_bytes.as_slice())
-    {
+    if !holds_node_standing(&origin_bytes, members, residents) {
         return Err("blob offer origin holds no committed node standing".into());
     }
     if required_blob_digest(frame).as_ref() != Some(digest) {
@@ -351,21 +369,44 @@ mod tests {
         }
     }
 
+    /// the door judges the COURIER, not the author: a frame signed by a key
+    /// with no standing whatsoever enters consensus, as long as the peer
+    /// relaying it holds committed node standing. that is what keeps this lane
+    /// on one contract with the validator's local HTTP submit lane while still
+    /// bounding who can spend a validator's finite consensus custody.
     #[test]
-    fn door_accepts_any_validly_signed_external_frame() {
-        // NO standing set exists at this door: a fresh key nobody has ever
-        // granted anything submits on the same contract as a validator's local
-        // HTTP lane. the signature is the whole gate; policy is per-module,
-        // resolved at dispatch.
+    fn door_accepts_a_standingless_author_relayed_by_a_standing_peer() {
+        let courier = sk(1).public_key().as_ref().to_vec();
         let author = sk(7);
         let frame = node::encode_frame(&author, 3, &msg());
-        let id = verify_relay_submit(&frame).expect("accepted");
+
+        let id = verify_relay_submit(&frame, &courier, std::slice::from_ref(&courier), &[])
+            .expect("a member courier is accepted");
         assert_eq!(id, node::frame_id(&frame));
+        assert!(
+            verify_relay_submit(&frame, &courier, &[], std::slice::from_ref(&courier)).is_ok(),
+            "a resident courier is accepted too"
+        );
+    }
+
+    #[test]
+    fn door_refuses_a_relaying_peer_with_no_committed_standing() {
+        let stranger = sk(2).public_key().as_ref().to_vec();
+        let member = sk(1).public_key().as_ref().to_vec();
+        // the frame is the member's OWN, validly signed: only the peer that
+        // carried it lacks standing, and that alone must refuse it.
+        let frame = node::encode_frame(&sk(1), 0, &msg());
+
+        let err = verify_relay_submit(&frame, &stranger, std::slice::from_ref(&member), &[])
+            .expect_err("a peer with no standing may not spend consensus custody");
+        assert!(err.contains("no committed node standing"), "{err}");
     }
 
     #[test]
     fn door_refuses_a_signature_tampered_frame_that_still_parses() {
         let author = sk(7);
+        let courier = author.public_key().as_ref().to_vec();
+        let members = std::slice::from_ref(&courier);
         let mut tampered = node::encode_frame(&author, 0, &msg());
 
         // flip a bit INSIDE the trailing 64-byte ed25519 signature: the binary
@@ -377,8 +418,8 @@ mod tests {
 
         // it fails at proof verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
-        let junk = verify_relay_submit(b"not a frame").unwrap_err();
-        let err = verify_relay_submit(&tampered).unwrap_err();
+        let junk = verify_relay_submit(b"not a frame", &courier, members, &[]).unwrap_err();
+        let err = verify_relay_submit(&tampered, &courier, members, &[]).unwrap_err();
         assert_ne!(err, junk, "tamper must fail at the proof, not the parser");
         assert!(err.contains("frame proof does not bind"), "{err}");
     }
