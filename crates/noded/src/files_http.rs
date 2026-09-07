@@ -309,17 +309,28 @@ pub(crate) async fn files_pin(
     }
 }
 
-/// DELETE /v1/files/pin/{name} — release a pin so gc can reclaim it once
-/// nothing else roots it. owner-gated at the module (`Fs::unpin`): the pin's
-/// creator or `system` may release it; anyone else's attempt is the module's
-/// verbatim 400.
+/// the json body of POST /v1/files/unpin.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnpinBody {
+    pub name: String,
+}
+
+/// POST /v1/files/unpin — release a pin so gc can reclaim it once nothing
+/// else roots it. owner-gated at the module (`Fs::unpin`): the pin's creator
+/// or `system` may release it; anyone else's attempt is the module's verbatim
+/// 400. the name travels in the signed JSON body, never a path segment: a
+/// pin name has no charset restriction (`.` and `..` are legal, see
+/// `pin_apply`), and a path segment is normalized by the `url` crate before
+/// it reaches the wire — `%2E%2E` collapses to a different route. a body is
+/// opaque to URL normalization and is exactly the bytes the signature covers.
 pub(crate) async fn files_unpin(
     State(handle): State<NodeHandle>,
     signed: Option<Extension<SignedBy>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(body): Json<UnpinBody>,
 ) -> Response {
     let origin = acting_origin(signed.as_deref());
-    let payload = encode_msg(&FilesMsg::Unpin { name });
+    let payload = encode_msg(&FilesMsg::Unpin { name: body.name });
     tracing::debug!(
         target: "ducktape::files",
         op = "unpin",
