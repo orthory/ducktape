@@ -354,6 +354,60 @@ fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
 }
 
 #[test]
+fn huddle_recipient_nodes_keeps_the_readers_other_device() {
+    // Two devices of ONE account in the same huddle: the module dedups a
+    // join by PARTY, so this device's own historical `user:{hex}` row (this
+    // exact key) sits alongside the account's shared `acct:1` row a second,
+    // now-bound device joined onto — and `is_you` answers by ACCOUNT, so
+    // BOTH rows answer it true. Excluding on `is_you` alone used to drop
+    // both, and the two devices went mutually dark. The fan-out has to tell
+    // them apart by NODE, the one thing that is actually per-device, so it
+    // must exclude only THIS device's own row.
+    let laptop = [0xaau8; 32];
+    let phone = [0xadu8; 32];
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&laptop),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&phone),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+    ]));
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                party: format!("user:{}", hex_encode(&laptop)),
+                node: "1a1a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                party: "acct:1".into(),
+                node: "2b2b".into(),
+                joined_at: 20,
+            },
+        ],
+        ChatReader::new(Some(&laptop), &names),
+    );
+    assert!(
+        roster.iter().all(|participant| participant.is_you),
+        "is_you answers by account: both rows are ours"
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("1a1a")),
+        vec!["2b2b".to_string()],
+        "the phone is still a recipient; only this device's own node is excluded"
+    );
+}
+
+#[test]
 fn popover_uses_only_shared_design_roles() {
     let tokens = ui_lang_components::ui::theme::LIGHT;
     let raised = raised_style(&iced::Theme::Light);
