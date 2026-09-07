@@ -186,7 +186,7 @@ impl ValidatorRuntime<'_> {
                 // is self-contained (its own `Arc`'d journal and a snapshot
                 // of the height index), so nothing here holds `node` past
                 // this match arm.
-                match node.sink_mut().frame_reader() {
+                match node.sink_mut().frame_reader().await {
                     Ok(reader) => {
                         tokio::spawn(async move {
                             let read = reader

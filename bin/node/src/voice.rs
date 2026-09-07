@@ -2130,7 +2130,7 @@ mod tests {
     /// this — that is the point.
     #[test]
     fn per_service_isolation_keeps_a_video_flood_from_starving_audio() {
-        // one peer's send backlog, sized like the mesh relay's (MAX_BACKLOG).
+        // one peer's send backlog, sized like the mesh burst (MESH_QUOTA_BURST).
         const CAP: usize = 128;
         let video_frame = || vec![0xDDu8; 200];
         let voice_frame = || vec![0xAAu8; 80];

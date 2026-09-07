@@ -15,7 +15,7 @@ use host::{FinalizedBlock, Host};
 use kv::Kv;
 use kv::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
-use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
+use statesync::qmdb::{QmdbStore, RemoteQmdbSource};
 use statesync::{
     CHUNK_LEN, ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse,
     SyncServer, decode_response, encode_request, fetch_manifest, fetch_snapshot,
@@ -176,7 +176,7 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
 
             // pinned target from the manifest, gated on the manifest root.
             let resolver =
-                RemoteQmdbResolver::new(client_for_join.clone(), manifest.boundary_id(), "kv");
+                RemoteQmdbSource::new(client_for_join.clone(), manifest.boundary_id(), "kv");
             let target = pinned_target(kv_entry);
             assert_eq!(
                 StateRoot(target.root.0),
@@ -298,7 +298,7 @@ fn byzantine_op_batches_fail_verification_not_installation() {
     // reject at the wire layer; this pins the decode side. (proof-level lies —
     // valid encoding, wrong ops — are rejected by the sync engine's merkle
     // verification against the target root, proven by commonware's own suite.)
-    use statesync::qmdb::{QmdbSyncReq, decode_ops_envelope, encode_qmdb_req};
+    use statesync::qmdb::{decode_qmdb_resp, encode_qmdb_req, ops_request};
 
     deterministic::Runner::default().start(|context| async move {
         let kv = Kv::new(
@@ -328,32 +328,22 @@ fn byzantine_op_batches_fail_verification_not_installation() {
         let body = host
             .serve_sync(
                 "kv",
-                &encode_qmdb_req(&QmdbSyncReq::Ops {
-                    op_count: target.op_count,
-                    start_loc: target.start,
-                    max_ops: 16,
-                    include_pinned: true,
-                }),
+                &encode_qmdb_req(&ops_request(target.op_count, target.start, 16)),
             )
             .await
             .expect("serve ops");
-        assert!(
-            decode_ops_envelope(&body).is_ok(),
-            "honest envelope decodes"
-        );
+        assert!(decode_qmdb_resp(&body).is_ok(), "honest reply decodes");
 
         // ...rejects when truncated,
-        assert!(decode_ops_envelope(&body[..body.len() - 1]).is_err());
+        assert!(decode_qmdb_resp(&body[..body.len() - 1]).is_err());
         // ...when carrying trailing garbage,
         let mut trailing = body.clone();
         trailing.push(0);
-        assert!(decode_ops_envelope(&trailing).is_err());
-        // ...and when its op count is forged past the buffer.
+        assert!(decode_qmdb_resp(&trailing).is_err());
+        // ...and when its variant tag names a reply shape that does not exist.
         let mut forged = body.clone();
-        let proof_len = u64::from_le_bytes(forged[0..8].try_into().unwrap()) as usize;
-        let count_at = 8 + proof_len;
-        forged[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decode_ops_envelope(&forged).is_err());
+        forged[0] = 0xFF;
+        assert!(decode_qmdb_resp(&forged).is_err());
     });
 }
 

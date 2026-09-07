@@ -38,7 +38,7 @@ x25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hkdf = "0.12"
 sha2 = { workspace = true }
-rand_core = { workspace = true }
+rand_core = "0.6.4"
 reqwest = { workspace = true, optional = true }
 axum = { version = "0.8", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "sync", "macros"] }

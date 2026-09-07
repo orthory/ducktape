@@ -12,7 +12,7 @@
 //! this exercises the TRANSPORT BINDING, not the qmdb sync engine: the served
 //! host and `SyncServer` are plain async (no commonware runtime), so the sim's
 //! tokio clock and the RPC protocol compose without nesting two runtimes. the
-//! qmdb resolver lane (`RemoteQmdbResolver`) needs a commonware context and is
+//! qmdb resolver lane (`RemoteQmdbSource`) needs a commonware context and is
 //! proven separately in `remote_kv_sync.rs`.
 
 use std::collections::HashSet;

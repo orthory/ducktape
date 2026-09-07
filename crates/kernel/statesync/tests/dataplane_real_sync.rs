@@ -32,7 +32,7 @@ use host::{FinalizedBlock, Host};
 use kv::{Kv, KvMsg, encode as kv_encode};
 use sdk::{Module as _, Msg};
 use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, write_frame};
-use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
+use statesync::qmdb::{QmdbStore, RemoteQmdbSource};
 use statesync::{PayloadKind, SyncServer, fetch_manifest};
 
 use commonware_runtime::{Runner as _, Supervisor as _};
@@ -209,7 +209,7 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
                 .expect("resolver entry carries a pinned target")
                 .to_sync_target()
                 .expect("pinned target range is non-empty");
-            let resolver = RemoteQmdbResolver::new(client.clone(), manifest.boundary_id(), "kv");
+            let resolver = RemoteQmdbSource::new(client.clone(), manifest.boundary_id(), "kv");
 
             // every op batch crosses a real TcpStream, opened by the sync
             // engine through DataPlaneSyncClient, merkle-verified against the
