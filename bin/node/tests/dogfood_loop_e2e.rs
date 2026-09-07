@@ -1,51 +1,14 @@
-//! the agent dogfooding loop, end to end on REAL `ducktape` validators:
-//! issue mention → forge-workspace run → PR, then a PR-scoped work session.
+//! Real-validator agent loop: issue mention, sandboxed work, host commit and
+//! push, program-authored progress and final replies, then a Forge PR.
 //!
-//!   1. a repo is born by its first push; an issue opens (item #1, hidden
-//!      channel `forge:<repo>:1`); the agent is registered with forge caps
-//!      and its programmable account is bound.
-//!   2. mentioning the agent runs the provider INSIDE a real git clone of the
-//!      repo, detached at the pinned dev tip; the host commits + pushes branch
-//!      `agent/item-1` through consensus and the PR sink opens a PR whose
-//!      title is the bound Forge issue title.
-//!   3. mentioning in the PR's channel forks its source tip into the PR item's
-//!      OWN agent branch and opens a child PR targeting the original branch.
-//!      The original branch stays unchanged.
-//!   4. another mention in that same PR channel continues its agent branch;
-//!      the duplicate guard reuses the child PR. Each commit's parent and
-//!      recorded detached HEAD prove the session's exact base.
+//! The scripted provider calls `ducktape_reply` through the real MCP server
+//! inside Firecracker. It records the MCP receipt and its detached Git HEAD
+//! in the workspace; the test reads both from the host-pushed commit.
+//! Subsequent runs in the PR channel prove branch continuation and PR reuse.
+//! Host-side concurrent push/rebase behavior is covered by the provisioner's
+//! `forge_tests` suite.
 //!
-//! ## a run is sandboxed, and that changed what this test can see
-//!
-//! The provider executes INSIDE a microVM, so this suite needs a
-//! `[sandbox]` table (without one every compute daemon exits at boot — the
-//! reason this file spent weeks passing nothing) and its script cannot touch a
-//! host path: the fixture directory does not exist in the guest. Evidence
-//! crosses the boundary through the workspace image, which the host reads
-//! back, commits, and pushes. Each run writes [`HEAD_FILE`], and the test reads it back
-//! out of committed git history, which is a stronger claim than the old
-//! host-side trace log: the authenticated push records it in the run's branch.
-//!
-//! `.git/HEAD` is read with `cat`, not `git rev-parse`: a detached HEAD holds
-//! the raw oid, so the whole proof (WHICH commit, and that it is DETACHED) is
-//! one file read, without requiring a guest Git client.
-//!
-//! ## what this file no longer covers, and why
-//!
-//! It used to end with an ordering proof: the provider script itself advanced
-//! the work branch through the node's loopback forge remote, so the host's push
-//! rejected and the provisioner had to rebase. A run's guest has no route to
-//! its own node — it gets no tap device at all, and its vsock tunnels reach
-//! only its broker port and the run RPC — so a provider CANNOT race a push
-//! any more, and a scenario that cannot happen is not a regression this suite
-//! can hold. The property
-//! itself is covered where it lives, against the provisioner:
-//! `crates/noded/src/agent_provision/forge_tests.rs`'s
-//! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the
-//! merge-preserving and author-preservation variants beside it).
-//!
-//! run alone (cluster e2es flake under parallel load):
-//!   cargo test -p node-bin --test dogfood_loop_e2e -- --nocapture
+//! Run alone: cargo test -p node-bin --test dogfood_loop_e2e -- --nocapture
 
 mod common;
 
@@ -86,8 +49,8 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 ///
 /// It runs inside the microVM and calls the real `ducktape mcp` tool through
 /// the scoped action tunnel before returning its final result. Its writable
-/// surface is the workspace it was handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
-/// and answers on stdout.
+/// surface is the workspace it was handed. It records `pwd|HEAD` into
+/// [`HEAD_FILE`], which the host commits, and answers on stdout.
 ///
 /// The behaviour rides the spec's ARGV, not a staged `provider.sh`: a microVM
 /// mounts nothing from the host, so an executor a node lends has to already be
