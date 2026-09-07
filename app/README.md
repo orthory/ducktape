@@ -28,8 +28,10 @@ for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
 `target/views/<module>_view.wasm`, where a built binary looks for it
-(`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-binary); `make dev` and `make app` run it first. A tab whose view is not
+(`DUCKTAPE_VIEWS_DIR` overrides; the bundle's `resources` metadata carries the
+directory into `Ducktape.app` beside the executable, and the Linux
+`make install-app` copies it beside the binary); `make dev` and `make app` run
+it first. A tab whose view is not
 staged says so in its place.
 
 A view is a pure function of the props the app pushes it (`<module>.props`,

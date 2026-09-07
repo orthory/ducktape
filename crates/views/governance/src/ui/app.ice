@@ -67,6 +67,133 @@ on gov_execute(proposal_id)
   return if !connected || !empty(voting)
   let _sent = execute(proposal_id)
 
+// The card's pieces as components — the tree target inlines a component
+// use now instead of lowering it to native layout memoization.
+
+component ProposalKindPill(action:str)
+  col #root
+    if proposal_kind_tone(action) == "access"
+      box
+        with
+          px=6.0
+          py=2.0
+          bg=brand_bg
+          r=4.0
+        text action
+          with
+            size=9.0
+            @text-brand
+            @font-mono
+            @font-semibold
+    if proposal_kind_tone(action) != "access"
+      box
+        with
+          px=6.0
+          py=2.0
+          bg=elevated
+          r=4.0
+        text action
+          with
+            size=9.0
+            @text-avatar_fg_sm
+            @font-mono
+            @font-semibold
+
+component QuorumDot(filled:bool)
+  col #root
+    if filled
+      box
+        with
+          w=13.0
+          h=13.0
+          bg=success_dot
+          r=6.5
+        space w=1.0 h=1.0
+    if !filled
+      box
+        with
+          w=13.0
+          h=13.0
+          bg=surface
+          border=presence_off
+          border-w=1.5
+          r=6.5
+        space w=1.0 h=1.0
+
+component SettledProposalRow(proposal:ProposalRow)
+  box #root
+    with
+      w=fill
+      px=15.0
+      py=13.0
+      bg=surface
+      border=separator
+      border-w=1.0
+      r=10.0
+    row
+      with
+        w=fill
+        gap=11.0
+        align=center
+      box
+        with
+          w=19.0
+          h=19.0
+          align-x=center
+          align-y=center
+          bg=success_bg
+          border=success_line
+          border-w=1.0
+          r=9.5
+        text "✓"
+          with
+            size=9.0
+            @text-success
+            @font-mono
+            @font-semibold
+      text proposal.id
+        with
+          size=13.0
+          @text-muted
+          @font-medium
+      space w=fill
+      row gap=5.0 align=center
+        text proposal.status
+          with
+            size=11.0
+            @text-meta
+            @font-mono
+            @font-medium
+        text "·"
+          with
+            size=11.0
+            @text-meta
+            @font-mono
+            @font-medium
+        text tally_label(proposal.approvals, proposal.required_yes)
+          with
+            size=11.0
+            @text-meta
+            @font-mono
+            @font-medium
+        // NO ✓ WITHOUT A HEIGHT BEHIND IT: a row whose op
+        // predates the settle fold has 0 and prints nothing
+        // rather than `h 0`.
+        if proposal.settled_height > 0
+          text "·"
+            with
+              size=11.0
+              @text-meta
+              @font-mono
+              @font-medium
+        if proposal.settled_height > 0
+          text height_label_short(proposal.settled_height)
+            with
+              size=11.0
+              @text-meta
+              @font-mono
+              @font-medium
+
 view
   box #root
     with
@@ -247,32 +374,7 @@ view
                           align=center
                         // ACCESS-class proposals wear the terracotta pair;
                         // everything else is neutral.
-                        if proposal_kind_tone(proposal.action) == "access"
-                          box
-                            with
-                              px=6.0
-                              py=2.0
-                              bg=brand_bg
-                              r=4.0
-                            text proposal.action
-                              with
-                                size=9.0
-                                @text-brand
-                                @font-mono
-                                @font-semibold
-                        if proposal_kind_tone(proposal.action) != "access"
-                          box
-                            with
-                              px=6.0
-                              py=2.0
-                              bg=elevated
-                              r=4.0
-                            text proposal.action
-                              with
-                                size=9.0
-                                @text-avatar_fg_sm
-                                @font-mono
-                                @font-semibold
+                        ProposalKindPill action=proposal.action
                         text proposal.id
                           with
                             w=fill
@@ -317,24 +419,7 @@ view
                           pt=9.0
                         row gap=5.0 align=center
                           for seat in quorum_dots(proposal.approvals, proposal.required_yes)
-                            if seat.filled
-                              box
-                                with
-                                  w=13.0
-                                  h=13.0
-                                  bg=success_dot
-                                  r=6.5
-                                space w=1.0 h=1.0
-                            if !seat.filled
-                              box
-                                with
-                                  w=13.0
-                                  h=13.0
-                                  bg=surface
-                                  border=presence_off
-                                  border-w=1.5
-                                  r=6.5
-                                space w=1.0 h=1.0
+                            QuorumDot filled=seat.filled
                         // `3 / 4` in one mono run: grey until one signature
                         // from quorum, then green
                         if tally_tone(proposal.approvals, proposal.required_yes) == "near"
@@ -414,75 +499,4 @@ view
               // A settled proposal: a tick, the title, and the tally it
               // closed on.
               for proposal in settled_proposals(rows)
-                box
-                  with
-                    w=fill
-                    px=15.0
-                    py=13.0
-                    bg=surface
-                    border=separator
-                    border-w=1.0
-                    r=10.0
-                  row
-                    with
-                      w=fill
-                      gap=11.0
-                      align=center
-                    box
-                      with
-                        w=19.0
-                        h=19.0
-                        align-x=center
-                        align-y=center
-                        bg=success_bg
-                        border=success_line
-                        border-w=1.0
-                        r=9.5
-                      text "✓"
-                        with
-                          size=9.0
-                          @text-success
-                          @font-mono
-                          @font-semibold
-                    text proposal.id
-                      with
-                        size=13.0
-                        @text-muted
-                        @font-medium
-                    space w=fill
-                    row gap=5.0 align=center
-                      text proposal.status
-                        with
-                          size=11.0
-                          @text-meta
-                          @font-mono
-                          @font-medium
-                      text "·"
-                        with
-                          size=11.0
-                          @text-meta
-                          @font-mono
-                          @font-medium
-                      text tally_label(proposal.approvals, proposal.required_yes)
-                        with
-                          size=11.0
-                          @text-meta
-                          @font-mono
-                          @font-medium
-                      // NO ✓ WITHOUT A HEIGHT BEHIND IT: a row whose op
-                      // predates the settle fold has 0 and prints nothing
-                      // rather than `h 0`.
-                      if proposal.settled_height > 0
-                        text "·"
-                          with
-                            size=11.0
-                            @text-meta
-                            @font-mono
-                            @font-medium
-                      if proposal.settled_height > 0
-                        text height_label_short(proposal.settled_height)
-                          with
-                            size=11.0
-                            @text-meta
-                            @font-mono
-                            @font-medium
+                SettledProposalRow proposal=proposal
