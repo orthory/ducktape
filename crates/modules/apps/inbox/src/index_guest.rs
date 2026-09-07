@@ -4,9 +4,13 @@
 use index_guest::Fail;
 use index_guest::guest::{self as ig, Change};
 
+/// the attribution module's genesis-constant id: the one origin whose
+/// applied ops fold as deliveries (the same id the module shell wires).
+const ATTRIBUTION_ID: &str = "attribution";
+
 fn fold(changes: Vec<Change>) -> Result<(), Fail> {
     for op in ig::ops(changes)? {
-        ig::apply(crate::index::fold_op(&op, &ig::EngineRead)?)?;
+        ig::apply(crate::index::fold_op(&op, &ig::EngineRead, ATTRIBUTION_ID)?)?;
     }
     Ok(())
 }

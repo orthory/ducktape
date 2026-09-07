@@ -7,13 +7,15 @@
 //! validator produces, and it deliberately carries every shape a naive "export
 //! live records and re-apply sorted" could not reproduce:
 //!
-//! * record OVERWRITES — a recipe update, and a dispatch walking
-//!   AwaitingResult → AwaitingDelivery → Delivered,
-//! * record DELETES — a removed recipe, and the mailbox entries the delivery
-//!   sweep drains,
-//! * the DELIVERED receipt whose outcome payload was dropped at delivery (the
+//! * record OVERWRITES — a recipe update, a dispatch walking
+//!   AwaitingResult → AwaitingDelivery → Delivered, and a call walking
+//!   Queued → Completed → Delivered,
+//! * record DELETES — a removed recipe, and the mailbox entries the host's
+//!   acknowledgments retire,
+//! * the DELIVERED receipts whose outcome bytes were dropped at delivery (the
 //!   retention rule) sitting next to a still-PENDING delivery whose outcome is
-//!   still in its record and whose mailbox entry still rides the cursor.
+//!   still in its record and whose mailbox entry still rides the cursor, and a
+//!   still-QUEUED call whose claim and record ride the call cursor.
 //!
 //! a [`DispatchModule`] consumes its injected store, so the handoff-as-resolver
 //! form is only reachable on the raw store: REOPEN the committed partitions
@@ -22,16 +24,26 @@
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::{
-    AdmissionPolicy, DispatchModule, DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus,
-    DispatchView, OutputContract, Recipe, Routing, decode_reply, encode_msg, encode_query,
+    AdmissionPolicy, CallOutcome, CallStatus, CallView, DispatchModule, DispatchMsg, DispatchQuery,
+    DispatchReply, DispatchStatus, DispatchView, OutputContract, PendingCall, Recipe, Routing,
+    decode_reply, encode_msg, encode_query,
 };
+use identity::{AccountView, Control, IdentityQuery, IdentityReply, ProgramStanding};
 use saga::{SagaCallback, SagaOutcome, encode_callback};
-use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{
+    Ack, CallId, Cause, DeliveryOutcome, Env, Error, MerkleStore as _, Module, Msg, Origin,
+    StateRoot, StateSyncHandle,
+};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
 const DISPATCH: &str = "dispatch";
 const SAGA: &str = "saga";
+const IDENTITY: &str = "identity";
+/// the module that queues calls, and the executor identity names for the
+/// program account they run as.
+const RUNS: &str = "runs";
+const PROGRAM: u64 = 7;
 
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
@@ -39,21 +51,88 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: 1_000 + height,
         origin,
         me: DISPATCH.into(),
+        cause: Cause::Direct,
+    })
+}
+
+/// the requester's ctx: identity serves [`PROGRAM`] as an active program
+/// executed by `runs`, which a `Call` is admitted against.
+fn requester_ctx(height: u64) -> TestCtx {
+    ctx(height, Origin::Module(RUNS.into())).on_query(IDENTITY, |req| {
+        let IdentityQuery::Get { number } = identity::decode_query(req).map_err(Error::Module)?
+        else {
+            return Err(Error::Module("only Get is served here".into()));
+        };
+        let account = (number == PROGRAM).then(|| AccountView {
+            number,
+            name: "program".into(),
+            control: Control::Program {
+                controller: 1,
+                executor: RUNS.into(),
+                generation: 0,
+                standing: ProgramStanding::Active,
+            },
+            keys: Vec::new(),
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        });
+        Ok(identity::encode_reply(&IdentityReply::Account(account)))
     })
 }
 
 /// drive one op through the REAL module path: execute + commit_block (one op
 /// per block height), so the committed op log is what a validator produces.
 async fn apply(module: &mut DispatchModule, height: u64, origin: Origin, payload: Vec<u8>) {
+    apply_with(module, ctx(height, origin), payload).await;
+}
+
+async fn apply_with(module: &mut DispatchModule, mut ctx: TestCtx, payload: Vec<u8>) {
     let msg = Msg {
         target: DISPATCH.into(),
         payload,
     };
-    module
-        .execute(&mut ctx(height, origin), &msg)
-        .await
-        .expect("op applies");
+    module.execute(&mut ctx, &msg).await.expect("op applies");
     module.commit_block().await.expect("commit");
+}
+
+/// the host's between-block pump for one boundary: read the committed mailbox
+/// head, acknowledge every item as applied, commit the delivery unit.
+async fn deliver_all(module: &mut DispatchModule, height: u64) -> usize {
+    let items = module.pending_items().await.expect("a well-formed mailbox");
+    for item in &items {
+        module
+            .acknowledge(
+                &mut ctx(height, Origin::System),
+                &Ack {
+                    item: item.item,
+                    target: item.target.clone(),
+                    outcome: DeliveryOutcome::Applied,
+                },
+            )
+            .await
+            .expect("ack");
+    }
+    module.commit_block().await.expect("commit");
+    items.len()
+}
+
+fn call_id(step: u64) -> CallId {
+    CallId {
+        requester: RUNS.into(),
+        invocation: "run-1".into(),
+        step,
+    }
+}
+
+fn call_op(step: u64) -> Vec<u8> {
+    encode_msg(&DispatchMsg::Call {
+        invocation: "run-1".into(),
+        step,
+        account: PROGRAM,
+        target: "chat".into(),
+        payload: b"the call input".to_vec(),
+    })
 }
 
 /// the saga's terminal callback for `key` — the intake that records the checked
@@ -133,12 +212,35 @@ async fn pending(module: &DispatchModule) -> u64 {
     }
 }
 
+async fn pending_calls(module: &DispatchModule) -> Vec<PendingCall> {
+    let reply = module
+        .query(&encode_query(&DispatchQuery::PendingCalls))
+        .await
+        .expect("pending calls");
+    match decode_reply(&reply).expect("decode") {
+        DispatchReply::PendingCalls(calls) => calls,
+        other => panic!("expected PendingCalls, got {other:?}"),
+    }
+}
+
+async fn call(module: &DispatchModule, step: u64) -> Option<CallView> {
+    let reply = module
+        .query(&encode_query(&DispatchQuery::Call { id: call_id(step) }))
+        .await
+        .expect("call");
+    match decode_reply(&reply).expect("decode") {
+        DispatchReply::Call(view) => view,
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
 #[test]
 fn synced_store_reconstructs_source_root_and_every_read() {
     deterministic::Runner::default().start(|context| async move {
         let mut src = DispatchModule::new(
             DISPATCH,
             SAGA,
+            IDENTITY,
             Box::new(QmdbStore::init(context.child("src"), "src").await),
         );
         let owner = Origin::External(b"owner".to_vec());
@@ -172,29 +274,41 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         )
         .await;
 
-        // two dispatches. `done` runs the FULL lifecycle and ends Delivered —
-        // its outcome payload dropped, its mailbox entry deleted. `live` stops
-        // at AwaitingDelivery, so its outcome IS in the record and its mailbox
-        // entry rides the committed cursor.
+        // two dispatches and two calls. `done` and call 0 run the FULL
+        // lifecycle and end Delivered — their outcome bytes dropped, their
+        // mailbox entries deleted. `live` stops at AwaitingDelivery, so its
+        // outcome IS in the record and its mailbox entry rides the committed
+        // cursor; call 1 stays Queued, so its claim and record ride the call
+        // cursor.
         apply(&mut src, 5, caller.clone(), dispatch_op("done")).await;
         apply(&mut src, 6, caller.clone(), dispatch_op("live")).await;
+        apply_with(&mut src, requester_ctx(7), call_op(0)).await;
+        apply_with(&mut src, requester_ctx(8), call_op(1)).await;
         callback(
             &mut src,
-            7,
+            9,
             "caller\x1fdone",
             SagaOutcome::Done(b"the whole result".to_vec()),
         )
         .await;
         apply(
             &mut src,
-            8,
+            10,
             Origin::System,
-            encode_msg(&DispatchMsg::DeliverPending {}),
+            encode_msg(&DispatchMsg::CompleteCall {
+                enqueued: 0,
+                id: call_id(0),
+                outcome: CallOutcome::Applied {
+                    output: b"the call output".to_vec(),
+                    assigned: b"stamp".to_vec(),
+                },
+            }),
         )
         .await;
+        assert_eq!(deliver_all(&mut src, 11).await, 2);
         callback(
             &mut src,
-            9,
+            12,
             "caller\x1flive",
             SagaOutcome::Failed("provider died".into()),
         )
@@ -214,6 +328,10 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let src_done = view(&src, "done").await.expect("the receipt survives");
         let src_live = view(&src, "live").await.expect("the pending delivery");
         assert_eq!(pending(&src).await, 1);
+        let src_call_done = call(&src, 0).await.expect("the call receipt survives");
+        let src_call_queued = call(&src, 1).await.expect("the queued call");
+        let src_pending_calls = pending_calls(&src).await;
+        assert_eq!(src_pending_calls.len(), 1);
 
         // the module consumed its store, so REOPEN the committed partitions as
         // a bare store for the handoff (drop first — one owner at a time).
@@ -232,7 +350,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = DispatchModule::new(DISPATCH, SAGA, Box::new(store));
+        let synced = DispatchModule::new(DISPATCH, SAGA, IDENTITY, Box::new(store));
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -253,19 +371,44 @@ fn synced_store_reconstructs_source_root_and_every_read() {
 
         // the DELIVERED receipt rode the sync with its payload dropped...
         assert_eq!(view(&synced, "done").await, Some(src_done.clone()));
-        assert_eq!(src_done.status, DispatchStatus::Delivered);
+        assert_eq!(
+            src_done.status,
+            DispatchStatus::Delivered {
+                delivery: DeliveryOutcome::Applied
+            }
+        );
         assert_eq!(
             src_done.outcome, None,
             "delivery dropped this module's copy"
         );
 
         // ...and the still-PENDING delivery kept its outcome AND its mailbox
-        // entry, so the joiner's host will inject exactly one more delivery.
+        // entry, so the joiner's host will deliver exactly one more item.
         assert_eq!(view(&synced, "live").await, Some(src_live.clone()));
         assert_eq!(src_live.status, DispatchStatus::AwaitingDelivery);
         assert_eq!(src_live.outcome, Some(Err("provider died".into())));
         assert_eq!(pending(&synced).await, 1);
 
         assert_eq!(view(&synced, "never-dispatched").await, None);
+
+        // the call queue rode the sync whole: the delivered call's receipt
+        // (outcome reduced to its summary), the queued call with its claim,
+        // and the committed head batch the joiner's host will run next.
+        assert_eq!(call(&synced, 0).await, Some(src_call_done.clone()));
+        assert!(
+            matches!(
+                src_call_done.status,
+                CallStatus::Delivered {
+                    delivery: DeliveryOutcome::Applied,
+                    ..
+                }
+            ),
+            "got {:?}",
+            src_call_done.status
+        );
+        assert_eq!(call(&synced, 1).await, Some(src_call_queued.clone()));
+        assert_eq!(src_call_queued.status, CallStatus::Queued);
+        assert_eq!(pending_calls(&synced).await, src_pending_calls);
+        assert_eq!(call(&synced, 2).await, None);
     });
 }

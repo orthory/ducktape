@@ -23,13 +23,13 @@ fn retired_tagged_trigger_shape_rejects_loudly() {
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AutomationsReply, decode_reply, encode_msg, encode_query};
+use attribution::{AttributionMsg, decode_msg as attribution_decode_msg};
 use chat::{
     Block, Channel, Mark, MessageHead, MessageView, PostPolicy, Span,
     decode_msg as chat_decode_msg, decode_query as chat_decode_query,
     encode_event as chat_encode_event, encode_reply as chat_encode_reply,
 };
 use futures::executor::block_on;
-use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
 use sdk::{Env, Event};
 use sdk_testkit::{MemStore, TestCtx};
 use tasks::{
@@ -38,10 +38,9 @@ use tasks::{
 
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
-const INBOX: &str = "inbox";
+const ATTRIBUTION: &str = "attribution";
+const IDENTITY: &str = "identity";
 const ME: &str = "automations";
-/// the default admin submitter, and therefore the owner of every rule these
-/// tests create: only an authenticated EXTERNAL origin may own a rule.
 const OWNER: &[u8] = b"owner";
 /// a second submitter, who owns nothing.
 const STRANGER: &[u8] = b"stranger";
@@ -60,7 +59,7 @@ struct CaptureCtx {
     /// open, which is what chat answers for a channel nobody restricted.
     members_only: BTreeSet<String>,
     /// (channel, user) pairs chat reports as members.
-    members: BTreeSet<(String, Vec<u8>)>,
+    members: BTreeSet<(String, u64)>,
     /// the task list served to the tasks probe.
     tasks: Vec<Task>,
     msgs: Vec<Msg>,
@@ -81,6 +80,7 @@ impl CaptureCtx {
                 // tests swap it with `with_chat_origin`.
                 origin: Origin::External(OWNER.to_vec()),
                 me: ME.into(),
+                cause: sdk::Cause::Direct,
             },
             transcripts: BTreeMap::new(),
             channels: BTreeSet::new(),
@@ -113,20 +113,18 @@ impl CaptureCtx {
             id: task_id.into(),
             title: task_id.into(),
             status: TaskStatus::Open,
-            owner: "test".into(),
+            owner: tasks::Party::Module("test".into()),
             created_at: 0,
             updated_at: 0,
         });
         self
     }
-    /// seed a task already owned by `owner`'s actor string — how the
-    /// `OwnerOpenCount` probe (#1740) sees a rule owner already at cap.
     fn with_task_owned_by(mut self, task_id: &str, owner: &[u8]) -> Self {
         self.tasks.push(Task {
             id: task_id.into(),
             title: task_id.into(),
             status: TaskStatus::Open,
-            owner: owner_queue(owner),
+            owner: tasks::Party::Account(account_of(owner)),
             created_at: 0,
             updated_at: 0,
         });
@@ -138,7 +136,7 @@ impl CaptureCtx {
         self.channels.insert(channel.into());
         self.members_only.insert(channel.into());
         for member in members {
-            self.members.insert((channel.into(), member.to_vec()));
+            self.members.insert((channel.into(), account_of(member)));
         }
         self
     }
@@ -164,11 +162,11 @@ impl CaptureCtx {
             .map(|m| tasks_decode_msg(&m.payload).expect("task msg"))
             .collect()
     }
-    fn inbox_msgs(&self) -> Vec<InboxMsg> {
+    fn report_msgs(&self) -> Vec<AttributionMsg> {
         self.msgs
             .iter()
-            .filter(|m| m.target == INBOX)
-            .map(|m| inbox_decode_msg(&m.payload).expect("inbox msg"))
+            .filter(|m| m.target == ATTRIBUTION)
+            .map(|m| attribution_decode_msg(&m.payload).expect("attribution msg"))
             .collect()
     }
 }
@@ -186,6 +184,7 @@ impl Ctx for CaptureCtx {
             return Err(Error::Module("query failed".into()));
         }
         match target {
+            IDENTITY => identity_probe(req),
             CHAT => match chat_decode_query(req).map_err(Error::Module)? {
                 ChatQuery::MessagesRange {
                     channel_id,
@@ -218,7 +217,8 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
-                        owner: None,
+                        owner: Party::System,
+                        revision: 0,
                         archived: false,
                     });
                     Ok(chat_encode_reply(&ChatReply::Channel(channel)))
@@ -227,9 +227,11 @@ impl Ctx for CaptureCtx {
                 // was not told about is OPEN, mirroring `PostPolicy::Open`:
                 // channel EXISTENCE is probe 1's job, and the real chat's
                 // closed answer for an absent channel has its own test there.
-                ChatQuery::Access { channel_id, user } => {
+                ChatQuery::Access { channel_id, party } => {
                     let is_restricted = self.members_only.contains(&channel_id);
-                    let is_member = self.members.contains(&(channel_id, user));
+                    let is_member = party
+                        .account()
+                        .is_some_and(|account| self.members.contains(&(channel_id, account)));
                     let admitted = !is_restricted || is_member;
                     Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
                         may_read: admitted,
@@ -277,11 +279,18 @@ impl Ctx for CaptureCtx {
 // ---- fixtures -----------------------------------------------------------
 
 fn module() -> Automations {
-    Automations::new(ME, Box::new(MemStore::new()), CHAT, TASKS, INBOX)
+    Automations::new(
+        ME,
+        Box::new(MemStore::new()),
+        CHAT,
+        TASKS,
+        IDENTITY,
+        ATTRIBUTION,
+    )
 }
 
-fn user(byte: u8) -> AuthorRef {
-    AuthorRef::User(vec![byte; 4])
+fn user(byte: u8) -> Party {
+    Party::Key(vec![byte; 4])
 }
 
 fn post_trigger(channel: Option<&str>, text_contains: Option<&str>) -> Trigger {
@@ -306,19 +315,16 @@ fn task_action(prefix: &str, title: &str) -> Action {
     }
 }
 
-fn inbox_action(member: &str, kind: &str, body: &str) -> Action {
-    Action::DeliverInbox {
-        member_template: member.into(),
+fn report_action(recipient: u64, kind: &str, body: &str) -> Action {
+    Action::Report {
+        recipient,
         kind: kind.into(),
         body_template: body.into(),
     }
 }
 
-/// a `DeliverInbox` action whose `member_template` is the ONLY value
-/// `CreateRule` accepts for `owner`: `owner`'s own literal inbox queue (#1739
-/// — a rule may deliver only to its own owner, never a foreign member).
-fn owner_inbox_action(owner: &[u8], kind: &str, body: &str) -> Action {
-    inbox_action(&owner_queue(owner), kind, body)
+fn owner_report_action(owner: &[u8], kind: &str, body: &str) -> Action {
+    report_action(account_of(owner), kind, body)
 }
 
 fn admin(m: &AutomationsMsg) -> Msg {
@@ -337,7 +343,7 @@ fn create(rule_id: &str, trigger: Trigger, action: Action) -> Msg {
 }
 
 /// a hook event as chat delivers it: raw ChatEvent bytes.
-fn posted(channel: &str, seq: u64, author: AuthorRef, mentions: Vec<AuthorRef>) -> Msg {
+fn posted(channel: &str, seq: u64, author: Party, mentions: Vec<u64>) -> Msg {
     Msg {
         target: ME.into(),
         payload: chat_encode_event(&ChatEvent::MessagePosted {
@@ -350,15 +356,24 @@ fn posted(channel: &str, seq: u64, author: AuthorRef, mentions: Vec<AuthorRef>) 
     }
 }
 
-fn message(channel: &str, seq: u64, author: AuthorRef, blocks: Vec<Block>) -> MessageView {
+fn message(channel: &str, seq: u64, author: Party, blocks: Vec<Block>) -> MessageView {
+    let origin = match &author {
+        Party::Account(account) => Origin::Program(*account),
+        Party::Key(key) => Origin::External(key.clone()),
+        Party::Module(id) => Origin::Module(id.clone()),
+        Party::System => Origin::System,
+    };
     MessageView {
         channel_id: channel.into(),
         seq,
         head: MessageHead {
             message_id: format!("{channel}-m{seq}"),
+            origin: origin.clone(),
+            content_origin: origin,
             author,
             blocks,
             created_at: 0,
+            revision: 0,
             rev: 0,
             edited_at: None,
             base_rev: None,
@@ -469,10 +484,6 @@ fn duplicate_rule_id_is_rejected() {
     assert!(matches!(err, Error::Module(msg) if msg.contains("already exists")));
 }
 
-/// #1741: `MAX_RULES_PER_OWNER` refuses the (N+1)th rule for THAT owner while
-/// a different owner is unaffected — the tasks board's per-owner cap shape
-/// applied to the rule roster, so one account can no longer permanently own
-/// the whole registry.
 #[test]
 fn per_owner_rule_cap_refuses_the_next_create_for_that_owner_only() {
     let mut m = module();
@@ -636,7 +647,6 @@ fn caps_are_enforced_at_execute() {
         .is_err()
     );
 
-    // empty inbox kind.
     assert!(
         exec(
             &mut m,
@@ -644,13 +654,12 @@ fn caps_are_enforced_at_execute() {
             &create(
                 "inbox-empty-kind",
                 post_trigger(None, None),
-                inbox_action("alice", "", "body")
+                report_action(account_of(OWNER), "", "body")
             ),
         )
         .is_err()
     );
 
-    // oversized inbox kind.
     assert!(
         exec(
             &mut m,
@@ -658,7 +667,7 @@ fn caps_are_enforced_at_execute() {
             &create(
                 "inbox-big-kind",
                 post_trigger(None, None),
-                inbox_action("alice", &"k".repeat(65), "body")
+                report_action(account_of(OWNER), &"k".repeat(65), "body")
             ),
         )
         .is_err()
@@ -672,7 +681,6 @@ fn caps_are_enforced_at_execute() {
 #[test]
 fn hook_event_from_non_chat_origin_is_rejected() {
     let mut m = module();
-    // an explicit HookEvent wrapper from an external submitter is a spoof.
     let mut ext = CaptureCtx::new().with_origin(Origin::External(vec![9; 4]));
     let err = exec(
         &mut m,
@@ -703,7 +711,7 @@ fn a_rule_records_its_creator_and_only_the_creator_administers_it() {
     block_on(m.commit_block()).expect("commit");
     assert_eq!(
         get_rule(&m, "r").expect("r").owner,
-        OWNER,
+        account_of(OWNER),
         "the submitter of CreateRule is the rule's owner"
     );
 
@@ -783,14 +791,11 @@ fn a_stranger_cannot_walk_past_the_gate_on_a_no_op_set_enabled() {
 
 #[test]
 fn an_ownerless_rule_is_unrepresentable() {
-    // only an authenticated external submitter may own a rule, so every other
-    // origin is refused at CreateRule — there is no shape in which a rule
-    // exists without a principal answerable for it.
     let mut m = module();
     for (origin, refusal) in [
-        (Origin::System, "system origin"),
-        (Origin::Module("automations".into()), "module origin"),
-        (Origin::Module("governance".into()), "module origin"),
+        (Origin::System, "account origin"),
+        (Origin::Module("automations".into()), "account origin"),
+        (Origin::Module("governance".into()), "account origin"),
         (Origin::External(Vec::new()), "non-empty submitter id"),
     ] {
         let mut ctx = CaptureCtx::new().with_origin(origin.clone());
@@ -811,11 +816,6 @@ fn an_ownerless_rule_is_unrepresentable() {
 
 #[test]
 fn creating_a_rule_is_gated_but_firing_one_is_not() {
-    // the two principals are different and must stay so: a rule is CREATED by
-    // its owner's external origin, and RUN under `Origin::Module("automations")`.
-    // the hook lane is routed before the owner gate, so a chat event still
-    // fires the rule and its action still leaves as a module-authority
-    // follow-up — while the module's own origin cannot mint a rule.
     let mut m = module();
     let mut owner = CaptureCtx::new();
     exec(
@@ -838,16 +838,16 @@ fn creating_a_rule_is_gated_but_firing_one_is_not() {
         vec![TaskMsg::CreateTask {
             task_id: "auto-general-1".into(),
             title: "T".into(),
-            owner: Some(OWNER.to_vec()),
+            owner: Some(account_of(OWNER)),
         }],
         "the owner-gated rule still fires under module authority, and the \
          created task is attributed to the RULE OWNER, never this module"
     );
-    assert_eq!(get_rule(&m, "r").expect("r").owner, OWNER);
+    assert_eq!(get_rule(&m, "r").expect("r").owner, account_of(OWNER));
 }
 
 #[test]
-fn only_user_authored_posts_fire() {
+fn automatic_posts_do_not_recursively_fire_rules() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -866,7 +866,7 @@ fn only_user_authored_posts_fire() {
         &posted(
             "general",
             1,
-            AuthorRef::Module("automations".into()),
+            Party::Module("automations".into()),
             Vec::new(),
         ),
     )
@@ -992,7 +992,9 @@ fn post_message_fire_reads_chat_via_testkit_on_query() {
         consensus_time: 42,
         origin: Origin::Module(CHAT.into()),
         me: ME.into(),
+        cause: sdk::Cause::Direct,
     })
+    .on_query(IDENTITY, identity_probe)
     .on_query(CHAT, |req| {
         match chat_decode_query(req).map_err(Error::Module)? {
             ChatQuery::Channel { channel_id } => {
@@ -1005,7 +1007,8 @@ fn post_message_fire_reads_chat_via_testkit_on_query() {
                     hooks: Vec::new(),
                     pinned: Vec::new(),
                     huddle: Vec::new(),
-                    owner: None,
+                    owner: Party::System,
+                    revision: 0,
                     archived: false,
                 }))))
             }
@@ -1070,7 +1073,7 @@ fn channel_filter_gates_matching() {
 }
 
 #[test]
-fn mention_filter_matches_agent_display() {
+fn mention_filter_matches_account_identity() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1080,7 +1083,7 @@ fn mention_filter_matches_agent_display() {
             "r",
             Trigger {
                 channel_id: None,
-                mention: Some("helper".into()),
+                mention: Some("acct:1234".into()),
                 text_contains: None,
             },
             task_action("t", "T"),
@@ -1089,16 +1092,13 @@ fn mention_filter_matches_agent_display() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let helper = AuthorRef::Agent {
-        module: "agent".into(),
-        agent_id: "helper".into(),
-    };
+    let helper = 1234;
     // mention present -> fire.
     let mut hit = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
         &mut hit,
-        &posted("general", 1, user(1), vec![helper.clone()]),
+        &posted("general", 1, user(1), vec![helper]),
     )
     .expect("fire");
     assert_eq!(hit.task_msgs().len(), 1);
@@ -1167,7 +1167,7 @@ fn text_contains_filter_fetches_message_once() {
 }
 
 #[test]
-fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
+fn chat_trigger_reports_with_chat_placeholders() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1176,7 +1176,7 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
         &create(
             "notify-chat",
             post_trigger(Some("general"), None),
-            owner_inbox_action(
+            owner_report_action(
                 OWNER,
                 "chat",
                 "channel={channel} seq={seq} author={author} text={text} mention={mention}",
@@ -1186,10 +1186,7 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mentioned = AuthorRef::Agent {
-        module: "agent".into(),
-        agent_id: "helper".into(),
-    };
+    let mentioned = 1234;
     let msg = message(
         "general",
         1,
@@ -1206,37 +1203,36 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     )
     .expect("fire");
 
-    let delivered = chat_ctx.inbox_msgs();
+    let delivered = chat_ctx.report_msgs();
     assert_eq!(delivered.len(), 1);
-    let InboxMsg::Deliver { member, kind, body } = &delivered[0] else {
-        panic!("expected Deliver");
+    let AttributionMsg::Attribute {
+        object,
+        actor,
+        relations,
+        ..
+    } = &delivered[0]
+    else {
+        panic!("expected Attribute");
     };
+    assert_eq!(object.kind, "report");
+    assert_eq!(*actor, attribution::Actor::Account(account_of(OWNER)));
+    assert_eq!(relations[0].recipient, account_of(OWNER));
+    assert_eq!(relations[0].reason, attribution::Reason::Report);
+    let detail: serde_json::Value = sdk::wire::decode(&relations[0].detail).unwrap();
+    assert_eq!(detail["kind"], "chat");
     assert_eq!(
-        member,
-        &owner_queue(OWNER),
-        "member is always the rule owner's own queue, regardless of the mention"
-    );
-    assert_eq!(kind, "chat");
-    assert_eq!(
-        body,
-        "channel=general seq=1 author=ext:03030303 text=please review mention=agent/helper"
+        detail["body"],
+        "channel=general seq=1 author=ext:03030303 text=please review mention=acct:1234"
     );
 }
 
-/// #1739: `DeliverInbox` may reach ONLY the rule owner's own inbox queue.
-/// `{author}` used to be treated as "safe" because a firing rule only ever
-/// sees a user-authored post, but the author is whoever TRIGGERED the rule,
-/// never necessarily the rule's OWNER — so a foreign `{author}`/`{mention}`/
-/// literal member is refused at `CreateRule`, before the rule ever burns a
-/// roster slot, and neither ever reaches inbox.
 #[test]
-fn deliver_inbox_to_a_foreign_member_is_refused_at_create() {
+fn report_to_a_foreign_account_is_refused_at_create() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     for (rule_id, member) in [
-        ("notify-author", "{author}"),
-        ("notify-mention", "{mention}"),
-        ("notify-literal", "ext:deadbeef"),
+        ("notify-stranger", account_of(STRANGER)),
+        ("notify-zero", 0),
     ] {
         let refused = exec(
             &mut m,
@@ -1244,14 +1240,14 @@ fn deliver_inbox_to_a_foreign_member_is_refused_at_create() {
             &create(
                 rule_id,
                 post_trigger(Some("general"), None),
-                inbox_action(member, "mention", "you were posted at"),
+                report_action(member, "mention", "you were posted at"),
             ),
         )
         .expect_err(&format!("{member} must not resolve to the owner"));
         assert!(
             refused
                 .to_string()
-                .contains("must be the rule owner's own queue"),
+                .contains("report recipient must be the rule owner"),
             "unexpected error for {member}: {refused}"
         );
     }
@@ -1262,16 +1258,8 @@ fn deliver_inbox_to_a_foreign_member_is_refused_at_create() {
     );
 }
 
-/// the create-time gate is a fast-fail convenience; the SAME confused-deputy
-/// refusal binds again at fire time, deterministically on every validator —
-/// see the module doc and [`Automations::build_and_emit`]'s `DeliverInbox`
-/// arm. `CreateRule` alone can never produce a rule whose member does not
-/// resolve to its owner, so this test crafts one directly through the
-/// in-crate store seam (the [`fire_count_saturates_at_u64_max`] pattern) to
-/// prove the re-check holds even if a future path ever mutated a rule after
-/// creation.
 #[test]
-fn deliver_inbox_to_a_foreign_member_is_refused_at_fire() {
+fn report_to_a_foreign_account_is_refused_at_fire() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1280,24 +1268,19 @@ fn deliver_inbox_to_a_foreign_member_is_refused_at_fire() {
         &create(
             "notify-owner",
             post_trigger(Some("general"), None),
-            owner_inbox_action(OWNER, "mention", "you were posted at"),
+            owner_report_action(OWNER, "mention", "you were posted at"),
         ),
     )
-    .expect("create: the literal owner queue is the one accepted member");
+    .expect("create: the owner account is the accepted recipient");
     block_on(m.commit_block()).expect("commit");
 
-    // craft a member_template that no longer resolves to the owner --
-    // unreachable via any admin op, but a fire-time re-check must still hold.
     let mut rule = block_on(m.rule("notify-owner"))
         .expect("load")
         .expect("notify-owner");
-    let Action::DeliverInbox {
-        member_template, ..
-    } = &mut rule.action
-    else {
-        panic!("expected DeliverInbox");
+    let Action::Report { recipient, .. } = &mut rule.action else {
+        panic!("expected Report");
     };
-    *member_template = "ext:deadbeef".into();
+    *recipient = account_of(STRANGER);
     m.store(rule_key("notify-owner"), &rule);
     block_on(m.commit_block()).expect("commit crafted member");
 
@@ -1308,14 +1291,16 @@ fn deliver_inbox_to_a_foreign_member_is_refused_at_fire() {
         &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire records failure, never aborts the block");
-    assert!(chat_ctx.msgs.is_empty(), "no delivery reaches inbox");
+    assert!(chat_ctx.msgs.is_empty(), "no report reaches attribution");
     block_on(m.commit_block()).expect("commit fire");
     assert_eq!(get_rule(&m, "notify-owner").expect("rule").fire_count, 0);
     let recs = history(&m, "notify-owner", 4);
     assert_eq!(recs.len(), 1);
     assert!(!recs[0].action_ok);
     assert!(
-        recs[0].detail.contains("may not deliver to"),
+        recs[0]
+            .detail
+            .contains("report recipient must be the rule owner"),
         "detail: {}",
         recs[0].detail
     );
@@ -1423,14 +1408,9 @@ fn empty_template_records_action_ok_false_without_failing() {
     assert!(recs[0].detail.contains("empty message"));
 }
 
-/// a rule owner's OWN queue can still exceed the inbox member cap if the raw
-/// external key itself is large enough (`member_template` must equal it
-/// exactly, so #1739's gate cannot shrink it) — the length check still runs
-/// BEFORE the owner-equality check, so this stays reachable even though a
-/// foreign or substituted member can no longer reach it.
 #[test]
-fn inbox_member_over_cap_records_action_ok_false_without_emitting() {
-    let big_owner = vec![0x11; MAX_MEMBER_BYTES];
+fn stable_report_recipient_does_not_depend_on_key_length() {
+    let big_owner = vec![0x11; MAX_FILTER_BYTES];
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_origin(Origin::External(big_owner.clone()));
     exec(
@@ -1439,7 +1419,7 @@ fn inbox_member_over_cap_records_action_ok_false_without_emitting() {
         &create(
             "member-cap",
             post_trigger(None, None),
-            owner_inbox_action(&big_owner, "chat", "body"),
+            owner_report_action(&big_owner, "chat", "body"),
         ),
     )
     .expect("create");
@@ -1452,18 +1432,17 @@ fn inbox_member_over_cap_records_action_ok_false_without_emitting() {
         &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire records failure");
-    assert!(chat_ctx.msgs.is_empty());
+    assert_eq!(chat_ctx.report_msgs().len(), 1);
     block_on(m.commit_block()).expect("commit");
 
     let recs = history(&m, "member-cap", 16);
     assert_eq!(recs.len(), 1);
-    assert!(!recs[0].action_ok);
-    assert!(recs[0].detail.contains("inbox member exceeds cap"));
-    assert_eq!(get_rule(&m, "member-cap").expect("rule").fire_count, 0);
+    assert!(recs[0].action_ok);
+    assert_eq!(get_rule(&m, "member-cap").expect("rule").fire_count, 1);
 }
 
 #[test]
-fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
+fn report_body_substitution_is_bounded() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
@@ -1472,14 +1451,13 @@ fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
         &create(
             "body-cap",
             post_trigger(None, None),
-            owner_inbox_action(OWNER, "chat", "{channel}"),
+            owner_report_action(OWNER, "chat", "{channel}"),
         ),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    // an unbounded `{channel}` body substitutes past the inbox body cap.
-    let long_channel = "c".repeat(INBOX_MAX_BODY_BYTES + 1);
+    let long_channel = "c".repeat(MAX_SUBSTITUTED_BYTES + 1);
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
@@ -1487,14 +1465,22 @@ fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
         &posted(&long_channel, 1, user(1), Vec::new()),
     )
     .expect("fire records failure");
-    assert!(chat_ctx.msgs.is_empty());
+    let reports = chat_ctx.report_msgs();
+    assert_eq!(reports.len(), 1);
+    let AttributionMsg::Attribute { relations, .. } = &reports[0] else {
+        panic!("report");
+    };
+    let detail: serde_json::Value = sdk::wire::decode(&relations[0].detail).unwrap();
+    assert_eq!(
+        detail["body"].as_str().unwrap().len(),
+        MAX_SUBSTITUTED_BYTES
+    );
     block_on(m.commit_block()).expect("commit");
 
     let recs = history(&m, "body-cap", 16);
     assert_eq!(recs.len(), 1);
-    assert!(!recs[0].action_ok);
-    assert!(recs[0].detail.contains("inbox body exceeds cap"));
-    assert_eq!(get_rule(&m, "body-cap").expect("rule").fire_count, 0);
+    assert!(recs[0].action_ok);
+    assert_eq!(get_rule(&m, "body-cap").expect("rule").fire_count, 1);
 }
 
 #[test]
@@ -1640,9 +1626,6 @@ fn squatted_message_id_is_caught_by_probe() {
     assert!(recs[0].detail.contains("already taken"));
 }
 
-/// #1617's write half: the rule fires under this module's origin, which chat
-/// admits unconditionally, so the OWNER's own standing in the TARGET channel
-/// is the gate. a refusal is recorded, never emitted, never a block failure.
 #[test]
 fn a_rule_may_not_post_where_its_owner_may_not() {
     let mut m = module();
@@ -1721,9 +1704,6 @@ fn a_member_owner_still_posts_into_a_members_only_channel() {
     assert_eq!(get_rule(&m, "brief").expect("brief").fire_count, 1);
 }
 
-/// #1618's read half: a wildcard trigger means "every channel the OWNER can
-/// read", so a members-only channel's traffic never reaches a stranger's rule
-/// — and a non-match leaves no run record to disclose that the post happened.
 #[test]
 fn a_wildcard_rule_does_not_observe_a_channel_its_owner_cannot_read() {
     let mut m = module();
@@ -1734,7 +1714,7 @@ fn a_wildcard_rule_does_not_observe_a_channel_its_owner_cannot_read() {
         &create(
             "spy",
             post_trigger(None, None),
-            owner_inbox_action(STRANGER, "note", "{channel}#{seq}: {text}"),
+            owner_report_action(STRANGER, "note", "{channel}#{seq}: {text}"),
         ),
     )
     .expect("create");
@@ -1760,7 +1740,7 @@ fn a_wildcard_rule_does_not_observe_a_channel_its_owner_cannot_read() {
     .expect("no-fail arm");
     assert!(
         chat_ctx.msgs.is_empty(),
-        "no inbox delivery of private text"
+        "no attribution report contains private text"
     );
     block_on(m.commit_block()).expect("commit");
     assert_eq!(get_rule(&m, "spy").expect("spy").fire_count, 0);
@@ -1781,7 +1761,7 @@ fn a_wildcard_rule_observes_a_channel_its_owner_is_a_member_of() {
         &create(
             "digest",
             post_trigger(None, None),
-            owner_inbox_action(OWNER, "note", "{channel}#{seq}: {text}"),
+            owner_report_action(OWNER, "note", "{channel}#{seq}: {text}"),
         ),
     )
     .expect("create");
@@ -1805,7 +1785,7 @@ fn a_wildcard_rule_observes_a_channel_its_owner_is_a_member_of() {
         &posted("secrets", 1, user(1), Vec::new()),
     )
     .expect("fire");
-    assert_eq!(chat_ctx.inbox_msgs().len(), 1);
+    assert_eq!(chat_ctx.report_msgs().len(), 1);
     block_on(m.commit_block()).expect("commit");
     assert_eq!(get_rule(&m, "digest").expect("digest").fire_count, 1);
 }
@@ -1907,9 +1887,6 @@ fn task_id_collision_is_caught_by_probe() {
     assert!(recs[0].detail.contains("already exists"));
 }
 
-/// #1740: the pre-emit probe checks the RULE OWNER's own open-task census,
-/// not just id collision — a full owner refuses the firing rule's action as a
-/// `RunRecord`, never the triggering post's block (P2).
 #[test]
 fn owner_task_cap_probe_refuses_the_action_not_the_block() {
     let mut m = module();
@@ -2142,7 +2119,7 @@ fn fire_count_saturates_at_u64_max() {
 #[test]
 fn substitution_covers_all_placeholders_single_pass() {
     // {author} for a user renders its actor string; unknown tokens stay literal.
-    let author = actor_of(&AuthorRef::User(vec![0xab, 0xcd]));
+    let author = actor_of(&Party::Key(vec![0xab, 0xcd]));
     let out = substitute(
         "c={channel} s={seq} a={author} t={text} u={unknown}",
         "general",
@@ -2157,32 +2134,22 @@ fn substitution_covers_all_placeholders_single_pass() {
     assert_eq!(author, "ext:abcd");
 }
 
-/// every arm of the ONE author rendering is `sdk::Origin::actor_string` of the
-/// origin the handle names — derived, never spelled. the agent arm is the one
-/// refinement: its module's actor string plus the agent id, so a `mention`
-/// filter can address one agent instead of its whole module.
 #[test]
 fn every_author_renders_in_the_actor_string_domain() {
     let key = vec![0x03; 4];
     assert_eq!(
-        actor_of(&AuthorRef::User(key.clone())),
+        actor_of(&Party::Key(key.clone())),
         Origin::External(key).actor_string()
     );
     assert_eq!(
-        actor_of(&AuthorRef::Module("chat".into())),
+        actor_of(&Party::Module("chat".into())),
         Origin::Module("chat".into()).actor_string()
     );
-    assert_eq!(actor_of(&AuthorRef::System), Origin::System.actor_string());
-    assert_eq!(
-        actor_of(&AuthorRef::Agent {
-            module: "agent".into(),
-            agent_id: "helper".into(),
-        }),
-        format!("{}/helper", Origin::Module("agent".into()).actor_string())
-    );
+    assert_eq!(actor_of(&Party::System), Origin::System.actor_string());
+    assert_eq!(actor_of(&Party::Account(1234)), "acct:1234");
     // and NOT the index tier's display handle: no origin's actor string is
     // `user:…`, so a member rendered that way is a queue nobody can ack.
-    assert!(!actor_of(&AuthorRef::User(vec![0xab])).starts_with("user:"));
+    assert!(!actor_of(&Party::Key(vec![0xab])).starts_with("user:"));
 }
 
 #[test]
@@ -2285,7 +2252,7 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
                     mention: Some("ops".into()),
                     text_contains: None,
                 },
-                owner_inbox_action(OWNER, "notify", "posted {channel}@{seq}"),
+                owner_report_action(OWNER, "notify", "posted {channel}@{seq}"),
             ),
         )
         .expect("create r3");
@@ -2403,4 +2370,73 @@ fn run_history_ring_drops_the_oldest_past_the_cap() {
         "the oldest records were dropped"
     );
     assert_eq!(records.last().expect("newest").seq, total);
+}
+
+fn account_of(key: &[u8]) -> u64 {
+    match key {
+        OWNER => 1,
+        STRANGER => 2,
+        other => other.iter().fold(3_u64, |value, byte| {
+            value.wrapping_mul(257).wrapping_add(u64::from(*byte))
+        }),
+    }
+}
+fn account_view(number: u64) -> identity::AccountView {
+    identity::AccountView {
+        number,
+        name: String::new(),
+        control: identity::Control::Keys,
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    }
+}
+fn identity_probe(req: &[u8]) -> Result<Vec<u8>, Error> {
+    let number = match identity::decode_query(req).map_err(Error::Module)? {
+        identity::IdentityQuery::OfKey { key } => account_of(&key),
+        identity::IdentityQuery::Get { number } => number,
+        _ => return Err(Error::QueryUnsupported),
+    };
+    Ok(identity::encode_reply(&identity::IdentityReply::Account(
+        Some(account_view(number)),
+    )))
+}
+
+#[test]
+fn exhausted_history_refuses_before_emitting_or_staging_a_fire() {
+    let mut module = module();
+    let mut admin = CaptureCtx::new();
+    exec(
+        &mut module,
+        &mut admin,
+        &create(
+            "report",
+            post_trigger(None, None),
+            owner_report_action(OWNER, "note", "body"),
+        ),
+    )
+    .unwrap();
+    module.store(
+        RUN_CURSOR_KEY.to_vec(),
+        &RunCursor {
+            head: u64::MAX,
+            next: u64::MAX,
+        },
+    );
+    block_on(module.commit_block()).unwrap();
+    let before = module.root();
+    let mut hook = CaptureCtx::new().with_chat_origin();
+    assert!(
+        exec(
+            &mut module,
+            &mut hook,
+            &posted("general", 1, user(1), Vec::new())
+        )
+        .is_err()
+    );
+    assert!(hook.msgs.is_empty());
+    block_on(module.commit_block()).unwrap();
+    assert_eq!(module.root(), before);
+    assert_eq!(get_rule(&module, "report").unwrap().fire_count, 0);
 }

@@ -19,6 +19,7 @@
 
 mod harness;
 
+use commonware_cryptography::Signer as _;
 use harness::{Sim, create_channel, post_message};
 use serde_json::{Value, json};
 
@@ -43,28 +44,16 @@ const WRONG: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 /// budget rung enforces, and the number its exact refusal string carries.
 const BUDGET: u32 = runs::MAX_ACTIONS_PER_SESSION;
 
-/// a wasm tenant's refusal crosses the boundary Debug-formatted
-/// (`Error::Rejected("…")`), so a run id's 0x1f separators reach the wire as
-/// `\u{1f}`. render an expected id the same way before matching on it.
-fn as_refused(run_id: &str) -> String {
-    run_id.escape_debug().to_string()
-}
-
 /// register agent `scribe` (granted `allowed`), open channel `room` with an
 /// anchor message, request an explicit run against it, and read back its
 /// (run_id, saga_id). the sim announces no provider pool, so the run's saga
 /// attempt stays UNASSIGNED — claimable by the first `Accept`.
 fn stage_run(sim: &Sim, allowed: Value) -> (String, String) {
-    sim.submit_ok(
-        "agent",
-        json!({ "register_agent": {
-            "agent_id": "scribe",
-            "display_name": "Scribe",
-            "capability": "text",
-            "allowed_actions": allowed,
-        }}),
-        Some("owner"),
-    );
+    let controller =
+        harness::key_origin(&commonware_cryptography::ed25519::PrivateKey::from_seed(41));
+    for (target, operation) in harness::model_setup("scribe", "text", allowed) {
+        sim.submit_ok(target, operation, Some(&controller));
+    }
     sim.submit_ok("chat", create_channel("room", "Room"), None);
     sim.submit_ok("chat", post_message("room", "m-1", "please help"), None);
     sim.submit_ok(
@@ -215,7 +204,7 @@ fn only_the_bound_session_key_may_act_on_the_run() {
     assert!(
         error.contains(&format!(
             "only the bound session key may act for run {}",
-            as_refused(&run_id)
+            run_id
         )),
         "a different origin fails at the wrong-key rung: {error}"
     );
@@ -265,7 +254,7 @@ fn only_the_lease_holder_may_open_the_agent_session() {
     assert!(
         error.contains(&format!(
             "only the node holding the run's execution lease may open its agent session: {}",
-            as_refused(&run_id)
+            run_id
         )),
         "a non-assignee is refused at the lease rung: {error}"
     );

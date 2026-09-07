@@ -119,12 +119,10 @@ fn shares_view(sim: &Sim) -> Value {
 }
 
 /// one filler block — advances the logical clock without touching membership.
-/// delivers to the "filler" origin's OWN queue: inbox refuses an external
-/// `Deliver` anywhere else.
 fn filler(sim: &Sim) {
     sim.submit_ok(
-        "inbox",
-        json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": "walk" } }),
+        "dispatch",
+        serde_json::json!({ "nudge": {} }),
         Some("filler"),
     );
 }

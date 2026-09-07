@@ -13,6 +13,8 @@
 //! `commit_block` internally, so nesting a second `block_on` inside would trip
 //! futures' LocalPool re-entry guard. no helper nests.
 
+mod harness;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use futures::executor::block_on;
@@ -31,8 +33,24 @@ const FILES: &str = "files";
 /// a host wrapping a single fresh `Files` module over `dir`. genesis performs no
 /// module writes — it only registers — so a fresh dir starts at the empty root.
 fn open_host(dir: &tempfile::TempDir) -> Host {
+    open_host_with_attribution(dir, harness::SharedStore::default())
+}
+
+fn open_host_with_attribution(dir: &tempfile::TempDir, attribution: harness::SharedStore) -> Host {
     let m = files::Files::open(FILES, dir.path().to_path_buf()).expect("open files");
-    Host::genesis(vec![Box::new(m)]).expect("genesis")
+    Host::genesis(vec![
+        Box::new(m),
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "test".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(attribution),
+        )),
+    ])
+    .expect("genesis")
 }
 
 /// the block-constant consensus context: height doubles as the agreed logical
@@ -333,7 +351,11 @@ fn host_flow() {
     match query(&host, &FilesQuery::History { limit: 8 }) {
         FilesReply::History(snaps) => {
             let latest = snaps.first().expect("one commit in history");
-            assert_eq!(latest.author, owner, "author recorded as ext:<hex>");
+            assert_eq!(
+                latest.author.to_string(),
+                owner,
+                "author recorded as ext:<hex>"
+            );
         }
         other => panic!("history: {other:?}"),
     }
@@ -713,14 +735,15 @@ fn restart_mid_sequence_converges() {
     // host B runs blocks 1-3, is dropped (releasing disk handles), reopened, and
     // replays 4-6.
     let dir_b = tempfile::tempdir().unwrap();
+    let attribution_b = harness::SharedStore::default();
     {
-        let mut b = open_host(&dir_b);
+        let mut b = open_host_with_attribution(&dir_b, attribution_b.clone());
         for (h, o, m) in ops.iter().take(3) {
             submit(&mut b, *h, o.clone(), m.clone()).expect("host B pre-restart block");
         }
     } // b drops here.
 
-    let mut b2 = open_host(&dir_b);
+    let mut b2 = open_host_with_attribution(&dir_b, attribution_b);
     // the reopened host re-adopts block 3's durable committed state (including the
     // still-staged second chunk) — the same module root host A held at block 3.
     assert_eq!(

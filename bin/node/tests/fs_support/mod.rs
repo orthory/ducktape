@@ -1,5 +1,5 @@
 //! an in-process duckfs node for the CLI e2e, over noded's shared in-proc
-//! daemon testkit: a REAL `host::Host::genesis` with ONLY the files module,
+//! daemon testkit: a REAL `host::Host::genesis` with files, identity and attribution,
 //! fronted by noded's router on a loopback listener. the CLI subprocess
 //! (`env!(CARGO_BIN_EXE_ducktape) fs`) drives it over http exactly as it would
 //! a real daemon.
@@ -10,6 +10,7 @@
 
 use std::process::Command;
 
+use commonware_cryptography::{Signer as _, ed25519};
 use host::Host;
 use noded::testkit::InProcDaemon;
 
@@ -34,12 +35,26 @@ impl Harness {
             .tempdir()
             .expect("harness tempdir");
         let duckfs_dir = dir.path().join("duckfs");
-        let daemon = InProcDaemon::start(
+        let node_key = ed25519::PrivateKey::from_seed(rand::random()).public_key();
+        let daemon = InProcDaemon::start_with_node_key(
             move || {
                 let files = files::Files::open("files", duckfs_dir).expect("open files");
-                Host::genesis(vec![Box::new(files)]).expect("genesis")
+                Host::genesis(vec![
+                    Box::new(identity::Identity::new(
+                        "identity",
+                        Box::new(sdk_testkit::MemStore::new()),
+                        "fs-e2e".into(),
+                    )),
+                    Box::new(attribution::AttributionModule::new(
+                        "attribution",
+                        Box::new(sdk_testkit::MemStore::new()),
+                    )),
+                    Box::new(files),
+                ])
+                .expect("genesis")
             },
-            vec!["files".into()],
+            vec!["files".into(), "identity".into(), "attribution".into()],
+            node_key,
         );
         let harness = Harness { daemon, dir };
         harness.mint_wallet();

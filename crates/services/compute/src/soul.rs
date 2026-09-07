@@ -46,11 +46,11 @@
 const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktape\" is available in this session. It is how you read and write Ducktape state — chat, tasks, pages, forge items, and duckfs files. Call its tools instead of guessing; its own instructions describe every tool it offers.";
 
 /// the duckfs prefix the global skill library lives under — re-exported from
-/// the module that owns the CAP GATING it (`agent::AgentRecord::library_readable`),
+/// the module that owns the CAP GATING it (`runs::ModelRecord::library_readable`),
 /// never restated here: the string the assembler advertises and the string the
 /// cap grants must be the same one, or the document points an agent at a prefix
 /// its caps do not cover.
-pub use agent::SKILL_LIBRARY_PREFIX;
+pub use runs::SKILL_LIBRARY_PREFIX;
 
 /// the tier-2 pointer. named tools with their real parameter names, because a
 /// model that has to guess the call will guess wrong: `ducktape_files_ls` takes
@@ -79,14 +79,14 @@ pub const MAX_ALWAYS_BYTES: usize = 64 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 200;
 
 /// hard cap on the curated on-demand skills the index lists — the SAME number
-/// consensus enforces on an agent's curated list ([`agent::MAX_SKILLS_PER_AGENT`]),
+/// consensus enforces on an agent's curated list ([`runs::MAX_SKILLS_PER_AGENT`]),
 /// deliberately re-exported rather than restated: two caps that could drift is
 /// how you get a record consensus happily accepts and no run can load.
 ///
 /// re-checked here anyway, because the consensus cap only binds at WRITE time —
 /// a record registered before the cap existed still carries whatever it carries,
 /// and the assembler is the last thing standing between it and a run.
-pub use agent::MAX_SKILLS_PER_AGENT as MAX_INDEXED_SKILLS;
+pub use runs::MAX_SKILLS_PER_AGENT as MAX_INDEXED_SKILLS;
 
 /// one curated skill, already materialized. `name` is the CURATED name
 /// consensus committed (`SkillRef.name`), never a name read out of the document
@@ -112,7 +112,7 @@ pub struct SkillDoc {
 /// instruction went missing for skill-less agents in the first place.)
 ///
 /// `library_readable` is the agent's `duckfs_read` grant over
-/// [`SKILL_LIBRARY_PREFIX`], decided by consensus data (`agent::AgentRecord::
+/// [`SKILL_LIBRARY_PREFIX`], decided by consensus data (`runs::ModelRecord::
 /// library_readable`) and carried here as plain data. it gates the library
 /// paragraph and nothing else: an agent WITHOUT the grant is never told about a
 /// door the MCP tool plane would refuse to open for it. the alternative — always

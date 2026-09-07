@@ -17,3 +17,6 @@ async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# the causal-context and origin types derive the uniform store-record codec so
+# a module can persist them beside its own records.
+borsh = { workspace = true }

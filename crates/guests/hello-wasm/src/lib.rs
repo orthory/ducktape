@@ -35,6 +35,14 @@ impl Guest for Component {
 
     /// the declared shape: plain host-KV keys over a map the host owns, no
     /// network config, read-your-writes queries.
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Map,
@@ -57,6 +65,34 @@ impl Guest for Component {
                 host::state_set(COUNT_KEY, &0u64.to_le_bytes());
                 Ok(())
             }
+            b"output-cap"
+            | b"output-cap-then-small"
+            | b"output-cap-then-error"
+            | b"assigned-cap"
+            | b"declarations-valid" => {
+                host::state_set(COUNT_KEY, &1u64.to_le_bytes());
+                match payload.as_slice() {
+                    b"output-cap" => host::set_output(&vec![0; 256 * 1024 + 1]),
+                    b"output-cap-then-small" => {
+                        host::set_output(&vec![0; 256 * 1024 + 1]);
+                        host::set_output(b"small");
+                    }
+                    b"output-cap-then-error" => {
+                        host::set_output(&vec![0; 256 * 1024 + 1]);
+                        return Err(host::Error::Rejected("explicit refusal".into()));
+                    }
+                    b"assigned-cap" => host::set_assigned(&vec![0; 64 * 1024 + 1]),
+                    b"declarations-valid" => {
+                        host::set_output(b"result");
+                        host::set_assigned(b"stamp");
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            }
+            b"module-error" => Err(host::Error::Rejected("explicit refusal".into())),
+            b"self-query" => host::query_module("hello", b"").map(|_| ()),
+            b"missing-query" => host::query_module("missing", b"").map(|_| ()),
             other => Err(host::Error::Rejected(format!(
                 "unknown op ({} bytes)",
                 other.len()

@@ -49,6 +49,7 @@ fn ctx(height: u64, origin: Origin, member: Vec<u8>) -> TestCtx {
         consensus_time: height,
         origin,
         me: "governance".into(),
+        cause: sdk::Cause::Direct,
     })
     .on_query("valset", move |req| {
         match valset_decode_query(req).expect("valset query decodes") {

@@ -39,6 +39,14 @@ impl Guest for Component {
 
     /// the same shape as `hello-wasm`: a code swap keeps the store, so the
     /// replacement must declare the backing that store is.
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Map,

@@ -31,7 +31,8 @@ serde_json = { workspace = true }
 # enable the default `native` features) whole.
 chat = { path = "../chat", default-features = false }
 tasks = { path = "../tasks", default-features = false }
-inbox = { workspace = true }
+identity = { workspace = true }
+attribution = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

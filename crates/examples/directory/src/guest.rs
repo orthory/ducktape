@@ -8,12 +8,20 @@
 //! raw utf-8 key/value bytes — so the host-computed root() and snapshot
 //! encoding are BYTE-IDENTICAL to the native module's.
 
-use crate::{decode_msg, decode_query, encode_reply, DirMsg, DirQuery, DirReply};
-use ducktape_module_sdk::{host, Guest};
+use crate::{DirMsg, DirQuery, DirReply, decode_msg, decode_query, encode_reply};
+use ducktape_module_sdk::{Guest, host};
 
 struct Component;
 
 impl Guest for Component {
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("directory has no queued work".into()))
+    }
+
     fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
         Ok(())
     }

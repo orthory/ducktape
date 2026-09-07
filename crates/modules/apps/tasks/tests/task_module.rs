@@ -14,7 +14,7 @@ const TASKS: &str = "tasks";
 /// `Box<dyn MerkleStore>`. these tests assert BEHAVIOR, so the in-memory store
 /// stands in for qmdb; the real-store round trip lives in `sync_round_trip`.
 fn tasks_on_mem() -> Tasks {
-    Tasks::new(TASKS, Box::new(MemStore::new()))
+    Tasks::new(TASKS, "identity", "attribution", Box::new(MemStore::new()))
 }
 
 fn msg(task_msg: TaskMsg) -> Msg {
@@ -53,6 +53,12 @@ fn at_as(consensus_time: u64, origin: Origin) -> TestCtx {
         consensus_time,
         origin,
         me: TASKS.into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
     })
 }
 
@@ -101,6 +107,12 @@ fn at(consensus_time: u64) -> TestCtx {
         consensus_time,
         origin: Origin::System,
         me: TASKS.into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
     })
 }
 
@@ -198,8 +210,20 @@ impl Module for CreateThenFail {
 #[test]
 fn failed_write_rolls_back_task_state() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(tasks_on_mem()), Box::new(CreateThenFail)])
-            .expect("genesis");
+        let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
+            Box::new(tasks_on_mem()),
+            Box::new(CreateThenFail),
+        ])
+        .expect("genesis");
 
         let root0 = host.module_root(TASKS).expect("tasks root");
         let app0 = host.root_hash();
@@ -240,7 +264,19 @@ fn failed_write_rolls_back_task_state() {
 #[test]
 fn root_hash_changes_when_task_state_changes() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(tasks_on_mem())]).expect("genesis");
+        let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
+            Box::new(tasks_on_mem()),
+        ])
+        .expect("genesis");
         let app0 = host.root_hash();
 
         let created = host
@@ -459,7 +495,10 @@ fn delete_frees_a_slot_at_the_cap_and_a_per_owner_cap_admits_another_owner() {
         tasks.commit_block().await.expect("commit alice's tasks");
 
         let refused = tasks
-            .execute(&mut at_as(2, ext("alice")), &create("a-over", "one too many"))
+            .execute(
+                &mut at_as(2, ext("alice")),
+                &create("a-over", "one too many"),
+            )
             .await
             .expect_err("alice is at her per-owner cap");
         assert!(

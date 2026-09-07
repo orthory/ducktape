@@ -139,6 +139,7 @@ pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
     match origin {
         sdk::Origin::External(id) => indexer::OriginTag::external(indexer::user_handle(id)),
         sdk::Origin::Module(id) => indexer::OriginTag::module(id.clone()),
+        sdk::Origin::Program(account) => indexer::OriginTag::program(*account),
         sdk::Origin::System => indexer::OriginTag::system(),
     }
 }

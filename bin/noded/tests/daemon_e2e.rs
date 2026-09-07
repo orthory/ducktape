@@ -43,14 +43,6 @@ impl Daemon {
     /// a leaked dir plus a recycled pid would reopen stale qmdb state and
     /// fail this suite spuriously.
     fn spawn(storage: &Path) -> Self {
-        Self::spawn_inner(storage, false)
-    }
-
-    fn spawn_with_echo_oracle(storage: &Path) -> Self {
-        Self::spawn_inner(storage, true)
-    }
-
-    fn spawn_inner(storage: &Path, echo_oracle: bool) -> Self {
         let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"));
         cmd.arg("--listen")
@@ -71,9 +63,6 @@ impl Daemon {
             // storage) land on stderr — keep it visible or they read as an
             // opaque readiness timeout.
             .stderr(Stdio::inherit());
-        if echo_oracle {
-            cmd.env("DUCKTAPE_NODED_ECHO_ORACLE", "1");
-        }
         let child = cmd.spawn().expect("spawn ducktape-noded");
         let mut daemon = Self {
             child,
@@ -390,12 +379,11 @@ fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Valu
             "message_id": message_id,
             "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
-            "as_agent": null,
         }
     })
 }
 
-fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::Value {
+fn post_mention(channel: &str, message_id: &str, account: u64) -> serde_json::Value {
     serde_json::json!({
         "post_message": {
             "channel_id": channel,
@@ -404,10 +392,10 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                 "paragraph": [
                     { "text": "hey ", "marks": [] },
                     {
-                        "text": format!("@{agent_id}"),
+                        "text": format!("@{account}"),
                         "marks": [{
                             "mention": {
-                                "agent": { "module": "runs", "agent_id": agent_id }
+                                "account": account
                             }
                         }]
                     },
@@ -415,7 +403,6 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                 ]
             }],
             "thread": null,
-            "as_agent": null,
         }
     })
 }
@@ -589,9 +576,9 @@ fn full_surface_blocks_authorship_and_ws() {
     let head = &messages[0]["head"];
     assert_eq!(head["message_id"], "m1");
     assert_eq!(head["blocks"][0]["paragraph"][0]["text"], "hello from e2e");
-    let author_bytes: Vec<u8> = head["author"]["user"]
+    let author_bytes: Vec<u8> = head["author"]["key"]
         .as_array()
-        .expect("User author")
+        .expect("Key author")
         .iter()
         .map(|v| v.as_u64().expect("byte") as u8)
         .collect();
@@ -664,110 +651,141 @@ fn block_commits_push_tip_heartbeats_before_their_events() {
 }
 
 #[test]
-fn agent_run_drains_oracle_effect_and_posts_reply() {
+fn programmable_user_calls_and_reports_failure_through_onchain_attribution() {
+    use agent::{Continuation, Decode, Predicate, Program, Step, Value};
+    use attribution::{Actor, AttributionReply, Reason};
+
     let storage = tempfile::TempDir::new().expect("storage dir");
-    let daemon = Daemon::spawn_with_echo_oracle(storage.path());
+    let daemon = Daemon::spawn(storage.path());
+    macro_rules! map {
+        ($($key:literal => $value:expr),* $(,)?) => {
+            Value::Map(std::collections::BTreeMap::from([
+                $(($key.to_owned(), $value)),*
+            ]))
+        };
+    }
+    let program = Program {
+        steps: vec![
+            Step::Branch {
+                test: Predicate::Equals {
+                    left: Value::Ref(vec!["change".into(), "reason".into()]),
+                    right: Value::Text("mention".into()),
+                },
+                then: 1,
+                or: 3,
+            },
+            Step::Call {
+                module: "tasks".into(),
+                msg: map! {
+                    "task" => map! {
+                        "create_task" => map! {
+                            "task_id" => Value::Text("from-program".into()),
+                            "title" => Value::Text("Created by a programmable user".into()),
+                            "owner" => Value::Null,
+                        },
+                    },
+                },
+                bind: "task".into(),
+                decode: Decode::Json,
+                on_failure: Continuation::Step(2),
+            },
+            Step::Report {
+                recipient: Value::Number(1),
+                reason: Reason::Report,
+                detail: Value::Ref(vec!["task".into()]),
+            },
+            Step::Finish,
+        ],
+    };
+    let controller = "n".repeat(32);
+    for (target, operation) in [
+        (
+            "chat",
+            serde_json::json!({ "create_channel": {
+                "channel_id": "general", "name": "General", "post_policy": "open",
+            }}),
+        ),
+        (
+            "identity",
+            serde_json::json!({ "create": {
+                "name": "controller", "scheme": "ed25519",
+            }}),
+        ),
+        (
+            "agent",
+            serde_json::json!({ "provision": {
+                "name": "taskbot", "program": program,
+            }}),
+        ),
+    ] {
+        let (code, reply) = daemon.submit(target, operation, Some(&controller));
+        assert_eq!(code, 200, "program setup {target}: {reply}");
+    }
 
-    let (code, block) = daemon.submit(
-        "chat",
+    for message_id in ["first", "second"] {
+        let (code, included) = daemon.submit(
+            "chat",
+            post_mention("general", message_id, 2),
+            Some("alice"),
+        );
+        assert_eq!(code, 200, "mention: {included}");
+        assert!(
+            daemon.status()["height"].as_u64().unwrap() > included["height"].as_u64().unwrap(),
+            "the script and call completion commit at later boundaries"
+        );
+    }
+
+    let task = daemon.query(
+        "tasks",
         serde_json::json!({
-            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+            "task": { "get": { "task_id": "from-program" } },
         }),
-        Some("owner"),
     );
-    assert_eq!(code, 200, "create channel failed: {block}");
+    assert_eq!(
+        task["task"]["task"]["owner"],
+        serde_json::json!({"account": 2}),
+        "the program owns the task and its later failed duplicate leaves it intact: {task}"
+    );
 
-    let (code, block) = daemon.submit(
-        "agent",
+    let changes = daemon.query(
+        "attribution",
         serde_json::json!({
-            "register_agent": {
-                "agent_id": "quackbot",
-                "display_name": "Quackbot",
-                "capability": "echo-model",
-                "allowed_actions": ["chat.post"]
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register agent failed: {block}");
-
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({
-            "watch_channel": {
-                "channel_id": "general",
-                "policy": "mention"
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "watch channel failed: {block}");
-
-    let (code, block) = daemon.submit(
-        "chat",
-        post_mention("general", "m1", "quackbot"),
-        Some("alice"),
-    );
-    assert_eq!(code, 200, "mention post failed: {block}");
-    // the receipt reports the block that INCLUDED the post, not the drain tail…
-    assert_eq!(
-        block["height"], 4,
-        "the receipt should carry the post's inclusion block"
-    );
-    // …while the drain tail runs behind it: the saga guest runs the STRICT
-    // lease policy, so the echo worker BIDS for the unassigned announcement
-    // (block 5), answers the re-emitted order that names it (block 6, the
-    // result into the dispatch mailbox), and the nudge block (7) carries the
-    // DeliverPending injection that posts the reply — the never-pop-stack rule
-    // made visible in the block arithmetic.
-    assert_eq!(
-        daemon.status()["height"],
-        7,
-        "post + oracle bid + oracle result + delivery nudge should all drain"
-    );
-
-    let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
-    // the run's lifecycle lives in the dispatch module; the runs module's
-    // pending entry pruned when the delivery landed.
-    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
-    assert_eq!(
-        pending["pending_runs"].as_array().map(Vec::len),
-        Some(0),
-        "the delivered run must leave no pending entry: {pending}"
-    );
-    let dispatch = daemon.query(
-        "dispatch",
-        serde_json::json!({
-            "dispatch": {
-                "receiver": "runs",
-                "dispatch_id": runs::dispatch_id_for(run_id),
-            }
+            "changes_for": { "recipient": 1, "after": 0, "limit": 64 },
         }),
     );
-    assert_eq!(
-        dispatch["dispatch"]["status"], "delivered",
-        "the dispatch record is the run's history: {dispatch}"
-    );
-
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 16 } }),
-    );
-    let messages = reply["messages"].as_array().expect("Messages reply");
-    assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
-    let agent_reply = &messages[1]["head"];
-    assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
-    assert_eq!(
-        agent_reply["author"],
-        serde_json::json!({ "agent": { "module": "runs", "agent_id": "quackbot" } })
-    );
-    let text = agent_reply["blocks"][0]["paragraph"][0]["text"]
-        .as_str()
-        .expect("reply text");
+    let AttributionReply::Changes(entries) = serde_json::from_value(changes).unwrap() else {
+        panic!("expected the controller's attributions");
+    };
+    let reports: Vec<_> = entries
+        .iter()
+        .map(|entry| &entry.change)
+        .filter(|change| change.source.module == "agent" && change.reason == Reason::Report)
+        .collect();
+    assert_eq!(reports.len(), 2, "one chosen report for each invocation");
+    for report in &reports {
+        assert_eq!(report.actor, Actor::Account(2));
+        assert_eq!(report.recipient, 1);
+        assert!(
+            matches!(
+                report.cause,
+                sdk::Cause::Chain {
+                    hop: sdk::Hop::Completion(_),
+                    ..
+                }
+            ),
+            "the report preserves its call completion: {:?}",
+            report.cause
+        );
+    }
+    let applied: agent::CallResult = serde_json::from_slice(&reports[0].detail).unwrap();
+    assert!(matches!(applied, agent::CallResult::Applied { .. }));
+    let rejected: agent::CallResult = serde_json::from_slice(&reports[1].detail).unwrap();
+    let agent::CallResult::Rejected { reason } = rejected else {
+        panic!("duplicate task must report its target rejection");
+    };
     assert!(
-        text.starts_with("echo: handling dispatch "),
-        "the reply is the echo worker's dispatch-lane answer, normalized \
-         into a paragraph by the runs module: {text}"
+        reason.contains("task already exists: from-program"),
+        "{reason}"
     );
 }
 

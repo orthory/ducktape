@@ -9,7 +9,7 @@
 //! of forge's wire types (`forge` stays a DEV-ONLY dependency; conformance
 //! tests pin every mirror against the real forge codec).
 
-use agent::{CapRequest, ReplyBlock};
+use crate::{CapRequest, ReplyBlock};
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
@@ -175,10 +175,10 @@ impl RunsModule {
     /// any missing precondition degrades to a breadcrumb — the sink NEVER
     /// aborts the delivery block.
     ///
-    /// returns the PR number this sink touched — the guard-found open PR the
-    /// push updated, or the number the emitted `OpenPr` gets (the tracker
-    /// numbers items sequentially: committed max + 1) — for the delivered-runs
-    /// ring. `None` when no PR was involved.
+    /// Returns only a committed PR the push already updated. A newly proposed
+    /// OpenPr has no link until its authenticated target receipt supplies the
+    /// allocated number; another operation may allocate first or the program
+    /// may decline to open it.
     #[allow(clippy::too_many_arguments, reason = "delivery-scoped internal seam")]
     pub(crate) async fn emit_sink(
         &self,
@@ -275,7 +275,10 @@ impl RunsModule {
                 // cannot name a commit the push lane never landed. reads the
                 // same `ListRefs` mirror `forge_branch_born` uses, so a
                 // deleted/renamed source branch degrades identically.
-                let source_tip = match self.forge_branch_tip(&*ctx, &forge, repo, source_branch).await {
+                let source_tip = match self
+                    .forge_branch_tip(&*ctx, &forge, repo, source_branch)
+                    .await
+                {
                     Ok(Some(tip)) => tip,
                     Ok(None) => {
                         self.note(
@@ -289,7 +292,8 @@ impl RunsModule {
                         return None;
                     }
                 };
-                let output_commit_is_source_tip = receipt.output_commit.as_deref() == Some(source_tip.as_str());
+                let output_commit_is_source_tip =
+                    receipt.output_commit.as_deref() == Some(source_tip.as_str());
                 if !output_commit_is_source_tip {
                     self.note(
                         ctx,
@@ -343,15 +347,15 @@ impl RunsModule {
                 // the duplicate-PR guard: an OPEN PR already sourcing this
                 // branch means the session's push WAS the feedback — never a
                 // second PR.
-                let next_number = match self
+                match self
                     .forge_pr_probe(&*ctx, &forge, repo, source_branch)
                     .await
                 {
-                    Ok((Some(number), _)) => {
+                    Ok(Some(number)) => {
                         self.note(ctx, format!("run {run_id} pr sink: updated PR #{number}"));
                         return Some(number);
                     }
-                    Ok((None, next_number)) => next_number,
+                    Ok(None) => {}
                     Err(why) => {
                         // an unreadable tracker must not risk a duplicate PR.
                         self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
@@ -366,7 +370,10 @@ impl RunsModule {
                 // "updated PR #n" breadcrumb stays honest even when the
                 // target was since deleted. born-in-committed-refs also
                 // implies the name normalizes (forge validates on push).
-                match self.forge_branch_born(&*ctx, &forge, repo, target_branch).await {
+                match self
+                    .forge_branch_born(&*ctx, &forge, repo, target_branch)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         self.note(
@@ -388,7 +395,7 @@ impl RunsModule {
                     target: forge,
                     payload: forge_open_pr_bytes(repo, &title, &body, source_branch, target_branch),
                 });
-                Some(next_number)
+                None
             }
         }
     }
@@ -450,23 +457,19 @@ impl RunsModule {
             .and_then(|r| r.get("head").and_then(|h| h.as_str()).map(str::to_string)))
     }
 
-    /// the duplicate-PR guard's read, plus the tracker's NEXT item number:
-    /// `(open_pr, next_number)`. `open_pr` is the lowest-numbered OPEN PR whose
+    /// The duplicate-PR guard returns the lowest-numbered OPEN PR whose
     /// source branch is `source_branch`, from COMMITTED tracker state
     /// (summaries via the ListItems mirror, then one GetItem per open PR —
     /// `ItemSummary` carries no branches); deterministic: the listing is
-    /// ascending by number, first match wins. `next_number` is the number a
-    /// fresh `OpenPr` gets — forge numbers items sequentially per repo, so it
-    /// is the committed max + 1.
+    /// ascending by number, first match wins.
     async fn forge_pr_probe(
         &self,
         ctx: &dyn Ctx,
         forge: &str,
         repo: &str,
         source_branch: &str,
-    ) -> Result<(Option<u64>, u64), String> {
+    ) -> Result<Option<u64>, String> {
         let summaries = self.forge_item_summaries(ctx, forge, repo).await?;
-        let next_number = summaries.iter().map(|s| s.number).max().unwrap_or(0) + 1;
         for summary in summaries {
             if summary.kind != ForgeItemKind::Pr || summary.state != ForgeItemState::Open {
                 continue;
@@ -475,10 +478,10 @@ impl RunsModule {
                 continue;
             };
             if item.source_branch.as_deref() == Some(source_branch) {
-                return Ok((Some(summary.number), next_number));
+                return Ok(Some(summary.number));
             }
         }
-        Ok((None, next_number))
+        Ok(None)
     }
 
     /// the run's durable executor attribution: the `assignee` on its DONE saga
@@ -568,7 +571,10 @@ mod tests {
     #[test]
     fn bound_item_title_never_degrades_to_a_generic_message() {
         let issue = "Use Forge issue titles for auto-published Agent PRs";
-        assert_eq!(derive_pr_title(Some(issue), "Apply agent changes", "run-1"), issue);
+        assert_eq!(
+            derive_pr_title(Some(issue), "Apply agent changes", "run-1"),
+            issue
+        );
     }
 
     #[test]
@@ -578,7 +584,10 @@ mod tests {
             "Useful response"
         );
         assert_eq!(derive_pr_title(None, "", "run-1"), "agent run run-1");
-        assert_eq!(derive_pr_title(None, "  \n\t\n", "run-1"), "agent run run-1");
+        assert_eq!(
+            derive_pr_title(None, "  \n\t\n", "run-1"),
+            "agent run run-1"
+        );
     }
 
     #[test]
@@ -623,7 +632,10 @@ mod tests {
         // guard keeps a regression from handing forge a rejectable op.
         let receipt = crate::facets::WorkspaceReceipt::default();
         let body = derive_pr_body(&"x".repeat(FORGE_BODY_BYTE_CAP), "r1", &receipt, "unknown");
-        assert!(body.len() <= FORGE_BODY_BYTE_CAP, "body stays inside forge's cap");
+        assert!(
+            body.len() <= FORGE_BODY_BYTE_CAP,
+            "body stays inside forge's cap"
+        );
         assert!(body.ends_with("---\nrun: r1\noutput: none\nnode: unknown"));
     }
 
@@ -662,6 +674,7 @@ mod tests {
                 consensus_time: t,
                 origin,
                 me: "forge".into(),
+                cause: sdk::Cause::Direct,
             });
             let msg = Msg {
                 target: "forge".into(),
@@ -710,7 +723,7 @@ mod tests {
         };
         assert_eq!(
             item.summary.author,
-            chat::AuthorRef::Module("runs".into()),
+            chat::Party::Module("runs".into()),
             "the PR is authored by the emitting MODULE, not a forged user"
         );
         let _ = std::fs::remove_dir_all(&base);

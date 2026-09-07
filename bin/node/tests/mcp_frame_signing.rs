@@ -115,7 +115,7 @@ fn task_write_uses_the_exact_run_scoped_endpoint() {
         runs::RunsMsg::AgentAction { run_id, action } => {
             assert_eq!(run_id, RUN_ID);
             match action {
-                agent::AgentAction::CreateTask { title, .. } => assert_eq!(title, "prove it"),
+                runs::AgentAction::CreateTask { title, .. } => assert_eq!(title, "prove it"),
                 other => panic!("expected CreateTask, got {other:?}"),
             }
         }

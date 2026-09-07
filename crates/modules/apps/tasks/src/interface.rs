@@ -19,6 +19,8 @@
 //! board-prefixed `encode_task_*`/`encode_job_*` helpers wrap a board message
 //! in that envelope, so a caller keeps building `TaskMsg`/`JobsMsg` values.
 
+pub use attribution::Actor as Party;
+use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
 
 // ---- task board wire (assigned-list kind) ---------------------------------
@@ -37,12 +39,8 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
-    /// origin-derived creator identity (a module id verbatim, `"ext:"` +
-    /// lowercase-hex external key, or `"system"` -- the shared
-    /// [`sdk::Origin::actor_string`] convention [`crate::Job::submitter`]
-    /// also uses). set by the module, never carried on the wire. the ONLY
-    /// account [`TaskMsg::UpdateStatus`] and [`TaskMsg::DeleteTask`] accept.
-    pub owner: String,
+    /// Stable owning account, or the authenticated non-account creator.
+    pub owner: Party,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -59,19 +57,10 @@ pub enum TaskMsg {
     CreateTask {
         task_id: String,
         title: String,
-        /// override the created task's owner with this raw external-key
-        /// actor, instead of the dispatch origin's own. `None` keeps the
-        /// original behavior (owner = the origin's own actor string).
-        ///
-        /// honored ONLY when the dispatch origin is `Origin::Module` -- a
-        /// module vouching for a DIFFERENT principal's task on its own
-        /// authority (e.g. automations attributing a rule's created task to
-        /// the rule's OWNER, never to the literal module id "automations" --
-        /// see #1740). an `Origin::External` submitter naming anyone but
-        /// itself is refused: an external caller may only ever own its own
-        /// tasks.
+        /// A module may assign another existing account; other origins may
+        /// name only their own account. None derives ownership from origin.
         #[serde(default)]
-        owner: Option<Vec<u8>>,
+        owner: Option<AccountNumber>,
     },
     /// move a task's status. gated to [`Task::owner`] -- anyone else's op
     /// fails the block.
@@ -89,7 +78,9 @@ pub enum TaskMsg {
 pub enum TaskQuery {
     /// one task by id — the existence/point read another module's `execute`
     /// path wants. an absent id answers `Task(None)`.
-    Get { task_id: String },
+    Get {
+        task_id: String,
+    },
     /// one page in ascending id order: at most `limit` tasks (clamped into
     /// `1..=`[`crate::MAX_LIST_LIMIT`]) whose ids sort strictly after `after`.
     /// page by handing the last returned id back as the next `after`.
@@ -103,13 +94,9 @@ pub enum TaskQuery {
         #[serde(default)]
         after: Option<String>,
     },
-    /// one owner's live open-task count -- what
-    /// [`crate::MAX_OPEN_TASKS_PER_OWNER`] is checked against. automations
-    /// spends this as a pre-emit probe (see #1740) so a full owner refuses
-    /// the firing rule's action instead of aborting the triggering post's
-    /// block. `owner` is the actor string ([`sdk::Origin::actor_string`]),
-    /// the same domain [`Task::owner`] records.
-    OwnerOpenCount { owner: String },
+    OwnerOpenCount {
+        owner: Party,
+    },
 }
 
 /// replies to [`TaskQuery`].
@@ -148,7 +135,7 @@ impl JobStatus {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
-    pub worker: String,
+    pub worker: Party,
     pub claimed_at_height: u64,
     pub lease_views: u64,
 }
@@ -168,10 +155,7 @@ pub struct Job {
     pub job_id: String,
     pub kind: String,
     pub spec: String,
-    /// origin-derived submitter identity (module id verbatim, `ext:` +
-    /// lowercase-hex external key, or "system"). set by the module, never
-    /// carried on the wire.
-    pub submitter: String,
+    pub submitter: Party,
     pub status: JobStatus,
     /// total number of successful claims over this job's life.
     pub attempt: u64,
@@ -228,7 +212,7 @@ pub enum JobsEvent {
     Submitted {
         job_id: String,
         kind: String,
-        submitter: String,
+        submitter: Party,
         spec: String,
         spec_hash: Vec<u8>,
     },
@@ -380,4 +364,19 @@ pub fn encode_job_event(e: &JobsEvent) -> Vec<u8> {
 
 pub fn decode_job_event(b: &[u8]) -> Result<JobsEvent, String> {
     sdk::wire::decode(b)
+}
+
+/// Resolved identity stamped on applied operations for derived indexes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkAssigned {
+    Task { actor: Party, owner: Party },
+    Job { actor: Party },
+}
+
+pub fn encode_assigned(assigned: &WorkAssigned) -> Vec<u8> {
+    sdk::wire::encode(assigned)
+}
+pub fn decode_assigned(bytes: &[u8]) -> Result<WorkAssigned, String> {
+    sdk::wire::decode(bytes)
 }

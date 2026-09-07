@@ -641,12 +641,17 @@ fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
-fn saga_origin(origin: &Origin) -> SagaOrigin {
+/// the canonical state form of a dispatch origin (see [`SagaOrigin`]). a
+/// program account has no saga standing: it triggers nothing and owns
+/// nothing here, so its origin is refused rather than mapped.
+fn saga_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
     match origin {
-        Origin::External(key) => SagaOrigin::External(key.clone()),
-        Origin::Module(module) => SagaOrigin::Module(module.clone()),
-        Origin::System => SagaOrigin::System,
+        Origin::External(key) => Ok(SagaOrigin::External(key.clone())),
+        Origin::Module(module) => Ok(SagaOrigin::Module(module.clone())),
+        Origin::Program(account) => Err(Error::Module(format!(
+            "saga: a program account has no saga standing: {account}"
+        ))),
+        Origin::System => Ok(SagaOrigin::System),
     }
 }
 
@@ -1475,7 +1480,7 @@ impl SagaModule {
                 // (it is the only one that reads the store). the subject is the
                 // trigger's own origin — the same one `owns_id` just admitted
                 // the id under and `Cancel` will gate on.
-                let origin = saga_origin(&ctx.env().origin);
+                let origin = saga_origin(&ctx.env().origin)?;
                 let cap = live_saga_cap(&origin);
                 let live = self.live_sagas(&origin).await?;
                 if live >= cap {
@@ -1641,7 +1646,7 @@ impl SagaModule {
                 };
                 if current.status.is_terminal()
                     || attempt != current.attempt
-                    || current.origin != saga_origin(&ctx.env().origin)
+                    || current.origin != saga_origin(&ctx.env().origin)?
                 {
                     return Ok(());
                 }
@@ -1821,7 +1826,8 @@ impl SagaModule {
                 let Some(current) = self.load(&saga_id).await? else {
                     return Ok(());
                 };
-                if current.status.is_terminal() || current.origin != saga_origin(&ctx.env().origin)
+                if current.status.is_terminal()
+                    || current.origin != saga_origin(&ctx.env().origin)?
                 {
                     return Ok(());
                 }
@@ -1838,7 +1844,7 @@ impl SagaModule {
                 // unknown ids are skipped as no-ops. the automatic trim in
                 // `execute` bounds the tail regardless; this is an owner
                 // reclaiming a specific id early.
-                let origin = saga_origin(&ctx.env().origin);
+                let origin = saga_origin(&ctx.env().origin)?;
                 for saga_id in saga_ids {
                     let Some(current) = self.load(&saga_id).await? else {
                         continue;
@@ -2018,6 +2024,7 @@ mod tests {
                     consensus_time: 0,
                     origin: Origin::System,
                     me: "saga".into(),
+                    cause: sdk::Cause::Direct,
                 },
                 known_modules: BTreeSet::new(),
                 validators: None,
@@ -5569,13 +5576,13 @@ mod tests {
 
     /// one origin's live count, straight out of the store view.
     fn live(m: &SagaModule, origin: &Origin) -> u32 {
-        block_on(m.live_sagas(&saga_origin(origin))).unwrap()
+        block_on(m.live_sagas(&saga_origin(origin).unwrap())).unwrap()
     }
 
     /// whether the ledger holds a count record for `origin` at all — the
     /// empty-collection-drops-its-key half of the rule.
     fn has_quota_key(m: &SagaModule, origin: &Origin) -> bool {
-        block_on(m.staged.get(&quota_key(&saga_origin(origin))))
+        block_on(m.staged.get(&quota_key(&saga_origin(origin).unwrap())))
             .unwrap()
             .is_some()
     }
@@ -5788,12 +5795,12 @@ mod tests {
         let dispatch = Origin::Module("dispatch".into());
         let alice = Origin::External(b"alice".to_vec());
         assert_eq!(
-            live_saga_cap(&saga_origin(&alice)),
+            live_saga_cap(&saga_origin(&alice).unwrap()),
             PER_ORIGIN_LIVE_SAGAS,
             "a key IS a principal"
         );
         assert_eq!(
-            live_saga_cap(&saga_origin(&dispatch)),
+            live_saga_cap(&saga_origin(&dispatch).unwrap()),
             PER_MODULE_LIVE_SAGAS,
             "a module id is an aggregate producer"
         );

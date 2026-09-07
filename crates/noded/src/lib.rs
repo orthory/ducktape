@@ -269,6 +269,7 @@ impl From<&host::DispatchRecord> for DispatchInfo {
             origin: match &record.origin {
                 sdk::Origin::External(_) => "external".to_string(),
                 sdk::Origin::Module(id) => format!("module:{id}"),
+                sdk::Origin::Program(account) => format!("acct:{account}"),
                 sdk::Origin::System => "system".to_string(),
             },
             emitted_msgs: record.emitted_msgs,

@@ -75,7 +75,7 @@ pub struct WorkspaceSpec {
     /// verbatim.
     pub ro_mounts: Vec<RoMount>,
     /// whether the agent may READ the global skill library
-    /// (`agent::SKILL_LIBRARY_PREFIX`): a plain-data echo of the committed
+    /// (`runs::SKILL_LIBRARY_PREFIX`): a plain-data echo of the committed
     /// `duckfs_read` grant, decided in consensus by the composer and carried
     /// across the reachability wall like every other plan field.
     ///
@@ -428,7 +428,7 @@ fn receipt_stub(r: &WorkspaceReceipt) -> WorkspaceReceipt {
 /// parse used for effects. Validation remains the workspace commit boundary's
 /// job; this seam preserves the proposed subject and body verbatim.
 pub fn commit_message_from_response_text(text: &str) -> Option<String> {
-    serde_json::from_value::<agent::AgentResponse>(parse_response_value(text)?)
+    serde_json::from_value::<runs::AgentResponse>(parse_response_value(text)?)
         .ok()?
         .commit_message
 }

@@ -24,17 +24,17 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
-    BoundAccount, CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember,
-    ChatMessage, ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory,
-    append_thread_page, author_display, author_name, bounded_chat_window, bounded_thread_window,
-    chat_message, contains_pending_message, mark_message_groups, merge_landing_messages,
+    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
+    ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory, append_thread_page,
+    author_display, bounded_chat_window, bounded_thread_window, chat_message,
+    contains_pending_message, mark_message_groups, merge_landing_messages,
     merge_message_send_result, merge_pending_messages, merge_thread_refresh,
     parse_message_with_mentions, rollback_pending_message, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::{THREAD_HOT_WINDOW_LIMIT, paragraph_blocks};
+pub use ::chat::client::{BoundAccount, THREAD_HOT_WINDOW_LIMIT, author_name, paragraph_blocks};
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
 pub use ::forge::client::{

@@ -250,6 +250,7 @@ mod tests {
             consensus_time: 1,
             origin: Origin::Module("governance".into()),
             me: DEFAULT_ACL_ID.into(),
+            cause: sdk::Cause::Direct,
         })
     }
 
@@ -259,6 +260,7 @@ mod tests {
             consensus_time: 1,
             origin: Origin::External(vec![7u8; 32]),
             me: DEFAULT_ACL_ID.into(),
+            cause: sdk::Cause::Direct,
         })
     }
 
@@ -277,6 +279,7 @@ mod tests {
             consensus_time: 1,
             origin: Origin::Module(module_id.into()),
             me: DEFAULT_ACL_ID.into(),
+            cause: sdk::Cause::Direct,
         })
     }
 
@@ -344,6 +347,7 @@ mod tests {
             consensus_time: 1,
             origin: Origin::System,
             me: DEFAULT_ACL_ID.into(),
+            cause: sdk::Cause::Direct,
         });
         run(&mut a, &mut sys, &set("valset", Some(Standing::Validator))).unwrap();
 

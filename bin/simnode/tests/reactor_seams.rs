@@ -82,7 +82,7 @@ fn echo_work_spec() -> Vec<u8> {
 
 /// an automations rule whose action posts back into its own hooked channel is
 /// the textbook infinite loop. WHAT stops it, from the wire, is the module's
-/// OWN loop-prevention guard (a rule fires only on `AuthorRef::User` posts, and
+/// OWN loop-prevention guard (a rule fires only on `external-user` posts, and
 /// its follow-up post is module-authored), not the host's `MAX_DISPATCHES`
 /// budget — the raw `Error::BudgetExceeded` path stays unreachable through this
 /// route. the guard swallows the re-entry silently (before any run record), so
@@ -91,12 +91,13 @@ fn echo_work_spec() -> Vec<u8> {
 fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let operator = harness::found_account(&sim, "operator", 40);
     // the operator owns the channel — hook registration is the owner's call.
-    sim.submit_ok("chat", create_channel("loop", "Loop"), Some("operator"));
+    sim.submit_ok("chat", create_channel("loop", "Loop"), Some(&operator));
     sim.submit_ok(
         "chat",
         json!({ "register_hook": { "channel_id": "loop", "module_id": "automations" } }),
-        Some("operator"),
+        Some(&operator),
     );
     // the loop, wired deliberately: the trigger matches "ping", and the action
     // posts "ping again" — which contains "ping" — straight back into "loop".
@@ -107,7 +108,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
             "trigger": { "channel_id": "loop", "mention": null, "text_contains": "ping" },
             "action": { "post_message": { "channel_id": "loop", "template": "ping again" } },
         }}),
-        Some("operator"),
+        Some(&operator),
     );
 
     let before = sim.status();
@@ -339,20 +340,9 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 
 // ── A5: whole-registry determinism sweep ────────────────
 
-/// one op per registered module the sim can reach over /v1/submit, in a fixed
-/// order. `chat` cascades a `TagEvent` into `tagging`; `runs` subscribes through
-/// `tagging` too; `identity`'s Create founds the account `duckdns` then claims a
-/// handle on, and `gateway` publishes a member-signed route for that same
-/// just-founded account. no op here produces a CROSS-block follow-up (the
-/// fire-and-forget saga trigger's effect is dropped — no worker — and no
-/// dispatch result lands), so auto and stepped commit the identical block per op.
-///
-/// TWO modules stay absent (see the report): `files` (duckfs takes a BINARY
-/// op-frame, not a JSON submit) and `forge` (a libgit2-on-disk module whose
-/// determinism is repo-internal — its own e2e owns it, and it stays out of this
-/// cross-dir root-hash-equality assertion). `gateway` was the third until its
-/// SetRoute MemberAuthorization ceremony joined the sweep here — a route the
-/// account's founding Ed25519 member signs AND submits (the origin is the key).
+/// A fixed operation sequence covers source publication, human inbox
+/// maintenance, program provisioning, and model configuration alongside the
+/// ordinary module writes. Both drivers drain the same committed work.
 fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
     let node = "n".repeat(32);
     let key = Ed::from_seed(7);
@@ -361,7 +351,8 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
     let origin = key_origin(&key);
     let spec = echo_work_spec();
     vec![
-        // chat — and, via the post's TagEvent, tagging.
+        ("identity", create("alice"), Some(origin.clone())),
+        // Chat publishes source-owned attributions.
         (
             "chat",
             create_channel("general", "General"),
@@ -378,12 +369,11 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "task": { "create_task": { "task_id": "t1", "title": "sweep" } } }),
             Some("owner".into()),
         ),
-        // inbox — delivers to the "courier" origin's OWN queue: inbox refuses
-        // an external `Deliver` anywhere else.
+        // Human inbox maintenance resolves the actual account's signer.
         (
             "inbox",
-            json!({ "deliver": { "member": harness::ext_actor("courier"), "kind": "note", "body": "hi" } }),
-            Some("courier".into()),
+            json!({ "mark_read": { "account": 1, "up_to_seq": 0 } }),
+            Some(origin.clone()),
         ),
         // the job board (the merged tasks module's `job` arm)
         (
@@ -400,7 +390,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
                 "trigger": { "channel_id": "general", "mention": null, "text_contains": "zznomatch" },
                 "action": { "create_task": { "task_id_prefix": "auto", "title_template": "x" } },
             }}),
-            Some("owner".into()),
+            Some(origin.clone()),
         ),
         // saga — fire-and-forget: stages a pending saga, emits a WorkerRequest
         // effect no worker claims (dropped). no follow-up in either mode.
@@ -431,25 +421,25 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "create_page": { "page_id": "p1", "title": "Sweep" } }),
             Some("owner".into()),
         ),
-        // agent
         (
             "agent",
-            json!({ "register_agent": {
+            json!({ "provision": {
+                "name": "quackbot",
+                "program": runs::model_program("quackbot"),
+            }}),
+            Some(origin.clone()),
+        ),
+        (
+            "runs",
+            json!({ "configure_model": { "operation": { "register_model": {
+                "account": 2,
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo",
                 "allowed_actions": ["chat.post"],
-            }}),
-            Some("owner".into()),
+            }}}}),
+            Some(origin.clone()),
         ),
-        // runs — watching the channel subscribes through the tagging plane.
-        (
-            "runs",
-            json!({ "watch_channel": { "channel_id": "general", "policy": "mention" } }),
-            Some("owner".into()),
-        ),
-        // identity — Create founds account 1 for the key (the origin).
-        ("identity", create("alice"), Some(origin.clone())),
         // duckdns — claim a handle on the just-founded account (a member origin).
         (
             "gateway",
@@ -524,6 +514,14 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
         );
         let (code, reply) = pending.join().expect("submit thread");
         assert_eq!(code, 200, "{target} rejected in the stepped run: {reply}");
+        // Match the auto driver's committed internal-work drain before the
+        // next external operation. An empty step is the completion event.
+        loop {
+            let report = sim.step();
+            if report["committed"].is_null() {
+                break;
+            }
+        }
     }
     hashes
 }

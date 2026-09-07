@@ -32,6 +32,7 @@ fn ctx_at(consensus_time: u64) -> TestCtx {
         consensus_time,
         origin: Origin::System,
         me: "chat".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 
@@ -60,7 +61,8 @@ fn synced_store_reconstructs_source_root_and_history() {
         let mut src = Chat::new(
             "src",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
-        );
+        )
+        .with_attribution("attribution");
         apply_commit(
             &mut src,
             10,
@@ -79,7 +81,6 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "m1".into(),
                 blocks: vec![Block::paragraph("draft")],
                 thread: None,
-                as_agent: None,
             },
         )
         .await;
@@ -91,7 +92,6 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "m2".into(),
                 blocks: vec![Block::paragraph("final")],
                 thread: None,
-                as_agent: None,
             },
         )
         .await;
@@ -103,7 +103,6 @@ fn synced_store_reconstructs_source_root_and_history() {
                 message_id: "r1".into(),
                 blocks: vec![Block::paragraph("sync the thread too")],
                 thread: Some(1),
-                as_agent: None,
             },
         )
         .await;
@@ -135,7 +134,7 @@ fn synced_store_reconstructs_source_root_and_history() {
             25,
             ChatMsg::SetMembership {
                 channel_id: "general".into(),
-                user: vec![7; 32],
+                party: chat::Party::Key(vec![7; 32]),
                 member: true,
             },
         )

@@ -1,13 +1,12 @@
 use super::{
-    Block, BlockKind, MAX_PAGE_ID_BYTES, Origin, PageError, PageMsg, Pages, author_from_origin,
-    id_is_index_safe, to_page_err,
+    Block, BlockKind, MAX_PAGE_ID_BYTES, PageError, PageMsg, Pages, id_is_index_safe, to_page_err,
 };
 
 impl Pages {
     pub(super) async fn apply_page_op(
         &mut self,
         msg: PageMsg,
-        origin: &Origin,
+        authority: &super::Authority,
     ) -> Result<(), PageError> {
         match msg {
             PageMsg::CreatePage { page_id, title } => {
@@ -23,12 +22,9 @@ impl Pages {
                     // are block ids, so this is a global-uniqueness violation.
                     Some(_) => Err(PageError::DuplicateBlock),
                     None => {
-                        // a module origin is recorded as the module — same
-                        // rule as a comment's stored author.
-                        let author = author_from_origin(origin)?;
                         self.index_add(&page_id, None).await?;
-                        self.store_page_author(&page_id, &author)?;
                         self.store_block(&Block {
+                            author: authority.actor.clone(),
                             id: page_id.clone(),
                             parent: None,
                             page: page_id,

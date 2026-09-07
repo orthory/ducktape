@@ -8,19 +8,21 @@
 //! production genesis path does (`bin/node/src/host_state.rs`
 //! `seed_store_config`), then founds an account, admits a WebAuthn passkey
 //! (the consent verifies in-module), REMOVES it again (the op log carries an
-//! index DELETE, not just inserts, and the generation counter survives), and
-//! sets the profile (record overwrites). only a real sync that ships the
-//! ACTUAL proven op range lands on the same root — and the config record
-//! arrives with it, which is what lets a joiner's wasm guest read its chain id
-//! from the synced store.
+//! index DELETE, not just inserts, and the generation counter survives), sets
+//! the profile (record overwrites), provisions a program account from a
+//! module origin, founds a second key-held account and hands the program to
+//! it (the controlled-set records move and the generation advances), and
+//! suspends it. only a real sync that ships the ACTUAL proven op range lands
+//! on the same root — and the config record arrives with it, which is what
+//! lets a joiner's wasm guest read its chain id from the synced store.
 
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use identity::{
-    IDENTITY_ADD_KEY_NS, Authorizer, Identity, IdentityMsg, IdentityQuery, IdentityReply,
-    KeyScheme, add_key_preimage, decode_reply, encode_msg, encode_query,
+    Authorizer, Control, IDENTITY_ADD_KEY_NS, Identity, IdentityMsg, IdentityQuery, IdentityReply,
+    KeyScheme, ProgramStanding, add_key_preimage, decode_reply, encode_msg, encode_query,
 };
-use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
+use sdk::{Cause, Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
@@ -65,6 +67,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: height,
         origin,
         me: "identity".into(),
+        cause: Cause::Direct,
     })
 }
 
@@ -77,9 +80,19 @@ async fn apply_commit(m: &mut Identity, height: u64, origin: Origin, op: Msg) {
 }
 
 /// the read matrix compared source-vs-joiner: the listing, the account point
-/// read, the key resolver for a live key and a removed one, and the removed
-/// key's surviving generation counter.
-const QUERIES: [&str; 5] = ["all", "get", "of-key-founder", "of-key-removed", "gen-removed"];
+/// read, the key resolver for a live key and a removed one, the removed
+/// key's surviving generation counter, the program's record, and both
+/// controllers' sets after the transfer.
+const QUERIES: [&str; 8] = [
+    "all",
+    "get",
+    "of-key-founder",
+    "of-key-removed",
+    "gen-removed",
+    "get-program",
+    "controlled-by-founder",
+    "controlled-by-second",
+];
 
 async fn replies(m: &Identity, founder: &[u8], removed: &[u8]) -> Vec<IdentityReply> {
     let queries = [
@@ -93,6 +106,17 @@ async fn replies(m: &Identity, founder: &[u8], removed: &[u8]) -> Vec<IdentityRe
         }),
         encode_query(&IdentityQuery::KeyGen {
             key: removed.to_vec(),
+        }),
+        encode_query(&IdentityQuery::Get { number: 2 }),
+        encode_query(&IdentityQuery::Controlled {
+            by: 1,
+            from: 0,
+            limit: 16,
+        }),
+        encode_query(&IdentityQuery::Controlled {
+            by: 3,
+            from: 0,
+            limit: 16,
         }),
     ];
     let mut out = Vec::new();
@@ -176,14 +200,76 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
             }),
         )
         .await;
+        // a module provisions program 2 for account 1: the program record
+        // and the founder's controlled set enter the op log.
+        apply_commit(
+            &mut src,
+            5,
+            Origin::Module("agent".into()),
+            identity_msg(&IdentityMsg::CreateProgram {
+                name: "bot".into(),
+                controller: 1,
+                request: 1,
+            }),
+        )
+        .await;
+        // a second key-held account 3, then the founder hands the program to
+        // it: one set loses the number, the other gains it, and the program
+        // record's generation advances.
+        let second = ed(2);
+        apply_commit(
+            &mut src,
+            6,
+            Origin::External(ed_pub(&second)),
+            identity_msg(&IdentityMsg::Create {
+                name: "carol".into(),
+                scheme: KeyScheme::Ed25519,
+            }),
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            7,
+            Origin::External(ed_pub(&founder)),
+            identity_msg(&IdentityMsg::TransferControl { account: 2, to: 3 }),
+        )
+        .await;
+        // the executor suspends it: the record overwrites once more.
+        apply_commit(
+            &mut src,
+            8,
+            Origin::Module("agent".into()),
+            identity_msg(&IdentityMsg::SetProgramStanding {
+                account: 2,
+                standing: ProgramStanding::Suspended,
+            }),
+        )
+        .await;
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, config_root, "the ops moved the root");
         let src_replies = replies(&src, &ed_pub(&founder), &passkey_pub).await;
         let IdentityReply::Accounts(listed) = &src_replies[0] else {
             panic!("expected the listing");
         };
-        assert_eq!(listed.len(), 1, "one account is numbered");
-        assert_eq!(src_replies[4], IdentityReply::Gen(1), "removal keeps the counter");
+        assert_eq!(listed.len(), 3, "three accounts are numbered");
+        assert_eq!(
+            src_replies[4],
+            IdentityReply::Gen(1),
+            "removal keeps the counter"
+        );
+        let IdentityReply::Account(Some(program)) = &src_replies[5] else {
+            panic!("expected the program record");
+        };
+        assert_eq!(
+            program.control,
+            Control::Program {
+                controller: 3,
+                executor: "agent".into(),
+                generation: 2,
+                standing: ProgramStanding::Suspended,
+            }
+        );
+        assert!(program.keys.is_empty(), "a program holds no key");
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -242,5 +328,17 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
         let IdentityReply::Account(None) = &synced_replies[3] else {
             panic!("the removed key must stay unlinked on the joiner");
         };
+        // the controlled sets moved with the transfer, on both sides.
+        let IdentityReply::Accounts(by_founder) = &synced_replies[6] else {
+            panic!("expected the founder's controlled set");
+        };
+        assert!(by_founder.is_empty(), "the founder handed the program on");
+        let IdentityReply::Accounts(by_second) = &synced_replies[7] else {
+            panic!("expected the second account's controlled set");
+        };
+        assert_eq!(
+            by_second.iter().map(|a| a.number).collect::<Vec<_>>(),
+            vec![2]
+        );
     });
 }

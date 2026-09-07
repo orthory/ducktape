@@ -1,42 +1,28 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
-    ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply,
-    MAX_PAYLOAD_BYTES, MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule,
-    SagaOrigin, SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query,
-    chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
-    dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
-    inject, recipe_id_for,
+    CONTEXT_WINDOW, ChannelAccess, ChatQuery, ChatReply, Ctx, DispatchMsg, DispatchQuery,
+    DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES, MessageView, ModelRecord,
+    ModelStatus, ModuleId, Msg, PendingState, PreparedDispatch, RunOrigin, RunsModule,
+    SiblingReadBudget, SkillRef, chat_decode_reply, chat_encode_query, dispatch_decode_reply,
+    dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply,
+    files_encode_query, inject, recipe_id_for,
 };
 use crate::facets::WireSink;
 
 impl RunsModule {
-    // ---- registry reads --------------------------------------------------------
-    // the agent registry is another module's state; these queries see staged
-    // same-block registrations through the host's live query routing, so a
-    // register-watch-engage cascade works within one block — deterministically,
-    // on every validator.
+    // ---- model configuration reads ---------------------------------------------
+    // Reads include the current execute overlay, so an admitted configuration
+    // change is visible to later model work in consensus order.
 
     /// one registry record, or `None` when the agent isn't registered.
     pub(super) async fn agent_record(
         &self,
         ctx: &dyn Ctx,
         agent_id: &str,
-    ) -> Result<Option<AgentRecord>, String> {
-        let reply = ctx
-            .query(
-                &self.agent,
-                &agent_encode_query(&AgentQuery::Agent {
-                    agent_id: agent_id.to_string(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("agent registry query failed: {e}"))?;
-        match agent_decode_reply(&reply) {
-            Ok(AgentReply::Agent(record)) => Ok(record),
-            _ => Err("unexpected agent reply for an agent lookup".into()),
-        }
+    ) -> Result<Option<ModelRecord>, String> {
+        let _ = ctx;
+        Ok(self.model(agent_id).cloned())
     }
 
     /// The live registry record narrowed by this run's admission ceiling.
@@ -47,7 +33,7 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         entry: &PendingState,
-    ) -> Result<Option<AgentRecord>, String> {
+    ) -> Result<Option<ModelRecord>, String> {
         Ok(self
             .agent_record(ctx, &entry.agent_id)
             .await?
@@ -64,28 +50,11 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         agent_id: &str,
-    ) -> Result<Option<AgentRecord>, String> {
+    ) -> Result<Option<ModelRecord>, String> {
         Ok(self
             .agent_record(ctx, agent_id)
             .await?
-            .filter(|a| a.status == AgentStatus::Active))
-    }
-
-    /// every ACTIVE registered agent, sorted — the deterministic engagement
-    /// domain for `All` and `RoundRobin`.
-    pub(super) async fn active_agent_ids(&self, ctx: &dyn Ctx) -> Result<Vec<String>, String> {
-        let reply = ctx
-            .query(&self.agent, &agent_encode_query(&AgentQuery::Agents))
-            .await
-            .map_err(|e| format!("agent registry query failed: {e}"))?;
-        match agent_decode_reply(&reply) {
-            Ok(AgentReply::Agents(records)) => Ok(records
-                .into_iter()
-                .filter(|a| a.status == AgentStatus::Active)
-                .map(|a| a.agent_id)
-                .collect()),
-            _ => Err("unexpected agent reply for an agents listing".into()),
-        }
+            .filter(|a| a.status == ModelStatus::Active))
     }
 
     // ---- the turn claim --------------------------------------------------------
@@ -125,7 +94,7 @@ impl RunsModule {
 
     /// chat's answer to "may `user` post to `channel_id`" — the standing an
     /// explicit `RequestRun` submitter must hold before this module pins that
-    /// channel's transcript and posts a reply into it under module authority.
+    /// channel's transcript for a model run whose program may reply there.
     /// post standing covers read (chat's [`ChatReply::may_post`] implies
     /// `may_read`), so this one query is the whole gate. an unexpected or
     /// failed reply answers `false` — the submission fails closed rather than
@@ -162,7 +131,7 @@ impl RunsModule {
                 &self.chat,
                 &chat_encode_query(&ChatQuery::Access {
                     channel_id: channel_id.to_string(),
-                    user: user.to_vec(),
+                    party: chat::Party::Key(user.to_vec()),
                 }),
             )
             .await
@@ -228,7 +197,7 @@ impl RunsModule {
     pub(super) async fn portable_inputs(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
         self.portable_inputs_with_workspace(ctx, agent, agent, extra)
@@ -241,8 +210,8 @@ impl RunsModule {
     async fn portable_inputs_with_workspace(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
-        workspace_agent: &AgentRecord,
+        agent: &ModelRecord,
+        workspace_agent: &ModelRecord,
         extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
         let source_snapshot = match self.files.clone() {
@@ -299,7 +268,7 @@ impl RunsModule {
     pub(super) async fn prepare_dispatch(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
@@ -319,14 +288,35 @@ impl RunsModule {
     pub(super) async fn prepare_dispatch_with_context(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
-        delegation: Option<(&AgentRecord, &str)>,
+        delegation: Option<(&ModelRecord, &str)>,
         extra: &[SkillRef],
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let bytes = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.into(),
+                    party: chat::Party::Account(agent.account),
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) = chat_decode_reply(&bytes)? else {
+            return Err("unexpected program channel access reply".into());
+        };
+        if !access.may_read {
+            return Err("program may not read the requested channel".into());
+        }
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => {
@@ -343,10 +333,10 @@ impl RunsModule {
                 .await?
             }
         };
-        // M2: `[[page:<id>]]` refs in the trigger message text or the injected
+        // `duck://page/<id>` refs in the trigger message text or the injected
         // item body render referenced page subtrees into the same context
         // section — resolved from COMMITTED pages state at compose height,
-        // appended after the M1 item context (which stays untouched).
+        // appended after the referenced item context.
         let anchor_text = transcript
             .last()
             .map(inject::message_text)
@@ -390,6 +380,8 @@ impl RunsModule {
             ));
         }
         Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
             thread_root,
             payload,
             sink,
@@ -397,17 +389,22 @@ impl RunsModule {
     }
 
     /// Prepare a run triggered by one Pages comment. `ordinal` is 1-based in
-    /// the thread and comes from Pages' same-block tag event. `run_id` is the
+    /// the committed source thread. `run_id` is the
     /// caller's, exactly as in [`Self::prepare_dispatch`].
     pub(super) async fn prepare_page_dispatch(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         thread_id: &str,
         ordinal: u64,
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let pages = self
             .pages
             .as_deref()
@@ -435,10 +432,10 @@ impl RunsModule {
             .cloned()
             .ok_or_else(|| format!("pages comment is missing: {thread_id}/{ordinal}"))?;
         let author = match &comment.author {
-            pages::AuthorRef::User(key) => format!("user:{}", crate::hex(key)),
-            pages::AuthorRef::Agent { module, agent_id } => format!("{module}/{agent_id}"),
-            pages::AuthorRef::Module(module) => format!("module:{module}"),
-            pages::AuthorRef::System => "system".into(),
+            pages::Party::Key(key) => format!("user:{}", crate::hex(key)),
+            pages::Party::Account(account) => format!("account:{account}"),
+            pages::Party::Module(module) => format!("module:{module}"),
+            pages::Party::System => "system".into(),
         };
         let block_reply = ctx
             .query(
@@ -479,16 +476,62 @@ impl RunsModule {
             ));
         }
         Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
             thread_root: None,
             payload,
             sink,
         })
     }
 
-    /// stage a chat run's dispatch — one atomic unit with whatever op caused
-    /// it (P2). the recipe is the agent's own (`agent/{agent_id}`, registered
-    /// by the registry hook); the result lands as a next-block `ResultEvent`
-    /// keyed by the dispatch id, which prunes the entry staged here.
+    /// A page is also a block. Resolve the exact attributed block, then use
+    /// the same bounded page context as comment-triggered model work.
+    pub(super) async fn prepare_page_block_dispatch(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &ModelRecord,
+        run_id: &str,
+        block_id: &str,
+        budget: &SiblingReadBudget,
+    ) -> Result<PreparedDispatch, String> {
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pages = self
+            .pages
+            .as_deref()
+            .ok_or_else(|| "pages module is not configured".to_string())?;
+        let block = self.page_block(ctx, pages, block_id).await?;
+        let mut portable = self.portable_inputs(ctx, agent, &[]).await?;
+        let blocks = self
+            .page_blocks_for_execute(ctx, pages, &block.page, budget)
+            .await;
+        portable.context = Some(inject::render_pages_section(
+            &[(block.page.clone(), blocks)],
+            &self.net_query(),
+        ));
+        let sink = portable.sink.clone();
+        let payload =
+            envelope::render_page_block_payload(agent, run_id, &block, portable).into_bytes();
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
+                payload.len()
+            ));
+        }
+        Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
+            thread_root: None,
+            payload,
+            sink,
+        })
+    }
+
+    /// Stage a source-backed run and its dispatch atomically. The model's
+    /// configured recipe returns a `ResultEvent` keyed by the dispatch id,
+    /// which prunes the pending entry staged here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stage_dispatch_run(
         &mut self,
@@ -497,7 +540,7 @@ impl RunsModule {
         agent_id: String,
         channel_id: String,
         anchor_seq: u64,
-        requester: SagaOrigin,
+        requester: RunOrigin,
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
     ) {
@@ -526,7 +569,7 @@ impl RunsModule {
         workspace_agent_id: String,
         channel_id: String,
         anchor_seq: u64,
-        requester: SagaOrigin,
+        requester: RunOrigin,
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
         authority: Option<super::RunAuthority>,
@@ -547,6 +590,9 @@ impl RunsModule {
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
+                account: prepared.account,
+                generation: prepared.generation,
+                cause: ctx.env().cause.clone(),
                 run_id: run_id.to_string(),
                 workspace_agent_id,
                 agent_id,

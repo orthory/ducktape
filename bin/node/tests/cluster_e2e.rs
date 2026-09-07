@@ -25,7 +25,7 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use chat::{Party, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::Cluster;
 use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
 use tasks::{TaskMsg, TaskQuery, TaskReply};
@@ -42,7 +42,6 @@ fn chat_post(channel: &str, message_id: &str, text: &str) -> Vec<u8> {
         message_id: message_id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
-        as_agent: None,
     })
 }
 
@@ -53,7 +52,7 @@ fn read_message(
     idx: usize,
     channel: &str,
     message_id: &str,
-) -> Option<(String, AuthorRef)> {
+) -> Option<(String, Party)> {
     let reply = cluster.query(
         idx,
         "chat",
@@ -178,7 +177,7 @@ fn cluster_lifecycle() {
         });
     assert_eq!(text, "hello ducktape");
     // authorship is derived from the VERIFIED frame origin — node 0 signed it.
-    assert_eq!(author, AuthorRef::User(Cluster::identity(0)));
+    assert_eq!(author, Party::Key(Cluster::identity(0)));
 
     // 6. governance: node 0 proposes admitting node 3's key, nodes 0+1 vote
     // yes (2 of 3 = strict majority), node 1 executes; the passing proposal

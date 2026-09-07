@@ -374,9 +374,47 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
             "message_id": message_id,
             "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
-            "as_agent": null,
         }
     })
+}
+
+/// Provision the model's real keyless account and its program under the first
+/// account in a fresh scenario. The caller submits all three operations as the
+/// same 32-byte controller key.
+pub fn model_setup(
+    agent_id: &str,
+    capability: &str,
+    allowed_actions: serde_json::Value,
+) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("identity", create("model-controller")),
+        (
+            "agent",
+            serde_json::json!({ "provision": {
+                "name": agent_id,
+                "program": runs::model_program(agent_id),
+            }}),
+        ),
+        (
+            "runs",
+            serde_json::json!({ "configure_model": { "operation": { "register_model": {
+                "account": 2,
+                "agent_id": agent_id,
+                "display_name": agent_id,
+                "capability": capability,
+                "allowed_actions": allowed_actions,
+            }}}}),
+        ),
+    ]
+}
+
+pub fn found_account(sim: &Sim, name: &str, seed: u64) -> String {
+    use commonware_cryptography::Signer as _;
+    let origin = key_origin(&commonware_cryptography::ed25519::PrivateKey::from_seed(
+        seed,
+    ));
+    sim.submit_ok("identity", create(name), Some(&origin));
+    origin
 }
 
 /// the sim's identity chain id — the composer's `Bindings { chain_id: "local" }`
@@ -397,18 +435,6 @@ pub fn key_origin(key: &commonware_cryptography::ed25519::PrivateKey) -> String 
         .map(|b| format!("{b:02x}"))
         .collect();
     format!("hex:{hex}")
-}
-
-/// the inbox queue a plain-string `/v1/submit` origin owns: mirrors
-/// [`sdk::Origin::actor_string`]'s `ext:` + lowercase-hex convention for an
-/// `Origin::External` whose key is the origin string's own ASCII bytes (the
-/// trusted-client convention `decode_origin` in `bin/simnode/src/lib.rs`
-/// passes through verbatim). inbox now refuses an external `Deliver` outside
-/// its own queue, so any harness helper that ticks the logical clock through
-/// inbox must target this, not the raw origin string.
-pub fn ext_actor(origin: &str) -> String {
-    let hex: String = origin.bytes().map(|b| format!("{b:02x}")).collect();
-    format!("ext:{hex}")
 }
 
 /// the `Create` op founding an account for the submit ORIGIN (declared

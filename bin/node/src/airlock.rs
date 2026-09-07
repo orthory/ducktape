@@ -811,6 +811,7 @@ mod tests {
                     };
                     Ok(identity::encode_reply(&identity::IdentityReply::Account(
                         account.map(|number| identity::AccountView {
+                            control: identity::Control::Keys,
                             number,
                             name: "someone".into(),
                             keys: Vec::new(),

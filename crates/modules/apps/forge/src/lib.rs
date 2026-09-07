@@ -80,8 +80,8 @@
 //! objects, and reading them would break the determinism invariant above. so
 //! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
 //! a repo pins its owner — the Identity ACCOUNT principal the origin resolves
-//! to (see [`state::ForgeState::principal_of_origin`]; every key of one
-//! association, laptop or phone, collapses onto one account) — and only that
+//! to (every bound key resolves to its canonical account; an unbound key
+//! retains exact signer ownership) — and only that
 //! owner may move `main`/`dev` afterwards, whether by
 //! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
 //! FEATURE branches stay open to every member.

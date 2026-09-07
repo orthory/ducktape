@@ -204,11 +204,8 @@ fn install_panic_hook() {
 
 /// the drain-side sink for module events that no worker claimed.
 ///
-/// this is not a nicety: 9 of the 11 app modules compile to WASM guests, and the
-/// WIT world exposes NO log import — `emit_event` is their entire outbound
-/// diagnostic surface, forever. every `runs::note()` breadcrumb arrives here,
-/// including `run <id> failed: <reason>` — the single most important line in the
-/// agent path, which until now was collected by the host and dropped on the floor.
+/// Guest diagnostic breadcrumbs arrive through `emit_event`. They can fire
+/// many times per block, so they log at debug under `ducktape::modules`.
 ///
 /// one instance per drain: `take_events()` returns everything since the last tick,
 /// and a single drain can apply MANY blocks (catch-up, a post-reboot suffix), so
@@ -255,7 +252,7 @@ impl ModuleNotes {
             return;
         }
         self.emitted += 1;
-        tracing::info!(
+        tracing::debug!(
             target: "ducktape::modules",
             height = self.height,
             source = %event.source,

@@ -73,10 +73,9 @@ mod index_guest;
 use std::collections::BTreeMap;
 
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
-    StateRoot, StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
+    StateSyncHandle,
 };
-use tagging::{TagEvent, TaggingMsg};
 
 mod block_ops;
 mod comment_ops;
@@ -89,19 +88,21 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
-/// derive an author from the dispatch origin — shared by the comment ops and
-/// the page/block ops (mirrors chat). the pre-consensus default
-/// `Origin::External(vec![])` must never pass as a real user.
-pub(crate) fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
-    match origin {
-        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
-        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
-            Err(PageError::AuthorTooLarge)
+/// The current account is a canonical actor, while an original signed key
+/// retains authority over records it created before joining an account.
+struct Authority {
+    actor: Party,
+    origin: sdk::Origin,
+}
+
+impl Authority {
+    fn owns(&self, owner: &Party) -> bool {
+        match owner {
+            Party::Key(key) => {
+                matches!(&self.origin, sdk::Origin::External(signer) if signer == key)
+            }
+            Party::Account(_) | Party::Module(_) | Party::System => owner == &self.actor,
         }
-        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
-        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
-        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
-        Origin::System => Ok(AuthorRef::System),
     }
 }
 
@@ -178,9 +179,9 @@ pub struct Pages {
     /// `commit_block`; NOT in `root()` until then. store key is
     /// `sha256(block_id)`, owned by [`StagedStore`].
     staged: StagedStore,
-    /// Optional engagement router. Tests/minimal registries may leave it
-    /// unwired; production reports each newly-added comment after staging it.
-    tagging: Option<ModuleId>,
+    /// Source-owned block and comment attribution, wired in production.
+    attribution: Option<ModuleId>,
+    identity: Option<ModuleId>,
 }
 
 #[cfg(test)]

@@ -31,29 +31,32 @@ fn commit_sink(m: &mut RunsModule, run_id: &str, sink: WireSink) {
         .sink = sink;
 }
 
-/// a module wired with the forge sink, one watch on "general", one engaged
+/// a module wired with the forge sink and one attributed
 /// run for agent "bot" at seq 2, with the canonical PR sink committed
 /// (#1835) so a test's echoed `forge_wrapper`/inline PR sink is accepted.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     let mut m = module().with_sink_forge("forge");
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: "general".into(),
-            policy: TurnPolicy::All,
-        }),
-    )
-    .unwrap();
+    m.models = registry.clone();
     commit(&mut m);
-    engage_post(&mut m, registry, 2, &[]);
+    request_post(&mut m, registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
     commit_sink(&mut m, &run_id, canonical_forge_sink());
     (m, run_id)
+}
+
+#[test]
+fn a_snapshot_preserves_the_committed_sink_and_program_identity() {
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let (mut original, run_id) = awaiting_run_with_forge(&registry);
+    commit(&mut original);
+    let bytes = original.snapshot();
+    let mut restored = module().with_sink_forge("forge");
+    restored.install(&bytes, original.root()).unwrap();
+    let dispatch = dispatch_id_for(&run_id);
+    assert_eq!(restored.pending[&dispatch], original.pending[&dispatch]);
+    assert_eq!(restored.pending[&dispatch].sink, canonical_forge_sink());
+    assert_eq!(restored.snapshot(), bytes);
 }
 
 #[test]
@@ -642,7 +645,7 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
     exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
     commit(&mut m);
     let run_id = job_run_id_for("job-1", "duck", 3);
-    let response = agent::encode_response(&AgentResponse {
+    let response = crate::encode_response(&AgentResponse {
         reply_blocks: Vec::new(),
         actions: vec![AgentAction::CreateTask {
             task_id: "t1".into(),
@@ -884,12 +887,11 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
             target_branch: "main".into(),
         }
     );
-    // the delivered-runs ring observes the same delivery: the forge
-    // output ref and the number the fresh OpenPr gets (issue #7 → PR #8).
+    // The pushed ref is committed, but the proposed PR has no number yet.
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
-    assert_eq!(rec.pr_number, Some(8));
+    assert_eq!(rec.pr_number, None);
     assert_eq!(rec.executing_node, "ab".repeat(32));
 }
 
@@ -1085,10 +1087,9 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
         1,
         "no open PR matches the source — OpenPr fires"
     );
-    // the ring records the number the fresh OpenPr gets: committed max
-    // item number (issue 6) + 1.
+    // A later program call decides whether to open a PR and allocates its id.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, Some(7));
+    assert_eq!(recent_runs(&m)[0].pr_number, None);
 }
 
 #[test]
@@ -1225,8 +1226,12 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // pin the executing-node lookup's saga-id mirror against the REAL
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
-    let mut d =
-        dispatch::DispatchModule::new("dispatch", "saga", Box::new(sdk_testkit::MemStore::new()));
+    let mut d = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+    );
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,

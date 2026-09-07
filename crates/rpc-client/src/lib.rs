@@ -167,6 +167,7 @@ pub struct StreamOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum StreamOriginKind {
     External,
+    Program,
     Module,
     System,
 }

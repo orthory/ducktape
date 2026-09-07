@@ -1240,13 +1240,13 @@ fn the_explorer_names_what_it_shows() {
             "emitted_msgs": 1, "emitted_events": 0,
         }),
         serde_json::json!({
-            "module": "tagging", "origin": "module:chat",
+            "module": "attribution", "origin": "module:chat",
             "emitted_msgs": 0, "emitted_events": 2,
         }),
     ];
     assert_eq!(
         backend::explorer_trace(Some(&hops)),
-        "chat · 1 msg · 0 events → tagging · 0 msgs · 2 events",
+        "chat · 1 msg · 0 events → attribution · 0 msgs · 2 events",
         "every count in the trace names what it counts"
     );
 
@@ -1608,7 +1608,10 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
         .split_once("\n        members:")
         .expect("the mount ends")
         .0;
-    assert!(mount.contains("dark\n"), "the mount hands the screen the appearance");
+    assert!(
+        mount.contains("dark\n"),
+        "the mount hands the screen the appearance"
+    );
     assert!(
         mount.contains("open_message_link -> open_message_link _"),
         "markdown links route through the shell's link seam"
@@ -1622,10 +1625,19 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
         .split_once("\non ")
         .expect("the handler ends")
         .0;
-    let cleared = open_file.find("fs_preview_text = \"\"").expect("the old body is cleared");
-    let unpictured = open_file.find("fs_preview_picture = false").expect("the old picture flag is cleared");
-    let read = open_file.find("run replace lane=files_preview").expect("the read");
-    assert!(cleared < read && unpictured < read, "the body is cleared before the read is issued");
+    let cleared = open_file
+        .find("fs_preview_text = \"\"")
+        .expect("the old body is cleared");
+    let unpictured = open_file
+        .find("fs_preview_picture = false")
+        .expect("the old picture flag is cleared");
+    let read = open_file
+        .find("run replace lane=files_preview")
+        .expect("the read");
+    assert!(
+        cleared < read && unpictured < read,
+        "the body is cleared before the read is issued"
+    );
 }
 
 /// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.

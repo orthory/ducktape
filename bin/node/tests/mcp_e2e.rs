@@ -18,6 +18,7 @@
 #[path = "mcp_support/mod.rs"]
 mod support;
 
+use commonware_cryptography::Signer as _;
 use serde_json::json;
 use support::{AGENT_ID, Harness, OWNER, content, payload};
 
@@ -42,23 +43,37 @@ fn whoami_reports_the_committed_grant() {
     // the grant the agent sees is the one consensus holds — not one copied into
     // the environment, which could disagree with the chain.
     assert_eq!(who["allowed_actions"], json!(["tasks.create"]));
-    assert_eq!(who["owner"], json!({"external": OWNER.as_bytes()}));
+    assert_eq!(
+        who["owner"],
+        serde_json::to_value(sdk::Origin::External(
+            support::owner_key().public_key().as_ref().to_vec()
+        ))
+        .unwrap()
+    );
+    let number = who["account"]
+        .as_u64()
+        .expect("the model has a real account");
+    let reply = h.query(
+        "identity",
+        serde_json::to_value(identity::IdentityQuery::Get { number }).unwrap(),
+    );
+    let identity::IdentityReply::Account(Some(account)) = serde_json::from_value(reply).unwrap()
+    else {
+        panic!("model identity");
+    };
+    assert!(
+        account.keys.is_empty(),
+        "a program account has no signing key"
+    );
+    assert!(
+        matches!(account.control, identity::Control::Program { executor, .. } if executor == "agent")
+    );
 }
 
 #[test]
 fn agents_and_runs_are_read_from_the_real_modules() {
     let h = Harness::start(&["tasks.create"]);
-    h.submit(
-        "agent",
-        json!({"register_agent": {
-            "agent_id": "tailbot",
-            "display_name": "Tailbot",
-            "capability": "codex",
-            "allowed_actions": [],
-            "caps": {},
-        }}),
-        OWNER,
-    );
+    h.register_model("tailbot", "Tailbot", &[], &[]);
 
     let results = h.session(
         h.mcp(),
@@ -105,8 +120,14 @@ fn whoami_reports_the_run_id_without_exposing_the_session_key() {
     let sessionless = payload(&h.call(h.mcp(), "ducktape_whoami", json!({})));
     assert!(sessionless["run_id"].is_null());
 
-    let bound = payload(&h.call(h.mcp_with_action(UNBOUND_RUN), "ducktape_whoami", json!({})));
-    assert_eq!(bound["run_id"], UNBOUND_RUN);
+    let run_id = h.pending_run();
+    let bound = payload(&h.call(h.mcp_with_action(&run_id), "ducktape_whoami", json!({})));
+    assert_eq!(bound["run_id"], run_id);
+    let refused = h.call(h.mcp_with_action(UNBOUND_RUN), "ducktape_whoami", json!({}));
+    assert!(
+        content(&refused).0,
+        "an invented run id cannot claim model authority"
+    );
     assert!(bound.get("session_key").is_none());
     assert!(!bound.to_string().contains(&"4d".repeat(32)));
 }
@@ -169,8 +190,8 @@ fn the_reported_grant_is_the_committed_one_even_as_it_narrows() {
     );
 
     h.submit(
-        "agent",
-        json!({"update_agent": {"agent_id": AGENT_ID, "allowed_actions": ["chat.post"]}}),
+        "runs",
+        json!({"configure_model": {"operation": {"update_model": {"agent_id": AGENT_ID, "allowed_actions": ["chat.post"]}}}}),
         OWNER,
     );
 

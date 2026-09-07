@@ -1,88 +1,31 @@
-//! the agent session lane: an agent's MID-RUN writes, made unforgeable.
+//! Interactive model work authenticates the host-owned ephemeral session
+//! signer against the committed execution lease and model grant. The signer
+//! never becomes a key of the program account, and the child receives only a
+//! narrow endpoint token.
 //!
-//! the settle path validates what a run RETURNS. this lane validates what an
-//! agent does WHILE it runs — the same grant, the same caps, the same code
-//! ([`RunsModule::validate_response`] and [`RunsModule::pages_action_msg`]),
-//! reached through a different door. there is exactly ONE definition of what an
-//! agent may do; a second one would be the hole this lane exists to close.
+//! Admission validates one action and reserves its immutable proposal,
+//! completion marker and publication queue item. The account's program then
+//! claims and executes the prepared message through dispatch. The target
+//! receives the actual Program origin and applies its own authorization.
 //!
-//! ## why a session key at all
+//! The HTTP caller waits for the bound target's committed outcome. Admission
+//! errors reject immediately; later target failures remain queryable receipts.
+//! Result-returned actions use the same program route, while optional malformed
+//! page effects can be omitted with a recorded diagnostic before admission.
 //!
-//! the frameless `/v1/submit` lane lets a caller NAME an origin, and `bin/node`
-//! discards it — it signs every op with its own node key. so an agent's write
-//! was byte-indistinguishable from the human's at the same keyboard: no audit
-//! trail, the wrong account cross-node, and an ACL that only ever ran in a host
-//! binary, where consensus could not see it.
-//!
-//! a frame's origin, by contrast, IS its verified public key (`node::decode_frame`
-//! binds `(origin, seq, target, payload)`, and every honest validator rejects a
-//! forged frame identically). so the executing node mints an ephemeral keypair
-//! per run, binds the PUBLIC half here, and hands only the private half to the
-//! agent's tool server. an op signed by it provably came from that run — and
-//! consensus refuses it the moment it exceeds the owner's committed grant.
-//!
-//! the owner's authority is never asked for: `AgentRecord { owner,
-//! allowed_actions, caps }` IS the capability grant, already committed.
-//! registering an agent with `pages.comment` is the act of authorizing it. what
-//! this lane adds is not authority but PROOF of who is exercising it.
-//!
-//! ## the two authorizations (X2)
-//!
-//! - **open** — the origin must be the run's committed LEASE-HOLDER: the node
-//!   the dispatch plane actually handed the work to (the `assignee` on the saga
-//!   the dispatch names, read directly). self-authorizing,
-//!   so an automated issue-mention run works with nobody at a keyboard, and
-//!   correct cross-node, because the lease names the node really executing.
-//! - **act** — the origin must BE the bound session key, AND the lease must
-//!   still sit where it did when the session opened. no other origin, not even
-//!   the owner's or the assignee's, may act through a session; and a lease that
-//!   moves (reassignment, expiry) strands the old session on the spot instead
-//!   of handing an evicted node the agent's grant for the rest of the run.
-//!
-//! ## LOUD, not degraded (the deliberate divergence from the settle path)
-//!
-//! `emit_pages_effects` degrades a bad pages action to a breadcrumb: it runs
-//! inside the no-fail delivery block, and a page annotation is never worth
-//! failing a run over. an action HERE is the opposite: an explicit, synchronous
-//! op the agent submitted and is waiting on. a refusal it never sees is a lie,
-//! so every refusal is an `Err` the submitter reads.
-//!
-//! ## the no-fail rule does NOT bind this lane (and why that matters)
-//!
-//! the settle path runs inside the dispatch plane's DELIVERY injection: a
-//! follow-up its target rejects aborts that whole block, the committed mailbox
-//! re-injects the delivery next block, and it aborts again — forever. that is
-//! the no-fail rule, and it is why the settle path must prove every follow-up
-//! valid before emitting any of them.
-//!
-//! an `AgentAction` is a ROOT op — the agent's own frame, isolated by the host
-//! like any submitter's op. a follow-up the target rejects rolls THIS op back
-//! and returns the error to the agent that sent it. nothing re-injects it,
-//! nothing else in the block is touched, and the next op is unaffected: a
-//! rejection here is a rejection, not a wedge.
-//!
-//! the probes still run — an agent deserves the refusal SYNCHRONOUSLY, and the
-//! shared validator is the one definition of what it may do — but the failure
-//! POLICIES are what differ, and conflating them is a trap: the settle path
-//! emits the run's reply AND every action of one response into a SINGLE block,
-//! all probed up front against committed state, so its probes must also count
-//! what that same response already staged (chat's thread cap, the duplicate
-//! task ids) or a sibling silently moves the cap out from under them. here each
-//! op stages exactly ONE follow-up and drains it before the next op executes,
-//! and a module query reads its own pending overlay first — so a sibling's post
-//! is already visible to the next probe. that is why this lane needs no
-//! same-block counter and the settle path does.
-
+//! The lease holder opens the session. Only its bound signer may propose work,
+//! and a moved or expired lease fences subsequent proposals. Completed target
+//! outcomes remain reportable after the session or account authority changes.
 use super::pages_effects::is_pages_action;
 use super::response::is_duckfs_action;
 use super::{
-    AgentAction, AgentResponse, AgentSession, AgentStatus, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
+    AgentAction, AgentResponse, AgentSession, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN, SagaOrigin,
-    SiblingReadBudget, delegated_run_id_for, delegation_id_for, dispatch_decode_reply,
-    dispatch_encode_query, dispatch_id_for, page_thread_id,
+    MAX_DELEGATIONS_PER_RUN, ModelStatus, Origin, RunAuthority, RunOrigin, RunsModule,
+    SESSION_KEY_LEN, SiblingReadBudget, delegated_run_id_for, delegation_id_for,
+    dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_source,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -161,8 +104,52 @@ impl RunsModule {
         Ok(())
     }
 
-    /// apply ONE agent action, signed by the run's bound session key.
     pub(super) async fn agent_action(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: String,
+        action: AgentAction,
+    ) -> Result<(), Error> {
+        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        let Some(session) = self.session(&run_id).cloned() else {
+            return Err(Error::Module("run session is not open".into()));
+        };
+        let generation = self.active_generation(&*ctx, entry.account).await?;
+        if generation != entry.generation {
+            return Err(Error::Module("run program authority changed".into()));
+        }
+        let mut effects = super::action_requests::EffectsCtx {
+            inner: ctx,
+            messages: Vec::new(),
+        };
+        self.prepare_agent_action(&mut effects, run_id.clone(), action)
+            .await?;
+        let [message]: [sdk::Msg; 1] =
+            std::mem::take(&mut effects.messages)
+                .try_into()
+                .map_err(|_| {
+                    Error::Module("one tool action must prepare exactly one target message".into())
+                })?;
+        let request_id = crate::action_request_id(&run_id, session.actions);
+        self.stage_action_request(
+            &entry,
+            request_id.clone(),
+            super::action_requests::RequestScope::Session {
+                holder: session.holder,
+            },
+            message,
+        )
+        .await?;
+        effects.inner.set_output(sdk::wire::encode(
+            &serde_json::json!({"request_id": request_id}),
+        ));
+        Ok(())
+    }
+
+    /// apply ONE agent action, signed by the run's bound session key.
+    async fn prepare_agent_action(
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
@@ -261,9 +248,7 @@ impl RunsModule {
                 .map_err(Error::Module)?;
             ctx.emit_msg(msg);
         } else {
-            // MODULE origin, exactly like the settle path's — which is what lets
-            // chat refine `as_agent` into `AuthorRef::Agent { module, agent_id }`:
-            // the attribution the frameless lane could not produce at all.
+            // Capture the prepared intent; the account program executes it later.
             self.emit_response(ctx, &run_id, &entry, lane, validated)
                 .await;
         }
@@ -282,10 +267,82 @@ impl RunsModule {
         Ok(())
     }
 
-    /// Start one caller/callee edge while the caller is live. This deliberately
-    /// does not mutate either AgentRecord: hierarchy is unnecessary when the
-    /// actual relation lasts only for these two runs.
     pub(super) async fn delegate_run(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: String,
+        request_id: String,
+        request: DelegationRequest,
+        _budget: &SiblingReadBudget,
+    ) -> Result<(), Error> {
+        let Some(session) = self.session(&run_id).cloned() else {
+            return Err(Error::Module("run session closed".into()));
+        };
+        if ctx.env().origin != Origin::External(session.session_key.clone()) {
+            return Err(Error::Module(
+                "only the bound session key may propose delegation".into(),
+            ));
+        }
+        self.session_holds_lease(&*ctx, &run_id, &session).await?;
+        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        let generation = self.active_generation(&*ctx, entry.account).await?;
+        if generation != entry.generation {
+            return Err(Error::Module("run program authority changed".into()));
+        }
+        if session.actions >= MAX_ACTIONS_PER_SESSION {
+            return Err(Error::Module("session action budget exhausted".into()));
+        }
+        if sdk::wire::encode(&request).len() > MAX_DELEGATIONS_BYTES {
+            return Err(Error::Module(
+                "delegation request exceeds the byte bound".into(),
+            ));
+        }
+        let id = crate::delegation_action_id(&run_id, &request_id);
+        let payload = crate::encode_msg(&crate::RunsMsg::ExecuteDelegation {
+            run_id: run_id.clone(),
+            request_id,
+            request,
+        });
+        if let Some(existing) = self.action_request(&id).await? {
+            let exact = existing.view.payload
+                == sdk::wire::decode::<serde_json::Value>(&payload).map_err(Error::Module)?;
+            if !exact {
+                return Err(Error::Module(
+                    "request_id was already used for a different agent call".into(),
+                ));
+            }
+            ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+            return Ok(());
+        }
+        self.stage_action_request(
+            &entry,
+            id.clone(),
+            super::action_requests::RequestScope::Session {
+                holder: session.holder.clone(),
+            },
+            sdk::Msg {
+                target: self.id.clone(),
+                payload,
+            },
+        )
+        .await?;
+        self.pending_sessions.insert(
+            run_id,
+            Some(AgentSession {
+                actions: session.actions + 1,
+                ..session
+            }),
+        );
+        ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+        Ok(())
+    }
+
+    /// Start one caller/callee edge while the caller is live. This deliberately
+    /// does not mutate either ModelRecord: hierarchy is unnecessary when the
+    /// actual relation lasts only for these two runs.
+    pub(super) async fn execute_delegation(
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
@@ -293,26 +350,28 @@ impl RunsModule {
         request: DelegationRequest,
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
-        let Origin::External(submitter) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "an agent call must be signed by the caller's session key".into(),
-            ));
-        };
         let session = self
             .session(&run_id)
             .cloned()
-            .ok_or_else(|| Error::Module(format!("run has no open agent session: {run_id}")))?;
-        if *submitter != session.session_key {
-            return Err(Error::Module(format!(
-                "only the bound session key may delegate for run {run_id}"
-            )));
+            .ok_or_else(|| Error::Module("run session closed".into()))?;
+        let Some(owner) = self.pending_entry(&dispatch_id_for(&run_id)) else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        if ctx.env().origin != Origin::Program(owner.account) {
+            return Err(Error::Module(
+                "only the run's program may delegate work".into(),
+            ));
+        }
+        let generation = self.active_generation(&*ctx, owner.account).await?;
+        if generation != owner.generation {
+            return Err(Error::Module("run program authority changed".into()));
         }
         self.session_holds_lease(&*ctx, &run_id, &session).await?;
         let entry = self
             .pending_entry(&dispatch_id_for(&run_id))
             .cloned()
             .ok_or_else(|| Error::Module(format!("run is not in flight: {run_id}")))?;
-        if entry.job_id.is_some() || page_thread_id(&entry.channel_id).is_some() {
+        if entry.job_id.is_some() || page_source(&entry.channel_id).is_some() {
             return Err(Error::Module(
                 "agent calls currently require a chat or Forge run".into(),
             ));
@@ -334,11 +393,6 @@ impl RunsModule {
                     "request_id was already used for a different agent call".into(),
                 ))
             };
-        }
-        if session.actions >= MAX_ACTIONS_PER_SESSION {
-            return Err(Error::Module(format!(
-                "session for run {run_id} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions"
-            )));
         }
 
         if request.agent_id == entry.agent_id {
@@ -371,7 +425,7 @@ impl RunsModule {
                     entry.agent_id
                 ))
             })?;
-        if caller.status != AgentStatus::Active {
+        if caller.status != ModelStatus::Active {
             return Err(Error::Module(format!(
                 "caller agent is paused: {}",
                 caller.agent_id
@@ -433,7 +487,7 @@ impl RunsModule {
         // owner is the account that will see the bytes, so its READ standing is
         // the gate. a module/system owner is not narrowed — chat admits those
         // origins everywhere already.
-        if let SagaOrigin::External(owner) = &callee.owner {
+        if let RunOrigin::External(owner) = &callee.owner {
             let may_read = !owner.is_empty()
                 && self
                     .may_read(&*ctx, owner, &entry.channel_id)
@@ -450,7 +504,7 @@ impl RunsModule {
         let extra = crate::envelope::library_skills(&request.skills).map_err(Error::Module)?;
         if let Some(skill) = extra
             .iter()
-            .find(|skill| !caller.permits(&agent::CapRequest::DuckfsRead(&skill.source_prefix)))
+            .find(|skill| !caller.permits(&crate::CapRequest::DuckfsRead(&skill.source_prefix)))
         {
             return Err(Error::Module(format!(
                 "the call authority cannot read delegated skill {}",
@@ -524,13 +578,6 @@ impl RunsModule {
             Some(RunAuthority::from_record(&scoped_callee)),
             Some(delegation_id),
         );
-        self.pending_sessions.insert(
-            run_id,
-            Some(AgentSession {
-                actions: session.actions + 1,
-                ..session
-            }),
-        );
         Ok(())
     }
 
@@ -540,7 +587,7 @@ impl RunsModule {
     /// otherwise leaves the ex-holder's key bound, spending the agent's whole
     /// grant for the rest of the run on a node that stopped executing it. the
     /// session's authority IS the lease, so every acting op re-reads it.
-    async fn session_holds_lease(
+    pub(super) async fn session_holds_lease(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,

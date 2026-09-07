@@ -32,7 +32,7 @@ const JOBS: &str = "tasks";
 /// `Box<dyn MerkleStore>`. these tests assert BEHAVIOR, so the in-memory store
 /// stands in for qmdb; the real-store round trip lives in `sync_round_trip`.
 fn jobs_on_mem() -> Jobs {
-    Jobs::new(JOBS, Box::new(MemStore::new()))
+    Jobs::new(JOBS, "identity", "attribution", Box::new(MemStore::new()))
 }
 
 // ---- wire builders ---------------------------------------------------------
@@ -106,14 +106,8 @@ fn ext(id: &str) -> Origin {
 /// the module's own external-actor derivation, mirrored so tests can name the
 /// exact worker/submitter string an external origin produces: `ext:` +
 /// lowercase hex (domain-separated from module ids and "system").
-fn actor(id: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::from("ext:");
-    for &b in id.as_bytes() {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+fn actor(id: &str) -> tasks::Party {
+    tasks::Party::Key(id.as_bytes().to_vec())
 }
 
 // ---- a configurable dispatch ctx (height + origin) -------------------------
@@ -125,7 +119,44 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: 0,
         origin,
         me: JOBS.into(),
+        cause: sdk::Cause::Direct,
     })
+    .on_query("identity", |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
+    })
+}
+
+/// Supply the committed Identity account at the module query boundary. The
+/// dispatch origin still decides which key or program is actually acting.
+fn account_ctx(height: u64, origin: Origin, account: &identity::AccountView) -> TestCtx {
+    let account = account.clone();
+    ctx(height, origin).on_query("identity", move |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            Some(account.clone()),
+        )))
+    })
+}
+
+fn key_account() -> identity::AccountView {
+    identity::AccountView {
+        number: 1,
+        name: "Submitter".into(),
+        control: identity::Control::Keys,
+        keys: ["founder", "sibling"]
+            .into_iter()
+            .map(|key| identity::KeyView {
+                scheme: identity::KeyScheme::Ed25519,
+                pubkey: key.as_bytes().to_vec(),
+                label: None,
+                added_at: 1,
+            })
+            .collect(),
+        avatar: None,
+        bio: None,
+        updated_at: 1,
+    }
 }
 
 // ---- test helpers ----------------------------------------------------------
@@ -707,28 +738,268 @@ fn one_submitter_cannot_fill_the_board() {
 }
 
 #[test]
-fn lease_views_are_clamped() {
+fn submitter_cap_is_shared_by_account_keys_and_isolated_per_program() {
     block_on(async {
         let mut jobs = jobs_on_mem();
-        for id in ["lo", "hi", "mid"] {
-            apply(&mut jobs, 1, ext("submitter"), submit(id, "k", "")).await;
+        let account = key_account();
+        let program = identity::AccountView {
+            number: 2,
+            name: "Program".into(),
+            keys: vec![],
+            control: identity::Control::Program {
+                controller: account.number,
+                executor: "runs".into(),
+                generation: 0,
+                standing: identity::ProgramStanding::Active,
+            },
+            ..account.clone()
+        };
+        // One uncommitted block exercises the staged counters. Alternating
+        // keys cannot split account1's quota, and program2 owns its own quota.
+        for i in 0..MAX_LIVE_JOBS_PER_SUBMITTER {
+            let signer = ["founder", "sibling"][i % 2];
+            jobs.execute(
+                &mut account_ctx(1, ext(signer), &account),
+                &submit(&format!("account-{i}"), "k", ""),
+            )
+            .await
+            .unwrap();
+            jobs.execute(
+                &mut account_ctx(1, Origin::Program(2), &program),
+                &submit(&format!("program-{i}"), "k", ""),
+            )
+            .await
+            .unwrap();
         }
-        apply(&mut jobs, 2, ext("worker-a"), claim("lo", 0)).await;
-        apply(&mut jobs, 2, ext("worker-a"), claim("hi", 1_000_000)).await;
-        apply(&mut jobs, 2, ext("worker-a"), claim("mid", 500)).await;
+        jobs.commit_block().await.unwrap();
+        let full_root = jobs.root();
+        for (origin, identity) in [
+            (ext("founder"), &account),
+            (ext("sibling"), &account),
+            (Origin::Program(2), &program),
+        ] {
+            let error = jobs
+                .execute(
+                    &mut account_ctx(2, origin, identity),
+                    &submit("overflow", "k", ""),
+                )
+                .await
+                .expect_err("the canonical submitter is at capacity");
+            assert!(
+                matches!(error, Error::Module(message) if message.contains("job submitter at cap"))
+            );
+        }
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), full_root, "refusals stage no record or census");
 
+        let other_program = identity::AccountView {
+            number: 3,
+            ..program.clone()
+        };
+        jobs.execute(
+            &mut account_ctx(3, Origin::Program(3), &other_program),
+            &submit("other-program", "k", ""),
+        )
+        .await
+        .unwrap();
+        for (id, origin) in [
+            ("module", Origin::Module("runs".into())),
+            ("system", Origin::System),
+            ("key", ext("acct:2")),
+        ] {
+            stage(&mut jobs, 3, origin, submit(id, "k", ""))
+                .await
+                .unwrap();
+        }
+        jobs.commit_block().await.unwrap();
         assert_eq!(
-            get(&jobs, "lo").await.unwrap().claim.unwrap().lease_views,
-            10
+            get(&jobs, "account-0").await.unwrap().submitter,
+            tasks::Party::Account(1)
         );
         assert_eq!(
-            get(&jobs, "hi").await.unwrap().claim.unwrap().lease_views,
-            10_000
+            get(&jobs, "program-0").await.unwrap().submitter,
+            tasks::Party::Account(2)
         );
         assert_eq!(
-            get(&jobs, "mid").await.unwrap().claim.unwrap().lease_views,
-            500
+            get(&jobs, "other-program").await.unwrap().submitter,
+            tasks::Party::Account(3)
         );
+        assert_eq!(
+            get(&jobs, "module").await.unwrap().submitter,
+            tasks::Party::Module("runs".into())
+        );
+
+        jobs.execute(
+            &mut account_ctx(4, Origin::Program(2), &program),
+            &cancel("program-0"),
+        )
+        .await
+        .unwrap();
+        jobs.execute(
+            &mut account_ctx(4, ext("founder"), &account),
+            &prune("program-0"),
+        )
+        .await
+        .expect_err("the controller account does not own the program's jobs");
+        jobs.execute(
+            &mut account_ctx(4, Origin::Program(2), &program),
+            &prune("program-0"),
+        )
+        .await
+        .unwrap();
+        jobs.execute(
+            &mut account_ctx(4, Origin::Program(2), &program),
+            &submit("program-replacement", "k", ""),
+        )
+        .await
+        .unwrap();
+        jobs.commit_block().await.unwrap();
+        jobs.execute(
+            &mut account_ctx(5, Origin::Program(2), &program),
+            &submit("program-overflow", "k", ""),
+        )
+        .await
+        .expect_err("pruning releases exactly one program slot");
+    });
+}
+
+#[test]
+fn pruning_after_key_admission_debits_the_stored_key_quota() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let account = key_account();
+        for i in 0..MAX_LIVE_JOBS_PER_SUBMITTER {
+            stage(
+                &mut jobs,
+                1,
+                ext("founder"),
+                submit(&format!("key-{i}"), "k", ""),
+            )
+            .await
+            .unwrap();
+        }
+        jobs.commit_block().await.unwrap();
+        // Admission changes new ownership to Account, leaving old Key records
+        // and their counters under the exact original signer.
+        for i in 0..MAX_LIVE_JOBS_PER_SUBMITTER {
+            jobs.execute(
+                &mut account_ctx(2, ext("founder"), &account),
+                &submit(&format!("account-{i}"), "k", ""),
+            )
+            .await
+            .unwrap();
+        }
+        jobs.commit_block().await.unwrap();
+        jobs.execute(
+            &mut account_ctx(3, ext("sibling"), &account),
+            &cancel("key-0"),
+        )
+        .await
+        .expect_err("an account sibling cannot control the historical key's job");
+        jobs.execute(
+            &mut account_ctx(3, ext("founder"), &account),
+            &cancel("key-0"),
+        )
+        .await
+        .unwrap();
+        jobs.commit_block().await.unwrap();
+        jobs.execute(
+            &mut account_ctx(4, ext("sibling"), &account),
+            &prune("key-0"),
+        )
+        .await
+        .expect_err("pruning also requires the actual historical signer");
+        jobs.execute(
+            &mut account_ctx(4, ext("founder"), &account),
+            &prune("key-0"),
+        )
+        .await
+        .unwrap();
+        jobs.abort_block().await.unwrap();
+        stage(
+            &mut jobs,
+            5,
+            ext("founder"),
+            submit("key-overflow", "k", ""),
+        )
+        .await
+        .expect_err("aborting the prune restores the key census");
+        jobs.execute(
+            &mut account_ctx(5, ext("founder"), &account),
+            &prune("key-0"),
+        )
+        .await
+        .unwrap();
+        jobs.commit_block().await.unwrap();
+        jobs.execute(
+            &mut account_ctx(6, ext("sibling"), &account),
+            &submit("account-overflow", "k", ""),
+        )
+        .await
+        .expect_err("the old-key prune must not release an account slot");
+        // Once that key leaves Identity, its exact remaining key-owned quota
+        // is visible again: precisely the pruned slot is free.
+        apply(
+            &mut jobs,
+            6,
+            ext("founder"),
+            submit("key-replacement", "k", ""),
+        )
+        .await;
+        stage(
+            &mut jobs,
+            7,
+            ext("founder"),
+            submit("key-overflow", "k", ""),
+        )
+        .await
+        .expect_err("only the stored key's one pruned slot was released");
+    });
+}
+
+#[test]
+fn applied_claim_and_index_agree_at_lease_bounds() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        let mut rows = std::collections::BTreeMap::new();
+        for (id, requested, expected) in [
+            ("below", 0, tasks::MIN_LEASE_VIEWS),
+            ("floor", tasks::MIN_LEASE_VIEWS, tasks::MIN_LEASE_VIEWS),
+            ("ceiling", tasks::MAX_LEASE_VIEWS, tasks::MAX_LEASE_VIEWS),
+            ("above", u64::MAX, tasks::MAX_LEASE_VIEWS),
+        ] {
+            for (height, msg) in [(1, submit(id, "k", "")), (2, claim(id, requested))] {
+                let mut context = ctx(height, ext("worker-a"));
+                jobs.execute(&mut context, &msg).await.unwrap();
+                jobs.commit_block().await.unwrap();
+                let op = index_guest::OpRow {
+                    height,
+                    seq: 0,
+                    time: height,
+                    origin: index_guest::OriginTag::external("raw-signer-label"),
+                    payload: msg.payload,
+                    assigned: context.assigned().unwrap().to_vec(),
+                };
+                let writes = tasks::index::fold_op(&op, &rows).unwrap();
+                index_guest::apply_to_map(&mut rows, writes);
+            }
+            let committed = get(&jobs, id).await.unwrap();
+            let claim = committed.claim.unwrap();
+            assert_eq!(claim.lease_views, expected);
+            let bytes = tasks::index::serve_view(&rows, br#"{"jobs":{}}"#).unwrap();
+            let tasks::index::TasksViewReply::Jobs { jobs: indexed, .. } =
+                serde_json::from_slice(&bytes).unwrap()
+            else {
+                panic!("expected indexed jobs");
+            };
+            let row = indexed.into_iter().find(|job| job.job_id == id).unwrap();
+            assert_eq!(row.status, committed.status);
+            assert_eq!(row.attempt, committed.attempt);
+            let indexed_claim = row.claim.unwrap();
+            assert_eq!(indexed_claim.lease_views, claim.lease_views, "{id}");
+            assert_eq!(indexed_claim.claimed_at_height, claim.claimed_at_height);
+            assert_eq!(indexed_claim.worker, ext("worker-a").actor_string());
+        }
     });
 }
 
@@ -790,9 +1061,15 @@ fn identities_are_derived_from_origin() {
         apply(&mut jobs, 1, ext("alice"), submit("j-ext", "k", "")).await;
         apply(&mut jobs, 1, Origin::System, submit("j-sys", "k", "")).await;
 
-        assert_eq!(get(&jobs, "j-mod").await.unwrap().submitter, "agent");
+        assert_eq!(
+            get(&jobs, "j-mod").await.unwrap().submitter,
+            tasks::Party::Module("agent".into())
+        );
         assert_eq!(get(&jobs, "j-ext").await.unwrap().submitter, actor("alice"));
-        assert_eq!(get(&jobs, "j-sys").await.unwrap().submitter, "system");
+        assert_eq!(
+            get(&jobs, "j-sys").await.unwrap().submitter,
+            tasks::Party::System
+        );
 
         // the pre-consensus empty-external default is not an authenticated actor.
         let err = stage(
@@ -917,7 +1194,7 @@ fn claim_attempt_saturates_instead_of_wrapping() {
             "job_id": "j1",
             "kind": "k",
             "spec": "spec",
-            "submitter": "ext:00",
+            "submitter": {"key": [0]},
             "status": "pending",
             "attempt": u64::MAX,
             "claim": null,
@@ -935,7 +1212,7 @@ fn claim_attempt_saturates_instead_of_wrapping() {
             ])
             .await
             .expect("seed the store");
-        let mut jobs = Jobs::new(JOBS, Box::new(store));
+        let mut jobs = Jobs::new(JOBS, "identity", "attribution", Box::new(store));
 
         apply(&mut jobs, 5, ext("worker-a"), claim("j1", 50)).await;
         let job = get(&jobs, "j1").await.expect("exists");
@@ -1090,6 +1367,15 @@ impl Module for ClaimingWorker {
 fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
     block_on(async {
         let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
             Box::new(jobs_on_mem()),
             Box::new(ClaimingWorker { id: "agent".into() }),
         ])
@@ -1112,8 +1398,8 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
         let job = host_get(&host, "j1").await.expect("job exists");
         assert_eq!(job.status, JobStatus::Processing);
         assert_eq!(
-            job.claim.as_ref().map(|claim| claim.worker.as_str()),
-            Some("agent"),
+            job.claim.as_ref().map(|claim| &claim.worker),
+            Some(&tasks::Party::Module("agent".into())),
             "the worker identity is host-assigned from the module origin"
         );
         assert_eq!(
@@ -1127,7 +1413,19 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
 #[test]
 fn host_first_claim_wins_across_ordered_blocks() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(jobs_on_mem())]).expect("genesis");
+        let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
+            Box::new(jobs_on_mem()),
+        ])
+        .expect("genesis");
 
         host.submit_at(as_origin(1, ext("submitter")), submit("j1", "k", ""))
             .await
@@ -1184,6 +1482,15 @@ impl Module for DoubleClaim {
 fn host_two_claims_in_one_block_abort_atomically() {
     block_on(async {
         let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
             Box::new(jobs_on_mem()),
             Box::new(DoubleClaim {
                 job_id: "j1".into(),

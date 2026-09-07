@@ -38,7 +38,7 @@ extern crate::backend
   // way — the buffer takes it, which is what rolls an illegal edit back.
   DocumentSaveResult(written:bool, refusal:str, data:PagesData, document:str)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
-  BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
+  BellItem(seq:i64, change_seq:i64, source:str, reason:str, kind:str, actor:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellData(unread:i64, items:[BellItem])
   pure apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
@@ -46,6 +46,7 @@ extern crate::backend
   pure bell_head(items:[BellItem]) -> i64
   pure bell_severity(kind:&str) -> str
   pure bell_title(kind:&str) -> str
+  pure bell_detail(item:&BellItem) -> str
   pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError

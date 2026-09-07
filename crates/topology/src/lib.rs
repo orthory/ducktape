@@ -71,6 +71,7 @@ const fn wasm_indexed(id: &'static str) -> ModuleSpec {
 const MODULES: &[ModuleSpec] = &[
     wasm("acl"),
     wasm("agent"),
+    wasm("attribution"),
     wasm("automations"),
     wasm("capability"),
     wasm_indexed("chat"),
@@ -86,7 +87,6 @@ const MODULES: &[ModuleSpec] = &[
     wasm_indexed("pages"),
     wasm("runs"),
     wasm_indexed("saga"),
-    wasm("tagging"),
     wasm_indexed("tasks"),
     wasm("valset"),
 ];
@@ -104,7 +104,7 @@ pub const PRODUCTION: &[&str] = &[
     "saga",
     "capability",
     "dispatch",
-    "tagging",
+    "attribution",
     "tasks",
     "identity",
     // the MERGED gateway owns the whole `.duck` name -> AccountId -> route
@@ -129,7 +129,7 @@ pub const SIM_BASE: &[&str] = &[
     // reproduce production's provider gate.
     "capability",
     "dispatch",
-    "tagging",
+    "attribution",
     "tasks",
     "inbox",
     "automations",
@@ -188,16 +188,45 @@ mod tests {
         assert_eq!(
             sorted(PRODUCTION),
             sorted(&[
-                "acl", "agent", "automations", "capability", "chat", "dispatch",
-                "files", "forge", "gateway", "governance", "identity", "inbox",
-                "modules", "pages", "runs", "saga", "tagging", "tasks", "valset",
+                "acl",
+                "agent",
+                "automations",
+                "capability",
+                "chat",
+                "dispatch",
+                "files",
+                "forge",
+                "gateway",
+                "governance",
+                "identity",
+                "inbox",
+                "modules",
+                "pages",
+                "runs",
+                "saga",
+                "attribution",
+                "tasks",
+                "valset",
             ])
         );
         assert_eq!(
             sorted(SIM_BASE),
             sorted(&[
-                "agent", "automations", "capability", "chat", "dispatch", "files", "forge",
-                "gateway", "identity", "inbox", "pages", "runs", "saga", "tagging", "tasks",
+                "agent",
+                "automations",
+                "capability",
+                "chat",
+                "dispatch",
+                "files",
+                "forge",
+                "gateway",
+                "identity",
+                "inbox",
+                "pages",
+                "runs",
+                "saga",
+                "attribution",
+                "tasks",
             ])
         );
         assert_eq!(
@@ -223,7 +252,10 @@ mod tests {
     fn sim_base_and_valset_are_disjoint() {
         let base: BTreeSet<&str> = SIM_BASE.iter().copied().collect();
         for id in SIM_VALSET {
-            assert!(!base.contains(id), "sim_valset id {id} is already in sim_base");
+            assert!(
+                !base.contains(id),
+                "sim_valset id {id} is already in sim_base"
+            );
         }
     }
 
@@ -232,7 +264,11 @@ mod tests {
     #[test]
     fn universe_and_selections_cover_each_other() {
         let universe: BTreeSet<&str> = MODULES.iter().map(|m| m.id).collect();
-        assert_eq!(universe.len(), MODULES.len(), "the module universe has a duplicate id");
+        assert_eq!(
+            universe.len(),
+            MODULES.len(),
+            "the module universe has a duplicate id"
+        );
 
         let used: BTreeSet<&str> = PRODUCTION
             .iter()

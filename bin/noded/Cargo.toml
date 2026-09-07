@@ -7,8 +7,7 @@ version.workspace = true
 # it serves — the actor lane, the axum /v1 router, the index/blob/stream lanes,
 # the module composer, the in-process testkit — is the `noded` LIBRARY
 # (crates/noded); this package owns only the process shape: argv, the storage
-# root, the modules dir its genesis composes from, the two runtimes, and the
-# debug echo worker.
+# root, the modules dir its genesis composes from, and the two runtimes.
 [[bin]]
 name = "ducktape-noded"
 path = "src/main.rs"
@@ -31,10 +30,6 @@ indexer = { workspace = true }
 # resolves the founding set the build staged beside the binary — the default
 # `--modules` dir the genesis composes from.
 workspace-config = { workspace = true }
-# the two module wire codecs the debug echo worker speaks: a saga worker
-# request in, a saga follow-up (bid, then result) out over a dispatch WorkSpec.
-dispatch = { workspace = true }
-saga = { workspace = true }
 commonware-runtime = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"
@@ -50,8 +45,9 @@ duckfs-client = { workspace = true }
 # the forge lanes are proven against a real libgit2 clone of the served repo.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 nettest = { path = "../../crates/testing/nettest" }
-# the run's dispatch id, derived the same way the runs module derives it.
-runs = { workspace = true }
+# typed programmable-user and attribution assertions over the real daemon.
+agent = { workspace = true }
+attribution = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3"

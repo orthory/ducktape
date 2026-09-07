@@ -1,103 +1,91 @@
 //! the inbox module's public wire surface — types only.
 //!
-//! writes go via [`InboxMsg`]; the read surface (paged lists, unread counts)
-//! lives on the derived tier (`src/index.rs`), not here — the module serves no
-//! queries. the
-//! inbox holds per-member notification queues as consensus state: other modules
-//! deliver notifications as follow-up ops, so a notification commits atomically
-//! with the event that caused it (platform promise P2), and no external push
-//! service is involved (the air-gap-native notification story).
+//! an inbox is an identity ACCOUNT's notification queue ([`AccountNumber`]):
+//! the human behind an account reads one inbox however many keys the account
+//! holds. its items are receipts of the attribution plane's canonical
+//! changes — a [`Notification`] carries the change's [`ChangeRef`] (the
+//! canonical seq, source, recipient, reason, kind, actor, cause and height)
+//! and nothing the attribution record does not hold: the inbox is a VIEW of
+//! central attribution, never a parallel route, and a change's detail stays
+//! on the canonical record.
 //!
-//! `member` names a queue in the shared ACTOR-STRING domain
-//! ([`sdk::Origin::actor_string`]) — the same domain [`Notification::source`]
-//! already records the delivering origin in, and the one tasks' job board and
-//! files' owner use. it is the module's whole identity model: a queue whose
-//! name is `origin.actor_string()` is OWNED by that origin, which is what makes
-//! an ack authorizable at all.
+//! ## two inputs, told apart by the authenticated origin
 //!
-//! DELIVERING and ACKING are different authorities. a module/system origin (a
-//! follow-up from chat, tasks, automations, …) may `Deliver` to any member;
-//! an external origin may `Deliver` only to its OWN queue (an unattributed
-//! signed op cannot mint a fabricated member or flood a stranger's queue).
-//! only the queue's OWN member may `MarkRead` or `Clear` it, and only an
-//! authenticated external submitter owns a queue.
+//! - a DELIVERY: the attribution module's own delivery of one
+//!   [`attribution::AttributionEvent::Changed`], run by the host under
+//!   `Origin::Module(attribution)`. only that origin's payload decodes as a
+//!   delivery; nothing else can mint a notification.
+//! - an ADMIN op ([`InboxMsg`]): `MarkRead` and `Clear`, submitted by a key
+//!   that identity resolves to the named account. programs, revoked
+//!   accounts, unbound keys, modules and the system hold no human inbox and
+//!   are refused.
+//!
+//! the read surface (paged lists, unread counts) lives on the derived tier
+//! (`src/index.rs`), not here — the module serves no queries.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
-// ---- write-time caps (consensus constants) ---------------------------------
-// enforced by the module BEFORE staging, so oversized bytes never enter the
-// `root()` preimage. shared here so clients can pre-validate.
+pub use attribution::ChangeRef;
+pub use identity::AccountNumber;
 
-/// notification `kind` byte bound.
-pub const MAX_KIND_BYTES: usize = 64;
-/// notification `body` byte bound.
-pub const MAX_BODY_BYTES: usize = 16 * 1024;
-/// member-identity byte bound (must also be non-empty).
-pub const MAX_MEMBER_BYTES: usize = 256;
-/// per-member queue bound. when a delivery would exceed this, the OLDEST item
-/// is dropped (this is a notification queue, not a ledger).
-pub const MAX_ITEMS_PER_MEMBER: usize = 4096;
-/// distinct members bound; a delivery that would introduce a new member beyond
-/// this is rejected.
-pub const MAX_MEMBERS: usize = 65536;
+/// per-account queue bound. when a delivery would exceed this, the OLDEST
+/// item is dropped (this is a notification queue, not a ledger — the ledger
+/// is the attribution plane).
+pub const MAX_ITEMS_PER_ACCOUNT: usize = 4096;
 
-/// one delivered notification. `seq` is assigned per member, monotonic and
+/// one delivered notification. `seq` is assigned per account, monotonic and
 /// gap-free within what was ever assigned (a `Clear` removes items but never
-/// rewinds the member's `next_seq`).
+/// rewinds the account's `next_seq`).
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Notification {
     pub seq: u64,
-    /// the queue this notification belongs to, in the actor-string domain (see
-    /// the module header) — the principal that may ack it.
-    pub member: String,
-    pub kind: String,
-    pub body: String,
-    /// the delivering origin, derived by the module from `Env.origin`: a module
-    /// id verbatim, `"ext:"` + the lowercase hex of external submitter bytes,
-    /// or `"system"`. NEVER caller-supplied. the `ext:` prefix domain-separates
-    /// external keys from module ids that happen to be pure hex.
-    pub source: String,
+    /// the account whose inbox this is — the change's recipient.
+    pub account: AccountNumber,
+    /// the canonical change, by reference.
+    pub change: ChangeRef,
     pub created_at: u64,
 }
 
-/// the ack family (`MarkRead`, `Clear`) is MEMBER-BOUND: `member` must be the
-/// submitter's own [`sdk::Origin::actor_string`], so a submitter can only ever
-/// name their own queue. `Deliver` is deliberately outside that gate — writing
-/// INTO a queue is the module's whole purpose and every origin may do it.
+/// the admin family: ACCOUNT-BOUND. `account` must be the account identity
+/// resolves the submitting key to, so a key can only ever name its own
+/// inbox.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InboxMsg {
-    /// enqueue a notification for `member`. a module/system origin may
-    /// deliver to any member (module follow-ups are the primary writers); an
-    /// external origin may deliver only to its OWN queue (self-delivery).
-    /// `source` is derived from the origin, not this msg.
-    Deliver {
-        member: String,
-        kind: String,
-        body: String,
+    /// mark every item with `seq <= up_to_seq` in `account`'s inbox as read.
+    /// idempotent; an inbox that holds nothing yet or a seq past its end is a
+    /// deterministic no-op (never an error), but an account the key does not
+    /// hold is REFUSED.
+    MarkRead {
+        account: AccountNumber,
+        up_to_seq: u64,
     },
-    /// mark every item with `seq <= up_to_seq` in the submitter's OWN queue as
-    /// read. idempotent; an unknown member or seq is a deterministic no-op
-    /// (never an error), but a member that is not the submitter is REFUSED.
-    MarkRead { member: String, up_to_seq: u64 },
-    /// delete every item with `seq <= up_to_seq` from the submitter's OWN
-    /// queue. `next_seq` never rewinds. an unknown member or seq is a
-    /// deterministic no-op; a member that is not the submitter is REFUSED.
-    Clear { member: String, up_to_seq: u64 },
+    /// delete every item with `seq <= up_to_seq` from `account`'s inbox.
+    /// `next_seq` never rewinds. an empty inbox or an unknown seq is a
+    /// deterministic no-op; an account the key does not hold is REFUSED.
+    Clear {
+        account: AccountNumber,
+        up_to_seq: u64,
+    },
 }
 
-/// the assigned stamp inbox declares per applied op
-/// ([`sdk::Ctx::set_assigned`]): the per-member sequence a `Deliver`
-/// assigned in-state. rides the dispatch trace onto the derived-tier
-/// op-feed row, so the fold consumes the exact assignment instead of
-/// re-deriving it by counting.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+/// the assigned stamp inbox declares per applied delivery
+/// ([`sdk::Ctx::set_assigned`]). rides the dispatch trace onto the
+/// derived-tier op-feed row, so the fold consumes the exact assignment
+/// instead of re-deriving it by counting. admin ops assign nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InboxAssigned {
-    /// `Deliver`: the notification's assigned per-member sequence.
+    /// the change was queued for its recipient at this per-account sequence.
     Delivered { seq: u64 },
+    /// the change was already the last one queued for its recipient: nothing
+    /// changed.
+    Duplicate,
+    /// the recipient holds no human inbox (a program or revoked account):
+    /// nothing changed.
+    Ignored,
 }
 
 pub fn encode_msg(m: &InboxMsg) -> Vec<u8> {

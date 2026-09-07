@@ -18,6 +18,8 @@ index-guest = ["index_guest/guest"]
 
 [dependencies]
 sdk = { workspace = true }
+identity = { workspace = true }
+attribution = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not

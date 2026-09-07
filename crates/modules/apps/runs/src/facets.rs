@@ -91,7 +91,7 @@ pub(crate) enum WireSink {
         source_branch: String,
         #[serde(default)]
         target_branch: String,
-        #[serde(skip_serializing_if = "String::is_empty")]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         body: String,

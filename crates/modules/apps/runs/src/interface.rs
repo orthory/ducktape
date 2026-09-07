@@ -1,51 +1,8 @@
-//! the runs module's public wire surface — types only.
-//!
-//! the runs module is the collaboration loop's actor — the consumer on the
-//! tagging and dispatch planes: it watches chat channels through the tagging
-//! plane's engagement events, composes each engaged post's model input in
-//! consensus, dispatches it under the agent's recipe, and validates the
-//! model's response before any cross-module write happens. the agents it runs
-//! live in the agent REGISTRY (`agent`) — this module reads them by
-//! query and never holds registry state. run LIFECYCLE is not this module's
-//! state either — a dispatched task's lifecycle lives in the dispatch module
-//! (and its saga); this surface only exposes the module's own correlation
-//! entries for still-pending work. two payload families cross this surface:
-//!
-//! - [`RunsMsg`] — writes: channel watches, the jobs-worker toggle, explicit
-//!   run requests, and run cancellation.
-//! - [`RunsQuery`] -> [`RunsReply`] — reads over watches and the pending
-//!   (not-yet-delivered) runs.
-
 use std::collections::BTreeMap;
 
-use agent::{AgentAction, AgentRecord, DelegationRequest, ReplyBlock, ResourceCaps};
-use saga::SagaOrigin;
+use crate::{AgentAction, DelegationRequest, ModelRecord, ReplyBlock, ResourceCaps};
+use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
-
-// ---- watches ------------------------------------------------------------------
-
-/// how a watched channel selects which agents a user post engages.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum TurnPolicy {
-    /// agents whose `AuthorRef::Agent` ref appears in the post's mentions.
-    Mention,
-    /// every active agent.
-    All,
-    /// exactly this agent.
-    Assigned(String),
-    /// the sorted active agents indexed by `anchor_seq % n`.
-    RoundRobin,
-}
-
-/// one channel watch — the runs-module-side mirror of the tagging-plane
-/// subscription it was registered with (the two are staged atomically, P2).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WatchView {
-    pub channel_id: String,
-    pub policy: TurnPolicy,
-}
 
 // ---- pending runs ---------------------------------------------------------------
 
@@ -76,26 +33,30 @@ pub struct PendingRun {
     pub job_id: Option<String>,
     /// the jobs claim height a job-backed run is bound to; chat runs use 0.
     pub job_claim_height: u64,
-    /// the run-creating origin (the tagging plane, or the explicit
-    /// `RequestRun` submitter) — a cancel capability alongside the owner.
-    pub requester: SagaOrigin,
+    /// The origin that called runs to create this work; it may cancel the
+    /// run alongside the program's current controller.
+    pub requester: RunOrigin,
     pub created_at: u64,
 }
 
-// ---- delivered-run history --------------------------------------------------
+// ---- terminal-run history ---------------------------------------------------
 
-/// how a run ended: the result delivered, or it failed (worker error,
-/// timeout, cancellation, failed validation). a degraded-but-delivered run is
-/// `Delivered` with [`RunRecord::degraded`] set.
+/// Model-result admission and result-action execution are separate facts. An
+/// accepted result proposes effects that its program may execute or omit.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunOutcome {
-    Delivered,
+    /// The model result passed admission; this does not claim its effects ran.
+    ResultAccepted,
+    /// At least one proposed result action was refused by its program or target.
+    /// The corresponding ActionRequest carries the authenticated reason.
+    ActionRejected,
+    /// Worker error, timeout, cancellation, or failed result validation.
     Failed,
 }
 
-/// one terminal run in the delivered-runs ring — DERIVED observability state,
-/// recorded at delivery (the moment the pending entry prunes). never part of
+/// One terminal run in the history ring, recorded when its pending entry
+/// prunes and updated by authenticated result-action completions. Never part of
 /// `root()`/snapshot: replay rebuilds it deterministically, and a
 /// snapshot-joined node starts with an empty ring.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -109,7 +70,7 @@ pub struct RunRecord {
     /// thread key is `"{channel_id}#{seq}"`.
     pub anchor_seq: u64,
     pub outcome: RunOutcome,
-    /// the host observed the run as degraded but still delivered it.
+    /// The accepted model result was degraded during validation or composition.
     pub degraded: bool,
     /// consensus counters (creation block / delivery block) — counter DIFFS
     /// are meaningful, the raw values are whatever the lane stamps.
@@ -151,7 +112,7 @@ pub struct DelegationResult {
     pub error: Option<String>,
 }
 
-/// One ephemeral caller/callee edge. This is run state, not an AgentRecord
+/// One ephemeral caller/callee edge. This is run state, not an ModelRecord
 /// relation: both agents remain peers before and after the call.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -174,33 +135,51 @@ pub struct DelegationView {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+// Messages are decoded one at a time; keeping configuration inline preserves
+// the same direct construction API as the other module operations.
+#[allow(clippy::large_enum_variant)]
 pub enum RunsMsg {
-    /// watch a channel under `policy` AND subscribe on the tagging plane —
-    /// one atomic block (P2), so the watch and the subscription cannot drift.
-    WatchChannel {
-        channel_id: String,
-        policy: TurnPolicy,
+    /// Configure model work for an existing keyless program account.
+    ConfigureModel {
+        operation: crate::ModelMsg,
     },
-    /// drop the watch and the plane subscription, atomically.
-    UnwatchChannel { channel_id: String },
+    RequestJobRun {
+        agent_id: String,
+        job_id: String,
+    },
+    RequestAttributedRun {
+        agent_id: String,
+        change_seq: u64,
+    },
+    ClaimActionRequest {
+        request_id: String,
+        target_step: u64,
+    },
+    CompleteActionRequest {
+        request_id: String,
+        call: sdk::CallId,
+        /// The program's decoded call binding. Output-derived links are
+        /// accepted only when their bytes match dispatch's committed digest.
+        result: agent::CallResult,
+    },
+    RejectActionRequest {
+        request_id: String,
+        reason: String,
+    },
+    /// Source-owned deferred publication; authenticated against the host delivery.
+    PublishActionRequest {
+        request_id: String,
+    },
     /// opt the runs module into or out of jobs-board submit notifications.
     /// the jobs module derives the worker id from this module's follow-up origin.
-    EnableJobWorker { enabled: bool },
-    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without an
-    /// engagement. the duplicate of a pending or already-dispatched turn is a
-    /// deterministic no-op — the turn claim: first in consensus order wins.
-    ///
-    /// an `Origin::External` submitter is admitted only when chat says the
-    /// submitter's own key `may_post` to `channel_id` — post standing covers
-    /// read, and it is the same gate chat itself would apply to a message
-    /// from that key. this run's transcript pin and its reply both act under
-    /// module authority, which chat admits unconditionally, so the
-    /// submitter's own standing is the only thing keeping a non-member from
-    /// reading and posting into a members-only channel through the agent. a
-    /// refused submitter gets a deterministic `Rejected`, never a dispatch.
-    /// `Origin::Module`/`Origin::System` submitters are not gated here —
-    /// chat's own post policy always admits them, so there is no narrower
-    /// standing to check.
+    EnableJobWorker {
+        enabled: bool,
+    },
+    /// Ask the configured program to run this model against a channel anchor.
+    /// The authenticated requester retains cancellation/reassignment authority.
+    /// Calls for an already dispatched model/anchor are deterministic no-ops.
+    /// External callers must have chat post standing; the eventual program
+    /// execution also passes the target's own account authorization.
     RequestRun {
         agent_id: String,
         channel_id: String,
@@ -226,11 +205,16 @@ pub enum RunsMsg {
     /// owner. cancels the underlying dispatch in the same block; the plane's
     /// Err("cancelled") delivery then prunes the entry (and finalizes a
     /// job-backed run's job) through the one result path.
-    CancelRun { run_id: String },
+    CancelRun {
+        run_id: String,
+    },
     /// fence the current attempt and move the run to another provider. gated
     /// exactly like cancellation; `attempt` prevents a delayed click from
     /// revoking a newer assignment.
-    ReassignRun { run_id: String, attempt: u32 },
+    ReassignRun {
+        run_id: String,
+        attempt: u32,
+    },
 
     // ---- the agent session lane (mid-run writes) --------------------------
     /// the EXECUTING node binds an ephemeral session key to a live run, so the
@@ -245,7 +229,7 @@ pub enum RunsMsg {
     /// the lease names the node actually executing the run.
     ///
     /// the OWNER's authority is deliberately not asked for here, because
-    /// consensus already holds it: `AgentRecord { owner, allowed_actions, caps }`
+    /// consensus already holds it: `ModelRecord { owner, allowed_actions, caps }`
     /// IS the capability grant — registering an agent with `chat.post` is the
     /// act of authorizing it. what this op adds is not authority but PROOF: that
     /// an op came from this agent's run and no other.
@@ -267,11 +251,19 @@ pub enum RunsMsg {
     /// the action is then validated against the SAME `allowed_actions` + caps
     /// the response path validates, by the same code: the tool plane must never
     /// become a second, wider permission vocabulary.
-    AgentAction { run_id: String, action: AgentAction },
+    AgentAction {
+        run_id: String,
+        action: AgentAction,
+    },
     /// Start one peer agent call while the caller is still running. The bound
     /// session key authorizes the request; `subagent_budget` bounds concurrent
     /// live calls across the root tree, and the callee executes with caller ∩
     /// callee authority.
+    ExecuteDelegation {
+        run_id: String,
+        request_id: String,
+        request: DelegationRequest,
+    },
     DelegateRun {
         run_id: String,
         request_id: String,
@@ -285,7 +277,7 @@ pub enum RunsMsg {
 pub const SESSION_KEY_LEN: usize = 32;
 
 /// hard cap on writes and peer calls ONE session may apply — the mid-run peer of
-/// [`agent::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
+/// [`crate::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
 /// its budget can still RETURN a response; it just cannot keep writing.
 pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
 
@@ -333,7 +325,7 @@ pub struct RunAuthority {
 }
 
 impl RunAuthority {
-    pub(crate) fn from_record(record: &AgentRecord) -> Self {
+    pub(crate) fn from_record(record: &ModelRecord) -> Self {
         Self {
             allowed_actions: record.allowed_actions.clone(),
             caps: record.caps.clone(),
@@ -342,7 +334,7 @@ impl RunAuthority {
 
     /// `record` narrowed to this ceiling — the ONE definition, shared by the
     /// consensus write path and the host-side read plane.
-    pub fn apply(&self, record: &AgentRecord) -> AgentRecord {
+    pub fn apply(&self, record: &ModelRecord) -> ModelRecord {
         let mut ceiling = record.clone();
         ceiling.allowed_actions = self.allowed_actions.clone();
         ceiling.caps = self.caps.clone();
@@ -366,11 +358,20 @@ pub struct RunAuthorityView {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    Model {
+        query: crate::ModelQuery,
+    },
+    /// Stored proposal data, without querying its program's status.
+    ActionPlan {
+        request_id: String,
+    },
+    ActionRequest {
+        request_id: String,
+    },
     /// every in-flight correlation entry, ascending by dispatch id. bounded:
     /// entries prune on delivery, and every dispatch has a deadline.
     PendingRuns,
-    Watches,
-    /// the delivered-runs ring, newest first (last 100). derived state — see
+    /// The terminal-runs ring, newest first (last 100). Derived state — see
     /// [`RunRecord`].
     RecentRuns,
     /// every LIVE agent session, ascending by run id — the audit surface: which
@@ -394,8 +395,9 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    Model(crate::ModelReply),
+    ActionRequest(Option<ActionRequestView>),
     PendingRuns(Vec<PendingRun>),
-    Watches(Vec<WatchView>),
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
     Delegations(Vec<DelegationView>),
@@ -423,4 +425,47 @@ pub fn encode_reply(r: &RunsReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<RunsReply, String> {
     sdk::wire::decode(b)
+}
+
+/// A run tool request is proposed work until a program's real target call completes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionStatus {
+    AwaitingProgram,
+    Claimed {
+        call: sdk::CallId,
+    },
+    Completed {
+        call: sdk::CallId,
+        outcome: dispatch::CallOutcomeSummary,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActionRequestView {
+    pub request_id: String,
+    pub account: sdk::AccountNumber,
+    pub generation: u64,
+    pub run_id: String,
+    pub target: String,
+    pub payload: serde_json::Value,
+    pub status: ActionStatus,
+}
+
+/// A caller knows its session slot before admission and can await this exact receipt.
+pub fn action_request_id(run_id: &str, slot: u32) -> String {
+    format!("session/{}/{slot}", crate::dispatch_id_for(run_id))
+}
+
+/// Stable correlation for a named peer call, including an exact retry.
+pub fn delegation_action_id(run_id: &str, request_id: &str) -> String {
+    format!(
+        "delegate/{}/{}",
+        crate::dispatch_id_for(run_id),
+        crate::dispatch_id_for(request_id)
+    )
 }

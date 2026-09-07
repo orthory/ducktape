@@ -296,7 +296,7 @@ mod tests {
     use crate::tracker_iface::{
         DiffSide, ItemKind, ItemSummary, ReviewComment, ReviewView, channel_id_for,
     };
-    use chat::AuthorRef;
+    use chat::Party;
 
     fn detail(reviews: Vec<ReviewView>) -> ItemDetail {
         ItemDetail {
@@ -305,7 +305,7 @@ mod tests {
                 kind: ItemKind::Pr,
                 title: "Greeting feature".into(),
                 state: ItemState::Open,
-                author: AuthorRef::User(vec![0xbe; 32]),
+                author: Party::Key(vec![0xbe; 32]),
                 created_at: 3250,
                 updated_at: 3250,
             },
@@ -320,7 +320,7 @@ mod tests {
 
     fn review(author: u8, verdict: ReviewVerdict, commit: &str) -> ReviewView {
         ReviewView {
-            author: AuthorRef::User(vec![author; 32]),
+            author: Party::Key(vec![author; 32]),
             verdict,
             body: "looked at it".into(),
             commit_oid: commit.into(),

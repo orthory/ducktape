@@ -35,6 +35,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: height,
         origin,
         me: "modules".into(),
+        cause: sdk::Cause::Direct,
     })
     .on_query("valset", |req| {
         match valset::decode_query(req).map_err(Error::Module)? {

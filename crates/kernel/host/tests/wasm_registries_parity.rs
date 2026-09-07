@@ -110,6 +110,7 @@ fn registry_ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
         height,
         consensus_time: height,
+        cause: sdk::Cause::Direct,
         me: "modules".into(),
         origin,
     })

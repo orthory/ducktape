@@ -1,308 +1,400 @@
 //! write-path consensus rules of the inbox module. the module serves NO
 //! queries (the read surface — paged lists, unread counts — is the index
 //! guest's job, `src/index.rs`), so committed state is asserted through
-//! `Module::root()` and the testkit-gated record read (`Inbox::queue_view`);
-//! the qmdb continuity proof lives in `tests/sync_round_trip.rs`.
+//! `Module::root()` and the testkit-gated record reads (`Inbox::queue_view`
+//! and friends); the qmdb continuity proof lives in `tests/sync_round_trip.rs`.
+//!
+//! identity is stubbed as a fixed directory behind the ctx's sibling-query
+//! seam: two keys on alice's account, one on bob's, a program account, a
+//! revoked one, and an account number nobody holds.
 
+use attribution::{Actor, AttributionEvent, Change, ChangeKind, Reason, Source, encode_event};
 use futures::executor::block_on;
-use host::{BlockContext, Host};
-use inbox::{Inbox, InboxMsg, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, Notification, encode_msg};
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use identity::{
+    AccountView, Control, IdentityQuery, IdentityReply, KeyScheme, KeyView, ProgramStanding,
+    decode_query as identity_decode_query, encode_reply as identity_encode_reply,
+};
+use inbox::{
+    AccountNumber, Inbox, InboxAssigned, InboxMsg, MAX_ITEMS_PER_ACCOUNT, Notification,
+    decode_assigned, encode_msg,
+};
+use sdk::{Cause, Env, Error, Hop, ItemRef, Module, Msg, Origin, Root};
 use sdk_testkit::{MemStore, TestCtx};
 
 const INBOX: &str = "inbox";
+const ATTRIBUTION: &str = "attribution";
+const IDENTITY: &str = "identity";
 
-fn msg(inbox_msg: InboxMsg) -> Msg {
-    Msg {
-        target: INBOX.into(),
-        payload: encode_msg(&inbox_msg),
+const ALICE: AccountNumber = 7;
+const BOB: AccountNumber = 9;
+const PROGRAM: AccountNumber = 12;
+const REVOKED: AccountNumber = 13;
+const GHOST: AccountNumber = 99;
+
+/// alice holds two keys (two devices, one inbox); bob one; a stranger's key
+/// is bound to no account.
+const ALICE_KEY_1: [u8; 4] = [0xa1, 0xa1, 0xa1, 0xa1];
+const ALICE_KEY_2: [u8; 4] = [0xa2, 0xa2, 0xa2, 0xa2];
+const BOB_KEY: [u8; 4] = [0xb0, 0xb0, 0xb0, 0xb0];
+const STRANGER_KEY: [u8; 4] = [0xc3, 0xc3, 0xc3, 0xc3];
+
+fn view(number: AccountNumber, control: Control, keys: &[[u8; 4]]) -> AccountView {
+    AccountView {
+        number,
+        name: format!("account-{number}"),
+        control,
+        keys: keys
+            .iter()
+            .map(|key| KeyView {
+                scheme: KeyScheme::Ed25519,
+                pubkey: key.to_vec(),
+                label: None,
+                added_at: 0,
+            })
+            .collect(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
     }
 }
 
-fn deliver(member: &str, kind: &str, body: &str) -> Msg {
-    msg(InboxMsg::Deliver {
-        member: member.into(),
-        kind: kind.into(),
-        body: body.into(),
-    })
+/// the fixed identity directory the tests resolve against.
+fn directory() -> Vec<AccountView> {
+    vec![
+        view(ALICE, Control::Keys, &[ALICE_KEY_1, ALICE_KEY_2]),
+        view(BOB, Control::Keys, &[BOB_KEY]),
+        view(
+            PROGRAM,
+            Control::Program {
+                controller: ALICE,
+                executor: "agent".into(),
+                generation: 0,
+                standing: ProgramStanding::Active,
+            },
+            &[],
+        ),
+        view(REVOKED, Control::Revoked { controller: ALICE }, &[]),
+    ]
 }
 
-fn mark_read(member: &str, up_to_seq: u64) -> Msg {
-    msg(InboxMsg::MarkRead {
-        member: member.into(),
-        up_to_seq,
-    })
+fn identity_stub(req: &[u8]) -> Result<Vec<u8>, Error> {
+    let accounts = directory();
+    let found = match identity_decode_query(req).map_err(Error::Module)? {
+        IdentityQuery::Get { number } => accounts.into_iter().find(|a| a.number == number),
+        IdentityQuery::OfKey { key } => accounts
+            .into_iter()
+            .find(|a| a.keys.iter().any(|k| k.pubkey == key)),
+        other => {
+            return Err(Error::Module(format!(
+                "unexpected identity query {other:?}"
+            )));
+        }
+    };
+    Ok(identity_encode_reply(&IdentityReply::Account(found)))
 }
 
-fn clear(member: &str, up_to_seq: u64) -> Msg {
-    msg(InboxMsg::Clear {
-        member: member.into(),
-        up_to_seq,
-    })
-}
-
-// inbox's execute reads only env (origin + consensus_time); me/height are
-// cosmetic, so the shared TestCtx stands in behind two thin constructors.
-fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
+fn ctx_with(origin: Origin, consensus_time: u64, cause: Cause) -> TestCtx {
     TestCtx::with_env(Env {
-        height: 0,
+        height: consensus_time,
         consensus_time,
         origin,
         me: INBOX.into(),
+        cause,
     })
+    .on_query(IDENTITY, identity_stub)
 }
 
-fn sys(consensus_time: u64) -> TestCtx {
-    ctx(Origin::System, consensus_time)
+fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
+    ctx_with(origin, consensus_time, Cause::Direct)
 }
 
-/// two distinct submitter keys. a MEMBER is an origin's actor string, so the
-/// queue a key owns is exactly `Origin::External(key).actor_string()` — these
-/// helpers keep the two in lockstep instead of hand-spelling hex.
-const ALICE_KEY: [u8; 4] = [0xa1, 0xa1, 0xa1, 0xa1];
-const STRANGER_KEY: [u8; 4] = [0xc3, 0xc3, 0xc3, 0xc3];
-
-fn queue_of(key: [u8; 4]) -> String {
-    Origin::External(key.to_vec()).actor_string()
+/// the host running attribution's delivery of change `seq` (queue item
+/// `item`) here: the source's origin, and the chain the source set.
+fn from_attribution(consensus_time: u64, seq: u64, item: u64) -> TestCtx {
+    ctx_with(
+        Origin::Module(ATTRIBUTION.into()),
+        consensus_time,
+        Cause::Chain {
+            root: Root::Change {
+                source: ATTRIBUTION.into(),
+                seq,
+            },
+            hop: Hop::Delivery(ItemRef {
+                source: ATTRIBUTION.into(),
+                item,
+            }),
+        },
+    )
 }
 
 fn submitter(key: [u8; 4], consensus_time: u64) -> TestCtx {
     ctx(Origin::External(key.to_vec()), consensus_time)
 }
 
+fn change(seq: u64, recipient: AccountNumber) -> Change {
+    Change {
+        seq,
+        source: Source {
+            module: "chat".into(),
+            kind: "message".into(),
+            object: format!("m{seq}"),
+        },
+        revision: 1,
+        recipient,
+        reason: Reason::Mention,
+        kind: ChangeKind::Added,
+        detail: vec![0xd; 16],
+        actor: Actor::Account(BOB),
+        cause: Cause::Direct,
+        height: seq,
+    }
+}
+
+fn changed(change: &Change) -> Msg {
+    Msg {
+        target: INBOX.into(),
+        payload: encode_event(&AttributionEvent::Changed(change.clone())),
+    }
+}
+
+fn admin(msg: InboxMsg) -> Msg {
+    Msg {
+        target: INBOX.into(),
+        payload: encode_msg(&msg),
+    }
+}
+
+fn mark_read(account: AccountNumber, up_to_seq: u64) -> Msg {
+    admin(InboxMsg::MarkRead { account, up_to_seq })
+}
+
+fn clear(account: AccountNumber, up_to_seq: u64) -> Msg {
+    admin(InboxMsg::Clear { account, up_to_seq })
+}
+
 fn fresh() -> Inbox {
-    Inbox::new(INBOX, Box::new(MemStore::new()))
+    Inbox::new(INBOX, Box::new(MemStore::new()), ATTRIBUTION, IDENTITY)
 }
 
-/// one member's committed-or-staged queue via the testkit read.
-async fn queue(inbox: &Inbox, member: &str) -> Option<(u64, Vec<Notification>)> {
-    inbox.queue_view(member).await.expect("queue view")
+/// deliver `change` as the attribution source would (item = seq, one
+/// subscriber) and return the stamp the inbox assigned.
+async fn deliver(inbox: &mut Inbox, time: u64, change: &Change) -> Result<InboxAssigned, Error> {
+    let mut c = from_attribution(time, change.seq, change.seq);
+    inbox.execute(&mut c, &changed(change)).await?;
+    let stamp = c.assigned().expect("a delivery stamps");
+    Ok(decode_assigned(stamp).expect("stamp decodes"))
 }
 
-/// the compact item shape assertions compare: `(seq, kind, body, source,
-/// created_at)`. `read` is not a per-item field any more (see
-/// `Inbox::read_watermark_view`) — a test that cares about read status
-/// checks the watermark directly.
-fn item_tuple(n: &Notification) -> (u64, String, String, String, u64) {
-    (
-        n.seq,
-        n.kind.clone(),
-        n.body.clone(),
-        n.source.clone(),
-        n.created_at,
-    )
+async fn queue(inbox: &Inbox, account: AccountNumber) -> Option<(u64, Vec<Notification>)> {
+    inbox.queue_view(account).await.expect("queue view")
 }
 
-fn tuples(items: &[Notification]) -> Vec<(u64, String, String, String, u64)> {
-    items.iter().map(item_tuple).collect()
-}
-
-fn t(
-    seq: u64,
-    kind: &str,
-    body: &str,
-    source: &str,
-    created_at: u64,
-) -> (u64, String, String, String, u64) {
-    (seq, kind.into(), body.into(), source.into(), created_at)
+/// the compact item shape assertions compare: `(seq, change seq, created_at)`.
+fn tuples(items: &[Notification]) -> Vec<(u64, u64, u64)> {
+    items
+        .iter()
+        .map(|n| (n.seq, n.change.seq, n.created_at))
+        .collect()
 }
 
 #[test]
-fn deliver_assigns_per_member_sequence() {
+fn a_human_recipients_change_is_queued_by_reference() {
     block_on(async {
         let mut inbox = fresh();
-
-        inbox
-            .execute(&mut sys(10), &deliver("alice", "mention", "hi"))
-            .await
-            .expect("deliver a1");
-        inbox
-            .execute(&mut sys(11), &deliver("alice", "reply", "yo"))
-            .await
-            .expect("deliver a2");
-        inbox
-            .execute(&mut sys(12), &deliver("bob", "mention", "sup"))
-            .await
-            .expect("deliver b1");
-        inbox.commit_block().await.expect("commit");
-
-        // per-member seqs are monotonic from 1 and the queues independent
-        // (bob restarts at 1); created_at is the block's consensus time and
-        // new items are unread.
-        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
-        assert_eq!(next, 3);
+        let first = change(4, ALICE);
+        let second = change(6, ALICE);
+        let bobs = change(7, BOB);
         assert_eq!(
-            tuples(&items),
-            vec![
-                t(1, "mention", "hi", "system", 10),
-                t(2, "reply", "yo", "system", 11),
-            ]
+            deliver(&mut inbox, 10, &first).await.unwrap(),
+            InboxAssigned::Delivered { seq: 1 }
         );
-        let (next, items) = queue(&inbox, "bob").await.expect("bob exists");
+        assert_eq!(
+            deliver(&mut inbox, 11, &second).await.unwrap(),
+            InboxAssigned::Delivered { seq: 2 }
+        );
+        assert_eq!(
+            deliver(&mut inbox, 12, &bobs).await.unwrap(),
+            InboxAssigned::Delivered { seq: 1 }
+        );
+        inbox.commit_block().await.unwrap();
+
+        // per-account seqs are monotonic from 1 and the inboxes independent;
+        // created_at is the block's consensus time; the item is the change
+        // by REFERENCE — the detail stays on the canonical record.
+        let (next, items) = queue(&inbox, ALICE).await.expect("alice's inbox");
+        assert_eq!(next, 3);
+        assert_eq!(tuples(&items), vec![(1, 4, 10), (2, 6, 11)]);
+        assert_eq!(items[0].account, ALICE);
+        assert_eq!(items[0].change, first.reference());
+        assert_eq!(items[1].change, second.reference());
+        let (next, items) = queue(&inbox, BOB).await.expect("bob's inbox");
         assert_eq!(next, 2);
-        assert_eq!(tuples(&items), vec![t(1, "mention", "sup", "system", 12)]);
+        assert_eq!(tuples(&items), vec![(1, 7, 12)]);
+        assert!(!inbox.is_read(ALICE, 1).await.unwrap());
+        assert_eq!(inbox.last_change_view(ALICE).await.unwrap(), 6);
     });
 }
 
 #[test]
-fn source_is_derived_from_origin() {
+fn program_and_revoked_recipients_are_ignored_and_a_missing_one_fails() {
     block_on(async {
         let mut inbox = fresh();
-
-        // module and system origins deliver to any member — "m" is neither's
-        // own queue, and that is exactly the point.
-        inbox
-            .execute(
-                &mut ctx(Origin::Module("chat".into()), 1),
-                &deliver("m", "k", "from module"),
-            )
-            .await
-            .expect("module deliver");
-        inbox
-            .execute(&mut sys(3), &deliver("m", "k", "from system"))
-            .await
-            .expect("system deliver");
-        inbox.commit_block().await.expect("commit");
-
-        // source = module id verbatim / "system" — never caller-supplied.
-        let (next, items) = queue(&inbox, "m").await.expect("m exists");
-        assert_eq!(next, 3);
-        assert_eq!(
-            tuples(&items),
-            vec![
-                t(1, "k", "from module", "chat", 1),
-                t(2, "k", "from system", "system", 3),
-            ]
-        );
-
-        // an authenticated external origin may deliver only to its OWN
-        // queue: self-delivery still derives `source` as "ext:"+hex, never
-        // caller-supplied.
-        let mut inbox = fresh();
-        let ext_key = vec![0xde, 0xad, 0xbe, 0xef];
-        let ext_member = Origin::External(ext_key.clone()).actor_string();
-        inbox
-            .execute(
-                &mut ctx(Origin::External(ext_key), 2),
-                &deliver(&ext_member, "k", "from external"),
-            )
-            .await
-            .expect("external self-deliver");
-        inbox.commit_block().await.expect("commit external");
-        let (_, items) = queue(&inbox, &ext_member).await.expect("ext member exists");
-        assert_eq!(
-            tuples(&items),
-            vec![t(1, "k", "from external", "ext:deadbeef", 2)]
-        );
-
-        // the pre-consensus anonymous-external default owns no queue at all,
-        // so it cannot even self-deliver to "ext:".
-        let err = inbox
-            .execute(
-                &mut ctx(Origin::External(Vec::new()), 4),
-                &deliver("ext:", "k", "from anonymous external"),
-            )
-            .await
-            .expect_err("an unauthenticated external must be refused");
-        assert!(
-            matches!(err, Error::Module(ref m) if m.contains("may only deliver to its own queue"))
-        );
-    });
-}
-
-#[test]
-fn caps_reject_oversized_and_leave_root_unchanged() {
-    block_on(async {
-        let mut inbox = fresh();
-        let root0 = inbox.root();
-
-        let big_body = "x".repeat(16 * 1024 + 1);
-        let err = inbox
-            .execute(&mut sys(1), &deliver("alice", "k", &big_body))
-            .await
-            .expect_err("oversized body must be rejected");
-        assert!(matches!(err, Error::Module(ref m) if m.contains("body exceeds")));
-
-        let big_kind = "k".repeat(65);
-        inbox
-            .execute(&mut sys(1), &deliver("alice", &big_kind, "b"))
-            .await
-            .expect_err("oversized kind must be rejected");
-
-        inbox
-            .execute(&mut sys(1), &deliver("", "k", "b"))
-            .await
-            .expect_err("empty member must be rejected");
-
-        let big_member = "m".repeat(257);
-        inbox
-            .execute(&mut sys(1), &deliver(&big_member, "k", "b"))
-            .await
-            .expect_err("oversized member must be rejected");
-
-        inbox.commit_block().await.expect("commit");
-        assert_eq!(
-            inbox.root(),
-            root0,
-            "rejected deliveries never enter the root"
-        );
-        assert!(
-            queue(&inbox, "alice").await.is_none(),
-            "nothing was staged for the rejected member"
-        );
-    });
-}
-
-#[test]
-fn queue_overflow_drops_oldest_item() {
-    block_on(async {
-        let mut inbox = fresh();
-        let cap = MAX_ITEMS_PER_MEMBER as u64;
-        // one over the per-member cap, all in a single block.
-        for i in 0..=cap {
-            inbox
-                .execute(&mut sys(i), &deliver("alice", "k", "b"))
-                .await
-                .expect("deliver");
+        let before = inbox.root();
+        for recipient in [PROGRAM, REVOKED] {
+            assert_eq!(
+                deliver(&mut inbox, 1, &change(1, recipient)).await.unwrap(),
+                InboxAssigned::Ignored,
+                "account {recipient} holds no human inbox"
+            );
+            assert!(queue(&inbox, recipient).await.is_none());
         }
-        inbox.commit_block().await.expect("commit");
+        // the program's controller is NOT notified on its behalf.
+        assert!(queue(&inbox, ALICE).await.is_none());
 
-        // seq 1 (the oldest) was dropped deterministically: the committed
-        // window is exactly 2..=cap+1 (the queue holds the cap), and next_seq
-        // kept counting past the drop.
-        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
-        assert_eq!(next, cap + 2, "next_seq counted past the drop");
-        assert_eq!(items.len(), MAX_ITEMS_PER_MEMBER, "the queue holds the cap");
-        assert_eq!(items.first().map(|n| n.seq), Some(2), "seq 1 dropped");
-        assert_eq!(items.last().map(|n| n.seq), Some(cap + 1));
+        // an account nobody holds cannot be notified: the delivery fails,
+        // which the attribution plane keeps as its receipt.
+        let mut c = from_attribution(1, 2, 2);
+        let err = inbox
+            .execute(&mut c, &changed(&change(2, GHOST)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("does not exist"),
+            "the failure names its reason: {err:?}"
+        );
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), before, "nothing was staged");
     });
 }
 
 #[test]
-fn member_cap_rejects_new_member() {
+fn only_the_attribution_source_delivers() {
     block_on(async {
         let mut inbox = fresh();
-        // fill exactly MAX_MEMBERS distinct members in one block.
-        for i in 0..MAX_MEMBERS as u64 {
-            let member = format!("m{i}");
-            inbox
-                .execute(&mut sys(0), &deliver(&member, "k", ""))
-                .await
-                .expect("deliver to fresh member");
+        let before = inbox.root();
+        let payload = changed(&change(1, ALICE));
+        for origin in [
+            Origin::Module("chat".into()),
+            Origin::External(ALICE_KEY_1.to_vec()),
+            Origin::Program(PROGRAM),
+            Origin::System,
+        ] {
+            let mut c = ctx(origin.clone(), 1);
+            assert!(
+                inbox.execute(&mut c, &payload).await.is_err(),
+                "{origin:?} cannot mint a notification"
+            );
         }
+        // and the source's origin carries deliveries only, never admin ops.
+        let mut c = from_attribution(1, 1, 1);
+        assert!(inbox.execute(&mut c, &mark_read(ALICE, 1)).await.is_err());
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), before);
+        assert!(queue(&inbox, ALICE).await.is_none());
+    });
+}
 
-        // a NEW member beyond the cap is rejected...
-        let err = inbox
-            .execute(&mut sys(0), &deliver("overflow", "k", ""))
-            .await
-            .expect_err("new member beyond cap must be rejected");
-        assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
+#[test]
+fn a_repeated_delivery_is_a_duplicate_and_an_older_one_is_refused() {
+    block_on(async {
+        let mut inbox = fresh();
+        assert_eq!(
+            deliver(&mut inbox, 1, &change(5, ALICE)).await.unwrap(),
+            InboxAssigned::Delivered { seq: 1 }
+        );
+        inbox.commit_block().await.unwrap();
+        let once = inbox.root();
 
-        // ...but delivering to an EXISTING member still works.
+        // the same change again: stamped, nothing staged, no root movement.
+        assert_eq!(
+            deliver(&mut inbox, 2, &change(5, ALICE)).await.unwrap(),
+            InboxAssigned::Duplicate
+        );
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), once);
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
+        assert_eq!((next, items.len()), (2, 1));
+
+        // an older change arriving later violates the source's ordering:
+        // an error, never a silent skip.
+        assert!(deliver(&mut inbox, 3, &change(3, ALICE)).await.is_err());
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), once);
+
+        // the duplicate gate is per account: bob's first change is new.
+        assert_eq!(
+            deliver(&mut inbox, 4, &change(5, BOB)).await.unwrap(),
+            InboxAssigned::Delivered { seq: 1 }
+        );
+    });
+}
+
+#[test]
+fn every_key_of_an_account_shares_its_one_inbox() {
+    block_on(async {
+        let mut inbox = fresh();
+        for seq in 1..=3 {
+            deliver(&mut inbox, seq, &change(seq, ALICE)).await.unwrap();
+        }
+        inbox.commit_block().await.unwrap();
+
+        // alice's first device marks read; her second device clears — the
+        // same inbox, addressed by the account, not by either key.
         inbox
-            .execute(&mut sys(0), &deliver("m0", "k", "again"))
+            .execute(&mut submitter(ALICE_KEY_1, 4), &mark_read(ALICE, 2))
             .await
-            .expect("existing member still accepts deliveries");
+            .expect("device one acks");
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.read_watermark_view(ALICE).await.unwrap(), 2);
+        inbox
+            .execute(&mut submitter(ALICE_KEY_2, 5), &clear(ALICE, 1))
+            .await
+            .expect("device two acks");
+        inbox.commit_block().await.unwrap();
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
+        assert_eq!(next, 4);
+        assert_eq!(
+            items.iter().map(|n| n.seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "device two's clear removed what device one had read"
+        );
+        assert!(inbox.is_read(ALICE, 2).await.unwrap());
+        assert!(!inbox.is_read(ALICE, 3).await.unwrap());
+    });
+}
+
+#[test]
+fn strangers_other_accounts_programs_modules_and_the_system_cannot_ack() {
+    block_on(async {
+        let mut inbox = fresh();
+        deliver(&mut inbox, 1, &change(1, ALICE)).await.unwrap();
+        inbox.commit_block().await.unwrap();
+        let before = inbox.root();
+
+        let refused: Vec<(&str, Origin)> = vec![
+            ("an unbound key", Origin::External(STRANGER_KEY.to_vec())),
+            ("another account's key", Origin::External(BOB_KEY.to_vec())),
+            ("an empty key", Origin::External(Vec::new())),
+            ("alice's own program", Origin::Program(PROGRAM)),
+            ("a module", Origin::Module("chat".into())),
+            ("the system", Origin::System),
+        ];
+        for (who, origin) in refused {
+            for op in [mark_read(ALICE, 1), clear(ALICE, 1)] {
+                let mut c = ctx(origin.clone(), 2);
+                assert!(
+                    inbox.execute(&mut c, &op).await.is_err(),
+                    "{who} cannot ack alice's inbox"
+                );
+            }
+        }
+        // the gate holds before the lookup: a stranger naming an inbox that
+        // holds nothing is refused the same way, never told it is empty.
+        let mut c = submitter(STRANGER_KEY, 2);
+        assert!(inbox.execute(&mut c, &mark_read(GHOST, 1)).await.is_err());
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), before, "a refused ack stages nothing");
+        assert_eq!(inbox.read_watermark_view(ALICE).await.unwrap(), 0);
     });
 }
 
@@ -310,84 +402,154 @@ fn member_cap_rejects_new_member() {
 fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
     block_on(async {
         let mut inbox = fresh();
-        // the acks below are alice's own, so the queue is named for her key.
-        let alice = queue_of(ALICE_KEY);
-        for _ in 0..3 {
+        // bob's own empty inbox: a no-op, never an error.
+        inbox
+            .execute(&mut submitter(BOB_KEY, 1), &mark_read(BOB, 5))
+            .await
+            .expect("empty inbox mark-read is a no-op");
+        inbox
+            .execute(&mut submitter(BOB_KEY, 1), &clear(BOB, 5))
+            .await
+            .expect("empty inbox clear is a no-op");
+        inbox.commit_block().await.unwrap();
+        let empty = inbox.root();
+        assert!(queue(&inbox, BOB).await.is_none());
+
+        for seq in 1..=3 {
+            deliver(&mut inbox, seq, &change(seq, ALICE)).await.unwrap();
+        }
+        inbox.commit_block().await.unwrap();
+        assert_ne!(inbox.root(), empty);
+
+        inbox
+            .execute(&mut submitter(ALICE_KEY_1, 4), &mark_read(ALICE, 2))
+            .await
+            .unwrap();
+        inbox.commit_block().await.unwrap();
+        let marked = inbox.root();
+        // re-marking the same range, or a lower one, is byte-identical.
+        for up_to in [2, 1] {
             inbox
-                .execute(&mut sys(1), &deliver(&alice, "k", "b"))
+                .execute(&mut submitter(ALICE_KEY_1, 5), &mark_read(ALICE, up_to))
                 .await
-                .expect("deliver");
+                .unwrap();
         }
-        inbox.commit_block().await.expect("commit deliveries");
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), marked);
 
-        // MarkRead up to seq 2 raises the watermark to 2, so seqs 1 and 2
-        // read as read (derived from the watermark) and seq 3 does not.
         inbox
-            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, 2))
+            .execute(&mut submitter(ALICE_KEY_1, 6), &clear(ALICE, 2))
             .await
-            .expect("mark read");
-        inbox.commit_block().await.expect("commit mark read");
-        assert_eq!(inbox.read_watermark_view(&alice).await.unwrap(), 2);
-        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
-        let mut derived_read = Vec::new();
-        for n in &items {
-            derived_read.push((n.seq, inbox.is_read(&alice, n.seq).await.unwrap()));
+            .unwrap();
+        inbox.commit_block().await.unwrap();
+        let cleared = inbox.root();
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
+        assert_eq!(next, 4, "next_seq never rewinds");
+        assert_eq!(items.iter().map(|n| n.seq).collect::<Vec<_>>(), vec![3]);
+        // clearing an already-cleared prefix stages nothing.
+        inbox
+            .execute(&mut submitter(ALICE_KEY_1, 7), &clear(ALICE, 2))
+            .await
+            .unwrap();
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), cleared);
+    });
+}
+
+#[test]
+fn a_cleared_inbox_keeps_its_numbering_and_its_duplicate_gate() {
+    block_on(async {
+        let mut inbox = fresh();
+        for seq in 1..=2 {
+            deliver(&mut inbox, seq, &change(seq, ALICE)).await.unwrap();
         }
+        inbox
+            .execute(&mut submitter(ALICE_KEY_1, 3), &clear(ALICE, u64::MAX))
+            .await
+            .unwrap();
+        inbox.commit_block().await.unwrap();
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
         assert_eq!(
-            derived_read,
-            vec![(1, true), (2, true), (3, false)],
-            "only seqs 1,2 are read"
-        );
-        let root_after_ack = inbox.root();
-
-        // idempotent re-ack: nothing flips, so nothing is staged and the
-        // root holds byte-identical.
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, 2))
-            .await
-            .expect("mark read again");
-        inbox.commit_block().await.expect("commit re-ack");
-        assert_eq!(inbox.root(), root_after_ack, "re-ack is idempotent");
-
-        // no-op tolerance: a submitter acking their OWN queue before anything
-        // was ever delivered to it must not error and must not move the root.
-        let nobody = queue_of(STRANGER_KEY);
-        inbox
-            .execute(&mut submitter(STRANGER_KEY, 3), &mark_read(&nobody, 99))
-            .await
-            .expect("mark read on an empty own queue is a no-op");
-        inbox
-            .execute(&mut submitter(STRANGER_KEY, 3), &clear(&nobody, 99))
-            .await
-            .expect("clear on an empty own queue is a no-op");
-        inbox.commit_block().await.expect("commit no-ops");
-        assert_eq!(
-            inbox.root(),
-            root_after_ack,
-            "no-op acks never change committed state"
+            (next, items.len()),
+            (3, 0),
+            "the meta record outlives its items"
         );
 
-        // Clear removes items but never rewinds next_seq: the next delivery
-        // gets seq 4, not a reused low seq.
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 4), &clear(&alice, 2))
-            .await
-            .expect("clear up to 2");
-        inbox
-            .execute(&mut sys(5), &deliver(&alice, "k", "after clear"))
-            .await
-            .expect("deliver after clear");
-        inbox.commit_block().await.expect("commit clear+deliver");
-        let (next, items) = queue(&inbox, &alice).await.expect("alice exists");
-        assert_eq!(next, 5);
+        // the last change is still a duplicate; the next continues at seq 3.
         assert_eq!(
-            tuples(&items),
-            vec![
-                t(3, "k", "b", "system", 1),
-                t(4, "k", "after clear", "system", 5),
-            ],
-            "seq 1,2 cleared; the new delivery took seq 4 — next_seq did not rewind"
+            deliver(&mut inbox, 4, &change(2, ALICE)).await.unwrap(),
+            InboxAssigned::Duplicate
         );
+        assert_eq!(
+            deliver(&mut inbox, 4, &change(3, ALICE)).await.unwrap(),
+            InboxAssigned::Delivered { seq: 3 }
+        );
+    });
+}
+
+#[test]
+fn queue_overflow_drops_oldest_and_counts_the_eviction() {
+    block_on(async {
+        let mut inbox = fresh();
+        let cap = MAX_ITEMS_PER_ACCOUNT as u64;
+        for seq in 1..=cap + 1 {
+            deliver(&mut inbox, seq, &change(seq, ALICE)).await.unwrap();
+        }
+        inbox.commit_block().await.unwrap();
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
+        assert_eq!(next, cap + 2);
+        assert_eq!(items.len(), MAX_ITEMS_PER_ACCOUNT);
+        assert_eq!(items.first().map(|n| n.seq), Some(2), "seq 1 was dropped");
+        assert_eq!(items.last().map(|n| n.seq), Some(cap + 1));
+        assert_eq!(inbox.evicted_count(ALICE).await.unwrap(), 1);
+        assert_eq!(inbox.evicted_count(BOB).await.unwrap(), 0);
+    });
+}
+
+#[test]
+fn seq_exhaustion_rejects_deterministically() {
+    block_on(async {
+        let mut inbox = fresh();
+        inbox.testkit_saturate_seq(ALICE).await.unwrap();
+        inbox.commit_block().await.unwrap();
+        let before = inbox.root();
+        assert!(deliver(&mut inbox, 1, &change(1, ALICE)).await.is_err());
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), before);
+    });
+}
+
+#[test]
+fn mark_read_beyond_the_last_seq_does_not_pre_read_future_deliveries() {
+    block_on(async {
+        let mut inbox = fresh();
+        deliver(&mut inbox, 1, &change(1, ALICE)).await.unwrap();
+        inbox
+            .execute(&mut submitter(ALICE_KEY_1, 2), &mark_read(ALICE, u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(inbox.read_watermark_view(ALICE).await.unwrap(), 1);
+        deliver(&mut inbox, 3, &change(2, ALICE)).await.unwrap();
+        inbox.commit_block().await.unwrap();
+        assert!(inbox.is_read(ALICE, 1).await.unwrap());
+        assert!(!inbox.is_read(ALICE, 2).await.unwrap());
+    });
+}
+
+#[test]
+fn an_oversized_reference_is_refused_before_staging() {
+    block_on(async {
+        let mut inbox = fresh();
+        let before = inbox.root();
+        let mut oversized = change(1, ALICE);
+        // the reference carries the reason; a defined reason the store's
+        // codec cannot hold is refused whole, and nothing of the delivery
+        // (not even the account's meta) is staged.
+        oversized.reason = Reason::Defined("r".repeat(sdk::MAX_STORE_VALUE_BYTES));
+        assert!(deliver(&mut inbox, 1, &oversized).await.is_err());
+        inbox.commit_block().await.unwrap();
+        assert_eq!(inbox.root(), before);
+        assert!(queue(&inbox, ALICE).await.is_none());
     });
 }
 
@@ -395,555 +557,24 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
 fn root_moves_only_on_commit_and_abort_leaves_no_trace() {
     block_on(async {
         let mut inbox = fresh();
-        let root0 = inbox.root();
-
-        inbox
-            .execute(&mut sys(1), &deliver("alice", "k", "b"))
-            .await
-            .expect("stage deliver");
-        assert_eq!(inbox.root(), root0, "staged writes do not move the root");
-        assert!(
-            queue(&inbox, "alice").await.is_some(),
-            "read-your-writes sees the stage"
-        );
-
-        inbox.commit_block().await.expect("commit");
-        let root1 = inbox.root();
-        assert_ne!(root1, root0, "commit moves the root");
-
-        inbox
-            .execute(&mut sys(2), &deliver("alice", "k", "b2"))
-            .await
-            .expect("stage another");
-        assert_eq!(inbox.root(), root1, "root is committed-state only");
-        inbox.abort_block().await.expect("abort");
+        let genesis = inbox.root();
+        deliver(&mut inbox, 1, &change(1, ALICE)).await.unwrap();
         assert_eq!(
             inbox.root(),
-            root1,
-            "abort leaves the root byte-identical to pre-block"
+            genesis,
+            "staged writes are invisible to root()"
         );
-        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
-        assert_eq!(
-            (next, items.len()),
-            (2, 1),
-            "the aborted delivery left no trace"
-        );
-    });
-}
-
-// ---- P2: a module follow-up delivers atomically in the causing block --------
-
-/// a stand-in producer module that, on any op, emits an inbox `Deliver`
-/// follow-up — the cross-module write path the inbox exists to serve.
-struct Producer;
-
-#[async_trait::async_trait(?Send)]
-impl Module for Producer {
-    fn id(&self) -> ModuleId {
-        "producer".into()
-    }
-
-    fn root(&self) -> StateRoot {
-        StateRoot::ZERO
-    }
-
-    async fn execute(&mut self, ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
-        ctx.emit_msg(deliver("alice", "event", "produced"));
-        Ok(())
-    }
-}
-
-/// the committed-state twin the P2 proofs compare against: a fresh inbox
-/// replaying the EXPECTED direct delivery — MemStore roots are a function of
-/// the record set alone, so root equality proves the follow-up landed with
-/// the emitting module as source and the block's consensus time.
-async fn expected_root(source: &str, consensus_time: u64) -> StateRoot {
-    let mut twin = fresh();
-    twin.execute(
-        &mut ctx(Origin::Module(source.into()), consensus_time),
-        &deliver("alice", "event", "produced"),
-    )
-    .await
-    .expect("twin deliver");
-    twin.commit_block().await.expect("twin commit");
-    twin.root()
-}
-
-#[test]
-fn module_follow_up_delivers_atomically_with_source_of_emitter() {
-    block_on(async {
-        let mut host = Host::genesis(vec![Box::new(fresh()), Box::new(Producer)]).expect("genesis");
-        let app0 = host.root_hash();
-
-        let out = host
-            .submit_at(
-                BlockContext {
-                    height: 1,
-                    consensus_time: 42,
-                    origin: Origin::External(b"tester".to_vec()),
-                },
-                Msg {
-                    target: "producer".into(),
-                    payload: Vec::new(),
-                },
-            )
-            .await
-            .expect("submit producer op");
-        assert_ne!(
-            out.root_hash, app0,
-            "the atomic delivery moves the root-hash"
-        );
-
-        // root equality against the replayed twin proves the follow-up
-        // delivered in THIS block, with the EMITTING module as source (not
-        // the external submitter) and the block's consensus time.
-        assert_eq!(
-            host.module_root(INBOX),
-            Some(expected_root("producer", 42).await)
-        );
-    });
-}
-
-/// a producer that emits a Deliver followed by a MarkRead ack — the shape a
-/// delivering module would use if it could also ack what it delivered. it
-/// cannot: delivering and acking are different principals.
-struct ProducerWithAck;
-
-#[async_trait::async_trait(?Send)]
-impl Module for ProducerWithAck {
-    fn id(&self) -> ModuleId {
-        "producer-ack".into()
-    }
-
-    fn root(&self) -> StateRoot {
-        StateRoot::ZERO
-    }
-
-    async fn execute(&mut self, ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
-        ctx.emit_msg(deliver("alice", "event", "produced"));
-        // the module's OWN actor string: even the queue named after the
-        // emitter is not the emitter's to ack.
-        ctx.emit_msg(mark_read("producer-ack", 999));
-        Ok(())
-    }
-}
-
-#[test]
-fn a_module_follow_up_cannot_ack_any_queue() {
-    block_on(async {
-        let mut host =
-            Host::genesis(vec![Box::new(fresh()), Box::new(ProducerWithAck)]).expect("genesis");
-        let app0 = host.root_hash();
-
-        // fail CLOSED: the ack is refused, which aborts the cascade its own
-        // delivery began. that is the correct trade — nothing in the tree
-        // emits an ack as a follow-up, and admitting a module origin would
-        // hand every delivering module a lever over the queue it wrote to.
-        let err = host
-            .submit_at(
-                BlockContext {
-                    height: 1,
-                    consensus_time: 7,
-                    origin: Origin::System,
-                },
-                Msg {
-                    target: "producer-ack".into(),
-                    payload: Vec::new(),
-                },
-            )
-            .await
-            .expect_err("a module-origin ack must be refused");
+        inbox.abort_block().await.unwrap();
+        assert_eq!(inbox.root(), genesis);
         assert!(
-            format!("{err:?}").contains("a module origin owns no inbox queue"),
-            "unexpected refusal: {err:?}"
-        );
-        assert_eq!(host.root_hash(), app0, "the aborted cascade left no trace");
-    });
-}
-
-// ---- the ack gate: only a queue's own member acks it -------------------------
-
-#[test]
-fn only_the_queues_own_member_may_ack_it() {
-    block_on(async {
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-        for _ in 0..3 {
-            inbox
-                .execute(
-                    &mut ctx(Origin::Module("chat".into()), 1),
-                    &deliver(&alice, "k", "b"),
-                )
-                .await
-                .expect("a module delivers into alice's queue");
-        }
-        inbox.commit_block().await.expect("commit deliveries");
-        let sealed = inbox.root();
-
-        // a stranger may neither read-mark nor DELETE alice's queue. Clear is
-        // permanent — this is the whole defect: an unattributed wipe of another
-        // member's notification history.
-        for op in [mark_read(&alice, 3), clear(&alice, 3)] {
-            let err = inbox
-                .execute(&mut submitter(STRANGER_KEY, 2), &op)
-                .await
-                .expect_err("a stranger must be refused");
-            assert!(
-                matches!(&err, Error::Module(m) if m.contains("only the queue's own member may ack it")),
-                "unexpected refusal: {err:?}"
-            );
-            inbox.abort_block().await.expect("abort");
-        }
-        assert_eq!(inbox.root(), sealed, "a refused ack stages nothing");
-        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
-        assert_eq!(items.len(), 3, "nothing was cleared");
-        assert_eq!(
-            inbox.read_watermark_view(&alice).await.unwrap(),
-            0,
-            "nothing was marked"
+            queue(&inbox, ALICE).await.is_none(),
+            "abort discards the overlay"
         );
 
-        // alice performs both on her own queue.
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 3), &mark_read(&alice, 3))
-            .await
-            .expect("the member marks her own queue read");
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 4), &clear(&alice, 3))
-            .await
-            .expect("the member clears her own queue");
-        inbox.commit_block().await.expect("commit alice's acks");
-        // the clear emptied her whole queue: the META record is deleted, not
-        // left behind item-less (see `clear_that_empties_a_queue...` below).
-        assert!(
-            queue(&inbox, &alice).await.is_none(),
-            "an emptied queue's meta record is deleted"
-        );
-    });
-}
-
-#[test]
-fn only_an_authenticated_external_submitter_owns_a_queue() {
-    block_on(async {
-        let mut inbox = fresh();
-        // every origin that cannot own a queue, against a queue named exactly
-        // after it — so the refusal is about the ORIGIN KIND, never a mismatch.
-        for (origin, member, refusal) in [
-            (
-                Origin::Module("chat".into()),
-                "chat",
-                "a module origin owns no inbox queue",
-            ),
-            (
-                Origin::System,
-                "system",
-                "a system origin owns no inbox queue",
-            ),
-            (
-                Origin::External(Vec::new()),
-                "ext:",
-                "external origin must carry a non-empty submitter id",
-            ),
-        ] {
-            for op in [mark_read(member, 1), clear(member, 1)] {
-                let err = inbox
-                    .execute(&mut ctx(origin.clone(), 1), &op)
-                    .await
-                    .expect_err("an unownable origin must be refused");
-                assert!(
-                    matches!(&err, Error::Module(m) if m.contains(refusal)),
-                    "{origin:?} must be refused with {refusal}: {err:?}"
-                );
-                inbox.abort_block().await.expect("abort");
-            }
-        }
-        assert!(
-            queue(&inbox, "chat").await.is_none(),
-            "no refused ack staged anything"
-        );
-    });
-}
-
-#[test]
-fn module_and_system_origins_deliver_to_any_member() {
-    block_on(async {
-        // a module/system follow-up delivers to a queue it does not own —
-        // the module's entire purpose, and unrestricted on purpose: that is
-        // the path every cross-module notification rides.
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-        for (height, origin) in [Origin::Module("chat".into()), Origin::System]
-            .into_iter()
-            .enumerate()
-        {
-            inbox
-                .execute(&mut ctx(origin, height as u64), &deliver(&alice, "k", "b"))
-                .await
-                .expect("a module/system origin delivers to any member");
-        }
-        inbox.commit_block().await.expect("commit");
-        let (next, items) = queue(&inbox, &alice).await.expect("alice exists");
-        assert_eq!((next, items.len()), (3, 2));
-    });
-}
-
-#[test]
-fn external_origin_delivering_to_another_members_queue_is_refused() {
-    block_on(async {
-        // the acl table is empty/open at genesis, so an external signed op
-        // reaches Deliver directly — it must not be able to mint a
-        // fabricated member (the one-way MAX_MEMBERS cap) or flood a real
-        // member's queue (evicting their genuine notifications).
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-
-        let err = inbox
-            .execute(
-                &mut submitter(STRANGER_KEY, 1),
-                &deliver(&alice, "k", "flood"),
-            )
-            .await
-            .expect_err("a stranger delivering to another member's queue must be refused");
-        assert!(
-            matches!(&err, Error::Module(m) if m.contains("may only deliver to its own queue")),
-            "unexpected refusal: {err:?}"
-        );
-
-        // to its OWN queue: accepted.
-        inbox
-            .execute(
-                &mut submitter(STRANGER_KEY, 2),
-                &deliver(&queue_of(STRANGER_KEY), "k", "self"),
-            )
-            .await
-            .expect("self-delivery is permitted");
-
-        inbox.commit_block().await.expect("commit");
-        assert!(
-            queue(&inbox, &alice).await.is_none(),
-            "the refused delivery never touched alice's queue"
-        );
-        let (_, items) = queue(&inbox, &queue_of(STRANGER_KEY))
-            .await
-            .expect("the stranger's own queue exists");
-        assert_eq!(items.len(), 1, "only the self-delivery landed");
-    });
-}
-
-// ---- the member counter falls -----------------------------------------------
-
-#[test]
-fn clear_that_empties_a_queue_frees_its_member_slot() {
-    block_on(async {
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-
-        // fill the member cap: MAX_MEMBERS-1 module-delivered members, plus
-        // alice's own single self-delivered item.
-        for i in 0..MAX_MEMBERS as u64 - 1 {
-            let member = format!("m{i}");
-            inbox
-                .execute(&mut sys(0), &deliver(&member, "k", ""))
-                .await
-                .expect("deliver to fresh member");
-        }
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 0), &deliver(&alice, "k", "hi"))
-            .await
-            .expect("alice self-delivers");
-        inbox.commit_block().await.expect("commit fill");
-        assert_eq!(inbox.member_count_view().await.unwrap(), MAX_MEMBERS as u64);
-
-        let err = inbox
-            .execute(&mut sys(0), &deliver("overflow", "k", ""))
-            .await
-            .expect_err("the cap is full");
-        assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
-
-        // alice clears her ONLY item: the queue empties, its meta record is
-        // deleted, and the member count falls by exactly one.
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 1), &clear(&alice, 1))
-            .await
-            .expect("alice clears her own queue");
-        inbox.commit_block().await.expect("commit clear");
-        assert!(
-            queue(&inbox, &alice).await.is_none(),
-            "an emptied queue's meta record is deleted"
-        );
-        assert_eq!(
-            inbox.member_count_view().await.unwrap(),
-            MAX_MEMBERS as u64 - 1,
-            "the member counter fell"
-        );
-
-        // the freed slot admits a fresh member again, right at the cap.
-        inbox
-            .execute(&mut sys(2), &deliver("newcomer", "k", ""))
-            .await
-            .expect("a fresh member is admitted again at the cap");
-        inbox.commit_block().await.expect("commit newcomer");
-        assert_eq!(inbox.member_count_view().await.unwrap(), MAX_MEMBERS as u64);
-
-        // the cap is full again (newcomer took the freed slot), so even
-        // alice's own re-delivery is rejected until another slot frees up —
-        // her old slot is gone, not reserved for her.
-        let err = inbox
-            .execute(&mut submitter(ALICE_KEY, 3), &deliver(&alice, "k", "again"))
-            .await
-            .expect_err("the freed slot was already spent on newcomer");
-        assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
-    });
-}
-
-// ---- overflow eviction stays visible -----------------------------------------
-
-#[test]
-fn overflow_eviction_is_counted_per_member() {
-    block_on(async {
-        let mut inbox = fresh();
-        let cap = MAX_ITEMS_PER_MEMBER as u64;
-        // two over the cap: two drops.
-        for i in 0..cap + 2 {
-            inbox
-                .execute(&mut sys(i), &deliver("alice", "k", "b"))
-                .await
-                .expect("deliver");
-        }
-        inbox.commit_block().await.expect("commit");
-        assert_eq!(
-            inbox.evicted_count("alice").await.unwrap(),
-            2,
-            "two overflow drops must be counted, not silent"
-        );
-        assert_eq!(
-            inbox.evicted_count("bob").await.unwrap(),
-            0,
-            "bob never overflowed"
-        );
-    });
-}
-
-// ---- the seq-exhaustion boundary --------------------------------------------
-
-#[test]
-fn seq_exhaustion_rejects_deterministically() {
-    block_on(async {
-        // next_seq == u64::MAX is execute-reachable in principle (2^64 - 2
-        // deliveries), so the testkit injector stands the boundary state up...
-        let mut inbox = fresh();
-        inbox
-            .testkit_saturate_seq("alice")
-            .await
-            .expect("saturate alice");
-        inbox.commit_block().await.expect("commit saturation");
-        let root_installed = inbox.root();
-
-        // ...and the NEXT delivery to that member has no seq left: reject
-        // deterministically, before any mutation — never panic or wrap.
-        let err = inbox
-            .execute(&mut sys(1), &deliver("alice", "k", "one too many"))
-            .await
-            .expect_err("seq space exhaustion must reject");
-        assert!(
-            matches!(err, Error::Module(ref m) if m.contains("seq space exhausted")),
-            "unexpected error: {err:?}"
-        );
-
-        // other members are unaffected, and the rejection left no trace.
-        inbox
-            .execute(&mut sys(1), &deliver("bob", "k", "fresh member"))
-            .await
-            .expect("an unexhausted member still accepts deliveries");
-        inbox.abort_block().await.expect("abort");
-        assert_eq!(
-            inbox.root(),
-            root_installed,
-            "the rejected delivery staged nothing"
-        );
-    });
-}
-
-// ---- MarkRead is O(1), never O(queue length) --------------------------------
-
-/// a queue at the cap marks read in ONE call: `stage_mark_read` reads and
-/// writes the member's META record exactly once, never one distinct read per
-/// item — the defect that made a full 4096-item queue unmarkable under the
-/// wasm host's 4096-distinct-store-read budget (issue #1742). This is a
-/// native test so the wasm host's budget is not itself in play; the property
-/// under test is that the fix touches meta only: the watermark lands and
-/// every item — including the newest, seq == cap — reads back as read.
-#[test]
-fn mark_read_on_a_full_queue_costs_one_meta_read_and_write() {
-    block_on(async {
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-        let cap = MAX_ITEMS_PER_MEMBER as u64;
-        for i in 0..cap {
-            inbox
-                .execute(&mut submitter(ALICE_KEY, i), &deliver(&alice, "k", "b"))
-                .await
-                .expect("deliver");
-        }
-        inbox.commit_block().await.expect("commit fill");
-        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
-        assert_eq!(items.len(), MAX_ITEMS_PER_MEMBER, "the queue holds the cap");
-
-        // ONE MarkRead call covers the whole queue.
-        inbox
-            .execute(&mut submitter(ALICE_KEY, cap), &mark_read(&alice, cap))
-            .await
-            .expect("mark read the full queue in one call");
-        inbox.commit_block().await.expect("commit mark read");
-
-        assert_eq!(
-            inbox.read_watermark_view(&alice).await.unwrap(),
-            cap,
-            "the watermark landed at the cap"
-        );
-        for seq in [1, cap / 2, cap] {
-            assert!(
-                inbox.is_read(&alice, seq).await.unwrap(),
-                "seq {seq} reads as read via the watermark"
-            );
-        }
-    });
-}
-
-/// `MarkRead { up_to_seq: u64::MAX }` must clamp to the last seq ever
-/// assigned, never store the raw value — otherwise every FUTURE delivery
-/// would be born pre-read, which the old per-item flag could never do (it
-/// only ever touched items that already existed).
-#[test]
-fn mark_read_beyond_the_last_seq_does_not_pre_read_future_deliveries() {
-    block_on(async {
-        let mut inbox = fresh();
-        let alice = queue_of(ALICE_KEY);
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 1), &deliver(&alice, "k", "b"))
-            .await
-            .expect("deliver seq 1");
-        inbox.commit_block().await.expect("commit deliver");
-
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, u64::MAX))
-            .await
-            .expect("mark read u64::MAX");
-        inbox.commit_block().await.expect("commit mark read");
-        assert_eq!(
-            inbox.read_watermark_view(&alice).await.unwrap(),
-            1,
-            "the watermark clamps to the last assigned seq, not u64::MAX"
-        );
-
-        inbox
-            .execute(&mut submitter(ALICE_KEY, 3), &deliver(&alice, "k", "c"))
-            .await
-            .expect("deliver seq 2");
-        inbox.commit_block().await.expect("commit deliver 2");
-        assert!(
-            !inbox.is_read(&alice, 2).await.unwrap(),
-            "a delivery AFTER the mark-read must not be born pre-read"
-        );
+        deliver(&mut inbox, 2, &change(1, ALICE)).await.unwrap();
+        inbox.commit_block().await.unwrap();
+        assert_ne!(inbox.root(), genesis);
+        let (next, items) = queue(&inbox, ALICE).await.unwrap();
+        assert_eq!((next, items.len()), (2, 1));
     });
 }

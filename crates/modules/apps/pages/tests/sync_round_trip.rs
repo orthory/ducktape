@@ -94,7 +94,8 @@ fn synced_store_reconstructs_source_root() {
         let mut src = Pages::new(
             "src",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
-        );
+        )
+        .with_attribution("attribution");
         apply_commit(
             &mut src,
             &PageMsg::CreatePage {
@@ -147,7 +148,6 @@ fn synced_store_reconstructs_source_root() {
                 text: "review this".into(),
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: None,
             },
         )
         .await;
@@ -176,7 +176,7 @@ fn synced_store_reconstructs_source_root() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = Pages::new("dst", Box::new(store));
+        let synced = Pages::new("dst", Box::new(store)).with_attribution("attribution");
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -223,7 +223,8 @@ fn synced_store_reproduces_the_page_index() {
         let mut src = Pages::new(
             "src",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
-        );
+        )
+        .with_attribution("attribution");
         for (id, title) in [("zebra", "Z"), ("alpha", "A")] {
             apply_commit(
                 &mut src,
@@ -258,7 +259,7 @@ fn synced_store_reproduces_the_page_index() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = Pages::new("dst", Box::new(store));
+        let synced = Pages::new("dst", Box::new(store)).with_attribution("attribution");
 
         // the byte-identical root carries the sentinel page index with it, and
         // the joiner answers the kept reads exactly like the source.

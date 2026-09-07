@@ -81,6 +81,7 @@
 //!   propose their digest. boot seeds the consensus content store from these
 //!   records so the re-reported finalization resolves and applies.
 
+mod journal;
 mod trailing;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,7 +95,10 @@ use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
 
-use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use host::{
+    BlockContext, DispatchRecord, Host, Observed, PreparedCall, PreparedDelivery, PreparedWork,
+    SubmitError, Trace, Witness,
+};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch};
 use sdk::{ModuleId, StateRoot};
 
@@ -245,9 +249,50 @@ const TAG_PINNED: u8 = 1;
 const TAG_BLOCK: u8 = 2;
 const TAG_SEAL: u8 = 3;
 const TAG_CUTOVER: u8 = 4;
+const TAG_PREPARED_CALL: u8 = 5;
+const TAG_PREPARED_DELIVERY: u8 = 6;
+const TAG_SCHEDULE: u8 = 7;
+const TAG_TRACE: u8 = 8;
+const TAG_WITNESSED: u8 = 9;
 
 const DISP_APPLIED: u8 = 0;
 const DISP_REJECTED: u8 = 1;
+
+/// Local consensus establishes a frame's order; catch-up must additionally
+/// reproduce the peer's claimed seal. That expectation belongs to the first
+/// WAL record so no interrupted schedule or restart can discard it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockSource {
+    Consensus,
+    Catchup {
+        disposition: Disposition,
+        roots: Vec<(ModuleId, StateRoot)>,
+        root_hash: StateRoot,
+    },
+}
+
+impl BlockSource {
+    fn verify(&self, seal: &BlockSeal) -> Result<(), Error> {
+        let Self::Catchup {
+            disposition,
+            roots,
+            root_hash,
+        } = self
+        else {
+            return Ok(());
+        };
+        let matches = seal.disposition == *disposition
+            && seal.roots == *roots
+            && seal.root_hash == *root_hash;
+        if !matches {
+            return Err(Error::Verify(format!(
+                "served seal mismatch at height {}: replay cannot settle this catch-up block",
+                seal.height
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// one op-journal entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,8 +300,44 @@ pub enum Record {
     /// a locally-submitted frame's bytes, durable BEFORE the consensus engine
     /// may propose their digest (closes the finalized-before-drained window).
     Pinned { frame: Vec<u8> },
-    /// WAL: a finalized frame about to be applied at `height`.
-    Block { height: u64, frame: Vec<u8> },
+    /// WAL: a finalized frame about to be applied at `height`. followed by
+    /// the block's prepared internal work — one [`Record::PreparedCall`] /
+    /// [`Record::PreparedDelivery`] per unit — and the [`Record::Schedule`]
+    /// that closes the list; physical chunks obey the journal codec cap. The
+    /// frame is not applied before all of them are durable.
+    Block {
+        height: u64,
+        frame: Vec<u8>,
+        source: BlockSource,
+    },
+    /// one queued call the block at `height` runs (read from committed state
+    /// before the block; see `host::PreparedWork`).
+    PreparedCall { height: u64, call: PreparedCall },
+    /// one queued item the block at `height` delivers.
+    PreparedDelivery {
+        height: u64,
+        delivery: PreparedDelivery,
+    },
+    /// the close of a block's prepared list: how many units precede it. a
+    /// block whose schedule never closed never began applying.
+    Schedule {
+        height: u64,
+        calls: u64,
+        deliveries: u64,
+        advance: Option<sdk::Msg>,
+    },
+    /// One read or dispatch of unit `unit`, in attempt order. Its original
+    /// answer or effects survive recovery even when a sibling or source
+    /// already committed. Durable before the block's first module commits;
+    /// large entries are split into bounded physical journal chunks.
+    Trace {
+        height: u64,
+        unit: u64,
+        trace: Trace,
+    },
+    /// the close of a block's witness: how many units it holds. a witness
+    /// that never closed never preceded a commit.
+    Witnessed { height: u64, units: u64 },
     /// a settled block: how it landed plus the post-block replay positions.
     Seal {
         height: u64,
@@ -286,10 +367,70 @@ impl Record {
                 out.push(TAG_PINNED);
                 put_bytes(&mut out, frame);
             }
-            Record::Block { height, frame } => {
+            Record::Block {
+                height,
+                frame,
+                source,
+            } => {
                 out.push(TAG_BLOCK);
                 put_u64(&mut out, *height);
                 put_bytes(&mut out, frame);
+                match source {
+                    BlockSource::Consensus => out.push(0),
+                    BlockSource::Catchup {
+                        disposition,
+                        roots,
+                        root_hash,
+                    } => {
+                        out.push(1);
+                        out.push(match disposition {
+                            Disposition::Applied => DISP_APPLIED,
+                            Disposition::Rejected => DISP_REJECTED,
+                            Disposition::Discarded => {
+                                unreachable!("discarded frames are not journaled")
+                            }
+                        });
+                        put_roots(&mut out, roots);
+                        put_root(&mut out, root_hash);
+                    }
+                }
+            }
+            Record::PreparedCall { height, call } => {
+                out.push(TAG_PREPARED_CALL);
+                put_u64(&mut out, *height);
+                put_bytes(&mut out, &host::encode_prepared_call(call));
+            }
+            Record::PreparedDelivery { height, delivery } => {
+                out.push(TAG_PREPARED_DELIVERY);
+                put_u64(&mut out, *height);
+                put_bytes(&mut out, &host::encode_prepared_delivery(delivery));
+            }
+            Record::Schedule {
+                height,
+                calls,
+                deliveries,
+                advance,
+            } => {
+                out.push(TAG_SCHEDULE);
+                put_u64(&mut out, *height);
+                put_u64(&mut out, *calls);
+                put_u64(&mut out, *deliveries);
+                put_bytes(&mut out, &host::encode_prepared_advance(advance));
+            }
+            Record::Trace {
+                height,
+                unit,
+                trace,
+            } => {
+                out.push(TAG_TRACE);
+                put_u64(&mut out, *height);
+                put_u64(&mut out, *unit);
+                put_bytes(&mut out, &host::encode_trace(trace));
+            }
+            Record::Witnessed { height, units } => {
+                out.push(TAG_WITNESSED);
+                put_u64(&mut out, *height);
+                put_u64(&mut out, *units);
             }
             Record::Seal {
                 height,
@@ -325,7 +466,15 @@ impl Record {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = sdk::codec::Cursor::with_cap(bytes, MAX_RECORD_FIELD_LEN);
+        let large_record = matches!(
+            bytes.first(),
+            Some(&TAG_PREPARED_CALL) | Some(&TAG_PREPARED_DELIVERY) | Some(&TAG_TRACE)
+        );
+        let cap = match large_record {
+            true => usize::MAX,
+            false => MAX_RECORD_FIELD_LEN,
+        };
+        let mut c = sdk::codec::Cursor::with_cap(bytes, cap);
         let tag = c.byte("record tag")?;
         let record = match tag {
             TAG_PINNED => Record::Pinned {
@@ -334,6 +483,53 @@ impl Record {
             TAG_BLOCK => Record::Block {
                 height: c.u64("block height")?,
                 frame: c.bytes("block frame")?.to_vec(),
+                source: match c.byte("block source")? {
+                    0 => BlockSource::Consensus,
+                    1 => BlockSource::Catchup {
+                        disposition: match c.byte("expected disposition")? {
+                            DISP_APPLIED => Disposition::Applied,
+                            DISP_REJECTED => Disposition::Rejected,
+                            d => return Err(Error::Corrupt(format!("unknown disposition {d}"))),
+                        },
+                        roots: get_roots(&mut c)?,
+                        root_hash: read_root(&mut c, "expected root hash")?,
+                    },
+                    source => return Err(Error::Corrupt(format!("unknown block source {source}"))),
+                },
+            },
+            TAG_PREPARED_CALL => {
+                let height = c.u64("prepared call height")?;
+                let call = host::decode_prepared_call(c.bytes("prepared call")?)
+                    .map_err(|e| Error::Corrupt(e.to_string()))?;
+                Record::PreparedCall { height, call }
+            }
+            TAG_PREPARED_DELIVERY => {
+                let height = c.u64("prepared delivery height")?;
+                let delivery = host::decode_prepared_delivery(c.bytes("prepared delivery")?)
+                    .map_err(|e| Error::Corrupt(e.to_string()))?;
+                Record::PreparedDelivery { height, delivery }
+            }
+            TAG_SCHEDULE => Record::Schedule {
+                height: c.u64("schedule height")?,
+                calls: c.u64("schedule calls")?,
+                deliveries: c.u64("schedule deliveries")?,
+                advance: host::decode_prepared_advance(c.bytes("schedule advance")?)
+                    .map_err(|e| Error::Corrupt(e.to_string()))?,
+            },
+            TAG_TRACE => {
+                let height = c.u64("read height")?;
+                let unit = c.u64("read unit")?;
+                let trace = host::decode_trace(c.bytes("trace")?)
+                    .map_err(|e| Error::Corrupt(e.to_string()))?;
+                Record::Trace {
+                    height,
+                    unit,
+                    trace,
+                }
+            }
+            TAG_WITNESSED => Record::Witnessed {
+                height: c.u64("witnessed height")?,
+                units: c.u64("witnessed units")?,
             },
             TAG_SEAL => {
                 let height = c.u64("seal height")?;
@@ -981,11 +1177,14 @@ where
             .await
             .map_err(storage_err)?;
         pin_mut!(stream);
+        let mut decoder = journal::Records::new(bounds.start);
         while let Some(item) = stream.next().await {
-            let (pos, bytes) = item.map_err(storage_err)?;
-            if let Record::Block { height, .. } = Record::decode(&bytes)? {
-                index.insert(height, pos);
-            }
+            let (position, bytes) = item.map_err(storage_err)?;
+            let Some((position, Record::Block { height, .. })) = decoder.push(position, &bytes)?
+            else {
+                continue;
+            };
+            index.insert(height, position);
         }
         Ok(index)
     }
@@ -1001,6 +1200,102 @@ where
     /// same source replay uses, so every path reconciles identically).
     pub fn code_source(&self) -> std::sync::Arc<dyn host::CodeSource> {
         std::sync::Arc::clone(&self.code_source)
+    }
+
+    /// Persist the served outcome with the frame before any suffix execution.
+    /// Recovery must reproduce it even when the process stops before sealing.
+    pub async fn pre_apply_catchup(
+        &mut self,
+        frame: &[u8],
+        prepared: &PreparedWork,
+        expected: &BlockSeal,
+    ) -> Result<(), node::Error> {
+        let source = BlockSource::Catchup {
+            disposition: expected.disposition,
+            roots: expected.roots.clone(),
+            root_hash: expected.root_hash,
+        };
+        self.write_pre_apply(expected.height, frame, prepared, source)
+            .await
+    }
+
+    async fn write_pre_apply(
+        &mut self,
+        height: u64,
+        frame: &[u8],
+        prepared: &PreparedWork,
+        source: BlockSource,
+    ) -> Result<(), node::Error> {
+        let mut records = vec![
+            Record::Block {
+                height,
+                frame: frame.to_vec(),
+                source,
+            }
+            .encode(),
+        ];
+        for call in &prepared.calls {
+            records.push(
+                Record::PreparedCall {
+                    height,
+                    call: call.clone(),
+                }
+                .encode(),
+            );
+        }
+        for delivery in &prepared.deliveries {
+            records.push(
+                Record::PreparedDelivery {
+                    height,
+                    delivery: delivery.clone(),
+                }
+                .encode(),
+            );
+        }
+        records.push(
+            Record::Schedule {
+                height,
+                calls: prepared.calls.len() as u64,
+                deliveries: prepared.deliveries.len() as u64,
+                advance: prepared.advance.clone(),
+            }
+            .encode(),
+        );
+        let position = self.journal.size().await;
+        for record in &records {
+            self.append_record(record).await?;
+        }
+        self.journal.sync().await.map_err(storage_err)?;
+        self.height_index.insert(height, position);
+        Ok(())
+    }
+
+    async fn append_record(&mut self, record: &[u8]) -> Result<(), Error> {
+        for piece in journal::pieces(record) {
+            self.journal.append(&piece).await.map_err(storage_err)?;
+        }
+        Ok(())
+    }
+
+    /// Decode complete logical records and identify an incomplete tail. A
+    /// recovery writer removes that tail before appending another record.
+    async fn records(&self) -> Result<(Vec<(u64, Record)>, Option<u64>), Error> {
+        let reader = self.journal.reader().await;
+        let bounds = reader.bounds();
+        let stream = reader
+            .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+            .await
+            .map_err(storage_err)?;
+        pin_mut!(stream);
+        let mut decoder = journal::Records::new(bounds.start);
+        let mut records = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (position, bytes) = item.map_err(storage_err)?;
+            if let Some(record) = decoder.push(position, &bytes)? {
+                records.push(record);
+            }
+        }
+        Ok((records, decoder.incomplete_position()))
     }
 
     /// the persisted checkpoint, if any. `None` means this storage dir has
@@ -1240,7 +1535,7 @@ async fn read_finalized_frames_from<E: Context>(
     }
 
     let mut out = Vec::new();
-    let mut pending: Option<(u64, Vec<u8>)> = None;
+    let mut pending: Option<(u64, Vec<u8>, BlockSource)> = None;
     {
         let reader = journal.reader().await;
         let stream = reader
@@ -1248,27 +1543,35 @@ async fn read_finalized_frames_from<E: Context>(
             .await
             .map_err(storage_err)?;
         pin_mut!(stream);
+        let mut decoder = journal::Records::new(start_pos);
         while out.len() < limit {
             let Some(item) = stream.next().await else {
                 break;
             };
-            let (_pos, bytes) = item.map_err(storage_err)?;
+            let (position, bytes) = item.map_err(storage_err)?;
             #[cfg(test)]
             TEST_DECODED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match Record::decode(&bytes)? {
-                Record::Block { height, frame } => {
+            let Some((_, record)) = decoder.push(position, &bytes)? else {
+                continue;
+            };
+            match record {
+                Record::Block {
+                    height,
+                    frame,
+                    source,
+                } => {
                     if height <= after_height {
                         continue;
                     }
                     if height > up_to_height {
                         break;
                     }
-                    if let Some((prev, _)) = pending {
+                    if let Some((prev, _, _)) = pending {
                         return Err(Error::Corrupt(format!(
                             "block {height} appeared before block {prev} was sealed"
                         )));
                     }
-                    pending = Some((height, frame));
+                    pending = Some((height, frame, source));
                 }
                 Record::Seal {
                     height,
@@ -1282,7 +1585,7 @@ async fn read_finalized_frames_from<E: Context>(
                     if height > up_to_height {
                         break;
                     }
-                    let Some((block_height, frame)) = pending.take() else {
+                    let Some((block_height, frame, source)) = pending.take() else {
                         return Err(Error::Corrupt(format!(
                             "seal at height {height} without its block record"
                         )));
@@ -1292,6 +1595,12 @@ async fn read_finalized_frames_from<E: Context>(
                             "seal height {height} does not match block {block_height}"
                         )));
                     }
+                    source.verify(&BlockSeal {
+                        height,
+                        disposition,
+                        roots: roots.clone(),
+                        root_hash,
+                    })?;
                     out.push(JournalFrame {
                         height,
                         frame,
@@ -1300,11 +1609,17 @@ async fn read_finalized_frames_from<E: Context>(
                         root_hash,
                     });
                 }
-                Record::Pinned { .. } | Record::Cutover { .. } => {}
+                Record::Pinned { .. }
+                | Record::Cutover { .. }
+                | Record::PreparedCall { .. }
+                | Record::PreparedDelivery { .. }
+                | Record::Schedule { .. }
+                | Record::Trace { .. }
+                | Record::Witnessed { .. } => {}
             }
         }
     }
-    if let Some((height, _)) = pending {
+    if let Some((height, _, _)) = pending {
         return Err(Error::Corrupt(format!(
             "block {height} in requested range is missing its seal"
         )));
@@ -1332,7 +1647,7 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
+            self.append_record(&record).await?;
             self.journal.sync().await.map_err(storage_err)?;
             Ok(())
         }
@@ -1342,16 +1657,45 @@ where
         &mut self,
         height: u64,
         frame: &[u8],
+        prepared: &PreparedWork,
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        let record = Record::Block {
-            height,
-            frame: frame.to_vec(),
+        self.write_pre_apply(height, frame, prepared, BlockSource::Consensus)
+    }
+
+    fn witness(
+        &mut self,
+        height: u64,
+        witness: &Witness,
+    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
+        // One logical record per trace entry, then the unit count — all
+        // durable before the host commits its first module.
+        let mut records = Vec::new();
+        for (unit, observed) in witness.units.iter().enumerate() {
+            for trace in &observed.trace {
+                records.push(
+                    Record::Trace {
+                        height,
+                        unit: unit as u64,
+                        trace: trace.clone(),
+                    }
+                    .encode(),
+                );
+            }
         }
-        .encode();
+        records.push(
+            Record::Witnessed {
+                height,
+                units: witness.units.len() as u64,
+            }
+            .encode(),
+        );
         async move {
-            let pos = self.journal.append(&record).await.map_err(storage_err)?;
+            for record in &records {
+                self.append_record(record).await?;
+            }
+            // the witness is a BARRIER like the seal: the host commits its
+            // first module the moment this returns.
             self.journal.sync().await.map_err(storage_err)?;
-            self.height_index.insert(height, pos);
             Ok(())
         }
     }
@@ -1368,7 +1712,7 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
+            self.append_record(&record).await?;
             // the seal is a BARRIER, not a plain append. a store-backed tenant
             // durably commits its own disk during apply (`MerkleStore::commit_batch`
             // is "apply + durably commit"), so from the moment the first one
@@ -1397,10 +1741,22 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
+            self.append_record(&record).await?;
             self.journal.sync().await.map_err(storage_err)?;
             Ok(())
         }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<E> host::CommitWitness for Recovery<E>
+where
+    E: Context + BufferPooler + commonware_runtime::Supervisor,
+{
+    async fn record(&mut self, height: u64, witness: &Witness) -> Result<(), String> {
+        BlockSink::witness(self, height, witness)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1538,26 +1894,21 @@ where
         // suffix below only reaches back to the checkpoint, and a window
         // shorter than a peer's is a fork waiting on a replayed batch.
         let mut applied_frames: Vec<(u64, node::FrameId)> = manifest.applied_frames.clone();
-        let mut pending: Option<(u64, Vec<u8>)> = None;
+        let mut pending: Option<PendingBlock> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
 
         // decode the retained journal into records first: replay borrows the
         // reader, and applying blocks needs `&mut host` with no borrow held.
-        let mut records: Vec<Record> = Vec::new();
-        {
-            let reader = self.journal.reader().await;
-            let bounds = reader.bounds();
-            let stream = reader
-                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
-                .await
-                .map_err(storage_err)?;
-            pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                let (_pos, bytes) = item.map_err(storage_err)?;
-                records.push(Record::decode(&bytes)?);
-            }
+        let (located, tail) = self.records().await?;
+        if let Some(position) = tail {
+            self.journal.rewind(position).await.map_err(storage_err)?;
+            self.journal.sync().await.map_err(storage_err)?;
         }
+        let last_block_position = located.iter().rev().find_map(|(position, record)| {
+            matches!(record, Record::Block { .. }).then_some(*position)
+        });
+        let records: Vec<Record> = located.into_iter().map(|(_, record)| record).collect();
 
         // forward pre-scan — seed each per-block-durable disk substrate's
         // "durable floor". a disk-cohort (`block_durable`) module commits to
@@ -1632,18 +1983,69 @@ where
                         residents = o;
                     }
                 }
-                Record::Block { height, frame } => {
+                Record::Block {
+                    height,
+                    frame,
+                    source,
+                } => {
                     if manifest.height.is_some_and(|h| height <= h) {
                         continue; // pre-checkpoint remnant, not yet pruned.
                     }
-                    if let Some((h, _)) = pending {
+                    if let Some(open) = &pending {
                         return Err(Error::Corrupt(format!(
-                            "two unsealed blocks ({h} then {height}) — the WAL never leaves \
-                             more than one apply in flight"
+                            "two unsealed blocks ({} then {height}) — the WAL never leaves \
+                             more than one apply in flight",
+                            open.height
                         )));
                     }
                     frames.push(frame.clone());
-                    pending = Some((height, frame));
+                    pending = Some(PendingBlock::open(height, frame, source));
+                }
+                Record::PreparedCall { height, call } => {
+                    if manifest.height.is_some_and(|h| height <= h) {
+                        continue;
+                    }
+                    pending_block_mut(&mut pending, height, "prepared call")?
+                        .prepared
+                        .calls
+                        .push(call);
+                }
+                Record::PreparedDelivery { height, delivery } => {
+                    if manifest.height.is_some_and(|h| height <= h) {
+                        continue;
+                    }
+                    pending_block_mut(&mut pending, height, "prepared delivery")?
+                        .prepared
+                        .deliveries
+                        .push(delivery);
+                }
+                Record::Schedule {
+                    height,
+                    calls,
+                    deliveries,
+                    advance,
+                } => {
+                    if manifest.height.is_some_and(|h| height <= h) {
+                        continue;
+                    }
+                    pending_block_mut(&mut pending, height, "schedule")?
+                        .close(calls, deliveries, advance)?;
+                }
+                Record::Trace {
+                    height,
+                    unit,
+                    trace,
+                } => {
+                    if manifest.height.is_some_and(|h| height <= h) {
+                        continue;
+                    }
+                    pending_block_mut(&mut pending, height, "read")?.trace(unit, trace)?;
+                }
+                Record::Witnessed { height, units } => {
+                    if manifest.height.is_some_and(|h| height <= h) {
+                        continue;
+                    }
+                    pending_block_mut(&mut pending, height, "witness")?.witnessed(units)?;
                 }
                 Record::Seal {
                     height,
@@ -1654,16 +2056,26 @@ where
                     if manifest.height.is_some_and(|h| height <= h) {
                         continue;
                     }
-                    let Some((block_height, frame)) = pending.take() else {
+                    let Some(block) = pending.take() else {
                         return Err(Error::Corrupt(format!(
                             "seal at height {height} without its block record"
                         )));
                     };
-                    if block_height != height {
+                    if block.height != height {
                         return Err(Error::Corrupt(format!(
-                            "seal height {height} does not match its block record {block_height}"
+                            "seal height {height} does not match its block record {}",
+                            block.height
                         )));
                     }
+                    block.source.verify(&BlockSeal {
+                        height,
+                        disposition,
+                        roots: roots.clone(),
+                        root_hash,
+                    })?;
+                    // Applied blocks have a complete precommit witness;
+                    // rejected blocks may never have entered the host.
+                    let (frame, prepared, witness) = block.sealed(disposition)?;
                     // the modules this block CHANGED: the replay unit. a pure
                     // comparison of RECORDED root values.
                     let changed: Vec<(ModuleId, StateRoot)> = roots
@@ -1739,8 +2151,11 @@ where
                                 host,
                                 height,
                                 &frame,
+                                prepared,
+                                witness,
                                 Some(disposition),
                                 code_source.as_ref(),
+                                &mut host::NoWitness,
                             )
                             .await?;
                             if let Some(sink) = sink.as_mut() {
@@ -1815,9 +2230,12 @@ where
                                 host,
                                 height,
                                 &frame,
+                                prepared,
+                                witness,
                                 Some(disposition),
                                 &commit_only,
                                 code_source.as_ref(),
+                                &mut host::NoWitness,
                             )
                             .await?;
                             if let Some(sink) = sink.as_mut() {
@@ -1871,30 +2289,67 @@ where
         // its seal. roll it forward (or recognize it as already applied) and
         // seal it NOW from the observed outcome.
         let mut rolled_forward = false;
-        if let Some((height, frame)) = pending {
+        if let Some(block) = pending {
+            let height = block.height;
+            let source = block.source.clone();
+            // a block whose schedule never closed never began applying (the
+            // WAL write returns before the apply starts), so its work is
+            // read afresh from the state every module still stands at;
+            // a closed schedule is replayed verbatim, with the decisions its
+            // witness recorded when it got that far.
+            let (frame, prepared, witness) = match block.trailing() {
+                Trailing::Scheduled {
+                    frame,
+                    prepared,
+                    witness,
+                } => (frame, prepared, witness),
+                Trailing::Unscheduled { frame } => {
+                    let prepared = host.prepare_work(height).await.map_err(|e| {
+                        Error::Torn(format!(
+                            "trailing block {height}: preparing its work afresh: {e}"
+                        ))
+                    })?;
+                    (frame, prepared, None)
+                }
+            };
             let moved: BTreeSet<ModuleId> = host
                 .module_roots()
                 .iter()
                 .filter(|(id, root)| expected.get(id) != Some(root))
                 .map(|(id, _)| id.clone())
                 .collect();
-            let disposition = if moved.is_empty() {
-                let (disposition, dispatches) =
-                    apply_block(host, height, &frame, None, code_source.as_ref()).await?;
-                if let Some(sink) = sink.as_mut() {
-                    sink.folded_block(&FoldedBlock {
-                        host,
-                        height,
-                        frame: &frame,
-                        disposition,
-                        // the roll-forward seals from the observed outcome
-                        // below; this is that same post-block boundary.
-                        root_hash: host.root_hash(),
-                        dispatches: &dispatches,
-                        roots: &host.module_roots(),
-                    });
+            if witness.is_none() {
+                if !moved.is_empty() {
+                    return Err(Error::Torn(format!(
+                        "trailing block {height}: state moved without a durable witness"
+                    )));
                 }
-                disposition
+                let position = last_block_position.ok_or_else(|| {
+                    Error::Corrupt("trailing block has no journal position".into())
+                })?;
+                self.journal.rewind(position).await.map_err(storage_err)?;
+                self.write_pre_apply(height, &frame, &prepared, source.clone())
+                    .await
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            let mut no_witness = host::NoWitness;
+            let hook: &mut dyn host::CommitWitness = match &witness {
+                Some(_) => &mut no_witness,
+                None => self,
+            };
+            let (disposition, dispatches) = if moved.is_empty() {
+                let (disposition, dispatches) = apply_block(
+                    host,
+                    height,
+                    &frame,
+                    prepared,
+                    witness,
+                    None,
+                    code_source.as_ref(),
+                    hook,
+                )
+                .await?;
+                (disposition, dispatches)
             } else {
                 // classify for its FAIL-CLOSED rules (an unexplained mover
                 // alongside a verified claimant, or a >1-substrate claim, is
@@ -1925,9 +2380,12 @@ where
                         host,
                         height,
                         &frame,
+                        prepared,
+                        witness,
                         None,
                         &commit_only,
                         code_source.as_ref(),
+                        hook,
                     )
                     .await?;
                     // the re-execution's own disposition is NOT a backstop:
@@ -1953,18 +2411,7 @@ where
                             )));
                         }
                     }
-                    if let Some(sink) = sink.as_mut() {
-                        sink.folded_block(&FoldedBlock {
-                            host,
-                            height,
-                            frame: &frame,
-                            disposition,
-                            root_hash: host.root_hash(),
-                            dispatches: &dispatches,
-                            roots: &host.module_roots(),
-                        });
-                    }
-                    disposition
+                    (disposition, dispatches)
                 }
             };
             let seal = BlockSeal {
@@ -1973,10 +2420,22 @@ where
                 roots: host.module_roots(),
                 root_hash: host.root_hash(),
             };
+            source.verify(&seal)?;
             BlockSink::seal(self, &seal)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
+            if let Some(sink) = sink.as_mut() {
+                sink.folded_block(&FoldedBlock {
+                    host,
+                    height,
+                    frame: &frame,
+                    disposition,
+                    root_hash: seal.root_hash,
+                    dispatches: &dispatches,
+                    roots: &seal.roots,
+                });
+            }
             blocks.push((height, seal.roots.clone()));
             applied_frames.push((height, node::frame_id(&frame)));
             tip_height = Some(height);
@@ -2042,14 +2501,28 @@ where
 /// alongside the disposition, hands back the block's dispatch trace (empty
 /// for a rejected block) so a [`ReplaySink`] can fold what the drain would
 /// have fed it live.
+#[allow(clippy::too_many_arguments)]
 async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
+    prepared: PreparedWork,
+    witness: Option<Witness>,
     expect: Option<Disposition>,
     code_source: &dyn host::CodeSource,
+    hook: &mut dyn host::CommitWitness,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) = replay_batch(host, height, frame, None, code_source).await?;
+    let (disposition, dispatches) = replay_batch(
+        host,
+        height,
+        frame,
+        prepared,
+        witness,
+        None,
+        code_source,
+        hook,
+    )
+    .await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -2060,21 +2533,225 @@ async fn apply_block(
     Ok((disposition, dispatches))
 }
 
+/// one WAL block being assembled from its records during replay: the frame,
+/// the prepared units that follow it, whether the schedule closed, and the
+/// witnessed decisions.
+struct PendingBlock {
+    height: u64,
+    frame: Vec<u8>,
+    source: BlockSource,
+    prepared: PreparedWork,
+    schedule: Schedule,
+    /// the reads journaled so far, by unit — the witness being assembled.
+    reads: Vec<Observed>,
+    witness: Option<Witness>,
+}
+
+/// whether a WAL block's prepared list has been closed by its
+/// [`Record::Schedule`].
+enum Schedule {
+    Open,
+    Closed,
+}
+
+/// what a trailing (unsealed) WAL block can be replayed from.
+enum Trailing {
+    /// the schedule closed: the block may have begun applying; replay its
+    /// journaled work and decisions verbatim.
+    Scheduled {
+        frame: Vec<u8>,
+        prepared: PreparedWork,
+        witness: Option<Witness>,
+    },
+    /// the schedule never closed: the block never began applying; its work
+    /// is read afresh.
+    Unscheduled { frame: Vec<u8> },
+}
+
+impl PendingBlock {
+    fn open(height: u64, frame: Vec<u8>, source: BlockSource) -> Self {
+        Self {
+            height,
+            frame,
+            source,
+            prepared: PreparedWork::default(),
+            schedule: Schedule::Open,
+            reads: Vec::new(),
+            witness: None,
+        }
+    }
+
+    fn close(
+        &mut self,
+        calls: u64,
+        deliveries: u64,
+        advance: Option<sdk::Msg>,
+    ) -> Result<(), Error> {
+        let counts_match = self.prepared.calls.len() as u64 == calls
+            && self.prepared.deliveries.len() as u64 == deliveries;
+        if !counts_match {
+            return Err(Error::Corrupt(format!(
+                "block {}: schedule closes {calls} calls / {deliveries} deliveries but the \
+                 journal holds {} / {}",
+                self.height,
+                self.prepared.calls.len(),
+                self.prepared.deliveries.len()
+            )));
+        }
+        if let Schedule::Closed = self.schedule {
+            return Err(Error::Corrupt(format!(
+                "block {}: schedule closed twice",
+                self.height
+            )));
+        }
+        self.prepared.advance = advance;
+        self.schedule = Schedule::Closed;
+        Ok(())
+    }
+
+    /// one journaled read of unit `unit`: units arrive in attempt order, a
+    /// unit without reads leaves no record, so the list grows to the unit.
+    fn trace(&mut self, unit: u64, trace: Trace) -> Result<(), Error> {
+        if let Schedule::Open = self.schedule {
+            return Err(Error::Corrupt(format!(
+                "block {}: a read before its schedule closed",
+                self.height
+            )));
+        }
+        if self.witness.is_some() {
+            return Err(Error::Corrupt(format!(
+                "block {}: a read after its witness closed",
+                self.height
+            )));
+        }
+        let unit = usize::try_from(unit)
+            .map_err(|_| Error::Corrupt(format!("block {}: unit {unit}", self.height)))?;
+        let out_of_order = unit + 1 < self.reads.len();
+        if out_of_order {
+            return Err(Error::Corrupt(format!(
+                "block {}: unit {unit} read after unit {}",
+                self.height,
+                self.reads.len() - 1
+            )));
+        }
+        self.reads.resize_with(unit + 1, Observed::default);
+        self.reads[unit].trace.push(trace);
+        Ok(())
+    }
+
+    /// the close of the witness: `units` entries, the trailing ones without
+    /// reads.
+    fn witnessed(&mut self, units: u64) -> Result<(), Error> {
+        if let Schedule::Open = self.schedule {
+            return Err(Error::Corrupt(format!(
+                "block {}: witness before its schedule closed",
+                self.height
+            )));
+        }
+        if self.witness.is_some() {
+            return Err(Error::Corrupt(format!(
+                "block {}: witness closed twice",
+                self.height
+            )));
+        }
+        let units = usize::try_from(units)
+            .map_err(|_| Error::Corrupt(format!("block {}: {units} units", self.height)))?;
+        if units < self.reads.len() {
+            return Err(Error::Corrupt(format!(
+                "block {}: witness closes {units} units but the journal holds reads of {}",
+                self.height,
+                self.reads.len()
+            )));
+        }
+        let mut entries = std::mem::take(&mut self.reads);
+        entries.resize_with(units, Observed::default);
+        self.witness = Some(Witness { units: entries });
+        Ok(())
+    }
+
+    /// a SEALED block applied: its schedule closed and its witness ran.
+    fn sealed(
+        self,
+        disposition: Disposition,
+    ) -> Result<(Vec<u8>, PreparedWork, Option<Witness>), Error> {
+        if let Schedule::Open = self.schedule {
+            return Err(Error::Corrupt(format!(
+                "block {}: sealed with an open schedule",
+                self.height
+            )));
+        }
+        if disposition == Disposition::Rejected {
+            return Ok((self.frame, self.prepared, self.witness));
+        }
+        let Some(witness) = self.witness else {
+            return Err(Error::Corrupt(format!(
+                "block {}: sealed without its witness",
+                self.height
+            )));
+        };
+        Ok((self.frame, self.prepared, Some(witness)))
+    }
+
+    fn trailing(self) -> Trailing {
+        match self.schedule {
+            Schedule::Closed => Trailing::Scheduled {
+                frame: self.frame,
+                prepared: self.prepared,
+                witness: self.witness,
+            },
+            Schedule::Open => Trailing::Unscheduled { frame: self.frame },
+        }
+    }
+}
+
+/// the open WAL block a follow-on record (`what`) at `height` belongs to.
+fn pending_block_mut<'a>(
+    pending: &'a mut Option<PendingBlock>,
+    height: u64,
+    what: &str,
+) -> Result<&'a mut PendingBlock, Error> {
+    let Some(block) = pending.as_mut() else {
+        return Err(Error::Corrupt(format!(
+            "{what} at height {height} without its block record"
+        )));
+    };
+    if block.height != height {
+        return Err(Error::Corrupt(format!(
+            "{what} at height {height} inside block {}",
+            block.height
+        )));
+    }
+    Ok(block)
+}
+
 /// re-apply one journaled BATCH frame like [`apply_block`], but commit ONLY the
 /// modules in `commit_only` at the block boundary and abort the rest (see
 /// [`Host::submit_block_committing`]). used to heal a TORN block whose disk
 /// substrates are already durable at their sealed post-root: replay re-commits
 /// only the in-memory cohort that was rolled back to the checkpoint.
+#[allow(clippy::too_many_arguments)]
 async fn apply_block_committing(
     host: &mut Host,
     height: u64,
     frame: &[u8],
+    prepared: PreparedWork,
+    witness: Option<Witness>,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
     code_source: &dyn host::CodeSource,
+    hook: &mut dyn host::CommitWitness,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) =
-        replay_batch(host, height, frame, Some(commit_only), code_source).await?;
+    let (disposition, dispatches) = replay_batch(
+        host,
+        height,
+        frame,
+        prepared,
+        witness,
+        Some(commit_only),
+        code_source,
+        hook,
+    )
+    .await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -2115,13 +2792,20 @@ fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
 }
 
 /// `ctx.origin` is unused on the batch path: each member carries its own
-/// origin, which the host stamps into that member's `Env`.
+/// origin, which the host stamps into that member's `Env`. `prepared` is the
+/// block's JOURNALED internal work and `witness` the call decisions its
+/// witness recorded — never re-read from the sources, which may already
+/// stand past this block.
+#[allow(clippy::too_many_arguments)]
 async fn replay_batch(
     host: &mut Host,
     height: u64,
     frame: &[u8],
+    prepared: PreparedWork,
+    witness: Option<Witness>,
     commit_only: Option<&BTreeSet<ModuleId>>,
     code_source: &dyn host::CodeSource,
+    hook: &mut dyn host::CommitWitness,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     // CODE-SWAP REALIZATION, mirroring the live drain: a block sealed after a
     // code-registry swap executed on the NEW component, so replay must swap
@@ -2152,15 +2836,21 @@ async fn replay_batch(
         origin: sdk::Origin::System,
     };
     let result = match commit_only {
-        None => host.submit_block_ops(ctx, ops).await,
-        Some(set) => host.submit_block_committing(ctx, ops, set).await,
+        None => {
+            host.submit_block_replaying(ctx, ops, prepared, witness, hook)
+                .await
+        }
+        Some(set) => {
+            host.submit_block_committing(ctx, ops, prepared, witness, set, hook)
+                .await
+        }
     };
     let outcome = match result {
         Ok(outcome) => outcome,
-        // a once-per-block System injection (`Advance` / `DeliverPending`)
-        // rejecting is a deterministic no-op — the live drain sealed the block
-        // Rejected. (a MEMBER rejection never errors the batch; submit_block folds
-        // it into its MemberOutcome.)
+        // the once-per-block System injection (`Advance`) rejecting is a
+        // deterministic no-op — the live drain sealed the block Rejected. (a
+        // MEMBER rejection never errors the batch; submit_block folds it into
+        // its MemberOutcome.)
         Err(SubmitError::Rejected(_)) => return Ok((Disposition::Rejected, Vec::new())),
         Err(SubmitError::Fatal(f)) => {
             return Err(Error::Torn(format!("boundary fault during replay: {f}")));
@@ -2202,6 +2892,16 @@ mod tests {
             Record::Block {
                 height: 7,
                 frame: vec![0, 1, 2],
+                source: BlockSource::Consensus,
+            },
+            Record::Block {
+                height: 8,
+                frame: vec![3, 4, 5],
+                source: BlockSource::Catchup {
+                    disposition: Disposition::Applied,
+                    roots: roots(&[("directory", 3), ("kv", 9)]),
+                    root_hash: StateRoot([5; 32]),
+                },
             },
             Record::Seal {
                 height: 7,
@@ -2221,6 +2921,82 @@ mod tests {
                 participants: vec![vec![7u8; 32], vec![8u8; 32]],
                 residents: vec![vec![9u8; 32]],
             },
+            Record::PreparedCall {
+                height: 9,
+                call: PreparedCall {
+                    enqueued: 3,
+                    id: sdk::CallId {
+                        requester: "probe".into(),
+                        invocation: "run-1".into(),
+                        step: 0,
+                    },
+                    account: 7,
+                    generation: 2,
+                    target: "kv".into(),
+                    payload: b"write".to_vec(),
+                    cause: sdk::Cause::Direct,
+                },
+            },
+            Record::PreparedDelivery {
+                height: 9,
+                delivery: PreparedDelivery {
+                    item: sdk::ItemRef {
+                        source: "dispatch".into(),
+                        item: 4,
+                    },
+                    target: "probe".into(),
+                    payload: b"result".to_vec(),
+                    cause: sdk::Cause::Chain {
+                        root: sdk::Root::Item(sdk::ItemRef {
+                            source: "dispatch".into(),
+                            item: 4,
+                        }),
+                        hop: sdk::Hop::Delivery(sdk::ItemRef {
+                            source: "dispatch".into(),
+                            item: 4,
+                        }),
+                    },
+                },
+            },
+            Record::Schedule {
+                height: 9,
+                calls: 1,
+                deliveries: 1,
+                advance: Some(sdk::Msg {
+                    target: "modules".into(),
+                    payload: modules::encode_msg(&modules::ModulesMsg::Advance),
+                }),
+            },
+            Record::Trace {
+                height: 9,
+                unit: 2,
+                trace: Trace::Read(host::Read::Query {
+                    module: "identity".into(),
+                    request: b"get 7".to_vec(),
+                    answer: Ok(b"program".to_vec()),
+                }),
+            },
+            Record::Trace {
+                height: 9,
+                unit: 3,
+                trace: Trace::Read(host::Read::Root {
+                    module: "kv".into(),
+                    root: Some(StateRoot([4; 32])),
+                }),
+            },
+            Record::Trace {
+                height: 9,
+                unit: 3,
+                trace: Trace::Read(host::Read::Query {
+                    module: "kv".into(),
+                    request: b"missing".to_vec(),
+                    answer: Err(sdk::Error::QueryUnsupported),
+                }),
+            },
+            Record::Witnessed {
+                height: 9,
+                units: 5,
+            },
         ];
         for r in records {
             let decoded = Record::decode(&r.encode()).expect("roundtrip");
@@ -2233,6 +3009,7 @@ mod tests {
         let good = Record::Block {
             height: 7,
             frame: vec![0, 1, 2],
+            source: BlockSource::Consensus,
         }
         .encode();
         // truncation
@@ -2262,6 +3039,7 @@ mod tests {
         let encoded = Record::Block {
             height: 7,
             frame: vec![0; MAX_RECORD_FIELD_LEN + 1],
+            source: BlockSource::Consensus,
         }
         .encode();
         assert!(
@@ -2607,6 +3385,83 @@ mod tests {
         assert_eq!(FloorCert::decode(&c.encode()).expect("roundtrip"), c);
     }
 
+    #[test]
+    fn catchup_expectation_survives_interrupted_schedule_and_witness_rewrite() {
+        use commonware_cryptography::Signer as _;
+        use commonware_runtime::{Runner as _, Supervisor as _};
+
+        for schedule in [Schedule::Open, Schedule::Closed] {
+            commonware_runtime::deterministic::Runner::default().start(|context| async move {
+                let fresh = || {
+                    Host::genesis(vec![Box::new(directory::Directory::new("directory"))]).unwrap()
+                };
+                let host = fresh();
+                let base =
+                    Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).unwrap();
+                let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(79);
+                let member = node::encode_frame(
+                    &signer,
+                    0,
+                    &sdk::Msg {
+                        target: "directory".into(),
+                        payload: directory::encode_msg(&directory::DirMsg::Set {
+                            key: "k".into(),
+                            value: "v".into(),
+                        }),
+                    },
+                );
+                let frame = node::encode_batch(&[member]);
+                let expected = BlockSeal {
+                    height: 1,
+                    disposition: Disposition::Applied,
+                    roots: host.module_roots(),
+                    root_hash: StateRoot([0xA5; 32]),
+                };
+                let source = BlockSource::Catchup {
+                    disposition: expected.disposition,
+                    roots: expected.roots.clone(),
+                    root_hash: expected.root_hash,
+                };
+                let mut recovery = Recovery::open(context.child("before_crash")).await.unwrap();
+                recovery.write_manifest(&base).await.unwrap();
+                match schedule {
+                    Schedule::Open => {
+                        let record = Record::Block {
+                            height: 1,
+                            frame,
+                            source: source.clone(),
+                        };
+                        recovery.append_record(&record.encode()).await.unwrap();
+                        recovery.journal.sync().await.unwrap();
+                    }
+                    Schedule::Closed => {
+                        recovery
+                            .pre_apply_catchup(&frame, &PreparedWork::default(), &expected)
+                            .await
+                            .unwrap();
+                    }
+                }
+                drop(recovery);
+                for label in ["first_restart", "second_restart"] {
+                    let mut recovery = Recovery::open(context.child(label)).await.unwrap();
+                    let mut host = fresh();
+                    let error = recovery.recover(&mut host, &base).await.unwrap_err();
+                    assert!(matches!(error, Error::Verify(_)), "{error}");
+                    assert!(error.to_string().contains("served seal"), "{error}");
+                    let (records, _) = recovery.records().await.unwrap();
+                    assert!(records.iter().any(|(_, record)| matches!(record,
+                        Record::Block { source: retained, .. } if retained == &source)));
+                    assert!(
+                        !records
+                            .iter()
+                            .any(|(_, record)| matches!(record, Record::Seal { .. })),
+                        "neither restart may bless the mismatched suffix"
+                    );
+                }
+            });
+        }
+    }
+
     /// #1814: `read_finalized_frames` must SEEK to the requested range via
     /// `height_index`, not decode the retained journal from its start. a
     /// journal of 200 blocks (400 records) asked for its last 3 frames
@@ -2623,7 +3478,7 @@ mod tests {
             const TOTAL: u64 = 200;
             for height in 1..=TOTAL {
                 recovery
-                    .pre_apply(height, &[height as u8])
+                    .pre_apply(height, &[height as u8], &PreparedWork::default())
                     .await
                     .expect("wal record");
                 recovery
@@ -2646,7 +3501,7 @@ mod tests {
             assert_eq!(tail[0].height, TOTAL - 2);
             assert_eq!(tail[2].height, TOTAL);
 
-            // the journal holds 2*TOTAL records (a Block + Seal per height);
+            // The journal holds three records per height: block, schedule, seal.
             // a scan from the journal's start would decode close to all of
             // them. the height index instead lands the stream within a
             // handful of records of the requested tail.
@@ -2654,7 +3509,7 @@ mod tests {
             assert!(
                 decoded <= 10,
                 "expected a bounded tail read, decoded {decoded} of {} records",
-                2 * TOTAL
+                3 * TOTAL
             );
         });
     }

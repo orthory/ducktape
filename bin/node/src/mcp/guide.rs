@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 /// tells it.
 ///
 /// the one list it does carry — the action vocabulary — is INTERPOLATED from
-/// [`agent::KNOWN_ACTIONS`] rather than typed out, so it cannot drift from the
+/// [`runs::KNOWN_ACTIONS`] rather than typed out, so it cannot drift from the
 /// names consensus actually enforces. a hand-copied list here silently taught
 /// the model a short vocabulary, and the whole point of the paragraph is that
 /// it can name the action behind a refusal.
@@ -57,7 +57,7 @@ You can write while you work — post progress to a channel, tick off a todo as 
 you finish it — rather than saving everything for your final answer. Your final \
 answer still follows whatever output contract your prompt gave you; these tools \
 do not replace it.",
-        actions = agent::KNOWN_ACTIONS.join(", ")
+        actions = runs::KNOWN_ACTIONS.join(", ")
     )
 });
 
@@ -70,7 +70,7 @@ mod tests {
         // the guide's promise is that a refused agent can name what it lacks.
         // that only holds if the vocabulary it prints is the vocabulary
         // consensus enforces — so no hand-written subset may creep back in.
-        for action in agent::KNOWN_ACTIONS {
+        for action in runs::KNOWN_ACTIONS {
             assert!(
                 GUIDE.contains(action),
                 "the initialize guide does not name the {action} action"

@@ -38,6 +38,7 @@ fn ctx(height: u64) -> TestCtx {
         consensus_time: height,
         origin: Origin::Module("governance".into()),
         me: "valset".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 

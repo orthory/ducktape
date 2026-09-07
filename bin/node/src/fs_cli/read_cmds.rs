@@ -292,7 +292,7 @@ mod tests {
             id: "snap9".into(),
             parent: None,
             root_tree: "root".into(),
-            author: "who".into(),
+            author: duckfs_core::Actor::Account(7),
             height: 7,
             consensus_time: 100,
             message: "did a thing".into(),

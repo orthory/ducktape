@@ -108,6 +108,15 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
             },
         ),
     ])));
+    assert_eq!(
+        post_gate(false, true, members.clone(), "b00f".into()),
+        "members_only",
+        "a sibling key does not inherit a historical key seat"
+    );
+    let members = vec![ChatMember {
+        key: "acct:7".into(),
+        label: "b".into(),
+    }];
     assert_eq!(post_gate(false, true, members.clone(), "b00f".into()), "");
     assert_eq!(
         post_gate(false, true, members, "cafe".into()),
@@ -188,7 +197,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 
 /// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
 /// wire author through `author_display`, so an Explorer hit arrives holding
-/// "alice", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
+/// "alice", "user 48cedb0d…" or "quackbot". The Explorer then ran `author_name`
 /// over that a SECOND time; none of those strings carries a `user:`/`agent:`
 /// prefix to split, so every one fell through to the `_` arm and every message
 /// hit in workspace search was attributed to "system".
@@ -198,7 +207,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 #[test]
 fn a_search_hits_author_is_not_reformatted_into_system() {
     // What `search_chat` hands the Explorer, for each kind of author.
-    for displayed in ["alice", "user 48cedb0d…", "@quackbot", "chat"] {
+    for displayed in ["alice", "user 48cedb0d…", "quackbot", "chat"] {
         assert_eq!(
             author_name(displayed),
             "system",
@@ -212,7 +221,24 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
         author_display("user:48cedb0d131f", &NameDirectory::default()),
         "user 48cedb0d…"
     );
-    assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
+    let program = identity::AccountView {
+        number: 7,
+        name: "quackbot".into(),
+        control: identity::Control::Program {
+            controller: 1,
+            executor: "agent".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        },
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    };
+    assert_eq!(
+        author_display("acct:7", &NameDirectory::from_accounts(&[program])),
+        "quackbot"
+    );
 
     // The call site itself, pinned: the message arm must carry the author
     // through, never re-format it. Without this the assertions above hold
@@ -462,7 +488,6 @@ async fn composer_markdown_round_trips_rich_spans() {
                 &MentionCandidates::default(),
             ),
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -520,7 +545,6 @@ async fn timeline_pages_past_thread_only_traffic() {
             message_id: "root".into(),
             blocks: vec![chat::Block::paragraph("root stays visible")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -535,7 +559,6 @@ async fn timeline_pages_past_thread_only_traffic() {
                 message_id: format!("reply-{index}"),
                 blocks: vec![chat::Block::paragraph(format!("reply {index}"))],
                 thread: Some(1),
-                as_agent: None,
             }),
         )
         .await;
@@ -919,6 +942,7 @@ fn every_key_of_an_account_renders_as_that_accounts_name() {
     let account = |number: u64, name: &str, keys: Vec<identity::KeyView>| identity::AccountView {
         number,
         name: name.into(),
+        control: identity::Control::Keys,
         keys,
         avatar: None,
         bio: None,
@@ -1036,13 +1060,25 @@ fn a_deleted_row_inside_the_range_contributes_nothing() {
 fn shift_extends_and_a_plain_click_starts_over() {
     use crate::CopySurface::{Nowhere, Thread, Timeline};
     let started = copy_range_after_press(0, Nowhere, 2, Timeline, false);
-    assert_eq!((started.anchor, started.head), (2, 2), "a click is a range of one");
+    assert_eq!(
+        (started.anchor, started.head),
+        (2, 2),
+        "a click is a range of one"
+    );
 
     let widened = copy_range_after_press(2, Timeline, 5, Timeline, true);
-    assert_eq!((widened.anchor, widened.head), (2, 5), "⇧ moves the far end");
+    assert_eq!(
+        (widened.anchor, widened.head),
+        (2, 5),
+        "⇧ moves the far end"
+    );
 
     let restarted = copy_range_after_press(2, Timeline, 5, Timeline, false);
-    assert_eq!((restarted.anchor, restarted.head), (5, 5), "no ⇧ starts over");
+    assert_eq!(
+        (restarted.anchor, restarted.head),
+        (5, 5),
+        "no ⇧ starts over"
+    );
 
     // ⇧ with nothing open is a plain click: there is no anchor to keep.
     let nothing_to_extend = copy_range_after_press(0, Nowhere, 5, Timeline, true);
@@ -1063,9 +1099,18 @@ fn shift_extends_and_a_plain_click_starts_over() {
 fn the_surface_keeps_a_reply_out_of_the_streams_range() {
     use crate::CopySurface::{Thread, Timeline};
     assert!(seq_in_copy_range(3, 2, 5, Timeline, Timeline));
-    assert!(!seq_in_copy_range(3, 2, 5, Timeline, Thread), "a reply in the rail");
-    assert!(!seq_in_copy_range(6, 2, 5, Timeline, Timeline), "past the end");
-    assert!(!seq_in_copy_range(3, 0, 0, Timeline, Timeline), "no range at all");
+    assert!(
+        !seq_in_copy_range(3, 2, 5, Timeline, Thread),
+        "a reply in the rail"
+    );
+    assert!(
+        !seq_in_copy_range(6, 2, 5, Timeline, Timeline),
+        "past the end"
+    );
+    assert!(
+        !seq_in_copy_range(3, 0, 0, Timeline, Timeline),
+        "no range at all"
+    );
 }
 
 /// THE PLATE IS ONE ANSWER, AND IT IS ORDERED. The row you are ON outranks a
@@ -1077,7 +1122,11 @@ fn the_row_plate_ranks_selection_over_range_and_skips_a_tombstone() {
     assert_eq!(message_plate(false, false, false), Plain);
     assert_eq!(message_plate(false, false, true), Ranged);
     assert_eq!(message_plate(false, true, true), Selected);
-    assert_eq!(message_plate(true, true, true), Plain, "a tombstone tints for nothing");
+    assert_eq!(
+        message_plate(true, true, true),
+        Plain,
+        "a tombstone tints for nothing"
+    );
 }
 
 /// THE CHORD LIFTS THE ROWS THE BAR COUNTED. The surface picks the list, so
@@ -1101,7 +1150,11 @@ fn the_surface_picks_the_list_the_copy_reads() {
 fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
     use crate::CopySurface::{Nowhere, Timeline};
     let cleared = copy_range_after_press(0, Nowhere, -1, Timeline, false);
-    assert_eq!((cleared.anchor, cleared.head), (0, 0), "a plain click on one");
+    assert_eq!(
+        (cleared.anchor, cleared.head),
+        (0, 0),
+        "a plain click on one"
+    );
     assert_eq!(cleared.surface, Nowhere);
 
     let dropped = copy_range_after_press(2, Timeline, -3, Timeline, true);

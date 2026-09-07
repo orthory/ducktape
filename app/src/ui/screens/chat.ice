@@ -1550,8 +1550,8 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         align=center
                       input "" #member-key <-> member_key_draft
                         with
-                          label="Member public key"
-                          hint="Member key (64 hex)"
+                          label="Member account or public key"
+                          hint="acct:123 or public key"
                           disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(add_channel_member_submit)
                           w=fill

@@ -781,16 +781,17 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     );
 
     // (9) remove the promoted validator. The two-member electorate needs one
-    //     ballot from each node; the cutover drops the friend and its validator
-    //     process halts itself at that committed boundary.
-    let (ok, out) = cluster.run_membership_verb("member remove", &friend_key);
-    assert!(ok, "founder member remove ballot failed:\n{out}");
-    assert!(
-        out.contains("waiting on other voters"),
-        "the first removal ballot should await the friend:\n{out}"
-    );
+    //     ballot from each node. The friend votes first so the surviving
+    //     founder can execute and observe the result: the cutover halts the
+    //     friend's process at that committed boundary, closing its local RPC.
     let (ok, out) = cluster.run_membership_verb_as(1, "member remove", &friend_key);
     assert!(ok, "friend member remove ballot failed:\n{out}");
+    assert!(
+        out.contains("waiting on other voters"),
+        "the first removal ballot should await the founder:\n{out}"
+    );
+    let (ok, out) = cluster.run_membership_verb("member remove", &friend_key);
+    assert!(ok, "founder member remove ballot failed:\n{out}");
     assert!(out.contains("removed"), "unexpected removal output:\n{out}");
     cluster.wait_marker(1, "demoted from the validator set; halting", CONVERGE);
     cluster.wait_exit(1, CONVERGE);
