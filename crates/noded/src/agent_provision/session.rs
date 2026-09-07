@@ -55,6 +55,8 @@ pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 pub(super) struct RunSession {
     pub(super) action_url: String,
     pub(super) action_token: String,
+    #[cfg(test)]
+    local_addr: std::net::SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -155,11 +157,11 @@ async fn start_action_server(
     signer: ed25519::PrivateKey,
     run_id: String,
 ) -> Result<RunSession, String> {
-    // Bind the host interfaces so a child in a private netns can reach the
-    // same run-scoped endpoint through its gateway. Direct children still
-    // receive a 127.0.0.1 URL; the 256-bit token and closed message/run scope
-    // are the boundary, not an ambient network listener.
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    // A child reaches this signer over a vsock tunnel that terminates on a
+    // socket the host process owns, so it dials `127.0.0.1:<port>` exactly
+    // as a local child would — the signer never has to bind past loopback
+    // to be reachable.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("bind scoped action signer: {error}"))?;
     let address = listener
@@ -190,6 +192,8 @@ async fn start_action_server(
     Ok(RunSession {
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
+        #[cfg(test)]
+        local_addr: address,
         shutdown: Some(shutdown),
         task,
     })
@@ -200,8 +204,8 @@ async fn run_action(
     headers: HeaderMap,
     Json(request): Json<ActionRequest>,
 ) -> Response<Body> {
-    // the listener is not loopback-bound (a child in a private netns must reach
-    // it), so the token IS the boundary: compare it in constant time like every
+    // The listener is loopback-only, but the token is still the boundary
+    // between every local process: compare it in constant time like every
     // other secret in this crate, never with a short-circuiting `==`.
     let authorized = headers
         .get(ACTION_HEADER)
@@ -405,4 +409,19 @@ async fn submit(node: &NodeLink, payload: Vec<u8>) -> Result<(), String> {
     // a module rejection rides through verbatim — "not the run's assignee" is
     // the one worth reading in a log.
     node.submit(RUNS_MODULE, &payload).await.map(|_height| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn action_server_binds_loopback_only() {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let session =
+            start_action_server(NodeLink::new("http://127.0.0.1:0"), signer, "run-1".into())
+                .await
+                .expect("bind scoped action signer");
+        assert!(session.local_addr.ip().is_loopback());
+    }
 }

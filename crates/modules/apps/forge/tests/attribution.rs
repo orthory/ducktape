@@ -503,16 +503,21 @@ fn failed_multi_ref_cas_restores_incoming_staging() {
 }
 
 #[test]
-fn historical_key_owners_and_authors_keep_only_the_original_signers_rights() {
+fn historical_key_item_authorship_keeps_only_the_original_signers_rights() {
     block_on(async {
         let base = Directory::new("key-rights");
         let mut forge = Forge::init("forge", base.0.clone())
             .unwrap()
             .with_attribution("attribution");
         let context = |byte, account: Option<u64>| {
-            test_ctx(key(byte)).on_query("identity", move |_| {
+            test_ctx(key(byte)).on_query("identity", move |req| {
+                let identity::IdentityQuery::OfKey { key } = identity::decode_query(req).unwrap()
+                else {
+                    panic!("key lookup");
+                };
+                let resolved = (key == vec![byte; 32]).then_some(account).flatten();
                 Ok(identity::encode_reply(&identity::IdentityReply::Account(
-                    account.map(|number| identity::AccountView {
+                    resolved.map(|number| identity::AccountView {
                         number,
                         name: "person".into(),
                         control: identity::Control::Keys,
@@ -546,24 +551,17 @@ fn historical_key_owners_and_authors_keep_only_the_original_signers_rights() {
                 title: Some(format!("edit {index}")),
                 body: None,
             };
-            let advance = push("main", Some(index as u8 + 1), Some(index as u8 + 2));
             let before = forge.root();
-            for denied in [&edit, &advance] {
-                assert!(
-                    forge
-                        .execute(&mut context(10, account), &message("forge", denied))
-                        .await
-                        .is_err(),
-                    "sibling keys cannot inherit exact-key records"
-                );
-                assert_eq!(forge.root(), before);
-            }
+            assert!(
+                forge
+                    .execute(&mut context(10, account), &message("forge", &edit))
+                    .await
+                    .is_err(),
+                "sibling keys cannot inherit exact-key item authorship"
+            );
+            assert_eq!(forge.root(), before);
             forge
                 .execute(&mut context(9, account), &message("forge", &edit))
-                .await
-                .unwrap();
-            forge
-                .execute(&mut context(9, account), &message("forge", &advance))
                 .await
                 .unwrap();
             forge
@@ -589,6 +587,149 @@ fn historical_key_owners_and_authors_keep_only_the_original_signers_rights() {
                 account.map_or_else(|| Party::Key(vec![9; 32]), Party::Account)
             );
         }
+    });
+}
+
+#[test]
+fn repository_owner_settlement_is_atomic_and_publishes_account_ownership() {
+    block_on(async {
+        let context = |byte, accounts: Vec<(u8, u64)>| {
+            test_ctx(key(byte)).on_query("identity", move |req| {
+                let identity::IdentityQuery::OfKey { key } = identity::decode_query(req).unwrap()
+                else {
+                    panic!("key lookup");
+                };
+                let account = accounts
+                    .iter()
+                    .find_map(|(byte, number)| (key == vec![*byte; 32]).then_some(*number));
+                Ok(identity::encode_reply(&identity::IdentityReply::Account(
+                    account.map(|number| identity::AccountView {
+                        number,
+                        name: "person".into(),
+                        control: identity::Control::Keys,
+                        keys: Vec::new(),
+                        avatar: None,
+                        bio: None,
+                        updated_at: 0,
+                    }),
+                )))
+            })
+        };
+        let mut state = forge::state::ForgeState::default();
+        state
+            .apply(
+                &mut context(9, vec![]),
+                &forge::encode_msg(&push("main", None, Some(1))),
+                None,
+                Some("attribution"),
+                "sources",
+            )
+            .await
+            .unwrap();
+        state = forge::state::ForgeState::from_lane(
+            forge::state::decode_image(&state.published_image()).unwrap(),
+            Default::default(),
+        );
+        let before = state.published_image();
+        let accounts = vec![(9, 1), (10, 1), (11, 2)];
+        // Both authorization and CAS can fail after the owner lookup. Neither
+        // may persist an account transition or publish its ownership report.
+        for (actor, previous) in [(11, 1), (10, 8)] {
+            let mut ctx = context(actor, accounts.clone());
+            assert!(
+                state
+                    .apply(
+                        &mut ctx,
+                        &forge::encode_msg(&push("main", Some(previous), Some(2))),
+                        None,
+                        Some("attribution"),
+                        "sources"
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(state.published_image(), before);
+            assert!(ctx.msgs().is_empty());
+        }
+        let mut ctx = context(10, accounts.clone());
+        state
+            .apply(
+                &mut ctx,
+                &forge::encode_msg(&push("main", Some(1), Some(2))),
+                None,
+                Some("attribution"),
+                "sources",
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.tracker_view().owner("demo"), Some(&Party::Account(1)));
+        let attribution::AttributionMsg::AttributeBatch { updates } =
+            attribution::decode_msg(&ctx.msgs()[0].payload).unwrap()
+        else {
+            panic!("source report");
+        };
+        let owner = updates
+            .iter()
+            .find(|update| update.object.kind == "repo")
+            .unwrap();
+        assert_eq!(owner.actor, Actor::Account(1));
+        assert_eq!(
+            owner.relations,
+            vec![attribution::Relation {
+                recipient: 1,
+                reason: Reason::Ownership,
+                detail: Vec::new(),
+            }]
+        );
+        state.abort();
+        assert_eq!(
+            state.published_image(),
+            before,
+            "aborted settlement is invisible"
+        );
+        state
+            .apply(
+                &mut context(10, accounts),
+                &forge::encode_msg(&push("main", Some(1), Some(2))),
+                None,
+                Some("attribution"),
+                "sources",
+            )
+            .await
+            .unwrap();
+        state = forge::state::ForgeState::from_lane(
+            forge::state::decode_image(&state.published_image()).unwrap(),
+            Default::default(),
+        );
+        let settled = state.published_image();
+        assert!(
+            state
+                .apply(
+                    &mut context(9, vec![(10, 1)]),
+                    &forge::encode_msg(&push("main", Some(2), Some(3))),
+                    None,
+                    Some("attribution"),
+                    "sources"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.published_image(),
+            settled,
+            "removed key cannot regain ownership"
+        );
+        state
+            .apply(
+                &mut context(10, vec![(10, 1)]),
+                &forge::encode_msg(&push("main", Some(2), Some(3))),
+                None,
+                Some("attribution"),
+                "sources",
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.tracker_view().owner("demo"), Some(&Party::Account(1)));
     });
 }
 

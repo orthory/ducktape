@@ -348,6 +348,7 @@ impl ForgeState {
                 cert: _,
             } => {
                 let name = norm_repo(&repo)?;
+                self.settle_owner(ctx, &name).await?;
                 self.stage_push_refs(&name, authority, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
@@ -483,6 +484,7 @@ impl ForgeState {
 
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
+                self.settle_owner(ctx, &name).await?;
                 self.require_merge_authorized(&name, &target, number, authority)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
@@ -641,6 +643,22 @@ impl ForgeState {
         Self::authority_of_key(ctx, signer).await
     }
 
+    /// An unregistered key's repository follows that key onto its account.
+    /// This is one-way: removing the key after settlement never restores its
+    /// ownership. Stage before each ref ownership check so a refused operation
+    /// or aborted block also discards the transition and its source report.
+    async fn settle_owner(&mut self, ctx: &dyn Ctx, repo: &str) -> Result<(), Error> {
+        let Some(Party::Key(owner)) = self.tracker_view().owner(repo).cloned() else {
+            return Ok(());
+        };
+        let Some(number) = Self::identity_account(ctx, &owner).await? else {
+            return Ok(());
+        };
+        self.staged_tracker_mut()
+            .claim_owner(repo, Party::Account(number));
+        Ok(())
+    }
+
     /// stage an atomic multi-branch push: validate the update list, settle
     /// ownership, then CAS every branch. PURE and deterministic — no repo
     /// opened, nothing installed, no ref moves (see
@@ -657,7 +675,9 @@ impl ForgeState {
     /// the push that BIRTHS a repo pins its owner; afterwards only that owner
     /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
     /// member — the GitHub flow this module documents, and what the dogfood
-    /// loop's second node pushes under its own key.
+    /// loop's second node pushes under its own key. a raw-key owner follows
+    /// its key onto an account the first time Identity knows it
+    /// ([`Self::settle_owner`], run by the caller before this).
     fn stage_push_refs(
         &mut self,
         name: &str,
