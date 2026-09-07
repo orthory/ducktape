@@ -1,5 +1,6 @@
 //! A chat-triggered VM commits a component; the node executor deploys its forge artifact.
 mod common;
+mod self_heal;
 
 use std::path::Path;
 use std::process::Command;

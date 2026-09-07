@@ -287,11 +287,11 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
   --after 50 --config "$WORKSPACE/node.toml"
 ```
 
-Commit a preassembled artifact containing the replacement component to the run's
-repository. The guest has
-host tunnels for its granted services, but no general network access for
-fetching a Rust toolchain or dependencies. The executor reads committed Wasm;
-it does not build source. The existing replacement fixture is
+Commit an artifact containing the replacement component to the run's repository.
+The guest can build it offline when its image contains the compiler and the
+repository vendors its dependencies. Its network is limited to host tunnels for
+granted services. The executor consumes committed artifacts; source compilation
+belongs to the run's build tools. The existing replacement fixture is
 `crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
 
 The model's final JSON response can include:
@@ -360,3 +360,36 @@ deployment controller records per-validator staging receipts and uses stable
 proposal ids, committed votes and registry status; the bridge keeps no private
 workflow checkpoint. Clock values in its query are hints from local committed
 status. Every target still validates messages against its execution context.
+
+To build Rust inside the Linux guest, prepare an image with the optional setup
+hook. This requires Bubblewrap with user namespaces, in addition to the base
+image builder's tools. Setup runs inside the extracted guest root with a private
+disk-backed scratch directory. It receives no host home, credentials or caches.
+
+```sh
+ROOTFS_SETUP=ops/guest-rust-tools.sh ops/build-guest-rootfs.sh 1.96.1 1.253.0
+```
+
+The arguments pin Rust and wasm-tools. A different `ROOTFS_SETUP` script can
+install another build environment without changing the node executor. The
+default image remains minimal. Writable run filesystems provide 8 GiB of sparse
+capacity: output can exceed input size, and only written blocks consume host
+disk. The read-only input image retains its measured size plus metadata margin.
+
+The opt-in live test uses the installed Claude CLI and host broker credential.
+Set `DUCKTAPE_GUEST_DIR` if the prepared image is outside the default guest
+directory. Keep `TMPDIR` short and disk-backed because the VM uses Unix sockets.
+
+```sh
+cargo test -p node-bin --test chat_module_upgrade_e2e \
+  a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle \
+  -- --ignored --nocapture
+```
+
+The test seeds only faulty source, vendored dependencies, a normal module
+contract and its faulty artifact. The agent receives an ordinary repair issue
+and the production provider invocation. It must repair source, build inside
+Firecracker and request deployment. Host assertions check preserved state,
+corrected increments, independent source reproduction and restart. The host's
+reference answer stays outside the guest. Evidence is retained under
+`target/self-heal/evidence/`; the provider trace is owner-readable only.

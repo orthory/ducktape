@@ -172,8 +172,8 @@ hard_timeout_factor = 36
 #   "jsonl-events" — a JSONL event stream; the LAST agent_message item wins;
 #                    tolerates both item shapes seen in the wild and skips
 #                    non-JSON noise lines.
-#   "json-result"  — a single {"type":"result",...} object; an is_error
-#                    result is surfaced as the error it is.
+#   "json-result"  — a {"type":"result",...} object, alone or the last
+#                    result in a JSONL stream; is_error surfaces as an error.
 #   "text"         — raw stdout, trimmed. THE GENERIC ESCAPE HATCH: any CLI
 #                    that prints the answer plainly works with zero code.
 #                    empty output on a zero exit is an error ("ran fine,
@@ -311,7 +311,7 @@ Ducktape MCP server — without making every argv in the file repeat them:
 
 ```toml
 [tools]
-args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
+args = ["-c", 'mcp_servers.ducktape.command="ducktape"', "-c", 'mcp_servers.ducktape.args=["mcp"]']
 ```
 
 - **Insertion is immediately after `args[0]`, never at the end.** An argv
@@ -328,12 +328,16 @@ args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
   built-in replaces its `[tools]` too. A `[tools]` section with no `args` is
   a hard error, like every other section that would do nothing.
 
-The binary a `[tools]` argv names (`ducktape-mcp` in the built-ins) is resolved
+The binary a `[tools]` argv names (`ducktape`, with `mcp` as its argument) is resolved
 from the **run's `PATH`** — the provisioner puts its directory there — so specs
 name no absolute path and stay portable across hosts. Claude's built-in also
 passes `--allowedTools mcp__ducktape`: in `-p` print mode there is no human to
 approve a tool call, so an unapproved MCP call is a denial and a merely
-*configured* server would be dead weight.
+*configured* server would be dead weight. Headless Claude invocation also allows
+shell and file tools inside the microVM, so builds need no permission prompt.
+Interactive and restricted invocation keep their separate arguments. Claude streams verbose
+JSON events and the provider extracts its terminal result. Events refresh the
+idle budget and count toward the same 4 MiB output bound as other providers.
 
 ---
 

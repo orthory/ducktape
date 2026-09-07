@@ -4,6 +4,9 @@
 #
 #   ops/build-guest-rootfs.sh                 # -> ~/.ducktape/guest
 #   OUT=~/guest ops/build-guest-rootfs.sh     # anywhere writable
+#   ROOTFS_SETUP=ops/guest-rust-tools.sh ops/build-guest-rootfs.sh 1.96.1 1.253.0
+#     Linux: optional setup hook in the extracted root (requires Bubblewrap).
+#     Remaining arguments are passed to that hook.
 #
 # The default is where `node init` writes a fresh [sandbox] table
 # (workspace-config's `default_guest_dir`) — build here and the node already
@@ -134,6 +137,25 @@ say "extracting the base"
 # do not have. Nothing in the guest depends on them — PID 1 runs as root
 # inside its own VM.
 unsquashfs -no-xattrs -quiet -force -dest "$TREE" "$BASE"
+
+# An operator can prepare build tools in the base without lending host paths or
+# credentials to runs. The setup executes as root only in a private user/mount
+# namespace. Its writable scratch stays on disk and never enters the image.
+if [[ -n "${ROOTFS_SETUP:-}" ]]; then
+  command -v bwrap >/dev/null || { echo "ROOTFS_SETUP requires bubblewrap" >&2; exit 1; }
+  SETUP="$(realpath "$ROOTFS_SETUP")"
+  [[ -f "$SETUP" ]] || { echo "ROOTFS_SETUP is not a file: $SETUP" >&2; exit 1; }
+  mkdir -p "$WORK/setup-tmp"
+  say "preparing guest tools"
+  bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --die-with-parent \
+    --bind "$TREE" / --proc /proc --dev /dev \
+    --bind "$WORK/setup-tmp" /tmp \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind "$SETUP" /run/ducktape-guest-setup \
+    --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --setenv DEBIAN_FRONTEND noninteractive \
+    /bin/bash /run/ducktape-guest-setup "$@"
+fi
 
 # ---- 3. the init -----------------------------------------------------------
 MUSL_TARGET="$ARCH-unknown-linux-musl"
