@@ -294,13 +294,13 @@ impl Guest {
 
     fn load_from(module: &'static str, path: &std::path::Path) -> Result<Self, String> {
         let shown = path.display().to_string();
-        let metadata = std::fs::metadata(&path).map_err(|error| format!("{shown}: {error}"))?;
+        let metadata = std::fs::metadata(path).map_err(|error| format!("{shown}: {error}"))?;
         if metadata.len() > MAX_MODULE_BYTES {
             return Err(format!(
                 "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
             ));
         }
-        let bytes = std::fs::read(&path).map_err(|error| format!("{shown}: {error}"))?;
+        let bytes = std::fs::read(path).map_err(|error| format!("{shown}: {error}"))?;
         let engine = engine();
         let component =
             Component::new(engine, &bytes).map_err(|error| format!("{shown}: {error}"))?;
