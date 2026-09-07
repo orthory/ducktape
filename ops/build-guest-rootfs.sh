@@ -4,6 +4,10 @@
 #
 #   ops/build-guest-rootfs.sh                 # -> ~/.ducktape/guest
 #   OUT=~/guest ops/build-guest-rootfs.sh     # anywhere writable
+#   ROOTFS_SETUP=/path/to/setup.sh ops/build-guest-rootfs.sh [setup arguments]
+#     Linux installs the repository's pinned Rust and wasm-tools by default
+#     (requires Bubblewrap). ROOTFS_SETUP replaces that setup; an empty value
+#     builds only the base image. Arguments are passed to a custom hook.
 #
 # The default is where `node init` writes a fresh [sandbox] table
 # (workspace-config's `default_guest_dir`) — build here and the node already
@@ -37,6 +41,15 @@ OUT="${OUT:-${DUCKTAPE_HOME:-$HOME/.ducktape}/guest}"
 # this class of host is both memory-backed and periodically reaped — a reaped
 # cache silently turns every rebuild into a fresh 250 MB download.
 WORK="${WORK:-$OUT/.build}"
+
+if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
+  ROOTFS_SETUP="$HERE/ops/guest-rust-tools.sh"
+  RUST_CHANNEL="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$HERE/rust-toolchain.toml")"
+  set -- "$RUST_CHANNEL" "$(cat "$HERE/wasm-tools.version")"
+fi
+if [[ -n "${ROOTFS_SETUP:-}" ]]; then
+  command -v bwrap >/dev/null || { echo "guest setup requires bubblewrap" >&2; exit 1; }
+fi
 
 # The GUEST's architecture: the host's, because there is no cross-hypervisor.
 # An x86_64 Linux box boots x86_64 guests under Firecracker; an Apple silicon
@@ -134,6 +147,24 @@ say "extracting the base"
 # do not have. Nothing in the guest depends on them — PID 1 runs as root
 # inside its own VM.
 unsquashfs -no-xattrs -quiet -force -dest "$TREE" "$BASE"
+
+# Prepare build tools in the base without lending host paths or
+# credentials to runs. The setup executes as root only in a private user/mount
+# namespace. Its writable scratch stays on disk and never enters the image.
+if [[ -n "${ROOTFS_SETUP:-}" ]]; then
+  SETUP="$(realpath "$ROOTFS_SETUP")"
+  [[ -f "$SETUP" ]] || { echo "ROOTFS_SETUP is not a file: $SETUP" >&2; exit 1; }
+  mkdir -p "$WORK/setup-tmp"
+  say "preparing guest tools"
+  bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --die-with-parent \
+    --bind "$TREE" / --proc /proc --dev /dev \
+    --bind "$WORK/setup-tmp" /tmp \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind "$SETUP" /run/ducktape-guest-setup \
+    --clearenv --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --setenv DEBIAN_FRONTEND noninteractive \
+    /bin/bash /run/ducktape-guest-setup "$@"
+fi
 
 # ---- 3. the init -----------------------------------------------------------
 MUSL_TARGET="$ARCH-unknown-linux-musl"

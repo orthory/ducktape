@@ -291,16 +291,24 @@ pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> ic
 
 /// What the status item's "Open" row has to do, as the discriminant the
 /// handler branches on once. Closing a window no longer ends the process, so
-/// the daemon can be running with both slots empty — and [`window_target`] on
-/// an empty slot names a FRESH id, whose focus is a no-op, which would make a
-/// raise-only row do nothing at all. With nothing tracked, open.
-pub fn tray_open_action(
-    console: Option<iced::window::Id>,
-    onboarding: Option<iced::window::Id>,
-) -> crate::WindowSummon {
-    match console.is_none() && onboarding.is_none() {
-        true => crate::WindowSummon::Open,
-        false => crate::WindowSummon::Raise,
+/// the daemon can be running connected with nothing tracked — an ordinary
+/// state, not "never signed in". Routing that case through the launch window
+/// (`onboarding_opened` always re-runs `hub_state()`, which resets `hub_step`
+/// to the network picker) sends a connected user back to network selection
+/// for merely closing the console; routing it through the console instead
+/// reconnects from `rpc` the way a fresh pick does (#1782). A window already
+/// tracked is always raised regardless of connection state — [`window_target`]
+/// on an empty slot names a FRESH id, whose focus is a no-op, so a raise-only
+/// row would do nothing with both slots empty.
+///
+/// Its own type: a third arm here would force a meaningless one onto
+/// [`huddle_summon`]'s `WindowSummon` match, which has no console to reconnect.
+pub fn tray_open_action(network_open: bool, window_tracked: bool) -> crate::TrayOpen {
+    match (network_open, window_tracked) {
+        (true, true) => crate::TrayOpen::Raise,
+        (false, true) => crate::TrayOpen::Raise,
+        (true, false) => crate::TrayOpen::Console,
+        (false, false) => crate::TrayOpen::Launch,
     }
 }
 
@@ -1064,5 +1072,25 @@ mod tests {
         );
         assert_eq!(active_wallet_label("demo"), "signing as demo");
         assert_eq!(active_wallet_label(""), "read-only — no wallet unlocked");
+    }
+
+    /// The tray's Open row (#1782): a window already tracked is always
+    /// raised, whichever it is — and only once nothing is tracked does
+    /// connection state decide between reopening the console (reconnect) and
+    /// the launch window (fresh pick).
+    #[test]
+    fn tray_open_reconnects_the_console_only_when_untracked_and_connected() {
+        use crate::TrayOpen;
+
+        assert!(matches!(
+            tray_open_action(false, false),
+            TrayOpen::Launch
+        ));
+        assert!(matches!(
+            tray_open_action(true, false),
+            TrayOpen::Console
+        ));
+        assert!(matches!(tray_open_action(true, true), TrayOpen::Raise));
+        assert!(matches!(tray_open_action(false, true), TrayOpen::Raise));
     }
 }

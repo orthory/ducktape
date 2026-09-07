@@ -60,58 +60,6 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     format!("{left} · {right}")
 }
 
-/// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
-/// runs in flight, not `runs::ModelStatus::Active`: Active is the registration
-/// default and would report every registered agent as busy forever.
-pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let working = rows.iter().filter(|row| row.live).count();
-    let registered = plural(count_i64(rows.len()), "agent", "agents");
-    format!("{registered} · {working} working")
-}
-
-/// `12 open · 3 settled` — the Approvals title's machine subtitle.
-pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let open = rows.iter().filter(|row| row.open).count();
-    format!("{open} open · {} settled", rows.len() - open)
-}
-
-/// `N pending` — the header count, open proposals only.
-pub fn pending_label(rows: &[ProposalRow]) -> String {
-    format!("{} pending", rows.iter().filter(|row| row.open).count())
-}
-
-/// The settled half of the register — the RECENTLY FINALIZED column.
-pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
-    rows.iter().filter(|row| !row.open).cloned().collect()
-}
-
-/// One seat per REQUIRED signature, filled for each approval already in —
-/// the quorum dots. Capped so a large threshold does not overflow the card.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct QuorumSeat {
-    pub filled: bool,
-}
-
-pub fn quorum_dots(approvals: i64, required: i64) -> Vec<QuorumSeat> {
-    let seats = required.clamp(0, 12) as usize;
-    (0..seats)
-        .map(|seat| QuorumSeat {
-            filled: (seat as i64) < approvals,
-        })
-        .collect()
-}
-
-/// `3 / 4` — the tally, one mono run.
-pub fn tally_label(approvals: i64, required: i64) -> String {
-    format!("{approvals} / {required}")
-}
-
 /// `tally_label` for two readings that are ALREADY rendered — the consensus
 /// trio off `/v1/status` is optional per field, so each arrives as its own
 /// `optional_number` string (`—` when the node reports nothing). Joining the
@@ -119,44 +67,6 @@ pub fn tally_label(approvals: i64, required: i64) -> String {
 /// `0` for "not reported".
 pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
-}
-
-/// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
-pub fn tally_tone(approvals: i64, required: i64) -> String {
-    match approvals >= required.saturating_sub(1) {
-        true => "near".into(),
-        false => "far".into(),
-    }
-}
-
-/// `3 approvals · 1 more for quorum`, or `quorum met`.
-pub fn tally_note(approvals: i64, required: i64) -> String {
-    let remaining = required.saturating_sub(approvals);
-    if remaining <= 0 {
-        return "quorum met".into();
-    }
-    let have = plural(approvals, "approval", "approvals");
-    format!("{have} · {remaining} more for quorum")
-}
-
-/// The approve button leans forward at the last vote: `Approve →`.
-pub fn approve_label(approvals: i64, required: i64) -> String {
-    match approvals + 1 >= required {
-        true => "Approve →".into(),
-        false => "Approve".into(),
-    }
-}
-
-/// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: &str) -> String {
-    let access = matches!(
-        action,
-        "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
-    );
-    match access {
-        true => "access".into(),
-        false => "neutral".into(),
-    }
 }
 
 /// How many proposals are still open — the count the rail pins to Approvals.

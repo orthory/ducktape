@@ -32,7 +32,7 @@
 //! that repaint their own window at the capture cadence — no app message, no
 //! view rebuild, no other window woken.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -136,6 +136,12 @@ struct VideoStore {
     peers: HashMap<String, TileFrame>,
     /// the local camera's preview, when on.
     preview: Option<TileFrame>,
+    /// peer node-key hex → a decode for that peer is running right now.
+    /// `store_peer_frame` checks-and-sets this BEFORE decoding and clears it
+    /// after, so a peer with a decode already in flight gets its next frame
+    /// DROPPED rather than queued — a hostile 25 fps sender must not stack
+    /// concurrent decodes on the blocking pool.
+    decoding: HashSet<String>,
 }
 
 fn store() -> &'static Mutex<VideoStore> {
@@ -144,6 +150,7 @@ fn store() -> &'static Mutex<VideoStore> {
         Mutex::new(VideoStore {
             peers: HashMap::new(),
             preview: None,
+            decoding: HashSet::new(),
         })
     })
 }
@@ -227,21 +234,39 @@ pub(crate) fn reset() {
     let mut store = store().lock().expect("video store");
     store.peers.clear();
     store.preview = None;
+    store.decoding.clear();
     SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
 
 /// A peer's encoded frame off the call socket: decode and store. Runs on a
 /// blocking task — JPEG decode of a 480p frame is ~1–3 ms.
+///
+/// DROP, NEVER QUEUE, A PEER'S SECOND FRAME WHILE ITS FIRST IS STILL
+/// DECODING. `spawn_blocking` has no back-pressure of its own — a peer
+/// sending faster than this box can decode (a hostile 25 fps sender, or a
+/// legitimate one over a slow host) would otherwise stack concurrent decodes
+/// without bound. The next frame is a keyframe too, so a dropped one costs
+/// nothing.
 pub(crate) fn store_peer_frame(frame: PeerFrame) {
-    let Some(tile) = decode_frame(&frame.data) else {
+    let peer = hex_of(&frame.peer);
+    {
+        let mut store = store().lock().expect("video store");
+        if !store.decoding.insert(peer.clone()) {
+            tracing::debug!(
+                target: "ducktape::call",
+                reason = "tile_decode_in_flight",
+                "peer frame dropped, a decode for this peer is already running"
+            );
+            return;
+        }
+    }
+    let tile = decode_frame(&frame.data);
+    let mut store = store().lock().expect("video store");
+    store.decoding.remove(&peer);
+    let Some(tile) = tile else {
         return;
     };
-    let peer = hex_of(&frame.peer);
-    store()
-        .lock()
-        .expect("video store")
-        .peers
-        .insert(peer, tile);
+    store.peers.insert(peer, tile);
 }
 
 /// Drop a peer's last frame: they left the huddle, or their beacon says the
@@ -266,11 +291,44 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
         zune_jpeg::zune_core::options::DecoderOptions::default()
             .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA),
     );
-    let pixels = decoder.decode().ok()?;
+    // Read the SOF's declared size WITHOUT allocating the decoded output.
+    // `decode_headers` stops the instant it has parsed the SOS marker — it
+    // never sizes a buffer off width×height (the only thing zune-jpeg
+    // allocates per component during header parsing is a small per-component
+    // Vec); the width×height×4 allocation happens inside `decode()`, called
+    // below only once the declared size has cleared the budget.
+    //
+    // zune-core's own `max_width`/`max_height` (the knob `DecoderOptions`
+    // exposes) default to 16384 EACH and are checked per AXIS — a hostile SOF
+    // sitting exactly on that boundary sails through it (16384 is not
+    // greater than 16384), which is this defect. Widening that knob doesn't
+    // fix it either: TILE_PIXEL_BUDGET/SCREEN_PIXEL_BUDGET are AREA budgets
+    // (pixel counts), and no single per-axis pair strict enough to refuse a
+    // 16384×16384 attack can also admit a real tile's aspect — a documented
+    // 1080p share alone lands at 960×540 (see SCREEN_PIXEL_BUDGET), already
+    // past a symmetric budget-derived per-axis cap. So the gate checks the
+    // area the budget is actually defined in, against SCREEN_PIXEL_BUDGET —
+    // the larger of the two named budgets a receive-side tile can be (today
+    // the same constant as TILE_PIXEL_BUDGET, but a screen-share frame is the
+    // one this receive path must not under-bound if that ever changes).
+    decoder.decode_headers().ok()?;
     let (width, height) = decoder.dimensions()?;
-    // An oversized peer frame is bounded HERE, not trusted to have been
-    // bounded at its sender — above the renderer's upload cliff a fresh
-    // handle is skipped for a frame, which reads as the tile blinking.
+    if width as u64 * height as u64 > u64::from(SCREEN_PIXEL_BUDGET) {
+        // debug, not warn: a hostile sender can repeat this every frame at
+        // 25 fps, and a per-frame warn would evict the whole ring in minutes.
+        tracing::debug!(
+            target: "ducktape::call",
+            reason = "tile_dimensions_over_budget",
+            width,
+            height,
+            "peer tile refused before allocation"
+        );
+        return None;
+    }
+    let pixels = decoder.decode().ok()?;
+    // An oversized-but-in-budget peer frame is bounded HERE too, not trusted
+    // to have been bounded at its sender — above the renderer's upload cliff
+    // a fresh handle is skipped for a frame, which reads as the tile blinking.
     let (pixels, width, height) =
         shrink_to_budget::<4>(pixels, width as u32, height as u32, TILE_PIXEL_BUDGET);
     Some(TileFrame {
@@ -987,6 +1045,65 @@ mod tests {
         ));
     }
 
+    /// A within-budget encoded frame, well clear of the crafted-header cases
+    /// below, still decodes end to end — the gate must not cost the happy
+    /// path anything.
+    #[test]
+    fn a_within_budget_frame_still_decodes() {
+        // 700×700 = 490_000 px, under SCREEN_PIXEL_BUDGET. Flat grey, not the
+        // round-trip test's modulo pattern: at this pixel count a short-period
+        // pattern is a high spatial frequency and could push the encode over
+        // MAX_FRAME_BYTES, triggering `encode_frame`'s own halving fallback —
+        // this test wants a frame that decodes AT the requested size.
+        let (width, height) = (700u16, 700u16);
+        let rgba = vec![0x80u8; usize::from(width) * usize::from(height) * 4];
+        let encoded = encode_frame(&rgba, width, height).expect("encode");
+        let tile = decode_frame(&encoded).expect("a within-budget frame must still decode");
+        assert_eq!((tile.width, tile.height), (700, 700));
+    }
+
+    /// Bytes for a JPEG whose SOF declares `width`×`height` and nothing else —
+    /// one Luma component, no quantization/Huffman tables, no scan data.
+    /// `decode_headers` only needs to walk SOI → SOF0 → SOS to learn the
+    /// declared size (it returns the instant SOS parses, never reading scan
+    /// bytes), so this is enough to probe the size gate without a real
+    /// encoder and without the whole image ever needing to be valid.
+    fn crafted_sof_bytes(width: u16, height: u16) -> Vec<u8> {
+        let [h_hi, h_lo] = height.to_be_bytes();
+        let [w_hi, w_lo] = width.to_be_bytes();
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x0B, // length = 8 + 3*1 components
+            0x08, // precision
+            h_hi, h_lo, // height
+            w_hi, w_lo, // width
+            0x01, // one component
+            0x01, 0x11, 0x00, // id=1, h/v sample=1/1, quant table 0
+            0xFF, 0xDA, // SOS
+            0x00, 0x08, // length = 6 + 2*1 components
+            0x01, // one component in scan
+            0x01, 0x00, // component id=1, DC/AC huffman table 0/0
+            0x00, 0x3F, 0x00, // spectral start/end, approximation
+        ]
+    }
+
+    /// THE ATTACK IN #1791: a SOF declaring 16384×16384 sat exactly on
+    /// zune-core's own per-axis default (`max_width`/`max_height` = 16384,
+    /// checked with a strict `>`), so it passed the decoder's own guard and
+    /// `decode()` allocated the full 16384·16384·4 = 1 GiB RGBA output before
+    /// the tile's own shrink ever ran. The fix reads the declared size via
+    /// `decode_headers`/`dimensions` — which never allocates output — and
+    /// refuses before `decode()` is called at all.
+    #[test]
+    fn an_oversized_declared_frame_is_refused_before_any_allocation() {
+        let crafted = crafted_sof_bytes(16384, 16384);
+        assert!(
+            decode_frame(&crafted).is_none(),
+            "16384×16384 is 268,435,456 declared pixels against a {SCREEN_PIXEL_BUDGET}-pixel budget"
+        );
+    }
+
     /// THE FALLBACK NEVER DECODES BIGGER THAN THE BUDGET. A camera that refuses
     /// VGA used to be opened at its fastest mode at its highest resolution —
     /// every frame a 1080p JPEG decode that the shrink then threw most of away.
@@ -1096,6 +1213,34 @@ mod tests {
         let off = call_use_screen(false);
         assert_eq!(source(), Source::Off);
         assert!(!off.camera && !off.sharing);
+
+        // A peer's frame arriving while a decode for that SAME peer is
+        // already running is DROPPED, never queued. `store_peer_frame`
+        // checks-and-sets the in-flight marker before it ever touches the
+        // bytes, so pre-arming that marker here stands in for a real decode
+        // still running on another blocking-pool thread.
+        reset();
+        let peer_key = [7u8; 32];
+        let peer_hex = hex_of(&peer_key);
+        store()
+            .lock()
+            .expect("video store")
+            .decoding
+            .insert(peer_hex.clone());
+        store_peer_frame(PeerFrame {
+            peer: peer_key,
+            keyframe: true,
+            ts_ms: 0,
+            data: Vec::new(),
+        });
+        assert!(
+            !store()
+                .lock()
+                .expect("video store")
+                .peers
+                .contains_key(&peer_hex),
+            "a frame arriving mid-decode must be dropped, not stored"
+        );
 
         reset();
         assert!(preview_id().is_none());

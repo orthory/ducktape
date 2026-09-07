@@ -137,7 +137,7 @@ submit runs "$(jq -nc --argjson account "$MODEL_ACCOUNT" '{
     account:$account, agent_id:"dogfood", display_name:"Dogfood Duck",
     capability:"<your provider tag>",
     allowed_actions:["chat.post","chat.post_message","tasks.create","tasks.update_status",
-                     "pages.comment","pages.set_checked"],
+                     "pages.comment","pages.set_checked","modules.update"],
     caps:{forge_read:["ducktape"],forge_push:["ducktape"],pages_write:["*"],
           duckfs_read:["/shared/skills"]},
     skills:[{name:"dogfood",source_prefix:"/shared/skills/dogfood",load:"always"}]
@@ -267,3 +267,136 @@ only an existing verified PR or a successfully committed allocation.
 - **Usage starts at the indexer's deploy boundary**: the ledger doesn't
   rebuild history, so runs before the indexer first ran are absent. "All
   time" means "since this deploy".
+
+## Deploy a component from a chat run
+
+The node process runs the module deployment executor alongside its API. There
+is no separate executor binary. A model with `modules.update` in
+`allowed_actions` can ask its program to deploy an existing module from the
+run's committed forge output. The runs Wasm projects each validator's next
+directive from committed state.
+The native bridge stages a hash-pinned forge file or submits the directive's
+opaque message with its own node key. Module loadability is checked by the
+registry's readiness process before activation. This is automatic under
+validator-ballot governance; a network using governance shares receives a rejected deployment because node keys cannot cast account ballots.
+
+Register the target module first, for example:
+
+```sh
+ducktape module register hello crates/kernel/host/tests/fixtures/hello.component.wasm \
+  --after 50 --config "$WORKSPACE/node.toml"
+```
+
+Commit an artifact containing the replacement component to the run's repository.
+The guest can build it offline when its image contains the compiler and the
+repository vendors its dependencies. Its network is limited to host tunnels for
+granted services. The executor consumes committed artifacts; source compilation
+belongs to the run's build tools. The existing replacement fixture is
+`crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
+
+The model's final JSON response can include:
+
+```json
+{
+  "reply_blocks": [{"kind":"paragraph","text":"Replacement committed; deployment requested."}],
+  "commit_message": "Update hello to count by one hundred",
+  "actions": [{"update_module": {
+    "module_id": "hello",
+    "artifact": "hello.module",
+    "code_hash": "<canonical artifact SHA-256 in lowercase hex>",
+    "after": 50
+  }}]
+}
+```
+
+`artifact` is a preassembled deployment file within the output commit. The host
+binds the repository, output branch and exact commit before passing the action
+to the program. The hash covers the canonical `ModuleArtifact`, including its
+length prefixes and optional mapper, rather than the component file alone:
+
+```sh
+ducktape module pack hello.component.wasm --out hello.module
+```
+
+Pass `--index <mapper.wasm>` to include a mapper. An artifact without a
+mapper removes the target's existing mapper when it activates. Activation is
+at the governance execute height plus `after`, with readiness required from every
+validator.
+
+The run's program reply acknowledges the request. Observe actual deployment
+through the durable queue, using the `query` function above:
+
+```sh
+query runs '{"next_module_update":null}'
+query runs '{"module_update":{"sequence":0}}'
+```
+
+A record contains the requesting program account, run, pinned forge source,
+artifact spec and `requested`, `activated` or `rejected` status. Completed
+records remain queryable across restarts. An expired swap or rejected proposal
+releases the queue for the next request; it does not automatically create a new
+proposal. Read the rejected reason before requesting another deployment.
+
+The `node-work` crate defines the bridge protocol. It accepts opaque submissions
+and preassembled forge blobs, with source-selected success and invalid-blob
+continuations. Deployment voting rules, sequencing and completion conditions
+live in the runs Wasm. A module policy change uses the normal Wasm update path;
+the native bridge has no governance action or deployment state to change.
+
+A directive can repeat after a restart or concurrent transaction. The source
+must derive it from committed state and choose idempotent messages. The
+deployment controller records per-validator staging receipts and uses stable
+proposal ids, committed votes and registry status; the bridge keeps no private
+workflow checkpoint. Clock values in its query are hints from local committed
+status. Every target still validates messages against its execution context.
+
+The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
+the wasm32 target, native build utilities and the componentizer from
+`wasm-tools.version`. Build it at the default location with:
+
+```sh
+ops/build-guest-rootfs.sh
+```
+
+Linux setup requires Bubblewrap with user namespaces, in addition to the base
+image builder's tools. It runs inside the extracted guest root with private,
+disk-backed scratch and receives no host home, credentials or caches.
+`ROOTFS_SETUP=/path/to/setup.sh` replaces the setup and receives command-line
+arguments; `ROOTFS_SETUP=` builds only the base image. macOS builds the base
+image without this Linux setup hook. Repositories must vendor dependencies for
+offline builds: the run's VM can reach only its host service tunnels.
+
+Writable run filesystems provide 8 GiB of sparse capacity. Only written blocks
+consume host disk. The read-only input image retains its measured size plus
+metadata margin. Headless Claude invocations allow shell, file and Ducktape MCP
+tools without interactive approval; the VM and committed grants define access.
+
+The live repair test uses the standard Claude capability, installed CLI, host
+broker credential and default guest location. Set `DUCKTAPE_GUEST_DIR` only when
+using an image elsewhere. Keep `TMPDIR` short and disk-backed for Unix sockets.
+The live test is opt-in because it spends provider budget:
+
+```sh
+cargo test -p node-bin --test chat_module_upgrade_e2e \
+  a_blind_agent_repairs_and_deploys_from_symptoms \
+  -- --ignored --nocapture
+```
+
+The agent receives an incident report describing the observed count after a
+click, faulty counter source, its wire interface and vendored dependencies.
+The source comes from `hello-wasm` with unrelated conformance operations and
+fixture labels removed. No repair recipe, build script, expected patch, clean
+history or repaired artifact enters its checkout. Standard MCP instructions
+explain the available build tools and deployment API to every run.
+
+The host harness provisions a single-validator network and a model with
+`chat.post` and `modules.update`, registers the faulty module, opens the issue
+and posts the mention. The test node advertises two cores and 4 GiB of memory.
+After activation the host independently rebuilds the delivered source, checks
+preserved state and corrected increments, restarts the node and checks again.
+Those recovery checks are host assertions; the agent's run ends with its
+deployment request. This tests blind repair of one arithmetic fault, rather
+than general autonomous incident detection or agent verification after deployment.
+Evidence is retained under `target/self-heal/evidence/`; the provider trace is
+written as events arrive and is owner-readable only. Canary and path assertions
+check those specific leaks; they do not establish what the model inferred.

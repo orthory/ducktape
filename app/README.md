@@ -20,6 +20,26 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 `DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app binary nor on
 `PATH`.
 
+## Module-owned views
+
+The Approvals, Members and Agents tabs are not native: each is an Ice
+application under `crates/views` (`governance`, `members`, `agents`) compiled
+for the `tree` target and wrapped as an `ice:view` component that the app
+loads from a file at runtime (`src/module_view.rs`).
+`make views` builds every view under `crates/views` and stages it as
+`target/views/<module>_view.wasm`, where a built binary looks for it
+(`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
+binary); `make dev` and `make app` run it first. A tab whose view is not
+staged says so in its place.
+
+A view is a pure function of the props the app pushes it (`<module>.props`,
+one JSON item per change) and speaks back only in intents (`governance.vote`,
+`members.propose`, …) that the tab's handler signs and submits exactly as the
+native screen did; a view with nothing to write, like Agents, declares none. The guest sees no key, no endpoint and no clock, and a view
+that traps shows why in its place instead of taking the window with it. The
+views workspace pins the same `ducktape-ui` rev as this crate; `make views`
+refuses when they differ.
+
 ## Release build (macOS: signed and notarized)
 
 `make app` builds `Ducktape.app` and `Ducktape-<version>-<arch>.dmg` under

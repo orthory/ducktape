@@ -3,8 +3,9 @@
 //!
 //! - READ tools ([`read`]) are ungated except where the caps vocabulary already
 //!   names the resource (`forge_read` repos, `duckfs_read` prefixes).
-//! - WRITE tools ([`write`]) mirror `runs::KNOWN_ACTIONS` ONE-FOR-ONE. that is
-//!   the point: the tool plane grants an agent nothing its registered
+//! - WRITE tools ([`write`]) expose the session actions in `runs::KNOWN_ACTIONS`.
+//!   `modules.update` uses only the final response, after the forge output commits.
+//!   The tool plane grants an agent nothing its registered
 //!   `allowed_actions` did not already grant it, and there is exactly one
 //!   vocabulary of "what an agent may do" — the one consensus validates a
 //!   response's actions against.

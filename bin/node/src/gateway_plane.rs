@@ -196,7 +196,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             // The permit is taken HERE, not in the recv loop:
                             // the loop must keep draining the lane, or a full
                             // budget wedges every `lane.send` behind it.
-                            let Some(_permit) = budget.admit_request().await else {
+                            let Some(permit) = budget.admit_request().await else {
                                 tracing::warn!(
                                     target: "ducktape::gateway",
                                     reason = "request_budget_full",
@@ -215,12 +215,20 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     // Self-serve rides the SAME frame protocol as
                                     // the overlay path over a local duplex, so a
                                     // single-node e2e exercises the real wire.
+                                    // The request permit taken above becomes the
+                                    // spawned server's drain permit, exactly like
+                                    // the overlay-inbound server's own — the local
+                                    // write side is bounded the same way.
                                     let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                     let serve_commands = commands.clone();
                                     let serve_workspace = workspace.clone();
                                     let serve_ports = node_api_ports.clone();
                                     let head_for_server = head.clone();
                                     let body_for_server = body.clone();
+                                    let serve_slot = RequestSlot {
+                                        budget: Arc::clone(&budget),
+                                        permit,
+                                    };
                                     tokio::spawn(async move {
                                         let scope = LoopbackScope {
                                             workspace: &serve_workspace,
@@ -233,14 +241,16 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                             &own_node,
                                             head_for_server,
                                             Some(body_for_server),
-                                            None,
+                                            serve_slot,
                                             server_end,
                                         )
                                         .await;
                                     });
-                                    read_streamed_response(caller_end, max_response_bytes).await
+                                    read_streamed_response(&budget, caller_end, max_response_bytes)
+                                        .await
                                 } else {
                                     proxy_remote(
+                                        &budget,
                                         &slot,
                                         publisher_node,
                                         max_response_bytes,
@@ -424,22 +434,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                     budget: Arc::clone(&budget),
                     permit,
                 };
-                serve_proxy_stream(
-                    &commands,
-                    &scope,
-                    &requester.0,
-                    head,
-                    None,
-                    Some(slot),
-                    stream,
-                )
-                .await;
+                serve_proxy_stream(&commands, &scope, &requester.0, head, None, slot, stream)
+                    .await;
             });
         }
     });
 }
 
 async fn proxy_remote(
+    budget: &Arc<GatewayBudget>,
     slot: &PlaneSlot,
     publisher: [u8; 32],
     max_response_bytes: u64,
@@ -470,7 +473,7 @@ async fn proxy_remote(
             .flush()
             .await
             .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        read_streamed_response(stream, max_response_bytes).await
+        read_streamed_response(budget, stream, max_response_bytes).await
     })
     .await
     .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
@@ -489,17 +492,17 @@ struct LoopbackScope<'a> {
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
 /// stream (overlay). `slot`: the request permit this exchange holds, swapped
-/// for a stream permit at the response head; `None` on the self-serve server
-/// side, whose caller holds the permit for the exchange. The deadline covers
-/// the body read + serve up to the response HEAD; the drain past it is bounded
-/// per frame instead, by [`write_proxy_response`].
+/// for a stream permit at the response head — every serve path holds one,
+/// overlay-inbound and local self-serve alike. The deadline covers the body
+/// read + serve up to the response HEAD; the drain past it is bounded per
+/// frame instead, by [`write_proxy_response`].
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<Vec<u8>>,
-    slot: Option<RequestSlot>,
+    slot: RequestSlot,
     mut stream: S,
 ) {
     let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
@@ -530,18 +533,17 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// Swap the serve task's request permit for a stream permit before the head
-/// goes out. A response with no permit to swap (the self-serve server side)
-/// drains unbudgeted; a full stream budget replaces the response with a
-/// refusal, which is still clean because the head has not been written yet.
+/// goes out. A full stream budget replaces the response with a refusal, which
+/// is still clean because the head has not been written yet.
 fn charge_drain(
     outcome: Result<GatewayResponse, GatewayFailure>,
-    slot: Option<RequestSlot>,
+    slot: RequestSlot,
 ) -> (
     Result<GatewayResponse, GatewayFailure>,
     Option<tokio::sync::OwnedSemaphorePermit>,
 ) {
-    match (outcome, slot) {
-        (Ok(response), Some(slot)) => match slot.into_stream_permit() {
+    match outcome {
+        Ok(response) => match slot.into_stream_permit() {
             Some(permit) => (Ok(response), Some(permit)),
             None => {
                 tracing::warn!(
@@ -558,21 +560,38 @@ fn charge_drain(
                 )
             }
         },
-        (outcome, _) => (outcome, None),
+        // The exchange already failed before a body existed to drain; the
+        // request permit just releases, with nothing to swap it for.
+        Err(failure) => (Err(failure), None),
     }
 }
 
-/// Read the response head, then hand the stream to the body pump. Returns AT
-/// the head — the returned `GatewayResponse.body` streams.
+/// Read the response head, then admit the caller's OWN stream permit before
+/// handing the stream to the body pump — the pump task holds it for the
+/// body's life, independent of whatever permit the far side (self-serve
+/// server or remote publisher) is charged. Returns AT the head — the returned
+/// `GatewayResponse.body` streams.
 async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
+    budget: &Arc<GatewayBudget>,
     mut stream: S,
     max_response_bytes: u64,
 ) -> Result<GatewayResponse, GatewayFailure> {
     let mut buf = Vec::new();
     let head = read_proxy_head(&mut stream, &mut buf).await?;
+    let Some(permit) = budget.admit_stream() else {
+        tracing::warn!(
+            target: "ducktape::gateway",
+            reason = "stream_budget_full",
+            open = MAX_CONCURRENT_STREAMS,
+            "gateway caller stream refused"
+        );
+        return Err(GatewayFailure::Unavailable(
+            "gateway stream budget is full".into(),
+        ));
+    };
     Ok(GatewayResponse {
         head,
-        body: spawn_body_pump(stream, buf, max_response_bytes),
+        body: spawn_body_pump(stream, buf, max_response_bytes, permit),
     })
 }
 
@@ -2073,10 +2092,15 @@ async fn read_proxy_head<S: AsyncRead + Unpin>(
 /// Frame → chunk pump for a streamed response body. Runs until `End`,
 /// `Failure`, overflow of the RUNNING cap (`0` = unbounded — the old buffered
 /// clamp is gone; per-frame size stays codec-bounded), or receiver hangup.
+/// `permit` is the caller's own stream-budget permit, admitted by
+/// [`read_streamed_response`] before the head was exposed; it lives inside
+/// this task for the body's whole life and drops on any of those exits —
+/// completion or a consumer that stops reading.
 fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     mut stream: S,
     mut buf: Vec<u8>,
     max_response_bytes: u64,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> noded::GatewayBody {
     // One slot: at most one chunk is in flight to the consumer, so a paced
     // reader backpressures the frame wire chunk by chunk. This alone cannot
@@ -2086,6 +2110,7 @@ fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     // head-commits-before-abort guarantee (issue #1030).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
     tokio::spawn(async move {
+        let _stream_permit = permit;
         let mut total: u64 = 0;
         loop {
             let frame = match read_frame(&mut stream, &mut buf).await {
@@ -2268,6 +2293,210 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             "the drain ends on its own progress deadline: {error:?}"
         );
+    }
+
+    /// The local self-serve server used to pass `None` for its slot, so its
+    /// write drain — the very `write_proxy_response` a real overlay peer's
+    /// response also runs — never charged the stream budget (issue #1889).
+    /// Fill it for real, through `charge_drain`/`RequestSlot` exactly as the
+    /// self-serve spawn now does, with drains a stalled body producer holds
+    /// open forever (never sends, never closes).
+    #[tokio::test]
+    async fn self_serve_drains_spend_the_stream_budget_and_free_it_on_completion() {
+        let budget = GatewayBudget::new();
+        let mut stalls = Vec::new();
+        let mut drains = Vec::new();
+        // The reader half of each duplex must stay open: dropping it closes
+        // the pipe, which fails the head write outright — a peer that never
+        // READS (the stall this test wants) is not a peer that is GONE.
+        let mut readers = Vec::new();
+        for _ in 0..MAX_CONCURRENT_STREAMS {
+            let permit = budget
+                .admit_request()
+                .await
+                .expect("the request budget is untouched by drains");
+            let slot = RequestSlot {
+                budget: Arc::clone(&budget),
+                permit,
+            };
+            let (tx, body) = tokio::sync::mpsc::channel(1);
+            let response = GatewayResponse {
+                head: gateway::ProxyResponseHead {
+                    status: 200,
+                    headers: vec![],
+                },
+                body,
+            };
+            let (outcome, drain_permit) = charge_drain(Ok(response), slot);
+            let drain_permit = drain_permit.expect("under the stream cap");
+            let (mut writer, reader) = tokio::io::duplex(4096);
+            drains.push(tokio::spawn(async move {
+                // Held across the drain, exactly like serve_proxy_stream's own
+                // `_drain_permit` local.
+                let _drain_permit = drain_permit;
+                let _ = write_proxy_response(&mut writer, outcome).await;
+            }));
+            stalls.push(tx); // never sent on: the drain never sees `None`
+            readers.push(reader);
+        }
+        assert_eq!(
+            budget.streams.available_permits(),
+            0,
+            "every self-serve drain above swapped a real stream permit"
+        );
+
+        // The (N+1)th self-serve drain is refused AT THE HEAD — charge_drain's
+        // existing contract, now actually reachable from the self-serve side.
+        let extra_permit = budget
+            .admit_request()
+            .await
+            .expect("the request budget is untouched by drains");
+        let extra_slot = RequestSlot {
+            budget: Arc::clone(&budget),
+            permit: extra_permit,
+        };
+        let ok_response = GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body: tokio::sync::mpsc::channel(1).1,
+        };
+        let (refused, refused_permit) = charge_drain(Ok(ok_response), extra_slot);
+        assert!(refused_permit.is_none());
+        match refused {
+            Err(GatewayFailure::Unavailable(message)) => {
+                assert!(message.contains("stream budget is full"), "{message}");
+            }
+            other => panic!("expected a stream-budget refusal, got {other:?}"),
+        }
+
+        // An ordinary request still proceeds with every drain parked.
+        assert!(
+            budget.admit_request().await.is_some(),
+            "request admission stays independent of the stream budget"
+        );
+
+        // Release one drain: drop its stalled producer. `write_proxy_response`
+        // observes the closed body, writes `End`, and the task returns —
+        // dropping the stream permit it held for the drain's whole life.
+        drop(stalls.pop().unwrap());
+        drains
+            .pop()
+            .unwrap()
+            .await
+            .expect("the drain task completes");
+        assert_eq!(
+            budget.streams.available_permits(),
+            1,
+            "the finished drain frees its permit"
+        );
+
+        // The next self-serve drain is admitted.
+        let permit = budget
+            .admit_request()
+            .await
+            .expect("under the request cap");
+        let slot = RequestSlot {
+            budget: Arc::clone(&budget),
+            permit,
+        };
+        let outcome: Result<GatewayResponse, GatewayFailure> = Ok(GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body: tokio::sync::mpsc::channel(1).1,
+        });
+        let (_, admitted) = charge_drain(outcome, slot);
+        assert!(admitted.is_some(), "a freed permit admits the next drain");
+
+        drop(stalls);
+        drop(readers);
+        for drain in drains {
+            let _ = drain.await;
+        }
+    }
+
+    /// The caller half — self-serve's own read AND every remote publisher,
+    /// since `read_streamed_response` is the one function both go through —
+    /// used to spend no stream permit for its local pump task (issue #1889).
+    /// Fill it for real, with pumps whose consumer never reads: the
+    /// `spawn_body_pump` harness above
+    /// (`streamed_response_arrives_and_zero_cap_is_unbounded`), at budget
+    /// scale.
+    #[tokio::test]
+    async fn caller_pumps_spend_the_stream_budget_and_free_it_on_completion() {
+        async fn write_a_stalled_response(writer: &mut (impl AsyncWrite + Unpin)) {
+            let head = gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            };
+            let mut frames =
+                gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+            // Two chunks: the pump buffers the first (channel capacity 1) and
+            // blocks sending the second — the never-reading consumer, from
+            // the pump's own side of the wire. `End` sits ready for release.
+            for _ in 0..2 {
+                frames.extend(
+                    gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(vec![0u8; 8])).unwrap(),
+                );
+            }
+            frames.extend(gateway::encode_frame(&gateway::ProxyFrame::End).unwrap());
+            writer.write_all(&frames).await.unwrap();
+        }
+
+        let budget = GatewayBudget::new();
+        let mut bodies = Vec::new();
+        for _ in 0..MAX_CONCURRENT_STREAMS {
+            let (mut writer, reader) = tokio::io::duplex(4096);
+            write_a_stalled_response(&mut writer).await;
+            let response = read_streamed_response(&budget, reader, 0)
+                .await
+                .expect("under the stream cap");
+            bodies.push((writer, response.body)); // never `.recv()`: the stalled consumer
+        }
+        assert_eq!(
+            budget.streams.available_permits(),
+            0,
+            "every caller pump above admitted a real stream permit"
+        );
+
+        // The (N+1)th caller response is refused AT THE HEAD — a real head
+        // was read off the wire, but never handed to whoever is waiting on it.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        write_a_stalled_response(&mut writer).await;
+        match read_streamed_response(&budget, reader, 0).await {
+            Err(GatewayFailure::Unavailable(message)) => {
+                assert!(message.contains("stream budget is full"), "{message}");
+            }
+            other => panic!("expected a stream-budget refusal, got {other:?}"),
+        }
+
+        // An ordinary (non-streaming) request still proceeds with every pump
+        // parked: request admission is independent of the stream budget.
+        assert!(budget.admit_request().await.is_some());
+
+        // Release one consumer: drain its body to completion. The pump's
+        // blocked send unblocks, it reads `End`, and returns — dropping the
+        // permit it held for the pump's whole life.
+        let (_writer, mut body) = bodies.pop().unwrap();
+        while body.recv().await.is_some() {}
+        assert_eq!(
+            budget.streams.available_permits(),
+            1,
+            "the finished pump frees its permit"
+        );
+
+        // The next caller pump is admitted.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        write_a_stalled_response(&mut writer).await;
+        assert!(
+            read_streamed_response(&budget, reader, 0).await.is_ok(),
+            "a freed permit admits the next stream"
+        );
+
+        drop(bodies);
     }
 
     /// The revocation wire: when the grant stops holding mid-socket, the caller
@@ -2458,7 +2687,9 @@ mod tests {
         let mut buf = Vec::new();
         let got_head = read_proxy_head(&mut reader, &mut buf).await.unwrap();
         assert_eq!(got_head.status, 200);
-        let mut body = spawn_body_pump(reader, buf, 0);
+        let budget = GatewayBudget::new();
+        let permit = budget.admit_stream().expect("a fresh budget has room");
+        let mut body = spawn_body_pump(reader, buf, 0, permit);
         let mut total = Vec::new();
         while let Some(chunk) = body.recv().await {
             total.extend_from_slice(&chunk.unwrap());
@@ -2485,7 +2716,9 @@ mod tests {
 
         let mut buf = Vec::new();
         read_proxy_head(&mut reader, &mut buf).await.unwrap();
-        let mut body = spawn_body_pump(reader, buf, 2048);
+        let budget = GatewayBudget::new();
+        let permit = budget.admit_stream().expect("a fresh budget has room");
+        let mut body = spawn_body_pump(reader, buf, 2048, permit);
         let mut seen = 0usize;
         let mut aborted = false;
         while let Some(item) = body.recv().await {
@@ -2543,8 +2776,9 @@ mod tests {
         let pump = tokio::spawn(async move {
             let _ = write_proxy_response(&mut writer, Ok(response)).await;
         });
+        let budget = GatewayBudget::new();
         let result = async {
-            let mut streamed = read_streamed_response(reader, cap).await?;
+            let mut streamed = read_streamed_response(&budget, reader, cap).await?;
             let body = noded::collect_body(&mut streamed.body).await?;
             Ok((streamed.head, body))
         }

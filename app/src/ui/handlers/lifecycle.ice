@@ -1041,16 +1041,23 @@ on window_was_closed(id)
   return if !leaving
   exit
 
-// THE STATUS ITEM'S MENU. Since a close no longer ends the process, "Open" has
-// to be able to OPEN: with both slots empty there is nothing to raise, and
-// `window_target` on an untracked slot names a fresh id whose focus is a no-op,
-// so a raise-only menu row would do nothing at all. One predicate, one branch.
+// THE STATUS ITEM'S MENU. Since a close no longer ends the process, a
+// connected network can have nothing tracked — an ordinary state, not "never
+// signed in". `window_target` on an untracked slot names a fresh id whose
+// focus is a no-op, so a raise-only row would do nothing with both slots
+// empty; but the LAUNCH window is the wrong way to fill them when a network
+// is open, because it re-runs `hub_state()` and resets `hub_step` to the
+// picker (#1782) — the console reconnects from `rpc` instead, the same as a
+// fresh pick. One predicate, one branch.
 on tray_open
-  let raising = tray_open_action(console_win, onboarding_win)
-  match raising
-    WindowSummon.open
+  let window_tracked = console_win != none || onboarding_win != none
+  let opening = tray_open_action(connected, window_tracked)
+  match opening
+    TrayOpen.launch
       task window open onboarding -> onboarding_opened _
-    WindowSummon.raise
+    TrayOpen.console
+      task window open console -> console_opened _
+    TrayOpen.raise
       parallel
         task window focus target=window_target(console_win)
         task window focus target=window_target(onboarding_win)

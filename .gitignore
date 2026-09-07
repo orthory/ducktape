@@ -2,6 +2,7 @@
 # labs is a standalone workspace (excluded from the root), so its build output
 # lands outside the root-anchored /target above.
 /crates/labs/target
+/crates/views/target
 # The Ice test runner writes per-test artifacts
 # (screenshots + paint json) under the app crate's own target dir.
 /app/target/
