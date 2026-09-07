@@ -95,19 +95,6 @@ impl HttpNode {
         self.run(request.body(body))
     }
 
-    /// DELETE a MUTATING route with no body, carrying whatever credential
-    /// [`Self::with_write_auth`] installed — the empty body is exactly what the
-    /// credential is computed over, same discipline as [`Self::post`].
-    fn delete(&self, path: &str) -> Result<reqwest::blocking::Response, ApiError> {
-        let mut request = self.client.delete(self.url(path));
-        if let Some(auth) = self.auth.as_ref() {
-            for (name, value) in auth("DELETE", path, &[]) {
-                request = request.header(name, value);
-            }
-        }
-        self.run(request)
-    }
-
     /// send a request and normalize the outcome: a clean 2xx yields the response;
     /// a 404 is [`ApiError::NotFound`]; any other non-2xx is decoded as the
     /// `{"error": msg}` envelope into [`ApiError::Rejected`] (verbatim), falling
@@ -340,15 +327,16 @@ impl NodeApi for HttpNode {
     }
 
     fn unpin(&self, name: &str) -> Result<(), ApiError> {
-        // percent-encode into the path segment so a name carrying '/' (or any
-        // other reserved byte — names have no charset restriction, only a byte
-        // cap) can't be mistaken for an extra path segment; the SAME encoded
-        // string is what gets signed below (`self.delete` -> `auth(method,
-        // path, body)`), so signer and server agree on the exact bytes.
-        let encoded: String =
-            percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
-                .collect();
-        self.delete(&format!("/v1/files/pin/{encoded}"))?;
+        // the name rides a signed JSON body (symmetric with `pin`), never a
+        // path segment: a pin name has no charset restriction (`.` and `..`
+        // are legal), and `reqwest`'s `url` crate normalizes a `%2E`/`%2E%2E`
+        // path segment as a dot-segment before the request leaves this
+        // process, so a path-shaped request could reach a different route or
+        // fail signature verification. a JSON body is opaque to URL
+        // normalization, and it is exactly the bytes `self.post` signs.
+        let body = serde_json::json!({ "name": name });
+        let bytes = serde_json::to_vec(&body).map_err(|e| ApiError::Transport(e.to_string()))?;
+        self.post("/v1/files/unpin", "application/json", bytes)?;
         Ok(())
     }
 }
