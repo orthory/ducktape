@@ -85,7 +85,7 @@ pub use handle::{
 };
 
 mod module_code;
-pub mod module_updates;
+pub mod node_work;
 pub use module_code::{
     CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest, MAX_MODULE_ARTIFACT_BYTES,
 };

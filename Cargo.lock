@@ -6472,6 +6472,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "node-work"
+version = "0.1.0"
+dependencies = [
+ "sdk",
+ "serde",
+]
+
+[[package]]
 name = "noded"
 version = "0.1.0"
 dependencies = [
@@ -6499,7 +6507,6 @@ dependencies = [
  "futures",
  "gateway",
  "git2",
- "governance",
  "host",
  "http-body-util",
  "identity",
@@ -6511,6 +6518,7 @@ dependencies = [
  "modules",
  "nettest",
  "node",
+ "node-work",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -8624,6 +8632,7 @@ dependencies = [
  "host",
  "identity",
  "modules",
+ "node-work",
  "pages",
  "saga",
  "sdk",
@@ -8632,6 +8641,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
+ "syn 2.0.118",
  "tasks",
  "valset",
 ]

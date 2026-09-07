@@ -352,8 +352,7 @@ async fn next_update(network: &Network) -> Option<runs::ModuleUpdateView> {
 fn replacement_action() -> runs::AgentAction {
     runs::AgentAction::UpdateModule(runs::ModuleUpdateSpec {
         module_id: "hello".into(),
-        component: "hello.component.wasm".into(),
-        index: None,
+        artifact: "hello.module".into(),
         code_hash: "ab".repeat(32),
         after: 50,
     })
@@ -743,5 +742,101 @@ fn reconciliation_requires_registry_evidence_and_expired_readiness_releases_the_
                 reason: "deployment expired before every validator was ready".into()
             }
         );
+    });
+}
+
+async fn work(network: &Network, voter: u8) -> Option<node_work::Directive> {
+    let query = node_work::Query::NodeWork {
+        node_key: vec![voter; 32],
+        height: network.height,
+        consensus_time: network.height,
+    };
+    let bytes = network
+        .host
+        .query("runs", &sdk::wire::encode(&query))
+        .await
+        .unwrap();
+    let node_work::Reply::NodeWork(work) = sdk::wire::decode(&bytes).unwrap();
+    work
+}
+
+async fn apply_work(network: &mut Network, voter: u8, message: node_work::Submission) {
+    network
+        .submit(
+            sdk::Origin::External(vec![voter; 32]),
+            sdk::Msg {
+                target: message.target,
+                payload: message.payload,
+            },
+        )
+        .await;
+}
+
+#[test]
+fn the_module_projects_the_entire_ceremony_and_retries_from_committed_receipts() {
+    block_on(async {
+        let (_directory, mut network) = deployment_network("work-projection", 1).await;
+        assert!(
+            work(&network, 1).await.is_none(),
+            "non-members receive no node work"
+        );
+        let node_work::Directive::StageBlob { blob, on_ready, .. } =
+            work(&network, 7).await.unwrap()
+        else {
+            panic!("stage first")
+        };
+        assert_eq!(blob.commit, "1a".repeat(20));
+        assert_eq!(blob.hash, [0xab; 32]);
+        assert_eq!(blob.path, "hello.module");
+        apply_work(&mut network, 7, on_ready.clone()).await;
+        apply_work(&mut network, 7, on_ready).await;
+        let node_work::Directive::Submit(propose) = work(&network, 7).await.unwrap() else {
+            panic!("propose")
+        };
+        assert!(matches!(
+            governance::decode_msg(&propose.payload).unwrap(),
+            governance::GovMsg::Propose { .. }
+        ));
+        apply_work(&mut network, 7, propose).await;
+        let node_work::Directive::Submit(vote) = work(&network, 7).await.unwrap() else {
+            panic!("first vote")
+        };
+        apply_work(&mut network, 7, vote).await;
+        assert!(
+            work(&network, 7).await.is_none(),
+            "a repeated wake does not vote twice"
+        );
+        let node_work::Directive::StageBlob { on_ready, .. } = work(&network, 8).await.unwrap()
+        else {
+            panic!("each validator stages before voting")
+        };
+        apply_work(&mut network, 8, on_ready).await;
+        let node_work::Directive::Submit(vote) = work(&network, 8).await.unwrap() else {
+            panic!("second vote")
+        };
+        apply_work(&mut network, 8, vote).await;
+        let node_work::Directive::Submit(execute) = work(&network, 7).await.unwrap() else {
+            panic!("execute")
+        };
+        assert!(matches!(
+            governance::decode_msg(&execute.payload).unwrap(),
+            governance::GovMsg::Execute { .. }
+        ));
+        apply_work(&mut network, 7, execute).await;
+        network.drain().await;
+        assert!(
+            work(&network, 7).await.is_none(),
+            "an in-flight swap owns its activation lead"
+        );
+        for _ in 0..50 {
+            network.step().await;
+        }
+        let node_work::Directive::Submit(reconcile) = work(&network, 7).await.unwrap() else {
+            panic!("reconcile expiry")
+        };
+        apply_work(&mut network, 7, reconcile.clone()).await;
+        apply_work(&mut network, 7, reconcile).await;
+        assert!(work(&network, 7).await.is_none());
+        assert!(next_update(&network).await.is_none());
     });
 }

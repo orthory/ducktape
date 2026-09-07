@@ -47,6 +47,9 @@ impl RunsModule {
                 self.request_module_update(ctx, request_id, run_id, source, update)
                     .await
             }
+            RunsMsg::MarkModuleArtifactStaged { sequence } => {
+                self.mark_module_artifact_staged(ctx, sequence).await
+            }
             RunsMsg::ReconcileModuleUpdate { sequence } => {
                 self.reconcile_module_update(ctx, sequence).await
             }

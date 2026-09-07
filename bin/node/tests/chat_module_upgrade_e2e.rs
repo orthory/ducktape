@@ -86,12 +86,12 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         "reply_blocks": [{"kind":"paragraph", "text":"Replacement committed; deployment requested."}],
         "commit_message": "Update hello to count by one hundred",
         "actions": [{"update_module": {
-            "module_id":"hello", "component":"hello.component.wasm", "index":null,
+            "module_id":"hello", "artifact":"hello.module",
             "code_hash":expected_hash, "after":AFTER.parse::<u64>().unwrap(),
         }}],
     });
     let script = format!(
-        "set -e; cat >/dev/null; cp replacement.component.wasm hello.component.wasm; printf '%s\\n' '{}'",
+        "set -e; cat >/dev/null; cp replacement.module hello.module; printf '%s\\n' '{}'",
         response
     );
     let args = serde_json::to_string(&["-c", &script]).unwrap();
@@ -151,12 +151,17 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
     let seed = fixtures.path().join("seed");
     std::fs::create_dir(&seed).unwrap();
     git_ok(&seed, &["init"]);
-    std::fs::copy(fixture("hello"), seed.join("hello.component.wasm")).unwrap();
-    std::fs::copy(
-        fixture("hello-replacement"),
-        seed.join("replacement.component.wasm"),
-    )
-    .unwrap();
+    for (name, fixture_id) in [
+        ("hello.module", "hello"),
+        ("replacement.module", "hello-replacement"),
+    ] {
+        let component = std::fs::read(fixture(fixture_id)).unwrap();
+        std::fs::write(
+            seed.join(name),
+            module_artifact::ModuleArtifact::component(component).encode(),
+        )
+        .unwrap();
+    }
     git_ok(&seed, &["add", "."]);
     git_ok(&seed, &["commit", "-m", "Seed both reference components"]);
     let url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[0]);
@@ -314,12 +319,15 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         &checkout,
         &[
             "show",
-            &format!("{}:hello.component.wasm", deployment.request.source.commit),
+            &format!("{}:hello.module", deployment.request.source.commit),
         ],
     );
     assert_eq!(
         delivered,
-        std::fs::read(fixture("hello-replacement")).unwrap()
+        module_artifact::ModuleArtifact::component(
+            std::fs::read(fixture("hello-replacement")).unwrap()
+        )
+        .encode()
     );
 
     cluster.kill(0);

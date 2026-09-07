@@ -17,11 +17,7 @@ fn request_key(request_id: &str) -> String {
     format!("module_updates/request/{request_id}")
 }
 
-fn relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains(['\\', '\0'])
-        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
-}
+use node_work::relative_path;
 
 impl ModuleUpdateSpec {
     pub fn digest(&self) -> Result<[u8; 32], String> {
@@ -47,8 +43,7 @@ impl ModuleUpdateSpec {
         if !valid_id {
             return Err("module update requires a bare module id".into());
         }
-        let valid_paths =
-            relative_path(&self.component) && self.index.as_deref().is_none_or(relative_path);
+        let valid_paths = relative_path(&self.artifact);
         if !valid_paths {
             return Err("module artifacts must be relative paths within the output commit".into());
         }

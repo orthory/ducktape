@@ -25,6 +25,7 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
+node-work = { workspace = true }
 # Committed-block receipt notifications for interactive program actions.
 tokio-tungstenite = "0.24"
 module-artifact = { workspace = true }
@@ -43,7 +44,6 @@ topology = { workspace = true }
 wasm-host = { workspace = true }
 valset = { workspace = true }
 modules = { workspace = true }
-governance = { workspace = true }
 kv = { workspace = true }
 files = { workspace = true }
 chat = { workspace = true }

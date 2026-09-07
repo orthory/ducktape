@@ -146,6 +146,10 @@ pub enum RunsMsg {
         source: ModuleUpdateSource,
         update: ModuleUpdateSpec,
     },
+    /// A validator confirms local residency of this request's immutable artifact.
+    MarkModuleArtifactStaged {
+        sequence: u64,
+    },
     /// Anyone may reconcile a request against its actual registry/governance outcome.
     ReconcileModuleUpdate {
         sequence: u64,
@@ -374,6 +378,11 @@ pub struct RunAuthorityView {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    NodeWork {
+        node_key: Vec<u8>,
+        height: u64,
+        consensus_time: u64,
+    },
     NextModuleUpdate,
     ModuleUpdate {
         sequence: u64,
@@ -415,6 +424,7 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    NodeWork(Option<node_work::Directive>),
     ModuleUpdate(Option<ModuleUpdateView>),
     Model(crate::ModelReply),
     ActionRequest(Option<ActionRequestView>),
@@ -448,14 +458,12 @@ pub fn decode_reply(b: &[u8]) -> Result<RunsReply, String> {
     sdk::wire::decode(b)
 }
 
-/// Paths within the run's output commit, and the canonical ModuleArtifact digest.
+/// A prebuilt artifact file within the output commit and its SHA-256 digest.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleUpdateSpec {
     pub module_id: String,
-    pub component: String,
-    #[serde(default)]
-    pub index: Option<String>,
+    pub artifact: String,
     pub code_hash: String,
     pub after: u64,
 }

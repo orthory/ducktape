@@ -273,9 +273,11 @@ only an existing verified PR or a successfully committed allocation.
 The node process runs the module deployment executor alongside its API. There
 is no separate executor binary. A model with `modules.update` in
 `allowed_actions` can ask its program to deploy an existing module from the
-run's committed forge output. Each validator stages and validates those bytes
-locally, then proposes, votes and executes with its own node key. This is
-automatic under validator-ballot governance; a network using governance shares
+run's committed forge output. The runs Wasm projects each validator's next
+directive from committed state.
+The native bridge stages a hash-pinned forge file or submits the directive's
+opaque message with its own node key. Module loadability is checked by the
+registry's readiness process before activation. This is automatic under validator-ballot governance; a network using governance shares
 receives a rejected deployment because node keys cannot cast account ballots.
 
 Register the target module first, for example:
@@ -299,36 +301,36 @@ The model's final JSON response can include:
   "commit_message": "Update hello to count by one hundred",
   "actions": [{"update_module": {
     "module_id": "hello",
-    "component": "hello.component.wasm",
-    "index": null,
+    "artifact": "hello.module",
     "code_hash": "<canonical artifact SHA-256 in lowercase hex>",
     "after": 50
   }}]
 }
 ```
 
-`component` and optional `index` are paths within the output commit. The host
+`artifact` is a preassembled deployment file within the output commit. The host
 binds the repository, output branch and exact commit before passing the action
 to the program. The hash covers the canonical `ModuleArtifact`, including its
 length prefixes and optional mapper, rather than the component file alone:
 
 ```sh
-python3 - hello.component.wasm <<'PYHASH'
+python3 - hello.component.wasm hello.module <<'PYHASH'
 import hashlib, pathlib, struct, sys
 component = pathlib.Path(sys.argv[1]).read_bytes()
 artifact = struct.pack("<I", len(component)) + component
-if len(sys.argv) == 3:
-    mapper = pathlib.Path(sys.argv[2]).read_bytes()
+if len(sys.argv) == 4:
+    mapper = pathlib.Path(sys.argv[3]).read_bytes()
     artifact += b"\x01" + struct.pack("<I", len(mapper)) + mapper
 else:
     artifact += b"\x00"
+pathlib.Path(sys.argv[2]).write_bytes(artifact)
 print(hashlib.sha256(artifact).hexdigest())
 PYHASH
 ```
 
-Pass a mapper path as the second Python argument to include it. `index: null`
-removes an existing mapper when the component activates. Activation is at the
-governance execute height plus `after`, with readiness required from every
+Pass a mapper path after `hello.module` to include it. An artifact without a
+mapper removes the target's existing mapper when it activates. Activation is
+at the governance execute height plus `after`, with readiness required from every
 validator.
 
 The run's program reply acknowledges the request. Observe actual deployment
@@ -344,3 +346,16 @@ artifact spec and `requested`, `activated` or `rejected` status. Completed
 records remain queryable across restarts. An expired swap or rejected proposal
 releases the queue for the next request; it does not automatically create a new
 proposal. Read the rejected reason before requesting another deployment.
+
+The `node-work` crate defines the bridge protocol. It accepts opaque submissions
+and preassembled forge blobs, with source-selected success and invalid-blob
+continuations. Deployment voting rules, sequencing and completion conditions
+live in the runs Wasm. A module policy change uses the normal Wasm update path;
+the native bridge has no governance action or deployment state to change.
+
+A directive can repeat after a restart or concurrent transaction. The source
+must derive it from committed state and choose idempotent messages. The
+deployment controller records per-validator staging receipts and uses stable
+proposal ids, committed votes and registry status; the bridge keeps no private
+workflow checkpoint. Clock values in its query are hints from local committed
+status. Every target still validates messages against its execution context.
