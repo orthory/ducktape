@@ -15,6 +15,17 @@ use crate::mcp::node::{NodeError, Result};
 pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
+            name: "ducktape_reply",
+            description: "Reply to this run's source as the agent's program account: a chat thread, \
+                          Pages block/comment thread, or job discussion. Omit destination to answer \
+                          where you were called; supply it to choose somewhere else. Chat replies \
+                          require chat.post; explicit chat destinations require chat.post_message. \
+                          Pages requires pages.comment and pages_write; jobs requires jobs.comment. \
+                          Use for progress, questions or updates during a live run.",
+            schema: reply_schema,
+            handler: reply,
+        },
+        Tool {
             name: "ducktape_chat_post",
             description: "Post a message to a chat channel. Use this to report progress or ask a \
                           question while you work — you do not have to save everything for your \
@@ -96,6 +107,38 @@ pub(super) fn tools() -> Vec<Tool> {
             handler: duckfs_write_text,
         },
     ]
+}
+
+fn reply_schema() -> Value {
+    let mut value = schema(&[("text", "string", true, "The reply text.")]);
+    value["properties"]["destination"] = json!({
+        "type": "object",
+        "description": "Omit to answer the source. Otherwise supply kind and its coordinates: chat (channel_id, optional thread), page (target), page_thread (thread_id), or job (job_id). Runs validates the destination and its grant.",
+        "properties": {"kind": {"type":"string"}},
+        "required": ["kind"],
+        "additionalProperties": true
+    });
+    value
+}
+
+fn reply_destination(args: &Value) -> Result<Option<Value>> {
+    let Some(destination) = args.get("destination") else {
+        return Ok(None);
+    };
+    let shaped = destination.is_object() && destination.get("kind").is_some_and(Value::is_string);
+    if !shaped {
+        return Err(NodeError::Rejected(
+            "reply destination needs an object with a string kind".into(),
+        ));
+    }
+    Ok(Some(destination.clone()))
+}
+
+fn reply(run: &Run, args: &Value) -> Result<Value> {
+    run.act(AgentAction::Reply {
+        text: arg_str(args, "text")?,
+        destination: reply_destination(args)?,
+    })
 }
 
 fn chat_post(run: &Run, args: &Value) -> Result<Value> {
@@ -191,6 +234,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_host_preserves_destinations_for_the_module_to_interpret() {
+        assert_eq!(reply_destination(&json!({"text":"hello"})).unwrap(), None);
+        // A newer module can accept this without a tool-binary update.
+        let destination = json!({"kind":"future_source","object":"item","coordinates":{"part":3}});
+        assert_eq!(
+            reply_destination(&json!({"destination":destination.clone()})).unwrap(),
+            Some(destination)
+        );
+        for destination in [json!(null), json!([]), json!({"kind":1})] {
+            assert!(reply_destination(&json!({"destination":destination})).is_err());
+        }
+    }
+
+    #[test]
     fn task_status_parses_exactly_the_three_wire_names() {
         assert_eq!(task_status_of("open").unwrap(), TaskStatus::Open);
         assert_eq!(
@@ -231,14 +288,10 @@ mod tests {
         // enforces. every KNOWN_ACTION that an agent can *invoke* has a tool, and
         // every tool names its action so a denied agent can say what it lacks.
         //
-        // chat.post belongs to no tool: it authorizes the
-        // run's REPLY BLOCKS (its final answer), which the runs module posts —
-        // not anything an agent calls mid-run. chat.post_message is the tool-side
-        // power, and it is deliberately a different grant. modules.update also
-        // requires a final response: its source is bound after the host push.
+        // Module deployment requires the committed output produced at run end.
         let described: Vec<&str> = tools().iter().map(|t| t.description).collect();
         for action in runs::KNOWN_ACTIONS {
-            let final_only = matches!(action, runs::ACTION_CHAT_POST | runs::ACTION_MODULES_UPDATE);
+            let final_only = matches!(action, runs::ACTION_MODULES_UPDATE);
             if final_only {
                 assert!(
                     !described

@@ -54,6 +54,7 @@ pub fn list() -> Value {
         .map(|t| {
             json!({
                 "name": t.name,
+                "title": t.name.replacen("ducktape_", "ducktape::", 1),
                 "description": t.description,
                 "inputSchema": (t.schema)(),
             })
@@ -62,10 +63,9 @@ pub fn list() -> Value {
     json!({"tools": tools})
 }
 
-/// a JSON Schema object from `(name, type, required, description)` rows — the
-/// whole schema surface this plane needs. no nested objects, no arrays of
-/// objects: every tool here takes a flat bag of scalars, and keeping it that
-/// way is what lets the table stay a table.
+/// A JSON Schema object from `(name, type, required, description)` rows.
+/// Tools with structured arguments extend these scalar properties in their
+/// own schema builder.
 pub fn schema(props: &[(&str, &str, bool, &str)]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();

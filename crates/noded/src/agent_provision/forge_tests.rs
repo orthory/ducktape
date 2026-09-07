@@ -125,7 +125,8 @@ impl Bed {
     }
 
     async fn provisioner(&self) -> NodedProvisioner {
-        let (handle, _rx, _hub) = NodeHandle::channel();
+        let (handle, rx, _hub) = NodeHandle::channel();
+        spawn_files_actor(rx, Default::default(), false);
         NodedProvisioner::new(
             crate::agent_provision::test_link(handle.with_forge_repo(&self.repo_base)).await,
             &self.runs_root,
@@ -133,10 +134,8 @@ impl Bed {
         .with_forge(Some(self.push_base()), NODE_IDENT)
     }
 
-    /// a provisioner whose actor lane is SERVED (the plain one above drops its
-    /// receiver — fine for runs with no mounts, but a W6 checkout needs a node
-    /// on the other end). `reject_reads` fails the mount checkout mid-way. the
-    /// actor handle must outlive the provision, so it comes back with it.
+    /// A served actor with skill files. `reject_reads` fails their checkout
+    /// midway; session binds use the same actor lane as the plain provisioner.
     async fn skill_provisioner(
         &self,
         reject_reads: bool,
@@ -184,9 +183,12 @@ impl Bed {
             // the forge lane's session bind rides the same id as every other:
             // the one `runs` resolves (a forge item run is a chat run on the
             // item's channel), never the host-local `run_id` above.
-            consensus_run_id: Some(runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT)),
-            agent_id: Some(AGENT.into()),
-            agent_display_name: Some(AGENT_DISPLAY_NAME.into()),
+            agent: Some(compute_service::AgentExecution {
+                run_id: runs::run_id_for(&format!("forge:{REPO}:7"), 1, AGENT),
+                attempt: 0,
+                agent_id: AGENT.into(),
+                display_name: AGENT_DISPLAY_NAME.into(),
+            }),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),
                 item_title: "Fix the flaky gate".into(),
@@ -1591,6 +1593,12 @@ async fn spawn_credential_capturing_remote(
         .expect("bind a loopback test remote");
     let address = listener.local_addr().expect("read the test remote address");
     let app = axum::Router::new()
+        .route(
+            "/v1/submit",
+            axum::routing::post(|| async {
+                axum::Json(super::super::plane_tests::committed_block())
+            }),
+        )
         .route(&format!("/{REPO}/info/refs"), axum::routing::get(advertise))
         .route(
             &format!("/{REPO}/git-receive-pack"),

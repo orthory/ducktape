@@ -148,6 +148,16 @@ pub struct JobResult {
     pub payload: String,
 }
 
+/// One immutable job discussion entry, attributed by the module at admission.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobComment {
+    pub id: String,
+    pub author: Party,
+    pub text: String,
+    pub height: u64,
+}
+
 /// a single work item on the board.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +171,9 @@ pub struct Job {
     pub attempt: u64,
     pub claim: Option<Claim>,
     pub result: Option<JobResult>,
+    pub comments: Vec<JobComment>,
+    /// Creation revision survives ID reuse, including replacement in one block.
+    pub created_at_revision: u64,
     pub created_at_height: u64,
     pub updated_at_height: u64,
 }
@@ -170,6 +183,14 @@ pub struct Job {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsMsg {
+    /// Add to the job discussion without changing its execution status.
+    Comment {
+        job_id: String,
+        /// The source revision that created the job instance being answered.
+        created_at_revision: u64,
+        comment_id: String,
+        text: String,
+    },
     /// post a new job (status `Pending`, attempt 0).
     Submit {
         job_id: String,

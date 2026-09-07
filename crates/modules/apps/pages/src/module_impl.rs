@@ -400,6 +400,17 @@ impl Module for Pages {
                 };
                 Ok(encode_reply(&PageReply::Block(block)))
             }
+            PageQuery::CommentThreadHead { thread_id } => {
+                let head = self
+                    .load_thread(&thread_id)
+                    .await
+                    .map_err(|error| Error::Module(error.to_string()))?
+                    .map(|thread| super::CommentThreadHead {
+                        target: thread.target,
+                        comment_count: thread.comment_ids.len() as u64,
+                    });
+                Ok(encode_reply(&PageReply::CommentThreadHead(head)))
+            }
             PageQuery::CommentThread { thread_id } => {
                 let view = self
                     .thread_view(&thread_id)

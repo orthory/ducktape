@@ -675,16 +675,17 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                 crate::task_dump::dump_tasks(&runtime.workspace, &runtime.label).await;
             }
             _ = context.sleep_until(next_drain).fuse() => runtime.on_drain().await,
-            wake = delivery_wake.recv().fuse() => {
-                // a finalized block is drainable NOW — drain event-driven
-                // instead of waiting out the tick. coalesce a finalization
-                // burst into one pass; `None` (all senders dropped) cannot
-                // happen while `runtime.delivery_wake_tx` lives.
-                if wake.is_some() {
-                    while delivery_wake.try_recv().is_ok() {}
-                    runtime.on_drain().await;
-                }
-            }
+            // The ingress lanes sit ABOVE the delivery wake on purpose. A
+            // chain that finalizes a view every few tens of milliseconds
+            // (idle views closed by the leader nudge while work is parked)
+            // rings the wake on every turn, and a biased select that ranks
+            // it first never reaches an arm below it: an operator RPC sat
+            // 10–13 s in its queue and answered "node unresponsive", a
+            // joiner's statesync requests timed out on every incumbent, and
+            // relayed frames waited with them. The wake is an optimisation
+            // over the tick, never a deadline — the deadline arm above still
+            // drains on time under any ingress flood, and each ingress queue
+            // is bounded.
             job = rpc_ingress.next() => {
                 if let Some(job) = job {
                     runtime.on_rpc(job).await;
@@ -711,6 +712,16 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             req = sync_state_rx.next() => {
                 if let Some(req) = req {
                     runtime.on_sync(req).await;
+                }
+            }
+            wake = delivery_wake.recv().fuse() => {
+                // a finalized block is drainable NOW — drain event-driven
+                // instead of waiting out the tick. coalesce a finalization
+                // burst into one pass; `None` (all senders dropped) cannot
+                // happen while `runtime.delivery_wake_tx` lives.
+                if wake.is_some() {
+                    while delivery_wake.try_recv().is_ok() {}
+                    runtime.on_drain().await;
                 }
             }
         }

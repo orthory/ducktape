@@ -1199,6 +1199,8 @@ fn claim_attempt_saturates_instead_of_wrapping() {
             "attempt": u64::MAX,
             "claim": null,
             "result": null,
+            "comments": [],
+            "created_at_revision": 1,
             "created_at_height": 1,
             "updated_at_height": 1,
         });
@@ -1525,6 +1527,163 @@ fn host_two_claims_in_one_block_abort_atomically() {
         assert_eq!(
             host_get(&host, "j1").await.unwrap().status,
             JobStatus::Pending
+        );
+    });
+}
+
+#[test]
+fn job_comments_preserve_authorship_status_and_bounded_immutable_history() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(
+            &mut jobs,
+            1,
+            ext("alice"),
+            submit("discussion", "build", "spec"),
+        )
+        .await;
+        apply(&mut jobs, 2, ext("worker"), claim("discussion", 100)).await;
+        for i in 0..tasks::MAX_JOB_COMMENTS {
+            apply(
+                &mut jobs,
+                3 + i as u64,
+                ext("alice"),
+                jobs_msg(JobsMsg::Comment {
+                    created_at_revision: 1,
+                    job_id: "discussion".into(),
+                    comment_id: format!("c{i}"),
+                    text: format!("Update {i}"),
+                }),
+            )
+            .await;
+        }
+        let job = get(&jobs, "discussion").await.unwrap();
+        assert_eq!(job.status, JobStatus::Processing);
+        assert_eq!(job.claim.as_ref().unwrap().worker, actor("worker"));
+        assert_eq!(job.comments.len(), tasks::MAX_JOB_COMMENTS);
+        assert_eq!(job.comments[0].author, actor("alice"));
+        assert_eq!(job.comments[0].height, 3);
+        assert_eq!(job.comments[0].text, "Update 0");
+        let root = jobs.root();
+        for (id, text) in [
+            ("overflow", "too late".to_string()),
+            ("c0", "overwrite".into()),
+            ("blank", " ".into()),
+            ("large", "x".repeat(tasks::MAX_JOB_COMMENT_TEXT_BYTES + 1)),
+        ] {
+            assert!(
+                stage(
+                    &mut jobs,
+                    100,
+                    ext("worker"),
+                    jobs_msg(JobsMsg::Comment {
+                        created_at_revision: 1,
+                        job_id: "discussion".into(),
+                        comment_id: id.into(),
+                        text
+                    })
+                )
+                .await
+                .is_err()
+            );
+            jobs.commit_block().await.unwrap();
+            assert_eq!(jobs.root(), root);
+        }
+        apply(
+            &mut jobs,
+            101,
+            ext("worker"),
+            finalize("discussion", true, "done"),
+        )
+        .await;
+        assert_eq!(
+            get(&jobs, "discussion").await.unwrap().comments,
+            job.comments
+        );
+    });
+}
+
+#[test]
+fn a_job_comment_cannot_be_overwritten_by_another_actor() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(&mut jobs, 1, ext("alice"), submit("j", "build", "spec")).await;
+        apply(
+            &mut jobs,
+            2,
+            ext("alice"),
+            jobs_msg(JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "j".into(),
+                comment_id: "c".into(),
+                text: "Original".into(),
+            }),
+        )
+        .await;
+        let before = jobs.root();
+        let error = stage(
+            &mut jobs,
+            3,
+            ext("bob"),
+            jobs_msg(JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "j".into(),
+                comment_id: "c".into(),
+                text: "Forged".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error}").contains("already exists"));
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), before);
+        let job = get(&jobs, "j").await.unwrap();
+        assert_eq!(job.comments[0].author, actor("alice"));
+        assert_eq!(job.comments[0].text, "Original");
+    });
+}
+
+#[test]
+fn a_queued_comment_cannot_land_on_a_reused_job_id() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        apply(&mut jobs, 1, ext("alice"), submit("reused", "build", "old")).await;
+        apply(&mut jobs, 1, ext("alice"), cancel("reused")).await;
+        apply(&mut jobs, 1, ext("alice"), prune("reused")).await;
+        apply(&mut jobs, 1, ext("alice"), submit("reused", "build", "new")).await;
+        let root = jobs.root();
+        let error = stage(
+            &mut jobs,
+            1,
+            ext("worker"),
+            jobs_msg(JobsMsg::Comment {
+                job_id: "reused".into(),
+                created_at_revision: 1,
+                comment_id: "late".into(),
+                text: "Old work".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error}").contains("replaced"));
+        jobs.commit_block().await.unwrap();
+        assert_eq!(jobs.root(), root);
+        assert!(get(&jobs, "reused").await.unwrap().comments.is_empty());
+        apply(
+            &mut jobs,
+            1,
+            ext("worker"),
+            jobs_msg(JobsMsg::Comment {
+                job_id: "reused".into(),
+                created_at_revision: 4,
+                comment_id: "current".into(),
+                text: "New work".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            get(&jobs, "reused").await.unwrap().comments[0].text,
+            "New work"
         );
     });
 }

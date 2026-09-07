@@ -255,6 +255,7 @@ pub enum RunsMsg {
     /// an op came from this agent's run and no other.
     OpenAgentSession {
         run_id: String,
+        attempt: u32,
         /// the session's ed25519 PUBLIC key, exactly [`SESSION_KEY_LEN`] bytes.
         /// its private half never leaves the executing host and reaches only the
         /// agent's tool server — never the node key, which can sign anything.
@@ -296,10 +297,18 @@ pub enum RunsMsg {
 /// required byte length of a session key (an ed25519 public key).
 pub const SESSION_KEY_LEN: usize = 32;
 
-/// hard cap on writes and peer calls ONE session may apply — the mid-run peer of
-/// [`crate::MAX_ACTIONS_PER_RUN`]'s blast-radius bound. a session that has burned
+/// Hard cap on writes and peer calls across all attempts of one run — the
+/// mid-run peer of [`crate::MAX_ACTIONS_PER_RUN`]. A session that has burned
 /// its budget can still RETURN a response; it just cannot keep writing.
 pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
+
+/// The exact execution attempt authorized to act for a run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLease {
+    pub holder: Vec<u8>,
+    pub attempt: u32,
+}
 
 /// one live agent session: an ephemeral key bound to a run, plus the audit
 /// record of what it did with it.
@@ -316,14 +325,10 @@ pub struct AgentSession {
     /// the ed25519 public key that must sign every [`RunsMsg::AgentAction`] for
     /// this run.
     pub session_key: Vec<u8>,
-    /// the node key that held the run's execution lease when the session was
-    /// opened. the lease can MOVE mid-run (a reassignment, or an expiry that
-    /// re-leases the saga), and the session's authority is the lease — so every
-    /// acting op re-reads the live holder and refuses once it stops matching
-    /// this, and the new holder may open a session of its own.
-    pub holder: Vec<u8>,
+    /// Every action must still belong to this node and execution attempt.
+    pub lease: ExecutionLease,
     pub opened_at: u64,
-    /// how many actions this session has applied — the audit counter.
+    /// Actions admitted across all attempts; rotation never resets ids or budget.
     pub actions: u32,
 }
 

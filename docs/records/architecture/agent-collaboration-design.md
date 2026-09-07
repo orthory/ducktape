@@ -66,7 +66,41 @@ The compute service receives a committed work payload and returns an oracle
 result. A host-owned ephemeral signer authenticates that run's interactive
 AgentAction or DelegateRun requests against its session, lease and grant.
 It is never an identity key of the program account. The scoped HTTP endpoint
-subscribes before admission and waits for the actual target receipt.
+subscribes before admission and waits for the actual target receipt. Each
+execution attempt binds a fresh public key under its lease holder's node key.
+The private key stays on that host; the guest receives a scoped endpoint token.
+A retry replaces the binding and retains the run's action counter. Terminal
+sagas and changed attempts refuse old keys and unclaimed proposals. A target
+call already authorized by the program can finish and retain its receipt. An
+attributed run whose binding fails does not start its provider.
+
+`ducktape_reply(text, destination?)` proposes `AgentAction::Reply`. Without a
+destination, Runs resolves it from committed source context: the original chat
+thread, the Pages comment thread, a shared reply thread on the mentioned block,
+or the job discussion. Live, final and failure replies use the same resolver
+and execute as the program account. Pages reply validation reads thread metadata
+without loading the discussion bodies. An action-only final response keeps its
+actions without inventing another source reply.
+
+The host forwards the destination object without decoding a modality enum.
+Runs owns its schema, resolution and permission checks, so a module can add a
+destination without changing the executor or the tool binary. The current
+module accepts `chat` (channel_id, optional thread), `page`
+(target), `page_thread` (thread_id), or `job` (job_id). Source chat replies require
+`chat.post`; explicit chat destinations require `chat.post_message`. Pages
+replies require `pages.comment` and the owning page in `pages_write`. Job replies
+require `jobs.comment`. Existing task, Pages and DuckFS tools let the model choose
+other writes within its grants. A destination never supplies the author.
+
+The job board stores bounded, immutable comments with their authenticated actor
+and commit height, and exposes them through its point read and index. Comments
+do not claim, finalize or reopen a job. Each comment binds the job creation
+revision, so delayed program calls cannot write into a replacement job, even
+when an ID is reused at the same height. A default job reply also requires the
+run's original claim when proposed; an explicit job destination selects the
+current job. Runs forwards only job claims and
+finalization as lifecycle operations; comments are proposals the program must
+execute like every other conversational write.
 
 ## 4. Failure and persistence
 

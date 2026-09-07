@@ -517,3 +517,106 @@ fn another_sources_run_request_detail_cannot_assign_manual_requester_authority()
         );
     });
 }
+
+#[test]
+fn a_same_node_retry_fences_queued_work_and_gives_new_actions_distinct_ids() {
+    block_on(async {
+        let mut network = Network::new().await;
+        let run = network.provision().await;
+        let stale = propose_task(&mut network, &run, "old-attempt").await;
+        let bytes = network
+            .host
+            .query(
+                "dispatch",
+                &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
+                    receiver: "runs".into(),
+                    dispatch_id: runs::dispatch_id_for(&run),
+                }),
+            )
+            .await
+            .unwrap();
+        let dispatch::DispatchReply::Dispatch(Some(dispatch::DispatchView {
+            status: dispatch::DispatchStatus::AwaitingResult { saga_id },
+            ..
+        })) = dispatch::decode_reply(&bytes).unwrap()
+        else {
+            panic!("the run must have a live saga");
+        };
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::OracleResult {
+                        saga_id: saga_id.clone(),
+                        attempt: 0,
+                        outcome: Err("provider interrupted".into()),
+                        usage: None,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::Accept {
+                        saga_id,
+                        attempt: 1,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::OpenAgentSession {
+                        run_id: run.clone(),
+                        attempt: 1,
+                        session_key: vec![10; 32],
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                sdk::Origin::External(vec![10; 32]),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::AgentAction {
+                        run_id: run.clone(),
+                        action: runs::AgentAction::CreateTask {
+                            task_id: "new-attempt".into(),
+                            title: "The current attempt".into(),
+                        },
+                    },
+                ),
+            )
+            .await;
+        network.drain().await;
+        let old = network.action(&stale).await;
+        assert!(
+            matches!(old.status, runs::ActionStatus::Rejected { .. }),
+            "{old:?}"
+        );
+        assert!(network.task("old-attempt").await.is_none());
+        let fresh = network.action(&runs::action_request_id(&run, 1)).await;
+        assert!(
+            matches!(
+                fresh.status,
+                runs::ActionStatus::Completed {
+                    outcome: dispatch::CallOutcomeSummary::Applied { .. },
+                    ..
+                }
+            ),
+            "{fresh:?}"
+        );
+        assert_eq!(
+            network.task("new-attempt").await.unwrap().owner,
+            tasks::Party::Account(2)
+        );
+    });
+}

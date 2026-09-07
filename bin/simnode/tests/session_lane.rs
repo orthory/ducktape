@@ -8,7 +8,7 @@
 //!
 //! - the per-session action budget (`MAX_ACTIONS_PER_SESSION`) is exact: the
 //!   grant is spent to the boundary, and the next action refuses.
-//! - one session per run: a second `OpenAgentSession` never replaces the live one.
+//! - one key per attempt: a different key cannot replace the live binding.
 //! - only the bound key may act: a different 32-byte origin, session open, is
 //!   refused at the ACL rung (not the unknown-session rung).
 //! - only the lease-holder may open: a non-assignee node, run in flight, is
@@ -99,7 +99,7 @@ fn claim_and_open(sim: &Sim, saga_id: &str, run_id: &str) {
     );
     sim.submit_ok(
         "runs",
-        json!({ "open_agent_session": { "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
+        json!({ "open_agent_session": { "attempt": 0, "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
         Some(NODE),
     );
 }
@@ -155,19 +155,17 @@ fn a_session_spends_its_action_budget_to_the_exact_boundary() {
 /// live session's key is the authority the agent is currently acting under, and
 /// a silent replace would let a squatter revoke it mid-run.
 #[test]
-fn a_second_open_agent_session_on_the_same_run_is_refused() {
+fn a_different_key_cannot_replace_the_same_attempts_session() {
     let storage = tempfile::tempdir().expect("storage dir");
     let node_hex = node_hex();
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
     let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
     claim_and_open(&sim, &saga_id, &run_id);
 
-    // the lease-holder re-opens with a fresh key: refused at the one-session rung
-    // (which fires ahead of the lease-holder check), so even the rightful opener
-    // cannot replace the live binding.
+    // Even the rightful lease holder cannot replace the current attempt's key.
     let error = sim.submit_rejected(
         "runs",
-        json!({ "open_agent_session": { "run_id": run_id, "session_key": OTHER.as_bytes().to_vec() } }),
+        json!({ "open_agent_session": { "attempt": 0, "run_id": run_id, "session_key": OTHER.as_bytes().to_vec() } }),
         Some(NODE),
     );
     assert!(
@@ -248,12 +246,12 @@ fn only_the_lease_holder_may_open_the_agent_session() {
     // is in flight and has no session, so the earlier rungs pass).
     let error = sim.submit_rejected(
         "runs",
-        json!({ "open_agent_session": { "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
+        json!({ "open_agent_session": { "attempt": 0, "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
         Some(OTHER),
     );
     assert!(
         error.contains(&format!(
-            "only the node holding the run's execution lease may open its agent session: {}",
+            "only the node holding the run's current execution lease and attempt may open its agent session: {}",
             run_id
         )),
         "a non-assignee is refused at the lease rung: {error}"
@@ -268,7 +266,7 @@ fn only_the_lease_holder_may_open_the_agent_session() {
     );
     sim.submit_ok(
         "runs",
-        json!({ "open_agent_session": { "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
+        json!({ "open_agent_session": { "attempt": 0, "run_id": run_id, "session_key": SESSION.as_bytes().to_vec() } }),
         Some(NODE),
     );
     let sessions = sim.query("runs", json!("agent_sessions"));

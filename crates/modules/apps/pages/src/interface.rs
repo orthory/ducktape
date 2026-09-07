@@ -362,6 +362,14 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
     sdk::wire::decode(b)
 }
 
+/// Metadata needed to append a reply without loading the discussion's text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommentThreadHead {
+    pub target: String,
+    pub comment_count: u64,
+}
+
 /// the DISPATCH read surface — the point reads other modules' `execute()`
 /// paths resolve through `Ctx::query` (runs' block/comment probes and page
 /// context assembly). UI-shaped enumeration (the page list, per-target
@@ -384,6 +392,8 @@ pub enum PageQuery {
     /// and `parent`, so a resolver learns where the block lives, not just
     /// what it says.
     GetBlock { block_id: String },
+    /// The target and comment count, without reading comment bodies.
+    CommentThreadHead { thread_id: String },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
     /// one comment by id, tombstones included — the existence probe a module
@@ -413,6 +423,7 @@ pub enum PageReply {
     Page(Option<PageBlockPage>),
     Block(Option<Block>),
     CommentThread(Option<ThreadView>),
+    CommentThreadHead(Option<CommentThreadHead>),
     Comment(Option<Comment>),
     TargetThreadCount(u64),
 }

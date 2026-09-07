@@ -412,11 +412,23 @@ async fn dispatch_assignee(h: &Host, run_id: &str) -> Option<Vec<u8>> {
 
 async fn oracle_op(h: &Host, run_id: &str, raw: Vec<u8>) -> Msg {
     let saga_id = dispatch_saga_id(h, run_id).await;
+    let bytes = h
+        .query(
+            "saga",
+            &saga_encode_query(&SagaQuery::Get {
+                saga_id: saga_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let SagaReply::Saga(Some(saga)) = saga_decode_reply(&bytes).unwrap() else {
+        panic!("the run must have a saga");
+    };
     Msg {
         target: "saga".into(),
         payload: saga_encode_msg(&SagaMsg::OracleResult {
             saga_id,
-            attempt: 0,
+            attempt: saga.attempt,
             outcome: Ok(raw),
             usage: None,
         }),
@@ -632,6 +644,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
             pair.submit(
                 Origin::External(WORKER_NODE.to_vec()),
                 runs_op(&RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: run.clone(),
                     session_key: SESSION_KEY.to_vec(),
                 }),
@@ -656,6 +669,18 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                     ..
                 }
             ));
+            pair.submit(
+                Origin::External(SESSION_KEY.to_vec()),
+                runs_op(&RunsMsg::AgentAction {
+                    run_id: run.clone(),
+                    action: AgentAction::Reply {
+                        text: "Review underway.".into(),
+                        destination: None,
+                    },
+                }),
+            )
+            .await;
+            pair.drain().await;
             pair.settle(run, b"Reviewed this inline mention.".to_vec())
                 .await;
             let query = pages::encode_query(&pages::PageQuery::CommentThread {
@@ -671,7 +696,9 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
             assert_eq!(thread.thread.target, target);
             assert_eq!(thread.thread.opener, pages::Party::Account(2));
             assert_eq!(thread.comments[0].author, pages::Party::Account(2));
-            assert_eq!(thread.comments[0].text, "Reviewed this inline mention.");
+            assert_eq!(thread.comments[0].text, "Review underway.");
+            assert_eq!(thread.comments[1].text, "Reviewed this inline mention.");
+            assert_eq!(thread.comments[1].author, pages::Party::Account(2));
             let query = pages::encode_query(&pages::PageQuery::GetBlock {
                 block_id: "inline-todo".into(),
             });
@@ -1098,6 +1125,7 @@ fn rejections_match_and_leave_no_trace() {
             (
                 alice(),
                 runs_op(&RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: "nope".into(),
                     session_key: vec![7; 8],
                 }),
@@ -1106,6 +1134,7 @@ fn rejections_match_and_leave_no_trace() {
             (
                 Origin::System,
                 runs_op(&RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: "nope".into(),
                     session_key: vec![7; 32],
                 }),
@@ -1114,6 +1143,7 @@ fn rejections_match_and_leave_no_trace() {
             (
                 alice(),
                 runs_op(&RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: "nope".into(),
                     session_key: vec![7; 32],
                 }),
@@ -1187,6 +1217,7 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
         pair.submit(
             Origin::External(WORKER_NODE.to_vec()),
             runs_op(&RunsMsg::OpenAgentSession {
+                attempt: 0,
                 run_id: run.clone(),
                 session_key: SESSION_KEY.to_vec(),
             }),
@@ -1302,24 +1333,30 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             Some(WORKER_NODE.to_vec())
         );
         let open = runs_op(&RunsMsg::OpenAgentSession {
+            attempt: 0,
             run_id: run.clone(),
             session_key: SESSION_KEY.to_vec(),
         });
         pair.rejected(alice(), open.clone(), "lease").await;
         pair.submit(Origin::External(WORKER_NODE.to_vec()), open.clone())
             .await;
+        pair.submit(Origin::External(WORKER_NODE.to_vec()), open)
+            .await;
         pair.rejected(
             Origin::External(WORKER_NODE.to_vec()),
-            open,
+            runs_op(&RunsMsg::OpenAgentSession {
+                attempt: 0,
+                run_id: run.clone(),
+                session_key: vec![0x66; 32],
+            }),
             "already has an open",
         )
         .await;
         let post = runs_op(&RunsMsg::AgentAction {
             run_id: run.clone(),
-            action: AgentAction::PostMessage {
-                channel_id: "general".into(),
+            action: AgentAction::Reply {
                 text: "working".into(),
-                thread: None,
+                destination: None,
             },
         });
         pair.rejected(
@@ -1361,13 +1398,86 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             .unwrap();
         assert_eq!(message.head.author, Party::Account(2));
         assert_eq!(message.head.origin, Origin::Program(2));
+        assert_eq!(message.head.thread, Some(1));
         verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 0)).await;
+        // An admitted action cannot borrow the next attempt's lease, even
+        // when the same node wins it. Completed receipts remain reportable.
+        let reply_action = runs_op(&RunsMsg::AgentAction {
+            run_id: run.clone(),
+            action: AgentAction::Reply {
+                text: "next update".into(),
+                destination: None,
+            },
+        });
+        pair.submit(Origin::External(SESSION_KEY.to_vec()), reply_action.clone())
+            .await;
+        let saga_id = dispatch_saga_id(&pair.native, &run).await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            op!(
+                "saga",
+                &SagaMsg::OracleResult {
+                    saga_id: saga_id.clone(),
+                    attempt: 0,
+                    outcome: Err("interrupted provider".into()),
+                    usage: None,
+                }
+            ),
+        )
+        .await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            op!(
+                "saga",
+                &SagaMsg::Accept {
+                    saga_id,
+                    attempt: 1,
+                }
+            ),
+        )
+        .await;
+        pair.rejected(
+            Origin::External(SESSION_KEY.to_vec()),
+            reply_action.clone(),
+            "lease has moved",
+        )
+        .await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            runs_op(&RunsMsg::OpenAgentSession {
+                run_id: run.clone(),
+                attempt: 1,
+                session_key: vec![0x77; 32],
+            }),
+        )
+        .await;
+        assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 2);
+        assert_eq!(agent_sessions(&pair.wasm).await[0].lease.attempt, 1);
+        pair.submit(Origin::External(vec![0x77; 32]), reply_action)
+            .await;
+        pair.drain().await;
+        assert!(matches!(
+            pair.action(&runs::action_request_id(&run, 1)).await.status,
+            runs::ActionStatus::Rejected { .. }
+        ));
+        assert!(
+            chat_message(&pair.wasm, &runs::post_message_id(&run, "s1"))
+                .await
+                .is_none()
+        );
+        let retried = chat_message(&pair.wasm, &runs::post_message_id(&run, "s2"))
+            .await
+            .unwrap();
+        assert_eq!(retried.head.author, Party::Account(2));
+        assert_eq!(retried.head.thread, Some(1));
+        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 2)).await;
         pair.settle(&run, canned_response(&run)).await;
         let reply = chat_message(&pair.wasm, &reply_message_id(&run))
             .await
             .unwrap();
         assert_eq!(reply.head.author, Party::Account(2));
         assert_eq!(reply.head.origin, Origin::Program(2));
+        assert_eq!(reply.head.thread, Some(1));
         assert_eq!(
             recent_runs(&pair.wasm).await[0].outcome,
             runs::RunOutcome::ResultAccepted
@@ -1393,7 +1503,12 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
     let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
         let mut pair = Pair::new(&context, directory.path()).await;
-        pair.provision(2, "quackbot", &[ACTION_TASKS_CREATE]).await;
+        pair.provision(
+            2,
+            "quackbot",
+            &[ACTION_TASKS_CREATE, runs::ACTION_JOBS_COMMENT],
+        )
+        .await;
         pair.submit(
             alice(),
             runs_op(&RunsMsg::EnableJobWorker { enabled: true }),
@@ -1419,8 +1534,33 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
         assert_eq!(pair.requests.len(), 1);
         pair.accept(&run).await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            runs_op(&RunsMsg::OpenAgentSession {
+                run_id: run.clone(),
+                attempt: 0,
+                session_key: SESSION_KEY.to_vec(),
+            }),
+        )
+        .await;
+        pair.submit(
+            Origin::External(SESSION_KEY.to_vec()),
+            runs_op(&RunsMsg::AgentAction {
+                run_id: run.clone(),
+                action: AgentAction::Reply {
+                    text: "Job underway.".into(),
+                    destination: None,
+                },
+            }),
+        )
+        .await;
+        pair.drain().await;
         let response = encode_response(&AgentResponse {
-            reply_blocks: Vec::new(),
+            reply_blocks: vec![ReplyBlock {
+                kind: "paragraph".into(),
+                text: "Job complete.".into(),
+                lang: None,
+            }],
             actions: vec![AgentAction::CreateTask {
                 task_id: "job-task".into(),
                 title: "complete job".into(),
@@ -1443,6 +1583,18 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&bytes).unwrap() else {
             panic!("job");
         };
+        assert_eq!(
+            job.comments
+                .iter()
+                .map(|comment| comment.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Job underway.", "Job complete."]
+        );
+        assert!(
+            job.comments
+                .iter()
+                .all(|comment| comment.author == tasks::Party::Account(2))
+        );
         assert_eq!(job.status, tasks::JobStatus::Done);
         assert!(job.result.unwrap().ok);
     });

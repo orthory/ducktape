@@ -348,7 +348,7 @@ pub(crate) fn render_job_payload(
         agent,
         run_id,
         format!(
-            "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
+            "Job {job_id} — replies are delivered to this job discussion; use ducktape_reply for live updates.\n\nJob spec:\n{spec}"
         ),
         portable,
     )
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(
             v["conversation"],
-            "Job job-1 — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\nsummarize this work item"
+            "Job job-1 — replies are delivered to this job discussion; use ducktape_reply for live updates.\n\nJob spec:\nsummarize this work item"
         );
     }
 

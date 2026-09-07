@@ -668,7 +668,7 @@ fn an_out_of_acl_agent_action_is_refused_at_the_module_layer() {
     // the same bytes as a UTF-8 origin below.
     sim.submit_ok(
         "runs",
-        serde_json::json!({ "open_agent_session": { "run_id": run_id, "session_key": vec![b's'; 32] } }),
+        serde_json::json!({ "open_agent_session": { "attempt": 0, "run_id": run_id, "session_key": vec![b's'; 32] } }),
         Some(&node),
     );
 
