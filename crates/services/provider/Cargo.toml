@@ -13,6 +13,15 @@ version.workspace = true
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home = { workspace = true }
 async-trait = { workspace = true }
+# the run's node read lane (src/read_lane.rs): a loopback proxy in front of the
+# node's http listener, bound to one run — same server/client pair the run's
+# credential broker next door is built from.
+axum = "0.8"
+futures = { workspace = true }
+# `ModelRecord::permits` and its two duckfs-reply filters: the read lane and the
+# `ducktape mcp` tool plane gate on the SAME predicate on the SAME record, so
+# neither can drift into admitting what the other refuses.
+runs = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
