@@ -49,9 +49,12 @@ const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// to hold one open, so the ceiling has to be the host's. See #1873.
 const MAX_TUNNEL_CONNECTIONS: usize = 64;
 
-/// a spliced connection with no bytes in either direction for this long is
-/// closed. Without this, a guest that stops talking (or a service that stops
-/// answering) holds its two fds and its permit forever for free.
+/// a spliced connection with no bytes moved in EITHER direction for this
+/// long is closed. The deadline is for the connection as a whole, not each
+/// direction on its own: a request that goes quiet once its body ends must
+/// not cut off a response still streaming the other way. Without this at
+/// all, a guest that stops talking (or a service that stops answering) holds
+/// its two fds and its permit forever for free.
 const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// a live run's stdio, shaped like the pipes an ordinary child would give, so
@@ -488,9 +491,10 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16, run: Arc<Tunnel
 }
 
 /// splice one guest connection to `service_port` on this host's loopback
-/// until either direction hits EOF, an error, or goes idle — whichever comes
-/// first ends the whole connection, since a splice held open by only one live
-/// direction still spends its permit and two fds for nothing.
+/// until EOF or an error ends either direction, or the shared [`Activity`]
+/// deadline decides the CONNECTION has been idle — a direction going quiet on
+/// its own (a request whose body ended while its response keeps streaming)
+/// never ends the splice by itself.
 async fn splice(guest: UnixStream, service_port: u16, _permit: tokio::sync::OwnedSemaphorePermit) {
     let service = match TcpStream::connect(("127.0.0.1", service_port)).await {
         Ok(service) => service,
@@ -511,35 +515,79 @@ async fn splice(guest: UnixStream, service_port: u16, _permit: tokio::sync::Owne
     };
     let (mut guest_read, mut guest_write) = guest.into_split();
     let (mut broker_read, mut broker_write) = service.into_split();
-    let up = copy_until_idle(&mut guest_read, &mut broker_write, TUNNEL_IDLE_TIMEOUT);
-    let down = copy_until_idle(&mut broker_read, &mut guest_write, TUNNEL_IDLE_TIMEOUT);
-    // race, not join: both directions concurrently, and the first one to end
-    // (EOF, error, or idle) tears down the whole connection rather than
-    // leaving the other half parked on a peer that already left.
+    let activity = Activity::new();
+    let up = copy_streaming(&mut guest_read, &mut broker_write, &activity);
+    let down = copy_streaming(&mut broker_read, &mut guest_write, &activity);
+    let watchdog = idle_watchdog(&activity, TUNNEL_IDLE_TIMEOUT);
+    // race, not join: EOF or an error in either direction, or the watchdog
+    // deciding the connection as a whole has moved no byte in
+    // TUNNEL_IDLE_TIMEOUT, tears the whole connection down — whichever of the
+    // three happens first.
     tokio::select! {
         _ = up => {}
         _ = down => {}
+        _ = watchdog => {}
     }
 }
 
-/// copy from `reader` to `writer` until EOF, a read/write error, or `idle`
-/// elapses with no bytes read — whichever comes first.
-async fn copy_until_idle<R, W>(reader: &mut R, writer: &mut W, idle: std::time::Duration)
+/// the last time any byte moved in either direction of one spliced
+/// connection. Shared by both copy loops and the watchdog in [`splice`] so
+/// idleness is judged for the connection as a whole, never per direction.
+struct Activity(Mutex<tokio::time::Instant>);
+
+impl Activity {
+    fn new() -> Self {
+        Self(Mutex::new(tokio::time::Instant::now()))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap() = tokio::time::Instant::now();
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// copy from `reader` to `writer` until EOF or a read/write error — no
+/// per-direction idle timeout here; that is [`idle_watchdog`]'s job, over the
+/// shared [`Activity`] mark, so one silent direction cannot end an otherwise
+/// live connection. `activity` is touched after every read AND after every
+/// write completes: touching only on read would let a writer that never
+/// accepts bytes (a stalled peer) hold the splice open forever, since a
+/// read-only mark never ages while `write_all` blocks.
+async fn copy_streaming<R, W>(reader: &mut R, writer: &mut W, activity: &Activity)
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let read = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => break, // EOF, a read error, or the idle timeout: all end the copy.
+        let read = match reader.read(&mut buf).await {
+            Ok(n) if n > 0 => n,
+            _ => break, // EOF or a read error ends the copy.
         };
+        activity.touch();
         if writer.write_all(&buf[..read]).await.is_err() {
             break;
         }
+        activity.touch();
     }
     let _ = writer.shutdown().await;
+}
+
+/// sleeps until `activity` has been unmoved for `idle`, re-checking on each
+/// wake since a copy loop may have touched it while this slept. The one place
+/// that decides a spliced connection's shared deadline has actually elapsed.
+async fn idle_watchdog(activity: &Activity, idle: std::time::Duration) {
+    loop {
+        let deadline = activity.last() + idle;
+        tokio::time::sleep_until(deadline).await;
+        let still_idle = tokio::time::Instant::now() >= activity.last() + idle;
+        if still_idle {
+            return;
+        }
+    }
 }
 
 /// one run's guest-tunnel bookkeeping, shared across every tunnel the run has
@@ -1161,6 +1209,116 @@ mod tests {
                 .expect("a closed socket reads Ok(0), not an error");
             assert_eq!(n, 0, "shutdown left a splice running");
         }
+
+        accept.abort();
+    }
+
+    /// #1881: a request direction that goes silent once its body ends must
+    /// not cut off a response still streaming the other way, even across
+    /// several `TUNNEL_IDLE_TIMEOUT` windows. A per-direction timer (the old
+    /// behavior) closes this tunnel after the first window; the shared
+    /// [`Activity`] deadline must not.
+    #[tokio::test(start_paused = true)]
+    async fn a_streaming_response_survives_a_silent_request_direction() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind service");
+        let service_port = listener.local_addr().expect("local addr").port();
+        let (service_tx, service_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = service_tx.send(stream);
+        });
+
+        let path = unique_socket_path("silent-request");
+        let tunnel_listener = UnixListener::bind(&path).expect("bind tunnel socket");
+        let run = Arc::new(TunnelRun::new(1));
+        let accept = tokio::spawn(serve_tunnel(tunnel_listener, service_port, Arc::clone(&run)));
+
+        let mut guest = UnixStream::connect(&path).await.expect("connect guest");
+        // the whole "request": sent once, then the guest→service direction
+        // never sends another byte for the rest of the test.
+        guest.write_all(b"req").await.expect("send the request");
+        let mut service = service_rx.await.expect("service accepted the splice");
+        let mut request = [0u8; 3];
+        service
+            .read_exact(&mut request)
+            .await
+            .expect("service reads the request");
+        assert_eq!(&request, b"req");
+
+        // the response streams for several idle windows while the request
+        // direction stays silent; each round trip must still arrive.
+        const ROUNDS: u8 = 3;
+        for round in 0..ROUNDS {
+            tokio::time::advance(TUNNEL_IDLE_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            service
+                .write_all(&[round])
+                .await
+                .expect("service writes a response chunk");
+            let mut chunk = [0u8; 1];
+            // a plain await, not a raced timeout: under a paused clock a
+            // `tokio::time::timeout` here would compete with the production
+            // watchdog's own sleep and can resolve on a virtual-clock
+            // auto-advance before the real cross-task splice hops (guest ->
+            // up copy -> broker -> service, and back down) ever run — the
+            // event to wait on is the byte arriving, not a deadline.
+            guest
+                .read_exact(&mut chunk)
+                .await
+                .expect("read the response chunk");
+            assert_eq!(
+                chunk[0], round,
+                "a response chunk was lost while the request direction was silent"
+            );
+        }
+
+        // the service ending its response is what closes the tunnel here —
+        // not an idle timeout that should never have fired.
+        drop(service);
+        let mut buf = [0u8; 1];
+        let n = guest
+            .read(&mut buf)
+            .await
+            .expect("a closed socket reads Ok(0), not an error");
+        assert_eq!(n, 0, "the tunnel did not close when the response ended");
+
+        accept.abort();
+    }
+
+    /// #1881: when NEITHER direction has moved a byte for `TUNNEL_IDLE_TIMEOUT`,
+    /// the shared deadline must still close the tunnel.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_silent_in_both_directions_closes_at_the_deadline() {
+        let service_port = spawn_echo_service().await;
+        let path = unique_socket_path("both-silent");
+        let listener = UnixListener::bind(&path).expect("bind tunnel socket");
+        let run = Arc::new(TunnelRun::new(1));
+        let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
+
+        let mut guest = UnixStream::connect(&path).await.expect("connect guest");
+        // a plain round trip, not `assert_spliced`'s timeout-wrapped read: see
+        // the comment in the streaming-response test above for why a raced
+        // timer is unsound here under a paused clock.
+        guest.write_all(b"x").await.expect("write to a live tunnel");
+        let mut echoed = [0u8; 1];
+        guest
+            .read_exact(&mut echoed)
+            .await
+            .expect("the echo answers");
+        assert_eq!(&echoed, b"x", "the tunnel closed instead of echoing");
+
+        // silence in both directions across the whole deadline.
+        tokio::time::advance(TUNNEL_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+
+        let mut buf = [0u8; 1];
+        let n = guest
+            .read(&mut buf)
+            .await
+            .expect("a closed socket reads Ok(0), not an error");
+        assert_eq!(n, 0, "a tunnel idle in both directions was not closed");
 
         accept.abort();
     }

@@ -725,7 +725,12 @@ pub fn router(handle: NodeHandle) -> Router {
         )
         .route("/v1/files/commit", post(files_commit))
         .route("/v1/files/pin", post(files_pin))
-        .route("/v1/files/pin/{name}", delete(files_unpin))
+        // the name rides a signed JSON body, not a path segment: `url`
+        // normalizes `%2E`/`%2E%2E` path segments as dot-segments before the
+        // request leaves the client, so a pin named `.` or `..` (both legal,
+        // see `pin_apply`) could reach a different route or fail signature
+        // verification through a path-shaped route.
+        .route("/v1/files/unpin", post(files_unpin))
         .route("/v1/files/watch", post(files_watch))
         .route("/v1/files/stat", get(files_stat))
         .route("/v1/files/ls", get(files_ls))

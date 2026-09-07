@@ -238,12 +238,13 @@ impl Run {
         })
     }
 
-    /// a read-side cap probe. reads cross no consensus op that could check them,
-    /// so this is the only gate they get — and it is honest about being one: the
-    /// node's `/v1/query` is ambient to any local process. under codex's
-    /// network-less sandbox this server IS the only door and the probe is a real
-    /// boundary; under claude it is a guardrail on a surface the run could reach
-    /// anyway.
+    /// a read-side cap probe. reads cross no consensus op that could check
+    /// them, so this is the gate they get — and it is not the only one: a
+    /// sandboxed run reaches the node through its own cap-checked read lane
+    /// (`provider-host`'s `read_lane`), which gates the raw `/v1/files/*`
+    /// routes on this same predicate and this same record. So the two agree by
+    /// construction, and the duckfs cap is a real boundary rather than a
+    /// suggestion a `curl` walks around.
     ///
     /// WRITES do not come through here. they are gated in consensus — see
     /// [`Run::act`] and this module's doc.
