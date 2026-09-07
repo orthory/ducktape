@@ -412,8 +412,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let pending_retarget: Option<reachability::MeshEpochEvent> = None;
     // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
     // dev chain quiet — no nop blocks — so every committed block is real
-    // activity and the journal/logs carry no idle churn. Pending module swaps
-    // temporarily restore the heartbeat so their activation height is reachable.
+    // activity and the journal/logs carry no idle churn. NEVER set this on a
+    // multi-node or upgrade-driving network: the heartbeat is what ticks an
+    // idle chain across a pending cutover and keeps the console height
+    // visibly live.
     let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
     // throttle for the saga crank pump below.
     let last_crank = context.current();

@@ -329,8 +329,7 @@ PYHASH
 Pass a mapper path as the second Python argument to include it. `index: null`
 removes an existing mapper when the component activates. Activation is at the
 governance execute height plus `after`, with readiness required from every
-validator. A pending swap keeps the dev node's otherwise quiet heartbeat
-running until it activates or expires.
+validator.
 
 The run's program reply acknowledges the request. Observe actual deployment
 through the durable queue, using the `query` function above:

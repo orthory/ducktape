@@ -546,3 +546,202 @@ fn forged_program_output_cannot_redirect_the_link_of_a_successful_call() {
         );
     });
 }
+
+async fn deployment_network(label: &str, actions: usize) -> (Directory, Network) {
+    let directory = Directory::new(label);
+    let (mut network, _) = awaiting_pr_with_actions(
+        &directory,
+        runs::model_program("builder"),
+        (0..actions).map(|_| replacement_action()).collect(),
+    )
+    .await;
+    let mut registry = modules::Modules::new("modules", store(), "valset", "governance");
+    registry.seed("hello", vec![0; 32]).await.unwrap();
+    registry.finish_seed().await.unwrap();
+    network.host.register(Box::new(registry));
+    network.host.register(Box::new(
+        governance::Governance::new("governance", store(), "valset", "identity")
+            .with_code_registry("modules"),
+    ));
+    network.drain().await;
+    (directory, network)
+}
+
+#[test]
+fn only_a_validator_can_refuse_unproposed_work_and_retries_do_not_enqueue_it_again() {
+    block_on(async {
+        let (_directory, mut network) = deployment_network("deployment-refusal", 2).await;
+        let first = next_update(&network).await.unwrap();
+        let refusal = runs::RunsMsg::RefuseModuleUpdate {
+            sequence: 0,
+            reason: "artifact hash mismatch".into(),
+        };
+        network.height += 1;
+        let denied = network
+            .host
+            .submit_at(
+                host::BlockContext {
+                    height: network.height,
+                    consensus_time: network.height,
+                    origin: member(),
+                },
+                msg("runs", &refusal),
+            )
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(next_update(&network).await, Some(first.clone()));
+        network.submit(provider(), msg("runs", &refusal)).await;
+        assert_eq!(next_update(&network).await.unwrap().request.sequence, 1);
+        let request = first.request;
+        network
+            .submit(
+                sdk::Origin::Program(request.account),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::RequestModuleUpdate {
+                        request_id: request.request_id,
+                        run_id: request.run_id,
+                        source: request.source,
+                        update: request.update,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::RefuseModuleUpdate {
+                        sequence: 1,
+                        reason: "artifact hash mismatch".into(),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            next_update(&network).await.is_none(),
+            "retry must not become sequence two"
+        );
+        let bytes = network
+            .host
+            .query(
+                "runs",
+                &runs::encode_query(&runs::RunsQuery::ModuleUpdate { sequence: 0 }),
+            )
+            .await
+            .unwrap();
+        let runs::RunsReply::ModuleUpdate(Some(view)) = runs::decode_reply(&bytes).unwrap() else {
+            panic!("durable rejected request")
+        };
+        assert!(matches!(
+            view.status,
+            runs::ModuleUpdateStatus::Rejected { .. }
+        ));
+    });
+}
+
+#[test]
+fn reconciliation_requires_registry_evidence_and_expired_readiness_releases_the_queue() {
+    block_on(async {
+        let (_directory, mut network) = deployment_network("deployment-expired", 1).await;
+        let first = next_update(&network).await.unwrap();
+        let reconcile = runs::RunsMsg::ReconcileModuleUpdate { sequence: 0 };
+        network.submit(member(), msg("runs", &reconcile)).await;
+        assert_eq!(
+            next_update(&network).await,
+            Some(first.clone()),
+            "a caller cannot claim activation"
+        );
+        let id = runs::module_update_proposal_id(0);
+        network
+            .submit(
+                provider(),
+                msg(
+                    "governance",
+                    &governance::GovMsg::Propose {
+                        proposal_id: id.clone(),
+                        voting_period: 1_000,
+                        action: governance::GovAction::UpdateModule {
+                            name: id.clone(),
+                            module_id: "hello".into(),
+                            activation_lead: first.request.update.after,
+                            code_hash: first.request.update.digest().unwrap().to_vec(),
+                        },
+                    },
+                ),
+            )
+            .await;
+        for voter in [7, 8] {
+            network
+                .submit(
+                    sdk::Origin::External(vec![voter; 32]),
+                    msg(
+                        "governance",
+                        &governance::GovMsg::Vote {
+                            proposal_id: id.clone(),
+                            approve: true,
+                        },
+                    ),
+                )
+                .await;
+        }
+        network
+            .submit(
+                provider(),
+                msg(
+                    "governance",
+                    &governance::GovMsg::Execute { proposal_id: id },
+                ),
+            )
+            .await;
+        network.drain().await;
+        network.height += 1;
+        let denied = network
+            .host
+            .submit_at(
+                host::BlockContext {
+                    height: network.height,
+                    consensus_time: network.height,
+                    origin: provider(),
+                },
+                msg(
+                    "runs",
+                    &runs::RunsMsg::RefuseModuleUpdate {
+                        sequence: 0,
+                        reason: "too late to refuse".into(),
+                    },
+                ),
+            )
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(
+            next_update(&network).await,
+            Some(first.clone()),
+            "a validator cannot override a committed proposal"
+        );
+        // Advancing these exact blocks exercises the activation lead, not a wall-clock wait.
+        for _ in 0..first.request.update.after {
+            network.step().await;
+        }
+        network.submit(member(), msg("runs", &reconcile)).await;
+        assert!(next_update(&network).await.is_none());
+        let bytes = network
+            .host
+            .query(
+                "runs",
+                &runs::encode_query(&runs::RunsQuery::ModuleUpdate { sequence: 0 }),
+            )
+            .await
+            .unwrap();
+        let runs::RunsReply::ModuleUpdate(Some(view)) = runs::decode_reply(&bytes).unwrap() else {
+            panic!("durable expired request")
+        };
+        assert_eq!(
+            view.status,
+            runs::ModuleUpdateStatus::Rejected {
+                reason: "deployment expired before every validator was ready".into()
+            }
+        );
+    });
+}

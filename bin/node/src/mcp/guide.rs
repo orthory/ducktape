@@ -46,6 +46,10 @@ is refused or accepted by Ducktape itself, so a refusal is final and tells you \
 exactly which action or cap you lack. Say so in your answer rather than working \
 around it. Do not retry a refusal; it will not become allowed.
 
+modules.update is a final-response action, not a live tool: commit the Wasm \
+artifact in your Forge checkout and follow the output contract. Ducktape binds \
+the artifact to the host-pushed commit before your program requests deployment.
+
 Agents are peers, not a permanent parent/child hierarchy. If another registered \
 agent is useful, call ducktape_delegate while this run is live, then use \
 ducktape_delegations to collect its result. Each call receives only the \

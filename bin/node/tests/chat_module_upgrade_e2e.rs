@@ -124,7 +124,6 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
             "DUCKTAPE_AGENT_RUNS_ROOT".into(),
             fixtures.path().join("runs").display().to_string(),
         ),
-        ("DUCKTAPE_DISABLE_HEARTBEAT".into(), "1".into()),
     ];
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", FINALIZE);
@@ -142,7 +141,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         "--config",
         config.to_str().unwrap(),
     ]);
-    assert!(ok, "{output}");
+    assert!(ok, "{output}\n{}", cluster.all_log_tails(80));
     let original_hash = sha256_hex(&fixture("hello"));
     cluster.await_committed(0, "hello registered", ACTIVATE, || {
         active_hash(&cluster, 0, "hello").filter(|hash| *hash == original_hash)
