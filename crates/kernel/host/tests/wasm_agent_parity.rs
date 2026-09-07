@@ -30,7 +30,7 @@ use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use saga::{SagaModule, SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
-use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
+use statesync::qmdb::{QmdbStore, encode_qmdb_req, ops_request};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `agent` module's guest port by
@@ -554,12 +554,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .await
         .expect("wasm target");
     assert_eq!(n_target, w_target, "resolver sync targets diverge");
-    let req = encode_qmdb_req(&QmdbSyncReq::Ops {
-        op_count: n_target.op_count,
-        start_loc: n_target.start,
-        max_ops: 64,
-        include_pinned: true,
-    });
+    let req = encode_qmdb_req(&ops_request(n_target.op_count, n_target.start, 64));
     assert_eq!(
         native
             .serve_sync("agent", &req)

@@ -16,7 +16,7 @@ use pages::{
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
-use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
+use statesync::qmdb::{QmdbStore, encode_qmdb_req, ops_request};
 use tagging::TaggingModule;
 use wasm_host::WasmModule;
 
@@ -414,12 +414,7 @@ fn same_ops_identical_roots_block_by_block() {
             .await
             .expect("wasm target");
         assert_eq!(n_target, w_target, "resolver sync targets diverge");
-        let req = encode_qmdb_req(&QmdbSyncReq::Ops {
-            op_count: n_target.op_count,
-            start_loc: n_target.start,
-            max_ops: 64,
-            include_pinned: true,
-        });
+        let req = encode_qmdb_req(&ops_request(n_target.op_count, n_target.start, 64));
         assert_eq!(
             native
                 .serve_sync("pages", &req)

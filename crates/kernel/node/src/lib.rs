@@ -111,7 +111,7 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
     use commonware_cryptography::{Hasher as _, Sha256};
     let mut hasher = Sha256::default();
     hasher.update(bytes);
-    let digest = hasher.finalize();
+    let (_, digest) = hasher.finalize();
     let mut id = [0u8; 32];
     id.copy_from_slice(digest.as_ref());
     id

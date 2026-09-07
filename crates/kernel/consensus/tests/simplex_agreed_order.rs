@@ -122,6 +122,7 @@ where
             simulated::Config {
                 max_size: 1024 * 1024,
                 disconnect_on_block: true,
+                max_peers_per_set: NZUsize!(32),
                 tracked_peer_sets: NZUsize!(1),
             },
             participants.clone(),
@@ -148,7 +149,7 @@ where
         let link = Link {
             latency: Duration::from_millis(10),
             jitter: Duration::from_millis(1),
-            success_rate: 1.0,
+            success_rate: commonware_utils::probability!(1.0),
         };
         for v1 in participants.iter() {
             for v2 in participants.iter() {

@@ -73,19 +73,19 @@ pub(crate) async fn run(
     for epoch in 0..EPOCH_CHANNEL_BANK {
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+            let (_tx, mut rx) = network.register(ch, quota);
             let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
             context
                 .child(label)
                 .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
-    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the submit-relay lane: a sync-only resident holds no standing,
     // relays no writes, and answers nothing — but an unregistered
     // channel kills the sender, so black-hole.
     {
-        let (_tx, mut rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+        let (_tx, mut rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
         context
             .child("blackhole_submit_relay")
             .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
@@ -93,7 +93,7 @@ pub(crate) async fn run(
     // the reachability lane: a sync-only resident runs no WireGuard
     // plane, but the channel must exist — black-hole.
     {
-        let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota);
         context
             .child("blackhole_reachability")
             .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });

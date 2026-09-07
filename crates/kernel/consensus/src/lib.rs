@@ -107,7 +107,7 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 pub fn digest_of(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::default();
     hasher.update(bytes);
-    hasher.finalize()
+    hasher.finalize().1
 }
 
 // ============================================================================
@@ -514,6 +514,13 @@ impl Cadence {
     pub fn timeout_retry(self) -> std::time::Duration {
         self.block_time * 10
     }
+
+    /// how long a leader may stay silent before its unfinalized views are
+    /// fast-skipped. simplex requires it above BOTH `certification_timeout`
+    /// and `timeout_retry`, so it sits one beat past the retry cadence.
+    pub fn skip_timeout(self) -> std::time::Duration {
+        self.block_time * 11
+    }
 }
 
 /// this node's pending-proposal queue plus its enqueue signal, one shared
@@ -898,6 +905,9 @@ impl ResolverConsumer for PayloadConsumer {
     type Key = Digest;
     type Value = Bytes;
     type Subscriber = ();
+    // a plain verdict: `true` completes the fetch, `false` blocks the peer
+    // and retries — content-addressing leaves no ambiguous middle.
+    type Outcome = bool;
 
     fn deliver(
         &mut self,
@@ -945,7 +955,7 @@ where
         + commonware_runtime::Storage
         + commonware_runtime::Metrics
         + commonware_runtime::BufferPooler
-        + rand_core::CryptoRngCore
+        + rand_core::CryptoRng
         + Send
         + Sync
         + 'static,
@@ -967,7 +977,6 @@ where
         producer: PayloadProducer { store },
         mailbox_size: NZUsize!(1024),
         me: Some(me),
-        initial: Duration::from_millis(100),
         timeout: Duration::from_millis(400),
         fetch_retry_timeout: Duration::from_millis(100),
         priority_requests: false,
@@ -1519,7 +1528,7 @@ impl SimplexOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -1543,7 +1552,7 @@ impl SimplexOrderer {
     {
         use commonware_consensus::simplex::{
             Engine,
-            config::{Config as SimplexConfig, Floor, ForwardingPolicy},
+            config::{Config as SimplexConfig, Floor, ForwardPolicy, SkipBudget, SkipPolicy},
             elector::RoundRobin,
         };
         use commonware_consensus::types::ViewDelta;
@@ -1597,13 +1606,18 @@ impl SimplexOrderer {
             certification_timeout: cadence.certification_timeout(),
             timeout_retry: cadence.timeout_retry(),
             fetch_timeout: Duration::from_secs(1),
-            activity_timeout: ViewDelta::new(10),
-            skip_timeout: ViewDelta::new(5),
-            fetch_concurrent: NZUsize!(4),
+            view_retention: ViewDelta::new(10),
+            skip: SkipPolicy::Enabled {
+                timeout: cadence.skip_timeout(),
+                budget: SkipBudget::default(),
+            },
+            // full votes stay retained past certification: the reporter's
+            // equivocation reports are exact, never best effort.
+            track_historical_votes: true,
             replay_buffer: NZUsize!(1024 * 1024),
             write_buffer: NZUsize!(1024 * 1024),
             page_cache,
-            forwarding: ForwardingPolicy::Disabled,
+            forward: ForwardPolicy::Disabled,
         };
 
         let engine = Engine::new(context.child("engine"), cfg);
@@ -1645,7 +1659,7 @@ impl SimplexOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -1734,7 +1748,7 @@ impl SimplexOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -1841,7 +1855,7 @@ impl SimplexOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -1919,7 +1933,7 @@ pub fn verify_finalization<S, R>(
 ) -> Result<Finalization<S, Digest>, String>
 where
     S: commonware_consensus::simplex::scheme::Scheme<Digest>,
-    R: rand_core::CryptoRngCore,
+    R: rand_core::CryptoRng,
 {
     use commonware_parallel::Sequential;
     let finalization =
@@ -2040,7 +2054,7 @@ impl FollowerOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -2111,7 +2125,7 @@ impl FollowerOrderer {
             + commonware_runtime::Storage
             + commonware_runtime::Metrics
             + commonware_runtime::BufferPooler
-            + rand_core::CryptoRngCore
+            + rand_core::CryptoRng
             + Send
             + Sync
             + 'static,
@@ -2149,7 +2163,7 @@ impl FollowerOrderer {
     ) -> Result<Observed, String>
     where
         S: commonware_consensus::simplex::scheme::Scheme<Digest>,
-        R: rand_core::CryptoRngCore,
+        R: rand_core::CryptoRng,
     {
         // retry fetches a previous observe failed to enqueue — a dropped
         // fetch would stall its gate slot (and the release prefix) forever.
@@ -2469,7 +2483,7 @@ mod tests {
             let tampered = Bytes::from_static(b"byzantine garbage");
             let bad = Delivery {
                 key,
-                subscribers: NonEmptyVec::new(()),
+                subscribers: NonEmptyVec::new(((), tracing::Span::none())),
             };
             let valid = consumer.deliver(bad, tampered).await.expect("verdict");
             assert!(
@@ -2482,7 +2496,7 @@ mod tests {
             let dg = digest_of(&good);
             let ok = Delivery {
                 key: dg,
-                subscribers: NonEmptyVec::new(()),
+                subscribers: NonEmptyVec::new(((), tracing::Span::none())),
             };
             let valid = consumer
                 .deliver(ok, Bytes::from(good.clone()))

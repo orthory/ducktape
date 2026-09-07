@@ -327,8 +327,10 @@ mod tests {
                 .expect("signer signs")
             })
             .collect();
+        let attestations = commonware_utils::iter::NonEmpty::try_new(attestations.into_iter())
+            .expect("a quorum is never empty");
         let certificate = schemes[0]
-            .assemble::<_, N3f1>(attestations, &Sequential)
+            .assemble(attestations, &Sequential)
             .expect("quorum assembles");
         Certificate::Finalization(Finalization::<simplex_ed25519::Scheme, Digest> {
             proposal,

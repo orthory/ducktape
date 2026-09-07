@@ -691,7 +691,7 @@ pub(super) async fn wire(
     for epoch in 0..initial_resume_epoch {
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+            let (_tx, mut rx) = network.register(ch, quota);
             let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
             context
                 .child(label)
@@ -713,21 +713,21 @@ pub(super) async fn wire(
             .map(|i| {
                 let (vote, cert, res, payload, fetch) = engine_channels(bank_base + i);
                 super::LaneSlot::Banked((
-                    network.register(vote, quota, MAX_BACKLOG),
-                    network.register(cert, quota, MAX_BACKLOG),
-                    network.register(res, quota, MAX_BACKLOG),
-                    network.register(payload, quota, MAX_BACKLOG),
-                    network.register(fetch, quota, MAX_BACKLOG),
+                    network.register(vote, quota),
+                    network.register(cert, quota),
+                    network.register(res, quota),
+                    network.register(payload, quota),
+                    network.register(fetch, quota),
                 ))
             })
             .collect(),
     );
-    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the submit-relay lane: a resident-standing node ships its own
     // signed frame here; this validator takes custody and answers on
     // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
     // the ingress select arm and the drain-resolution/expiry code.
-    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
 
     // the voice + video hub: huddle media between members. one per-use data
     // plane per service: media rides the OVERLAY — audio+control on
@@ -784,7 +784,7 @@ pub(super) async fn wire(
     // plain-tokio OS thread (the app-surface split exactly), talking to
     // the mesh through the two pump tasks below.
     let (reach_p2p_tx, mut reach_p2p_rx) =
-        network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        network.register(CHANNEL_REACHABILITY, quota);
     // the join GATE's two connectors between the intro doorbell (the plane's
     // thread) and the validator run loop: verified gate requests
     // forward in over the channel; resolved outcomes ride back through the

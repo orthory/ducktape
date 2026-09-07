@@ -238,25 +238,23 @@ impl<E: Clock> governor::clock::Clock for OverlayContext<E> {
 
 impl<E: Clock> governor::clock::ReasonablyRealtime for OverlayContext<E> {}
 
-impl<E: rand_core::RngCore> rand_core::RngCore for OverlayContext<E> {
-    fn next_u32(&mut self) -> u32 {
-        self.inner.next_u32()
+impl<E: rand_core::TryRng> rand_core::TryRng for OverlayContext<E> {
+    type Error = E::Error;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        self.inner.try_next_u32()
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.inner.next_u64()
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.inner.try_next_u64()
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.inner.fill_bytes(dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         self.inner.try_fill_bytes(dest)
     }
 }
 
-impl<E: rand_core::CryptoRng> rand_core::CryptoRng for OverlayContext<E> {}
+impl<E: rand_core::TryCryptoRng> rand_core::TryCryptoRng for OverlayContext<E> {}
 
 impl<E: BufferPooler> BufferPooler for OverlayContext<E> {
     fn network_buffer_pool(&self) -> &BufferPool {

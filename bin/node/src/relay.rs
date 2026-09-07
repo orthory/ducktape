@@ -34,19 +34,20 @@ use sha2::{Digest as _, Sha256};
 /// two were separate numbers once (64 MiB here, 512 MiB there) and this
 /// repository's own 83 MiB pack was refused by the relay after the door had
 /// taken it in. The shared number is sized by THIS lane: every chunk of a
-/// pack crosses a 128-message inbound backlog (`constants::MAX_BACKLOG`)
-/// that the p2p peer actor DROPS on when full, with no chunk retransmit —
-/// the pins below keep one offer plus a max-size pack's chunks inside it.
+/// pack crosses an inbound mailbox the p2p peer actor DROPS on when full,
+/// with no chunk retransmit, and one sender can count on exactly its own
+/// quota burst of that mailbox (`constants::MESH_QUOTA_BURST`) — the pins
+/// below keep one offer plus a max-size pack's chunks inside it.
 pub const MAX_RELAY_BLOB_BYTES: usize = noded::GIT_PACK_BODY_LIMIT;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
 /// process-wide 2 MiB commonware message cap.
 pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 
-// every chunk of a max-size pack plus its one offer fits the inbound backlog
-// the chunks are delivered through — a DROP boundary, not a backpressure one.
+// every chunk of a max-size pack plus its one offer fits one sender's burst
+// of the inbound mailbox — a DROP boundary, not a backpressure one.
 const RELAY_MESSAGES_PER_PACK: usize = MAX_RELAY_BLOB_BYTES.div_ceil(RELAY_BLOB_CHUNK_BYTES) + 1;
-const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MAX_BACKLOG);
+const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MESH_QUOTA_BURST);
 // this repository's own full-history pack (83 MiB) fits.
 const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
 

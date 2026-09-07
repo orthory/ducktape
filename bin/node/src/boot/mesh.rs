@@ -5,7 +5,7 @@ use commonware_runtime::{Quota, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 
 use crate::config::{self, hex_bytes};
-use crate::constants::MAX_MESSAGE_SIZE;
+use crate::constants::{MAX_MESSAGE_SIZE, MAX_PEERS_PER_SET, MESH_QUOTA_BURST};
 
 /// The chain's overlay prefix, spelled the ONE way every reader of it must:
 /// derived from the same namespace string the per-use planes' `OverlayBook`
@@ -172,7 +172,13 @@ pub(crate) fn build(
     // from the mesh `advertised`; lookup's config carries no self-address,
     // so the value survives whole as `advertised_reach`.
     let advertised_reach = advertised;
-    let mut p2p_cfg = lookup::Config::local(p2p_signer, &namespace, listen, MAX_MESSAGE_SIZE);
+    let mut p2p_cfg = lookup::Config::local(
+        p2p_signer,
+        &namespace,
+        listen,
+        MAX_PEERS_PER_SET,
+        MAX_MESSAGE_SIZE,
+    );
     // EXPLICIT decision — authorization parity with the retired discovery
     // dialect: admission is the cryptographic handshake plus
     // key-in-a-tracked-set, source IP ignored. lookup's default source-IP
@@ -225,7 +231,7 @@ pub(crate) fn build(
         p2p_cfg,
     );
 
-    let quota = Quota::per_second(NZU32!(128));
+    let quota = Quota::per_second(NZU32!(MESH_QUOTA_BURST as u32));
 
     MeshHead {
         context,

@@ -30,7 +30,7 @@ use sdk::StateRoot;
 use sha2::Digest as _;
 use statesync::{
     fetch_snapshot,
-    qmdb::{QmdbStore, RemoteQmdbResolver},
+    qmdb::{QmdbStore, RemoteQmdbSource},
 };
 use topology::PRODUCTION;
 use wasm_host::Backing;
@@ -583,7 +583,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // resolver lane: adopt the manifest's pinned target, then fetch only
     // boundary-scoped op batches through the remote resolver.
     let fetch_target = |module: &'static str| {
-        let resolver = RemoteQmdbResolver::new(client.clone(), manifest.boundary_id(), module);
+        let resolver = RemoteQmdbSource::new(client.clone(), manifest.boundary_id(), module);
         async move {
             let target = pinned_target(module)?;
             let root = entry_root(module)?;

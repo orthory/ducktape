@@ -57,11 +57,20 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_B
 // (`sync::serve::encode_bounded_response`) — that is the last line; this pin
 // keeps the honest path from ever needing it.
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
-/// inbound backlog per channel. NOT backpressure: commonware's peer actor
-/// DROPS an inbound message when the application buffer is full (it never
-/// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`
-/// is pinned so one offer plus every chunk of a max-size pack fits inside it.
-pub(crate) const MAX_BACKLOG: usize = 128;
+/// per-peer, per-second message quota on every mesh channel — and its burst.
+/// commonware sizes each channel's inbound mailbox to one burst from every
+/// peer the network may retain, and DROPS an inbound message when that
+/// mailbox is full (it never blocks a peer), so one peer's burst is the drop
+/// boundary a single sender can rely on — `relay::MAX_RELAY_BLOB_BYTES` is
+/// pinned so one offer plus every chunk of a max-size pack fits inside it.
+pub(crate) const MESH_QUOTA_BURST: usize = 128;
+/// the most distinct identities one tracked peer set may carry. a set is a
+/// generation's validators plus residents (each tier capped at
+/// `valset::MAX_MEMBERS`) plus this node's descriptor extras; commonware
+/// PANICS on a set over this cap and sizes every mailbox by it, so it is a
+/// ceiling on membership, not a tuning knob.
+pub(crate) const MAX_PEERS_PER_SET: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(2 * valset::MAX_MEMBERS + 256).unwrap();
 /// per-read/write deadline for every mesh socket — the OS arm gets it via
 /// `with_read_write_timeout` at boot, and it IS the overlay seam's own
 /// `IO_TIMEOUT` (aliased, not copied, so the arms cannot drift). see the

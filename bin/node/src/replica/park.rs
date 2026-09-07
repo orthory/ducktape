@@ -1246,7 +1246,7 @@ pub(super) async fn park(
                             }
                         }
                         match node_r.orderer_mut().observe_finalization(
-                            &mut rand::rngs::OsRng,
+                            &mut commonware_utils::sys_rng(),
                             scheme,
                             &anchor.finalization,
                         ) {

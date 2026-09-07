@@ -89,7 +89,8 @@ use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 use commonware_codec::RangeCfg;
 use commonware_runtime::BufferPooler;
 use commonware_runtime::buffer::paged::CacheRef;
-use commonware_storage::journal::contiguous::{Reader as _, variable};
+use commonware_runtime::ReadOptions;
+use commonware_storage::journal::contiguous::{Contiguous as _, variable};
 use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
@@ -735,9 +736,13 @@ pub struct Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
 {
-    journal: OpJournal<E>,
-    manifest_store: Meta<E>,
-    cert_store: Meta<E>,
+    /// every durable write consumes the store and hands it back only on
+    /// success, so each lives in an `Option`: a failed write leaves `None`,
+    /// and the next touch panics through [`Self::journal`] and friends rather
+    /// than reading half-applied state — the node restarts and replays.
+    journal: Option<OpJournal<E>>,
+    manifest_store: Option<Meta<E>>,
+    cert_store: Option<Meta<E>>,
     /// the out-of-band source of component BYTES for code-registry swaps.
     /// replay reconciles running module code against the committed registry
     /// before each re-applied block (`Host::realize_module_swaps`) — a block
@@ -750,6 +755,40 @@ where
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
     Error::Storage(e.to_string())
+}
+
+const LOST: &str = "recovery store lost to a failed durable write; restart to replay";
+
+impl<E> Recovery<E>
+where
+    E: Context + BufferPooler + commonware_runtime::Supervisor,
+{
+    fn journal(&self) -> &OpJournal<E> {
+        self.journal.as_ref().expect(LOST)
+    }
+
+    fn manifest_store(&self) -> &Meta<E> {
+        self.manifest_store.as_ref().expect(LOST)
+    }
+
+    fn cert_store(&self) -> &Meta<E> {
+        self.cert_store.as_ref().expect(LOST)
+    }
+
+    /// append one record and fsync it: every record the sink writes is
+    /// durable where it is written.
+    async fn append_synced(&mut self, record: &Vec<u8>) -> Result<(), Error> {
+        let journal = self.journal.take().expect(LOST);
+        let (journal, _pos) = journal.append(record).await.map_err(storage_err)?;
+        self.journal = Some(journal.sync().await.map_err(storage_err)?);
+        Ok(())
+    }
+
+    async fn sync_journal(&mut self) -> Result<(), Error> {
+        let journal = self.journal.take().expect(LOST);
+        self.journal = Some(journal.sync().await.map_err(storage_err)?);
+        Ok(())
+    }
 }
 
 /// one paired recovery-journal block and seal.
@@ -779,6 +818,7 @@ where
                 partition: PARTITION_OPLOG.into(),
                 items_per_section: NonZeroU64::new(64).expect("nonzero"),
                 write_buffer: NonZeroUsize::new(1024).expect("nonzero"),
+                replay_buffer: NonZeroUsize::new(1 << 16).expect("nonzero"),
                 compression: None,
                 codec_config: (RangeCfg::from(0..=MAX_RECORD_FIELD_LEN), ()),
                 page_cache,
@@ -805,9 +845,9 @@ where
         .await
         .map_err(storage_err)?;
         Ok(Self {
-            journal,
-            manifest_store,
-            cert_store,
+            journal: Some(journal),
+            manifest_store: Some(manifest_store),
+            cert_store: Some(cert_store),
             code_source: std::sync::Arc::new(host::NoCodeSource),
         })
     }
@@ -828,7 +868,7 @@ where
     /// the persisted checkpoint, if any. `None` means this storage dir has
     /// never run with recovery — a fresh genesis boot.
     pub fn manifest(&self) -> Result<Option<Manifest>, Error> {
-        self.manifest_store
+        self.manifest_store()
             .get(&U64::new(KEY))
             .map(|b| Manifest::decode(b))
             .transpose()
@@ -837,7 +877,7 @@ where
     /// true when the op journal holds any records (fresh-boot guard: a
     /// journal without a manifest is damaged state, not a fresh dir).
     pub async fn journal_is_empty(&self) -> bool {
-        self.journal.size().await == 0
+        self.journal().size() == 0
     }
 
     /// atomically persist a checkpoint manifest. syncs the op journal first
@@ -850,7 +890,7 @@ where
     /// the shutdown barrier `graceful_checkpoint` leans on, and a refused
     /// manifest must not leave buffered journal appends unflushed.
     pub async fn write_manifest(&mut self, manifest: &Manifest) -> Result<(), Error> {
-        self.journal.sync().await.map_err(storage_err)?;
+        self.sync_journal().await?;
         if let Err(e) = manifest.check_field_caps() {
             tracing::error!(
                 target: "ducktape::recovery",
@@ -862,15 +902,18 @@ where
             );
             return Err(e);
         }
-        self.manifest_store
+        let store = self.manifest_store.take().expect(LOST);
+        let store = store
             .put_sync(U64::new(KEY), manifest.encode())
             .await
-            .map_err(storage_err)
+            .map_err(storage_err)?;
+        self.manifest_store = Some(store);
+        Ok(())
     }
 
     /// the current op-journal append position (recorded into manifests).
     pub async fn oplog_pos(&self) -> u64 {
-        self.journal.size().await
+        self.journal().size()
     }
 
     /// force every buffered journal append durable. NOT part of any live path:
@@ -879,12 +922,12 @@ where
     /// harness, which wraps this sink to swallow a seal and then syncs the
     /// inner journal by hand — the only way to build "durable except the seal".
     pub async fn sync(&mut self) -> Result<(), Error> {
-        self.journal.sync().await.map_err(storage_err)
+        self.sync_journal().await
     }
 
     /// the persisted finalization floor, if any.
     pub fn floor_cert(&self) -> Result<Option<FloorCert>, Error> {
-        self.cert_store
+        self.cert_store()
             .get(&U64::new(KEY))
             .map(|b| FloorCert::decode(b))
             .transpose()
@@ -894,10 +937,13 @@ where
     /// this when the ordered lane has fully drained everything at or below
     /// the certificate's view.
     pub async fn write_floor_cert(&mut self, cert: &FloorCert) -> Result<(), Error> {
-        self.cert_store
+        let store = self.cert_store.take().expect(LOST);
+        let store = store
             .put_sync(U64::new(KEY), cert.encode())
             .await
-            .map_err(storage_err)
+            .map_err(storage_err)?;
+        self.cert_store = Some(store);
+        Ok(())
     }
 
     /// prune op-journal records below `pos` (a PREVIOUS manifest's
@@ -905,11 +951,10 @@ where
     /// passed that manifest's height — pruned frames must never be needed to
     /// resolve a re-reported finalization.
     pub async fn prune_oplog(&mut self, pos: u64) -> Result<(), Error> {
-        self.journal
-            .prune(pos)
-            .await
-            .map(|_| ())
-            .map_err(storage_err)
+        let journal = self.journal.take().expect(LOST);
+        let (journal, _pruned) = journal.prune(pos).await.map_err(storage_err)?;
+        self.journal = Some(journal);
+        Ok(())
     }
 
     /// read sealed recovery frames in `(after_height, up_to_height]`.
@@ -934,10 +979,14 @@ where
 
         let mut records: Vec<Record> = Vec::new();
         {
-            let reader = self.journal.reader().await;
-            let bounds = reader.bounds();
-            let stream = reader
-                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+            let journal = self.journal();
+            let bounds = journal.bounds();
+            let stream = journal
+                .replay(
+                    bounds.start,
+                    NonZeroUsize::new(1 << 16).expect("nonzero"),
+                    ReadOptions::default(),
+                )
                 .await
                 .map_err(storage_err)?;
             pin_mut!(stream);
@@ -1061,8 +1110,7 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
-            self.journal.sync().await.map_err(storage_err)?;
+            self.append_synced(&record).await?;
             Ok(())
         }
     }
@@ -1078,8 +1126,7 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
-            self.journal.sync().await.map_err(storage_err)?;
+            self.append_synced(&record).await?;
             Ok(())
         }
     }
@@ -1096,7 +1143,6 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
             // the seal is a BARRIER, not a plain append. a store-backed tenant
             // durably commits its own disk during apply (`MerkleStore::commit_batch`
             // is "apply + durably commit"), so from the moment the first one
@@ -1105,7 +1151,7 @@ where
             // `pre_apply`, or to a barrier the drain loop remembers to take —
             // is what makes that vouching durable at the same instant the
             // state is. it is also the only place that cannot be forgotten.
-            self.journal.sync().await.map_err(storage_err)?;
+            self.append_synced(&record).await?;
             Ok(())
         }
     }
@@ -1125,8 +1171,7 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
-            self.journal.sync().await.map_err(storage_err)?;
+            self.append_synced(&record).await?;
             Ok(())
         }
     }
@@ -1260,10 +1305,14 @@ where
         // reader, and applying blocks needs `&mut host` with no borrow held.
         let mut records: Vec<Record> = Vec::new();
         {
-            let reader = self.journal.reader().await;
-            let bounds = reader.bounds();
-            let stream = reader
-                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+            let journal = self.journal();
+            let bounds = journal.bounds();
+            let stream = journal
+                .replay(
+                    bounds.start,
+                    NonZeroUsize::new(1 << 16).expect("nonzero"),
+                    ReadOptions::default(),
+                )
                 .await
                 .map_err(storage_err)?;
             pin_mut!(stream);
@@ -1684,7 +1733,7 @@ where
             BlockSink::seal(self, &seal)
                 .await
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            self.journal.sync().await.map_err(storage_err)?;
+            self.sync_journal().await?;
             blocks.push((height, seal.roots.clone()));
             tip_height = Some(height);
             tip_hash = host.root_hash();

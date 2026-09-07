@@ -110,7 +110,7 @@ pub fn mint_chain_id(name: &str, initiator: &ed25519::PublicKey) -> String {
     let mut hasher = Sha256::default();
     hasher.update(initiator.as_ref());
     hasher.update(&nanos.to_le_bytes());
-    let digest = hasher.finalize();
+    let (_, digest) = hasher.finalize();
     format!("{name}#{}", hex_bytes(&digest.as_ref()[..4]))
 }
 

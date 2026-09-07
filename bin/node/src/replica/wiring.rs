@@ -152,7 +152,7 @@ pub(super) async fn wire(
     for epoch in 0..bank_base {
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
+            let (_tx, mut rx) = network.register(ch, quota);
             let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
             context
                 .child(label)
@@ -187,42 +187,42 @@ pub(super) async fn wire(
                     &context,
                     "blackhole",
                     vote,
-                    network.register(vote, quota, MAX_BACKLOG),
+                    network.register(vote, quota),
                     |_bytes| {},
                 ),
                 certificate: ReclaimableLane::drain(
                     &context,
                     "certbridge",
                     cert,
-                    network.register(cert, quota, MAX_BACKLOG),
+                    network.register(cert, quota),
                     cert_drain,
                 ),
                 resolver: ReclaimableLane::drain(
                     &context,
                     "blackhole",
                     res,
-                    network.register(res, quota, MAX_BACKLOG),
+                    network.register(res, quota),
                     |_bytes| {},
                 ),
                 payload: ReclaimableLane::drain(
                     &context,
                     "payload_store",
                     payload,
-                    network.register(payload, quota, MAX_BACKLOG),
+                    network.register(payload, quota),
                     payload_drain,
                 ),
                 fetch: ReclaimableLane::drain(
                     &context,
                     "blackhole",
                     fetch,
-                    network.register(fetch, quota, MAX_BACKLOG),
+                    network.register(fetch, quota),
                     |_bytes| {},
                 ),
             })
         })
         .collect();
     let lane_bank = LaneBank::new(bank_base, slots);
-    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+    let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the reachability lane: a parked joiner with a WireGuard config
     // runs the plane in its STANDBY role — once resident standing
     // lands (the park loop below drives Retargets off the manifest),
@@ -240,7 +240,7 @@ pub(super) async fn wire(
     // plane over the same registered channel.
     let mut reach_reclaim: Option<ReachLaneHandback> = None;
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
-        let (reach_tx, mut reach_rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let (reach_tx, mut reach_rx) = network.register(CHANNEL_REACHABILITY, quota);
         match wireguard_listen {
             Some(wg_addr) => {
                 // AMBIENT coordinator: the joiner resolves coordinated
@@ -534,7 +534,7 @@ pub(super) async fn wire(
     // custody. replies (the frame's consensus fate) come back on the
     // same lane. `relay_rx` is bridged into the serve window below (a
     // torn-down select must never drop its `recv()` mid-flight).
-    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+    let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota);
     network.start();
 
     ReplicaChannels {
