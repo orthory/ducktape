@@ -7,8 +7,9 @@
 //! audience/method/body/header policy, and only then touches DuckFS or one
 //! exact node-local loopback upstream.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -1122,6 +1123,149 @@ fn gateway_path(owner_signer: &[u8], label: &str, relative: &str) -> String {
     )
 }
 
+/// Repeated requests at an unchanged DuckFS head never need to re-read and
+/// re-hash the manifest: `manifest_sha256` is the route's signed content
+/// identity (two reads that verify against it always see byte-identical
+/// bytes), so once a lookup for (route, head, path) has been verified it
+/// stays correct until the head moves — the route component is the signed
+/// hash itself, not the owner/label used only to locate the DuckFS bytes, so
+/// a route republished under a new manifest (a new hash) cannot hit a stale
+/// entry left by the old one. Keyed by the request path rather than the
+/// resolved content path so a cache hit skips `manifest_file_for_path` too.
+/// Bounded with oldest-first eviction; a moved head is simply a new key, so
+/// nothing needs a timer or explicit invalidation.
+const MANIFEST_CACHE_CAP: usize = 4096;
+
+type ManifestCacheKey = (String, String, String);
+
+#[derive(Default)]
+struct ManifestCache {
+    entries: HashMap<ManifestCacheKey, gateway::ContentFile>,
+    order: VecDeque<ManifestCacheKey>,
+}
+
+impl ManifestCache {
+    fn insert(&mut self, key: ManifestCacheKey, file: gateway::ContentFile) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+            if self.order.len() > MANIFEST_CACHE_CAP
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, file);
+    }
+}
+
+static MANIFEST_CACHE: LazyLock<Mutex<ManifestCache>> =
+    LazyLock::new(|| Mutex::new(ManifestCache::default()));
+
+/// Resolve the manifest entry for `path_and_query`, reading and verifying the
+/// manifest only on a cache miss.
+async fn resolve_content_file(
+    commands: &mpsc::Sender<NodeCommand>,
+    owner_signer: &[u8],
+    label: &str,
+    manifest_sha256: &str,
+    snapshot: &duckfs_core::DigestHex,
+    path_and_query: &str,
+    max_response_bytes: u64,
+) -> Result<gateway::ContentFile, GatewayFailure> {
+    let cache_key = (
+        manifest_sha256.to_string(),
+        snapshot.clone(),
+        path_and_query.to_string(),
+    );
+    if let Some(file) = MANIFEST_CACHE
+        .lock()
+        .expect("manifest cache poisoned")
+        .entries
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(file);
+    }
+
+    // The manifest is a DuckFS file addressed by the signed hash: read it,
+    // verify the exact bytes, then trust its file table.
+    let manifest_bytes = read_duckfs_file(
+        commands,
+        &gateway_path(owner_signer, label, gateway::MANIFEST_FILE),
+        snapshot,
+        gateway::MAX_MANIFEST_BYTES,
+    )
+    .await?;
+    if hex_bytes(&Sha256::digest(&manifest_bytes)) != *manifest_sha256 {
+        return Err(GatewayFailure::Forbidden(
+            "manifest does not match the signed hash".into(),
+        ));
+    }
+    let manifest: gateway::RouteManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
+        })?;
+    gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
+
+    let file = gateway::manifest_file_for_path(&manifest, path_and_query)
+        .map_err(GatewayFailure::NotFound)?
+        .clone();
+    // Serve-time cap: the file table is off consensus, so the signed response
+    // cap is enforced here rather than at admission.
+    if file.size > max_response_bytes {
+        return Err(GatewayFailure::Forbidden(
+            "file exceeds the signed response cap".into(),
+        ));
+    }
+    MANIFEST_CACHE
+        .lock()
+        .expect("manifest cache poisoned")
+        .insert(cache_key, file.clone());
+    Ok(file)
+}
+
+/// `*` or an exact quoted match against `etag`, per RFC 7232 §3.2's
+/// comma-separated list — content routes only ever emit strong validators, so
+/// no weak-comparison handling is needed.
+fn if_none_match_hits(header_value: &str, etag: &str) -> bool {
+    header_value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == etag)
+}
+
+fn content_type_header(file: &gateway::ContentFile) -> gateway::ProxyHeader {
+    gateway::ProxyHeader {
+        name: "content-type".into(),
+        value: file.mime.clone(),
+    }
+}
+
+fn etag_header(etag: &str) -> gateway::ProxyHeader {
+    gateway::ProxyHeader {
+        name: "etag".into(),
+        value: etag.to_string(),
+    }
+}
+
+fn build_response_head(
+    status: u16,
+    headers: Vec<gateway::ProxyHeader>,
+) -> Result<gateway::ProxyResponseHead, GatewayFailure> {
+    let head = gateway::ProxyResponseHead { status, headers };
+    gateway::validate_response_head(&head).map_err(GatewayFailure::Unavailable)?;
+    Ok(head)
+}
+
+fn empty_gateway_response(
+    status: u16,
+    headers: Vec<gateway::ProxyHeader>,
+) -> Result<GatewayResponse, GatewayFailure> {
+    let head = build_response_head(status, headers)?;
+    let (_tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
+    Ok(GatewayResponse { head, body: rx })
+}
+
 async fn serve_duckfs(
     commands: &mpsc::Sender<NodeCommand>,
     head: &gateway::ProxyRequestHead,
@@ -1152,38 +1296,35 @@ async fn serve_duckfs(
     // publisher-local mutation cannot race them.
     let snapshot = duckfs_head(commands).await?;
 
-    // The manifest is a DuckFS file addressed by the signed hash: read it,
-    // verify the exact bytes, then trust its file table.
-    let manifest_bytes = read_duckfs_file(
+    let file = resolve_content_file(
         commands,
-        &gateway_path(owner_signer, label, gateway::MANIFEST_FILE),
+        owner_signer,
+        label,
+        manifest_sha256,
         &snapshot,
-        gateway::MAX_MANIFEST_BYTES,
+        &head.path_and_query,
+        route.policy.max_response_bytes,
     )
     .await?;
-    if hex_bytes(&Sha256::digest(&manifest_bytes)) != *manifest_sha256 {
-        return Err(GatewayFailure::Forbidden(
-            "manifest does not match the signed hash".into(),
-        ));
-    }
-    let manifest: gateway::RouteManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|error| {
-            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
-        })?;
-    gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
+    let etag = format!("\"{}\"", file.sha256);
+    let etag_matches = gateway::header_value(&head.headers, "if-none-match")
+        .is_some_and(|value| if_none_match_hits(value, &etag));
 
-    let file = gateway::manifest_file_for_path(&manifest, &head.path_and_query)
-        .map_err(GatewayFailure::NotFound)?;
-    // Serve-time cap: the file table is off consensus, so the signed response
-    // cap is enforced here rather than at admission.
-    if file.size > route.policy.max_response_bytes {
-        return Err(GatewayFailure::Forbidden(
-            "file exceeds the signed response cap".into(),
-        ));
+    // HEAD and a matching If-None-Match both answer from the manifest entry
+    // alone, with no file read: the manifest is already verified against its
+    // own signed hash, so the entry's `sha256` is an authenticated ETag for
+    // bytes the file read would only re-derive.
+    if head.method == gateway::RouteMethod::Head {
+        return empty_gateway_response(200, vec![content_type_header(&file), etag_header(&etag)]);
     }
-    // HEAD still authenticates the exact bytes before advertising the ETag, so
-    // a same-sized local mutation cannot make a stale file look current.
-    let mut bytes = read_duckfs_file(
+    if etag_matches {
+        return empty_gateway_response(304, vec![etag_header(&etag)]);
+    }
+
+    // A GET past an ETag miss still authenticates the exact bytes before
+    // serving them, so a same-sized local mutation cannot make a stale file
+    // look current.
+    let bytes = read_duckfs_file(
         commands,
         &gateway_path(owner_signer, label, &file.path),
         &snapshot,
@@ -1195,23 +1336,8 @@ async fn serve_duckfs(
             "DuckFS bytes do not match the manifest".into(),
         ));
     }
-    if head.method == gateway::RouteMethod::Head {
-        bytes.clear();
-    }
-    let response_head = gateway::ProxyResponseHead {
-        status: 200,
-        headers: vec![
-            gateway::ProxyHeader {
-                name: "content-type".into(),
-                value: file.mime.clone(),
-            },
-            gateway::ProxyHeader {
-                name: "etag".into(),
-                value: format!("\"{}\"", file.sha256),
-            },
-        ],
-    };
-    gateway::validate_response_head(&response_head).map_err(GatewayFailure::Unavailable)?;
+    let response_head =
+        build_response_head(200, vec![content_type_header(&file), etag_header(&etag)])?;
     // Content responses stay buffered internally; wrap the one blob as a
     // single-chunk stream (the frame writer re-splits at MAX_CHUNK_BYTES).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
@@ -3422,10 +3548,19 @@ mod tests {
         })))
     }
 
-    async fn serve_content_head(
-        declared: &[u8],
-        actual: &[u8],
-    ) -> Result<GatewayResponse, GatewayFailure> {
+    /// A signed content route naming one manifest entry (`index.html`,
+    /// declared as `declared`'s exact bytes/hash), plus everything needed to
+    /// answer for its owner.
+    struct ContentCase {
+        publisher: [u8; 32],
+        member: ed25519::PrivateKey,
+        statement: gateway::RouteStatement,
+        route: gateway::RouteRecord,
+        manifest_bytes: Vec<u8>,
+        owner: identity::AccountView,
+    }
+
+    fn content_case(declared: &[u8]) -> ContentCase {
         let publisher = [2u8; 32];
         let member = ed25519::PrivateKey::from_seed(77);
         // The signed statement binds only the manifest hash; the manifest (a
@@ -3460,7 +3595,6 @@ mod tests {
                 },
             }),
         };
-        let pop = user_pop(&member, &statement, gateway::RouteMethod::Head, "/");
         let route = gateway::RouteRecord {
             authorization: gateway::MemberAuthorization {
                 signer: member.public_key().as_ref().to_vec(),
@@ -3472,62 +3606,103 @@ mod tests {
                     .as_ref()
                     .to_vec(),
             },
-            statement,
+            statement: statement.clone(),
         };
         let owner = account(1, &member);
-        let signer = member.public_key().as_ref().to_vec();
-        let manifest_path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
-        let file_path = gateway_path(&signer, "_apex", "index.html");
-        let manifest_len = manifest_bytes.len() as u64;
-        let manifest_b64 = STANDARD.encode(&manifest_bytes);
-        let actual_b64 = STANDARD.encode(actual);
-        let actual_len = actual.len() as u64;
-        // Ordered replies: route → identity (authority) → identity (the
-        // caller's proof) → refs → manifest stat/read → file stat/read.
-        let replies: Vec<Vec<u8>> = vec![
-            gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
-            identity::encode_reply(&identity::IdentityReply::Account(Some(owner.clone()))),
-            identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
+        ContentCase {
+            publisher,
+            member,
+            statement,
+            route,
+            manifest_bytes,
+            owner,
+        }
+    }
+
+    /// Drive one `serve_current` call against `case` at DuckFS head
+    /// `head_hex`, queuing exactly: route → identity (authority) → identity
+    /// (caller proof) → refs, then — only when `queue_manifest` is set — the
+    /// manifest stat/read, then — only when `file_bytes` is `Some` — that
+    /// file's stat/read. Returns the response alongside how many queries were
+    /// actually answered, so a caller can assert the exact query count
+    /// (skipped as well as issued) rather than merely "it didn't hang".
+    ///
+    /// A query beyond what's queued panics immediately — a would-be file read
+    /// past a HEAD or a 304 needs no queued reply to fail loudly on.
+    async fn serve_content(
+        case: &ContentCase,
+        method: gateway::RouteMethod,
+        path_and_query: &str,
+        headers: Vec<gateway::ProxyHeader>,
+        head_hex: &str,
+        queue_manifest: bool,
+        file_bytes: Option<&[u8]>,
+    ) -> (Result<GatewayResponse, GatewayFailure>, usize) {
+        let pop = user_pop(&case.member, &case.statement, method, path_and_query);
+        let signer = case.member.public_key().as_ref().to_vec();
+        let mut replies: Vec<Vec<u8>> = vec![
+            gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
+                case.route.clone(),
+            )))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(case.owner.clone()))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(case.owner.clone()))),
             duckfs_core::encode_reply(&FilesReply::Refs(duckfs_core::RefsInfo {
-                head: Some("aa".repeat(32)),
+                head: Some(head_hex.to_string()),
                 pins: std::collections::BTreeMap::new(),
                 window_len: 1,
             })),
-            stat_reply(manifest_path, manifest_len),
-            duckfs_core::encode_reply(&FilesReply::Read {
-                b64: manifest_b64,
-                eof: true,
-            }),
-            stat_reply(file_path, actual_len),
-            duckfs_core::encode_reply(&FilesReply::Read {
-                b64: actual_b64,
-                eof: true,
-            }),
         ];
+        if queue_manifest {
+            let manifest_path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
+            replies.push(stat_reply(manifest_path, case.manifest_bytes.len() as u64));
+            replies.push(duckfs_core::encode_reply(&FilesReply::Read {
+                b64: STANDARD.encode(&case.manifest_bytes),
+                eof: true,
+            }));
+        }
+        if let Some(bytes) = file_bytes {
+            let file_path = gateway_path(&signer, "_apex", "index.html");
+            replies.push(stat_reply(file_path, bytes.len() as u64));
+            replies.push(duckfs_core::encode_reply(&FilesReply::Read {
+                b64: STANDARD.encode(bytes),
+                eof: true,
+            }));
+        }
         let (commands, mut requests) = mpsc::channel(8);
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answered_in_task = Arc::clone(&answered);
+        let (done, wait_done) = oneshot::channel();
         tokio::spawn(async move {
-            for bytes in replies {
-                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                    panic!("expected a query")
-                };
-                let _ = reply.send(Ok(bytes));
+            let mut queued = replies.into_iter();
+            while let Some(NodeCommand::Query { reply, .. }) = requests.next().await {
+                match queued.next() {
+                    Some(bytes) => {
+                        answered_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = reply.send(Ok(bytes));
+                    }
+                    None => panic!(
+                        "unexpected extra DuckFS/gateway query beyond the queued sequence \
+                         — an unwanted manifest or file read"
+                    ),
+                }
             }
+            let _ = done.send(());
         });
-        serve_current(
+        let result = serve_current(
             &commands,
             &LoopbackScope {
                 workspace: Path::new("."),
                 node_api_ports: &[],
-                own_node: &publisher,
+                own_node: &case.publisher,
             },
-            &publisher,
+            &case.publisher,
             &gateway::ProxyRequestHead {
                 account_id: 1,
                 name: gateway::RouteName::apex(),
                 revision: 1,
-                method: gateway::RouteMethod::Head,
-                path_and_query: "/".into(),
-                headers: vec![],
+                method,
+                path_and_query: path_and_query.into(),
+                headers,
                 body_len: 0,
                 upgrade: false,
                 // an `Owner` route: only the owner's own user proof admits.
@@ -3535,29 +3710,192 @@ mod tests {
             },
             &[],
         )
-        .await
+        .await;
+        // Dropping the sender closes the mock's request stream, which ends
+        // its loop — wait for that so the counter below is final.
+        drop(commands);
+        let _ = wait_done.await;
+        (result, answered.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     #[tokio::test]
-    async fn duckfs_head_verifies_signed_bytes_before_returning_no_body() {
-        let mut response = serve_content_head(b"safe", b"safe").await.unwrap();
+    async fn head_answers_from_manifest_without_reading_the_file() {
+        let declared = b"only the manifest is needed for HEAD";
+        let case = content_case(declared);
+        let (result, answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &"11".repeat(32),
+            true,
+            // No file bytes queued at all: a HEAD that still tried to read
+            // the file would panic in the mock rather than hang.
+            None,
+        )
+        .await;
+        let mut response = result.unwrap();
+        assert_eq!(response.head.status, 200);
         assert!(
             noded::collect_body(&mut response.body)
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(response.head.status, 200);
+        assert_eq!(
+            gateway::header_value(&response.head.headers, "etag"),
+            Some(format!("\"{}\"", hex_bytes(&Sha256::digest(declared))).as_str())
+        );
+        // route + identity×2 + refs + manifest stat/read, nothing else.
+        assert_eq!(answered, 6);
+    }
 
-        let mut empty = serve_content_head(b"", b"").await.unwrap();
+    #[tokio::test]
+    async fn matching_if_none_match_answers_304_without_reading_the_file() {
+        let declared = b"conditional get content";
+        let case = content_case(declared);
+        let etag = format!("\"{}\"", hex_bytes(&Sha256::digest(declared)));
+        let (result, answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![gateway::ProxyHeader {
+                name: "if-none-match".into(),
+                value: etag.clone(),
+            }],
+            &"22".repeat(32),
+            true,
+            // A match must not read the file either.
+            None,
+        )
+        .await;
+        let mut response = result.unwrap();
+        assert_eq!(response.head.status, 304);
+        assert!(
+            noded::collect_body(&mut response.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            gateway::header_value(&response.head.headers, "etag"),
+            Some(etag.as_str())
+        );
+        assert_eq!(answered, 6);
+    }
+
+    #[tokio::test]
+    async fn stale_head_misses_the_manifest_cache() {
+        let declared = b"cache probe content";
+        let case = content_case(declared);
+        let head_a = "33".repeat(32);
+        let head_b = "44".repeat(32);
+
+        // First request at head A: a cold cache, so the manifest read is
+        // queued and must happen.
+        let (first, first_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_a,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(first.unwrap().head.status, 200);
+        assert_eq!(first_answered, 6);
+
+        // Second request, the SAME head: no manifest reply is queued at all —
+        // a cache HIT is the only way this can still succeed.
+        let (second, second_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_a,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(second.unwrap().head.status, 200);
+        assert_eq!(second_answered, 4);
+
+        // Third request, a NEW head: a stale head is a cache MISS, so the
+        // manifest read is queued (and required) again.
+        let (third, third_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_b,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(third.unwrap().head.status, 200);
+        assert_eq!(third_answered, 6);
+    }
+
+    #[tokio::test]
+    async fn get_verifies_the_actual_bytes_before_serving_them() {
+        let declared = b"safe-declared-content";
+        let case = content_case(declared);
+
+        // Matching bytes serve normally.
+        let (matched, _) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"55".repeat(32),
+            true,
+            Some(declared.as_slice()),
+        )
+        .await;
+        let mut matched = matched.unwrap();
+        assert_eq!(matched.head.status, 200);
+        assert_eq!(
+            noded::collect_body(&mut matched.body).await.unwrap(),
+            declared
+        );
+
+        // Tampered local bytes are caught even though the manifest (and the
+        // ETag it authenticates) still says `declared` — a fresh head, so
+        // this doesn't ride the previous call's cached manifest entry.
+        let (mismatched, _) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"66".repeat(32),
+            true,
+            Some(b"evil-tampered-content".as_slice()),
+        )
+        .await;
+        let error = mismatched.unwrap_err();
+        assert!(matches!(error, GatewayFailure::Forbidden(_)));
+
+        // An empty file still issues its one confirming read and serves an
+        // empty body.
+        let empty_case = content_case(b"");
+        let (empty, _) = serve_content(
+            &empty_case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"77".repeat(32),
+            true,
+            Some(b"".as_slice()),
+        )
+        .await;
+        let mut empty = empty.unwrap();
+        assert_eq!(empty.head.status, 200);
         assert!(
             noded::collect_body(&mut empty.body)
                 .await
                 .unwrap()
                 .is_empty()
         );
-
-        let error = serve_content_head(b"safe", b"evil").await.unwrap_err();
-        assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 }
