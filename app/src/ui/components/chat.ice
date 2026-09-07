@@ -245,10 +245,7 @@ component RichLine(block:ChatBlock, size:f64)
 component MessageBody(message:ChatMessage)
   emits
     open_message_link(str)
-  col
-    with
-      w=fill
-      max-w=760.0
+  col w=fill max-w=760.0
     RichBody blocks=message.blocks size=13.5
       forward
         open_message_link
@@ -263,10 +260,7 @@ component MessageBody(message:ChatMessage)
 component RichBody(blocks:[ChatBlock], size:f64)
   emits
     open_message_link(str)
-  col
-    with
-      w=fill
-      gap=5.0
+  col w=fill gap=5.0
     for block in blocks
       if block.kind == "divider"
         Separator
@@ -687,7 +681,7 @@ component MessageContents(message:ChatMessage, surface:CopySurface)
               with
                 w=6.0
                 h=6.0
-                style=icon_tint("muted")
+                color=muted
                 opacity=1.0
 component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)
   emits
