@@ -1404,8 +1404,8 @@ struct WsGrant {
 /// the signing key. 1008 is the WebSocket "policy violation" code.
 const WS_REVOKED_CLOSE: u16 = 1008;
 /// How often a live bridge re-runs the caller-independent half of its
-/// authorization. The HTTP path re-gates every request; a socket must not
-/// outlive its grant by more than one tick.
+/// authorization. A removed grant is detected within one interval plus the
+/// bounded check, including when the node actor stops answering queries.
 const WS_REAUTH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Resolve once a live bridge's grant stops holding. Ticks forever while the
@@ -1421,15 +1421,19 @@ async fn ws_revoked(
     ticks.tick().await; // the first tick fires immediately; the gate just ran.
     loop {
         ticks.tick().await;
-        let Err(_failure) = reauthorize_ws(&commands, &own_node, &head, caller).await else {
-            continue;
+        let check = tokio::time::timeout(
+            PROXY_IO_TIMEOUT,
+            reauthorize_ws(&commands, &own_node, &head, caller),
+        )
+        .await;
+        let Ok(Ok(())) = check else {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                reason = "ws_reauth_failed",
+                "gateway websocket bridge revoked"
+            );
+            return;
         };
-        tracing::warn!(
-            target: "ducktape::gateway",
-            reason = "ws_reauth_failed",
-            "gateway websocket bridge revoked"
-        );
-        return;
     }
 }
 
@@ -1572,9 +1576,10 @@ fn upstream_step(
 
 /// Two independent tasks (mesh→upstream, upstream→mesh); when either direction
 /// ends — or the bridge goes two-way idle, or `revoked` resolves because the
-/// route stopped authorizing this caller — the others are aborted so both
-/// sockets drop and each peer sees EOF. A revocation writes a
-/// [`WS_REVOKED_CLOSE`] frame first, so the caller learns why.
+/// route stopped authorizing this caller — inbound forwarding stops. On
+/// revocation, the outbound pump finishes its current frame before sending
+/// [`WS_REVOKED_CLOSE`]. A blocked write ends at its progress deadline, dropping
+/// the connection instead of inserting a close inside a partial frame.
 async fn ws_pump<S, U, R>(stream: S, upstream: U, revoked: R)
 where
     R: std::future::Future<Output = ()> + Send + 'static,
@@ -1597,6 +1602,7 @@ where
     let activity = Arc::new(tokio::sync::Notify::new());
     let to_upstream_activity = Arc::clone(&activity);
     let to_mesh_activity = Arc::clone(&activity);
+    let (revoke_tx, mut revoke_rx) = oneshot::channel();
     let mut to_upstream = tokio::spawn(async move {
         let mut buf = Vec::new();
         loop {
@@ -1620,10 +1626,10 @@ where
         }
     });
     let mut to_mesh = tokio::spawn(async move {
-        let mut revoked = std::pin::pin!(revoked);
         loop {
             let step = tokio::select! {
-                () = &mut revoked => MeshStep::Send(gateway::ProxyFrame::WsClose {
+                biased;
+                _ = &mut revoke_rx => MeshStep::Send(gateway::ProxyFrame::WsClose {
                     code: WS_REVOKED_CLOSE,
                 }),
                 message = ws_rx.next() => upstream_step(message),
@@ -1634,10 +1640,9 @@ where
                 MeshStep::Stop => break,
             };
             let closing = matches!(frame, gateway::ProxyFrame::WsClose { .. });
-            if write_frame(&mut mesh_write, &frame).await.is_err() {
+            if push_frame(&mut mesh_write, &frame).await.is_err() {
                 break;
             }
-            let _ = mesh_write.flush().await;
             to_mesh_activity.notify_one();
             if closing {
                 break;
@@ -1649,6 +1654,13 @@ where
         _ = &mut to_upstream => {}
         _ = &mut to_mesh => {}
         _ = &mut idle => {}
+        () = revoked => {
+            // Revocation is polled outside the outbound pump: a peer that
+            // refuses to read cannot keep issuing upstream requests.
+            to_upstream.abort();
+            let _ = revoke_tx.send(());
+            let _ = (&mut to_mesh).await;
+        }
     }
     to_upstream.abort();
     to_mesh.abort();
@@ -2157,6 +2169,77 @@ mod tests {
             ),
             "a revoked bridge closes with the policy code: {frame:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revocation_is_observed_while_an_outbound_frame_is_blocked() {
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (server_end, mut caller_end) = tokio::io::duplex(64);
+        let (upstream, upstream_peer) = tokio::io::duplex(64 * 1024);
+        let upstream =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(upstream, Role::Client, None).await;
+        let mut upstream_peer =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(upstream_peer, Role::Server, None)
+                .await;
+        let (revoke, revoked) = oneshot::channel();
+        let (observed, observation) = oneshot::channel();
+        let bridge = tokio::spawn(ws_pump(server_end, upstream, async move {
+            revoked.await.expect("the test revokes the grant");
+            let _ = observed.send(());
+        }));
+        upstream_peer
+            .send(Message::binary(vec![7u8; 4096]))
+            .await
+            .unwrap();
+        // Observe a real partial frame, then stop reading. The remaining
+        // payload cannot fit in the duplex, so its writer stays blocked.
+        let mut prefix = [0u8; 4];
+        caller_end.read_exact(&mut prefix).await.unwrap();
+        let started = tokio::time::Instant::now();
+        revoke.send(()).unwrap();
+        tokio::time::timeout(PROXY_IO_TIMEOUT, observation)
+            .await
+            .expect("outbound backpressure must not delay checking revocation")
+            .expect("the independent revocation future ran");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "revocation is observed before any write or idle deadline"
+        );
+        // The connection ends at the pending frame's progress deadline. It
+        // cannot safely append a policy-close frame to that partial payload.
+        tokio::time::timeout(PROXY_IO_TIMEOUT + Duration::from_secs(1), bridge)
+            .await
+            .expect("a blocked frame must release the revoked bridge")
+            .expect("the bridge task completes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_reauthorization_fails_closed_when_the_actor_holds_its_reply() {
+        let (commands, mut requests) = mpsc::channel(1);
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+            user_pop: None,
+        };
+        let revoked = tokio::spawn(ws_revoked(commands, [2u8; 32], head, Some(1)));
+        // Receiving the query observes the reauthorization tick. Keep its
+        // reply alive without answering, reproducing a stalled node actor.
+        let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+            panic!("expected the route query")
+        };
+        tokio::time::timeout(PROXY_IO_TIMEOUT + Duration::from_secs(1), revoked)
+            .await
+            .expect("a silent actor must revoke the bridge within the check deadline")
+            .expect("the revocation task completes");
+        drop(reply);
     }
 
     /// A tombstoned route stops authorizing a socket that is already open —
