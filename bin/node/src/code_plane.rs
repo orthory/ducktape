@@ -7,9 +7,12 @@
 //! digest, so no trust ever attaches to which peer the bytes came from):
 //!
 //! - PUSH: the staging custodian fans a new artifact out to every member
-//!   BEFORE the governance proposal referencing its hash is submitted. The
-//!   receiver acks with its resume offset (transfers survive drops), streams
-//!   the tail into a disk-staged slot, and answers one result frame.
+//!   ONCE the governance proposal naming its hash is OPEN — the proposal is
+//!   what makes the digest admissible (see [`CodeRegistry`]), so the order is
+//!   propose, then stage, and the swap's readiness gate (not the fan-out
+//!   receipts) is what holds activation until every validator holds the bytes.
+//!   The receiver acks with its resume offset (transfers survive drops),
+//!   streams the tail into a disk-staged slot, and answers one result frame.
 //! - PULL: a node missing a committed artifact asks a peer to stream it —
 //!   the data-plane twin of the mesh's ranged blob lane.
 //!
@@ -110,6 +113,18 @@ fn kind_cap(kind: u8) -> Option<u64> {
 /// the validator drain refreshes this from the SAME registry read its own
 /// readiness pump already performs each tick (`pump_code_readiness`) — no
 /// second query, and no direct access to the host from this plane's tasks.
+///
+/// the set is a UNION: the registry walk above ([`code_blobs_referenced`])
+/// plus the `code_hash` of every OPEN `RegisterModule`/`UpdateModule`
+/// governance proposal ([`code_blobs_proposed`], read beside the registry on
+/// that same tick). the proposal half is what makes a brand-new artifact
+/// stageable at all (#1861): nothing in the registry can name its bytes until
+/// the ballot passes, yet the ballot is decided by the validators that must
+/// hold them. the bound stays finite — governance's own proposal caps
+/// (`MAX_PROPOSALS`, `MAX_OPEN_PROPOSALS_PER_SUBMITTER`) times
+/// [`MAX_MODULE_CODE_BYTES`] — and a proposal that closes without scheduling
+/// a swap (rejected, expired, superseded) drops its digest out of the set on
+/// the next tick, where the existing reclaim `forget`s the blob.
 #[derive(Clone, Default)]
 pub(crate) struct CodeRegistry(Arc<RwLock<HashSet<[u8; 32]>>>);
 
@@ -146,6 +161,25 @@ pub(crate) fn code_blobs_referenced(modules: &[modules::ModuleCode]) -> HashSet<
                 .as_ref()
                 .and_then(|p| p.code_hash.as_slice().try_into().ok());
             [active, pending].into_iter().flatten()
+        })
+        .collect()
+}
+
+/// the digests OPEN governance proposals NAME: the `code_hash` of every
+/// `RegisterModule`/`UpdateModule` action still accepting ballots. A settled
+/// proposal contributes nothing — a passing one scheduled the swap that
+/// [`code_blobs_referenced`] already names, and a rejected one leaves its
+/// bytes to the reclaim.
+pub(crate) fn code_blobs_proposed(proposals: &[governance::ProposalView]) -> HashSet<[u8; 32]> {
+    proposals
+        .iter()
+        .filter(|p| p.status == governance::ProposalStatus::Open)
+        .filter_map(|p| match &p.action {
+            governance::GovAction::RegisterModule { code_hash, .. }
+            | governance::GovAction::UpdateModule { code_hash, .. } => {
+                code_hash.as_slice().try_into().ok()
+            }
+            _other => None,
         })
         .collect()
 }
@@ -974,6 +1008,103 @@ mod tests {
             !blobs.has_chunk(&digest),
             "an unreferenced digest must never be staged, let alone published"
         );
+    }
+
+    fn proposal(
+        status: governance::ProposalStatus,
+        action: governance::GovAction,
+    ) -> governance::ProposalView {
+        governance::ProposalView {
+            proposal_id: "p".into(),
+            action,
+            proposer: Vec::new(),
+            created_at: 0,
+            deadline: 0,
+            status,
+            votes: Vec::new(),
+            voter_kind: governance::VoterKind::ValidatorNode,
+            electorate: Vec::new(),
+            voting_rule: governance::VotingRule::Threshold { required_yes: 1 },
+        }
+    }
+
+    /// #1861: a brand-new artifact's digest is named by nothing in the
+    /// registry until its ballot passes, so the OPEN proposal deciding it is
+    /// what admits the push that carries the bytes to the deciders. A settled
+    /// proposal names nothing — its digest is the scheduled swap's now, or
+    /// reclaimable.
+    #[test]
+    fn an_open_module_proposal_names_its_digest() {
+        use governance::{GovAction, ProposalStatus};
+        let register = [7u8; 32];
+        let update = [8u8; 32];
+        let rejected = [9u8; 32];
+        let action = |hash: [u8; 32]| GovAction::RegisterModule {
+            name: "hello@x".into(),
+            module_id: "hello".into(),
+            activation_lead: 50,
+            code_hash: hash.to_vec(),
+        };
+        let proposals = vec![
+            proposal(ProposalStatus::Open, action(register)),
+            proposal(
+                ProposalStatus::Open,
+                GovAction::UpdateModule {
+                    name: "hello@y".into(),
+                    module_id: "hello".into(),
+                    activation_lead: 50,
+                    code_hash: update.to_vec(),
+                },
+            ),
+            proposal(ProposalStatus::Rejected, action(rejected)),
+            // a proposal that carries no code at all
+            proposal(
+                ProposalStatus::Open,
+                GovAction::Signal {
+                    text: "hello".into(),
+                },
+            ),
+        ];
+
+        let named = code_blobs_proposed(&proposals);
+
+        assert_eq!(named, HashSet::from([register, update]));
+    }
+
+    /// the push gate reads the union: a digest an open proposal names is
+    /// admitted, and once that proposal closes without scheduling anything
+    /// `update` drops it for the reclaim.
+    #[tokio::test]
+    async fn a_digest_an_open_proposal_names_is_admitted_and_dropped_when_it_closes() {
+        let blobs = blobstore::BlobHandle::default();
+        let digest = [5u8; 32];
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
+
+        let wire = Recorder::default();
+        // the sender delivers nothing after the ack (`Recorder` reads EOF), so
+        // the transfer itself fails — the ack byte is what this asserts.
+        let _ = receive_push(
+            wire.clone(),
+            KIND_MODULE_CODE,
+            digest,
+            4096,
+            blobs.clone(),
+            Default::default(),
+            Arc::new(AtomicU64::new(0)),
+            registry.clone(),
+        )
+        .await;
+        assert_eq!(
+            wire.0.lock().expect("recorder")[0],
+            ACK_SEND_FROM,
+            "a digest an open proposal names must be admitted"
+        );
+
+        // the proposal is rejected without scheduling a swap: nothing names
+        // the digest any more, and the reclaim gets it.
+        assert_eq!(registry.update(HashSet::new()), vec![digest]);
+        assert!(!registry.is_referenced(&digest));
     }
 
     /// a digest the registry drops (a cancelled/replaced swap, or code that

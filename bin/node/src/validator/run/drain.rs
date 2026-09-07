@@ -1517,13 +1517,30 @@ impl ValidatorRuntime<'_> {
         else {
             return;
         };
+        // an OPEN RegisterModule/UpdateModule ballot names its bytes too
+        // (#1861). the registry cannot name a brand-new artifact until that
+        // ballot passes, yet the validators deciding it are exactly the ones
+        // that must hold the bytes — naming only the registry deadlocks every
+        // `register`. read beside the registry, on the same tick.
+        let gov_req = governance::encode_query(&governance::GovQuery::Proposals);
+        let gov_reply = node.host().query("governance", &gov_req).await;
+        let proposals = match gov_reply.as_deref().map(governance::decode_reply) {
+            Ok(Ok(governance::GovReply::Proposals(views))) => views,
+            // a net with no governance module names no proposed code, and
+            // neither does a reply that is not the listing: an EMPTY set, not
+            // a skipped tick — the registry read above drives readiness on
+            // its own either way.
+            Ok(Ok(_) | Err(_)) | Err(_) => Vec::new(),
+        };
         // the code plane's push admission gate reads THIS set (#1833): a
         // digest nothing here names any more is refused before any staging.
         // reclaim rides the same registry-change point — whatever fell out
-        // (a cancelled/replaced swap, or a module's `code_hash` that moved
-        // on) is forgotten, so an unreferenced blob does not outlive the
-        // registry entry that once justified it.
-        for digest in code_registry.update(crate::code_plane::code_blobs_referenced(&modules)) {
+        // (a cancelled/replaced swap, a closed proposal, or a module's
+        // `code_hash` that moved on) is forgotten, so an unreferenced blob
+        // does not outlive the record that once justified it.
+        let mut referenced = crate::code_plane::code_blobs_referenced(&modules);
+        referenced.extend(crate::code_plane::code_blobs_proposed(&proposals));
+        for digest in code_registry.update(referenced) {
             blobs.forget(&digest);
         }
         if !orchestrator

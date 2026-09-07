@@ -1,9 +1,13 @@
 //! `ducktape module …` — the operator's side of a live code swap.
 //!
-//! `update`/`register` stage a component at this node's owner-gated admin
-//! route (which fans it out to every validator and returns their receipts),
-//! then drive the governance proposal that schedules it. `status` reads the
-//! modules registry. Nothing here runs inside the node.
+//! `update`/`register` drive the governance proposal that schedules the swap
+//! FIRST, then stage the component at this node's owner-gated admin route
+//! (which fans it out to every validator and returns their receipts). That
+//! order is load-bearing: the code plane admits only a digest consensus names,
+//! and for a brand-new artifact the open proposal is the only thing that names
+//! it (#1861). A holdout receipt is a diagnostic — the swap's readiness quorum,
+//! not the fan-out, is what holds activation. `status` reads the modules
+//! registry. Nothing here runs inside the node.
 
 use std::path::PathBuf;
 
@@ -146,10 +150,11 @@ fn matches_module_action<'a>(
     }
 }
 
-/// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: stage the bytes
-/// at this node (fan-out to every validator), refuse unless every member holds
-/// them, then drive the governance proposal that schedules the swap at this
-/// execution height + N and read the registry back for its verdict.
+/// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: check the
+/// registry's static rules, drive the governance proposal that schedules the
+/// swap at its execute height + N, then stage the bytes at this node (fan-out
+/// to every validator, holdouts reported) and read the registry back for its
+/// verdict.
 fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     config::validate_module_id(&args.id)?;
     // the static half of the registry's lead rule, checked before anything is
@@ -211,32 +216,17 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         }
     }
 
-    // 2. stage + fan-out; 3. every member holds the bytes or nothing is proposed
-    // the token lives in the node's workspace — its `storage_dir` in the dev
-    // shape, which is NOT the config file's directory.
-    let reply = stage_component(http_base, &resolved.service.workspace, &bytes)?;
-    digest_matches(&reply, &bytes)?;
-    eprintln!(
-        "staged {} ({} bytes), {} peer receipt(s)",
-        hex_bytes(&code_hash),
-        reply.len,
-        reply.receipts.len()
-    );
-    // the fan-out never pushes to the staging node itself, so the one valset
-    // member allowed no receipt is THIS NODE's key — not the governance
-    // signer's, which under share governance is an account key.
-    let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
-    let members = crate::cli::read_members(rpc_addr)?;
-    note_non_member_holdouts(&reply, &members);
-    refuse_unless_every_validator_holds(&reply, &members, &me_hex)?;
+    // 2. the ceremony, BEFORE the bytes move: join an open proposal for the
+    //    same (verb, id, hash, lead) or propose; cast yes; execute when
+    //    decidable. it runs first because an OPEN proposal is what makes the
+    //    digest admissible on every peer (#1861) — the code plane refuses a
+    //    push nothing in consensus names, so staging a brand-new artifact
+    //    ahead of its proposal collected refusals, never receipts. `--after`
+    //    is the activation_lead governance applies RELATIVE TO THE EXECUTE
+    //    HEIGHT (#1775) — every member co-signing the same proposal passes the
+    //    same number, so no per-member height computation is needed here.
     let signer = crate::cli::gov_signer(rpc_addr, &cfg_path, &resolved)?;
     let pubkey_hex = signer_pubkey_hex(&signer);
-
-    // 4. the ceremony: join an open proposal for the same (verb, id, hash,
-    //    lead) or propose; cast yes; execute when decidable. `--after` is the
-    //    activation_lead governance applies RELATIVE TO THE EXECUTE HEIGHT
-    //    (#1775) — every member co-signing the same proposal passes the same
-    //    number, so no per-member height computation is needed here at all.
     let matches = matches_module_action(verb, &args.id, &code_hash, args.after);
     let ceremony = crate::cli::drive_proposal_ceremony(
         &node,
@@ -251,6 +241,26 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         Ok(outcome) => outcome,
         Err(error) => return Err(ceremony_failed(rpc_addr, &args.id, &code_hash, error)),
     };
+
+    // 3. stage + fan-out, now that the digest is referenced. the token lives
+    //    in the node's workspace — its `storage_dir` in the dev shape, which
+    //    is NOT the config file's directory.
+    let reply = stage_component(http_base, &resolved.service.workspace, &bytes)?;
+    digest_matches(&reply, &bytes)?;
+    eprintln!(
+        "staged {} ({} bytes), {} peer receipt(s)",
+        hex_bytes(&code_hash),
+        reply.len,
+        reply.receipts.len()
+    );
+    // the fan-out never pushes to the staging node itself, so the one valset
+    // member allowed no receipt is THIS NODE's key — not the governance
+    // signer's, which under share governance is an account key.
+    let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
+    let members = crate::cli::read_members(rpc_addr)?;
+    note_non_member_holdouts(&reply, &members);
+    report_validator_holdouts(&reply, &members, &me_hex);
+
     match outcome {
         CeremonyOutcome::AwaitingBallots => Ok(()),
         CeremonyOutcome::Passed => confirm_scheduled(rpc_addr, &args.id, &code_hash),
@@ -527,9 +537,10 @@ fn stage_component(
     serde_json::from_str(&text).map_err(|e| format!("stage reply: {e}: {text}"))
 }
 
-/// the sentence under every receipt refusal — one wording, whichever gate.
-const NOT_PROPOSED: &str = "not proposed: every validator must hold the bytes before a swap is scheduled \
-                            — re-run once they are reachable (staging is idempotent)";
+/// the sentence under the holdout table — one wording, whichever gate.
+const HOLDOUTS_HEAL: &str = "the swap cannot ACTIVATE until every validator holds the bytes and signals ready; each \
+     holdout fetches the committed artifact off a peer before the boundary. re-run to push \
+     again once they are reachable (staging is idempotent)";
 
 /// where one validator stands after the fan-out.
 enum Standing<'a> {
@@ -558,19 +569,22 @@ fn standing<'a>(reply: &'a StageReply, member_hex: &str, me_hex: &str) -> Standi
     }
 }
 
-/// The gate: a swap only makes sense once every VALIDATOR can run the code,
-/// and the readiness quorum that arms it is the valset, so the receipt table
-/// — one row per overlay peer the fan-out reached, validators and residents
-/// alike — is read through the member set. Every member is `me_hex` or holds
-/// an ok receipt; one holdout (a refused transfer, or no receipt at all
-/// because the node never dialled it) and nothing is proposed. The refusal
-/// names each holdout with the status its node reported.
-fn refuse_unless_every_validator_holds(
-    reply: &StageReply,
+/// A DIAGNOSTIC, not a gate (#1861). A swap only makes sense once every
+/// VALIDATOR can run the code, and the readiness quorum that arms it is the
+/// valset — but that gate lives in consensus (`pump_code_readiness` + the
+/// swap's R = n readiness latch), not here: the proposal is already open by
+/// the time the bytes move, and refusing to propose on a holdout would strand
+/// the very record that makes the digest admissible. So the receipt table —
+/// one row per overlay peer the fan-out reached, validators and residents
+/// alike — is read through the member set and each holdout (a refused
+/// transfer, or no receipt at all because the node never dialled it) is named
+/// with the status its node reported.
+fn holdout_rows<'a>(
+    reply: &'a StageReply,
     members: &[Vec<u8>],
     me_hex: &str,
-) -> Result<(), String> {
-    let holdouts: Vec<(String, &str)> = members
+) -> Vec<(String, &'a str)> {
+    members
         .iter()
         .map(|member| hex_bytes(member))
         .filter_map(|member| match standing(reply, &member, me_hex) {
@@ -578,17 +592,21 @@ fn refuse_unless_every_validator_holds(
             Standing::Refused(status) => Some((member, status)),
             Standing::Unreached => Some((member, "no receipt (unreachable)")),
         })
-        .collect();
+        .collect()
+}
+
+/// print [`holdout_rows`] for the operator; silent when every member holds it.
+fn report_validator_holdouts(reply: &StageReply, members: &[Vec<u8>], me_hex: &str) {
+    let holdouts = holdout_rows(reply, members, me_hex);
     let every_validator_holds_it = holdouts.is_empty();
     if every_validator_holds_it {
-        return Ok(());
+        return;
     }
-    let mut table = String::from("peer  status\n");
+    eprintln!("peer  status");
     for (peer, status) in holdouts {
-        table.push_str(&format!("{peer}  {status}\n"));
+        eprintln!("{peer}  {status}");
     }
-    table.push_str(NOT_PROPOSED);
-    Err(table)
+    eprintln!("{HOLDOUTS_HEAL}");
 }
 
 /// A peer outside the valset (a resident, a sentry) that did not take the
@@ -703,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn a_validator_whose_node_refused_the_bytes_refuses_with_its_status() {
+    fn a_validator_whose_node_refused_the_bytes_is_named_with_its_status() {
         let me = vec![0x01u8; 32];
         let stored = vec![0x02u8; 32];
         let refused = vec![0x03u8; 32];
@@ -712,53 +730,40 @@ mod tests {
             receipt(&refused, "module_artifact_too_large", false),
         ]);
         let members = vec![me.clone(), stored.clone(), refused.clone()];
-        let err =
-            refuse_unless_every_validator_holds(&reply, &members, &hex_bytes(&me)).unwrap_err();
-        assert!(err.starts_with("peer  status\n"), "{err}");
-        assert!(
-            err.contains(&format!(
-                "{}  module_artifact_too_large",
-                hex_bytes(&refused)
-            )),
-            "{err}"
+        let rows = holdout_rows(&reply, &members, &hex_bytes(&me));
+        assert_eq!(
+            rows,
+            vec![(hex_bytes(&refused), "module_artifact_too_large")],
+            "holders are not listed"
         );
-        assert!(
-            !err.contains(&hex_bytes(&stored)),
-            "holders are not listed: {err}"
-        );
-        assert!(err.contains("not proposed"), "{err}");
     }
 
     #[test]
-    fn a_validator_without_a_receipt_refuses_as_unreachable() {
+    fn a_validator_without_a_receipt_is_named_unreachable() {
         let me = vec![0x01u8; 32];
         let answered = vec![0x02u8; 32];
         let silent = vec![0x03u8; 32];
         let reply = reply(vec![receipt(&answered, "stored", true)]);
         let members = vec![me.clone(), answered.clone(), silent.clone()];
-        let err =
-            refuse_unless_every_validator_holds(&reply, &members, &hex_bytes(&me)).unwrap_err();
-        assert!(
-            err.contains(&format!("{}  no receipt (unreachable)", hex_bytes(&silent))),
-            "{err}"
-        );
-        assert!(
-            !err.contains(&hex_bytes(&answered)),
-            "answered peers are not listed: {err}"
+        let rows = holdout_rows(&reply, &members, &hex_bytes(&me));
+        assert_eq!(
+            rows,
+            vec![(hex_bytes(&silent), "no receipt (unreachable)")],
+            "answered peers are not listed"
         );
         // me + every other member answered: nothing missing
         let present = vec![me.clone(), answered];
-        assert!(refuse_unless_every_validator_holds(&reply, &present, &hex_bytes(&me)).is_ok());
-        // a staging node outside the valset needs every member's receipt
-        let err = refuse_unless_every_validator_holds(&reply, &present, "ff").unwrap_err();
-        assert!(err.contains(&hex_bytes(&me)), "{err}");
+        assert!(holdout_rows(&reply, &present, &hex_bytes(&me)).is_empty());
+        // a staging node outside the valset has no receipt of its own either
+        let rows = holdout_rows(&reply, &present, "ff");
+        assert_eq!(rows, vec![(hex_bytes(&me), "no receipt (unreachable)")]);
     }
 
     /// the receipt table names every overlay peer the fan-out reached, so a
     /// resident that could not take the bytes shows up in it; it is no part
-    /// of the readiness quorum and must not hold the proposal.
+    /// of the readiness quorum and is not a validator holdout.
     #[test]
-    fn a_non_validator_holdout_does_not_refuse() {
+    fn a_non_validator_holdout_is_not_a_validator_holdout() {
         let me = vec![0x01u8; 32];
         let other_validator = vec![0x02u8; 32];
         let resident = vec![0x03u8; 32];
@@ -767,7 +772,7 @@ mod tests {
             receipt(&resident, "open failed: io: tcp connect refused", false),
         ]);
         let members = vec![me.clone(), other_validator];
-        assert!(refuse_unless_every_validator_holds(&reply, &members, &hex_bytes(&me)).is_ok());
+        assert!(holdout_rows(&reply, &members, &hex_bytes(&me)).is_empty());
     }
 
     #[test]

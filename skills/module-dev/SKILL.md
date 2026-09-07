@@ -31,11 +31,18 @@ ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N
 ducktape module status                                      # the registry
 ```
 
-`register`/`update` stage the component at this node's owner-gated admin route
-(which fans it out to every validator and returns their receipts), then drive
-the governance proposal that schedules the admission/swap; it activates at
-`height + N` (`N > MIN_SWAP_LEAD`, i.e. `> 3`; default 50 to leave room for the
-ceremony's own blocks). `status` prints one row per module — `id  active
+`register`/`update` drive the governance proposal that schedules the
+admission/swap FIRST, then stage the component at this node's owner-gated admin
+route (which fans it out to every validator and returns their receipts). That
+order is load-bearing: a peer admits only a digest consensus names — an active
+`code_hash`, a pending swap, or an OPEN `RegisterModule`/`UpdateModule`
+proposal — so a brand-new artifact staged ahead of its proposal collects
+refusals. A validator that did not take the bytes is printed as a holdout, not
+a refusal to propose: the swap activates at `height + N` (`N > MIN_SWAP_LEAD`,
+i.e. `> 3`; default 50 to leave room for the ceremony's own blocks) only once
+every validator holds the code and signals ready, and a holdout fetches the
+committed artifact off a peer before that boundary. `status` prints one row per
+module — `id  active
 pending`, a pending swap carrying `ready k` (validators that signalled) or
 `ready ✓`. Restore and state sync compose the wasm set from the registry's
 roster at the boundary (`noded::compose`, `Boot::Reopen`), so an admitted id

@@ -98,37 +98,6 @@ fn register_then_update_activate_across_three_validators() {
     }
 }
 
-/// a dead peer refuses BEFORE the proposal (spec decision 2-B): the
-/// custodian's push dials it over the userspace stack, which has no SYN
-/// timeout, so only the code plane's `OPEN_TIMEOUT` (15 s) turns that peer
-/// into a receipt the operator can read — well inside the CLI's 60 s.
-#[test]
-fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
-    let mut cluster = three_validators();
-    cluster.kill(2);
-    let cfg = cluster.config_file(0);
-    let cfg = cfg.to_str().unwrap();
-    let started = std::time::Instant::now();
-    let (ok, out) = cluster.run_verb(&[
-        "module",
-        "register",
-        "hello",
-        &fixture("hello"),
-        "--config",
-        cfg,
-    ]);
-    println!("dead-peer run took {:?}:\n{out}", started.elapsed());
-    assert!(!ok, "{out}");
-    assert!(out.contains("peer  status"), "{out}");
-    let dead = common::hex(&Cluster::identity(3));
-    assert!(out.contains(&format!("{dead}  open timed out")), "{out}");
-    assert!(out.contains("not proposed"), "{out}");
-    // nothing reached governance: no pending swap, no proposal at all
-    let (_, status) = cluster.run_verb(&["module", "status", "--config", cfg]);
-    assert!(!status.contains("hello"), "{status}");
-    assert_no_proposals(&cluster, 0);
-}
-
 /// "before any governance" is only proven by the proposal list itself: the
 /// registry writes nothing until execute, so an empty `module status` row
 /// would still pass with a minted proposal sitting open.
