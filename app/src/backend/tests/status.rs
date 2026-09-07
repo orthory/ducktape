@@ -6,7 +6,7 @@ fn a_count_of_one_takes_the_singular_noun() {
     assert_eq!(plural(0, "agent", "agents"), "0 agents");
     assert_eq!(plural(2, "agent", "agents"), "2 agents");
     // the register subtitles that used to read `1 agents` / `1 validators`.
-    assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
+    assert_eq!(members_summary(true, &[]), "");
 }
 
 /// A SUBTITLE THAT COUNTS NOTHING, OVER A PLATE THAT ALREADY SAID SO. Approvals
@@ -32,21 +32,6 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
         skill_count: 0,
         cap_count: 0,
     };
-    let proposal = |open: bool| ProposalRow {
-        id: "proposal-1".into(),
-        action: "add_resident".into(),
-        detail: String::new(),
-        proposer: String::new(),
-        status: "open".into(),
-        deadline: 0,
-        approvals: 0,
-        rejections: 0,
-        rule: "threshold".into(),
-        required_yes: 1,
-        electorate: 1,
-        open,
-        settled_height: 0,
-    };
     let entry = FsEntry {
         key: 0,
         path: "/shared/notes".into(),
@@ -69,36 +54,12 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
     // Nothing there: the plate on each screen says it in words.
     assert_eq!(members_summary(true, &[]), "");
     assert_eq!(agents_summary(true, &[]), "");
-    assert_eq!(proposals_summary(true, &[]), "");
     assert_eq!(fs_counts_summary(true, true, &[]), "");
 
     // Something there: every subtitle speaks, zeros included.
     assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
     assert_eq!(agents_summary(true, &[agent(false)]), "1 agent · 0 working");
-    assert_eq!(
-        proposals_summary(true, &[proposal(true)]),
-        "1 open · 0 settled"
-    );
-    assert_eq!(
-        proposals_summary(true, &[proposal(false)]),
-        "0 open · 1 settled"
-    );
     assert_eq!(fs_counts_summary(true, true, &[entry]), "1 file · 0 dirs");
-}
-
-#[test]
-fn quorum_dots_count_the_frozen_rule_not_the_electorate() {
-    // three of the four REQUIRED signatures are in, inside a six-node pool.
-    let dots = quorum_dots(3, 4);
-    assert_eq!(dots.len(), 4);
-    assert_eq!(dots.iter().filter(|seat| seat.filled).count(), 3);
-    assert_eq!(tally_label(3, 4), "3 / 4");
-    assert_eq!(tally_tone(3, 4), "near");
-    assert_eq!(tally_tone(1, 4), "far");
-    assert_eq!(tally_note(3, 4), "3 approvals · 1 more for quorum");
-    assert_eq!(tally_note(4, 4), "quorum met");
-    assert_eq!(approve_label(3, 4), "Approve →");
-    assert_eq!(approve_label(1, 4), "Approve");
 }
 
 #[test]
@@ -373,14 +334,8 @@ fn a_proposal_renders_its_payload_and_its_frozen_bar() {
         "two no votes count toward turnout"
     );
     assert_eq!(yes_needed(&majority, 3), 4, "…but yes must still exceed no");
-    assert_eq!(
-        tally_note(3, yes_needed(&majority, 3)),
-        "3 approvals · 1 more for quorum"
-    );
 
     assert_eq!(tagged_name(&view["action"]), "add_validator");
-    assert_eq!(proposal_kind_tone("add_validator"), "access");
-    assert_eq!(proposal_kind_tone("signal"), "neutral");
     assert_eq!(
         gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
         "ship it"

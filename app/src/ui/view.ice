@@ -518,17 +518,11 @@ view
               note_composer_event -> forge_composer_event _
               open_message_link -> open_message_link _
               copy_to_clipboard -> copy_to_clipboard _ _
+        // Approvals is a MODULE-OWNED VIEW: the register the app holds goes
+        // in as props, and what the reader does comes back as an intent the
+        // handler below signs — the guest sees no key and no endpoint.
         governance:
-          GovernanceScreen #governance
-            with
-              rows=gov_rows
-              voting=gov_voting
-              admin=members_is_admin(members_rows)
-              connected
-              answered=gov_answered
-            events
-              gov_vote -> gov_vote _ _
-              gov_execute -> gov_execute _
+          extern governance_view(dark, connected, members_is_admin(members_rows), gov_answered, gov_voting, gov_rows) #governance -> governance_view_event _
         node:
           NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
             with
