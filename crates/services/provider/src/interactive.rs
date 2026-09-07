@@ -114,6 +114,10 @@ pub struct InteractiveSession {
     /// (another account's, since #843) will mount.
     _broker: Option<RunBroker>,
     _config_home: Option<RunHome>,
+    /// this session's cap-checked node read lane — the guest's `DUCKTAPE_NODE`,
+    /// so it dies with the session. `None` for the operator's local
+    /// vendor-login pty run, which is not a guest and gets no tunnel.
+    _read_lane: Option<crate::read_lane::ReadLane>,
 }
 
 impl InteractiveSession {
@@ -128,6 +132,7 @@ impl InteractiveSession {
         workdir: std::path::PathBuf,
         broker: Option<RunBroker>,
         config_home: Option<RunHome>,
+        read_lane: Option<crate::read_lane::ReadLane>,
     ) -> Self {
         let microvm::TerminalIo {
             output,
@@ -155,6 +160,7 @@ impl InteractiveSession {
             })),
             _broker: broker,
             _config_home: config_home,
+            _read_lane: read_lane,
         }
     }
 
@@ -197,6 +203,7 @@ impl InteractiveSession {
             })),
             _broker: broker,
             _config_home: config_home,
+            _read_lane: None,
         })
     }
 
@@ -436,7 +443,7 @@ impl CliProvider {
 
         match &self.backend {
             SandboxBackend::MicroVm { .. } => {
-                let (vm, io) = self
+                let (vm, io, read_lane) = self
                     .microvm_boot(&args, &workdir, ctx, &auth, crate::GuestStdio::Pty)
                     .await?;
                 Ok(InteractiveSession::from_microvm(
@@ -445,6 +452,7 @@ impl CliProvider {
                     workdir,
                     broker,
                     home,
+                    read_lane,
                 ))
             }
             #[cfg(any(test, feature = "testkit"))]

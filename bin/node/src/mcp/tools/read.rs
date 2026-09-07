@@ -378,13 +378,17 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 /// source, but it would also silently empty a legitimate call whose `prefix`
 /// names one exact file rather than a directory (grep only matches a file
 /// candidate with `child == prefix || child.starts_with(prefix)`, and no
-/// file path ends in `/`). `retain_capped_hits` and `scrub_uncapped_cursor`
-/// below already re-check every hit and the resume cursor against the cap
-/// regardless of what duckfs scanned, so nothing outside the cap can reach
-/// the agent either way — a `next` cursor is a resume path, not a hit: #1663
-/// scrubbed `hits` but left `next` verbatim, so a page that runs out of
-/// budget mid-scan of an out-of-cap sibling could still hand back that
-/// sibling's path.
+/// file path ends in `/`). `ModelRecord::retain_capped_rows` and
+/// `ModelRecord::scrub_uncapped_cursor` already re-check every hit and the
+/// resume cursor against the cap regardless of what duckfs scanned, so nothing
+/// outside the cap can reach the agent either way — a `next` cursor is a resume
+/// path, not a hit.
+///
+/// Those two live on the RECORD, beside `permits` itself, because this is not
+/// the only gate in front of the raw route any more: a sandboxed run's node
+/// tunnel is a cap-checked read lane (`provider-host`'s `read_lane`) that
+/// filters the same replies, and the lane and this tool plane must decide
+/// identically.
 fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let prefix = arg_str(args, "prefix")?;
     let pattern = arg_str(args, "pattern")?;
@@ -393,46 +397,9 @@ fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let mut reply = run
         .node
         .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
-    retain_capped_hits(&record, &mut reply);
-    scrub_uncapped_cursor(&record, &mut reply);
+    record.retain_capped_rows(&mut reply, "hits");
+    record.scrub_uncapped_cursor(&mut reply, "hits");
     Ok(reply)
-}
-
-/// drop every grep hit whose own path the record's duckfs_read cap does not
-/// segment-boundary cover — a no-op if the reply carries no `hits` array.
-fn retain_capped_hits(record: &runs::ModelRecord, reply: &mut Value) {
-    let Some(hits) = reply.get_mut("hits").and_then(Value::as_array_mut) else {
-        return;
-    };
-    hits.retain(|hit| {
-        hit.get("path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| record.permits(&CapRequest::DuckfsRead(path)))
-    });
-}
-
-/// a resume cursor the cap does not cover names a path in a sibling tree the
-/// agent may not read at all (the same leak `retain_capped_hits` closes for
-/// `hits`, #1755). Fall back to the last RETAINED hit's own path — still a
-/// valid resume point inside the cap — or drop `next` entirely when no hit
-/// survived filtering. A no-op if the reply carries no `next` cursor already.
-fn scrub_uncapped_cursor(record: &runs::ModelRecord, reply: &mut Value) {
-    // no cursor (missing key, or an explicit `null` meaning "no more pages")
-    // is nothing to scrub.
-    let Some(next) = reply.get("next").and_then(Value::as_str) else {
-        return;
-    };
-    if record.permits(&CapRequest::DuckfsRead(next)) {
-        return;
-    }
-    let fallback = reply
-        .get("hits")
-        .and_then(Value::as_array)
-        .and_then(|hits| hits.last())
-        .and_then(|hit| hit.get("path"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    reply["next"] = fallback;
 }
 
 fn gate_forge_read(run: &Run, repo: &str) -> Result<()> {
@@ -799,7 +766,7 @@ mod tests {
             ],
             "next": null,
         });
-        retain_capped_hits(&record, &mut reply);
+        record.retain_capped_rows(&mut reply, "hits");
         let paths: Vec<&str> = reply["hits"]
             .as_array()
             .unwrap()
@@ -823,8 +790,8 @@ mod tests {
             ],
             "next": "/shared/team-secrets/creds.txt",
         });
-        retain_capped_hits(&record, &mut reply);
-        scrub_uncapped_cursor(&record, &mut reply);
+        record.retain_capped_rows(&mut reply, "hits");
+        record.scrub_uncapped_cursor(&mut reply, "hits");
         assert_eq!(reply["next"], json!("/shared/team/a.txt"));
     }
 
@@ -839,8 +806,8 @@ mod tests {
             ],
             "next": "/shared/team-secrets/creds.txt",
         });
-        retain_capped_hits(&record, &mut reply);
-        scrub_uncapped_cursor(&record, &mut reply);
+        record.retain_capped_rows(&mut reply, "hits");
+        record.scrub_uncapped_cursor(&mut reply, "hits");
         assert_eq!(reply["hits"].as_array().unwrap().len(), 0);
         assert_eq!(reply["next"], Value::Null);
     }
@@ -855,14 +822,14 @@ mod tests {
             ],
             "next": "/shared/team/b.txt",
         });
-        retain_capped_hits(&record, &mut reply);
-        scrub_uncapped_cursor(&record, &mut reply);
+        record.retain_capped_rows(&mut reply, "hits");
+        record.scrub_uncapped_cursor(&mut reply, "hits");
         assert_eq!(reply["next"], json!("/shared/team/b.txt"));
     }
 
     /// `prefix` is never widened before it reaches duckfs: a cap (and a call)
     /// naming one exact FILE, not a directory, must still see its own hit and
-    /// keep a cursor that resumes at that same file — `retain_capped_hits`'s
+    /// keep a cursor that resumes at that same file — `retain_capped_rows`'s
     /// `p == pre` exact-match arm (mirroring `ModelRecord::permits`) covers
     /// this without any prefix rewriting.
     #[test]
@@ -880,8 +847,8 @@ mod tests {
             ],
             "next": "/shared/team/a.txt",
         });
-        retain_capped_hits(&record, &mut reply);
-        scrub_uncapped_cursor(&record, &mut reply);
+        record.retain_capped_rows(&mut reply, "hits");
+        record.scrub_uncapped_cursor(&mut reply, "hits");
         assert_eq!(
             reply["hits"].as_array().unwrap().len(),
             1,

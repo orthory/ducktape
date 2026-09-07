@@ -205,6 +205,7 @@ pub(crate) use sandbox_host::sandbox;
 pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
+mod read_lane;
 mod spec;
 mod variants;
 #[cfg(unix)]
@@ -726,7 +727,7 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
         stdio: GuestStdio,
-    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo), String> {
+    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo, Option<read_lane::ReadLane>), String> {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
@@ -744,6 +745,11 @@ impl CliProvider {
         };
 
         let mut envs = self.sandbox_env(ctx, auth)?;
+        // the run's node entry is its OWN cap-checked read lane, not the node's
+        // listener: this binds it and repoints `DUCKTAPE_NODE` at it, so what
+        // gets tunnelled below is the lane's port. It lives exactly as long as
+        // the returned value, which the run holds beside its VM.
+        let read_lane = read_lane::ReadLane::start(&mut envs, ctx.agent_id.clone()).await?;
         // wired HERE, before the env is translated and frozen into the
         // manifest — the name is the warning: it rewrites `envs`.
         let tunnel_ports = wire_guest_tunnels(
@@ -841,14 +847,12 @@ impl CliProvider {
             mem_mib,
             vsock_uds: socket_scratch.path().join(MICROVM_SOCKET_NAME),
             // no tap: the guest has no NIC, so its whole reach is the vsock
-            // tunnels above. That is no longer the same as "no egress" — those
-            // tunnels now carry this node's ENTIRE http listener, not just the
-            // broker, and `/v1/gateway/proxy` on it dispatches a
-            // `GatewayJob::Http` over the overlay to a publisher node. Its only
-            // gate (`gateway_http::gateway_api_origin_allowed`) is a header
-            // check a plain `curl` passes by sending no headers, so a run CAN
-            // reach off this host. See [`wire_guest_tunnels`] for the full
-            // reach and the open question of narrowing it (#1317).
+            // tunnels above. That is not the same as "no egress" — the node
+            // tunnel's read lane passes `/v1/gateway/proxy`, which dispatches a
+            // `GatewayJob::Http` over the overlay to a publisher node, and its
+            // only gate (`gateway_http::gateway_api_origin_allowed`) is a
+            // header check a plain `curl` passes by sending no headers. See
+            // [`wire_guest_tunnels`] for the full reach.
             tap: None,
         };
 
@@ -868,7 +872,8 @@ impl CliProvider {
         // the VM's own `Drop` removes them from here.
         run_scratch.disarm();
         socket_scratch.disarm();
-        Ok(booted)
+        let (vm, io) = booted;
+        Ok((vm, io, read_lane))
     }
 
     /// the env carried into a sandbox.
@@ -1706,16 +1711,18 @@ impl Drop for ContextGuard {
 /// away rather than leave the run half-planed — writes landing over the
 /// run-action lane while every read dies on the guest's own loopback.
 ///
-/// **The node entry is a whole http listener, not a read lane.** The VM has no
-/// NIC, so these tunnels ARE the guest's attack surface. Reachable from any
-/// process in the guest, with no credential:
+/// **The node entry is this run's read lane, not the node's listener.** The VM
+/// has no NIC, so these tunnels ARE the guest's attack surface — and the node
+/// end of them terminates in [`read_lane::ReadLane`], a loopback proxy bound to
+/// THIS run, which refuses `/v1/ws` outright and admits a `/v1/files/*` read
+/// only under the run's committed `duckfs_read` cap (see that module). What is
+/// reachable from any process in the guest, with no credential:
 /// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
-///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
+///   `/v1/blocks`, `/v1/index/*`, `/metrics`; the `/v1/files/*` duckfs reads
+///   only inside the run's cap;
 /// * `/v1/submit/frame` — self-authenticating: the frame's own signature IS
 ///   its origin, so a guest with no key can put nothing through it;
 /// * `/v1/services/hello`, volatile presence that ages out on its own TTL;
-/// * `/v1/ws` — no credential of any kind, and it carries the `logs` topic, so
-///   a guest can read this operator's log ring;
 /// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
 ///   over the overlay to a publisher node, and its only gate,
 ///   `gateway_http::gateway_api_origin_allowed`, is a header check a native
@@ -1740,8 +1747,8 @@ impl Drop for ContextGuard {
 /// what it can then do is exactly what that key is authorized to do on-chain —
 /// which for a fresh key is nothing.
 ///
-/// Narrowing the READS to a scoped lane is the open half of #1317, and this
-/// function is the one place such a lane would replace.
+/// The gateway egress above is what remains: a run's own credential-less reach
+/// off this host, gated only by a header check.
 fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
     let mut ports = Vec::new();
     ports.extend(broker_base.and_then(url_port));
@@ -2416,6 +2423,9 @@ struct MicroVmHandle {
     pump: Option<tokio::task::JoinHandle<()>>,
     /// the HOST directory the run's workspace image is walked back into.
     workdir: PathBuf,
+    /// held for the VM's lifetime: the run's cap-checked node read lane. It is
+    /// the guest's `DUCKTAPE_NODE`, so it must not outlive the guest.
+    _read_lane: Option<read_lane::ReadLane>,
 }
 
 impl RunControl {
@@ -2615,7 +2625,7 @@ impl CliProvider {
             RunControl,
         ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io) = self
+            let (vm, io, read_lane) = self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
                 .await?;
             (
@@ -2627,6 +2637,7 @@ impl CliProvider {
                     exit: Some(io.exit),
                     pump: Some(io.pump),
                     workdir: workdir.to_path_buf(),
+                    _read_lane: read_lane,
                 }),
             )
         } else {
@@ -5848,8 +5859,8 @@ format = "text"
     }
 
     /// the READ plane. Writes ride the broker and the run-action lane, both
-    /// already tunnelled; without the node's own port every `ducktape mcp`
-    /// read tool dies on the guest's own loopback (#1317).
+    /// already tunnelled; without the read lane's port every `ducktape mcp`
+    /// read tool dies on the guest's own loopback.
     #[test]
     fn the_guest_allowlist_carries_the_node_read_plane() {
         let mut envs = vec![
