@@ -3,8 +3,8 @@
 //! the environment carries which node and agent, plus a narrow host endpoint
 //! for actions made by this run. The session private key never enters the child.
 //! it carries NOTHING about the grant: owner, `allowed_actions` and
-//! `ResourceCaps` are read back from the committed agent registry, so what this
-//! module reports is always what consensus actually holds.
+//! `ResourceCaps` are read back from the committed Runs model configuration,
+//! so this module reports what consensus actually holds.
 //!
 //! ## writes are gated in CONSENSUS, not here
 //!
@@ -199,16 +199,16 @@ impl Run {
             .and_then(|model| model.get("agent"))
             .ok_or_else(|| {
                 NodeError::Transport(format!(
-                    "the agent registry answered a shape this server does not understand: {reply}"
+                    "the Runs model query answered a shape this server does not understand: {reply}"
                 ))
             })?;
         if record.is_null() {
             return Err(NodeError::Rejected(format!(
-                "the agent registry holds no agent {agent_id:?}"
+                "Runs holds no model {agent_id:?}"
             )));
         }
         let standing: ModelRecord = serde_json::from_value(record.clone()).map_err(|e| {
-            NodeError::Transport(format!("the agent registry's record did not decode: {e}"))
+            NodeError::Transport(format!("the Runs model record did not decode: {e}"))
         })?;
         let Some(run_id) = self.run_id.as_deref() else {
             return Ok(standing);
@@ -466,7 +466,7 @@ fn describe(cap: &CapRequest) -> String {
 mod tests {
     use super::*;
 
-    /// a node that answers `/v1/query` from a canned table: the agent registry
+    /// a node that answers `/v1/query` from a canned table: the Runs model query
     /// arm, then the runs `run_authority` arm. one thread, `n` requests, no
     /// framework — the whole point is to watch `record()` make BOTH queries.
     fn fake_node(replies: Vec<serde_json::Value>) -> String {

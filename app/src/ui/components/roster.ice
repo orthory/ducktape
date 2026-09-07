@@ -1,5 +1,5 @@
 // The roster detail panel: one member record, drawn from what the valset and
-// the agent registry actually hold — a 56px header, a centred identity block,
+// Runs model configurations hold — a 56px header, a centred identity block,
 // machine fact rows, then the writes this node is allowed to attempt.
 //
 // THE CHAIN'S OWN WORDS, NOT THE ARTIFACT'S. The handoff prints ADMIN /

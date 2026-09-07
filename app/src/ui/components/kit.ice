@@ -445,7 +445,7 @@ component RoleMarker(role:str)
               font=code_semibold
               @text-warning
 
-// An agent registry row: who it is, what capability it holds, who owns it, and
+// A Runs model row: who it is, what capability it holds, who owns it, and
 // whether it is live. The artifact lists agents — it does not card them.
 component AgentCard(agent:AgentRow)
   col #root w=fill

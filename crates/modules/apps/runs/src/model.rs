@@ -38,20 +38,14 @@ pub const MAX_DELEGATIONS_PER_RUN: usize = 8;
 /// consensus state, so registration is size-gated up front (at stage time).
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 
-/// hard cap on the COUNT of registered agents. the registry's roster — the
-/// enumeration record consensus itself consumes (runs' `All`/`RoundRobin`
-/// engagement domain reads EVERY active agent) — is one replicated record,
-/// and every id in it also costs a dispatch fan-out under `All` engagement;
-/// both must stay bounded. deliberately generous: a thousand agents is a
-/// fleet, and each still costs [`MAX_AGENT_RECORD_BYTES`] of replicated state.
+/// Maximum registered model configurations. The roster is replicated state;
+/// this count and [`MAX_AGENT_RECORD_BYTES`] bound its size. Programs decide
+/// when to request model work through their own attribution handlers.
 pub const MAX_REGISTERED_AGENTS: usize = 1024;
 
-/// hard cap on the COUNT of agents ONE owner may register. without this, a
-/// single account (one external key, or one module) fills the whole registry
-/// (`MAX_REGISTERED_AGENTS`) alone and locks out every other account — the
-/// global cap bounds total state, this one bounds one account's SHARE of it.
-/// small on purpose: a legitimate fleet operator still needs dozens, not
-/// hundreds, of distinct agent identities.
+/// Maximum model configurations registered by one canonical origin. The
+/// allocation follows the stored registration origin, independently of later
+/// program-controller transfers. [`MAX_REGISTERED_AGENTS`] bounds the total.
 pub const MAX_AGENTS_PER_OWNER: usize = 32;
 
 /// hard cap on the COUNT of skills one agent curates. an unbounded skill list
@@ -106,11 +100,9 @@ pub fn is_skill_mount_name(name: &str) -> bool {
 /// would grant the directory and none of its contents.
 pub const SKILL_LIBRARY_PREFIX: &str = "/shared/skills";
 
-/// hard cap on the serialized CHAT blocks a response's `reply_blocks` map to.
-/// deliberately well under chat's `MAX_MESSAGE_HEAD_BYTES`: the reply is
-/// emitted as a chat post inside the delivery block, and a post that chat
-/// rejects would abort that block (the no-fail rule) — so the delivering
-/// module must be able to prove the post will fit BEFORE emitting.
+/// Maximum serialized Chat blocks proposed by a model response. Admission
+/// bounds the reply before creating its action request; the program's later
+/// Chat call still has its own authorization, size checks and target outcome.
 pub const MAX_REPLY_BLOCKS_BYTES: usize = 32 * 1024;
 
 /// required byte length of a recipe content-address (a sha256 digest).
@@ -133,11 +125,7 @@ pub const ACTION_CHAT_POST: &str = "chat.post";
 /// [`ACTION_CHAT_POST`], which only ever lets an agent answer where it was
 /// spoken to.
 ///
-/// a separate name on purpose. folding "post anywhere, unprompted" into
-/// `chat.post` would have SILENTLY widened every agent already registered with
-/// it — an owner who granted "may answer me" would have been giving "may post
-/// in any channel at any time" without ever being asked. a new action name means
-/// the wider power can only arrive by an owner deliberately granting it.
+/// The controller grants arbitrary-channel posting separately from replies.
 pub const ACTION_CHAT_POST_MESSAGE: &str = "chat.post_message";
 /// permission to create a task ([`AgentAction::CreateTask`]).
 pub const ACTION_TASKS_CREATE: &str = "tasks.create";
@@ -159,10 +147,7 @@ pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
 /// always means something.
 ///
-/// ADDITIVE only: an existing record's `allowed_actions` is a set of these
-/// names, so a NEW name grants nothing to an agent already registered — it can
-/// only arrive through an owner-gated `UpdateModel`. removing or renaming one,
-/// by contrast, would strand every record that holds it.
+/// Each action requires an explicit grant in the model configuration.
 pub const KNOWN_ACTIONS: [&str; 7] = [
     ACTION_CHAT_POST,
     ACTION_CHAT_POST_MESSAGE,
@@ -175,12 +160,12 @@ pub const KNOWN_ACTIONS: [&str; 7] = [
 
 // ---- runtime identity ---------------------------------------------------------
 
-/// the D3 resource-capability grant an agent carries. every list is a
+/// The resource-capability grant a model carries. Every list is a
 /// canonical SORTED + DEDUPED set (the write path canonicalizes, the committed
 /// decoder rejects a non-ascending list) so two logically-equal grants hash
-/// identically. `secrets` are OPAQUE vault references (D6) — never a
-/// materialized value, never key material (D1). an empty `ResourceCaps` is the
-/// default and denies every request except a zero budget check.
+/// identically. `secrets` are opaque vault references; their values remain
+/// outside consensus. An empty `ResourceCaps` is the default and denies every
+/// request, including peer calls.
 #[derive(
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq,
 )]
@@ -201,7 +186,7 @@ pub struct ResourceCaps {
     /// tool / mcp ids this agent may invoke.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
-    /// D6 vault references (scoped, opaque). refs only — the value is resolved
+    /// Vault references (scoped, opaque). refs only — the value is resolved
     /// host-side and NEVER crosses consensus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
@@ -229,10 +214,9 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
 
 /// how a curated skill reaches the model. the agent's SOUL is its `Always`
 /// skills: the host assembles their full bodies into the one context document
-/// the executor auto-loads, in curation order — this is where the old
-/// `prompt_hash` blob went. an `OnDemand` skill is listed by name and
-/// description in that document's index and read from its read-only mount only
-/// when the task calls for it.
+/// the executor auto-loads, in curation order. An `OnDemand` skill is listed by
+/// name and description in that document's index and read from its read-only
+/// mount when the task calls for it.
 ///
 /// the mode rides the agent's skill REFERENCE, not the skill document, because
 /// curation is per-agent: the same skill is one agent's persona and another's
@@ -260,16 +244,15 @@ pub enum LoadMode {
     OnDemand,
 }
 
-/// a C4 skill reference an agent's runs mount. this pins the REF, never the
+/// A skill reference the model's runs mount. This pins the reference, not the
 /// content: `source_prefix` is a duckfs read-only subtree and
 /// `source_snapshot` is its optional consensus pin — `Some` is a PINNED skill
-/// (immutable), `None` is a TRACKING skill (the phase-5 composer resolves the
+/// (immutable), `None` is a TRACKING skill (the envelope composer resolves the
 /// committed head at compose time). the list is ORDERED (later entries override
 /// earlier, and `Always` bodies assemble in this order), so it is a `Vec`, not a
 /// set — order is significant to the hash.
 ///
-/// deliberately a struct (not an enum): the phase-5 envelope composer reads
-/// every field straight through into a skill mount, so the same fields live here.
+/// The envelope composer reads every field into a skill mount.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRef {
@@ -285,7 +268,7 @@ pub struct SkillRef {
     pub load: LoadMode,
 }
 
-/// a D3 capability request the runtime probes an [`ModelRecord`] with before
+/// A capability request the runtime probes a [`ModelRecord`] with before
 /// applying an effect or opening a sink (the delivery path calls
 /// [`ModelRecord::permits`]). the record carries the grant; this is the ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,20 +324,18 @@ pub enum ModelRole {
     General,
 }
 
-/// one registered agent — an ordered-op registration, so which capability and
-/// which SKILLS an agent runs is part of the root-hash and auditable. `owner` is
-/// the registration origin and gates every mutation of the record.
+/// One model configuration for a program account. Capability and skill grants
+/// are consensus state. `owner` records the registration origin for allocation
+/// accounting; the program account's live control governs mutations.
 ///
 /// `capability` names WHAT the run needs (an open-set registry tag like
 /// "codex" — dispatch selects providers of that tag); HOW it runs — binary,
 /// flags, model — is host policy in each provider's capability spec, and
 /// consensus never sees it. the record is a recipe, not an executor config.
 ///
-/// there is no prompt pin: an agent is DEFINED by its curated `skills`, and its
-/// persona is simply a skill loaded [`LoadMode::Always`]. determinism is
-/// unchanged in kind — consensus used to commit which prompt bytes ran (a
-/// hash), and now commits which skill snapshots ran (pins). both are content
-/// addresses; the skill one is also editable, diffable, and reviewable.
+/// Curated `skills` describe model context. [`LoadMode::Always`] includes the
+/// skill's body in every run; a snapshot pin fixes the source content, while an
+/// unpinned reference follows the committed source head.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRecord {
@@ -372,15 +353,15 @@ pub struct ModelRecord {
     pub role: ModelRole,
     pub created_at: u64,
     pub updated_at: u64,
-    /// W4 recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`]
+    /// Recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`]
     /// bytes. the committed encoding always carries it (empty when unset).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipe_hash: Vec<u8>,
-    /// D3 resource caps. the committed encoding always carries it (default-empty
+    /// Resource caps. the committed encoding always carries it (default-empty
     /// when unset).
     #[serde(default, skip_serializing_if = "caps_is_default")]
     pub caps: ResourceCaps,
-    /// C4 ordered skill refs. the committed encoding always carries it (empty
+    /// Ordered skill refs. the committed encoding always carries it (empty
     /// when unset).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillRef>,
@@ -391,9 +372,8 @@ fn role_is_default(role: &ModelRole) -> bool {
 }
 
 impl ModelRecord {
-    /// the pure D3 cap gate. the runtime calls this before applying an effect
-    /// or opening a sink; a record with empty caps denies every request except a
-    /// positive budget check. forge/tool/
+    /// The capability gate for preparing actions and opening sinks. Empty caps
+    /// deny every request; peer calls require a positive budget. Forge/tool/
     /// secret use exact membership; duckfs uses path-PREFIX containment (a
     /// prefix grants itself and any child path, but never a sibling that merely
     /// shares a textual prefix — `src` does not grant `srcx`); pages use exact

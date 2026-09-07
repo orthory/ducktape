@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// [`crate::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the model configuration. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -104,16 +104,16 @@ struct RunEnvelope<'a> {
 }
 
 /// the portable workspace source — WHERE the run's rw workspace is checked out
-/// from, tagged by kind. carries NO `mount_path` (D7): the envelope states
+/// from, tagged by kind. The envelope carries no `mount_path`: it states
 /// committed source coordinates only, and the host wrapper picks the per-run
 /// writable cwd — never a consensus-supplied host path.
 #[derive(Serialize, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WorkspaceSource {
-    /// a duckfs subtree checkout — exactly the flat era's two fields.
+    /// A duckfs subtree checkout.
     Duckfs {
         source_prefix: String,
-        /// the W2 consensus pin of the duckfs head. ALWAYS emitted (null when
+        /// The consensus pin of the duckfs head. Always emitted (null when
         /// the files head is unresolved) so the envelope states its pin
         /// decision.
         source_snapshot: Option<String>,
@@ -156,7 +156,7 @@ struct ResultContractEnvelope {
     sink: WireSink,
 }
 
-/// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
+/// A skill reference: a duckfs read-only source subtree the host mounts for the
 /// run, mirroring [`crate::SkillRef`]. a tracking skill's snapshot is resolved
 /// to the committed head at compose time (see `RunsModule::portable_inputs`).
 ///
@@ -810,10 +810,8 @@ mod tests {
         assert_eq!(v["run_id"], page);
     }
 
-    /// an agent with no always-skill has no persona to assemble — the generic
-    /// `instructions` are the floor under it. this fallback was UNREACHABLE
-    /// before (the old composer dropped `instructions` whenever a prompt pin was
-    /// set); now it is reached by a state you can see.
+    /// A model with no always-skill uses the generic `instructions` as its
+    /// context; on-demand skills do not replace that fallback.
     #[test]
     fn a_soulless_agent_falls_back_to_the_generic_instructions() {
         let agent = agent_with_skills(vec![skill_ref("release", LoadMode::OnDemand)]);
@@ -959,10 +957,10 @@ mod tests {
             "/shared/agent-workspaces/bot"
         );
         assert_eq!(v["workspace"]["source_snapshot"], "aa".repeat(32));
-        // D7: the envelope carries SOURCE coords only — never a host mount path.
+        // The envelope carries source coordinates, never a host mount path.
         assert!(
             v["workspace"].get("mount_path").is_none(),
-            "the workspace must NOT carry a mount_path (D7): {}",
+            "the workspace must not carry a mount_path: {}",
             v["workspace"]
         );
         assert!(

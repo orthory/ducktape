@@ -24,19 +24,19 @@ use tasks::{
     encode_task_reply as tasks_encode_reply,
 };
 
-/// a canned registry: agent id -> record, served by the ctx's "agent"
-/// query arm exactly like the live registry module would answer.
+/// Model configurations keyed by agent id, installed directly into the Runs
+/// fixture before executing an operation.
 type Registry = BTreeMap<String, ModelRecord>;
 
 /// a minimal `Ctx` that captures emitted msgs/effects/events and serves
-/// a canned agent registry, chat transcripts, task lists, job records,
+/// model fixture records, chat transcripts, task lists, job records,
 /// and dispatch records — enough to unit-test `execute` in isolation
 /// (the host provides the real routing in integration).
 struct CaptureCtx {
     env: Env,
     query_count: Cell<usize>,
     query_keys: RefCell<BTreeSet<(String, Vec<u8>)>>,
-    /// agent id -> registry record served by the "agent" arm.
+    /// Model records copied into the Runs fixture by `exec`.
     agents: Registry,
     /// channel -> messages with contiguous seqs starting at 1.
     transcripts: BTreeMap<String, Vec<MessageView>>,
