@@ -257,6 +257,209 @@ fn submit_both(native: &mut Host, wasm: &mut Host, height: u64, origin: Origin, 
     }
 }
 
+/// Repository settlement uses real key consent and committed identity changes.
+/// Failed ref operations must roll back both ownership and its attribution.
+#[test]
+fn repository_owner_follows_identity_once_with_native_and_wasm_rollback() {
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+    fn identity_op(operation: identity::IdentityMsg) -> Msg {
+        Msg {
+            target: "identity".into(),
+            payload: identity::encode_msg(&operation),
+        }
+    }
+    fn drain(native: &mut Host, wasm: &mut Host, height: &mut u64) {
+        while block_on(native.has_pending_work()).unwrap() {
+            assert!(block_on(wasm.has_pending_work()).unwrap());
+            *height += 1;
+            let n = block_on(native.submit_block(block(*height, Origin::System), vec![])).unwrap();
+            let w = block_on(wasm.submit_block(block(*height, Origin::System), vec![])).unwrap();
+            assert_eq!(n.calls, w.calls);
+            assert_eq!(n.deliveries, w.deliveries);
+            assert_eq!(all_roots(native), all_roots(wasm));
+        }
+        assert!(!block_on(wasm.has_pending_work()).unwrap());
+    }
+    fn ownership(host: &Host) -> Vec<attribution::Relation> {
+        let query = attribution::AttributionQuery::Relations {
+            source: attribution::Source {
+                module: FORGE.into(),
+                kind: "repo".into(),
+                object: serde_json::to_string(REPO).unwrap(),
+            },
+        };
+        let bytes =
+            block_on(host.query("attribution", &attribution::encode_query(&query))).unwrap();
+        let attribution::AttributionReply::Relations(Some(view)) =
+            attribution::decode_reply(&bytes).unwrap()
+        else {
+            panic!("repository ownership source");
+        };
+        view.relations
+    }
+    let dir_n = tempfile::tempdir().unwrap();
+    let dir_w = tempfile::tempdir().unwrap();
+    let blobs_n = blobstore::BlobHandle::default();
+    let blobs_w = blobstore::BlobHandle::default();
+    let commits = history(
+        "owner-settlement",
+        &[
+            (1, "README.md", "one\n", "birth"),
+            (2, "README.md", "two\n", "advance"),
+            (3, "README.md", "three\n", "sibling"),
+        ],
+    );
+    let packs: Vec<_> = commits
+        .iter()
+        .map(|commit| {
+            let digest = blobs_n.put_chunk(commit.pack.clone());
+            assert_eq!(digest, blobs_w.put_chunk(commit.pack.clone()));
+            digest
+        })
+        .collect();
+    let mut native = native_host(&dir_n, blobs_n);
+    let mut wasm = wasm_host(&dir_w, blobs_w);
+    let founder = PrivateKey::from_seed(41);
+    let founder_key = founder.public_key().as_ref().to_vec();
+    let sibling_key = PrivateKey::from_seed(42).public_key().as_ref().to_vec();
+    let mut height = 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(founder_key.clone()),
+        push(vec![update("dev", None, Some(&commits[0]))], Some(packs[0]))
+    ));
+    drain(&mut native, &mut wasm, &mut height);
+    assert!(
+        ownership(&wasm).is_empty(),
+        "unregistered key has no account relation"
+    );
+    height += 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(founder_key.clone()),
+        identity_op(identity::IdentityMsg::Create {
+            name: "owner".into(),
+            scheme: identity::KeyScheme::Ed25519
+        })
+    ));
+    let expires_at = 1_000 + identity::MAX_CONSENT_TTL;
+    let preimage = identity::add_key_preimage(
+        CHAIN_ID,
+        identity::KeyScheme::Ed25519,
+        &sibling_key,
+        0,
+        1,
+        expires_at,
+    );
+    height += 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(sibling_key.clone()),
+        identity_op(identity::IdentityMsg::AddKey {
+            scheme: identity::KeyScheme::Ed25519,
+            label: None,
+            authorizer: identity::Authorizer {
+                key: founder_key.clone(),
+                account: 1,
+                expires_at,
+                proof: keyscheme::testkit::ed25519_proof(
+                    &founder,
+                    identity::IDENTITY_ADD_KEY_NS,
+                    &preimage
+                ),
+            },
+        })
+    ));
+    let unsettled = forge_root(&native);
+    for (actor, previous) in [
+        (stranger(), &commits[0]),
+        (Origin::External(sibling_key.clone()), &commits[2]),
+    ] {
+        height += 1;
+        assert!(!submit_both(
+            &mut native,
+            &mut wasm,
+            height,
+            actor,
+            push(
+                vec![update("dev", Some(previous), Some(&commits[1]))],
+                Some(packs[1])
+            )
+        ));
+        assert_eq!(forge_root(&native), unsettled);
+        assert_eq!(forge_root(&wasm), unsettled);
+    }
+    drain(&mut native, &mut wasm, &mut height);
+    assert!(
+        ownership(&wasm).is_empty(),
+        "refused operations publish no owner transition"
+    );
+    height += 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(sibling_key.clone()),
+        push(
+            vec![update("dev", Some(&commits[0]), Some(&commits[1]))],
+            Some(packs[1])
+        )
+    ));
+    drain(&mut native, &mut wasm, &mut height);
+    let expected = vec![attribution::Relation {
+        recipient: 1,
+        reason: attribution::Reason::Ownership,
+        detail: vec![],
+    }];
+    assert_eq!(ownership(&native), expected);
+    assert_eq!(ownership(&wasm), expected);
+    height += 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(founder_key.clone()),
+        identity_op(identity::IdentityMsg::RemoveKey {
+            key: founder_key.clone()
+        })
+    ));
+    let settled = forge_root(&native);
+    height += 1;
+    assert!(!submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(founder_key),
+        push(
+            vec![update("dev", Some(&commits[1]), Some(&commits[2]))],
+            Some(packs[2])
+        )
+    ));
+    assert_eq!(forge_root(&native), settled);
+    assert_eq!(forge_root(&wasm), settled);
+    height += 1;
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        height,
+        Origin::External(sibling_key),
+        push(
+            vec![update("dev", Some(&commits[1]), Some(&commits[2]))],
+            Some(packs[2])
+        )
+    ));
+    drain(&mut native, &mut wasm, &mut height);
+    assert_eq!(ownership(&wasm), expected);
+    assert_eq!(all_roots(&native), all_roots(&wasm));
+}
+
 /// Program calls persist the result bytes in dispatch receipts and agent
 /// bindings. Native serde_json/preserve_order must not change those bytes.
 #[test]
