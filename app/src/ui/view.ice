@@ -441,18 +441,12 @@ view
               fs_cancel_edit -> fs_cancel_edit
               fs_save_edit -> fs_save_edit
         members:
-          MembersScreen #members
-            with
-              rows=members_rows
-              admin=members_is_admin(members_rows)
-              connected
-              answered=members_answered
-            events
-              copy_to_clipboard -> copy_to_clipboard _ _
-              agent_set_status -> agent_set_status _ _
-              gov_propose -> gov_propose _ _
+          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
         agents:
-          AgentsScreen rows=agents_rows connected answered=agents_answered #agents
+          // the agents view declares no intents, so nothing ever arrives on
+          // this route; the extern needs one and the roster handler is the
+          // honest destination
+          extern agents_view(dark, connected, agents_answered, agents_rows) #agents -> members_view_event _
         forge:
           ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
             with

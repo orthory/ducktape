@@ -60,18 +60,6 @@ pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     format!("{left} · {right}")
 }
 
-/// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
-/// runs in flight, not `runs::ModelStatus::Active`: Active is the registration
-/// default and would report every registered agent as busy forever.
-pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
-    if !connected || rows.is_empty() {
-        return String::new();
-    }
-    let working = rows.iter().filter(|row| row.live).count();
-    let registered = plural(count_i64(rows.len()), "agent", "agents");
-    format!("{registered} · {working} working")
-}
-
 /// `tally_label` for two readings that are ALREADY rendered — the consensus
 /// trio off `/v1/status` is optional per field, so each arrives as its own
 /// `optional_number` string (`—` when the node reports nothing). Joining the

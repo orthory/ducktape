@@ -17,21 +17,11 @@ fn a_count_of_one_takes_the_singular_noun() {
 /// sites it did not reach, and each of their screens plates the empty case in
 /// words already.
 ///
-/// A zero BESIDE a real reading is a different thing and stays: `1 agent ·
-/// 0 working` is the sentence doing its job.
+/// A zero BESIDE a real reading is a different thing and stays: `1 human ·
+/// 0 agents` is the sentence doing its job. The Agents subtitle is the
+/// `agents` module view's now, held to the same rule in `crates/views/agents`.
 #[test]
 fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
-    let agent = |live: bool| AgentRow {
-        id: "agent-1".into(),
-        name: "Quackbot".into(),
-        initials: "QU".into(),
-        capability: "mock-llm-1".into(),
-        status: "active".into(),
-        owner_handle: String::new(),
-        live,
-        skill_count: 0,
-        cap_count: 0,
-    };
     let entry = FsEntry {
         key: 0,
         path: "/shared/notes".into(),
@@ -53,12 +43,10 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
 
     // Nothing there: the plate on each screen says it in words.
     assert_eq!(members_summary(true, &[]), "");
-    assert_eq!(agents_summary(true, &[]), "");
     assert_eq!(fs_counts_summary(true, true, &[]), "");
 
     // Something there: every subtitle speaks, zeros included.
     assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
-    assert_eq!(agents_summary(true, &[agent(false)]), "1 agent · 0 working");
     assert_eq!(fs_counts_summary(true, true, &[entry]), "1 file · 0 dirs");
 }
 

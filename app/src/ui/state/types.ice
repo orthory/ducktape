@@ -220,11 +220,12 @@ enum GovIntent
   vote
   execute
 
-enum MembersFilter
-  all
-  humans
-  agents
-  validators
+// what the Members view asks of the app: a clipboard write, an agent's
+// paused state, or a membership ballot
+enum RosterIntent
+  copy
+  agent_status
+  propose
 
 enum MutationPhase
   idle

@@ -1049,7 +1049,7 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
 }
 
 /// One configured model, rendered with its live-run fact.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,

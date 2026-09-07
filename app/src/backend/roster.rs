@@ -3,7 +3,7 @@ use identity::{AccountNumber, AccountView, IdentityQuery, IdentityReply};
 
 /// One member of the network: a validator (quorum seat), a resident
 /// (mesh + statesync standing), or a registered agent.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct MemberRow {
     pub key: String,
     pub label: String,
@@ -252,19 +252,6 @@ pub fn member_tier(rows: &[MemberRow]) -> String {
     rows.iter()
         .find(|row| row.is_this_node)
         .map_or_else(|| "guest".into(), |row| row.role.clone())
-}
-
-/// The All / Humans / Agents / Validators strip.
-pub fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -> Vec<MemberRow> {
-    rows.iter()
-        .filter(|row| match filter {
-            crate::MembersFilter::All => true,
-            crate::MembersFilter::Humans => !row.is_agent,
-            crate::MembersFilter::Agents => row.is_agent,
-            crate::MembersFilter::Validators => row.role == "validator",
-        })
-        .cloned()
-        .collect()
 }
 
 /// One governance proposal, rendered. Serialized as-is for the `governance`
