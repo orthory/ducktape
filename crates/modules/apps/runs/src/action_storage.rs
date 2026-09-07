@@ -1,5 +1,7 @@
 //! Immutable proposals, reserved completion markers and an indexed outbox.
-use super::action_requests::{ActionRequest, Publication, RequestScope, canonical_action_payload};
+use super::action_requests::{
+    ActionRequest, Prepared, Publication, RequestScope, canonical_action_payload,
+};
 use super::receipts::View;
 use super::*;
 use sdk::{Ack, CallId, Cause, DeliveryOutcome, Hop, PendingItem};
@@ -172,31 +174,27 @@ impl RunsModule {
         entry: &PendingState,
         id: String,
         scope: RequestScope,
-        msg: Msg,
+        prepared: Prepared,
     ) -> Result<(), Error> {
-        let payload =
-            canonical_action_payload(sdk::wire::decode(&msg.payload).map_err(Error::Module)?);
+        let Prepared { message, receipt } = prepared;
+        let payload = canonical_action_payload(
+            sdk::wire::decode(&message.payload).map_err(Error::Module)?,
+        );
         let view = ActionRequestView {
             request_id: id.clone(),
             account: entry.account,
             generation: entry.generation,
             run_id: entry.run_id.clone(),
-            target: msg.target,
+            operation: receipt.operation,
+            result: canonical_action_payload(receipt.result),
+            target: message.target,
             payload,
             status: ActionStatus::AwaitingProgram,
         };
-        if let Some(existing) = self.action_request(&id).await? {
-            let exact = existing.view.account == view.account
-                && existing.view.generation == view.generation
-                && existing.view.run_id == view.run_id
-                && existing.view.target == view.target
-                && existing.view.payload == view.payload;
-            if !exact {
-                return Err(Error::Module(
-                    "action request id is already bound to different work".into(),
-                ));
-            }
-            return Ok(());
+        if self.action_request(&id).await?.is_some() {
+            return Err(Error::Module(
+                "action request id is already bound to earlier work".into(),
+            ));
         }
         let item = self
             .staged_next_action_item
@@ -215,6 +213,7 @@ impl RunsModule {
             scope,
             model_id: entry.agent_id.clone(),
             grant: RunAuthority::from_record(model),
+            invocation: receipt.invocation,
         };
         // Agent invocation names consist of account/sequence, both u64. Claim
         // authenticates that exact invocation before storing its call id.

@@ -149,17 +149,11 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
 
     let bytes = response(
         &[],
-        vec![AgentAction::CreateTask {
-            task_id: "job-task".into(),
-            title: "complete job".into(),
-        }],
+        vec![create_task("job-task", "complete job")],
     );
     let inner = response_json(
         &[],
-        vec![AgentAction::CreateTask {
-            task_id: "job-task".into(),
-            title: "complete job".into(),
-        }],
+        vec![create_task("job-task", "complete job")],
     );
     let mut ctx = CaptureCtx::new()
         .at(10)
@@ -322,10 +316,7 @@ fn a_stale_job_run_does_not_finalize_a_reclaimed_episode() {
             &run_id,
             Ok(response(
                 &[],
-                vec![AgentAction::CreateTask {
-                    task_id: "stale".into(),
-                    title: "late".into(),
-                }],
+                vec![create_task("stale", "late")],
             )),
         ),
     )

@@ -62,19 +62,23 @@ fn hosted() -> (RunsModule, Backing, PendingState) {
 }
 
 fn stage(module: &mut RunsModule, entry: &PendingState, slot: u32) -> String {
-    let id = action_request_id(&entry.run_id, slot);
+    let id = action_request_id(&entry.run_id, &format!("slot-{slot}"));
     block_on(module.stage_action_request(
         entry,
         id.clone(),
         crate::action_requests::RequestScope::Result,
-        Msg {
-            target: "tasks".into(),
-            payload: tasks::encode_task_msg(&TaskMsg::CreateTask {
-                task_id: format!("task-{slot}"),
-                title: "A durable proposal".into(),
-                owner: None,
-            }),
-        },
+        crate::action_requests::Prepared::new(
+            Msg {
+                target: "tasks".into(),
+                payload: tasks::encode_task_msg(&TaskMsg::CreateTask {
+                    task_id: format!("task-{slot}"),
+                    title: "A durable proposal".into(),
+                    owner: None,
+                }),
+            },
+            ACTION_TASKS_CREATE,
+            serde_json::json!({"task_id": format!("task-{slot}")}),
+        ),
     ))
     .unwrap();
     id
@@ -146,10 +150,14 @@ fn a_verified_pr_link_is_staged_and_abort_discards_it() {
         &entry,
         id.clone(),
         crate::action_requests::RequestScope::Result,
-        Msg {
-            target: "forge".into(),
-            payload: sdk::wire::encode(&serde_json::json!({"open_pr":{"repo":"demo"}})),
-        },
+        crate::action_requests::Prepared::new(
+            Msg {
+                target: "forge".into(),
+                payload: sdk::wire::encode(&serde_json::json!({"open_pr":{"repo":"demo"}})),
+            },
+            "forge.open_pr",
+            serde_json::Value::Null,
+        ),
     ))
     .unwrap();
     let request = block_on(module.action_request(&id)).unwrap().unwrap();
@@ -224,10 +232,14 @@ fn reordered_json_has_the_same_durable_proposal_bytes() {
             &entry,
             "reordered".into(),
             crate::action_requests::RequestScope::Result,
-            Msg {
-                target: "tasks".into(),
-                payload: payload.to_vec(),
-            },
+            crate::action_requests::Prepared::new(
+                Msg {
+                    target: "tasks".into(),
+                    payload: payload.to_vec(),
+                },
+                ACTION_TASKS_CREATE,
+                serde_json::json!({"task_id": "same"}),
+            ),
         ))
         .unwrap();
         commit(&mut module);

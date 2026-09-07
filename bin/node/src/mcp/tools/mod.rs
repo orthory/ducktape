@@ -1,19 +1,20 @@
 //! the tool table: one flat registry of every tool the plane exposes, split
 //! read / write because the two halves have genuinely different rules.
 //!
-//! - READ tools ([`read`]) are ungated except where the caps vocabulary already
-//!   names the resource (`forge_read` repos, `duckfs_read` prefixes).
-//! - WRITE tools ([`write`]) expose the session actions in `runs::KNOWN_ACTIONS`.
-//!   `modules.update` uses only the final response, after the forge output commits.
-//!   The tool plane grants an agent nothing its registered
-//!   `allowed_actions` did not already grant it, and there is exactly one
-//!   vocabulary of "what an agent may do" — the one consensus validates a
-//!   response's actions against.
+//! - READ tools ([`read`]) serve `whoami`, the operation catalog, one generic
+//!   `query` over a host-side table of read operations, and receipt lookup.
+//!   reads are ungated except where the caps vocabulary already names the
+//!   resource (`forge_read` repos, `duckfs_read` prefixes).
+//! - the ONE WRITE tool ([`write`]) carries a catalog envelope the runs module
+//!   decodes and gates in consensus. The tool plane grants an agent nothing its
+//!   registered `allowed_actions` did not already grant it, and there is
+//!   exactly one vocabulary of "what an agent may do" — the one consensus
+//!   validates a response's actions against — and exactly one catalog of
+//!   operations, owned by the module that executes them.
 //!
 //! a tool's `description` is not decoration: it is the entire interface the
-//! model has. it says what the tool reads or writes, and — for a write — which
-//! action name gates it, so a denied agent can tell its owner precisely which
-//! grant to widen.
+//! model has. it says what the tool reads or writes and where the catalog is,
+//! so a denied agent can tell its owner precisely which grant to widen.
 
 use serde_json::{Value, json};
 
@@ -103,15 +104,6 @@ pub fn opt_u64(args: &Value, name: &str) -> Option<u64> {
     args.get(name).and_then(Value::as_u64)
 }
 
-/// a required boolean argument.
-pub fn arg_bool(args: &Value, name: &str) -> Result<bool> {
-    args.get(name).and_then(Value::as_bool).ok_or_else(|| {
-        crate::mcp::node::NodeError::Rejected(format!(
-            "this tool needs a boolean {name:?} argument"
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,17 +133,21 @@ mod tests {
     }
 
     #[test]
-    fn every_write_tool_names_a_known_action_in_its_description() {
-        // the description is the model's only view of the gate. a write tool
-        // whose description does not name its action leaves a denied agent
-        // unable to say which grant it needs.
-        for t in write::tools() {
+    fn the_one_write_tool_points_at_the_catalog() {
+        // the description is the model's only view of the gate. the write tool
+        // must send the model to the catalog that names each operation's grant,
+        // and every live catalog operation must be reachable through it.
+        let [write] = write::tools().try_into().ok().expect("one write tool");
+        assert_eq!(write.name, "ducktape_action");
+        assert!(write.description.contains("ducktape_actions"));
+        for operation in runs::catalog(None) {
+            if !operation.lanes.contains(&runs::LaneKind::Live) {
+                continue;
+            }
             assert!(
-                runs::KNOWN_ACTIONS
-                    .iter()
-                    .any(|a| t.description.contains(a)),
-                "write tool {} names no known action in its description",
-                t.name
+                write.description.contains(&operation.name),
+                "the write tool does not name the live operation {}",
+                operation.name
             );
         }
     }

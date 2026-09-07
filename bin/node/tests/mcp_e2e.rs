@@ -78,9 +78,9 @@ fn agents_and_runs_are_read_from_the_real_modules() {
     let results = h.session(
         h.mcp(),
         &[
-            json!({"name": "ducktape_agents", "arguments": {"other": 1}}),
-            json!({"name": "ducktape_agents", "arguments": {"limit": 1}}),
-            json!({"name": "ducktape_runs", "arguments": {}}),
+            json!({"name": "ducktape_query", "arguments": {"operation": "agents.list", "input": {"other": 1}}}),
+            json!({"name": "ducktape_query", "arguments": {"operation": "agents.list", "input": {"limit": 1}}}),
+            json!({"name": "ducktape_query", "arguments": {"operation": "runs.list"}}),
         ],
     );
     let (is_error, text) = content(&results[0]);
@@ -138,8 +138,8 @@ fn an_unavailable_scoped_endpoint_never_falls_back_to_an_ambient_write_lane() {
 
     let refused = h.call(
         h.mcp_with_action(UNBOUND_RUN),
-        "ducktape_task_create",
-        json!({"title": "should never land"}),
+        "ducktape_action",
+        json!({"operation": "tasks.create", "input": {"title": "should never land"}, "request_id": "never"}),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an action for an unbound run must refuse: {text}");
@@ -165,7 +165,11 @@ fn a_write_without_a_scoped_endpoint_never_reaches_the_wire_at_all() {
     // the defect this whole design removes, so its absence is asserted.
     let h = Harness::start(&["tasks.create"]);
 
-    let refused = h.call(h.mcp(), "ducktape_task_create", json!({"title": "nope"}));
+    let refused = h.call(
+        h.mcp(),
+        "ducktape_action",
+        json!({"operation": "tasks.create", "input": {"title": "nope"}, "request_id": "nope"}),
+    );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an endpoint-less write must refuse: {text}");
     assert!(
@@ -220,8 +224,8 @@ fn one_session_carries_many_calls_and_never_answers_the_notification() {
         h.mcp(),
         &[
             json!({"name": "ducktape_whoami", "arguments": {}}),
-            json!({"name": "ducktape_tasks", "arguments": {}}),
-            json!({"name": "ducktape_chat_channels", "arguments": {}}),
+            json!({"name": "ducktape_query", "arguments": {"operation": "tasks.list"}}),
+            json!({"name": "ducktape_query", "arguments": {"operation": "chat.channels"}}),
         ],
     );
     assert_eq!(results.len(), 3);
@@ -238,8 +242,8 @@ fn a_cap_gated_read_refuses_when_the_caps_do_not_cover_it() {
 
     let refused = h.call(
         h.mcp(),
-        "ducktape_forge_pr_diff",
-        json!({"repo": "app", "number": 1}),
+        "ducktape_query",
+        json!({"operation": "forge.pr_diff", "target": {"repo": "app", "number": 1}}),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an uncapped forge read must refuse: {text}");
@@ -308,8 +312,8 @@ fn a_forge_scoped_read_only_agent_can_review_a_real_pr_diff() {
 
     let reply = payload(&h.call(
         h.mcp(),
-        "ducktape_forge_pr_diff",
-        json!({"repo": "app", "number": 1}),
+        "ducktape_query",
+        json!({"operation": "forge.pr_diff", "target": {"repo": "app", "number": 1}}),
     ));
     let diff = &reply["pr_diff"];
     assert_eq!(diff["source_oid"], source);
@@ -337,7 +341,7 @@ fn an_ungated_read_reaches_the_module() {
     // chat/tasks/pages carry no read cap in the caps vocabulary, so reads of
     // them are ungated — inventing a gate the registry cannot express would be
     // a permission nobody could grant.
-    let listed = payload(&h.call(h.mcp(), "ducktape_tasks", json!({})));
+    let listed = payload(&h.call(h.mcp(), "ducktape_query", json!({"operation": "tasks.list"})));
     assert_eq!(listed["task"]["tasks"][0]["id"], "seeded");
     assert_eq!(listed["task"]["tasks"][0]["title"], "from the test");
 }
@@ -353,7 +357,11 @@ fn a_run_with_no_agent_can_read_but_never_write() {
 
     // no DUCKTAPE_RUN_AGENT: the server is bound to a node but acting for
     // nobody. ungated reads still work...
-    let listed = payload(&h.call(h.mcp_agentless(), "ducktape_tasks", json!({})));
+    let listed = payload(&h.call(
+        h.mcp_agentless(),
+        "ducktape_query",
+        json!({"operation": "tasks.list"}),
+    ));
     assert_eq!(listed["task"]["tasks"][0]["id"], "seeded");
 
     // ...and every write refuses, because there is no grant to check against and
@@ -361,8 +369,8 @@ fn a_run_with_no_agent_can_read_but_never_write() {
     // identity, which would file the write under the operator's name.
     let refused = h.call(
         h.mcp_agentless(),
-        "ducktape_task_create",
-        json!({"title": "should never exist"}),
+        "ducktape_action",
+        json!({"operation": "tasks.create", "input": {"title": "should never exist"}, "request_id": "never"}),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "an agentless write must refuse: {text}");
@@ -384,8 +392,13 @@ fn a_refusal_reaches_the_model_verbatim() {
     // reworded guess at them. an agent can only correct a mistake it can read.
     let refused = h.call(
         h.mcp_with_action(UNBOUND_RUN),
-        "ducktape_task_status",
-        json!({"task_id": "no-such-task", "status": "done"}),
+        "ducktape_action",
+        json!({
+            "operation": "tasks.update_status",
+            "target": {"task_id": "no-such-task"},
+            "input": {"status": "done"},
+            "request_id": "move",
+        }),
     );
     let (is_error, text) = content(&refused);
     assert!(is_error, "the refusal must surface as one");
@@ -396,23 +409,44 @@ fn a_refusal_reaches_the_model_verbatim() {
 }
 
 #[test]
-fn a_bad_status_name_is_refused_before_it_reaches_the_node() {
+fn the_catalog_reaches_the_model_from_consensus_with_its_schemas() {
     let h = Harness::start(&["tasks.update_status"]);
 
-    // the ONE thing still checked locally: a status that is not one of the three
-    // wire names. not a permission decision — a spelling one — so answering it
-    // here costs the agent a consensus round-trip it would only lose anyway.
-    let refused = h.call(
-        h.mcp_with_action(UNBOUND_RUN),
-        "ducktape_task_status",
-        json!({"task_id": "t1", "status": "Done"}),
+    // nothing about an operation's shape is spelled out in this binary: the
+    // catalog the model reads is the runs module's own, fetched per call, with
+    // the read table this server serves beside it.
+    let listed = payload(&h.call(
+        h.mcp(),
+        "ducktape_actions",
+        json!({"filter": "tasks."}),
+    ));
+    let operations = listed["operations"].as_array().expect("operations");
+    let names: Vec<&str> = operations
+        .iter()
+        .map(|op| op["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["tasks.create", "tasks.update_status", "tasks.list"],
+        "{listed}"
     );
-    let (is_error, text) = content(&refused);
-    assert!(is_error);
-    assert!(
-        text.contains("open, in_progress, or done"),
-        "a near-miss status must be told the three real names: {text}"
+    let status = operations
+        .iter()
+        .find(|op| op["name"] == "tasks.update_status")
+        .unwrap();
+    assert_eq!(status["kind"], "write");
+    assert_eq!(status["grant"], json!({"action": "tasks.update_status"}));
+    assert_eq!(
+        status["input"]["properties"]["status"]["enum"],
+        json!(["open", "in_progress", "done"])
     );
+    assert_eq!(status["target"]["required"], json!(["task_id"]));
+    assert!(status["schema_digest"].as_str().is_some_and(|d| d.len() == 64));
+    let list = operations
+        .iter()
+        .find(|op| op["name"] == "tasks.list")
+        .unwrap();
+    assert_eq!(list["kind"], "read");
 }
 
 #[test]

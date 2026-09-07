@@ -55,30 +55,28 @@ fn open_attempt(run_id: &str, attempt: u32, key: &[u8]) -> Msg {
     })
 }
 
-fn act(run_id: &str, action: AgentAction) -> Msg {
+/// one live action under a fresh request id — every call is new work.
+fn act(run_id: &str, action: ActionEnvelope) -> Msg {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    act_as(run_id, &format!("auto-{n}"), action)
+}
+
+/// one live action under the caller's request id — the idempotency key.
+fn act_as(run_id: &str, request_id: &str, action: ActionEnvelope) -> Msg {
     admin(&RunsMsg::AgentAction {
         run_id: run_id.into(),
+        request_id: request_id.into(),
         action,
     })
 }
 
 fn delegate(run_id: &str, request_id: &str, agent_id: &str, instruction: &str) -> Msg {
-    admin(&RunsMsg::DelegateRun {
-        run_id: run_id.into(),
-        request_id: request_id.into(),
-        request: DelegationRequest {
-            agent_id: agent_id.into(),
-            instruction: instruction.into(),
-            skills: Vec::new(),
-        },
-    })
+    act_as(run_id, request_id, agent_call(agent_id, instruction))
 }
 
-fn comment(target: &str) -> AgentAction {
-    AgentAction::AddPageComment {
-        target: target.into(),
-        body: "looks good".into(),
-    }
+fn comment(target: &str) -> ActionEnvelope {
+    page_comment(target, "looks good")
 }
 
 fn sessions(m: &RunsModule) -> Vec<AgentSession> {
@@ -688,10 +686,7 @@ fn an_action_outside_the_grant_is_refused_and_emits_nothing() {
         &mut ctx,
         &act(
             &run_id,
-            AgentAction::CreateTask {
-                task_id: "t1".into(),
-                title: "ship it".into(),
-            },
+            create_task("t1", "ship it"),
         ),
     )
     .unwrap_err();
@@ -748,11 +743,7 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
     // where the agent was engaged. speaking into any channel at any moment is a
     // wider power, so it carries its own name: an agent already registered with
     // `chat.post` must NOT have been silently handed it.
-    let post = AgentAction::PostMessage {
-        channel_id: "general".into(),
-        text: "still working on it".into(),
-        thread: None,
-    };
+    let post = post_message("general", "still working on it", None);
     let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST], &[]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     let err = exec(&mut m, &mut ctx, &act(&run_id, post.clone())).unwrap_err();
@@ -797,11 +788,7 @@ fn post_message_probes_everything_chat_would_reject() {
     // the no-fail rule binds the EMISSION: an unknown channel, a squatted id, or
     // a ghost thread root would each make chat reject the follow-up. each is
     // caught here, before the op exists.
-    let post = |channel: &str, text: &str, thread: Option<u64>| AgentAction::PostMessage {
-        channel_id: channel.into(),
-        text: text.into(),
-        thread,
-    };
+    let post = |channel: &str, text: &str, thread: Option<u64>| post_message(channel, text, thread);
     for (action, needle) in [
         (post("ghost", "hi", None), "unknown channel"),
         (
@@ -1002,11 +989,7 @@ fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
             .with_transcript("general", transcript(2))
             .with_lease_holder(&run_id, &NEW_ASSIGNEE)
     };
-    let post = AgentAction::PostMessage {
-        channel_id: "general".into(),
-        text: "still here".into(),
-        thread: None,
-    };
+    let post = post_message("general", "still here", None);
 
     // the ex-holder's key is still bound, and still refused: its authority was
     // the lease, and the lease left.
@@ -1165,10 +1148,7 @@ fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
             &mut ctx,
             &act(
                 &run,
-                AgentAction::Reply {
-                    text: "Working on it".into(),
-                    destination: None,
-                },
+                reply("Working on it"),
             ),
         )
         .unwrap();
@@ -1201,10 +1181,7 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
             &mut ctx,
             &act(
                 &run,
-                AgentAction::Reply {
-                    text: text.into(),
-                    destination: None,
-                },
+                reply(text),
             ),
         )
         .unwrap_err();
@@ -1225,10 +1202,7 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
             &mut ctx,
             &act(
                 &run,
-                AgentAction::Reply {
-                    text: "hello".into(),
-                    destination: None,
-                },
+                reply("hello"),
             ),
         )
         .unwrap_err();
@@ -1306,10 +1280,7 @@ fn returning_to_a_previous_holder_does_not_revive_its_old_key() {
                 &mut ctx,
                 &act(
                     &run,
-                    AgentAction::Reply {
-                        text: "stale".into(),
-                        destination: None,
-                    }
+                    reply("stale")
                 )
             )
             .is_err()
@@ -1330,10 +1301,7 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
         &mut ctx,
         &act(
             &run,
-            AgentAction::Reply {
-                text: "too late".into(),
-                destination: None,
-            },
+            reply("too late"),
         ),
     )
     .unwrap_err();
@@ -1347,42 +1315,15 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
 }
 
 #[test]
-fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
-    for (destination, expected) in [
-        (
-            crate::ReplyDestination::Chat {
-                channel_id: "general".into(),
-                thread: Some(1),
-            },
-            "chat.post_message",
-        ),
-        (
-            crate::ReplyDestination::Page {
-                target: "b-p".into(),
-            },
-            "pages.comment",
-        ),
-        (
-            crate::ReplyDestination::Job {
-                job_id: "job-1".into(),
-            },
-            "jobs.comment",
-        ),
+fn explicit_destinations_enforce_their_own_grants_and_caps() {
+    for (action, expected) in [
+        (post_message("general", "hello", Some(1)), "chat.post_message"),
+        (page_comment("b-p", "hello"), "pages.comment"),
+        (job_comment("job-1", "hello"), "jobs.comment"),
     ] {
         let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
-        let error = exec(
-            &mut m,
-            &mut ctx,
-            &act(
-                &run,
-                AgentAction::Reply {
-                    text: "hello".into(),
-                    destination: Some(destination.into()),
-                },
-            ),
-        )
-        .unwrap_err();
+        let error = exec(&mut m, &mut ctx, &act(&run, action)).unwrap_err();
         assert!(format!("{error}").contains(expected), "{error}");
         assert_eq!(sessions(&m)[0].actions, 0);
         assert!(
@@ -1391,80 +1332,81 @@ fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
     }
     let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["other"]);
     let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
-    let error = exec(
-        &mut m,
-        &mut ctx,
-        &act(
-            &run,
-            AgentAction::Reply {
-                text: "hello".into(),
-                destination: Some(
-                    crate::ReplyDestination::Page {
-                        target: "b-p".into(),
-                    }
-                    .into(),
-                ),
-            },
-        ),
-    )
-    .unwrap_err();
+    let error = exec(&mut m, &mut ctx, &act(&run, page_comment("b-p", "hello"))).unwrap_err();
     assert!(format!("{error}").contains("pages_write"));
     assert_eq!(sessions(&m)[0].actions, 0);
 }
 
 #[test]
-fn a_reply_batch_counts_page_comments_before_emitting_any() {
-    let (m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
+fn a_settled_batch_counts_page_comments_it_already_staged() {
+    // the thread holds (cap - 1) COMMITTED comments; the response carries two
+    // comments to it. the committed-only probe is blind to the first comment,
+    // so the same-block accounting is what degrades the second instead of
+    // letting pages abort the delivery block.
+    let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
     let mut thread = dummy_thread_view("review");
     thread.thread.target = "b-p".into();
     thread.thread.comment_ids = (0..pages::MAX_COMMENTS_PER_THREAD - 1)
         .map(|i| format!("comment-{i}"))
         .collect();
-    let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+    let mut ctx = CaptureCtx::new()
+        .at(9)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_page("p1", page_blocks("p1", "Spec"))
         .with_page_thread(thread);
-    let reply = AgentAction::Reply {
-        text: "hello".into(),
-        destination: Some(
-            crate::ReplyDestination::PageThread {
-                thread_id: "review".into(),
-            }
-            .into(),
-        ),
-    };
-    let entry = m.pending_entry(&dispatch_id_for(&run)).unwrap();
-    let response = AgentResponse {
-        reply_blocks: Vec::new(),
-        actions: vec![reply.clone(), reply],
-        commit_message: None,
-    };
-    let error =
-        block_on(m.validate_response(&ctx, &run, entry, Lane::Settle, response)).unwrap_err();
-    assert!(error.contains("thread is full"), "{error}");
-    assert!(ctx.page_msgs().is_empty());
+    let comment = page_thread_comment("review", "hello");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run, Ok(response(&[], vec![comment.clone(), comment]))),
+    )
+    .unwrap();
+    assert_eq!(ctx.page_msgs().len(), 1, "{:?}", ctx.page_msgs());
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("thread is full")),
+        "{:?}",
+        ctx.notes()
+    );
 }
 
 #[test]
-fn reply_destination_validation_stays_in_the_module() {
-    for destination in [
-        serde_json::json!({"kind":"chat", "channel_id":"general", "author":1}),
-        serde_json::json!({"kind":"job", "thread_id":"wrong"}),
-        serde_json::json!({"kind":"unknown"}),
+fn envelopes_are_decoded_against_the_catalog_in_the_module() {
+    for (action, expected) in [
+        (
+            envelope(
+                ACTION_CHAT_POST_MESSAGE,
+                Some(serde_json::json!({"channel_id": "general", "author": 1})),
+                text_content("hello"),
+            ),
+            "chat.post_message target",
+        ),
+        (
+            envelope(
+                crate::ACTION_JOBS_COMMENT,
+                Some(serde_json::json!({"thread_id": "wrong"})),
+                text_content("hello"),
+            ),
+            "jobs.comment target",
+        ),
+        (
+            envelope("unknown", None, text_content("hello")),
+            "not a catalog operation",
+        ),
+        (
+            envelope(crate::OP_REPLY, Some(serde_json::json!({"channel_id": "general"})), text_content("hello")),
+            "takes no target",
+        ),
+        (
+            envelope(crate::OP_REPLY, None, serde_json::json!({"text": "hello"})),
+            "reply input",
+        ),
     ] {
         let (mut m, registry, run) = with_open_session(&crate::KNOWN_ACTIONS, &["*"]);
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
-        let error = exec(
-            &mut m,
-            &mut ctx,
-            &act(
-                &run,
-                AgentAction::Reply {
-                    text: "hello".into(),
-                    destination: Some(destination),
-                },
-            ),
-        )
-        .unwrap_err();
-        assert!(format!("{error}").contains("invalid reply destination"));
+        let error = exec(&mut m, &mut ctx, &act(&run, action)).unwrap_err();
+        assert!(format!("{error}").contains(expected), "{error}");
         assert_eq!(sessions(&m)[0].actions, 0);
         assert!(
             ctx.chat_msgs().is_empty() && ctx.page_msgs().is_empty() && ctx.job_msgs().is_empty()
@@ -1478,28 +1420,16 @@ fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_
     let mut entry = m.pending_entry(&dispatch_id_for(&run)).unwrap().clone();
     entry.job_id = Some("job-1".into());
     entry.job_claim_height = 3;
-    for (claim_height, destination, accepted) in [
-        (3, None, true),
-        (4, None, false),
-        (
-            4,
-            Some(
-                crate::ReplyDestination::Job {
-                    job_id: "job-1".into(),
-                }
-                .into(),
-            ),
-            true,
-        ),
+    for (claim_height, action, accepted) in [
+        (3, reply("progress"), true),
+        (4, reply("progress"), false),
+        (4, job_comment("job-1", "progress"), true),
     ] {
         let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
             .with_claimed_job("job-1", claim_height);
         let response = AgentResponse {
             reply_blocks: Vec::new(),
-            actions: vec![AgentAction::Reply {
-                text: "progress".into(),
-                destination,
-            }],
+            actions: vec![action],
             commit_message: None,
         };
         let result = block_on(m.validate_response(&ctx, &run, &entry, Lane::Settle, response));
@@ -1509,4 +1439,38 @@ fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_
         }
         assert!(ctx.job_msgs().is_empty(), "validation must not emit");
     }
+}
+
+#[test]
+fn a_callee_result_cannot_stage_a_module_update() {
+    // both settle lanes are the catalog's final lane, but only the run's own
+    // final response binds a forge output a module update can pin; a callee's
+    // result is refused by name instead of validating an update nobody emits.
+    let (m, registry, run) = with_open_session(&[crate::ACTION_MODULES_UPDATE], &[]);
+    let entry = m.pending_entry(&dispatch_id_for(&run)).unwrap().clone();
+    let update = envelope(
+        crate::ACTION_MODULES_UPDATE,
+        None,
+        serde_json::json!({
+            "module_id": "hello",
+            "artifact": "hello.module",
+            "code_hash": "a".repeat(64),
+            "after": 50,
+        }),
+    );
+    let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    let response = AgentResponse {
+        reply_blocks: Vec::new(),
+        actions: vec![update],
+        commit_message: None,
+    };
+    let reason = block_on(m.validate_response(
+        &ctx,
+        &run,
+        &entry,
+        Lane::DelegatedSettle,
+        response,
+    ))
+    .unwrap_err();
+    assert!(reason.contains("run's own final response"), "{reason}");
 }
