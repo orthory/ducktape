@@ -101,14 +101,17 @@ fn only_the_tray_row_and_the_quit_chord_leave() {
 }
 
 /// "OPEN" OPENS WHEN THERE IS NOTHING TO RAISE, and it decides that ONCE, on a
-/// discriminant. `window_target` on an untracked slot names a fresh id whose
-/// focus is a no-op, so a raise-only row is a dead row the moment every window
-/// is closed — which the change above made an ordinary state to be in.
+/// discriminant — three-valued (#1782), since a connected network with
+/// nothing tracked must reopen the CONSOLE, never the launch window (which
+/// resets `hub_step` to the picker). `window_target` on an untracked slot
+/// names a fresh id whose focus is a no-op, so a raise-only row is a dead row
+/// the moment every window is closed — which the change above made an
+/// ordinary state to be in.
 #[test]
 fn the_tray_open_row_branches_once_on_a_discriminant() {
     let body = handler("tray_open");
     assert!(
-        body.contains("tray_open_action(console_win, onboarding_win)"),
+        body.contains("tray_open_action(connected, window_tracked)"),
         "tray_open stopped asking the decide-fn: {body}"
     );
     let branches = body
@@ -116,14 +119,21 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
         .filter(|line| line.trim_start().starts_with("match "))
         .count();
     assert_eq!(branches, 1, "one branch, not a ladder: {body}");
-    assert!(body.contains("WindowSummon.open"), "no open arm: {body}");
-    assert!(body.contains("WindowSummon.raise"), "no raise arm: {body}");
+    assert!(body.contains("TrayOpen.launch"), "no launch arm: {body}");
+    assert!(body.contains("TrayOpen.console"), "no console arm: {body}");
+    assert!(body.contains("TrayOpen.raise"), "no raise arm: {body}");
     assert!(
         body.contains("task window open onboarding"),
-        "the open arm no longer opens a window: {body}"
+        "the launch arm no longer opens the onboarding window: {body}"
     );
     assert!(
-        EXTERNS.contains("pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon"),
+        body.contains("task window open console"),
+        "the console arm no longer reopens the console: {body}"
+    );
+    assert!(
+        EXTERNS.contains(
+            "pure tray_open_action(network_open:bool, window_tracked:bool) -> TrayOpen"
+        ),
         "backend.ice lost the tray-open discriminant"
     );
 }

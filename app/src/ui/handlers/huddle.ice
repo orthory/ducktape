@@ -64,8 +64,9 @@ on toggle_call_screen
 
 // THE CALL IS A WINDOW, and this is the one way to put it in front of you:
 // open it if it is gone, raise it if it is behind something. One discriminant,
-// one branch — the same decision the status item's Open row makes, which is
-// why they share `WindowSummon`.
+// one branch. The status item's Open row used to share this `WindowSummon`
+// decision; it now has its own `TrayOpen` (#1782), because a connected network
+// with nothing tracked reopens the console — a case this window has none of.
 //
 // CLOSING THAT WINDOW IS NOT LEAVING. A call is a session and the window is a
 // view of it, so the OS close button (and ⌘W) only clears `huddle_win` in
