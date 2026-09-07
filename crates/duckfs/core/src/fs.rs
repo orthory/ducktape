@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
+use crate::Authority;
 use crate::objects::{
     EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id,
     verify_chunk_len_at, verify_file_shape,
@@ -266,6 +267,14 @@ impl<S: ObjectStore> Fs<S> {
         &self.refs
     }
 
+    /// The effective refs after earlier operations in this block. Adapters use
+    /// this for source publication; public read queries stay committed-only.
+    pub fn pending_refs(&self) -> &Refs {
+        self.pending
+            .as_ref()
+            .map_or(&self.refs, |pending| &pending.refs)
+    }
+
     /// read-only access to the object store — the `&self` twin of
     /// [`Fs::store_mut`]. the host-side odb backing ([`files::FilesOdbBacking`])
     /// serves its `HostOdb::stat`/`get` (a `&self` surface) by reading committed
@@ -320,12 +329,120 @@ impl<S: ObjectStore> Fs<S> {
         self.refs.head.as_ref().map(|h| to_hex(h))
     }
 
+    /// Apply one verb atomically to the pending refs. A refused verb preserves
+    /// earlier operations in this block, including expired staging entries.
+    /// Objects are appended only after each verb's last fallible check.
+    fn transact<T>(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        operation: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        authority.validate()?;
+        self.require_pending(height);
+        let before = self.pending_refs().clone();
+        let next_revision = before
+            .source_revision
+            .checked_add(1)
+            .ok_or_else(|| "files: source revision exhausted".to_string())?;
+        match operation(self) {
+            Ok(output) => {
+                let pending = self.pending.as_mut().expect("require_pending set it");
+                if pending.refs != before {
+                    pending.refs.source_revision = next_revision;
+                }
+                Ok(output)
+            }
+            Err(error) => {
+                self.pending.as_mut().expect("require_pending set it").refs = before;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn putblob(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.putblob_apply(authority, height, bytes)
+        })
+    }
+
+    pub fn commit(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        time: u64,
+        base: Option<String>,
+        message: String,
+        changes: Vec<Change>,
+    ) -> Result<Vec<Notification>, String> {
+        self.transact(authority, height, |fs| {
+            fs.commit_apply(authority, height, time, base, message, changes)
+        })
+    }
+
+    pub fn pin(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        snapshot: String,
+        name: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.pin_apply(authority, height, snapshot, name)
+        })
+    }
+
+    pub fn unpin(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        name: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.unpin_apply(authority, height, name)
+        })
+    }
+
+    pub fn watch(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        prefix: String,
+        module_id: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.watch_apply(authority, height, prefix, module_id)
+        })
+    }
+
+    pub fn unwatch(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        prefix: String,
+        module_id: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.unwatch_apply(authority, height, prefix, module_id)
+        })
+    }
+
     // ---- op surface (semantics land in tasks 7/9/10) ------------------------
 
     /// stage a raw chunk for a later commit to reference. bytes are consensus
     /// state: staged now, durable at THIS block's commit, gc-reachable via the
     /// staging table until referenced or expired.
-    pub fn putblob(&mut self, actor: &str, height: u64, bytes: &[u8]) -> Result<(), String> {
+    fn putblob_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         // tick the deterministic staging sweep first, over the pending view, so
         // same-block ops and the quota below see the post-sweep state.
         self.require_pending(height);
@@ -336,9 +453,7 @@ impl<S: ObjectStore> Fs<S> {
         let pending = self.pending.as_mut().expect("require_pending set it");
         sweep_expired(&mut pending.refs, height);
 
-        // a malformed frame is not a stageable object. (a rejected op aborts the
-        // whole block in production, so this never leaves the sweep half-applied;
-        // the direct-execute tests likewise keep earlier same-block stages.)
+        // A refused frame restores the pre-operation refs in `transact`.
         if bytes.is_empty() {
             return Err("files: chunk must not be empty".into());
         }
@@ -383,7 +498,7 @@ impl<S: ObjectStore> Fs<S> {
             .refs
             .staging
             .values()
-            .filter(|s| s.owner == actor)
+            .filter(|s| authority.controls(&s.owner))
             .fold((0u64, 0usize), |(used, n), s| {
                 (used.saturating_add(s.len), n + 1)
             });
@@ -396,7 +511,11 @@ impl<S: ObjectStore> Fs<S> {
         if used.saturating_add(len) > quota {
             return Err("files: staging quota exceeded".into());
         }
-        refuse_refs_growth(&pending.refs, staged_entry_len(actor), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            staged_entry_len(&authority.actor()),
+            self.window_cap,
+        )?;
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
         // digests as roots), and the bytes ride pending.objects so they are
@@ -404,7 +523,7 @@ impl<S: ObjectStore> Fs<S> {
         pending.refs.staging.insert(
             digest,
             Staged {
-                owner: actor.to_string(),
+                owner: authority.actor(),
                 len,
                 expires_at: height.saturating_add(STAGING_TTL_BLOCKS),
             },
@@ -419,9 +538,9 @@ impl<S: ObjectStore> Fs<S> {
     /// this block's pending overlay — all-or-nothing: nothing touches
     /// `self.pending` until full success, so a rejected commit leaves the block
     /// exactly as it was. returns the watch notifications the glue emits.
-    pub fn commit(
+    fn commit_apply(
         &mut self,
-        actor: &str,
+        authority: &Authority,
         height: u64,
         time: u64,
         base: Option<String>,
@@ -462,7 +581,7 @@ impl<S: ObjectStore> Fs<S> {
                 &store,
                 &pending.object_ids,
                 scratch,
-                actor,
+                authority,
                 height,
                 time,
                 base,
@@ -490,22 +609,17 @@ impl<S: ObjectStore> Fs<S> {
     /// block height the sweep and `require_pending` key on — there is no other
     /// source of the current height in the pure core (the refs preimage carries
     /// none), and the binding sweep-first rule below needs it.
-    pub fn pin(
+    fn pin_apply(
         &mut self,
-        actor: &str,
+        authority: &Authority,
         height: u64,
         snapshot: String,
         name: String,
     ) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
-        // sweep-first, on the pending view, like putblob. the deterministic staging
-        // sweep ticks at every mutating verb so expiry stays a pure function of the
-        // op stream even in a block whose only op is a pin. a reject AFTER the sweep
-        // is harmless: the kernel aborts the whole block on any execute error
-        // (verified in task 9's review — the host aborts every module on any drain
-        // failure), so `abort_block` erases the swept-but-rejected pending; it is
-        // never observed.
+        // Every accepted verb ticks staging expiry. `transact` restores this
+        // sweep as well if validation below refuses the operation.
         sweep_expired(&mut pending.refs, height);
 
         // validate fully before the single mutation (all pre-checks).
@@ -529,7 +643,7 @@ impl<S: ObjectStore> Fs<S> {
             .refs
             .pins
             .values()
-            .filter(|p| p.owner == actor)
+            .filter(|pin| authority.controls(&pin.owner))
             .count();
         if owner_pins >= MAX_PINS_PER_OWNER {
             return Err("files: pin quota exceeded".into());
@@ -542,13 +656,17 @@ impl<S: ObjectStore> Fs<S> {
         if !refs_contains_snapshot(&pending.refs, &id) {
             return Err("files: snapshot not resolvable".into());
         }
-        refuse_refs_growth(&pending.refs, pin_entry_len(&name, actor), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            pin_entry_len(&name, &authority.actor()),
+            self.window_cap,
+        )?;
 
         pending.refs.pins.insert(
             name,
             PinEntry {
                 snapshot: id,
-                owner: actor.to_string(),
+                owner: authority.actor(),
             },
         );
         Ok(())
@@ -556,10 +674,15 @@ impl<S: ObjectStore> Fs<S> {
 
     /// remove a pin by name — owner-gated: only the pin's creator or system.
     /// mutates the PENDING view only (see [`Fs::pin`] for the height/sweep rules).
-    pub fn unpin(&mut self, actor: &str, height: u64, name: String) -> Result<(), String> {
+    fn unpin_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        name: String,
+    ) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
-        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        // `transact` restores the sweep if this verb is refused.
         sweep_expired(&mut pending.refs, height);
 
         let owner = match pending.refs.pins.get(&name) {
@@ -567,7 +690,8 @@ impl<S: ObjectStore> Fs<S> {
             None => return Err("files: pin not found".into()),
         };
         // owner-gated: the creator or system may remove it; nobody else.
-        if actor != owner && actor != "system" {
+        let can_unpin = authority.controls(&owner) || matches!(authority, Authority::System);
+        if !can_unpin {
             return Err("files: only the pin owner may unpin".into());
         }
         pending.refs.pins.remove(&name);
@@ -577,20 +701,19 @@ impl<S: ObjectStore> Fs<S> {
     /// register a `(prefix, module_id)` watch. origin-gated: watches are
     /// module-origin only and a module may only watch for itself; system may
     /// register for any module. mutates the PENDING view only (see [`Fs::pin`]).
-    pub fn watch(
+    fn watch_apply(
         &mut self,
-        actor: &str,
+        authority: &Authority,
         height: u64,
-        is_module: bool,
         prefix: String,
         module_id: String,
     ) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
-        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        // `transact` restores the sweep if this verb is refused.
         sweep_expired(&mut pending.refs, height);
 
-        watch_origin_gate(actor, is_module, &module_id)?;
+        watch_origin_gate(authority, &module_id)?;
         if module_id.is_empty() {
             return Err("files: watch module id must not be empty".into());
         }
@@ -608,28 +731,31 @@ impl<S: ObjectStore> Fs<S> {
         if pending.refs.watches.contains(&key) {
             return Err("files: watch already registered".into());
         }
-        refuse_refs_growth(&pending.refs, watch_entry_len(&key.0, &key.1), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            watch_entry_len(&key.0, &key.1),
+            self.window_cap,
+        )?;
         pending.refs.watches.insert(key);
         Ok(())
     }
 
     /// remove a `(prefix, module_id)` watch — same origin gate as [`Fs::watch`].
     /// mutates the PENDING view only.
-    pub fn unwatch(
+    fn unwatch_apply(
         &mut self,
-        actor: &str,
+        authority: &Authority,
         height: u64,
-        is_module: bool,
         prefix: String,
         module_id: String,
     ) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
-        // sweep-first (see `pin`): `abort_block` erases a swept-but-rejected pending.
+        // `transact` restores the sweep if this verb is refused.
         sweep_expired(&mut pending.refs, height);
 
         // gate first — never leak whether a watch exists to an unauthorized caller.
-        watch_origin_gate(actor, is_module, &module_id)?;
+        watch_origin_gate(authority, &module_id)?;
         // key on the same canonical prefix registration stored.
         let prefix = canonical_watch_prefix(&prefix)?;
         let key = (prefix, module_id);
@@ -944,7 +1070,7 @@ fn commit_apply(
     store: &Store,
     pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     mut refs: Refs,
-    actor: &str,
+    authority: &Authority,
     height: u64,
     time: u64,
     base: Option<String>,
@@ -953,7 +1079,7 @@ fn commit_apply(
     window_cap: usize,
 ) -> Result<CommitBuilt, String> {
     // step 0: the deterministic staging sweep, over the scratch. a reject never
-    // persists a half-applied sweep — production aborts the whole block, and an
+    // persists a half-applied sweep — the scratch view is discarded on failure, and an
     // idempotent later op re-sweeps if the block continues.
     sweep_expired(&mut refs, height);
 
@@ -1015,7 +1141,7 @@ fn commit_apply(
                 content,
             } => {
                 // step 3: canonicalize + authority-check the written path.
-                let segs = canon_authorized(actor, path)?;
+                let segs = canon_authorized(authority, path)?;
                 let joined = join_segs(&segs);
                 dedup(&mut seen, &joined)?; // step 4
                 validate_meta(meta)?; // step 8 meta caps, enforced before staging
@@ -1075,14 +1201,14 @@ fn commit_apply(
                 });
             }
             Change::Mkdir { path } => {
-                let segs = canon_authorized(actor, path)?;
+                let segs = canon_authorized(authority, path)?;
                 let joined = join_segs(&segs);
                 dedup(&mut seen, &joined)?;
                 touched.push((joined, segs.clone()));
                 plan.push(EditOp::Mkdir { segs });
             }
             Change::Rm { path } => {
-                let segs = canon_authorized(actor, path)?;
+                let segs = canon_authorized(authority, path)?;
                 let joined = join_segs(&segs);
                 dedup(&mut seen, &joined)?;
                 touched.push((joined, segs.clone()));
@@ -1091,8 +1217,8 @@ fn commit_apply(
             Change::Mv { from, to } => {
                 // both endpoints are written paths: canonicalized, authority-checked
                 // and dedup'd, and both feed CAS + watch fan-out.
-                let from_segs = canon_authorized(actor, from)?;
-                let to_segs = canon_authorized(actor, to)?;
+                let from_segs = canon_authorized(authority, from)?;
+                let to_segs = canon_authorized(authority, to)?;
                 let from_joined = join_segs(&from_segs);
                 let to_joined = join_segs(&to_segs);
                 dedup(&mut seen, &from_joined)?;
@@ -1105,7 +1231,7 @@ fn commit_apply(
                 });
             }
             Change::Symlink { path, target } => {
-                let segs = canon_authorized(actor, path)?;
+                let segs = canon_authorized(authority, path)?;
                 let joined = join_segs(&segs);
                 dedup(&mut seen, &joined)?;
                 if target.len() > MAX_SYMLINK_TARGET_BYTES {
@@ -1214,7 +1340,7 @@ fn commit_apply(
     let snapshot = SnapshotObj {
         root,
         parent: effective_head,
-        author: actor.to_string(),
+        author: authority.actor(),
         consensus_time: time,
         height,
         message,
@@ -1296,9 +1422,9 @@ fn chunk_stat(
 }
 
 /// canonicalize a written path and authority-check it for `actor`.
-fn canon_authorized(actor: &str, path: &str) -> Result<Vec<String>, String> {
+fn canon_authorized(authority: &Authority, path: &str) -> Result<Vec<String>, String> {
     let segs = canonical(path)?;
-    check_authority(actor, &segs)?;
+    check_authority(authority, &segs)?;
     Ok(segs)
 }
 
@@ -1307,10 +1433,6 @@ fn join_segs(segs: &[String]) -> String {
     format!("/{}", segs.join("/"))
 }
 
-/// the watch origin gate, shared by [`Fs::watch`]/[`Fs::unwatch`]: watches are
-/// module-origin only (external submitters cannot register), and a module may act
-/// only for itself. system (also `is_module`) may act for any module_id — it is
-/// the arbitrary-authority origin. one function so both ends enforce it identically.
 /// the refs image byte cap ([`MAX_REFS_IMAGE_BYTES`]) gates EVERY growth path
 /// (`putblob`, `pin`, `watch`) the way the count caps do: an entry that would
 /// push the encoded image past the cap is refused before the mutation, so
@@ -1340,14 +1462,19 @@ fn refs_commit_headroom(refs: &Refs, window_cap: usize) -> usize {
     head + window
 }
 
-fn watch_origin_gate(actor: &str, is_module: bool, module_id: &str) -> Result<(), String> {
-    if !is_module {
-        return Err("files: watch registration is module-origin only".into());
+fn watch_origin_gate(authority: &Authority, module_id: &str) -> Result<(), String> {
+    match authority {
+        Authority::System => Ok(()),
+        Authority::Module(actor) => {
+            if actor != module_id {
+                return Err("files: a module may only watch for itself".into());
+            }
+            Ok(())
+        }
+        Authority::External { .. } | Authority::Program(_) => {
+            Err("files: watch registration is module-origin only".into())
+        }
     }
-    if actor != "system" && actor != module_id {
-        return Err("files: a module may only watch for itself".into());
-    }
-    Ok(())
 }
 
 /// canonicalize a watch prefix to its stored joined form, run at BOTH ends
@@ -1544,8 +1671,10 @@ mod consensus_uniformity {
         let mut b = new_fs();
         a.store_mut().put(Kind::Chunk, b"orphan-payload").unwrap();
 
-        a.putblob("system", 1, b"orphan-payload").unwrap();
-        b.putblob("system", 1, b"orphan-payload").unwrap();
+        a.putblob(&crate::Authority::System, 1, b"orphan-payload")
+            .unwrap();
+        b.putblob(&crate::Authority::System, 1, b"orphan-payload")
+            .unwrap();
         commit_block(&mut a);
         commit_block(&mut b);
 
@@ -1577,8 +1706,22 @@ mod consensus_uniformity {
         a.store_mut().put(Kind::Chunk, b"data-x").unwrap(); // A holds the orphan
         let mut b = new_fs(); // B does not
 
-        let ra = a.commit("system", 1, 1, None, "c".into(), vec![change.clone()]);
-        let rb = b.commit("system", 1, 1, None, "c".into(), vec![change]);
+        let ra = a.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "c".into(),
+            vec![change.clone()],
+        );
+        let rb = b.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "c".into(),
+            vec![change],
+        );
 
         assert_eq!(
             ra.is_ok(),
@@ -1641,7 +1784,7 @@ mod object_read_budget {
     fn seed_three_dirs(fs: &mut Fs<MemStore>) -> String {
         let seed = fs
             .commit(
-                "system",
+                &crate::Authority::System,
                 1,
                 1,
                 None,
@@ -1674,15 +1817,21 @@ mod object_read_budget {
 
         let err = fs
             .commit(
-                "system",
+                &crate::Authority::System,
                 2,
                 2,
                 Some(head),
                 "rm".into(),
                 vec![
-                    Change::Rm { path: "/d0/f0".into() },
-                    Change::Rm { path: "/d1/f1".into() },
-                    Change::Rm { path: "/d2/f2".into() },
+                    Change::Rm {
+                        path: "/d0/f0".into(),
+                    },
+                    Change::Rm {
+                        path: "/d1/f1".into(),
+                    },
+                    Change::Rm {
+                        path: "/d2/f2".into(),
+                    },
                 ],
             )
             .map(|_| ())
@@ -1709,15 +1858,21 @@ mod object_read_budget {
         let root_before = fs.root_bytes();
 
         fs.commit(
-            "system",
+            &crate::Authority::System,
             2,
             2,
             Some(head),
             "rm".into(),
             vec![
-                Change::Rm { path: "/d0/f0".into() },
-                Change::Rm { path: "/d1/f1".into() },
-                Change::Rm { path: "/d2/f2".into() },
+                Change::Rm {
+                    path: "/d0/f0".into(),
+                },
+                Change::Rm {
+                    path: "/d1/f1".into(),
+                },
+                Change::Rm {
+                    path: "/d2/f2".into(),
+                },
             ],
         )
         .expect("within-budget commit must succeed");
@@ -1742,7 +1897,7 @@ mod object_read_budget {
         fs.set_object_read_budget_for_tests(3);
         let err = fs
             .commit(
-                "system",
+                &crate::Authority::System,
                 1,
                 1,
                 None,
@@ -1785,7 +1940,7 @@ mod refs_image_budget {
         let mut refused = None;
         for i in 0..crate::wire::MAX_WATCHES {
             let prefix = format!("{}/{i:0250}", format!("/{segment}").repeat(15));
-            match fs.watch("system", 1, true, prefix, module_id.clone()) {
+            match fs.watch(&crate::Authority::System, 1, prefix, module_id.clone()) {
                 Ok(()) => {}
                 Err(why) => {
                     refused = Some(why);
@@ -1829,7 +1984,7 @@ mod refs_image_budget {
         for i in 0..crate::wire::MAX_WATCHES {
             let prefix = format!("{}/{i:0250}", format!("/{segment}").repeat(15));
             if fs
-                .watch("system", 1, true, prefix, module_id.clone())
+                .watch(&crate::Authority::System, 1, prefix, module_id.clone())
                 .is_err()
             {
                 refused = true;
@@ -1840,7 +1995,7 @@ mod refs_image_budget {
         for i in 0..=HISTORY_WINDOW {
             let height = 2 + i as u64;
             fs.commit(
-                "system",
+                &crate::Authority::System,
                 height,
                 height,
                 None,

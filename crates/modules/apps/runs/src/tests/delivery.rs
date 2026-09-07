@@ -51,7 +51,6 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             message_id: reply_message_id(&run_id),
             blocks: vec![Block::paragraph("on it")],
             thread: None,
-            as_agent: Some("bot".into()),
         }],
         "the reply posts as the AGENT, under the run's message id"
     );
@@ -74,19 +73,19 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
 #[test]
 fn a_threaded_anchor_threads_the_reply() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    let mut m = watched(TurnPolicy::All, &registry);
+    let mut m = configured(&registry);
     // seq 3 is a reply to root 1; the pin records thread_root = 1.
     let mut thread_transcript = transcript(2);
     thread_transcript.push(message_in(
         "general",
         3,
-        AuthorRef::User(vec![1; 32]),
+        Party::Key(vec![1; 32]),
         "in thread",
         Some(1),
     ));
     let mut ctx = CaptureCtx::new()
         .at(3)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript("general", thread_transcript.clone());
     exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
@@ -198,10 +197,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
         let posts = ctx.chat_msgs();
         assert_eq!(posts.len(), 1, "exactly one failure reply ({fragment})");
         let ChatMsg::PostMessage {
-            message_id,
-            blocks,
-            as_agent,
-            ..
+            message_id, blocks, ..
         } = &posts[0]
         else {
             panic!("expected a post");
@@ -211,7 +207,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             reply_message_id(&run_id),
             "the failure reply holds the run's one reply id ({fragment})"
         );
-        assert_eq!(*as_agent, Some("bot".into()));
+
         assert_eq!(blocks.len(), 1, "one ⚠ paragraph ({fragment})");
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("expected a paragraph");
@@ -587,7 +583,7 @@ fn a_fenced_job_response_still_yields_actions_only() {
 fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
     // the agent SPEAKING (its own channel, its own message) rather than
     // ANSWERING where it was engaged — one more action in the strict lane, and
-    // one more chat post carrying `as_agent`.
+    // one more proposed chat post for the program account.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -623,7 +619,6 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
             message_id: post_message_id(&run_id, "0"),
             blocks: vec![Block::paragraph("progress: halfway")],
             thread: None,
-            as_agent: Some("bot".into()),
         }
     );
     assert_ne!(
@@ -740,10 +735,13 @@ fn dispatch_view_reads_through_testkit_on_query() {
         assert_eq!(receiver, "runs", "runs is the dispatching module");
         Ok(dispatch::encode_reply(&dispatch::DispatchReply::Dispatch(
             Some(DispatchView {
+                cause: sdk::Cause::Direct,
                 dispatch_id,
                 recipe_id: "agent/x".into(),
                 receiver,
-                status: DispatchStatus::Delivered,
+                status: DispatchStatus::Delivered {
+                    delivery: sdk::DeliveryOutcome::Applied,
+                },
                 outcome: Some(Ok(Vec::new())),
                 created_at: 0,
                 updated_at: 0,
@@ -763,7 +761,7 @@ fn dispatch_view_reads_through_testkit_on_query() {
     };
     assert_eq!(view.dispatch_id, dispatch_id);
     assert_eq!(view.receiver, "runs");
-    assert!(matches!(view.status, DispatchStatus::Delivered));
+    assert!(matches!(view.status, DispatchStatus::Delivered { .. }));
 
     // an unregistered sibling still gets the shared QueryUnsupported default.
     let err = block_on(ctx.query("saga", b"")).unwrap_err();

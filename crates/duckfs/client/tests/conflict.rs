@@ -158,7 +158,7 @@ impl NodeApi for ScriptedNode {
             id: "REBASED".into(),
             parent: None,
             root_tree: String::new(),
-            author: String::new(),
+            author: duckfs_core::Actor::System,
             height: self.height,
             consensus_time: 0,
             message: String::new(),

@@ -26,7 +26,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent::{AgentRecord, CapRequest};
+use runs::{CapRequest, ModelRecord};
 use serde_json::json;
 
 use crate::mcp::node::{Node, NodeError, Result};
@@ -43,13 +43,9 @@ const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
 const ENV_PROVIDER_CONTROL_TOKEN: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 const PROVIDER_CONTROL_HEADER: &str = "x-ducktape-provider-control";
 
-/// the agent-registry module id. the node's genesis registers it under this
-/// name (`bin/noded/src/main.rs`), as it does every module the tools speak to.
-pub const TARGET_AGENT: &str = "agent";
-/// the runs module id — the target of every `AgentAction`, and the only module
-/// this binary ever WRITES to. chat, tasks and pages are written by runs, in
-/// consensus, on the agent's behalf; that indirection is what earns the write
-/// its `AuthorRef::Agent` attribution.
+/// Model configuration and run requests belong to the runs module.
+pub const TARGET_MODEL: &str = "runs";
+/// Scoped action proposals go to runs; the user program performs their writes.
 pub const TARGET_RUNS: &str = "runs";
 
 /// The narrow host signer endpoint for this live run. Its random token can ask
@@ -114,7 +110,7 @@ impl Run {
     /// validator, against the agent's committed grant — and its refusal is what
     /// comes back. a second gate in this process could only ever drift from the
     /// one that actually decides.
-    pub fn act(&self, action: agent::AgentAction) -> Result<serde_json::Value> {
+    pub fn act(&self, action: runs::AgentAction) -> Result<serde_json::Value> {
         self.submit_runs(runs::RunsMsg::AgentAction {
             run_id: self.run_id().unwrap_or_default().to_string(),
             action,
@@ -124,7 +120,7 @@ impl Run {
     pub fn delegate(
         &self,
         request_id: String,
-        request: agent::DelegationRequest,
+        request: runs::DelegationRequest,
     ) -> Result<serde_json::Value> {
         self.submit_runs(runs::RunsMsg::DelegateRun {
             run_id: self.run_id().unwrap_or_default().to_string(),
@@ -184,30 +180,34 @@ impl Run {
     /// the record and applied the same way — and FAIL CLOSED: a query this
     /// server cannot complete, or a run the module no longer holds, refuses the
     /// read. falling back to the standing record is exactly the escalation.
-    pub fn record(&self) -> Result<AgentRecord> {
+    pub fn record(&self) -> Result<ModelRecord> {
         let agent_id = self.agent_id.as_deref().ok_or_else(|| {
             NodeError::Rejected(format!(
                 "this MCP server was started without {ENV_AGENT}, so it is not acting for any \
                  agent and cannot write"
             ))
         })?;
-        let reply = self
-            .node
-            .query(TARGET_AGENT, json!({"agent": {"agent_id": agent_id}}))?;
-        // AgentReply::Agent(Option<AgentRecord>) — snake_case externally
+        let reply = self.node.query(
+            TARGET_MODEL,
+            json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}),
+        )?;
+        // ModelReply::Agent(Option<ModelRecord>) — snake_case externally
         // tagged, so the record sits under "agent" and is null for an id the
         // registry does not hold.
-        let record = reply.get("agent").ok_or_else(|| {
-            NodeError::Transport(format!(
-                "the agent registry answered a shape this server does not understand: {reply}"
-            ))
-        })?;
+        let record = reply
+            .get("model")
+            .and_then(|model| model.get("agent"))
+            .ok_or_else(|| {
+                NodeError::Transport(format!(
+                    "the agent registry answered a shape this server does not understand: {reply}"
+                ))
+            })?;
         if record.is_null() {
             return Err(NodeError::Rejected(format!(
                 "the agent registry holds no agent {agent_id:?}"
             )));
         }
-        let standing: AgentRecord = serde_json::from_value(record.clone()).map_err(|e| {
+        let standing: ModelRecord = serde_json::from_value(record.clone()).map_err(|e| {
             NodeError::Transport(format!("the agent registry's record did not decode: {e}"))
         })?;
         let Some(run_id) = self.run_id.as_deref() else {
@@ -247,7 +247,7 @@ impl Run {
     ///
     /// WRITES do not come through here. they are gated in consensus — see
     /// [`Run::act`] and this module's doc.
-    pub fn permits(&self, record: &AgentRecord, cap: &CapRequest) -> Result<()> {
+    pub fn permits(&self, record: &ModelRecord, cap: &CapRequest) -> Result<()> {
         record.permits(cap).then_some(()).ok_or_else(|| {
             NodeError::Rejected(format!(
                 "agent {:?}'s resource caps do not cover {}",
@@ -491,19 +491,20 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn standing_record() -> AgentRecord {
-        let mut record = agent::AgentRecord {
+    fn standing_record() -> ModelRecord {
+        let mut record = runs::ModelRecord {
+            account: 2,
             agent_id: "worker".into(),
-            owner: saga::SagaOrigin::External(vec![9; 32]),
+            owner: runs::RunOrigin::External(vec![9; 32]),
             display_name: "Worker".into(),
             capability: "model-1".into(),
-            allowed_actions: vec![agent::ACTION_CHAT_POST.into()],
-            status: agent::AgentStatus::Active,
-            role: agent::AgentRole::General,
+            allowed_actions: vec![runs::ACTION_CHAT_POST.into()],
+            status: runs::ModelStatus::Active,
+            role: runs::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
-            caps: agent::ResourceCaps::default(),
+            caps: runs::ResourceCaps::default(),
             skills: Vec::new(),
         };
         record.caps.duckfs_read = vec!["/shared".into()];
@@ -528,13 +529,13 @@ mod tests {
         let standing = standing_record();
         // the caller granted LESS than the callee's owner did: no duckfs read.
         let ceiling = json!({
-            "allowed_actions": [agent::ACTION_CHAT_POST],
-            "caps": agent::ResourceCaps::default(),
+            "allowed_actions": [runs::ACTION_CHAT_POST],
+            "caps": runs::ResourceCaps::default(),
         });
         let run = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing}),
+                json!({"model": {"agent": standing}}),
                 json!({"run_authority": {
                     "run_id": "run-1", "agent_id": "worker", "authority": ceiling
                 }}),
@@ -559,7 +560,7 @@ mod tests {
         let run = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing_record()}),
+                json!({"model": {"agent": standing_record()}}),
                 json!({"run_authority": {
                     "run_id": "run-1", "agent_id": "worker", "authority": null
                 }}),
@@ -576,7 +577,10 @@ mod tests {
         // the standing record, which is exactly the escalation.
         let run = bound_run(
             "run-1".into(),
-            vec![json!({"agent": standing_record()}), json!({"nope": 1})],
+            vec![
+                json!({"model": {"agent": standing_record()}}),
+                json!({"nope": 1}),
+            ],
         );
         assert!(run.record().is_err());
 
@@ -584,7 +588,7 @@ mod tests {
         let gone = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing_record()}),
+                json!({"model": {"agent": standing_record()}}),
                 json!({"run_authority": null}),
             ],
         );

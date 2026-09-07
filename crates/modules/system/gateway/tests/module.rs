@@ -36,6 +36,7 @@ impl TestCtx {
                 consensus_time: 1,
                 origin: Origin::External(origin),
                 me: "gateway".into(),
+                cause: sdk::Cause::Direct,
             },
             accounts,
         }
@@ -78,6 +79,7 @@ fn pubkey(signer: &ed25519::PrivateKey) -> Vec<u8> {
 
 fn account(number: u64, signer: &ed25519::PrivateKey) -> AccountView {
     AccountView {
+        control: identity::Control::Keys,
         number,
         name: "Alice".into(),
         keys: vec![KeyView {

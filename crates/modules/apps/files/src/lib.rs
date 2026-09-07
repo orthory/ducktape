@@ -6,6 +6,9 @@
 
 pub use duckfs_core::*;
 
+#[cfg(any(feature = "native", feature = "guest"))]
+mod adapter;
+
 #[cfg(feature = "native")]
 mod module;
 

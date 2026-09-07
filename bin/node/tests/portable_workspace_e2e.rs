@@ -30,17 +30,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg, SkillRef};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
+use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
 };
-use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use runs::{ACTION_CHAT_POST, ModelMsg, SkillRef};
+use runs::{RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
@@ -67,8 +67,7 @@ const SKILL_PREFIX: &str = "/shared/skills/quackskill";
 struct PortableProvider {
     tag: String,
     spec_dir: PathBuf,
-    env_var: String,
-    bin: PathBuf,
+    executors: PathBuf,
 }
 
 /// Where the executor records what only it can attest, one file per fact.
@@ -126,7 +125,7 @@ fn materialized_dirs(cluster: &Cluster, kind: &str) -> Vec<PathBuf> {
 ///
 /// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
 /// executes inside a microVM that mounts nothing from the host — an executor a
-/// node lends has to already be in the guest rootfs. A host script reaches the
+/// node lends must be installed in the executor image. A host script reaches the
 /// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
 ///
 /// Every path it writes is CWD-RELATIVE, which is the workspace: that is the
@@ -168,11 +167,9 @@ impl PortableProvider {
         let dir = root.join("portable-provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        // resolved by basename to /opt/duck/bin/sh inside the guest
-        let bin = PathBuf::from("/bin/sh");
+        let executors = common::script_executor_dir(&dir);
 
         let tag = "quack-portable";
-        let env_var = "DUCKTAPE_TEST_QUACK_PORTABLE_BIN".to_string();
         std::fs::write(
             spec_dir.join(format!("{tag}.toml")),
             format!(
@@ -181,8 +178,7 @@ impl PortableProvider {
                  tag = \"{tag}\"\n\
                  description = \"portable e2e script executor\"\n\
                  [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
+                 bin = \"sh\"\n\
                  [invoke]\n\
                  args = {args}\n\
                  prompt = \"stdin\"\n\
@@ -196,8 +192,7 @@ impl PortableProvider {
         Self {
             tag: tag.into(),
             spec_dir,
-            env_var,
-            bin,
+            executors,
         }
     }
 
@@ -207,7 +202,10 @@ impl PortableProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.bin.display().to_string()),
+            (
+                "DUCKTAPE_EXECUTOR_DIR".into(),
+                self.executors.display().to_string(),
+            ),
         ]
     }
 }
@@ -221,22 +219,17 @@ impl PortableProvider {
 fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
     let empty = root.join(name).join("specs");
     std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let missing = root.join(name).join("missing-executor");
+    let executors = root.join(name).join("executors");
+    std::fs::create_dir_all(&executors).expect("empty executor dir");
     vec![
         (
             "DUCKTAPE_CAPABILITY_DIR".into(),
             empty.display().to_string(),
         ),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-fn hide_builtins(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+        (
+            "DUCKTAPE_EXECUTOR_DIR".into(),
+            executors.display().to_string(),
+        ),
     ]
 }
 
@@ -280,21 +273,19 @@ fn mention(cluster: &Cluster, idx: usize, message_id: &str) {
                 Span::plain("hey "),
                 Span {
                     text: format!("@{AGENT_ID}"),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: AGENT_ID.into(),
-                    })],
+                    marks: vec![Mark::Mention(Party::Account(common::model_account(
+                        cluster, idx, AGENT_ID,
+                    )))],
                 },
                 Span::plain(" do the portable thing"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     );
 }
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
-    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
+    let body = cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
             "chat",
@@ -308,7 +299,7 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
             return None;
         };
         views.into_iter().find_map(|v| {
-            (v.head.message_id == format!("agent/{run_id}")).then(|| {
+            (v.head.message_id == runs::reply_message_id(run_id)).then(|| {
                 v.head
                     .blocks
                     .iter()
@@ -322,7 +313,19 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
                     .collect::<String>()
             })
         })
-    })
+    });
+    let reply = cluster
+        .query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))
+        .expect("the accepted run's history");
+    let RunsReply::RecentRuns(records) = runs::decode_reply(&reply).unwrap() else {
+        panic!("expected recent runs");
+    };
+    let record = records
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
+    body
 }
 
 /// the committed files-module view of `path` on `idx` — `Some(size)` when the
@@ -430,16 +433,8 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // node 1's compute daemon prints the `run dir materialized` marker at
     // debug under `ducktape::agent` (RUST_LOG appends to the daemon's info
     // floor, it never replaces it), and `materialized_dirs` below reads it.
-    let agent_debug = (
-        "RUST_LOG".to_string(),
-        "ducktape::agent=debug".to_string(),
-    );
-    cluster.env[1] = [
-        provider.env(),
-        hide_builtins(fixtures.path(), "node1"),
-        vec![runs_root_env.clone(), agent_debug],
-    ]
-    .concat();
+    let agent_debug = ("RUST_LOG".to_string(), "ducktape::agent=debug".to_string());
+    cluster.env[1] = [provider.env(), vec![runs_root_env.clone(), agent_debug]].concat();
     cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
     boot(&mut cluster);
 
@@ -482,59 +477,52 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             post_policy: PostPolicy::Open,
         }),
     );
-    cluster.submit(
-        0,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: AGENT_ID.into(),
-            display_name: AGENT_ID.into(),
-            capability: provider.tag.clone(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            // the library grant the app pre-fills on every new agent: an
-            // ordinary duckfs_read cap over the shared skill library. it is what
-            // earns the assembled document its library paragraph (and what the
-            // MCP tool plane would gate a real grep/read on) — ungranted, the
-            // document must never mention a door the tool plane would slam.
-            caps: Some(agent::ResourceCaps {
-                duckfs_read: vec![agent::SKILL_LIBRARY_PREFIX.into()],
-                ..Default::default()
-            }),
-            // a TRACKING skill (no pin): the composer resolves it to the
-            // committed head, the provisioner mounts it read-only (W6). curated
-            // `Always`, so it is this agent's PERSONA: the assembler inlines its
-            // body into the run's context document — the lane that replaced the
-            // prompt blob.
-            skills: Some(vec![SkillRef {
-                name: SKILL_NAME.into(),
-                source_prefix: SKILL_PREFIX.into(),
-                source_snapshot: None,
-                load: agent::LoadMode::Always,
-            }]),
-        }),
-    );
+    let program_account = common::provision_model_program(&cluster, 0, AGENT_ID);
     cluster.submit(
         0,
         "runs",
-        &runs::encode_msg(&RunsMsg::WatchChannel {
-            channel_id: CHANNEL.into(),
-            policy: TurnPolicy::Mention,
+        &runs::encode_msg(&RunsMsg::ConfigureModel {
+            operation: ModelMsg::RegisterModel {
+                account: program_account,
+                agent_id: AGENT_ID.into(),
+                display_name: AGENT_ID.into(),
+                capability: provider.tag.clone(),
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+                recipe_hash: None,
+                // the library grant the app pre-fills on every new agent: an
+                // ordinary duckfs_read cap over the shared skill library. it is what
+                // earns the assembled document its library paragraph (and what the
+                // MCP tool plane would gate a real grep/read on) — ungranted, the
+                // document must never mention a door the tool plane would slam.
+                caps: Some(runs::ResourceCaps {
+                    duckfs_read: vec![runs::SKILL_LIBRARY_PREFIX.into()],
+                    ..Default::default()
+                }),
+                // a TRACKING skill (no pin): the composer resolves it to the
+                // committed head, the provisioner mounts it read-only (W6). curated
+                // `Always`, so it is this agent's PERSONA: the assembler inlines its
+                // body into the run's context document — the lane that replaced the
+                // prompt blob.
+                skills: Some(vec![SkillRef {
+                    name: SKILL_NAME.into(),
+                    source_prefix: SKILL_PREFIX.into(),
+                    source_snapshot: None,
+                    load: runs::LoadMode::Always,
+                }]),
+            },
         }),
     );
-    cluster.await_committed(0, "the channel watch to commit", FINALIZE, || {
-        let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
-        match runs::decode_reply(&reply) {
-            Ok(RunsReply::Watches(w)) => w.iter().any(|v| v.channel_id == CHANNEL).then_some(()),
-            _ => None,
-        }
-    });
+    assert_eq!(
+        common::model_account(&cluster, 0, AGENT_ID),
+        program_account
+    );
 
     // ---- run 1: the agent's workspace prefix has no content yet -> an EMPTY
     // rw checkout (the cold-start case) beside the materialized skill mount;
     // the script writes the artifact, commit mints the output_ref, the reply
     // delivers.
     mention(&cluster, 0, "m1");
-    let run_1 = runs::run_id_for(CHANNEL, 1, AGENT_ID);
+    let run_1 = common::attributed_run_id(&cluster, 0, CHANNEL, 1, AGENT_ID);
     assert_eq!(wait_for_reply(&cluster, 0, &run_1), "portable run done");
 
     // W6 evidence: the script content-checked the skill file under the
@@ -577,7 +565,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         "a library-granted agent is told the library is there: {prompt}"
     );
     assert!(
-        prompt.contains("ducktape_files_grep") && prompt.contains(agent::SKILL_LIBRARY_PREFIX),
+        prompt.contains("ducktape_files_grep") && prompt.contains(runs::SKILL_LIBRARY_PREFIX),
         "…and told, by name, the tool and prefix that open it: {prompt}"
     );
 
@@ -610,7 +598,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // materialize run 1's committed artifact (W2 chaining) — content-checked
     // inside the mount by the script itself.
     mention(&cluster, 0, "m2");
-    let run_2 = runs::run_id_for(CHANNEL, 3, AGENT_ID);
+    let run_2 = common::attributed_run_id(&cluster, 0, CHANNEL, 3, AGENT_ID);
     assert_eq!(wait_for_reply(&cluster, 2, &run_2), "portable run done");
     cluster.await_committed(0, "run 2's chain evidence to commit", FINALIZE, || {
         (evidence_lines(&cluster, 0, EVIDENCE_CHAIN).len() == 1).then_some(())

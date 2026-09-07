@@ -1,6 +1,6 @@
 //! path normalization and authority (task 4): NFC-normalized absolute paths,
-//! segment/depth/byte caps, and the `/home/<module-id>/**` write-authority
-//! rule over a plain `actor: &str` (origin mapping stays in the native glue).
+//! segment/depth/byte caps, and the `/home/<principal>/**` write-authority
+//! rule over authenticated account, key, module, and system authority.
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -83,15 +83,15 @@ pub fn is_namespace_root(segments: &[String]) -> bool {
     matches!(segments, [only] if only == "home" || only == "shared")
 }
 
-/// decide whether `owner` may write to the already-canonicalized `segments`.
-/// `system` writes anywhere; `/home/<o>/**` is writable only by `o`, and the
+/// Decide whether authenticated `authority` may write the canonical `segments`.
+/// System writes anywhere; a home uses its actor label or actual signer key, and the
 /// home root itself (`/home` or `/home/<o>`) is never a writable file — only
 /// paths strictly under it; `/shared/**` (≥ 2 segments) is writable by anyone;
 /// everything else (including the filesystem root) is rejected. authority never
 /// re-derives or mutates the path.
-pub fn check_authority(owner: &str, segments: &[String]) -> Result<(), String> {
+pub fn check_authority(authority: &crate::Authority, segments: &[String]) -> Result<(), String> {
     // system bypasses authority entirely (the path was still canonicalized).
-    if owner == "system" {
+    if matches!(authority, crate::Authority::System) {
         return Ok(());
     }
     match segments.first().map(String::as_str) {
@@ -99,11 +99,12 @@ pub fn check_authority(owner: &str, segments: &[String]) -> Result<(), String> {
             // a home tree needs the owner segment AND at least one entry under
             // it: `["home", o, ..]`. the home root itself is not a file.
             Some(o) if segments.len() >= 3 => {
-                if o == owner {
+                if authority.owns_home(o) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "files: actor '{owner}' is not the home owner '{o}'"
+                        "files: actor '{}' is not the home owner '{o}'",
+                        authority.actor()
                     ))
                 }
             }

@@ -44,6 +44,8 @@ pub enum InlineMark {
     Underline,
     Strikethrough,
     Code,
+    /// Attribute this selected text to an identity account.
+    Mention(sdk::AccountNumber),
 }
 
 /// One half-open inline mark range (`start..end`) in UTF-16 code units.
@@ -76,6 +78,8 @@ pub struct RelativeAnchor {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Block {
+    /// Authenticated actor at creation; edits and moves preserve authorship.
+    pub author: Party,
     /// globally unique within the module — the addressable handle.
     pub id: String,
     /// the parent block id; `None` only for a top-level page.
@@ -176,10 +180,7 @@ pub enum PageMsg {
     // (mirrors the chat module). ids are client-minted like block ids.
     /// open a thread (when `thread_id` is new) anchored to `target` with this
     /// first comment, or append `comment_id` to an existing thread (whose
-    /// target must match). author = origin — except `as_agent`, which refines
-    /// a MODULE origin into `AuthorRef::Agent { module, agent_id }` (the
-    /// module half stays origin-derived and spoof-proof; mirrors chat's
-    /// `as_agent`). `as_agent` with a non-module origin is rejected.
+    /// target must match). The author is the authenticated resolved party.
     AddComment {
         thread_id: String,
         comment_id: String,
@@ -189,15 +190,9 @@ pub enum PageMsg {
         /// omit it (a comment with no text selection).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor: Option<RelativeAnchor>,
-        /// Structured mentions carried by this comment. Only agent refs are
-        /// translated into tagging-plane entities; omitted when the comment
-        /// mentions no one.
+        /// Full account mention set; empty means no mentions.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        mentions: Vec<AuthorRef>,
-        /// Present only for an agent-authored comment; omitted for a human
-        /// author (see `PostMessage::as_agent`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        as_agent: Option<String>,
+        mentions: Vec<sdk::AccountNumber>,
     },
     /// Move a thread with text that crossed a block boundary during split or
     /// merge. The replacement anchor is validated against the new target.
@@ -213,13 +208,13 @@ pub enum PageMsg {
         anchor: Option<RelativeAnchor>,
     },
     /// replace a comment's text; stored-author-only. rejected on a tombstone.
-    /// `mentions` carries only refs newly introduced by this edit, so an
-    /// unrelated wording change cannot re-engage everyone already mentioned.
+    /// `mentions` replaces the complete mention set; retained relations do
+    /// not produce new attribution events.
     EditComment {
         comment_id: String,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        mentions: Vec<AuthorRef>,
+        mentions: Vec<sdk::AccountNumber>,
     },
     /// tombstone a comment; stored-author-only. when it was the thread's last
     /// live comment, the whole thread record is removed.
@@ -255,7 +250,6 @@ pub const MAX_COMMENT_WORK_PER_TARGET: usize = 3_000;
 /// per-request target cap on the index tier's grouped thread read.
 pub const MAX_QUERY_TARGETS: usize = 512;
 pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
-pub const MAX_COMMENT_AGENT_ID_BYTES: usize = 512;
 /// Hard count bound for both page-index and page-block query pages.
 pub const MAX_PAGE_QUERY_LIMIT: u16 = 256;
 /// Encoded item budget for a page query reply. The remaining 2 MiB covers the
@@ -298,9 +292,9 @@ pub fn id_is_index_safe(s: &str) -> bool {
 /// copy of chat's shape (each module's interface is self-contained).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuthorRef {
-    User(Vec<u8>),
-    Agent { module: String, agent_id: String },
+pub enum Party {
+    Account(sdk::AccountNumber),
+    Key(Vec<u8>),
     Module(String),
     System,
 }
@@ -313,13 +307,13 @@ pub enum AuthorRef {
 pub struct Thread {
     pub id: String,
     pub target: String,
-    pub opener: AuthorRef,
+    pub opener: Party,
     pub created_at: u64,
     /// `None` is a block/page-level thread; `Some` pins it to exact text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<RelativeAnchor>,
     pub resolved: bool,
-    pub resolved_by: Option<AuthorRef>,
+    pub resolved_by: Option<Party>,
     pub comment_ids: Vec<String>,
 }
 
@@ -330,8 +324,10 @@ pub struct Thread {
 pub struct Comment {
     pub id: String,
     pub thread_id: String,
-    pub author: AuthorRef,
+    pub author: Party,
     pub text: String,
+    /// The full account mention set for this comment.
+    pub mentions: Vec<sdk::AccountNumber>,
     pub created_at: u64,
     pub edited_at: Option<u64>,
     pub deleted: bool,
@@ -343,6 +339,20 @@ pub struct Comment {
 pub struct ThreadView {
     pub thread: Thread,
     pub comments: Vec<Comment>,
+}
+
+/// The authenticated actor resolved by the module for this applied operation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PageAssigned {
+    pub actor: Party,
+}
+
+pub fn encode_assigned(assigned: &PageAssigned) -> Vec<u8> {
+    sdk::wire::encode(assigned)
+}
+pub fn decode_assigned(bytes: &[u8]) -> Result<PageAssigned, String> {
+    sdk::wire::decode(bytes)
 }
 
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
@@ -485,7 +495,7 @@ mod interface_tests {
     #[test]
     fn omitted_optional_fields_decode_to_defaults() {
         let block: Block = serde_json::from_slice(
-            br#"{"id":"b1","parent":"p1","page":"p1","kind":"paragraph","text":"hello","checked":false,"children":[]}"#,
+            br#"{"author":"system","id":"b1","parent":"p1","page":"p1","kind":"paragraph","text":"hello","checked":false,"children":[]}"#,
         )
         .unwrap();
         assert!(block.marks.is_empty());
@@ -507,16 +517,12 @@ mod interface_tests {
         let wire =
             br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
         let PageMsg::AddComment {
-            anchor,
-            mentions,
-            as_agent,
-            ..
+            anchor, mentions, ..
         } = decode_msg(wire).unwrap()
         else {
             panic!("expected AddComment")
         };
         assert!(anchor.is_none());
         assert!(mentions.is_empty());
-        assert!(as_agent.is_none());
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! - READ tools ([`read`]) are ungated except where the caps vocabulary already
 //!   names the resource (`forge_read` repos, `duckfs_read` prefixes).
-//! - WRITE tools ([`write`]) mirror `agent::KNOWN_ACTIONS` ONE-FOR-ONE. that is
+//! - WRITE tools ([`write`]) mirror `runs::KNOWN_ACTIONS` ONE-FOR-ONE. that is
 //!   the point: the tool plane grants an agent nothing its registered
 //!   `allowed_actions` did not already grant it, and there is exactly one
 //!   vocabulary of "what an agent may do" — the one consensus validates a
@@ -146,7 +146,7 @@ mod tests {
         // unable to say which grant it needs.
         for t in write::tools() {
             assert!(
-                agent::KNOWN_ACTIONS
+                runs::KNOWN_ACTIONS
                     .iter()
                     .any(|a| t.description.contains(a)),
                 "write tool {} names no known action in its description",

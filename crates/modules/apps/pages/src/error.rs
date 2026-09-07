@@ -61,22 +61,13 @@ pub(super) enum PageError {
     /// than the page's recorded author (see [`Pages::may_edit`]).
     NotPageAuthor,
     /// a block/page or comment op arrived with an empty (pre-consensus)
-    /// origin — [`crate::author_from_origin`] rejects it before any op can
+    /// origin — the actor resolver rejects it before any op can
     /// derive an author from it.
     EmptyOrigin,
     /// an external or module origin was too large for a bounded stored
     /// author (a page's recorded author or a comment's).
     AuthorTooLarge,
     // ── comments ──
-    /// an AddComment carried an empty `as_agent` id.
-    EmptyAgent,
-    /// an AddComment carried an `as_agent` id too large for bounded comment
-    /// query replies.
-    AgentIdTooLarge,
-    /// an AddComment carried `as_agent` under a non-module origin — only
-    /// genesis-trusted module code may attribute a comment to an agent.
-    AgentNeedsModuleOrigin,
-    /// resolve/append named a thread id not in the store.
     ThreadNotFound,
     /// edit/delete named a comment id not in the store (or a tombstone).
     CommentNotFound,
@@ -134,9 +125,6 @@ impl core::fmt::Display for PageError {
             PageError::NotPageAuthor => "not the page author",
             PageError::EmptyOrigin => "empty origin",
             PageError::AuthorTooLarge => "comment author is too large",
-            PageError::EmptyAgent => "empty as_agent",
-            PageError::AgentIdTooLarge => "as_agent is too large",
-            PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
             PageError::DuplicateComment => "duplicate comment id",

@@ -35,11 +35,12 @@ sha2 = { workspace = true }
 # chat's WIRE TYPES only: forge opens one hidden discussion channel per
 # issue/PR (`forge:<repo>:<n>`) and posts state-change system lines into it via
 # emit_msg follow-ups — the same seam runs/automations use. forge reuses
-# chat's AuthorRef so the app renders forge authors through the same path.
+# chat's Party so the app renders forge authors through the same path.
 chat = { workspace = true }
+attribution = { workspace = true }
 # identity's WIRE TYPES only: forge resolves a ref-moving origin to the account
 # it belongs to, so the SAME human's node-key `git push` and user-key app merge
-# land on one owner principal (see `ForgeState::principal_of_origin`).
+# land on one owner principal (see `ForgeState::authority_of_origin`).
 identity = { workspace = true }
 # `git push --signed`: the push certificate's OpenSSH signature is verified
 # in consensus (`pushcert::signer`), by every validator.

@@ -609,7 +609,7 @@ mod tests {
                 id: id.into(),
                 parent: Some(parent.into()),
                 root_tree: String::new(),
-                author: String::new(),
+                author: duckfs_core::Actor::System,
                 height: 5,
                 consensus_time: 0,
                 message: msg.into(),

@@ -17,8 +17,8 @@
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
+use futures::{FutureExt as _, StreamExt as _};
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
 
@@ -36,6 +36,7 @@ pub struct InProcDaemon {
     operator_token: String,
     server: Option<JoinHandle<()>>,
     actor: Option<JoinHandle<()>>,
+    drain: mpsc::UnboundedSender<oneshot::Sender<Result<BlockSummary, String>>>,
 }
 
 impl InProcDaemon {
@@ -65,6 +66,31 @@ impl InProcDaemon {
         status_modules: Vec<String>,
         blob_root: Option<std::path::PathBuf>,
     ) -> Self {
+        Self::start_configured(build_host, status_modules, blob_root, None)
+    }
+
+    /// Serve the normal signed HTTP mutation lane bound to this node key.
+    /// The harness supplies a real Ed25519 public key, just as a consensus
+    /// node wires its key into both status and request verification at boot.
+    pub fn start_with_node_key(
+        build_host: impl FnOnce() -> Host + Send + 'static,
+        status_modules: Vec<String>,
+        node_key: commonware_cryptography::ed25519::PublicKey,
+    ) -> Self {
+        Self::start_configured(
+            build_host,
+            status_modules,
+            None,
+            Some(node_key.as_ref().to_vec()),
+        )
+    }
+
+    fn start_configured(
+        build_host: impl FnOnce() -> Host + Send + 'static,
+        status_modules: Vec<String>,
+        blob_root: Option<std::path::PathBuf>,
+        node_key: Option<Vec<u8>>,
+    ) -> Self {
         // Bind FIRST, and hand the bound socket to the server thread.
         //
         // The harness used to reserve a port with `nettest::free_port()`, drop
@@ -80,7 +106,8 @@ impl InProcDaemon {
         listener
             .set_nonblocking(true)
             .expect("harness listener is nonblocking for tokio");
-        let (handle, cmd_rx, _events) = NodeHandle::channel();
+        let (handle, cmd_rx, hub) = NodeHandle::channel();
+        let (drain, drain_rx) = mpsc::unbounded();
         // chained right after `channel()`, before any `blob_handle()` clone is
         // handed out — the ordering `with_blob_root` documents.
         let handle = match blob_root {
@@ -88,6 +115,13 @@ impl InProcDaemon {
             None => handle,
         };
         let status = handle.status_cell();
+        status.publish(NodeStatus {
+            public_key: node_key
+                .as_deref()
+                .map(crate::hex_bytes)
+                .unwrap_or_default(),
+            ..Default::default()
+        });
         // the testkit has no mesh and no registry: an empty exposition
         // parses to the honest empty peers sample and an empty scrape.
         status.wire_exposition(String::new);
@@ -97,6 +131,7 @@ impl InProcDaemon {
         let operator_token = crate::services::new_secret();
         let handle = handle.with_admin(crate::AdminConfig {
             operator_token: Some(operator_token.clone()),
+            node_key,
             ..Default::default()
         });
 
@@ -112,7 +147,19 @@ impl InProcDaemon {
         let (booted_tx, booted_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
-            .spawn(move || run_actor(build_host(), status_modules, cmd_rx, status, booted_tx))
+            .spawn(move || {
+                run_actor(
+                    build_host(),
+                    status_modules,
+                    ActorIo {
+                        cmd_rx,
+                        drain_rx,
+                        status,
+                        hub,
+                        booted: booted_tx,
+                    },
+                )
+            })
             .expect("spawn actor");
         // a dropped sender means genesis panicked; say that rather than block.
         booted_rx.recv().expect("in-proc actor died during genesis");
@@ -137,9 +184,22 @@ impl InProcDaemon {
             operator_token,
             server: Some(server),
             actor: Some(actor),
+            drain,
         };
         daemon.await_ready();
         daemon
+    }
+
+    /// Commit the host's ready calls and deliveries in ordinary empty blocks.
+    /// The reply arrives after state/status and block notifications publish;
+    /// no wall-clock wait or synthetic Program origin is involved.
+    pub fn drain_ready_work(&self) -> Result<BlockSummary, String> {
+        let (reply, result) = oneshot::channel();
+        self.drain
+            .unbounded_send(reply)
+            .map_err(|_| "in-proc actor stopped".to_string())?;
+        futures::executor::block_on(result)
+            .map_err(|_| "in-proc drain reply dropped".to_string())?
     }
 
     /// the port the client surface listens on.
@@ -240,13 +300,22 @@ impl Drop for InProcDaemon {
 /// the minimal node actor: one block per submit, queries answered inline — the
 /// SAME [`NodeCommand`] contract `bin/noded`'s daemon serves, so a harness
 /// proves the real submit/query/frame path rather than a hand-mirrored stub.
-pub fn run_actor(
-    mut host: Host,
-    status_modules: Vec<String>,
-    mut cmd_rx: mpsc::Receiver<NodeCommand>,
+struct ActorIo {
+    cmd_rx: mpsc::Receiver<NodeCommand>,
+    drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<Result<BlockSummary, String>>>,
     status: crate::StatusCell,
+    hub: crate::StreamHub,
     booted: std::sync::mpsc::SyncSender<()>,
-) {
+}
+
+fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
+    let ActorIo {
+        mut cmd_rx,
+        mut drain_rx,
+        status,
+        hub,
+        booted,
+    } = io;
     let mut height: u64 = 0;
     futures::executor::block_on(async move {
         // the boot snapshot, then one publish per committed block — the SAME
@@ -255,7 +324,19 @@ pub fn run_actor(
         // this one, never the cell's empty default.
         publish_status(&status, &host, &status_modules, height);
         let _ = booted.send(());
-        while let Some(cmd) = cmd_rx.next().await {
+        loop {
+            let command = futures::select! {
+                command = cmd_rx.next().fuse() => command,
+                request = drain_rx.next().fuse() => {
+                    let Some(reply) = request else { break; };
+                    let result = drain_ready_work(&mut host, &mut height, &status_modules, &status, &hub).await;
+                    let _ = reply.send(result);
+                    continue;
+                }
+            };
+            let Some(cmd) = command else {
+                break;
+            };
             match cmd {
                 NodeCommand::Submit {
                     target,
@@ -266,11 +347,13 @@ pub fn run_actor(
                     let result = commit(
                         &mut host,
                         &mut height,
+                        &hub,
+                        &status,
+                        &status_modules,
                         Origin::External(origin),
                         Msg { target, payload },
                     )
                     .await;
-                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 // the signed-frame lane, FAITHFUL to the real daemon: the origin
@@ -278,10 +361,20 @@ pub fn run_actor(
                 // forged/tampered frame is a rejection, not a block.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => commit(&mut host, &mut height, origin, msg).await,
+                        Ok((origin, msg)) => {
+                            commit(
+                                &mut host,
+                                &mut height,
+                                &hub,
+                                &status,
+                                &status_modules,
+                                origin,
+                                msg,
+                            )
+                            .await
+                        }
                         Err(err) => Err(err.to_string()),
                     };
-                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
@@ -315,7 +408,7 @@ fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[Str
         consensus_time: height,
         consensus_time_unit: crate::ConsensusTimeUnit::Height,
         modules,
-        public_key: String::new(),
+        public_key: status.current().public_key,
         chain_id: String::new(),
         operations: Default::default(),
     });
@@ -332,6 +425,9 @@ fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[Str
 async fn commit(
     host: &mut Host,
     height: &mut u64,
+    hub: &crate::StreamHub,
+    status: &crate::StatusCell,
+    status_modules: &[String],
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
@@ -344,6 +440,12 @@ async fn commit(
     match host.submit_at(ctx, msg).await {
         Ok(out) => {
             *height = next;
+            publish_status(status, host, status_modules, *height);
+            hub.publish_block(
+                *height,
+                hex_root(&out.root_hash),
+                crate::BlockWake::from_dispatches(&out.dispatches),
+            );
             Ok(BlockSummary {
                 height: *height,
                 root_hash: hex_root(&out.root_hash),
@@ -351,4 +453,42 @@ async fn commit(
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+async fn drain_ready_work(
+    host: &mut Host,
+    height: &mut u64,
+    modules: &[String],
+    status: &crate::StatusCell,
+    hub: &crate::StreamHub,
+) -> Result<BlockSummary, String> {
+    while host
+        .has_pending_work()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let next = *height + 1;
+        let out = host
+            .submit_block(
+                BlockContext {
+                    height: next,
+                    consensus_time: next,
+                    origin: Origin::System,
+                },
+                Vec::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        *height = next;
+        publish_status(status, host, modules, *height);
+        hub.publish_block(
+            *height,
+            hex_root(&out.root_hash),
+            crate::BlockWake::from_dispatches(&out.internal_dispatches()),
+        );
+    }
+    Ok(BlockSummary {
+        height: *height,
+        root_hash: hex_root(&host.root_hash()),
+    })
 }

@@ -197,7 +197,7 @@ component MemberDetail(member:MemberRow, admin:bool)
                 GateNote
                   with
                     reason="Pause and resume are owner-gated writes."
-                    next="The registry accepts them only from the signer that registered this agent."
+                    next="The model accepts changes from its program account or current controller."
               // membership moves are ballots: this opens the proposal, it does not settle it
               if admin && !member.is_agent && member.role == "resident"
                 button -> emit(gov_propose, "add_validator", member.key)

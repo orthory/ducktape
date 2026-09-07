@@ -637,7 +637,7 @@ fn read_errs_on_short_interior_chunk() {
     let snap = SnapshotObj {
         root: tree_id,
         parent: None,
-        author: "system".into(),
+        author: duckfs_core::Actor::System,
         consensus_time: 1,
         height: 1,
         message: String::new(),

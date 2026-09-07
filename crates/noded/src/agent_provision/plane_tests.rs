@@ -115,8 +115,54 @@ fn spawn_session_actor(
                         .push(runs::decode_msg(&payload).expect("a runs op"));
                     let _ = reply.send(bind.map(|()| committed_block()).map_err(Into::into));
                 }
-                NodeCommand::Query { req, reply, .. } => {
-                    let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
+                NodeCommand::Query {
+                    target, req, reply, ..
+                } => {
+                    let result = if target == "runs" {
+                        let result = match runs::decode_query(&req).unwrap() {
+                            runs::RunsQuery::AgentSessions => {
+                                runs::RunsReply::AgentSessions(vec![runs::AgentSession {
+                                    run_id: consensus_run_id(),
+                                    agent_id: "quackbot".into(),
+                                    session_key: Vec::new(),
+                                    holder: Vec::new(),
+                                    opened_at: 0,
+                                    actions: 0,
+                                }])
+                            }
+                            runs::RunsQuery::ActionRequest { request_id } => {
+                                assert_eq!(
+                                    seen_actions.lock().unwrap().len(),
+                                    1,
+                                    "receipt follows admitted action"
+                                );
+                                runs::RunsReply::ActionRequest(Some(runs::ActionRequestView {
+                                    request_id,
+                                    account: 2,
+                                    generation: 0,
+                                    run_id: consensus_run_id(),
+                                    target: "tasks".into(),
+                                    payload: serde_json::Value::Null,
+                                    status: runs::ActionStatus::Completed {
+                                        call: sdk::CallId {
+                                            requester: "agent".into(),
+                                            invocation: "2/1".into(),
+                                            step: 1,
+                                        },
+                                        outcome: dispatch::CallOutcomeSummary::Applied {
+                                            output_digest: [0; 32],
+                                            assigned: Vec::new(),
+                                        },
+                                    },
+                                }))
+                            }
+                            query => panic!("unexpected session query {query:?}"),
+                        };
+                        Ok(runs::encode_reply(&result))
+                    } else {
+                        files_reply(&BTreeMap::new(), false, &req)
+                    };
+                    let _ = reply.send(result);
                 }
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let (origin, msg) = node::decode_frame(&frame).expect("a valid action frame");
@@ -434,7 +480,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     assert_eq!(out_of_scope, 403);
     assert!(actions.lock().unwrap().is_empty());
 
-    let action = agent::AgentAction::CreateTask {
+    let action = runs::AgentAction::CreateTask {
         task_id: "task-1".into(),
         title: "scoped".into(),
     };
@@ -594,4 +640,183 @@ async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() 
         Some("quackbot")
     );
     ws.cleanup().await;
+}
+
+type ReceiptState = std::sync::Arc<std::sync::Mutex<runs::ActionStatus>>;
+
+fn spawn_receipt_actor(
+    mut commands: futures::channel::mpsc::Receiver<NodeCommand>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    ReceiptState,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    let status: ReceiptState =
+        std::sync::Arc::new(std::sync::Mutex::new(runs::ActionStatus::AwaitingProgram));
+    let stored = status.clone();
+    let (observed, queries) = tokio::sync::mpsc::unbounded_channel();
+    let actor = tokio::spawn(async move {
+        while let Some(command) = commands.next().await {
+            match command {
+                NodeCommand::Submit { reply, .. } | NodeCommand::SubmitFrame { reply, .. } => {
+                    let _ = reply.send(Ok(committed_block()));
+                }
+                NodeCommand::Query {
+                    target, req, reply, ..
+                } => {
+                    assert_eq!(target, "runs");
+                    let response = match runs::decode_query(&req).unwrap() {
+                        runs::RunsQuery::AgentSessions => {
+                            runs::RunsReply::AgentSessions(vec![runs::AgentSession {
+                                run_id: consensus_run_id(),
+                                agent_id: "quackbot".into(),
+                                session_key: Vec::new(),
+                                holder: Vec::new(),
+                                opened_at: 0,
+                                actions: 0,
+                            }])
+                        }
+                        runs::RunsQuery::ActionRequest { request_id } => {
+                            let _ = observed.send(());
+                            runs::RunsReply::ActionRequest(Some(runs::ActionRequestView {
+                                request_id,
+                                account: 2,
+                                generation: 0,
+                                run_id: consensus_run_id(),
+                                target: "tasks".into(),
+                                payload: serde_json::Value::Null,
+                                status: stored.lock().unwrap().clone(),
+                            }))
+                        }
+                        query => panic!("unexpected receipt query {query:?}"),
+                    };
+                    let _ = reply.send(Ok(runs::encode_reply(&response)));
+                }
+            }
+        }
+    });
+    (actor, status, queries)
+}
+
+fn request_tool_action(session: &super::session::RunSession) -> tokio::task::JoinHandle<u16> {
+    let url = session.action_url.clone();
+    let token = session.action_token.clone();
+    tokio::spawn(async move {
+        post_action(&url, &token, &serde_json::json!({"message":{"agent_action":{
+            "run_id":consensus_run_id(), "action":{"create_task":{"task_id":"committed", "title":"wait for target"}}
+        }}})).await
+    })
+}
+
+#[tokio::test]
+async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_failure() {
+    for (outcome, expected) in [
+        (
+            dispatch::CallOutcomeSummary::Applied {
+                output_digest: [1; 32],
+                assigned: Vec::new(),
+            },
+            200,
+        ),
+        (
+            dispatch::CallOutcomeSummary::Rejected {
+                reason: "the target rejected the write".into(),
+            },
+            400,
+        ),
+    ] {
+        let (handle, commands, hub) = NodeHandle::channel();
+        let (actor, state, mut observed) = spawn_receipt_actor(commands);
+        let link = test_link(handle).await;
+        let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
+            .await
+            .unwrap();
+        let request = request_tool_action(&session);
+        observed
+            .recv()
+            .await
+            .expect("the admitted action queried its still-pending receipt");
+        assert!(
+            !request.is_finished(),
+            "admission must not return tool success"
+        );
+        *state.lock().unwrap() = runs::ActionStatus::Completed {
+            call: sdk::CallId {
+                requester: "agent".into(),
+                invocation: "2/1".into(),
+                step: 1,
+            },
+            outcome,
+        };
+        hub.publish_block(2, "cd".repeat(32), crate::stream::BlockWake::TipOnly);
+        assert_eq!(request.await.unwrap(), expected);
+        drop(session);
+        actor.abort();
+    }
+}
+
+#[tokio::test]
+async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let token = crate::admin::mint_operator_token(directory.path()).unwrap();
+    let (handle, commands, _) = NodeHandle::channel();
+    let handle = handle.with_admin(crate::AdminConfig {
+        operator_token: Some(token),
+        ..Default::default()
+    });
+    let (actor, _, mut observed) = spawn_receipt_actor(commands);
+    let (disconnect, signal) = tokio::sync::oneshot::channel::<()>();
+    let signal = std::sync::Arc::new(tokio::sync::Mutex::new(Some(signal)));
+    // Only the stream is controlled here; admission and receipt queries use
+    // the real node router and actor boundary.
+    let app = axum::Router::new()
+        .route(
+            "/v1/ws",
+            axum::routing::get(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                let signal = signal.clone();
+                async move {
+                    let signal = signal.lock().await.take().unwrap();
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        socket.recv().await.expect("subscription").unwrap();
+                        socket
+                            .send(axum::extract::ws::Message::Text(
+                                "{\"type\":\"subscribed\"}".into(),
+                            ))
+                            .await
+                            .unwrap();
+                        signal.await.unwrap();
+                        socket
+                            .send(axum::extract::ws::Message::Close(None))
+                            .await
+                            .unwrap();
+                    })
+                }
+            }),
+        )
+        .fallback_service(crate::router(handle));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let link =
+        NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
+    let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
+        .await
+        .unwrap();
+    let request = request_tool_action(&session);
+    observed.recv().await.unwrap();
+    assert!(!request.is_finished());
+    disconnect.send(()).unwrap();
+    assert_eq!(request.await.unwrap(), 400);
+    drop(session);
+    actor.abort();
+    server.abort();
 }

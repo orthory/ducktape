@@ -405,7 +405,6 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
             message_id: "message-1".into(),
             blocks: vec![chat::Block::paragraph("first")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -467,7 +466,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "hello-1".into(),
             blocks: vec![chat::Block::paragraph("hello from the app")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -562,7 +560,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "hello-2".into(),
             blocks: vec![chat::Block::paragraph("arrived on the next block")],
             thread: None,
-            as_agent: None,
         }),
     )
     .await;
@@ -607,7 +604,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             message_id: "reply-1".into(),
             blocks: vec![chat::Block::paragraph("a threaded reply")],
             thread: Some(1),
-            as_agent: None,
         }),
     )
     .await;
@@ -749,7 +745,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
             text: "temporary".into(),
             anchor: None,
             mentions: Vec::new(),
-            as_agent: None,
         }),
     )
     .await;
@@ -895,17 +890,14 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     );
 }
 
-/// TWO MODULES, ONE PROJECTION — every quadrant. `agent` commits an agent's
-/// registration and `runs` commits its liveness, so this is the only plane
-/// predicate that answers for a pair; `plane_live_hit`'s single `want` cannot
-/// express it and the Ice checker will not let the handler spell the pair
-/// inline. A non-plane kind must stay false whatever module it names, or a
-/// chat fold's module string starts issuing agent queries.
+/// Model configuration and run activity share the runs plane. Generic program
+/// changes are not model-registry changes.
 #[test]
-fn the_agents_plane_hit_answers_for_both_of_its_modules_and_nothing_else() {
+fn the_agents_plane_hit_tracks_models_and_current_identity_control() {
     for (kind, module, want) in [
-        (crate::LiveKind::Plane, "agent", true),
+        (crate::LiveKind::Plane, "agent", false),
         (crate::LiveKind::Plane, "runs", true),
+        (crate::LiveKind::Plane, "identity", true),
         (crate::LiveKind::Plane, "valset", false),
         (crate::LiveKind::Chat, "agent", false),
         (crate::LiveKind::Chat, "runs", false),

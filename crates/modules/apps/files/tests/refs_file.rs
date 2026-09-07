@@ -10,8 +10,8 @@
 mod harness;
 use harness::open_files;
 
-use files::state::{PinEntry, Refs, Staged, root_bytes};
 use duckfs_disk::DiskStore;
+use files::state::{PinEntry, Refs, Staged, root_bytes};
 use files::{Kind, ObjectStore as _};
 use sdk::{Module as _, StateRoot};
 
@@ -23,7 +23,7 @@ fn a_refs() -> Refs {
     r.staging.insert(
         [2; 32],
         Staged {
-            owner: "ext:aa".into(),
+            owner: duckfs_core::Actor::Key(vec![0xaa]),
             len: 5,
             expires_at: 100,
         },
@@ -32,7 +32,7 @@ fn a_refs() -> Refs {
         "release".into(),
         PinEntry {
             snapshot: [3; 32],
-            owner: "kv".into(),
+            owner: duckfs_core::Actor::Module("kv".into()),
         },
     );
     r

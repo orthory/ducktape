@@ -331,6 +331,7 @@ pub struct StreamOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum StreamOriginKind {
     External,
+    Program,
     Module,
     System,
 }
@@ -343,8 +344,8 @@ fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
     let assigned: Option<serde_json::Value> = (!row.assigned.is_empty())
         .then(|| serde_json::from_slice(&row.assigned).ok())
         .flatten();
-    let assigned_hex = (!row.assigned.is_empty() && assigned.is_none())
-        .then(|| crate::hex_bytes(&row.assigned));
+    let assigned_hex =
+        (!row.assigned.is_empty() && assigned.is_none()).then(|| crate::hex_bytes(&row.assigned));
     StreamOpRow {
         height: row.height,
         seq: row.seq,
@@ -352,6 +353,7 @@ fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
         origin: StreamOrigin {
             kind: match row.origin.kind {
                 indexer::OriginKind::External => StreamOriginKind::External,
+                indexer::OriginKind::Program => StreamOriginKind::Program,
                 indexer::OriginKind::Module => StreamOriginKind::Module,
                 indexer::OriginKind::System => StreamOriginKind::System,
             },
@@ -1446,9 +1448,9 @@ fn take_service_link(
     let terminals = handle
         .terminals()
         .ok_or("terminal sessions are not enabled on this node")?;
-    terminals
-        .attach(token)
-        .ok_or("refused: present this node's service-link token, and only one agent service may attach")
+    terminals.attach(token).ok_or(
+        "refused: present this node's service-link token, and only one agent service may attach",
+    )
 }
 
 /// every `ducktape::term` refusal below that a CLIENT drives per frame (a held
@@ -1841,7 +1843,12 @@ fn subscribe_topics(
             ));
             continue;
         }
-        match prepare_topic(&topic, holds_workspace_secret, resume.get(&topic), store.as_ref()) {
+        match prepare_topic(
+            &topic,
+            holds_workspace_secret,
+            resume.get(&topic),
+            store.as_ref(),
+        ) {
             Ok((state, lagged)) => {
                 accepted.insert(topic.clone(), state.cursor());
                 states.insert(topic, state);
@@ -3192,7 +3199,12 @@ mod tests {
             })
         ));
         assert!(matches!(
-            prepare_topic("logs", NO_SECRET, Some(&"not-a-seq".to_string()), Some(&store)),
+            prepare_topic(
+                "logs",
+                NO_SECRET,
+                Some(&"not-a-seq".to_string()),
+                Some(&store)
+            ),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::BadCursor,
                 ..
@@ -3336,7 +3348,11 @@ mod tests {
             line: "forged".into(),
         }));
         let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
-        assert_eq!(rows.len(), 1, "the peer's line never entered the local ring");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the peer's line never entered the local ring"
+        );
         assert_eq!(rows[0].2, "local");
     }
 
@@ -3360,7 +3376,10 @@ mod tests {
                 "no remote ring exists to evict, so the flood is refused outright"
             );
         }
-        assert!(runs.is_local(&"aa".repeat(32)), "the local ring survives the flood");
+        assert!(
+            runs.is_local(&"aa".repeat(32)),
+            "the local ring survives the flood"
+        );
         let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
         assert_eq!(rows.len(), 1);
     }
@@ -3433,9 +3452,8 @@ mod tests {
     fn term_command_topic_subscribes_and_replays_the_ordered_attributed_log() {
         // any session id subscribes to its command log (like `term:`); a fresh
         // subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) =
-            prepare_topic("term-cmd:abc", HOLDS_SECRET, None, None)
-                .expect("term-cmd topic subscribes");
+        let (state, lagged) = prepare_topic("term-cmd:abc", HOLDS_SECRET, None, None)
+            .expect("term-cmd topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
         assert!(matches!(state, TopicState::TermCommand { .. }));
@@ -3606,10 +3624,7 @@ mod tests {
         assert_eq!(Topic::parse("term:s1"), Some(Topic::Term("s1")));
         // `term-cmd:` is its own family and never decodes as a `term:` session
         // named "cmd:s1" — the two prefixes diverge before the colon.
-        assert_eq!(
-            Topic::parse("term-cmd:s1"),
-            Some(Topic::TermCommand("s1"))
-        );
+        assert_eq!(Topic::parse("term-cmd:s1"), Some(Topic::TermCommand("s1")));
 
         // ... and a name no family owns parses to nothing, which is what makes
         // admission deny-by-default rather than a habit.
@@ -3750,9 +3765,11 @@ mod tests {
         tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
                 match command {
-                    wire::Command::TermCreate(create) => daemon.on_event(wire::Event::TermCreated {
-                        session: create.session,
-                    }),
+                    wire::Command::TermCreate(create) => {
+                        daemon.on_event(wire::Event::TermCreated {
+                            session: create.session,
+                        })
+                    }
                     wire::Command::TermInput { data_b64, .. } => {
                         let _ = seen_tx.send(format!("input:{data_b64}")).await;
                     }
@@ -3889,7 +3906,9 @@ mod tests {
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
         assert!(
-            frames.iter().all(|f| !matches!(f, ServerFrame::Error { .. })),
+            frames
+                .iter()
+                .all(|f| !matches!(f, ServerFrame::Error { .. })),
             "every topic at exactly the cap must admit: {frames:?}"
         );
 
@@ -4014,9 +4033,13 @@ mod tests {
         // metrics rides the exposition source, not the index — a daemon with
         // no index store still serves it, and a reconnect's stored cursor is
         // harmless.
-        let (state, lagged) =
-            prepare_topic("metrics", NO_SECRET, Some(&"1752000000000".to_string()), None)
-                .expect("topic");
+        let (state, lagged) = prepare_topic(
+            "metrics",
+            NO_SECRET,
+            Some(&"1752000000000".to_string()),
+            None,
+        )
+        .expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0", "a fresh subscribe never resumes");
     }
@@ -4228,7 +4251,10 @@ mod tests {
         let Err(refusal) = take_service_link(&handle, crate::services::AGENT_KIND, "any") else {
             panic!("a handle with no terminal plane has no link to give");
         };
-        assert!(refusal.contains("terminal sessions are not enabled"), "{refusal}");
+        assert!(
+            refusal.contains("terminal sessions are not enabled"),
+            "{refusal}"
+        );
     }
 
     #[tokio::test]

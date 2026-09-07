@@ -67,7 +67,7 @@ pub mod bindings {
 // module authored outside this repository pins ONE crate and reaches the
 // module contract (`sdk::Module`, `sdk::Ctx`, the codecs) through it.
 pub use bindings::ducktape::module::host;
-pub use bindings::{export_module, Guest};
+pub use bindings::{Guest, export_module};
 pub use sdk;
 
 // ============================================================================
@@ -109,7 +109,8 @@ pub fn odb_shape() -> host::ModuleShape {
 }
 
 use sdk::{
-    Ctx, Env, Error, Event, MerkleStore, Msg, Origin, ResolverSyncTarget, StateRoot, ROOT_LEN,
+    Ack, CallId, Cause, Ctx, DeliveryOutcome, Env, Error, Event, Hop, ItemRef, MerkleStore, Msg,
+    Origin, PendingItem, ROOT_LEN, ResolverSyncTarget, Root, StateRoot,
 };
 
 use std::future::Future;
@@ -149,9 +150,108 @@ fn env_from_wit(env: host::Env) -> Env {
         origin: match env.origin {
             host::Origin::External(id) => Origin::External(id),
             host::Origin::FromModule(id) => Origin::Module(id),
+            host::Origin::Program(account) => Origin::Program(account),
             host::Origin::System => Origin::System,
         },
         me: env.me,
+        cause: cause_from_wit(env.cause),
+    }
+}
+
+// ---- the causal-context and queue types, both directions --------------------
+//
+// the exact inverses of wasm-host's `to_wit_*` / `*_from_wit`, so a value that
+// crosses the boundary out and back reads the same to the ported logic as it
+// would have natively. public because the guest shells (the macros below)
+// expand them in the downstream crate.
+
+fn call_id_from_wit(id: host::CallId) -> CallId {
+    CallId {
+        requester: id.requester,
+        invocation: id.invocation,
+        step: id.step,
+    }
+}
+
+fn call_id_to_wit(id: CallId) -> host::CallId {
+    host::CallId {
+        requester: id.requester,
+        invocation: id.invocation,
+        step: id.step,
+    }
+}
+
+fn item_ref_from_wit(item: host::ItemRef) -> ItemRef {
+    ItemRef {
+        source: item.source,
+        item: item.item,
+    }
+}
+
+fn item_ref_to_wit(item: ItemRef) -> host::ItemRef {
+    host::ItemRef {
+        source: item.source,
+        item: item.item,
+    }
+}
+
+pub fn cause_from_wit(cause: host::Cause) -> Cause {
+    match cause {
+        host::Cause::Direct => Cause::Direct,
+        host::Cause::Chain(chain) => Cause::Chain {
+            root: match chain.root {
+                host::Root::Item(item) => Root::Item(item_ref_from_wit(item)),
+                host::Root::Call(id) => Root::Call(call_id_from_wit(id)),
+                host::Root::Change(change) => Root::Change {
+                    source: change.source,
+                    seq: change.seq,
+                },
+            },
+            hop: match chain.hop {
+                host::Hop::Delivery(item) => Hop::Delivery(item_ref_from_wit(item)),
+                host::Hop::Call(id) => Hop::Call(call_id_from_wit(id)),
+                host::Hop::Completion(id) => Hop::Completion(call_id_from_wit(id)),
+            },
+        },
+    }
+}
+
+pub fn cause_to_wit(cause: Cause) -> host::Cause {
+    match cause {
+        Cause::Direct => host::Cause::Direct,
+        Cause::Chain { root, hop } => host::Cause::Chain(host::Chain {
+            root: match root {
+                Root::Item(item) => host::Root::Item(item_ref_to_wit(item)),
+                Root::Call(id) => host::Root::Call(call_id_to_wit(id)),
+                Root::Change { source, seq } => host::Root::Change(host::ChangeRef { source, seq }),
+            },
+            hop: match hop {
+                Hop::Delivery(item) => host::Hop::Delivery(item_ref_to_wit(item)),
+                Hop::Call(id) => host::Hop::Call(call_id_to_wit(id)),
+                Hop::Completion(id) => host::Hop::Completion(call_id_to_wit(id)),
+            },
+        }),
+    }
+}
+
+pub fn pending_item_to_wit(item: PendingItem) -> host::PendingItem {
+    host::PendingItem {
+        item: item.item,
+        target: item.target,
+        payload: item.payload,
+        cause: cause_to_wit(item.cause),
+    }
+}
+
+pub fn ack_from_wit(ack: host::Ack) -> Ack {
+    Ack {
+        item: ack.item,
+        target: ack.target,
+        outcome: match ack.outcome {
+            host::DeliveryOutcome::Applied => DeliveryOutcome::Applied,
+            host::DeliveryOutcome::Failed(reason) => DeliveryOutcome::Failed { reason },
+            host::DeliveryOutcome::Unrepresentable => DeliveryOutcome::Unrepresentable,
+        },
     }
 }
 
@@ -159,11 +259,28 @@ fn env_from_wit(env: host::Env) -> Env {
 /// the exact INVERSE of wasm-host's `to_wit_error`, so an error that crossed
 /// the boundary out and back reads the same to the ported logic as it would
 /// have natively.
-fn error_from_wit(target: &str, e: host::Error) -> Error {
+fn error_from_wit(e: host::Error) -> Error {
     match e {
         host::Error::Rejected(m) => Error::Module(m),
-        host::Error::NotFound => Error::UnknownModule(target.to_string()),
+        host::Error::UnknownModule(id) => Error::UnknownModule(id),
+        host::Error::SelfQuery => Error::SelfQuery,
         host::Error::Unsupported => Error::QueryUnsupported,
+        host::Error::SyncUnsupported => Error::SyncUnsupported,
+        host::Error::SwapUnsupported => Error::SwapUnsupported,
+        host::Error::BudgetExceeded => Error::BudgetExceeded,
+    }
+}
+
+/// Preserve SDK error identity across the component boundary.
+pub fn error_to_wit(error: Error) -> host::Error {
+    match error {
+        Error::UnknownModule(id) => host::Error::UnknownModule(id),
+        Error::SelfQuery => host::Error::SelfQuery,
+        Error::QueryUnsupported => host::Error::Unsupported,
+        Error::SyncUnsupported => host::Error::SyncUnsupported,
+        Error::SwapUnsupported => host::Error::SwapUnsupported,
+        Error::BudgetExceeded => host::Error::BudgetExceeded,
+        Error::Module(message) => host::Error::Rejected(message),
     }
 }
 
@@ -186,7 +303,7 @@ impl Ctx for WitCtx {
     }
 
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
-        host::query_module(target, req).map_err(|e| error_from_wit(target, e))
+        host::query_module(target, req).map_err(error_from_wit)
     }
 
     fn emit_msg(&mut self, msg: Msg) {
@@ -195,6 +312,10 @@ impl Ctx for WitCtx {
 
     fn emit_event(&mut self, ev: Event) {
         host::emit_event(&ev.source, &ev.payload);
+    }
+
+    fn set_output(&mut self, bytes: Vec<u8>) {
+        host::set_output(&bytes);
     }
 
     fn set_assigned(&mut self, bytes: Vec<u8>) {
@@ -241,6 +362,12 @@ pub struct WitStore;
 
 #[async_trait::async_trait(?Send)]
 impl MerkleStore for WitStore {
+    async fn prefetch(&self, keys: &[[u8; ROOT_LEN]]) -> Result<(), Error> {
+        let keys: Vec<_> = keys.iter().map(|key| key.to_vec()).collect();
+        host::state_prefetch(&keys);
+        Ok(())
+    }
+
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
         Ok(host::state_get(key))
     }
@@ -337,10 +464,7 @@ impl duckfs_core::ObjectStore for GuestOdb {
         host::object_stat(id).is_some()
     }
 
-    fn stat(
-        &self,
-        id: &duckfs_core::ObjectId,
-    ) -> Result<Option<(duckfs_core::Kind, u64)>, String> {
+    fn stat(&self, id: &duckfs_core::ObjectId) -> Result<Option<(duckfs_core::Kind, u64)>, String> {
         let Some((tag, len)) = host::object_stat(id) else {
             return Ok(None);
         };
@@ -409,9 +533,7 @@ pub fn load_state() -> Option<(Vec<u8>, [u8; ROOT_LEN])> {
     match (host::state_get(STATE_KEY), host::state_get(ROOT_KEY)) {
         (None, None) => None,
         (Some(bytes), Some(root)) => {
-            let root: [u8; ROOT_LEN] = root
-                .try_into()
-                .expect("persisted __root must be 32 bytes");
+            let root: [u8; ROOT_LEN] = root.try_into().expect("persisted __root must be 32 bytes");
             Some((bytes, root))
         }
         // one key without the other can only mean a torn write in the
@@ -497,9 +619,10 @@ pub fn store_genesis_chain_id(module_label: &str) -> Result<String, host::Error>
 fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error> {
     let params = sdk::genesis_config::decode_config(raw)
         .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
-    let chain_id = sdk::genesis_config::find(&params, sdk::genesis_config::CHAIN_ID).ok_or_else(|| {
-        host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))
-    })?;
+    let chain_id =
+        sdk::genesis_config::find(&params, sdk::genesis_config::CHAIN_ID).ok_or_else(|| {
+            host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))
+        })?;
     String::from_utf8(chain_id.to_vec())
         .map_err(|e| host::Error::Rejected(format!("{module_label} chain_id is not utf-8: {e}")))
 }
@@ -554,14 +677,8 @@ macro_rules! snapshot_guest {
             ::core::result::Result::Ok(module)
         }
 
-        /// map an inner sdk error onto the wit surface. `Module` is the native
-        /// rejection verbatim; anything else the native module never surfaces
-        /// from its own execute, so the debug rendering is purely diagnostic.
         fn to_wit_error(e: $crate::sdk::Error) -> $crate::host::Error {
-            match e {
-                $crate::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
-                other => $crate::host::Error::Rejected(other.to_string()),
-            }
+            $crate::error_to_wit(e)
         }
 
         impl $crate::Guest for Component {
@@ -604,7 +721,10 @@ macro_rules! snapshot_guest {
                 let mut ctx = $crate::WitCtx::new();
                 $crate::block_on(module.execute(
                     &mut ctx,
-                    &$crate::sdk::Msg { target: $id.into(), payload },
+                    &$crate::sdk::Msg {
+                        target: $id.into(),
+                        payload,
+                    },
                 ))
                 .map_err(to_wit_error)?;
                 // fully apply per dispatch: publish the inner per-op staging,
@@ -626,6 +746,34 @@ macro_rules! snapshot_guest {
                 let module = loaded_module()?;
                 $crate::block_on(module.query_with(&$crate::WitCtx::new(), &req))
                     .map_err(to_wit_error)
+            }
+
+            fn pending_items() -> ::core::result::Result<
+                ::std::vec::Vec<$crate::host::PendingItem>,
+                $crate::host::Error,
+            > {
+                use $crate::sdk::Module as _;
+                // the host runs this in a committed-only round, so the loaded
+                // snapshot is the committed one.
+                let module = loaded_module()?;
+                let items = $crate::block_on(module.pending_items()).map_err(to_wit_error)?;
+                ::core::result::Result::Ok(
+                    items.into_iter().map($crate::pending_item_to_wit).collect(),
+                )
+            }
+
+            fn acknowledge(
+                ack: $crate::host::Ack,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                let mut module = loaded_module()?;
+                let mut ctx = $crate::WitCtx::new();
+                let ack = $crate::ack_from_wit(ack);
+                $crate::block_on(module.acknowledge(&mut ctx, &ack)).map_err(to_wit_error)?;
+                // Publish operation writes; finalization runs at the block boundary.
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)?;
+                $crate::save_state(&module.snapshot(), module.root().as_bytes());
+                ::core::result::Result::Ok(())
             }
         }
 
@@ -653,14 +801,8 @@ macro_rules! store_guest {
             ::core::result::Result::Ok($new)
         }
 
-        /// map an inner sdk error onto the wit surface. `Module` is the native
-        /// rejection verbatim; anything else the native module never surfaces
-        /// from its own execute, so the debug rendering is purely diagnostic.
         fn to_wit_error(e: $crate::sdk::Error) -> $crate::host::Error {
-            match e {
-                $crate::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
-                other => $crate::host::Error::Rejected(other.to_string()),
-            }
+            $crate::error_to_wit(e)
         }
 
         impl $crate::Guest for Component {
@@ -690,7 +832,10 @@ macro_rules! store_guest {
                 let mut ctx = $crate::WitCtx::new();
                 $crate::block_on(module.execute(
                     &mut ctx,
-                    &$crate::sdk::Msg { target: $id.into(), payload },
+                    &$crate::sdk::Msg {
+                        target: $id.into(),
+                        payload,
+                    },
                 ))
                 .map_err(to_wit_error)?;
                 // flush the inner per-dispatch staging into the host's OUTER
@@ -708,6 +853,33 @@ macro_rules! store_guest {
                 let module = module()?;
                 $crate::block_on(module.query_with(&$crate::WitCtx::new(), &req))
                     .map_err(to_wit_error)
+            }
+
+            fn pending_items() -> ::core::result::Result<
+                ::std::vec::Vec<$crate::host::PendingItem>,
+                $crate::host::Error,
+            > {
+                use $crate::sdk::Module as _;
+                // the host runs this in a committed-only round: the store view
+                // `WitStore` serves is the committed one.
+                let module = module()?;
+                let items = $crate::block_on(module.pending_items()).map_err(to_wit_error)?;
+                ::core::result::Result::Ok(
+                    items.into_iter().map($crate::pending_item_to_wit).collect(),
+                )
+            }
+
+            fn acknowledge(
+                ack: $crate::host::Ack,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                let mut module = module()?;
+                let mut ctx = $crate::WitCtx::new();
+                let ack = $crate::ack_from_wit(ack);
+                $crate::block_on(module.acknowledge(&mut ctx, &ack)).map_err(to_wit_error)?;
+                // Flush operation writes into the host's block overlay.
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)?;
+                ::core::result::Result::Ok(())
             }
         }
 

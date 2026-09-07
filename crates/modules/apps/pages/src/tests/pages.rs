@@ -402,7 +402,6 @@ fn block_ops_are_gated_to_the_page_author() {
                 text: "a note".into(),
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: None,
             },
             user("mallory"),
         )

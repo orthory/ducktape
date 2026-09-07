@@ -10,9 +10,9 @@
 use chat::Chat;
 use chat::client::dm_channel_id;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS,
-    MAX_CHANNELS_PER_CREATOR, MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, PostPolicy, Span,
-    decode_event, decode_reply, encode_msg, encode_query, huddle_join_preimage,
+    Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, MAX_CHANNELS_PER_CREATOR,
+    MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, Party, PostPolicy, Span, decode_event,
+    decode_reply, encode_msg, encode_query, huddle_join_preimage,
 };
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -29,15 +29,29 @@ use statesync::qmdb::QmdbStore;
 /// on a [`TestCtx`] via `.on_query("identity", ...)`.
 fn identity_stub(accounts: Vec<(Vec<u8>, u64)>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
     move |req| {
-        let IdentityQuery::OfKey { key } = identity_decode_query(req).map_err(Error::Module)?
-        else {
-            return Err(Error::Module(
-                "test identity stub only answers OfKey".into(),
-            ));
-        };
+        let query = identity_decode_query(req).map_err(Error::Module)?;
+        if let IdentityQuery::Resolve { references } = query {
+            let numbers = references
+                .iter()
+                .map(|reference| {
+                    accounts.iter().find_map(|(key, number)| {
+                        let matches = match reference {
+                            identity::AccountRef::Key(requested) => key == requested,
+                            identity::AccountRef::Account(requested) => number == requested,
+                        };
+                        matches.then_some(*number)
+                    })
+                })
+                .collect();
+            return Ok(identity_encode_reply(&IdentityReply::Resolved(numbers)));
+        }
         let account = accounts
             .iter()
-            .find(|(k, _)| *k == key)
+            .find(|(key, number)| match &query {
+                IdentityQuery::OfKey { key: requested } => key == requested,
+                IdentityQuery::Get { number: requested } => number == requested,
+                _ => false,
+            })
             .map(|(_, number)| AccountView {
                 number: *number,
                 name: String::new(),
@@ -45,6 +59,7 @@ fn identity_stub(accounts: Vec<(Vec<u8>, u64)>) -> impl FnMut(&[u8]) -> Result<V
                 avatar: None,
                 bio: None,
                 updated_at: 0,
+                control: identity::Control::Keys,
             });
         Ok(identity_encode_reply(&IdentityReply::Account(account)))
     }
@@ -68,6 +83,7 @@ fn ctx_with_origin(consensus_time: u64, origin: Origin) -> TestCtx {
         consensus_time,
         origin,
         me: "chat".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 
@@ -79,8 +95,8 @@ fn user(byte: u8) -> Origin {
     Origin::External(vec![byte; 32])
 }
 
-fn author_of(byte: u8) -> AuthorRef {
-    AuthorRef::User(vec![byte; 32])
+fn author_of(byte: u8) -> Party {
+    Party::Key(vec![byte; 32])
 }
 
 /// a deterministic node keypair for huddle tests — `seed` picks the key, so
@@ -138,7 +154,6 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
         message_id: message_id.into(),
         blocks: vec![Block::paragraph(text)],
         thread,
-        as_agent: None,
     }
 }
 
@@ -146,7 +161,7 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
 async fn access(module: &Chat, channel: &str, byte: u8) -> chat::ChannelAccess {
     let req = ChatQuery::Access {
         channel_id: channel.into(),
-        user: vec![byte; 32],
+        party: chat::Party::Key(vec![byte; 32]),
     };
     match query(module, req).await {
         ChatReply::Access(access) => access,
@@ -553,7 +568,7 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
             panic!("messages reply expected");
         };
         assert_eq!(messages[0].head.author, author_of(1));
-        assert_eq!(messages[1].head.author, AuthorRef::Module("agent".into()));
+        assert_eq!(messages[1].head.author, Party::Module("agent".into()));
 
         // external origin B cannot edit or delete A's message.
         for op in [
@@ -607,62 +622,19 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
 }
 
 #[test]
-fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
+fn program_accounts_author_and_edit_their_own_messages() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(0), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
-        let root_before = module.root();
-
-        let as_agent_post = |message_id: &str| ChatMsg::PostMessage {
-            channel_id: "general".into(),
-            message_id: message_id.into(),
-            blocks: vec![Block::paragraph("agent reply")],
-            thread: None,
-            as_agent: Some("quackbot".into()),
-        };
-
-        // an external user claiming an agent identity is rejected — users are
-        // not genesis-trusted code — and so is the system origin.
-        for origin in [user(1), Origin::System] {
-            let err = module
-                .execute(
-                    &mut ctx_with_origin(20, origin),
-                    &module_msg(as_agent_post("m1")),
-                )
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Module(_)));
-            module.abort_block().await.unwrap();
-            assert_eq!(module.root(), root_before, "the rejection leaves no trace");
-        }
-
-        // an empty agent id never passes, even from a module origin.
-        let err = module
-            .execute(
-                &mut ctx_with_origin(20, Origin::Module("agent".into())),
-                &module_msg(ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "m1".into(),
-                    blocks: vec![Block::paragraph("agent reply")],
-                    thread: None,
-                    as_agent: Some(String::new()),
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        module.abort_block().await.unwrap();
-
-        // a module origin is honored: the stored author is the FULL agent ref,
-        // module half from the origin, agent half from the payload.
+        let post = post("general", "m1", "program reply", None);
         module
             .execute(
-                &mut ctx_with_origin(21, Origin::Module("agent".into())),
-                &module_msg(as_agent_post("m1")),
+                &mut ctx_with_origin(20, Origin::Program(5)),
+                &module_msg(post),
             )
             .await
             .unwrap();
@@ -675,32 +647,31 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
         )
         .await
         else {
-            panic!("message must exist");
+            panic!("message")
         };
-        assert_eq!(
-            view.head.author,
-            AuthorRef::Agent {
-                module: "agent".into(),
-                agent_id: "quackbot".into(),
-            }
+        assert_eq!(view.head.author, Party::Account(5));
+        let edit = ChatMsg::EditMessage {
+            channel_id: "general".into(),
+            seq: 1,
+            blocks: vec![Block::paragraph("edited")],
+            base_rev: None,
+        };
+        assert!(
+            module
+                .execute(
+                    &mut ctx_with_origin(21, Origin::Module("agent".into())),
+                    &module_msg(edit.clone())
+                )
+                .await
+                .is_err()
         );
-
-        // author checks compare the FULL AuthorRef: the bare module origin is
-        // a different author than its agent, so it cannot edit the agent post.
-        let err = module
+        module
             .execute(
-                &mut ctx_with_origin(22, Origin::Module("agent".into())),
-                &module_msg(ChatMsg::EditMessage {
-                    channel_id: "general".into(),
-                    seq: 1,
-                    blocks: vec![Block::paragraph("rewritten")],
-                    base_rev: None,
-                }),
+                &mut ctx_with_origin(22, Origin::Program(5)),
+                &module_msg(edit),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        module.abort_block().await.unwrap();
+            .unwrap();
     });
 }
 
@@ -955,7 +926,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
                 &mut ctx_with_origin(22, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![1; 32],
+                    party: chat::Party::Key(vec![1; 32]),
                     member: true,
                 }),
             )
@@ -991,7 +962,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
                 &mut ctx_with_origin(25, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![1; 32],
+                    party: chat::Party::Key(vec![1; 32]),
                     member: true,
                 }),
             )
@@ -1010,7 +981,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
                 &mut ctx_with_origin(26, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![1; 32],
+                    party: chat::Party::Key(vec![1; 32]),
                     member: false,
                 }),
             )
@@ -1094,11 +1065,10 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
                         Span::plain("ping "),
                         Span {
                             text: "@agent".into(),
-                            marks: vec![Mark::Mention(AuthorRef::Module("agent".into()))],
+                            marks: vec![Mark::Bold],
                         },
                     ])],
                     thread: None,
-                    as_agent: None,
                 }),
             )
             .await
@@ -1113,7 +1083,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
                 seq: 1,
                 thread_root: None,
                 author: author_of(1),
-                mentions: vec![AuthorRef::Module("agent".into())],
+                mentions: vec![],
             }
         );
 
@@ -1375,7 +1345,7 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
                     user(1),
                     ChatMsg::SetMembership {
                         channel_id: "general".into(),
-                        user: vec![9; 32],
+                        party: chat::Party::Key(vec![9; 32]),
                         member: true,
                     },
                 ),
@@ -1458,10 +1428,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             panic!("channel must exist");
         };
         assert_eq!(channel.huddle.len(), 2);
-        assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
+        assert_eq!(channel.huddle[0].party, Party::Key(vec![1u8; 32]));
         assert_eq!(channel.huddle[0].node, node_a1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20);
-        assert_eq!(channel.huddle[1].user, vec![2u8; 32]);
+        assert_eq!(channel.huddle[1].party, Party::Key(vec![2u8; 32]));
         assert_eq!(channel.huddle[1].joined_at, 21);
 
         // re-join with the same node key is idempotent: root unchanged.
@@ -1497,7 +1467,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             panic!("channel must exist");
         };
         assert_eq!(channel.huddle.len(), 2);
-        assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
+        assert_eq!(channel.huddle[0].party, Party::Key(vec![1u8; 32]));
         assert_eq!(channel.huddle[0].node, node_b1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20, "rejoin keeps join order");
 
@@ -1523,7 +1493,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             panic!("channel must exist");
         };
         assert_eq!(channel.huddle.len(), 1);
-        assert_eq!(channel.huddle[0].user, vec![2u8; 32]);
+        assert_eq!(channel.huddle[0].party, Party::Key(vec![2u8; 32]));
 
         // leaving while not in the huddle is a deterministic no-op.
         let settled = module.root();
@@ -1632,7 +1602,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
                 )
                 .await
                 .unwrap_err();
-            assert!(format!("{err:?}").contains("external users"));
+            assert!(format!("{err:?}").contains("only people"));
         }
 
         // a node key that is not raw ed25519 bytes is rejected.
@@ -1692,7 +1662,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
                 &mut ctx_at(10),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                     member: true,
                 }),
             )
@@ -1756,7 +1726,7 @@ fn sweep_huddle_self_is_a_leave_and_is_idempotent() {
                 &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                 }),
             )
             .await
@@ -1781,7 +1751,7 @@ fn sweep_huddle_self_is_a_leave_and_is_idempotent() {
                 &mut ctx_with_origin(31, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                 }),
             )
             .await
@@ -1816,7 +1786,7 @@ fn sweep_huddle_of_another_user_by_a_non_admin_is_refused() {
                 &mut ctx_with_origin(30, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                 }),
             )
             .await
@@ -1862,7 +1832,7 @@ fn sweep_huddle_of_another_user_by_the_channel_admin_succeeds() {
                 &mut ctx_with_origin(30, user(9)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                 }),
             )
             .await
@@ -1901,12 +1871,12 @@ fn sweep_huddle_rejects_module_origin() {
                 &mut ctx_with_origin(20, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: vec![1u8; 32],
+                    party: chat::Party::Key(vec![1u8; 32]),
                 }),
             )
             .await
             .unwrap_err();
-        assert!(format!("{err:?}").contains("external users"));
+        assert!(format!("{err:?}").contains("only people"));
     });
 }
 
@@ -2050,7 +2020,11 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
         else {
             panic!("channel must exist");
         };
-        assert_eq!(channel.owner, Some(vec![1u8; 32]), "creator is the owner");
+        assert_eq!(
+            channel.owner,
+            Party::Key(vec![1u8; 32]),
+            "creator is the owner"
+        );
         assert!(!channel.archived);
 
         // a non-owner user cannot rename an owned channel.
@@ -2207,7 +2181,11 @@ fn ownerless_channels_refuse_every_user_admin_op() {
         else {
             panic!("channel must exist");
         };
-        assert_eq!(channel.owner, None, "system-minted channels are unowned");
+        assert_eq!(
+            channel.owner,
+            Party::System,
+            "system-minted channels are unowned"
+        );
 
         // NO user administers an unowned channel: there is no owner to be, and
         // the minting principal is a module. every channel-admin op refuses.
@@ -2216,7 +2194,7 @@ fn ownerless_channels_refuse_every_user_admin_op() {
             set_archived("general", true),
             ChatMsg::SetMembership {
                 channel_id: "general".into(),
-                user: vec![7; 32],
+                party: chat::Party::Key(vec![7; 32]),
                 member: true,
             },
             ChatMsg::RegisterHook {
@@ -2266,7 +2244,7 @@ fn ownerless_channels_refuse_every_user_admin_op() {
                 &mut ctx_with_origin(30, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "general".into(),
-                    user: vec![7; 32],
+                    party: chat::Party::Key(vec![7; 32]),
                     member: true,
                 }),
             )
@@ -2326,7 +2304,7 @@ fn membership_and_hooks_are_owner_gated_like_rename() {
         for op in [
             ChatMsg::SetMembership {
                 channel_id: "core".into(),
-                user: vec![2; 32],
+                party: chat::Party::Key(vec![2; 32]),
                 member: true,
             },
             ChatMsg::RegisterHook {
@@ -2381,7 +2359,7 @@ fn membership_and_hooks_are_owner_gated_like_rename() {
                 &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![2; 32],
+                    party: chat::Party::Key(vec![2; 32]),
                     member: true,
                 }),
             )
@@ -2566,7 +2544,7 @@ fn access_answers_one_users_standing_from_chats_own_gates() {
                 &mut ctx_with_origin(12, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
-                    user: vec![2; 32],
+                    party: chat::Party::Key(vec![2; 32]),
                     member: true,
                 }),
             )
@@ -2628,6 +2606,7 @@ fn a_third_account_can_never_mint_the_pairs_derived_dm_id() {
         let mallory_number = 3u64;
         let pairs = vec![
             (vec![1u8; 32], alice_number),
+            (vec![2u8; 32], bob_number),
             (vec![3u8; 32], mallory_number),
         ];
         let their_dm = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
@@ -2672,12 +2651,13 @@ fn a_participant_opens_their_derived_dm_and_both_get_seated() {
         let mut module = chat_on!(context, "chat").with_identity("identity");
         let alice_number = 1u64;
         let bob_number = 2u64;
-        let pairs = vec![(vec![1u8; 32], alice_number)];
+        let pairs = vec![(vec![1u8; 32], alice_number), (vec![2u8; 32], bob_number)];
         let expected_id = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
 
         module
             .execute(
-                &mut ctx_with_origin(10, user(1)).on_query("identity", identity_stub(pairs)),
+                &mut ctx_with_origin(10, user(1))
+                    .on_query("identity", identity_stub(pairs.clone())),
                 &module_msg(ChatMsg::CreateDmChannel {
                     counterpart: bob_number,
                     name: "Bob".into(),
@@ -2685,20 +2665,6 @@ fn a_participant_opens_their_derived_dm_and_both_get_seated() {
             )
             .await
             .unwrap();
-        // seat both ends, exactly like `app::open_dm`'s follow-up writes.
-        for byte in [1u8, 2u8] {
-            module
-                .execute(
-                    &mut ctx_with_origin(11, user(1)),
-                    &module_msg(ChatMsg::SetMembership {
-                        channel_id: expected_id.clone(),
-                        user: vec![byte; 32],
-                        member: true,
-                    }),
-                )
-                .await
-                .unwrap();
-        }
         module.commit_block().await.unwrap();
 
         let ChatReply::Channel(Some(channel)) = query(
@@ -2714,12 +2680,24 @@ fn a_participant_opens_their_derived_dm_and_both_get_seated() {
         assert_eq!(channel.id, expected_id);
         assert_eq!(channel.post_policy, PostPolicy::MembersOnly);
 
-        let alice_access = access(&module, &expected_id, 1).await;
-        let bob_access = access(&module, &expected_id, 2).await;
+        let read_access = |party| ChatQuery::Access {
+            channel_id: expected_id.clone(),
+            party: Party::Account(party),
+        };
+        let ChatReply::Access(alice_access) = query(&module, read_access(1)).await else {
+            panic!("access")
+        };
+        let ChatReply::Access(bob_access) = query(&module, read_access(2)).await else {
+            panic!("access")
+        };
         assert!(
             alice_access.may_post && bob_access.may_post,
             "both ends must be seated"
         );
+        let ChatReply::Access(outsider_access) = query(&module, read_access(3)).await else {
+            panic!("access")
+        };
+        assert!(!outsider_access.may_post);
     });
 }
 

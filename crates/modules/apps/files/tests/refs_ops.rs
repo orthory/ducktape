@@ -179,7 +179,8 @@ fn pin_happy_path_moves_root_and_records_owner() {
     let pin = refs.pins.get("v1").expect("pin recorded under its name");
     assert_eq!(to_hex(&pin.snapshot), head, "pin protects the seeded head");
     assert_eq!(
-        pin.owner, "system",
+        pin.owner,
+        files::Actor::System,
         "owner is the acting origin, not the payload"
     );
 }
@@ -247,8 +248,8 @@ fn pin_table_full_at_max_pins() {
     }
     // the table is now exactly full: even a FRESH owner (nowhere near its own
     // per-owner share) is refused by the global cap.
-    let err = exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow"))
-        .expect_err("cap reached");
+    let err =
+        exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow")).expect_err("cap reached");
     assert_module_err(&err, "pin table is full");
     abort_block(&mut f);
 }
@@ -274,6 +275,76 @@ fn pin_per_owner_cap_is_independent_of_other_owners() {
     // bob's share is untouched by alice filling hers.
     exec(&mut f, md("bob"), 2, pin_op(&head, "b0")).expect("bob still pins");
     abort_block(&mut f);
+}
+
+#[test]
+fn pin_quota_follows_account_ownership_and_exact_key_admission() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    let head = seed_head(&mut f, 1);
+    let old_key = files::Authority::External {
+        key: vec![1],
+        account: None,
+    };
+    let admitted = files::Authority::External {
+        key: vec![1],
+        account: Some(1),
+    };
+    let sibling = files::Authority::External {
+        key: vec![2],
+        account: Some(1),
+    };
+    let store = duckfs_disk::DiskStore::open(d.path().join("objects")).unwrap();
+    let mut core = files::Fs::new(store, decoded_refs(&f));
+    core.pin(&old_key, 2, head.clone(), "before-admission".into())
+        .unwrap();
+    for i in 0..files::MAX_PINS_PER_OWNER - 1 {
+        let signer = match i % 2 {
+            0 => &admitted,
+            _ => &sibling,
+        };
+        core.pin(signer, 2, head.clone(), format!("account-{i}"))
+            .unwrap();
+    }
+
+    // Admission must not erase the actual signer's earlier quota usage.
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&admitted, 2, head.clone(), "over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+
+    // The other member controls only the account's pins, not the earlier key
+    // pin. Its one remaining account slot is shared by every account member.
+    core.pin(&sibling, 2, head.clone(), "last-account-slot".into())
+        .unwrap();
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&sibling, 2, head.clone(), "account-over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+    assert!(core.unpin(&sibling, 2, "before-admission".into()).is_err());
+    assert_eq!(core.pending_refs(), &before);
+    core.unpin(&admitted, 2, "before-admission".into()).unwrap();
+
+    // A keyless program has its own account share and can release its own pin
+    // to regain capacity, with the same revision/rollback discipline.
+    let program = files::Authority::Program(2);
+    for i in 0..files::MAX_PINS_PER_OWNER {
+        core.pin(&program, 2, head.clone(), format!("program-{i}"))
+            .unwrap();
+    }
+    let before = core.pending_refs().clone();
+    assert_eq!(
+        core.pin(&program, 2, head.clone(), "program-over-quota".into()),
+        Err("files: pin quota exceeded".into())
+    );
+    assert_eq!(core.pending_refs(), &before);
+    core.unpin(&program, 2, "program-0".into()).unwrap();
+    core.pin(&program, 2, head, "program-replacement".into())
+        .unwrap();
 }
 
 // ---- unpin ------------------------------------------------------------------
@@ -480,7 +551,7 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     .expect("commit under a different top-level name");
     commit_block(&mut f);
     assert!(
-        ctx.msgs().is_empty(),
+        watch_msgs(&ctx).is_empty(),
         "no false-positive notification across the segment boundary"
     );
 
@@ -494,8 +565,12 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     )
     .expect("commit under the watched prefix");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "fires under the real segment prefix");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "fires under the real segment prefix"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 
 #[test]
@@ -515,8 +590,12 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /sharedsecret/x");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /sharedsecret/x"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 
     let ctx = commit(
         &mut f,
@@ -527,8 +606,12 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /shared/y too");
-    assert_eq!(ctx.msgs()[0].target, "indexer");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /shared/y too"
+    );
+    assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 
 // ---- root-movement discipline: staged-then-abort is a no-op -----------------

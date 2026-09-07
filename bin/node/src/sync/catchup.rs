@@ -16,7 +16,9 @@ const CATCHUP_WINDOW_HEIGHTS: u64 = statesync::MAX_APPLIED_FRAMES as u64;
 pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
+    prepared: host::PreparedWork,
     code_source: &dyn host::CodeSource,
+    witness: &mut dyn host::CommitWitness,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
     // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
@@ -44,7 +46,14 @@ pub(crate) async fn apply_verified_suffix_frame(
                 consensus_time: served.height,
                 origin: sdk::Origin::System,
             };
-            match host.submit_block_ops(ctx, ops).await {
+            // the served frame carries no journal of the peer's internal work:
+            // this node's committed state is the network's at this height (its
+            // roots verified), so the same units prepare here identically and
+            // their authority decides live on all-pre state.
+            match host
+                .submit_block_prepared(ctx, ops, prepared, witness)
+                .await
+            {
                 Ok(batch) => {
                     let (ran, dispatches) = batch.into_trace();
                     let outcome = if ran {
@@ -96,13 +105,25 @@ pub(crate) async fn apply_and_journal_verified_frame<E>(
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
-    node::BlockSink::pre_apply(recovery, frame.height, &frame.frame)
-        .await
-        .map_err(|e| format!("catch-up WAL write: {e}"))?;
     // realize swaps through the SAME source replay uses (wired on Recovery), so
     // every path reconciles code identically.
     let code_source = recovery.code_source();
-    let dispatches = apply_verified_suffix_frame(host, frame, code_source.as_ref()).await?;
+    let prepared = host
+        .prepare_work(frame.height)
+        .await
+        .map_err(|e| format!("catch-up prepare at height {}: {e}", frame.height))?;
+    let expected = node::BlockSeal {
+        height: frame.height,
+        disposition: to_node_disposition(frame.disposition),
+        roots: frame.roots.clone(),
+        root_hash: frame.root_hash,
+    };
+    recovery
+        .pre_apply_catchup(&frame.frame, &prepared, &expected)
+        .await
+        .map_err(|e| format!("catch-up WAL write: {e}"))?;
+    let dispatches =
+        apply_verified_suffix_frame(host, frame, prepared, code_source.as_ref(), recovery).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),

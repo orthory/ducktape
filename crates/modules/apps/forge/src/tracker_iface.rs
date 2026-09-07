@@ -9,10 +9,10 @@
 //! record, so authorship stays origin-derived (a chat follow-up would be
 //! attributed to the forge module, not the opening user).
 //!
-//! authorship reuses chat's [`AuthorRef`] so the app renders forge authors
+//! authorship reuses chat's [`Party`] so the app renders forge authors
 //! through the exact same display-name path as chat messages.
 
-use chat::AuthorRef;
+use chat::Party;
 use serde::{Deserialize, Serialize};
 
 // ---- write-time caps (consensus constants) ---------------------------------
@@ -109,7 +109,7 @@ pub struct ReviewComment {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewView {
-    pub author: AuthorRef,
+    pub author: Party,
     pub verdict: ReviewVerdict,
     pub body: String,
     /// the PR source head hex (40-char sha1) the review was made against —
@@ -127,7 +127,7 @@ pub struct ItemSummary {
     pub kind: ItemKind,
     pub title: String,
     pub state: ItemState,
-    pub author: AuthorRef,
+    pub author: Party,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -199,7 +199,7 @@ mod tests {
                 kind: ItemKind::Pr,
                 title: "t".into(),
                 state: ItemState::Open,
-                author: AuthorRef::User(vec![1; 4]),
+                author: Party::Key(vec![1; 4]),
                 created_at: 10,
                 updated_at: 11,
             },
@@ -209,7 +209,7 @@ mod tests {
             target_branch: Some("main".into()),
             merge_oid: None,
             reviews: vec![ReviewView {
-                author: AuthorRef::User(vec![2; 4]),
+                author: Party::Key(vec![2; 4]),
                 verdict: ReviewVerdict::Approve,
                 body: "lgtm".into(),
                 commit_oid: "a".repeat(40),

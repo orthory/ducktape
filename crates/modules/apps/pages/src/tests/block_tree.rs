@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 async fn page_slice(p: &Pages, page_id: &str, after: Option<&str>, limit: u16) -> PageBlockPage {
     let reply = p
@@ -40,6 +41,7 @@ fn stage_page_ancestry(p: &mut Pages, count: usize) -> String {
         let parent = position.checked_sub(1).map(|index| ids[index].clone());
         let children = ids.get(position + 1).cloned().into_iter().collect();
         p.store_block(&Block {
+            author: Party::System,
             id: id.clone(),
             parent: parent.clone(),
             page: id.clone(),
@@ -53,6 +55,7 @@ fn stage_page_ancestry(p: &mut Pages, count: usize) -> String {
         index.insert(id.clone(), parent);
     }
     p.store_block(&Block {
+        author: Party::System,
         id: "moving".into(),
         parent: None,
         page: "moving".into(),
@@ -73,6 +76,7 @@ async fn seed_wide_branch(p: &mut Pages, child_count: usize) {
         .map(|index| format!("leaf-{index:04}"))
         .collect();
     p.store_block(&Block {
+        author: Party::System,
         id: "outer".into(),
         parent: None,
         page: "outer".into(),
@@ -84,6 +88,7 @@ async fn seed_wide_branch(p: &mut Pages, child_count: usize) {
     })
     .unwrap();
     p.store_block(&Block {
+        author: Party::System,
         id: "branch".into(),
         parent: Some("outer".into()),
         page: "outer".into(),
@@ -96,6 +101,7 @@ async fn seed_wide_branch(p: &mut Pages, child_count: usize) {
     .unwrap();
     for id in children {
         p.store_block(&Block {
+            author: Party::System,
             id,
             parent: Some("branch".into()),
             page: "outer".into(),
@@ -743,6 +749,7 @@ fn deepening_a_wide_subtree_rejects_before_the_wasm_read_ceiling() {
             .map(|index| format!("leaf-{index}"))
             .collect();
         p.store_block(&Block {
+            author: Party::System,
             id: "root".into(),
             parent: None,
             page: "root".into(),
@@ -754,6 +761,7 @@ fn deepening_a_wide_subtree_rejects_before_the_wasm_read_ceiling() {
         })
         .unwrap();
         p.store_block(&Block {
+            author: Party::System,
             id: "branch".into(),
             parent: Some("root".into()),
             page: "root".into(),
@@ -765,6 +773,7 @@ fn deepening_a_wide_subtree_rejects_before_the_wasm_read_ceiling() {
         })
         .unwrap();
         p.store_block(&Block {
+            author: Party::System,
             id: "target".into(),
             parent: Some("root".into()),
             page: "root".into(),
@@ -777,6 +786,7 @@ fn deepening_a_wide_subtree_rejects_before_the_wasm_read_ceiling() {
         .unwrap();
         for id in children {
             p.store_block(&Block {
+                author: Party::System,
                 id,
                 parent: Some("branch".into()),
                 page: "root".into(),
@@ -814,7 +824,10 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(boundary_parent.clone()),
                     after: None,
                 },
-                &Origin::System,
+                &Authority {
+                    actor: Party::System,
+                    origin: sdk::Origin::System,
+                },
                 0,
             )
             .await
@@ -833,7 +846,10 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(over_parent.clone()),
                     after: None,
                 },
-                &Origin::System,
+                &Authority {
+                    actor: Party::System,
+                    origin: sdk::Origin::System,
+                },
                 0,
             )
             .await
@@ -869,7 +885,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                     target: "branch".into(),
                     text: "counts staged comment deletes".into(),
                     mentions: Vec::new(),
-                    as_agent: None,
+
                     anchor: None,
                 },
                 user("alice"),
@@ -881,7 +897,10 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Origin::System,
+                &Authority {
+                    actor: Party::System,
+                    origin: sdk::Origin::System,
+                },
                 0,
             )
             .await
@@ -908,7 +927,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                     target: "branch".into(),
                     text: "one staged delete beyond the work budget".into(),
                     mentions: Vec::new(),
-                    as_agent: None,
+
                     anchor: None,
                 },
                 user("alice"),
@@ -920,7 +939,10 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Origin::System,
+                &Authority {
+                    actor: Party::System,
+                    origin: sdk::Origin::System,
+                },
                 0,
             )
             .await
@@ -965,7 +987,6 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
                 text: "grief".into(),
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: None,
             },
             user("mallory"),
         )
@@ -980,7 +1001,6 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
                     text: "grief".into(),
                     anchor: None,
                     mentions: Vec::new(),
-                    as_agent: None,
                 },
                 user("mallory"),
             )
@@ -996,9 +1016,11 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
                     text: "grief".into(),
                     anchor: None,
                     mentions: Vec::new(),
-                    as_agent: None,
                 },
-                &user("mallory"),
+                &Authority {
+                    actor: Party::Key(b"mallory".to_vec()),
+                    origin: sdk::Origin::External(b"mallory".to_vec()),
+                },
                 0,
             )
             .await
@@ -1010,7 +1032,10 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
             PageMsg::RemoveBlock {
                 block_id: "branch".into(),
             },
-            &Origin::System,
+            &Authority {
+                actor: Party::System,
+                origin: sdk::Origin::System,
+            },
             0,
         )
         .await
@@ -1138,5 +1163,65 @@ fn remove_deletes_the_whole_subtree() {
         )
         .await;
         assert!(get_page(&p, "p1").await.is_none());
+    });
+}
+
+#[test]
+fn deletion_batches_budget_the_removed_distinct_authors_and_mentions() {
+    deterministic::Runner::default().start(|_context| async move {
+        let mut p = Pages::new("pages", Box::new(sdk_testkit::MemStore::new()))
+            .with_attribution("attribution");
+        const CHILDREN: usize = 1_500;
+        seed_wide_branch(&mut p, CHILDREN).await;
+        for index in 0..CHILDREN {
+            let id = format!("leaf-{index:04}");
+            let mut block = p.load_block(&id).await.unwrap().unwrap();
+            block.author = Party::Account(index as u64 + 1);
+            block.text = "tag".into();
+            block.marks = vec![SpanMark {
+                start: 0,
+                end: 3,
+                kind: InlineMark::Mention(CHILDREN as u64 + index as u64 + 1),
+            }];
+            p.store_block(&block).unwrap();
+        }
+        // Deliberately leave the last author/mention edits staged: publication
+        // must use the incoming overlay, including earlier ops in this block.
+        let mut ctx = ctx_as(sdk::Origin::System);
+        p.execute(
+            &mut ctx,
+            &msg(&PageMsg::RemoveBlock {
+                block_id: "branch".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(ctx.msgs().len() > 1);
+        let mut retired = BTreeSet::new();
+        for report in ctx.msgs() {
+            let attribution::AttributionMsg::AttributeBatch { updates } =
+                attribution::decode_msg(&report.payload).unwrap()
+            else {
+                panic!("batch")
+            };
+            let mut recipients = BTreeSet::new();
+            for update in &updates {
+                assert_eq!(update.object.kind, "block");
+                if let Some(index) = update.object.object.strip_prefix("leaf-") {
+                    let number = index.parse::<u64>().unwrap() + 1;
+                    recipients.extend([number, CHILDREN as u64 + number]);
+                    assert!(update.relations.is_empty());
+                    assert!(retired.insert(update.object.object.clone()));
+                }
+            }
+            assert!(
+                updates.len() + recipients.len() <= 128,
+                "removed recipients count toward publication's store reads"
+            );
+        }
+        assert_eq!(retired.len(), CHILDREN);
+        assert!(p.load_block("branch").await.unwrap().is_none());
+        p.commit_block().await.unwrap();
+        assert!(p.load_block("leaf-0000").await.unwrap().is_none());
     });
 }

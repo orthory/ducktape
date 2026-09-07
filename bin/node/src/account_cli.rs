@@ -867,7 +867,7 @@ fn query_identity(
 fn account_reply(reply: IdentityReply) -> Result<Option<AccountView>, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Account(account) => Ok(account),
-        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }
@@ -876,7 +876,7 @@ fn account_reply(reply: IdentityReply) -> Result<Option<AccountView>, Box<dyn st
 fn accounts_reply(reply: IdentityReply) -> Result<Vec<AccountView>, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Accounts(accounts) => Ok(accounts),
-        IdentityReply::Account(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Account(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }
@@ -885,7 +885,7 @@ fn accounts_reply(reply: IdentityReply) -> Result<Vec<AccountView>, Box<dyn std:
 fn gen_reply(reply: IdentityReply) -> Result<u64, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Gen(generation) => Ok(generation),
-        IdentityReply::Account(_) | IdentityReply::Accounts(_) => {
+        IdentityReply::Account(_) | IdentityReply::Accounts(_) | IdentityReply::Resolved(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }
@@ -1260,6 +1260,7 @@ mod tests {
         let device_key = device.public_key().as_ref().to_vec();
         let mine = passkey(3);
         let account = AccountView {
+            control: identity::Control::Keys,
             number: 11,
             name: "alice".into(),
             keys: vec![identity::KeyView {
@@ -1441,6 +1442,7 @@ mod tests {
     #[test]
     fn authority_name_refusal_lists_current_holders_and_never_picks_one() {
         let account = |number: u64, name: &str| AccountView {
+            control: identity::Control::Keys,
             number,
             name: name.into(),
             keys: Vec::new(),

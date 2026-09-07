@@ -13,7 +13,8 @@
 //! | reflexive discovery             | `reflexive_discovery`                     |
 //! | hole-punch success              | `hole_punch_success_with_idle_passive_side` |
 //! | hole-punch failure is terminal  | `hole_punch_failure_is_terminal`          |
-//! | endpoint-churn re-advertisement | `endpoint_churn_readvertise_reconnect`    |
+//! | live mapping resists endpoint churn | `endpoint_churn_preserves_live_mapping` |
+//! | expired mapping accepts fresh source | `expired_mapping_accepts_authenticated_rebind` |
 //! | multiple coordinators           | `multi_coordinator_failover`              |
 //! | keepalive / coordinator death   | `punched_path_survives_coordinator_death` |
 //!
@@ -26,7 +27,8 @@ use std::time::Duration;
 
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{
-    AuthPolicy, NatClient, NatSocket, NodeKey, SimHandle, SimNat, SimNetwork, run_coordinator,
+    AuthPolicy, AuthRequest, Coordinator, Msg, NatClient, NatSocket, NodeKey, SimHandle, SimNat,
+    SimNetwork, run_coordinator, run_coordinator_with, sign_authenticator,
 };
 use reachability::{
     EndpointResolver as _, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus, Resolution,
@@ -222,11 +224,17 @@ async fn hole_punch_failure_is_terminal() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn endpoint_churn_readvertise_reconnect() {
+async fn endpoint_churn_preserves_live_mapping() {
     let net = SimNetwork::new();
-    let (coord, _task) = spawn_coordinator(&net);
-    // A's keepalive is short so its re-advertisement lands well inside B's
-    // punch-retry budget once the NAT churns.
+    let coord: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+    let coordinator = Coordinator::with_policy(AuthPolicy::Public);
+    let adverts = coordinator.adverts();
+    let _task = tokio::spawn(run_coordinator_with(
+        NatSocket::Simulated(net.public(coord)),
+        coordinator,
+    ));
+    // A's short keepalive exercises repeated changed-source adverts inside
+    // B's punch-retry budget. They cannot replace a still-live registration.
     let a = node(
         &net,
         6,
@@ -254,21 +262,181 @@ async fn endpoint_churn_readvertise_reconnect() {
     let old_endpoint = punched(first);
     assert_eq!(old_endpoint, a_reflexive);
 
-    // A's NAT rebinds: the stale mapping admits nobody. The keepalive
-    // re-advertises A's fresh mapping under a higher nonce, superseding the
-    // stale registration, and B's re-resolution punches the NEW mapping.
+    // A's NAT rebinds: the old mapping admits nobody. A higher nonce alone
+    // cannot distinguish this from a captured advert replayed from another
+    // source, so the coordinator preserves the live registration.
     a.nat.rebind();
-    let second = b
+    let error = b
         .resolver
         .resolve(a.key, ADVERTISED.parse().unwrap())
         .await
-        .expect("reconnect after the rebind rides the re-advertised mapping");
-    let new_endpoint = punched(second);
-    assert_ne!(
-        new_endpoint, old_endpoint,
-        "B reconnected against the superseding reflexive, not the stale one"
+        .expect_err("a changed source cannot replace a live mapping");
+    assert_eq!(error, "hole-punch failed after 3 tries");
+    assert_eq!(
+        adverts.current(a.key, nat_traversal::now_secs()),
+        Some(old_endpoint),
+        "changed-source keepalives cannot move or extend the live registration"
     );
-    assert_eq!(new_endpoint.ip(), ip(1));
+}
+
+/// Drive the production authenticated handler at explicit wall-clock times.
+/// Tokio's paused clock does not advance the coordinator's registration TTL.
+#[test]
+fn expired_mapping_accepts_authenticated_rebind() {
+    fn request(
+        coordinator: &mut Coordinator,
+        signer: &ed25519::PrivateKey,
+        from: SocketAddr,
+        inner: Msg,
+        now: u64,
+    ) -> Vec<(SocketAddr, Msg)> {
+        let mut key = [0; 32];
+        key.copy_from_slice(signer.public_key().as_ref());
+        let auth = sign_authenticator(signer, &inner.encode(), now, None);
+        let encoded = AuthRequest {
+            caller: NodeKey(key),
+            inner,
+            auth,
+        }
+        .encode();
+        let request = AuthRequest::decode(&encoded).expect("signed request wire round-trip");
+        coordinator.handle_auth(from, request, now)
+    }
+
+    let (a, a_signer) = identity(6);
+    let (b, b_signer) = identity(7);
+    let old = SocketAddr::new(ip(1), 40001);
+    let new = SocketAddr::new(ip(1), 40002);
+    let peer = SocketAddr::new(ip(2), 40003);
+    let mut coordinator = Coordinator::with_policy(AuthPolicy::Public);
+    let start = 1_000;
+    let bound = request(
+        &mut coordinator,
+        &a_signer,
+        old,
+        Msg::BindRequest { from: a },
+        start,
+    );
+    let [(_, Msg::BindResponse { cookie, .. })] = bound.as_slice() else {
+        panic!("authenticated bind must issue the source's return-routability cookie");
+    };
+    request(
+        &mut coordinator,
+        &a_signer,
+        old,
+        Msg::Register {
+            key: a,
+            cookie: *cookie,
+        },
+        start,
+    );
+    assert_eq!(coordinator.adverts().current(a, start), Some(old));
+
+    let live = start + nat_traversal::REGISTRATION_TTL_SECS;
+    let bound = request(
+        &mut coordinator,
+        &a_signer,
+        new,
+        Msg::BindRequest { from: a },
+        live,
+    );
+    let [(_, Msg::BindResponse { cookie, .. })] = bound.as_slice() else {
+        panic!("a fresh source must obtain its own cookie");
+    };
+    request(
+        &mut coordinator,
+        &a_signer,
+        new,
+        Msg::Readvertise {
+            key: a,
+            nonce: 1,
+            cookie: *cookie,
+        },
+        live,
+    );
+    assert_eq!(coordinator.adverts().current(a, live), Some(old));
+
+    let expired = live + 1;
+    assert_eq!(
+        coordinator.adverts().current(a, expired),
+        None,
+        "refused changed-source adverts must not prolong the old registration"
+    );
+    request(
+        &mut coordinator,
+        &a_signer,
+        new,
+        Msg::Readvertise {
+            key: a,
+            nonce: 2,
+            cookie: [0; 32],
+        },
+        expired,
+    );
+    assert_eq!(
+        coordinator.adverts().current(a, expired),
+        None,
+        "even an expired registration needs the new source's cookie"
+    );
+    request(
+        &mut coordinator,
+        &a_signer,
+        new,
+        Msg::Readvertise {
+            key: a,
+            nonce: 2,
+            cookie: *cookie,
+        },
+        expired,
+    );
+    assert_eq!(coordinator.adverts().current(a, expired), Some(new));
+
+    let bound = request(
+        &mut coordinator,
+        &b_signer,
+        peer,
+        Msg::BindRequest { from: b },
+        expired,
+    );
+    let [(_, Msg::BindResponse { cookie, .. })] = bound.as_slice() else {
+        panic!("the lookup caller must prove its source too");
+    };
+    request(
+        &mut coordinator,
+        &b_signer,
+        peer,
+        Msg::Register {
+            key: b,
+            cookie: *cookie,
+        },
+        expired,
+    );
+    let lookup = request(
+        &mut coordinator,
+        &b_signer,
+        peer,
+        Msg::Lookup { key: a },
+        expired,
+    );
+    assert!(lookup.contains(&(
+        peer,
+        Msg::LookupResponse {
+            key: a,
+            reflexive: Some(new)
+        }
+    )));
+    assert!(
+        lookup
+            .iter()
+            .any(|(destination, msg)| *destination == new && matches!(msg, Msg::PunchSync { .. })),
+        "fresh lookup fans the hole punch toward the rebound source"
+    );
+    assert!(lookup.iter().all(|(destination, _)| *destination != old));
+    assert_eq!(
+        coordinator.rejects(),
+        0,
+        "all requests passed real signature verification"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -32,6 +32,12 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: 1_000 + height,
         origin,
         me: TASKS.into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
     })
 }
 
@@ -83,6 +89,8 @@ fn synced_store_reconstructs_source_root_and_every_read() {
     deterministic::Runner::default().start(|context| async move {
         let mut src = Tasks::new(
             TASKS,
+            "identity",
+            "attribution",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
         );
 
@@ -199,7 +207,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = Tasks::new(TASKS, Box::new(store));
+        let mut synced = Tasks::new(TASKS, "identity", "attribution", Box::new(store));
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -223,5 +231,34 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             JobStatus::Processing
         );
         assert_eq!(job(&synced, "temp").await, None, "the pruned job is gone");
+        let mut write_ctx = ctx(9, ext("alice"));
+        synced
+            .execute(
+                &mut write_ctx,
+                &Msg {
+                    target: TASKS.into(),
+                    payload: encode_job_msg(&JobsMsg::Submit {
+                        job_id: "temp".into(),
+                        kind: "again".into(),
+                        spec: "".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let report = write_ctx
+            .msgs()
+            .iter()
+            .find(|message| message.target == "attribution")
+            .unwrap();
+        let attribution::AttributionMsg::Attribute { revision, .. } =
+            attribution::decode_msg(&report.payload).unwrap()
+        else {
+            panic!("report");
+        };
+        assert_eq!(
+            revision, 4,
+            "the deleted object's revision survived state sync"
+        );
     });
 }

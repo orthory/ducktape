@@ -873,7 +873,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "bfb5ae082fce4634276f8e06ff3dbb2a68c62064d72a930013c2721978bbaa6f";
+        "08cc4692bab9013066eb588f8594741611cca0251f071b7860473270a2dff58c";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -988,6 +988,7 @@ mod tests {
                 consensus_time: 0,
                 origin,
                 me: "modules".into(),
+                cause: sdk::Cause::Direct,
             })
             .on_query("valset", one_member.clone())
         };
@@ -1066,6 +1067,7 @@ mod tests {
             consensus_time: 0,
             origin: sdk::Origin::System,
             me: "modules".into(),
+            cause: sdk::Cause::Direct,
         });
         let reply = futures::executor::block_on(registry.query_with(&ctx, &req)).expect("status");
         let Ok(modules::ModulesReply::ModuleStatus { modules: roster }) =

@@ -100,7 +100,10 @@ fn anyone_admits_even_when_the_caller_cannot_be_resolved() {
         WorkCaller::PeerNode,
         caller(STRANGER),
     ] {
-        assert_eq!(verdict(&WorkAdmission::Anyone, &caller), WorkVerdict::Admitted);
+        assert_eq!(
+            verdict(&WorkAdmission::Anyone, &caller),
+            WorkVerdict::Admitted
+        );
     }
 }
 
@@ -189,6 +192,7 @@ impl CommittedReader for KeyTable {
 
 fn account_view(number: u64) -> identity::AccountView {
     identity::AccountView {
+        control: identity::Control::Keys,
         number,
         name: "someone".into(),
         keys: Vec::new(),
@@ -356,7 +360,10 @@ fn the_policy_round_trips_and_the_default_leaves_no_file() {
     save(&dir, &policy).expect("save");
     assert_eq!(load(&dir).expect("load"), policy);
     let text = std::fs::read_to_string(policy_path(&dir)).expect("read");
-    assert!(text.contains("\"2\""), "entries are decimal numbers: {text}");
+    assert!(
+        text.contains("\"2\""),
+        "entries are decimal numbers: {text}"
+    );
 
     save(&dir, &WorkAdmission::Anyone).expect("save anyone");
     assert_eq!(load(&dir).expect("load anyone"), WorkAdmission::Anyone);

@@ -54,6 +54,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: height,
         origin,
         me: SAGA.into(),
+        cause: sdk::Cause::Direct,
     })
     .with_module_root("agent", StateRoot::ZERO)
     .on_query("valset", validators_query)

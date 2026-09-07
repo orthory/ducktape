@@ -578,8 +578,8 @@ fn case12_watch_fan_out_emits_notification() {
     .expect("commit");
     commit_block(&mut f);
     let head = f.committed_head_for_test().expect("head");
-    assert_eq!(ctx.msgs().len(), 1, "exactly one watch hit");
-    let msg = &ctx.msgs()[0];
+    assert_eq!(watch_msgs(&ctx).len(), 1, "exactly one watch hit");
+    let msg = &watch_msgs(&ctx)[0];
     assert_eq!(
         msg.target, "indexer",
         "notification targets the watching module"
@@ -607,7 +607,7 @@ fn case12_watch_outside_prefix_does_not_notify() {
     .expect("commit");
     commit_block(&mut f);
     assert!(
-        ctx.msgs().is_empty(),
+        watch_msgs(&ctx).is_empty(),
         "a path outside the prefix emits nothing"
     );
 }

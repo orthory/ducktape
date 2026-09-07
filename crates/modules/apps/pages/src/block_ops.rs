@@ -1,6 +1,6 @@
 use super::{
-    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, Origin, PageError, PageMsg, Pages,
-    author_from_origin, id_is_index_safe, to_page_err,
+    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, PageError, PageMsg, Pages,
+    id_is_index_safe, to_page_err,
 };
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
@@ -22,9 +22,8 @@ impl Pages {
     pub(super) async fn apply_block_op(
         &mut self,
         msg: PageMsg,
-        origin: &Origin,
+        authority: &super::Authority,
     ) -> Result<(), PageError> {
-        let actor = author_from_origin(origin)?;
         match msg {
             PageMsg::InsertBlock {
                 parent,
@@ -49,7 +48,7 @@ impl Pages {
                 let mut parent_blk = self
                     .require_block(&parent, PageError::ParentNotFound)
                     .await?;
-                if !self.may_edit(&parent_blk.page, &actor).await? {
+                if !self.may_edit(&parent_blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 let i = idx_after(&parent_blk.children, &after)?;
@@ -67,11 +66,9 @@ impl Pages {
                 if creates_page {
                     self.index_add(&block.id, Some(parent_blk.page.clone()))
                         .await?;
-                    // a nested subpage records ITS OWN author — the inserting
-                    // actor — same as a top-level `CreatePage`.
-                    self.store_page_author(&block.id, &actor)?;
                 }
                 self.store_block(&Block {
+                    author: authority.actor.clone(),
                     id: block.id,
                     parent: Some(parent_blk.id.clone()),
                     page,
@@ -93,7 +90,7 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 // Validate the client-supplied atomic replacement before
@@ -124,7 +121,7 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 set_span_mark(&mut blk.marks, &blk.text, start, end, kind, active)?;
@@ -140,7 +137,7 @@ impl Pages {
                 if blk.kind == BlockKind::Page {
                     return Err(PageError::PageKindImmutable);
                 }
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 blk.kind = kind;
@@ -153,7 +150,7 @@ impl Pages {
                 if blk.kind != BlockKind::Todo {
                     return Err(PageError::NotTodo);
                 }
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 blk.checked = checked;
@@ -173,7 +170,7 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 let moves_page = blk.kind == BlockKind::Page;
@@ -214,7 +211,7 @@ impl Pages {
                         // (its children list), so a page block moving under a
                         // different page needs that page's authority too —
                         // same-page moves recheck the source's own page.
-                        if !self.may_edit(&new_parent.page, &actor).await? {
+                        if !self.may_edit(&new_parent.page, authority).await? {
                             return Err(PageError::NotPageAuthor);
                         }
                         let new_parent_depth = if moves_page {
@@ -281,7 +278,7 @@ impl Pages {
                 let blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
-                if !self.may_edit(&blk.page, &actor).await? {
+                if !self.may_edit(&blk.page, authority).await? {
                     return Err(PageError::NotPageAuthor);
                 }
                 let invalid_top_level = blk.parent.is_none() && blk.kind != BlockKind::Page;
@@ -295,7 +292,7 @@ impl Pages {
                     // page than the subpage itself; removing it also
                     // mutates that page's children list, so it needs that
                     // page's authority too.
-                    if parent.page != blk.page && !self.may_edit(&parent.page, &actor).await? {
+                    if parent.page != blk.page && !self.may_edit(&parent.page, authority).await? {
                         return Err(PageError::NotPageAuthor);
                     }
                     let position = parent

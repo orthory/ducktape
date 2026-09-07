@@ -542,7 +542,7 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         app.active_channel_members_only = members_only;
         // Empty roster: she is not seated, which is what `members_only` refuses.
         app.channel_members = Vec::new();
-        app.settings_user_key = "me".into();
+        app.settings_user_key = "ab".repeat(32);
         // The gate the composers re-ask is the MIRROR every handler that moves
         // one of those four inputs writes — so the fixture writes it the same
         // way, through `post_gate` itself, and the two reasons are still real.
@@ -592,10 +592,10 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     app.active_channel = "general".into();
     app.active_channel_members_only = true;
     app.channel_members = vec![backend::ChatMember {
-        key: "me".into(),
+        key: "ab".repeat(32),
         label: "me".into(),
     }];
-    app.settings_user_key = "me".into();
+    app.settings_user_key = "ab".repeat(32);
     app.post_refusal = backend::post_gate(
         false,
         true,

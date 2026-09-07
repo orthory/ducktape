@@ -19,7 +19,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use sdk::{Ctx, Env, Error, Event, MerkleStore, Msg, Origin, ResolverSyncTarget, StateRoot, ROOT_LEN};
+use sdk::{
+    Cause, Ctx, Env, Error, Event, MerkleStore, Msg, Origin, ROOT_LEN, ResolverSyncTarget,
+    StateRoot,
+};
 use sha2::{Digest as _, Sha256};
 
 /// one registered sibling-query responder; sees the query payload bytes.
@@ -41,6 +44,7 @@ pub struct TestCtx {
     msgs: Vec<Msg>,
     events: Vec<Event>,
     output: Option<Vec<u8>>,
+    assigned: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TestCtx {
@@ -54,20 +58,22 @@ impl std::fmt::Debug for TestCtx {
             .field("msgs", &self.msgs)
             .field("events", &self.events)
             .field("output", &self.output)
+            .field("assigned", &self.assigned)
             .finish()
     }
 }
 
 impl TestCtx {
     /// a ctx at block `height`, `consensus_time == height` (the convention),
-    /// `origin = System`. Tests needing a specific `origin`/`me` use
-    /// [`TestCtx::with_env`].
+    /// `origin = System`, `cause = Direct`. Tests needing a specific
+    /// `origin`/`me`/`cause` use [`TestCtx::with_env`].
     pub fn at_height(height: u64) -> Self {
         Self::with_env(Env {
             height,
             consensus_time: height,
             origin: Origin::System,
             me: "test".into(),
+            cause: Cause::Direct,
         })
     }
 
@@ -80,6 +86,7 @@ impl TestCtx {
             msgs: Vec::new(),
             events: Vec::new(),
             output: None,
+            assigned: None,
         }
     }
 
@@ -121,6 +128,11 @@ impl TestCtx {
     pub fn output(&self) -> Option<&[u8]> {
         self.output.as_deref()
     }
+
+    /// the last stamp declared via [`Ctx::set_assigned`], if any.
+    pub fn assigned(&self) -> Option<&[u8]> {
+        self.assigned.as_deref()
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -150,6 +162,10 @@ impl Ctx for TestCtx {
 
     fn set_output(&mut self, bytes: Vec<u8>) {
         self.output = Some(bytes);
+    }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        self.assigned = Some(bytes);
     }
 }
 
@@ -207,7 +223,8 @@ impl MerkleStore for MemStore {
 
     async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
         Err(Error::Module(
-            "MerkleStore::serve_sync is unsupported on MemStore — a test double has no sync wire".into(),
+            "MerkleStore::serve_sync is unsupported on MemStore — a test double has no sync wire"
+                .into(),
         ))
     }
 }
@@ -217,6 +234,29 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use sdk::{Ctx, Module, Msg, StateRoot};
+
+    #[test]
+    fn operation_rollback_preserves_prior_staged_writes_and_deletes() {
+        let mut store = sdk::StagedStore::new(Box::new(MemStore::new()));
+        store.stage(b"keep".to_vec(), b"committed".to_vec());
+        store.stage(b"remove".to_vec(), b"committed".to_vec());
+        block_on(store.commit()).unwrap();
+        store.stage(b"keep".to_vec(), b"earlier".to_vec());
+        store.delete(b"remove".to_vec());
+        let before = store.checkpoint();
+        store.delete(b"keep".to_vec());
+        store.stage(b"remove".to_vec(), b"rejected".to_vec());
+        store.stage(b"new".to_vec(), b"rejected".to_vec());
+        store.restore(before.clone());
+        assert_eq!(store.staged_writes(), &before);
+        block_on(store.commit()).unwrap();
+        assert_eq!(
+            block_on(store.get(b"keep")).unwrap(),
+            Some(b"earlier".to_vec())
+        );
+        assert_eq!(block_on(store.get(b"remove")).unwrap(), None);
+        assert_eq!(block_on(store.get(b"new")).unwrap(), None);
+    }
 
     /// a toy module that reads a sibling and echoes the reply back as an
     /// emitted msg — enough to prove `TestCtx::on_query` serves a real sibling
@@ -340,6 +380,10 @@ mod tests {
         }
         let old_root = StateRoot(old_h.finalize().into());
 
-        assert_eq!(store.root(), old_root, "shared helper must reproduce the old root");
+        assert_eq!(
+            store.root(),
+            old_root,
+            "shared helper must reproduce the old root"
+        );
     }
 }

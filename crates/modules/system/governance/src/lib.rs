@@ -556,7 +556,7 @@ impl Governance {
             .await?;
         match identity_decode_reply(&reply).map_err(Error::Module)? {
             IdentityReply::Account(account) => Ok(account),
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 Err(Error::Module("unexpected identity reply".into()))
             }
         }

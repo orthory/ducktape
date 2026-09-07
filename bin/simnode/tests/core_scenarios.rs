@@ -90,12 +90,10 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 
     // the LOGICAL clock is the lease clock: walk it with filler blocks to the
     // last in-lease height. a reclaim executing AT the deadline still fails…
-    // each tick delivers to the "filler" origin's OWN queue: inbox refuses an
-    // external `Deliver` anywhere else.
-    for i in 0..8 {
+    for _ in 0..8 {
         sim.submit_ok(
-            "inbox",
-            serde_json::json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": format!("{i}") } }),
+            "dispatch",
+            serde_json::json!({ "nudge": {} }),
             Some("filler"),
         );
     } // heights 4..=11 — the next op executes at 12 == deadline
@@ -107,8 +105,8 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 
     // …and one block later the permissionless reclaim requeues the job.
     sim.submit_ok(
-        "inbox",
-        serde_json::json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": "last" } }),
+        "dispatch",
+        serde_json::json!({ "nudge": {} }),
         Some("filler"),
     ); // height 13
     sim.submit_ok("tasks", reclaim, Some("scavenger")); // height 14 > deadline
@@ -128,17 +126,18 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let operator = harness::found_account(&sim, "operator", 40);
     // the operator creates — and therefore OWNS — the channel: registering a
     // hook is channel-admin authority, so the owner is who may wire one up.
     sim.submit_ok(
         "chat",
         create_channel("general", "General"),
-        Some("operator"),
+        Some(&operator),
     );
     sim.submit_ok(
         "chat",
         serde_json::json!({ "register_hook": { "channel_id": "general", "module_id": "automations" } }),
-        Some("operator"),
+        Some(&operator),
     );
     sim.submit_ok(
         "automations",
@@ -147,39 +146,50 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
             "trigger": { "channel_id": "general", "mention": null, "text_contains": "deploy" },
             "action": { "create_task": { "task_id_prefix": "auto", "title_template": "deploy requested" } },
         }}),
-        Some("operator"),
+        Some(&operator),
     );
 
     // a non-matching post fires nothing.
     sim.submit_ok("chat", post_message("general", "m-1", "hello world"), None);
-    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
+    let tasks = sim.query(
+        "tasks",
+        serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+    );
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
         "non-matching post must not fire: {tasks}"
     );
 
-    // the matching post and its task commit as ONE atomic block: the receipt
-    // height IS the chain tip afterwards — no follow-up block exists.
+    // The matching post and its task commit together. Attribution subscribers
+    // may consume their changes in later blocks before auto mode settles.
     let receipt = sim.submit_ok(
         "chat",
         post_message("general", "m-2", "please deploy now"),
         None,
     );
     let fired_at = receipt["height"].as_u64().expect("receipt height");
-    assert_eq!(
-        sim.status()["height"].as_u64(),
-        Some(fired_at),
-        "the rule's effect rides the triggering block"
-    );
 
     // the task id is deterministic per (prefix, channel, seq) — m-2 is seq 2.
-    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
+    let tasks = sim.query(
+        "tasks",
+        serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+    );
     assert_eq!(
         tasks["task"]["tasks"][0]["id"], "auto-general-2",
         "tasks: {tasks}"
     );
     assert_eq!(tasks["task"]["tasks"][0]["title"], "deploy requested");
+    let messages = sim.query(
+        "chat",
+        serde_json::json!({"messages_range": {
+            "channel_id": "general", "from_seq": 2, "limit": 1
+        }}),
+    );
+    assert_eq!(
+        tasks["task"]["tasks"][0]["created_at"], messages["messages"][0]["head"]["created_at"],
+        "the task and triggering post share their block's consensus time"
+    );
 
     // the run history recorded exactly one fire.
     let history = sim.query(
@@ -191,43 +201,27 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
         Some(1),
         "history: {history}"
     );
+    assert_eq!(history["history"][0]["height"], fired_at);
 }
 
 #[test]
 fn a_hook_event_cannot_be_spoofed_from_outside_chat() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let mallory = harness::found_account(&sim, "mallory", 99);
 
     // routing is by the HOST-ASSIGNED origin: an external submitter claiming
     // the chat-hook payload never reaches the hook arm.
     let error = sim.submit_rejected(
         "automations",
         serde_json::json!({ "hook_event": [1, 2, 3] }),
-        Some("mallory"),
+        Some(&mallory),
     );
     assert!(
         error.contains("hook events must originate from the chat module"),
         "spoofed hook: {error}"
     );
 }
-
-// ── inbox: no scenario, and that is the current contract ─
-//
-// `inbox_seqs_never_rewind_and_maintenance_is_idempotent` lived here until the
-// read-model cutover made inbox WRITE-ONLY in canonical state: its member feeds
-// and unread counters moved into the index guest, so `/v1/query` answers
-// `QueryUnsupported` and the scenario had no surface left to read. It is gone
-// rather than re-pointed at the index tier, because folding through a derived
-// view would have tested the GUEST's mirroring, not the module's seq discipline.
-//
-// Nothing is uncovered. `crates/modules/apps/inbox/tests/inbox_module.rs` owns
-// every property it asserted and reads canonical state directly, so it can also
-// see `next_seq` — which this scenario could only ever infer:
-// `deliver_assigns_per_member_sequence` (per-member seqs) and
-// `mark_read_and_clear_are_idempotent_and_noop_tolerant` (watermark acks,
-// over-ack and unknown-member no-ops, and clear NOT rewinding next_seq).
-// `crates/kernel/host/tests/wasm_inbox_parity.rs` carries the same to the wasm
-// tenant. inbox writes still ride the sim e2e in `frame_and_batch.rs`.
 
 // ── identity → duckdns: origin-derived account authority ─
 

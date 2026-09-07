@@ -332,12 +332,39 @@ fn restart_recovers_staged_bytes_and_table() {
 #[test]
 fn staging_rejections_carry_the_files_prefix() {
     let mut f = files::Fs::new(files::MemStore::new(), files::Refs::default());
-    let err = f.putblob("ext:aa", 1, &[]).unwrap_err();
+    let err = f
+        .putblob(
+            &files::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            1,
+            &[],
+        )
+        .unwrap_err();
     assert!(err.starts_with("files: "), "empty chunk: {err}");
     let big = vec![0u8; CHUNK_SIZE as usize + 1];
-    let err = f.putblob("ext:aa", 1, &big).unwrap_err();
+    let err = f
+        .putblob(
+            &files::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            1,
+            &big,
+        )
+        .unwrap_err();
     assert!(err.starts_with("files: "), "oversized chunk: {err}");
     f.set_staging_quota_for_tests(4);
-    let err = f.putblob("ext:aa", 1, b"hello").unwrap_err();
+    let err = f
+        .putblob(
+            &files::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            1,
+            b"hello",
+        )
+        .unwrap_err();
     assert!(err.starts_with("files: "), "quota breach: {err}");
 }

@@ -334,7 +334,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
         {
             use node::BlockSink as _;
             node.sink_mut()
-                .pre_apply(sealed_height + 1, &frame)
+                .pre_apply(sealed_height + 1, &frame, &host::PreparedWork::default())
                 .await
                 .expect("wal record");
         }
@@ -521,7 +521,10 @@ fn range_read_refuses_below_the_retained_floor() {
             .expect("open pruned-shape recovery");
         let signer = sk(9);
         let frame = node::encode_batch(&[node::encode_frame(&signer, 9, &set("k9", "v9"))]);
-        pruned.pre_apply(2, &frame).await.expect("wal record");
+        pruned
+            .pre_apply(2, &frame, &host::PreparedWork::default())
+            .await
+            .expect("wal record");
         pruned
             .seal(&node::BlockSeal {
                 height: 2,

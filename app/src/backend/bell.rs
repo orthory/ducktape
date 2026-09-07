@@ -6,46 +6,42 @@ pub struct BellData {
     pub items: Vec<BellItem>,
 }
 
-/// Load the bell: this member's notification page (newest first) + unread
-/// count from the inbox views. A device without a user key has no inbox.
+/// Load the current account's attribution notifications and unread count.
 pub async fn load_bell(rpc: String) -> Result<BellData, AppError> {
     async {
-        let Some(member) = local_member().await else {
+        let rpc = rpc_client(&rpc)?;
+        let Some(account) = local_account(&rpc).await? else {
             return Ok(BellData {
                 unread: 0,
                 items: Vec::new(),
             });
         };
-        let rpc = rpc_client(&rpc)?;
-        let listed: serde_json::Value = rpc
+        let listed: inbox::index::InboxViewReply = rpc
             .view(
                 "inbox",
-                &serde_json::json!({ "list": { "member": member, "from_seq": 0, "limit": 50 } }),
+                &inbox::index::InboxViewQuery::List {
+                    account,
+                    from_seq: 0,
+                    limit: Some(50),
+                },
             )
             .await?;
-        let unread: serde_json::Value = rpc
-            .view(
-                "inbox",
-                &serde_json::json!({ "unread": { "member": member } }),
-            )
+        let inbox::index::InboxViewReply::Items(rows) = listed else {
+            return Err("the inbox returned the wrong list reply".to_string());
+        };
+        let unread: inbox::index::InboxViewReply = rpc
+            .view("inbox", &inbox::index::InboxViewQuery::Unread { account })
             .await?;
-        let mut items: Vec<BellItem> = listed["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| BellItem {
-                seq: row["seq"].as_i64().unwrap_or(0),
-                kind: row["kind"].as_str().unwrap_or_default().to_string(),
-                body: row["body"].as_str().unwrap_or_default().to_string(),
-                source: row["source"].as_str().unwrap_or_default().to_string(),
-                height: row["height"].as_i64().unwrap_or(0),
-                read: row["read"].as_bool().unwrap_or(false),
-            })
+        let inbox::index::InboxViewReply::UnreadCount(unread) = unread else {
+            return Err("the inbox returned the wrong unread reply".to_string());
+        };
+        let items = rows
+            .iter()
+            .rev()
+            .map(inbox::client::bell_item_from_row)
             .collect();
-        items.reverse();
         Ok(BellData {
-            unread: unread["unread_count"].as_i64().unwrap_or(0),
+            unread: i64::try_from(unread).unwrap_or(i64::MAX),
             items,
         })
     }
@@ -63,15 +59,15 @@ pub async fn mark_bell_read(
         if up_to_seq <= 0 {
             return Ok(());
         }
-        let member = local_member()
-            .await
-            .ok_or_else(|| "no local user key".to_string())?;
-        let up_to_seq = u64::try_from(up_to_seq).unwrap_or(0);
         let rpc = rpc_client(&rpc)?;
+        let account = local_account(&rpc)
+            .await?
+            .ok_or_else(|| "this key is on no account".to_string())?;
+        let up_to_seq = u64::try_from(up_to_seq).unwrap_or(0);
         signed_write(
             &rpc,
             "inbox",
-            inbox::encode_msg(&inbox::InboxMsg::MarkRead { member, up_to_seq }),
+            inbox::encode_msg(&inbox::InboxMsg::MarkRead { account, up_to_seq }),
             password,
         )
         .await
@@ -97,18 +93,7 @@ pub fn bell_head(items: Vec<BellItem>) -> i64 {
     inbox::client::bell_head_seq(&items)
 }
 
-/// One notification's severity — `info` | `warn` | `error` — for the row dot,
-/// the INFO/WARN/ALERT chip and the badge tint.
-///
-/// THE WIRE CARRIES NO SEVERITY. `Notification` is seq/member/kind/body/source/
-/// created_at (crates/modules/apps/inbox/src/interface.rs; `read` is derived
-/// from the member's read watermark, not a per-item field), so this is a
-/// PROJECTION of the delivering module's `kind` token, not a field anything
-/// signed. A kind this mapping does not name reads `info`: an unclassified
-/// notice is a notice, never an alarm.
-/// The row's title: the wire `kind` token said as words. The vocabulary is
-/// open — any module mints tokens — so this is a rendering, not a registry:
-/// `review_requested` reads "Review requested".
+/// The relation reason as words, including source-defined reason names.
 pub fn bell_title(kind: &str) -> String {
     let words = kind.replace('_', " ");
     let mut chars = words.chars();
@@ -118,6 +103,8 @@ pub fn bell_title(kind: &str) -> String {
     }
 }
 
+/// Source-defined reason names may carry a severity; unclassified reasons
+/// stay informational. This does not infer severity from opaque source detail.
 pub fn bell_severity(kind: &str) -> String {
     const WARN: &[&str] = &[
         "review_requested",
@@ -142,13 +129,19 @@ pub fn bell_severity(kind: &str) -> String {
     }
 }
 
+/// The canonical change and its authenticated actor, shown below the reason.
+pub fn bell_detail(item: &BellItem) -> String {
+    let change = item.kind.replace('_', " ");
+    format!("{change} · {}", item.actor)
+}
+
 /// The worst severity among the UNREAD rows, for the bell badge's tint —
 /// `info` when nothing is unread.
 pub fn bell_worst_severity(items: &[BellItem]) -> String {
     let severities: Vec<String> = items
         .iter()
         .filter(|item| !item.read)
-        .map(|item| bell_severity(&item.kind))
+        .map(|item| bell_severity(&item.reason))
         .collect();
     let any_error = severities.iter().any(|severity| severity == "danger");
     let any_warning = severities.iter().any(|severity| severity == "warning");

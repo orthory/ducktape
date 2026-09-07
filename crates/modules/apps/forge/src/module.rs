@@ -333,6 +333,7 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
+    attribution_target: Option<String>,
     /// this network's chain id — the wasm tenant's genesis-config twin
     /// (`crate::guest`'s `shape().config`, #1773). empty for a native `Forge`
     /// that never carries a push certificate (every unit test but the
@@ -463,6 +464,7 @@ impl Forge {
                 staged_tracker: None,
             },
             chat_target: None,
+            attribution_target: None,
             chain_id: String::new(),
             snapshot_cache: std::cell::RefCell::new(None),
         };
@@ -479,8 +481,14 @@ impl Forge {
         self
     }
 
+    /// publish source relationships in the same unit as the accepted mutation.
+    pub fn with_attribution(mut self, target: impl Into<String>) -> Self {
+        self.attribution_target = Some(target.into());
+        self
+    }
+
     /// this network's chain id — the genesis-config parameter a push
-    /// certificate's nonce is checked against (`pushcert::signer`, #1773).
+    /// certificate's nonce is checked against (`pushcert::signer`).
     pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
         self.chain_id = chain_id.into();
         self
@@ -980,6 +988,7 @@ impl Module for Forge {
                 ctx,
                 &msg.payload,
                 self.chat_target.as_deref(),
+                self.attribution_target.as_deref(),
                 &self.chain_id,
             )
             .await
@@ -1204,6 +1213,7 @@ mod tests {
             consensus_time,
             origin,
             me: "forge".into(),
+            cause: sdk::Cause::Direct,
         })
     }
 
@@ -1751,6 +1761,7 @@ mod tests {
             Ok(identity::encode_reply(&IdentityReply::Account(Some(
                 identity::AccountView {
                     number,
+                    control: identity::Control::Keys,
                     name: "acct".into(),
                     keys: Vec::new(),
                     avatar: None,
@@ -2744,6 +2755,7 @@ mod tests {
             let account = members.contains(&key).then(|| identity::AccountView {
                 number,
                 name: "acct".into(),
+                control: identity::Control::Keys,
                 keys: Vec::new(),
                 avatar: None,
                 bio: None,
@@ -2753,17 +2765,15 @@ mod tests {
         }
     }
 
-    // #1866: a repo birthed by a key identity knows nothing about stores that
-    // RAW key, but the principal a push speaks for is re-derived per op — so
-    // registering that same key on an account used to lock its owner out, and
-    // revoking it used to hand ownership back. the stored owner FOLLOWS the
-    // key onto its account, one-way.
+    // A repository follows its original key onto the owning account. Once
+    // committed, that transition survives removal of the original key.
     #[test]
     fn ownership_follows_the_owning_key_onto_its_account() {
         let base = tmp_base("owner-settles");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let account = 3u64;
         let alice = vec![0xA1u8; 32];
+        let sibling = vec![0xB1u8; 32];
         let stranger = vec![0xEEu8; 32];
 
         // 1. an account-less key births the repo: owner = the raw key.
@@ -2784,8 +2794,10 @@ mod tests {
         // 2. `account key add --ssh` admits alice's key. her next push derives
         //    the ACCOUNT principal, and it is still her repo.
         let registered = |t: u64, key: &Vec<u8>| {
-            ctx_with_origin(t, sdk::Origin::External(key.clone()))
-                .on_query("identity", identity_knowing(account, vec![alice.clone()]))
+            ctx_with_origin(t, sdk::Origin::External(key.clone())).on_query(
+                "identity",
+                identity_knowing(account, vec![alice.clone(), sibling.clone()]),
+            )
         };
         push(
             &mut forge,
@@ -2798,7 +2810,7 @@ mod tests {
         .expect("registering the owning key does not lock its owner out");
         assert_eq!(
             forge.state.tracker.owner("demo"),
-            Some(identity::account_principal(account).as_slice()),
+            Some(&chat::Party::Account(account)),
             "the stored owner settled onto the account"
         );
 
@@ -2835,7 +2847,7 @@ mod tests {
         // 5. any key of the owning account moves main.
         push(
             &mut forge,
-            &mut registered(5, &alice),
+            &mut registered(5, &sibling),
             "demo",
             "main",
             Some(oid('b')),
@@ -3043,7 +3055,7 @@ mod tests {
         };
 
         // the pre-consensus probe and the system origin are refused; a MODULE
-        // is an authenticated principal and is not (see `author_from_origin`).
+        // is authenticated and is allowed as a tracker author.
         for origin in [sdk::Origin::External(Vec::new()), sdk::Origin::System] {
             let mut probe = ctx_with_origin(2, origin.clone());
             assert!(
@@ -3437,7 +3449,7 @@ mod tests {
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let mut tracker = Tracker::default();
         assert!(tracker.is_empty());
-        tracker.claim_owner("demo", vec![4u8; 32]);
+        tracker.claim_owner("demo", chat::Party::Key(vec![4u8; 32]));
         assert!(
             !tracker.is_empty(),
             "an owner alone makes the tracker non-empty"
@@ -3459,7 +3471,7 @@ mod tests {
         let reopened = Forge::init("forge", base.clone()).unwrap();
         assert_eq!(
             reopened.state.tracker.owner("demo"),
-            Some(user_key(1).as_slice()),
+            Some(&chat::Party::Key(user_key(1))),
             "the owner is re-adopted from the persisted tracker"
         );
         let _ = std::fs::remove_dir_all(&base);

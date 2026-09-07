@@ -1,24 +1,32 @@
+pub(super) enum ModelChange {
+    /// a new agent landed; the hook registers its recipe.
+    Registered {
+        agent_id: String,
+        capability: String,
+    },
+    /// an existing agent's capability changed; the hook retunes its recipe.
+    CapabilityChanged {
+        agent_id: String,
+        capability: String,
+    },
+    /// an agent left the registry; the hook retires its recipe.
+    Deregistered { agent_id: String },
+}
+
 use super::{
-    AgentEvent, Ctx, DispatchMsg, Error, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_LEASE_VIEWS,
-    RUN_MAX_ATTEMPTS, Routing, RunsModule, agent_decode_event, dispatch_encode_msg, recipe_id_for,
+    Ctx, DispatchMsg, Error, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_LEASE_VIEWS,
+    RUN_MAX_ATTEMPTS, Routing, RunsModule, dispatch_encode_msg, recipe_id_for,
 };
 
 impl RunsModule {
-    // ---- the registry hook (origin == agent) ------------------------------------
-
-    /// keep an agent's dispatch-plane recipe in lockstep with its registry
-    /// record. this intake rides the registry write's own block and — unlike
-    /// every other module intake — MAY error: an `Err` aborts that write,
-    /// which is exactly the atomicity the recipe seam needs (a squatted or
-    /// oversized recipe id must fail the registration, not land a record
-    /// without a recipe).
-    pub(super) fn on_agent_event(
+    /// Model configuration and the matching dispatch recipe share one unit.
+    pub(super) fn apply_model_change(
         &mut self,
         ctx: &mut dyn Ctx,
-        payload: &[u8],
+        event: ModelChange,
     ) -> Result<(), Error> {
-        match agent_decode_event(payload).map_err(Error::Module)? {
-            AgentEvent::Registered {
+        match event {
+            ModelChange::Registered {
                 agent_id,
                 capability,
             } => {
@@ -48,7 +56,7 @@ impl RunsModule {
                 });
                 Ok(())
             }
-            AgentEvent::CapabilityChanged {
+            ModelChange::CapabilityChanged {
                 agent_id,
                 capability,
             } => {
@@ -67,7 +75,7 @@ impl RunsModule {
                 });
                 Ok(())
             }
-            AgentEvent::Deregistered { agent_id } => {
+            ModelChange::Deregistered { agent_id } => {
                 // retire the recipe with the agent: dispatch's own
                 // `RemoveRecipe` already lets an in-flight dispatch finish
                 // against the manifest it captured, so no run-liveness check

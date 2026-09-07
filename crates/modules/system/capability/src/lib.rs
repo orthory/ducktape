@@ -650,6 +650,7 @@ mod tests {
             consensus_time: 0,
             origin,
             me: "capability".into(),
+            cause: sdk::Cause::Direct,
         })
         .on_query("valset", valset_reads(members, residents))
     }

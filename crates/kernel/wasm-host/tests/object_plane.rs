@@ -73,6 +73,7 @@ impl MockCtx {
                 consensus_time: 0,
                 origin: Origin::System,
                 me: me.into(),
+                cause: sdk::Cause::Direct,
             },
             msgs: Vec::new(),
             events: Vec::new(),

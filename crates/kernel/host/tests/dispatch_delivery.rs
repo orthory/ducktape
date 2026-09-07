@@ -15,8 +15,7 @@ use std::rc::Rc;
 use dispatch::DispatchModule;
 use dispatch::{
     DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, OutputContract, ResultEvent,
-    Routing, decode_result_event, encode_msg as dispatch_encode_msg,
-    encode_query as dispatch_encode_query,
+    Routing, encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
 use futures::executor::block_on;
 use host::{BlockContext, Host};
@@ -43,9 +42,12 @@ impl Module for Caller {
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         if matches!(&ctx.env().origin, Origin::Module(m) if m == "dispatch") {
-            if let Ok(event) = decode_result_event(&msg.payload) {
-                self.received.borrow_mut().push(event);
-            }
+            let dispatch::Delivery::Result(event) =
+                dispatch::decode_delivery(&msg.payload).map_err(Error::Module)?
+            else {
+                return Err(Error::Module("expected recipe result".into()));
+            };
+            self.received.borrow_mut().push(event);
             return Ok(());
         }
         if msg.payload == b"go" {
@@ -114,6 +116,7 @@ fn results_deliver_exactly_once_and_never_in_their_own_block() {
     host.register(Box::new(DispatchModule::new(
         "dispatch",
         "saga",
+        "identity",
         Box::new(MemStore::new()),
     )));
     host.register(Box::new(Caller {
@@ -202,7 +205,12 @@ fn results_deliver_exactly_once_and_never_in_their_own_block() {
         assert_eq!(events[0].outcome, Ok(br#"{"answer":42}"#.to_vec()));
     }
     assert_eq!(pending_deliveries(&host), 0);
-    assert_eq!(dispatch_view(&host).status, DispatchStatus::Delivered);
+    assert_eq!(
+        dispatch_view(&host).status,
+        DispatchStatus::Delivered {
+            delivery: sdk::DeliveryOutcome::Applied
+        }
+    );
 
     // block 5: nothing left — the injection is idempotent over an empty
     // mailbox and no duplicate delivery ever fires.

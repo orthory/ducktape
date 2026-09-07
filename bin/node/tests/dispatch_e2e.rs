@@ -15,10 +15,10 @@
 //!   consensus — and replies exactly once, one block (or more) after the
 //!   result committed (the never-pop-stack rule, observed via the op index).
 //!
-//! - `unannounced_capable_nodes_race_accept_and_execute_once`: both provider
-//!   validators run a compute grant announcing nothing (accept-lane-only), so
-//!   the agent's tag has an EMPTY rendezvous pool and the dispatch's
-//!   WorkerRequest goes out UNASSIGNED — an announcement. both capable nodes
+//! - `announced_capable_nodes_race_accept_and_execute_once`: both provider
+//!   validators announce their tag, but their newly increased local capacity
+//!   exceeds the node's advertised capacity. A request that needs that capacity
+//!   has an EMPTY rendezvous pool and goes out UNASSIGNED. Both capable nodes
 //!   race `SagaMsg::Accept`; consensus order seats exactly one winner and the
 //!   loser's accept finalizes as a deterministic no-op.
 //!
@@ -52,12 +52,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg};
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
+use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
-use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use runs::{ACTION_CHAT_POST, ModelMsg};
+use runs::{RunsMsg, RunsQuery, RunsReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -69,23 +69,20 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// pull, which happens on FIRST RUN, not at daemon boot).
 const ROUND_TRIP: Duration = Duration::from_secs(300);
 
-/// one script-backed provider staged on disk for one node: an operator spec
-/// dir holding a single capability spec whose `detect.env` points at an
-/// executable script. the script answers on stdout in the spec's declared
+/// One scripted provider staged on disk for one node: an operator spec
+/// directory and an executor directory containing only a real Linux shell.
+/// The shell answers on stdout in the spec's declared
 /// output format — a REAL provider through the full provider path
 /// (discovery, announce, resolve, sandboxed spawn), minus the LLM bill.
 ///
-/// The script runs INSIDE the run's container, mounted read-only at
-/// `/ducktape/bin/`, so it must be self-contained: no host paths (they do not
-/// exist in that mount namespace) and nothing beyond what the image provides —
-/// which for [`SANDBOX_IMAGE`] is a busybox `sh`. Its `stdout` is therefore the
+/// The shell runs inside the microVM from `/opt/duck/bin/sh`, so its command
+/// must be self-contained and use tools the guest image provides. Its stdout is the
 /// whole of its observable behaviour, and giving each provider a DISTINCT
 /// answer is what makes the reply name the node that ran it.
 struct ScriptProvider {
     tag: String,
     spec_dir: PathBuf,
-    env_var: String,
-    bin: PathBuf,
+    executors: PathBuf,
 }
 
 /// the test executor every provider here runs, as a shell one-liner: drain the
@@ -93,7 +90,7 @@ struct ScriptProvider {
 ///
 /// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
 /// executes inside a microVM that mounts nothing from the host — an executor a
-/// node lends has to already be in the guest rootfs. A host script reaches the
+/// node lends must be installed in the executor image. A host script reaches the
 /// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
 fn script_provider_argv(stdout: &str) -> String {
     // the payload is single-quoted for the shell (none of these carry a `'`)
@@ -106,19 +103,13 @@ fn script_provider_argv(stdout: &str) -> String {
 impl ScriptProvider {
     /// stage a provider under `root/<name>`: `format` is the spec's output
     /// format and `stdout` the exact bytes it prints (compose them to match).
-    /// the spec carries a per-provider `detect.env` name, so a node provides
-    /// this tag exactly when its process env names this executor.
+    /// The node provides this tag through its own spec and installed shell;
+    /// another node's operator directory never contributes capabilities.
     fn stage(root: &std::path::Path, name: &str, tag: &str, format: &str, stdout: &str) -> Self {
         let dir = root.join(name);
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        // resolved by basename to /opt/duck/bin/sh inside the guest
-        let bin = PathBuf::from("/bin/sh");
-
-        let env_var = format!(
-            "DUCKTAPE_TEST_{}_BIN",
-            tag.replace(['-', '.'], "_").to_uppercase()
-        );
+        let executors = common::script_executor_dir(&dir);
         std::fs::write(
             spec_dir.join(format!("{tag}.toml")),
             format!(
@@ -127,8 +118,7 @@ impl ScriptProvider {
                  tag = \"{tag}\"\n\
                  description = \"dispatch e2e script executor\"\n\
                  [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
+                 bin = \"sh\"\n\
                  [invoke]\n\
                  args = {}\n\
                  prompt = \"stdin\"\n\
@@ -142,13 +132,12 @@ impl ScriptProvider {
         Self {
             tag: tag.into(),
             spec_dir,
-            env_var,
-            bin,
+            executors,
         }
     }
 
     /// the env pairs that make node `idx` provide this tag: the operator dir
-    /// override plus the spec's detect override. combine multiple providers
+    /// override plus its installed executor directory. Combine multiple providers
     /// on one node by pointing them at the SAME spec dir... this fixture
     /// keeps one dir per provider, so a node carries exactly one.
     fn env(&self) -> Vec<(String, String)> {
@@ -157,35 +146,30 @@ impl ScriptProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.bin.display().to_string()),
+            (
+                "DUCKTAPE_EXECUTOR_DIR".into(),
+                self.executors.display().to_string(),
+            ),
         ]
     }
-
 }
 
-/// env that keeps a node OUT of the provider business regardless of what the
-/// host machine has installed: an empty operator dir plus detect overrides
-/// pointing the embedded executor specs at nothing (a broken override is a
-/// loud warning + absent capability — never a PATH fallback), so a dev box
-/// with a real `claude`/`codex` on PATH runs this suite identically to CI.
+/// Empty operator specs and executors keep this node out of provider discovery,
+/// regardless of which CLIs the operator has installed elsewhere.
 fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
     let empty = root.join(name).join("specs");
     std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let missing = root.join(name).join("missing-executor");
+    let executors = root.join(name).join("executors");
+    std::fs::create_dir_all(&executors).expect("empty executor dir");
     vec![
-        ("DUCKTAPE_CAPABILITY_DIR".into(), empty.display().to_string()),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-/// the detect overrides that hide the embedded executor specs, for nodes that
-/// DO carry a script provider dir.
-fn hide_builtins(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            empty.display().to_string(),
+        ),
+        (
+            "DUCKTAPE_EXECUTOR_DIR".into(),
+            executors.display().to_string(),
+        ),
     ]
 }
 
@@ -198,6 +182,15 @@ fn hide_builtins(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
 /// provider times out minutes later naming something else. A daemon is a
 /// separate process — so wait for the process to SAY it is serving.
 fn boot(cluster: &mut Cluster) {
+    boot_validators(cluster);
+    for i in 0..3 {
+        // Discovery readiness is separate from a successful guest execution,
+        // which the reply assertions below prove.
+        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
+    }
+}
+
+fn boot_validators(cluster: &mut Cluster) {
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
     cluster.spawn(1);
@@ -209,13 +202,6 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
-        // What this marker covers, exactly: the daemon reached the sandbox
-        // probe + provider discovery. It does NOT cover a bootable guest — no
-        // VM starts until a run does, so an unreadable rootfs passes here on
-        // every node and fails the run seconds later. Not a skip either: past
-        // `probe()` this suite has declared the host capable, so an unusable
-        // sandbox is a failure.
-        cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 }
 
@@ -302,7 +288,7 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-/// register `agent_id` on `tag`, watch `channel` under Mention, and post the
+/// Provision the model program, register `agent_id` on `tag`, and post the
 /// mention that engages it — the whole client-side trigger, submitted through
 /// node `idx` (whose key becomes the owner/author). returns the mention's
 /// message id.
@@ -320,42 +306,7 @@ fn register_and_mention(
     tag: &str,
     message_id: &str,
 ) {
-    cluster.submit(
-        idx,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: agent_id.into(),
-            display_name: agent_id.into(),
-            capability: tag.into(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            caps: None,
-            skills: None,
-        }),
-    );
-    cluster.submit(
-        idx,
-        "runs",
-        &runs::encode_msg(&RunsMsg::WatchChannel {
-            channel_id: channel.into(),
-            policy: TurnPolicy::Mention,
-        }),
-    );
-    // the watch must be committed before the mention posts, or the tagging
-    // plane has no subscriber to engage.
-    cluster.await_committed(idx, "the channel watch to commit", FINALIZE, || {
-        let reply = cluster.query(
-            idx,
-            "runs",
-            &runs::encode_query(&RunsQuery::Watches),
-        )?;
-        match runs::decode_reply(&reply) {
-            Ok(RunsReply::Watches(w)) => {
-                w.iter().any(|v| v.channel_id == channel).then_some(())
-            }
-            _ => None,
-        }
-    });
+    let program_account = register_model(cluster, idx, agent_id, tag);
     cluster.submit(
         idx,
         "chat",
@@ -366,22 +317,50 @@ fn register_and_mention(
                 Span::plain("hey "),
                 Span {
                     text: format!("@{agent_id}"),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: agent_id.into(),
-                    })],
+                    marks: vec![Mark::Mention(Party::Account(program_account))],
                 },
                 Span::plain(" say the word"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     );
 }
 
+fn register_model(cluster: &Cluster, idx: usize, agent_id: &str, tag: &str) -> u64 {
+    let program_account = common::provision_model_program(cluster, idx, agent_id);
+    cluster.submit(
+        idx,
+        "runs",
+        &runs::encode_msg(&RunsMsg::ConfigureModel {
+            operation: ModelMsg::RegisterModel {
+                account: program_account,
+                agent_id: agent_id.into(),
+                display_name: agent_id.into(),
+                capability: tag.into(),
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+                recipe_hash: None,
+                caps: None,
+                skills: None,
+            },
+        }),
+    );
+    assert_eq!(
+        common::model_account(cluster, idx, agent_id),
+        program_account
+    );
+    program_account
+}
+
 /// poll `channel` on `idx` until the agent's reply to `run_id` exists, and
 /// return its plain text.
-fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
+fn wait_for_reply(
+    cluster: &Cluster,
+    idx: usize,
+    channel: &str,
+    run_id: &str,
+    agent_id: &str,
+) -> String {
+    let account = common::model_account(cluster, idx, agent_id);
     cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
@@ -396,13 +375,10 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
             return None;
         };
         views.into_iter().find_map(|v| {
-            (v.head.message_id == format!("agent/{run_id}")).then(|| {
+            (v.head.message_id == runs::reply_message_id(run_id)).then(|| {
                 assert_eq!(
                     v.head.author,
-                    AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: run_id.rsplit('\u{1f}').next().expect("run id agent").into(),
-                    },
+                    Party::Account(account),
                     "the reply must be authored by the agent"
                 );
                 v.head
@@ -435,18 +411,34 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
         )?;
         match dispatch::decode_reply(&reply) {
             Ok(DispatchReply::Dispatch(Some(view)))
-                if view.status == DispatchStatus::Delivered =>
+                if matches!(view.status, DispatchStatus::Delivered { .. }) =>
             {
                 Some(())
             }
             _ => None,
         }
     });
+    let reply = cluster
+        .query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))
+        .expect("the accepted run's history");
+    let RunsReply::RecentRuns(records) = runs::decode_reply(&reply).unwrap() else {
+        panic!("expected recent runs");
+    };
+    let record = records
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
 }
 
 /// every op row of `module`'s derived op index on `idx`, oldest-first.
 fn index_ops(cluster: &Cluster, idx: usize, module: &str) -> Vec<serde_json::Value> {
-    let (status, body) = cluster.http(idx, "GET", &format!("/v1/index/{module}/ops?limit=500"), None);
+    let (status, body) = cluster.http(
+        idx,
+        "GET",
+        &format!("/v1/index/{module}/ops?limit=500"),
+        None,
+    );
     assert_eq!(status, 200, "index ops for {module} failed: {body}");
     body["ops"].as_array().cloned().unwrap_or_default()
 }
@@ -492,8 +484,8 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // without the table. Appended LAST — nothing may follow a toml table header.
     cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
-    cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
-    cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
+    cluster.env[1] = text_provider.env();
+    cluster.env[2] = json_provider.env();
     boot(&mut cluster);
 
     // both hosts announce their discovered set on boot; the registry maps
@@ -518,17 +510,31 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // beat 1: the text provider's agent. the mention is seq 1 in the fresh
     // channel; the run executes on node 1 (the tag's only announced
     // provider) and replies once.
-    register_and_mention(&cluster, 0, "dispatch", "quacker-text", &text_provider.tag, "m1");
-    let run_text = runs::run_id_for("dispatch", 1, "quacker-text");
-    let reply = wait_for_reply(&cluster, 0, "dispatch", &run_text);
+    register_and_mention(
+        &cluster,
+        0,
+        "dispatch",
+        "quacker-text",
+        &text_provider.tag,
+        "m1",
+    );
+    let run_text = common::attributed_run_id(&cluster, 0, "dispatch", 1, "quacker-text");
+    let reply = wait_for_reply(&cluster, 0, "dispatch", &run_text, "quacker-text");
     assert_eq!(reply, "the word is quack", "the text provider's raw answer");
     wait_for_delivered(&cluster, 0, &run_text);
 
     // beat 2: the json provider's agent, cross-checked from ANOTHER node.
     // the reply above was seq 2, so this mention anchors at seq 3.
-    register_and_mention(&cluster, 0, "dispatch", "quacker-json", &json_provider.tag, "m2");
-    let run_json = runs::run_id_for("dispatch", 3, "quacker-json");
-    let reply = wait_for_reply(&cluster, 2, "dispatch", &run_json);
+    register_and_mention(
+        &cluster,
+        0,
+        "dispatch",
+        "quacker-json",
+        &json_provider.tag,
+        "m2",
+    );
+    let run_json = common::attributed_run_id(&cluster, 0, "dispatch", 3, "quacker-json");
+    let reply = wait_for_reply(&cluster, 2, "dispatch", &run_json, "quacker-json");
     assert_eq!(
         reply, "the json word is quack",
         "the json-result provider's extracted answer"
@@ -576,7 +582,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
         (status == 200).then_some(())?;
         let rows = body["roots"]["roots"].as_array()?;
         rows.iter()
-            .find(|r| r["message_id"] == format!("agent/{run_text}"))
+            .find(|r| r["message_id"] == runs::reply_message_id(&run_text))
             .map(|_| ())
     });
 
@@ -586,18 +592,20 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // and its consumption. the derived op index applies block-by-block
     // BEHIND finalized state (the reply was already read from chat state
     // above), so both lookups poll instead of racing the indexer.
-    let result_height = cluster.await_committed(0, "the OracleResult op to index", FINALIZE, || {
-        op_height(&index_ops(&cluster, 0, "saga"), |p| {
-            p.get("oracle_result").is_some()
-        })
-    });
-    let reply_height = cluster.await_committed(0, "the agent reply post to index", FINALIZE, || {
-        op_height(&index_ops(&cluster, 0, "chat"), |p| {
-            p.get("post_message")
-                .and_then(|m| m["message_id"].as_str())
-                .is_some_and(|id| id == format!("agent/{run_text}"))
-        })
-    });
+    let result_height =
+        cluster.await_committed(0, "the OracleResult op to index", FINALIZE, || {
+            op_height(&index_ops(&cluster, 0, "saga"), |p| {
+                p.get("oracle_result").is_some()
+            })
+        });
+    let reply_height =
+        cluster.await_committed(0, "the agent reply post to index", FINALIZE, || {
+            op_height(&index_ops(&cluster, 0, "chat"), |p| {
+                p.get("post_message")
+                    .and_then(|m| m["message_id"].as_str())
+                    .is_some_and(|id| id == runs::reply_message_id(&run_text))
+            })
+        });
     assert!(
         reply_height > result_height,
         "next-block delivery: reply at {reply_height} must sit above the result at {result_height}"
@@ -605,11 +613,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
     // no correlation entries left behind: delivery pruned the pending map.
     let reply = cluster
-        .query(
-            0,
-            "runs",
-            &runs::encode_query(&RunsQuery::PendingRuns),
-        )
+        .query(0, "runs", &runs::encode_query(&RunsQuery::PendingRuns))
         .expect("pending runs query");
     match runs::decode_reply(&reply) {
         Ok(RunsReply::PendingRuns(pending)) => {
@@ -620,14 +624,14 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 }
 
 #[test]
-fn unannounced_capable_nodes_race_accept_and_execute_once() {
-    if skip_unless_sandboxed("unannounced_capable_nodes_race_accept_and_execute_once").is_some() {
+fn announced_capable_nodes_race_accept_and_execute_once() {
+    if skip_unless_sandboxed("announced_capable_nodes_race_accept_and_execute_once").is_some() {
         return;
     }
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    // the SAME tag on two nodes, both accept-lane-only: the rendezvous pool
-    // stays empty, so the dispatch goes out unassigned and both race to
-    // claim it.
+    // The same tag on two authorized nodes. Their compute daemons have more
+    // capacity than the validators advertised at boot, so both can claim a
+    // request that the rendezvous capacity filter cannot assign.
     let racer_one = ScriptProvider::stage(
         fixtures.path(),
         "node1",
@@ -644,24 +648,52 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
-    // a grant that announces NO tags: the accept-lane-only provider — it can
-    // still execute claimed work, but never enters a tag's rendezvous pool.
-    cluster.compute_grant = Some(vec![]);
-    // and the table that says HOW it isolates one. Without it the daemon exits
-    // at boot and this whole scenario silently exercises nothing.
-    cluster.extra_toml.extend(sandbox_toml());
+    cluster.extra_toml = sandbox_toml()
+        .into_iter()
+        .map(|line| match line.as_str() {
+            "cores = 0" => "cores = 1".into(),
+            "mem_gb = 0" => "mem_gb = 1".into(),
+            _ => line,
+        })
+        .collect();
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
-    cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
-    cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();
-    boot(&mut cluster);
+    cluster.env[1] = racer_one.env();
+    cluster.env[2] = racer_two.env();
+    boot_validators(&mut cluster);
+    // A service restart can pick up increased capacity before its validator
+    // restarts. Keep that real distinction stable throughout the claim race:
+    // the node advertises one core while the daemon can reserve two.
+    let cores = cluster
+        .extra_toml
+        .iter_mut()
+        .find(|line| line.as_str() == "cores = 1")
+        .expect("the validator's configured capacity");
+    *cores = "cores = 2".into();
+    cluster.compute_grant = Some(vec!["quack-race".into()]);
+    for idx in 0..3 {
+        cluster.spawn_compute(idx);
+        cluster.wait_compute_marker(idx, "compute daemon serving", CONVERGE);
+    }
 
-    // the knob holds: capable hosts, empty pool.
-    let pool = cluster.await_committed(0, "the capability registry to answer", FINALIZE, || {
-        providers(&cluster, 0, "quack-race")
+    cluster.await_committed(0, "both racers to announce standing", FINALIZE, || {
+        let pool: BTreeSet<_> = providers(&cluster, 0, "quack-race")?.into_iter().collect();
+        (pool == BTreeSet::from([Cluster::identity(1), Cluster::identity(2)])).then_some(())
     });
-    assert!(
-        pool.is_empty(),
-        "suppressed providers must never enter the rendezvous pool: {pool:?}"
+    let demands = BTreeMap::from([("cores".to_string(), 2)]);
+    let reply = cluster
+        .query(
+            0,
+            "capability",
+            &capability::encode_query(&CapabilityQuery::CapableProviders {
+                capability: "quack-race".into(),
+                demands: demands.clone(),
+            }),
+        )
+        .expect("the demand-filtered provider pool");
+    assert_eq!(
+        capability::decode_reply(&reply).unwrap(),
+        CapabilityReply::Providers(Vec::new()),
+        "the announced capacity must leave this request unassigned"
     );
 
     cluster.submit(
@@ -673,8 +705,29 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
             post_policy: PostPolicy::Open,
         }),
     );
-    register_and_mention(&cluster, 0, "race", "racer", "quack-race", "m1");
-    let run_id = runs::run_id_for("race", 1, "racer");
+    register_model(&cluster, 0, "racer", "quack-race");
+    cluster.submit(
+        0,
+        "chat",
+        &chat::encode_msg(&ChatMsg::PostMessage {
+            channel_id: "race".into(),
+            message_id: "m1".into(),
+            blocks: vec![Block::paragraph("say the word")],
+            thread: None,
+        }),
+    );
+    cluster.submit(
+        0,
+        "runs",
+        &runs::encode_msg(&RunsMsg::RequestRun {
+            agent_id: "racer".into(),
+            channel_id: "race".into(),
+            anchor_seq: 1,
+            demands,
+            skills: Vec::new(),
+        }),
+    );
+    let run_id = common::attributed_run_id(&cluster, 0, "race", 1, "racer");
 
     // ==================================================================
     // THE claim-lane assertion — the one that goes red on the regression this
@@ -713,7 +766,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     );
 
     // the winner then EXECUTES what it claimed, and one reply posts.
-    let reply = wait_for_reply(&cluster, 0, "race", &run_id);
+    let reply = wait_for_reply(&cluster, 0, "race", &run_id, "racer");
     assert!(
         reply == "claimed by node one" || reply == "claimed by node two",
         "the reply must be one racer's answer: {reply:?}"

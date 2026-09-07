@@ -24,6 +24,8 @@ sim = []
 tracing = { workspace = true }
 sdk = { workspace = true }
 host = { workspace = true }
+# the sink-backed pre-commit witness implements the host's async trait.
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 # op frames are SIGNED: encode signs (ed25519, the node/device key), decode
 # verifies under the frame's declared scheme, so the host's Origin::External
@@ -63,6 +65,4 @@ sdk-testkit = { workspace = true }
 # the code-swap stall test seeds the real code registry with a hash whose bytes
 # no source can serve — the fail-closed boundary the drain must PAUSE on.
 modules = { workspace = true }
-# a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
-async-trait = { workspace = true }
 commonware-runtime = { workspace = true }

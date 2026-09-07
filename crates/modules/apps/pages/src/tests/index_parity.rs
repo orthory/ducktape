@@ -25,7 +25,9 @@ fn fold(map: &mut Map, height: u64, seq: u32, msg: &PageMsg) {
         time: 1_000 + height,
         origin: OriginTag::external("jess"),
         payload: encode_msg(msg),
-        assigned: Vec::new(),
+        assigned: crate::encode_assigned(&crate::PageAssigned {
+            actor: crate::Party::System,
+        }),
     };
     let writes = index::fold_op(&op, map).expect("the fold mirrors every applied op");
     apply_to_map(map, writes);

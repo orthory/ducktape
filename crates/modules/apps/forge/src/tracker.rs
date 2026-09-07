@@ -27,8 +27,8 @@
 
 use std::collections::BTreeMap;
 
-use chat::AuthorRef;
-use sdk::{Error, Msg, Origin};
+use chat::Party;
+use sdk::{Error, Msg};
 
 use crate::codec::{self, Reader};
 use crate::oid::{OID_RAW_LEN, Oid};
@@ -51,7 +51,7 @@ pub struct Item {
     pub kind: ItemKind,
     pub title: String,
     pub body: String,
-    pub author: AuthorRef,
+    pub author: Party,
     pub state: ItemState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -104,7 +104,7 @@ pub struct RepoTracker {
     /// may move a protected branch (`main`/`dev`) afterwards. see
     /// [`crate::state::ForgeState::stage_push_refs`] for why authorization is
     /// the whole of protected-branch safety.
-    pub owner: Option<Vec<u8>>,
+    pub owner: Option<Party>,
     /// the LAST assigned number; 0 = none yet. the next item gets `+1`.
     pub last_number: u64,
     /// how many items in [`Self::items`] are currently `Open` — what
@@ -116,7 +116,7 @@ pub struct RepoTracker {
     /// [`crate::tracker_iface::MAX_OPEN_ITEMS_PER_ACTOR`] is checked against.
     /// an entry is removed once its count reaches zero, so this map never
     /// outgrows `open_count`.
-    pub open_by_author: BTreeMap<AuthorRef, u64>,
+    pub open_by_author: BTreeMap<Party, u64>,
     pub items: BTreeMap<u64, Item>,
 }
 
@@ -124,40 +124,9 @@ pub struct RepoTracker {
 /// canonical encoding iterates in key order).
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Tracker {
+    /// Source revisions survive ref deletion, image re-entry, and recovery.
+    pub source_revision: u64,
     pub repos: BTreeMap<String, RepoTracker>,
-}
-
-/// derive the item author from the dispatch origin — the same posture as
-/// chat: authorship is NEVER a payload field.
-///
-/// a MODULE is a FIRST-CLASS author, not a second-class one. `runs` opens the
-/// pull request that publishes a finished agent run (`runs/src/sink.rs`
-/// `emit_sink`), and the host stamps that follow-up `Origin::Module("runs")`
-/// — refusing it does not "keep items member-only", it errors the emitted op
-/// and aborts the whole delivery block. the module id is trustworthy because
-/// the host synthesizes `Origin::Module` in exactly ONE place, from the
-/// module that just ran, and a frame cannot express a second op that picks
-/// its own id (the deleted continuation lane). both halves are pinned by
-/// `node/tests/no_continuation_lane.rs`.
-///
-/// two origins are refused, for two different reasons:
-/// - an EMPTY external id is the pre-consensus probe, never an authenticated
-///   submitter.
-/// - `Origin::System` has no producer that can reach here: the host stamps it
-///   only on its two once-per-block injections (`modules::Advance` and
-///   `dispatch::DeliverPending`), neither of which targets forge. an
-///   unreachable arm stays refused rather than minting an unowned item.
-pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {
-    match origin {
-        Origin::External(id) if id.is_empty() => Err(Error::Module(
-            "forge: tracker ops require an authenticated origin".into(),
-        )),
-        Origin::External(id) => Ok(AuthorRef::User(id.clone())),
-        Origin::Module(m) => Ok(AuthorRef::Module(m.clone())),
-        Origin::System => Err(Error::Module(
-            "forge: tracker ops require an authenticated origin".into(),
-        )),
-    }
 }
 
 fn check_len(field: &str, s: &str, max: usize) -> Result<(), Error> {
@@ -192,7 +161,7 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
 /// refuse an open/reopen once the repo or the author is at its OPEN-item
 /// ceiling. named so the two caps this crate enforces (a repo cap, and an
 /// author's share of it) read as one decision at every call site.
-fn require_open_slot(rt: &RepoTracker, author: &AuthorRef, repo: &str) -> Result<(), Error> {
+fn require_open_slot(rt: &RepoTracker, author: &Party, repo: &str) -> Result<(), Error> {
     if rt.open_count as usize >= MAX_OPEN_ITEMS_PER_REPO {
         return Err(Error::Module(format!(
             "forge: repo {repo:?} is at its open-item cap ({MAX_OPEN_ITEMS_PER_REPO}); close or \
@@ -211,13 +180,13 @@ fn require_open_slot(rt: &RepoTracker, author: &AuthorRef, repo: &str) -> Result
 
 /// record that `author` just opened (or reopened) an item — the
 /// [`RepoTracker::open_by_author`] half of [`require_open_slot`]'s ceiling.
-fn note_author_opened(rt: &mut RepoTracker, author: &AuthorRef) {
+fn note_author_opened(rt: &mut RepoTracker, author: &Party) {
     *rt.open_by_author.entry(author.clone()).or_insert(0) += 1;
 }
 
 /// record that `author`'s item just closed or merged, pruning the entry at
 /// zero so the map never outgrows the live open count.
-fn note_author_closed(rt: &mut RepoTracker, author: &AuthorRef) {
+fn note_author_closed(rt: &mut RepoTracker, author: &Party) {
     use std::collections::btree_map::Entry;
     if let Entry::Occupied(mut e) = rt.open_by_author.entry(author.clone()) {
         *e.get_mut() -= 1;
@@ -233,28 +202,30 @@ impl Tracker {
     /// tracker fold and the owner becomes UNAUTHENTICATED state — a joiner
     /// could install a snapshot naming any owner it liked.
     pub fn is_empty(&self) -> bool {
-        self.repos
-            .values()
-            .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
+        self.source_revision == 0
+            && self
+                .repos
+                .values()
+                .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
     }
 
     /// the principal that owns `repo`, if a push has birthed it.
-    pub fn owner(&self, repo: &str) -> Option<&[u8]> {
-        self.repos.get(repo).and_then(|r| r.owner.as_deref())
+    pub fn owner(&self, repo: &str) -> Option<&Party> {
+        self.repos.get(repo).and_then(|r| r.owner.as_ref())
     }
 
     /// how many repos `principal` already owns — derived from the tracker the
     /// owner entries already live in, so the cap needs no counter of its own.
-    pub fn repos_owned_by(&self, principal: &[u8]) -> usize {
+    pub fn repos_owned_by(&self, principal: &Party) -> usize {
         self.repos
             .values()
-            .filter(|r| r.owner.as_deref() == Some(principal))
+            .filter(|r| r.owner.as_ref() == Some(principal))
             .count()
     }
 
     /// pin the owner of the repo this block's push is BIRTHING. the caller has
     /// already established that the repo has none.
-    pub fn claim_owner(&mut self, repo: &str, principal: Vec<u8>) {
+    pub fn claim_owner(&mut self, repo: &str, principal: Party) {
         self.repos.entry(repo.to_string()).or_default().owner = Some(principal);
     }
 
@@ -282,7 +253,7 @@ impl Tracker {
         kind: ItemKind,
         title: String,
         body: String,
-        author: AuthorRef,
+        author: Party,
         now: u64,
         branches: Option<(String, String)>,
     ) -> Result<u64, Error> {
@@ -325,7 +296,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        editor: &AuthorRef,
+        editor: &Party,
         title: Option<String>,
         body: Option<String>,
         now: u64,
@@ -440,7 +411,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        author: AuthorRef,
+        author: Party,
         verdict: ReviewVerdict,
         body: String,
         commit_oid: &str,
@@ -524,7 +495,7 @@ impl Tracker {
     /// self-filed review must never unlock `MergePr`. reviews are still
     /// stored and shown (`ItemDetail::reviews`); they just no longer feed
     /// authorization.
-    pub fn pr_author(&self, repo: &str, number: u64) -> Result<AuthorRef, Error> {
+    pub fn pr_author(&self, repo: &str, number: u64) -> Result<Party, Error> {
         let item = self.item(repo, number)?;
         if item.kind != ItemKind::Pr {
             return Err(Error::Module(format!(
@@ -564,12 +535,17 @@ impl Tracker {
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = TRACKER_MAGIC.to_vec();
+        codec::put_u64(&mut out, self.source_revision);
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
-            // an EMPTY owner is `None`: an empty principal is never a valid
-            // origin, so the two can never be confused.
-            codec::put_bytes(&mut out, rt.owner.as_deref().unwrap_or_default());
+            match &rt.owner {
+                None => codec::put_u8(&mut out, 0),
+                Some(owner) => {
+                    codec::put_u8(&mut out, 1);
+                    encode_author(&mut out, owner);
+                }
+            }
             codec::put_u64(&mut out, rt.last_number);
             codec::put_u32(&mut out, rt.items.len() as u32);
             for item in rt.items.values() {
@@ -586,13 +562,16 @@ impl Tracker {
                 Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
             })?;
         let mut r = Reader::new(body);
+        let source_revision = r.u64()?;
         let repo_count = r.u32()?;
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
             let name = r.str_()?;
-            let owner_len = r.u32()? as usize;
-            let owner = r.take(owner_len)?;
-            let owner = (!owner.is_empty()).then(|| owner.to_vec());
+            let owner = match r.u8()? {
+                0 => None,
+                1 => Some(decode_author(&mut r)?),
+                _ => return Err(Error::Module("forge tracker: invalid owner tag".into())),
+            };
             let last_number = r.u64()?;
             let item_count = r.u32()?;
             let mut items = BTreeMap::new();
@@ -611,7 +590,7 @@ impl Tracker {
             // pure function of `items`' states, derived here rather than
             // trusted from bytes so the two can never drift apart.
             let mut open_count = 0u64;
-            let mut open_by_author: BTreeMap<AuthorRef, u64> = BTreeMap::new();
+            let mut open_by_author: BTreeMap<Party, u64> = BTreeMap::new();
             for item in items.values() {
                 if item.state == ItemState::Open {
                     open_count += 1;
@@ -639,41 +618,40 @@ impl Tracker {
                 "forge tracker: trailing bytes after the container".into(),
             ));
         }
-        Ok(Self { repos })
+        Ok(Self {
+            source_revision,
+            repos,
+        })
     }
 }
 
-fn encode_author(out: &mut Vec<u8>, a: &AuthorRef) {
+fn encode_author(out: &mut Vec<u8>, a: &Party) {
     match a {
-        AuthorRef::User(id) => {
+        Party::Key(id) => {
             codec::put_u8(out, 0);
             codec::put_bytes(out, id);
         }
-        AuthorRef::Agent { module, agent_id } => {
+        Party::Account(account) => {
             codec::put_u8(out, 1);
-            codec::put_str(out, module);
-            codec::put_str(out, agent_id);
+            codec::put_u64(out, *account);
         }
-        AuthorRef::Module(m) => {
+        Party::Module(m) => {
             codec::put_u8(out, 2);
             codec::put_str(out, m);
         }
-        AuthorRef::System => codec::put_u8(out, 3),
+        Party::System => codec::put_u8(out, 3),
     }
 }
 
-fn decode_author(r: &mut Reader) -> Result<AuthorRef, Error> {
+fn decode_author(r: &mut Reader) -> Result<Party, Error> {
     Ok(match r.u8()? {
         0 => {
             let len = r.u32()? as usize;
-            AuthorRef::User(r.take(len)?.to_vec())
+            Party::Key(r.take(len)?.to_vec())
         }
-        1 => AuthorRef::Agent {
-            module: r.str_()?,
-            agent_id: r.str_()?,
-        },
-        2 => AuthorRef::Module(r.str_()?),
-        3 => AuthorRef::System,
+        1 => Party::Account(r.u64()?),
+        2 => Party::Module(r.str_()?),
+        3 => Party::System,
         t => return Err(Error::Module(format!("forge tracker: bad author tag {t}"))),
     })
 }
@@ -863,7 +841,6 @@ pub fn system_line_msg(
             message_id,
             blocks: vec![chat::Block::paragraph(text)],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -872,8 +849,8 @@ pub fn system_line_msg(
 mod tests {
     use super::*;
 
-    fn user(b: u8) -> AuthorRef {
-        AuthorRef::User(vec![b; 4])
+    fn user(b: u8) -> Party {
+        Party::Key(vec![b; 4])
     }
 
     #[test]
@@ -1006,7 +983,7 @@ mod tests {
             ItemKind::Pr,
             "pr".into(),
             "prbody".into(),
-            AuthorRef::Module("runs".into()),
+            Party::Module("runs".into()),
             2,
             Some(("feature/x".into(), "main".into())),
         )

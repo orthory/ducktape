@@ -65,13 +65,12 @@ commonware-cryptography.workspace = true
 # the microVM sandbox into a GUI.
 dispatch.workspace = true
 run-envelope.workspace = true
+runs.workspace = true
 # the 32 random bytes of a fresh dispatch id.
 rand.workspace = true
 pages.workspace = true
 saga.workspace = true
-# RUNTIME, not dev-only: `local_member` derives the signing identity through
-# `sdk::Origin::External(..).actor_string()` on the product path, so a
-# dev-dependency here builds every TEST lane and breaks only the BINARY.
+# Consensus payloads and authenticated origin types used by signed writes.
 sdk.workspace = true
 # The join ceremony, linked rather than spawned. Joining is the one node
 # operation with no daemon to ask — it is what BRINGS a workspace into

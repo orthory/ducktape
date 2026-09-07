@@ -3,16 +3,13 @@ use crate::facets::{WireSink, decode_run_result};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
+use crate::{ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS};
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
-use agent::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
-    encode_event as agent_encode_event, encode_reply as agent_encode_reply,
-};
 use base64::Engine as _;
-use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
+use chat::{Channel, MessageHead, Party, decode_msg as chat_decode_msg};
 use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
-    encode_reply as dispatch_encode_reply, encode_result_event,
+    encode_reply as dispatch_encode_reply,
 };
 use files::{
     decode_msg as files_decode_msg, decode_query as files_decode_query,
@@ -21,7 +18,6 @@ use files::{
 use futures::executor::block_on;
 use sdk::Env;
 use std::cell::{Cell, RefCell};
-use tagging::{Author, encode_event as tagging_encode_event};
 use tasks::{
     Claim as JobClaim, Job, Task, decode_task_msg as tasks_decode_msg,
     encode_job_event as jobs_encode_event, encode_job_reply as jobs_encode_reply,
@@ -30,7 +26,7 @@ use tasks::{
 
 /// a canned registry: agent id -> record, served by the ctx's "agent"
 /// query arm exactly like the live registry module would answer.
-type Registry = BTreeMap<String, AgentRecord>;
+type Registry = BTreeMap<String, ModelRecord>;
 
 /// a minimal `Ctx` that captures emitted msgs/effects/events and serves
 /// a canned agent registry, chat transcripts, task lists, job records,
@@ -74,7 +70,7 @@ struct CaptureCtx {
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
     /// page_id -> the canonical whole page in preorder, sliced by the "pages"
-    /// GetPage arm (the M2 `[[page:<id>]]` injection lane); GetBlock scans the
+    /// GetPage arm (the `duck://page/<id>` injection lane); GetBlock scans the
     /// same pages by block id (the pages-effects target resolution).
     pages: BTreeMap<String, Vec<pages::Block>>,
     page_query_count: Cell<usize>,
@@ -105,6 +101,7 @@ impl CaptureCtx {
                 consensus_time: 0,
                 origin: Origin::System,
                 me: "runs".into(),
+                cause: sdk::Cause::Direct,
             },
             query_count: Cell::new(0),
             query_keys: RefCell::new(BTreeSet::new()),
@@ -221,8 +218,8 @@ impl CaptureCtx {
         self.env.origin = origin;
         self
     }
-    fn with_tagging_origin(self) -> Self {
-        self.with_origin(Origin::Module("tagging".into()))
+    fn with_program_origin(self) -> Self {
+        self.with_origin(Origin::Program(2))
     }
     fn with_dispatch_origin(self) -> Self {
         self.with_origin(Origin::Module("dispatch".into()))
@@ -256,7 +253,7 @@ impl CaptureCtx {
             id: id.into(),
             title: id.into(),
             status: TaskStatus::Open,
-            owner: "test".into(),
+            owner: tasks::Party::Module("test".into()),
             created_at: 0,
             updated_at: 0,
         });
@@ -293,11 +290,11 @@ impl CaptureCtx {
                 job_id: job_id.into(),
                 kind: "agent/duck".into(),
                 spec: "spec".into(),
-                submitter: "ext:01".into(),
+                submitter: tasks::Party::Key(vec![1]),
                 status: JobStatus::Processing,
                 attempt: 1,
                 claim: Some(JobClaim {
-                    worker: "runs".into(),
+                    worker: tasks::Party::Module("runs".into()),
                     claimed_at_height: height,
                     lease_views: JOB_RUN_LEASE_VIEWS,
                 }),
@@ -340,14 +337,6 @@ impl CaptureCtx {
             .map(|m| dispatch_decode_msg(&m.payload).expect("dispatch msg"))
             .collect()
     }
-    /// decoded tagging-plane msgs emitted this dispatch.
-    fn tagging_msgs(&self) -> Vec<TaggingMsg> {
-        self.msgs
-            .iter()
-            .filter(|m| m.target == "tagging")
-            .map(|m| tagging::decode_msg(&m.payload).expect("tagging msg"))
-            .collect()
-    }
     /// decoded pages msgs emitted this dispatch.
     fn page_msgs(&self) -> Vec<pages::PageMsg> {
         self.msgs
@@ -380,7 +369,7 @@ fn dummy_thread_view(id: &str) -> pages::ThreadView {
         thread: pages::Thread {
             id: id.into(),
             target: "elsewhere".into(),
-            opener: pages::AuthorRef::System,
+            opener: pages::Party::System,
             created_at: 0,
             anchor: None,
             resolved: false,
@@ -397,7 +386,8 @@ fn dummy_comment(id: &str) -> pages::Comment {
     pages::Comment {
         id: id.into(),
         thread_id: "elsewhere".into(),
-        author: pages::AuthorRef::System,
+        author: pages::Party::System,
+        mentions: Vec::new(),
         text: String::new(),
         created_at: 0,
         edited_at: None,
@@ -419,14 +409,31 @@ impl Ctx for CaptureCtx {
             .borrow_mut()
             .insert((target.to_string(), req.to_vec()));
         match target {
-            "agent" => match agent::decode_query(req).map_err(Error::Module)? {
-                AgentQuery::Agent { agent_id } => Ok(agent_encode_reply(&AgentReply::Agent(
-                    self.agents.get(&agent_id).cloned(),
-                ))),
-                AgentQuery::Agents => Ok(agent_encode_reply(&AgentReply::Agents(
-                    self.agents.values().cloned().collect(),
-                ))),
-            },
+            "identity" => {
+                let query: identity::IdentityQuery =
+                    identity::decode_query(req).map_err(Error::Module)?;
+                let number = match query {
+                    identity::IdentityQuery::Get { number } => number,
+                    identity::IdentityQuery::OfKey { .. } => 1,
+                    _ => return Err(Error::QueryUnsupported),
+                };
+                Ok(identity::encode_reply(&identity::IdentityReply::Account(
+                    Some(identity::AccountView {
+                        number,
+                        name: "fixture".into(),
+                        control: identity::Control::Program {
+                            controller: 1,
+                            executor: "agent".into(),
+                            generation: 0,
+                            standing: identity::ProgramStanding::Active,
+                        },
+                        keys: Vec::new(),
+                        avatar: None,
+                        bio: None,
+                        updated_at: 0,
+                    }),
+                )))
+            }
             "chat" => match chat::decode_query(req).map_err(Error::Module)? {
                 ChatQuery::MessagesRange {
                     channel_id,
@@ -466,7 +473,8 @@ impl Ctx for CaptureCtx {
                         hooks: Vec::new(),
                         pinned: Vec::new(),
                         huddle: Vec::new(),
-                        owner: None,
+                        owner: chat::Party::System,
+                        revision: 1,
                         archived: false,
                     }),
                 ))),
@@ -474,7 +482,12 @@ impl Ctx for CaptureCtx {
                 // members-only channel's transcript; every other channel with
                 // a transcript answers open standing, mirroring the "Channel"
                 // arm's hardcoded `PostPolicy::Open`.
-                ChatQuery::Access { channel_id, user } => {
+                ChatQuery::Access { channel_id, party } => {
+                    let user = match party {
+                        chat::Party::Key(key) => key,
+                        chat::Party::Account(_) => vec![9; 32],
+                        _ => Vec::new(),
+                    };
                     let may_post = if self.members_only.contains(&channel_id) {
                         self.members
                             .get(&channel_id)
@@ -524,6 +537,7 @@ impl Ctx for CaptureCtx {
                     let view =
                         (awaiting || self.taken_dispatches.contains(&dispatch_id)).then(|| {
                             DispatchView {
+                                cause: sdk::Cause::Direct,
                                 recipe_id: "agent/x".into(),
                                 receiver: "runs".into(),
                                 status: if awaiting {
@@ -534,7 +548,9 @@ impl Ctx for CaptureCtx {
                                         ),
                                     }
                                 } else {
-                                    DispatchStatus::Delivered
+                                    DispatchStatus::Delivered {
+                                        delivery: sdk::DeliveryOutcome::Applied,
+                                    }
                                 },
                                 outcome: (!awaiting).then(|| Ok(Vec::new())),
                                 dispatch_id,
@@ -702,7 +718,7 @@ impl Ctx for CaptureCtx {
                     // a Done saga still carrying its winning attempt's
                     // lease holder — exactly what the saga module commits.
                     let view = self.saga_assignees.get(&saga_id).map(|key| saga::SagaView {
-                        origin: SagaOrigin::Module("dispatch".into()),
+                        origin: saga::SagaOrigin::Module("dispatch".into()),
                         reply_to: Some("dispatch".into()),
                         reply_payload: Vec::new(),
                         spec: Vec::new(),
@@ -742,7 +758,7 @@ fn module() -> RunsModule {
         "runs",
         "chat",
         "saga",
-        "tagging",
+        "attribution",
         "dispatch",
         "agent",
         Some("tasks".into()),
@@ -754,27 +770,20 @@ fn user(byte: u8) -> Origin {
     Origin::External(vec![byte; 32])
 }
 
-/// entity tags carry the ACTING module's id — the unified agent identity.
-fn agent_tag(agent_id: &str) -> EntityRef {
-    EntityRef {
-        module: "runs".into(),
-        entity: agent_id.into(),
-    }
-}
-
-fn record(agent_id: &str, actions: &[&str]) -> AgentRecord {
-    AgentRecord {
+fn record(agent_id: &str, actions: &[&str]) -> ModelRecord {
+    ModelRecord {
+        account: 2,
         agent_id: agent_id.into(),
-        owner: SagaOrigin::External(vec![9; 32]),
+        owner: RunOrigin::External(vec![9; 32]),
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
-        status: AgentStatus::Active,
-        role: agent::AgentRole::General,
+        status: ModelStatus::Active,
+        role: crate::ModelRole::General,
         created_at: 0,
         updated_at: 0,
         recipe_hash: Vec::new(),
-        caps: agent::ResourceCaps::default(),
+        caps: crate::ResourceCaps::default(),
         skills: Vec::new(),
     }
 }
@@ -787,13 +796,13 @@ fn registry(agents: &[(&str, &[&str])]) -> Registry {
 }
 
 fn pause(registry: &mut Registry, agent_id: &str) {
-    registry.get_mut(agent_id).expect("registered").status = AgentStatus::Paused;
+    registry.get_mut(agent_id).expect("registered").status = ModelStatus::Paused;
 }
 
 fn message_in(
     channel: &str,
     seq: u64,
-    author: AuthorRef,
+    author: Party,
     text: &str,
     thread: Option<u64>,
 ) -> MessageView {
@@ -802,10 +811,23 @@ fn message_in(
         seq,
         head: MessageHead {
             message_id: format!("{channel}-m{seq}"),
+            content_origin: match &author {
+                chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                chat::Party::Account(account) => sdk::Origin::Program(*account),
+                chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                chat::Party::System => sdk::Origin::System,
+            },
+            origin: match &author {
+                chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                chat::Party::Account(account) => sdk::Origin::Program(*account),
+                chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                chat::Party::System => sdk::Origin::System,
+            },
             author,
             blocks: vec![Block::paragraph(text)],
             created_at: 0,
             rev: 0,
+            revision: 1,
             edited_at: None,
             base_rev: None,
             deleted: false,
@@ -817,7 +839,7 @@ fn message_in(
 }
 
 fn message(seq: u64, text: &str) -> MessageView {
-    message_in("general", seq, AuthorRef::User(vec![1; 32]), text, None)
+    message_in("general", seq, Party::Key(vec![1; 32]), text, None)
 }
 
 fn transcript(n: u64) -> Vec<MessageView> {
@@ -831,31 +853,25 @@ fn admin(m: &RunsMsg) -> Msg {
     }
 }
 
-/// the tagging plane's routed report of a user post — the engagement
-/// intake's payload. the plane's loop rule means these are always
-/// user-authored in practice.
-fn engagement(channel: &str, seq: u64, tags: Vec<EntityRef>) -> Msg {
-    Msg {
-        target: "runs".into(),
-        payload: tagging_encode_event(&EngagementEvent {
-            source: "chat".into(),
-            container: channel.into(),
-            content_seq: seq,
-            author: Author::User(vec![1; 32]),
-            tags,
-        }),
-    }
+fn engagement(channel: &str, seq: u64, _tags: Vec<()>) -> Msg {
+    admin(&RunsMsg::RequestRun {
+        agent_id: "bot".into(),
+        channel_id: channel.into(),
+        anchor_seq: seq,
+        demands: BTreeMap::new(),
+        skills: Vec::new(),
+    })
 }
 
 /// the dispatch plane's next-block delivery for a run.
 fn result_event(run_id: &str, outcome: Result<Vec<u8>, String>) -> Msg {
     Msg {
         target: "runs".into(),
-        payload: encode_result_event(&ResultEvent {
+        payload: dispatch::encode_delivery(&dispatch::Delivery::Result(ResultEvent {
             dispatch_id: dispatch_id_for(run_id),
             recipe_id: recipe_id_for("bot"),
             outcome,
-        }),
+        })),
     }
 }
 
@@ -866,23 +882,57 @@ fn jobs_event(job_id: &str, kind: &str, spec: &str) -> Msg {
         payload: jobs_encode_event(&JobsEvent::Submitted {
             job_id: job_id.into(),
             kind: kind.into(),
-            submitter: "ext:01".into(),
+            submitter: tasks::Party::Key(vec![1]),
             spec: spec.into(),
             spec_hash: job_spec_hash(spec.as_bytes()),
         }),
     }
 }
 
-/// the registry hook's payload (origin == agent).
-fn agent_event(event: &AgentEvent) -> Msg {
-    Msg {
-        target: "runs".into(),
-        payload: agent_encode_event(event),
-    }
-}
-
 fn exec(m: &mut RunsModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
-    block_on(m.execute(ctx, op))
+    // These unit probes exercise composition and validation with configured
+    // models. The real host suite owns queue timing and program authority.
+    m.models = ctx.agents.clone();
+    let previous: BTreeSet<_> = m
+        .receipts
+        .staged()
+        .keys()
+        .filter(|key| key.starts_with("action/body/"))
+        .cloned()
+        .collect();
+    if ctx.env.origin == Origin::Module("jobs".into()) {
+        let origin = std::mem::replace(&mut ctx.env.origin, Origin::Program(2));
+        let result = block_on(m.on_jobs_event(ctx, &op.payload));
+        ctx.env.origin = origin;
+        return result;
+    }
+    block_on(m.execute(ctx, op))?;
+    let prepared: Vec<_> = m
+        .receipts
+        .staged()
+        .iter()
+        .filter(|(id, _)| id.starts_with("action/body/") && !previous.contains(*id))
+        .map(|(_, bytes)| {
+            let request: super::action_requests::ActionRequest = sdk::wire::decode(bytes).unwrap();
+            Msg {
+                target: request.view.target,
+                payload: sdk::wire::encode(&request.view.payload),
+            }
+        })
+        .collect();
+    for message in prepared {
+        if let Ok(RunsMsg::ExecuteDelegation { .. }) = decode_msg(&message.payload) {
+            let origin = std::mem::replace(&mut ctx.env.origin, Origin::Program(2));
+            ctx.query_count.set(0);
+            ctx.query_keys.borrow_mut().clear();
+            let result = block_on(m.execute(ctx, &message));
+            ctx.env.origin = origin;
+            result?;
+        } else {
+            ctx.msgs.push(message);
+        }
+    }
+    Ok(())
 }
 
 fn commit(m: &mut RunsModule) {
@@ -929,7 +979,7 @@ fn forge_item_detail(
             kind,
             title: title.into(),
             state: forge::ItemState::Open,
-            author: AuthorRef::User(vec![1; 32]),
+            author: Party::Key(vec![1; 32]),
             created_at: 0,
             updated_at: 0,
         },
@@ -970,6 +1020,7 @@ fn forge_module() -> RunsModule {
 /// the injection assertions. the root names itself as `page`.
 fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
     let block = |id: &str, parent: Option<&str>, kind, text: &str| pages::Block {
+        author: pages::Party::System,
         id: id.into(),
         parent: parent.map(str::to_string),
         page: page_id.into(),
@@ -997,6 +1048,7 @@ fn page_with_block_count(total: usize, text: &str) -> Vec<pages::Block> {
         .map(|index| format!("block-{index}"))
         .collect::<Vec<_>>();
     let mut blocks = vec![pages::Block {
+        author: pages::Party::System,
         id: "plan".into(),
         parent: None,
         page: "plan".into(),
@@ -1007,6 +1059,7 @@ fn page_with_block_count(total: usize, text: &str) -> Vec<pages::Block> {
         children: child_ids.clone(),
     }];
     blocks.extend(child_ids.into_iter().map(|id| pages::Block {
+        author: pages::Party::System,
         id,
         parent: Some("plan".into()),
         page: "plan".into(),
@@ -1019,40 +1072,49 @@ fn page_with_block_count(total: usize, text: &str) -> Vec<pages::Block> {
     blocks
 }
 
-/// a committed module with one watch on "general" under `policy`. the
-/// registry itself lives in each ctx (`with_registry`), never here.
-fn watched(policy: TurnPolicy, registry: &Registry) -> RunsModule {
-    let mut m = module();
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: "general".into(),
-            policy,
-        }),
-    )
-    .unwrap();
-    commit(&mut m);
-    m
+/// A module whose current model configuration matches the query fixture.
+fn configured(registry: &Registry) -> RunsModule {
+    let mut module = module();
+    module.models = registry.clone();
+    module
 }
 
-/// drive an engagement at `seq` (author user(1)) tagging `mentioned`.
-fn engage_post(
+fn request_post(
     m: &mut RunsModule,
     registry: &Registry,
     seq: u64,
-    mentioned: &[&str],
+    requested: &[&str],
 ) -> CaptureCtx {
     let mut ctx = CaptureCtx::new()
         .at(seq)
-        .with_tagging_origin()
         .with_registry(registry)
         .with_transcript("general", transcript(seq));
-    let tags = mentioned.iter().map(|a| agent_tag(a)).collect();
-    exec(m, &mut ctx, &engagement("general", seq, tags)).unwrap();
+    let ids: Vec<String> = if requested.is_empty() {
+        registry.keys().cloned().collect()
+    } else {
+        requested.iter().map(|id| (*id).into()).collect()
+    };
+    for id in ids {
+        let Some(model) = registry.get(&id) else {
+            continue;
+        };
+        if model.status != ModelStatus::Active {
+            continue;
+        }
+        ctx.env.origin = Origin::Program(model.account);
+        exec(
+            m,
+            &mut ctx,
+            &admin(&RunsMsg::RequestRun {
+                agent_id: id,
+                channel_id: "general".into(),
+                anchor_seq: seq,
+                demands: BTreeMap::new(),
+                skills: Vec::new(),
+            }),
+        )
+        .unwrap();
+    }
     ctx
 }
 
@@ -1092,7 +1154,7 @@ fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
 /// the bare AgentResponse wire JSON — the PROSE inside [`response`], and the
 /// expected-value shape assertions compare against.
 fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
-    agent::encode_response(&AgentResponse {
+    crate::encode_response(&AgentResponse {
         reply_blocks: reply
             .iter()
             .map(|t| ReplyBlock {
@@ -1110,8 +1172,8 @@ fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
 /// `actions`) at general/2, plus the registry and the run id.
 fn awaiting_run(actions: &[&str]) -> (RunsModule, Registry, String) {
     let registry = registry(&[("bot", actions)]);
-    let mut m = watched(TurnPolicy::All, &registry);
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry);
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     (m, registry, run_id_for("general", 2, "bot"))
 }
@@ -1119,13 +1181,12 @@ fn awaiting_run(actions: &[&str]) -> (RunsModule, Registry, String) {
 fn job_registry() -> Registry {
     registry(&[("duck", &[ACTION_TASKS_CREATE])])
 }
-mod admin;
 mod composition;
 mod delivery;
-mod engagement;
 mod facets;
 mod job_runs;
 mod pages_actions;
+mod receipts;
 mod registry;
 mod sessions;
 mod state;

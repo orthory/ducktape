@@ -23,12 +23,12 @@
 //! compiled natively and unit-tested against a plain map. the wasm shell
 //! (`src/index_guest.rs`, feature `index-guest`) wires it into the engine.
 
-use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
+use index_guest::{Fail, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ATTEMPTS_EXHAUSTED_RESULT, JobStatus, JobsMsg, MAX_ATTEMPTS, TaskMsg, TaskStatus, WorkMsg,
-    decode_work_msg,
+    ATTEMPTS_EXHAUSTED_RESULT, JobStatus, JobsMsg, MAX_ATTEMPTS, MAX_LEASE_VIEWS, MIN_LEASE_VIEWS,
+    Party, TaskMsg, TaskStatus, WorkAssigned, WorkMsg, decode_assigned, decode_work_msg,
 };
 
 /// default page size for by-status listing (the cap is the scan clamp).
@@ -52,6 +52,7 @@ pub struct TaskRow {
     pub status: TaskStatus,
     /// the origin id that created the task (display-grade).
     pub created_by: String,
+    pub owner: Party,
     pub created_height: u64,
     pub created_at: u64,
     pub updated_height: u64,
@@ -64,7 +65,8 @@ pub struct JobRow {
     pub job_id: String,
     pub kind: String,
     pub spec: String,
-    /// rendered submitter: `user:{id}`, `module:{id}`, or `system`.
+    /// Rendered canonical submitter: `acct:{number}`, `ext:{hex}`,
+    /// `module:{id}`, or `system`.
     pub submitter: String,
     pub status: JobStatus,
     /// total number of successful claims over this job's life.
@@ -105,9 +107,6 @@ pub struct JobCountsRow {
     pub cancelled: u64,
 }
 
-/// tasks' view requests, externally tagged:
-/// `{"by_status": {"status": "open", "after": "...", "limit": 50}}` or
-/// `{"task": {"task_id": "..."}}`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TasksViewQuery {
@@ -186,13 +185,32 @@ fn job_count_key(status: &JobStatus) -> String {
     format!("jobcnt/{}", job_status_key(status))
 }
 
-/// rendered origin for job rows: the submitter/worker identity.
-fn render_origin(origin: &OriginTag) -> String {
-    let id = origin.id.as_deref().unwrap_or_default();
-    match origin.kind {
-        OriginKind::Module => format!("module:{id}"),
-        OriginKind::External => format!("user:{id}"),
-        OriginKind::System => "system".to_string(),
+fn assigned_party(op: &OpRow) -> Result<Party, Fail> {
+    let assigned =
+        decode_assigned(&op.assigned).map_err(|error| Fail::new(FAIL_OP_DECODE, error))?;
+    match assigned {
+        WorkAssigned::Task { .. } => {
+            Err(Fail::new(FAIL_OP_DECODE, "task stamp on a job operation"))
+        }
+        WorkAssigned::Job { actor } => Ok(actor),
+    }
+}
+
+fn task_parties(op: &OpRow) -> Result<(Party, Party), Fail> {
+    let assigned =
+        decode_assigned(&op.assigned).map_err(|error| Fail::new(FAIL_OP_DECODE, error))?;
+    let WorkAssigned::Task { actor, owner } = assigned else {
+        return Err(Fail::new(FAIL_OP_DECODE, "job stamp on a task operation"));
+    };
+    Ok((actor, owner))
+}
+
+fn render_party(party: &Party) -> String {
+    match party {
+        Party::Account(account) => format!("acct:{account}"),
+        Party::Key(key) => sdk::Origin::External(key.clone()).actor_string(),
+        Party::Module(module) => format!("module:{module}"),
+        Party::System => "system".into(),
     }
 }
 
@@ -243,19 +261,23 @@ fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, 
             task_id,
             title,
             owner: _,
-        } => put_row(
-            &mut out,
-            &TaskRow {
-                task_id,
-                title,
-                status: TaskStatus::Open,
-                created_by: op.origin.id.clone().unwrap_or_default(),
-                created_height: op.height,
-                created_at: op.time,
-                updated_height: op.height,
-                updated_at: op.time,
-            },
-        )?,
+        } => {
+            let (actor, owner) = task_parties(op)?;
+            put_row(
+                &mut out,
+                &TaskRow {
+                    task_id,
+                    title,
+                    status: TaskStatus::Open,
+                    created_by: render_party(&actor),
+                    owner,
+                    created_height: op.height,
+                    created_at: op.time,
+                    updated_height: op.height,
+                    updated_at: op.time,
+                },
+            )?
+        }
         TaskMsg::UpdateStatus { task_id, status } => {
             // absent row == the task predates this index; nothing to move.
             let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
@@ -356,7 +378,7 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
                 job_id,
                 kind,
                 spec,
-                submitter: render_origin(&op.origin),
+                submitter: render_party(&assigned_party(op)?),
                 status: JobStatus::Pending,
                 attempt: 0,
                 claim: None,
@@ -378,9 +400,9 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             };
             row.attempt += 1;
             row.claim = Some(JobClaimRow {
-                worker: render_origin(&op.origin),
+                worker: render_party(&assigned_party(op)?),
                 claimed_at_height: op.height,
-                lease_views,
+                lease_views: lease_views.clamp(MIN_LEASE_VIEWS, MAX_LEASE_VIEWS),
             });
             transition_job(read, &mut out, row, JobStatus::Processing, op)?;
         }
@@ -542,7 +564,10 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_task_msg(msg),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&WorkAssigned::Task {
+                actor: Party::Account(1),
+                owner: Party::Account(1),
+            }),
         }
     }
 
@@ -554,6 +579,31 @@ mod tests {
     fn view(map: &BTreeMap<Vec<u8>, Vec<u8>>, req: serde_json::Value) -> TasksViewReply {
         let bytes = serve_view(map, &serde_json::to_vec(&req).unwrap()).expect("view");
         serde_json::from_slice(&bytes).expect("reply decodes")
+    }
+
+    #[test]
+    fn task_index_preserves_module_creator_and_assigned_account_owner() {
+        let message = TaskMsg::CreateTask {
+            task_id: "delegated".into(),
+            title: "Work".into(),
+            owner: Some(9),
+        };
+        let mut operation = op(1, &message);
+        operation.origin = OriginTag::module("automations");
+        operation.assigned = crate::encode_assigned(&WorkAssigned::Task {
+            actor: Party::Module("automations".into()),
+            owner: Party::Account(9),
+        });
+        let mut map = BTreeMap::new();
+        let writes = fold_op(&operation, &map).unwrap();
+        apply_to_map(&mut map, writes);
+        let TasksViewReply::Task(Some(row)) =
+            view(&map, serde_json::json!({"task": {"task_id": "delegated"}}))
+        else {
+            panic!("task row");
+        };
+        assert_eq!(row.created_by, "module:automations");
+        assert_eq!(row.owner, Party::Account(9));
     }
 
     #[test]
@@ -584,7 +634,7 @@ mod tests {
             panic!("wrong reply shape")
         };
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].created_by, "jess");
+        assert_eq!(tasks[0].created_by, "acct:1");
 
         fold(
             &mut map,
@@ -664,9 +714,17 @@ mod tests {
             height,
             seq: 0,
             time: 1_000 + height,
-            origin,
+            origin: origin.clone(),
             payload: crate::encode_work_msg(&WorkMsg::Job(msg.clone())),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&WorkAssigned::Job {
+                actor: match origin.kind {
+                    index_guest::OriginKind::Module => Party::Module(origin.id.unwrap()),
+                    index_guest::OriginKind::System => Party::System,
+                    index_guest::OriginKind::Program | index_guest::OriginKind::External => {
+                        Party::Account(1)
+                    }
+                },
+            }),
         }
     }
 
@@ -737,7 +795,10 @@ mod tests {
         assert_eq!((counted.pending, counted.processing), (1, 1));
         let processing = jobs(&map, serde_json::json!({"jobs": {"status": "processing"}}));
         assert_eq!(processing[0].attempt, 1);
-        assert_eq!(processing[0].claim.as_ref().map(|c| c.lease_views), Some(8));
+        assert_eq!(
+            processing[0].claim.as_ref().map(|c| c.lease_views),
+            Some(MIN_LEASE_VIEWS)
+        );
 
         fold_job_msg(
             &mut map,

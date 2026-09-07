@@ -1413,6 +1413,7 @@ fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, owner_key: Vec<u8>) 
                 let view = identity::AccountView {
                     number: 1,
                     name: "owner".into(),
+                    control: identity::Control::Keys,
                     keys: vec![identity::KeyView {
                         scheme: identity::KeyScheme::Ed25519,
                         pubkey: owner_key.clone(),

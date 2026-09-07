@@ -22,7 +22,7 @@
 //! spelled out point by point — tasks rides the identical seams:
 //!
 //! * the guest rebuilds the module FRESH per dispatch over the production
-//!   constructor (`Tasks::new("tasks", store)`); its inner `pending` overlay is
+//!   constructor (`Tasks::new("tasks", "identity", "attribution", store)`); its inner `pending` overlay is
 //!   per-dispatch, and cross-dispatch read-your-writes comes from the host's
 //!   outer staged overlay via `WitStore::get` (staged-over-committed).
 //! * each successful `execute` flushes the inner staging with the inner
@@ -46,5 +46,5 @@ ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Tasks,
     shape: ducktape_module_sdk::store_shape(),
-    new: Tasks::new(MODULE_ID, Box::new(WitStore)),
+    new: Tasks::new(MODULE_ID, "identity", "attribution", Box::new(WitStore)),
 }

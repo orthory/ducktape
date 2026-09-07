@@ -92,6 +92,74 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     Host::genesis(vec![Box::new(wasm_identity(Box::new(store)))]).expect("genesis")
 }
 
+#[test]
+fn compiled_reference_batches_are_positional_bounded_and_read_only() {
+    deterministic::Runner::default().start(|context| async move {
+        use identity::{AccountRef, IdentityReply};
+        let mut native = native_host(&context).await;
+        let mut wasm = wasm_host_(&context).await;
+        for host in [&mut native, &mut wasm] {
+            for number in 1..=2 {
+                host.submit_at(
+                    block(number, Origin::External(ed_pub(&ed(number)))),
+                    create(&format!("person-{number}")),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let references = vec![
+            AccountRef::Key(ed_pub(&ed(2))),
+            AccountRef::Account(1),
+            AccountRef::Account(0),
+            AccountRef::Key(ed_pub(&ed(99))),
+            AccountRef::Account(99),
+            AccountRef::Key(ed_pub(&ed(1))),
+            AccountRef::Account(2),
+        ];
+        let expected = vec![Some(2), Some(1), None, None, None, Some(1), Some(2)];
+        for host in [&native, &wasm] {
+            let settled = root_of(host);
+            for (references, expected) in [
+                (references.clone(), expected.clone()),
+                (Vec::new(), Vec::new()),
+                (
+                    vec![AccountRef::Key(ed_pub(&ed(2))); MAX_QUERY_LIMIT as usize],
+                    vec![Some(2); MAX_QUERY_LIMIT as usize],
+                ),
+            ] {
+                let bytes = host
+                    .query(
+                        "identity",
+                        &encode_query(&IdentityQuery::Resolve { references }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    identity::decode_reply(&bytes).unwrap(),
+                    IdentityReply::Resolved(expected)
+                );
+            }
+            let error = host
+                .query(
+                    "identity",
+                    &encode_query(&IdentityQuery::Resolve {
+                        references: vec![AccountRef::Account(1); MAX_QUERY_LIMIT as usize + 1],
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("reference count exceeds query limit")
+            );
+            assert_eq!(root_of(host), settled);
+        }
+        assert_eq!(root_of(&native), root_of(&wasm));
+    });
+}
+
 // ---- key builders (the shapes identity's own tests use) --------------------
 
 type Ed = PrivateKey;

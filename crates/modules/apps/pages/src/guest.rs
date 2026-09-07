@@ -17,8 +17,8 @@
 //! must fully FLUSH per dispatch. each `execute`:
 //!
 //! 1. constructs the native module FRESH over `WitStore` — the exact
-//!    production builder chain (`Pages::new("pages", store).with_tagging
-//!    ("tagging")`), so `Env::me`, follow-up routing, and the tag-report edge
+//!    production builder chain (`Pages::new("pages", store).with_attribution
+//!    ("attribution")`), so `Env::me`, follow-up routing, and the attribution-report edge
 //!    read identically to ported logic,
 //! 2. runs the native `execute` over a [`WitCtx`] — its own-store reads go
 //!    `pending` → `WitStore::get` → host `state-get` (staged-over-committed;
@@ -54,21 +54,20 @@
 //!   rejected member re-runs accepted ops over the untouched store, same as
 //!   native.)
 //! * a rejected op: step 3 never ran, so nothing was flushed, and the runtime
-//!   restores the pre-dispatch overlay — the native execute's error paths
-//!   leave partial staging behind only until the host aborts the block, which
-//!   both sides answer identically.
+//!   restores the pre-dispatch overlay. The native module likewise restores
+//!   its incoming staging on rejection, preserving earlier successful ops.
 
 use crate::Pages;
 
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "pages";
-/// the engagement plane every newly-added comment is reported to — the
+/// the attribution plane every changed block/comment is reported to — the
 /// production wiring in
-/// (`bin/node/src/host_state.rs`): `.with_tagging("tagging")`. the wiring is
+/// (`bin/node/src/host_state.rs`): `.with_attribution("attribution")`. the wiring is
 /// genesis config compiled into the guest; drift here would be a consensus
 /// fork.
-const TAGGING_ID: &str = "tagging";
+const ATTRIBUTION_ID: &str = "attribution";
 
 use ducktape_module_sdk::WitStore;
 
@@ -78,5 +77,5 @@ ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Pages,
     shape: ducktape_module_sdk::store_shape(),
-    new: Pages::new(MODULE_ID, Box::new(WitStore)).with_tagging(TAGGING_ID),
+    new: Pages::new(MODULE_ID, Box::new(WitStore)).with_identity("identity").with_attribution(ATTRIBUTION_ID),
 }

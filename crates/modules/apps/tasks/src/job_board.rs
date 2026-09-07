@@ -50,7 +50,7 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, actor_from_origin,
+    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, Party, controls,
     encode_job_event, stage_record,
 };
 
@@ -66,8 +66,8 @@ pub const MAX_PAYLOAD: usize = 64 * 1024;
 pub const MAX_JOBS: usize = 65536;
 /// max live job records ONE submitter may hold at once, well under
 /// [`MAX_JOBS`]: no single account can fill a shared board with its own
-/// [`MAX_SPEC`]-sized records (64 MiB is this cap's whole byte ceiling per
-/// submitter), and [`JobsMsg::Prune`] is what lets a submitter recede from it.
+/// [`MAX_SPEC`]-sized records (at most 64 MiB of spec bytes per submitter,
+/// plus bounded record metadata). [`JobsMsg::Prune`] lets a submitter recede.
 /// "live" means the same thing the board census means: the RECORD exists.
 /// finalizing or cancelling a job does not free the slot, because the record
 /// (and its spec bytes) is still on the board -- only a prune drops it.
@@ -93,6 +93,8 @@ const COUNT_KEY: &[u8] = b"j#";
 /// the per-submitter live-job census (u64 LE), one record per submitter --
 /// what [`MAX_LIVE_JOBS_PER_SUBMITTER`] is checked against. a zero count drops
 /// the key, the same rule [`stage_count`] follows.
+/// The key encodes the stored Party: account keys share one counter; old
+/// key-owned records retain theirs after admission, just like their authority.
 const SUBMITTER_COUNT_PREFIX: &[u8] = b"j@";
 /// the registered worker set (a json `BTreeSet<ModuleId>`, at most
 /// [`MAX_WORKERS`] entries).
@@ -115,7 +117,7 @@ fn decode_job(bytes: &[u8]) -> Result<Job, Error> {
 // through the overlay. the `Get` query does NOT.
 
 /// the live view of a single job, reading through the staged overlay.
-async fn load(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
+pub(crate) async fn load(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
     let Some(bytes) = staged.get(&record_key(job_id)).await? else {
         return Ok(None);
     };
@@ -146,19 +148,19 @@ async fn live_count(staged: &StagedStore) -> Result<u64, Error> {
     read_census(staged, COUNT_KEY).await
 }
 
-fn submitter_count_key(submitter: &str) -> Vec<u8> {
+fn submitter_count_key(submitter: &Party) -> Vec<u8> {
     let mut key = SUBMITTER_COUNT_PREFIX.to_vec();
-    key.extend_from_slice(submitter.as_bytes());
+    key.extend_from_slice(&sdk::wire::encode(submitter));
     key
 }
 
 /// count of one submitter's live job records, through the staged overlay.
-async fn submitter_count(staged: &StagedStore, submitter: &str) -> Result<u64, Error> {
+async fn submitter_count(staged: &StagedStore, submitter: &Party) -> Result<u64, Error> {
     read_census(staged, &submitter_count_key(submitter)).await
 }
 
 /// stage a submitter's census (see [`SUBMITTER_COUNT_PREFIX`] on the zero case).
-fn stage_submitter_count(staged: &mut StagedStore, submitter: &str, count: u64) {
+fn stage_submitter_count(staged: &mut StagedStore, submitter: &Party, count: u64) {
     let key = submitter_count_key(submitter);
     if count == 0 {
         staged.delete(key);
@@ -167,9 +169,8 @@ fn stage_submitter_count(staged: &mut StagedStore, submitter: &str, count: u64) 
     staged.stage(key, count.to_le_bytes().to_vec());
 }
 
-/// stage the census. an EMPTY board drops the key entirely, so a board pruned
-/// back to nothing hashes to the same root a never-used one does (the
-/// empty-collection-is-absence rule the whole-state encoding gave for free).
+/// Stage the census. An empty board drops the counter entirely; source
+/// revision records remain so a recreated job cannot reuse an attribution.
 fn stage_count(staged: &mut StagedStore, count: u64) {
     if count == 0 {
         staged.delete(COUNT_KEY.to_vec());
@@ -269,7 +270,7 @@ async fn submit(
     job_id: String,
     kind: String,
     spec: String,
-    origin: &Origin,
+    actor: &Party,
     height: u64,
 ) -> Result<JobsEvent, Error> {
     // enforce every size cap HERE, at execute time, with rejection -- so
@@ -300,7 +301,7 @@ async fn submit(
         )));
     }
 
-    let submitter = actor_from_origin(origin)?;
+    let submitter = actor.clone();
     let submitter_live = submitter_count(staged, &submitter).await?;
     if submitter_live >= MAX_LIVE_JOBS_PER_SUBMITTER as u64 {
         return Err(Error::Module(format!(
@@ -338,7 +339,7 @@ async fn claim(
     staged: &mut StagedStore,
     job_id: String,
     lease_views: u64,
-    origin: &Origin,
+    actor: &Party,
     height: u64,
 ) -> Result<(), Error> {
     let mut job = require(staged, &job_id).await?;
@@ -350,7 +351,7 @@ async fn claim(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
+    let worker = actor.clone();
     job.status = JobStatus::Processing;
     job.attempt = job.attempt.saturating_add(1);
     job.claim = Some(Claim {
@@ -367,6 +368,7 @@ async fn finalize(
     job_id: String,
     ok: bool,
     payload: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -379,8 +381,11 @@ async fn finalize(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
-    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+    let is_claimant = job
+        .claim
+        .as_ref()
+        .is_some_and(|claim| controls(&claim.worker, actor, origin));
+    if !is_claimant {
         return Err(Error::Module(format!(
             "only the current claimant may finalize: {job_id}"
         )));
@@ -403,6 +408,7 @@ async fn finalize(
 async fn release(
     staged: &mut StagedStore,
     job_id: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -413,8 +419,11 @@ async fn release(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
-    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+    let is_claimant = job
+        .claim
+        .as_ref()
+        .is_some_and(|claim| controls(&claim.worker, actor, origin));
+    if !is_claimant {
         return Err(Error::Module(format!(
             "only the current claimant may release: {job_id}"
         )));
@@ -465,6 +474,7 @@ async fn reclaim(staged: &mut StagedStore, job_id: String, height: u64) -> Resul
 async fn cancel(
     staged: &mut StagedStore,
     job_id: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -476,8 +486,7 @@ async fn cancel(
             job.status
         )));
     }
-    let actor = actor_from_origin(origin)?;
-    if job.submitter != actor {
+    if !controls(&job.submitter, actor, origin) {
         return Err(Error::Module(format!(
             "only the submitter may cancel: {job_id}"
         )));
@@ -487,7 +496,12 @@ async fn cancel(
     stage_job(staged, &job)
 }
 
-async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Result<(), Error> {
+async fn prune(
+    staged: &mut StagedStore,
+    job_id: String,
+    actor: &Party,
+    origin: &Origin,
+) -> Result<(), Error> {
     let job = require(staged, &job_id).await?;
     if !job.status.is_terminal() {
         return Err(Error::Module(format!(
@@ -495,8 +509,7 @@ async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Res
             job.status
         )));
     }
-    let actor = actor_from_origin(origin)?;
-    if job.submitter != actor {
+    if !controls(&job.submitter, actor, origin) {
         return Err(Error::Module(format!(
             "only the submitter may prune: {job_id}"
         )));
@@ -517,14 +530,16 @@ pub(crate) async fn execute(
     staged: &mut StagedStore,
     ctx: &mut dyn Ctx,
     msg: JobsMsg,
+    actor: &Party,
     module_id: &ModuleId,
 ) -> Result<(), Error> {
     let env = ctx.env();
     let (origin, height) = (env.origin.clone(), env.height);
     match msg {
         JobsMsg::Submit { job_id, kind, spec } => {
-            let event = submit(staged, job_id, kind, spec, &origin, height).await?;
-            for worker in load_workers(staged).await? {
+            let workers = load_workers(staged).await?;
+            let event = submit(staged, job_id, kind, spec, actor, height).await?;
+            for worker in workers {
                 ctx.emit_msg(Msg {
                     target: worker,
                     payload: encode_job_event(&event),
@@ -535,16 +550,16 @@ pub(crate) async fn execute(
         JobsMsg::Claim {
             job_id,
             lease_views,
-        } => claim(staged, job_id, lease_views, &origin, height).await,
+        } => claim(staged, job_id, lease_views, actor, height).await,
         JobsMsg::Finalize {
             job_id,
             ok,
             payload,
-        } => finalize(staged, job_id, ok, payload, &origin, height).await,
-        JobsMsg::Release { job_id } => release(staged, job_id, &origin, height).await,
+        } => finalize(staged, job_id, ok, payload, actor, &origin, height).await,
+        JobsMsg::Release { job_id } => release(staged, job_id, actor, &origin, height).await,
         JobsMsg::Reclaim { job_id } => reclaim(staged, job_id, height).await,
-        JobsMsg::Cancel { job_id } => cancel(staged, job_id, &origin, height).await,
-        JobsMsg::Prune { job_id } => prune(staged, job_id, &origin).await,
+        JobsMsg::Cancel { job_id } => cancel(staged, job_id, actor, &origin, height).await,
+        JobsMsg::Prune { job_id } => prune(staged, job_id, actor, &origin).await,
         JobsMsg::RegisterWorker {} => register_worker(staged, &origin, module_id).await,
         JobsMsg::UnregisterWorker {} => unregister_worker(staged, &origin, module_id).await,
     }

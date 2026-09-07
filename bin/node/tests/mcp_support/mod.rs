@@ -1,34 +1,23 @@
-//! an in-process node for the MCP e2e, over noded's shared in-proc daemon
-//! testkit: a REAL `host::Host::genesis` with the agent registry, saga (the
-//! registry's declared collaborator) and tasks, fronted by `noded::router` on a
-//! local listener — the same shape as the `ducktape fs` harness, plus the modules the
-//! tool plane's gate is built on.
-//!
-//! chat and pages are deliberately ABSENT. both need a commonware runtime
-//! context to `init`, which would drag a deterministic runner into a test whose
-//! subject is a subprocess talking http. what they would prove — that a
-//! `ChatMsg` / `PageMsg` encodes to the module's wire shape — is proven in the
-//! unit tests against the modules' own types. what only an e2e can prove is
-//! that the CAP GATE and the SUBMIT path are real, and `tasks` proves both: a
-//! granted write reaches consensus, a denied one never leaves the process.
-//!
-//! the `NodeCommand` actor this used to hand-mirror now lives ONCE in
-//! `noded::testkit`; this harness just builds the host and hands it over.
+//! In-process MCP read/query fixture with real identity, programmable account,
+//! model configuration, source attribution and signed seeding writes.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::process::{Child, Command, Stdio};
 
+use commonware_cryptography::{Signer as _, ed25519};
 use host::Host;
 use noded::testkit::InProcDaemon;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// the agent every test registers, and the owner it is registered under. the
-/// owner is the origin the tool plane's writes must land with — the assertion
-/// that a run's writes are attributed to the person who owns the agent, not to
-/// the daemon that happened to execute it.
 pub const AGENT_ID: &str = "quackbot";
-pub const OWNER: &str = "alice";
+/// Deterministic Ed25519 fixture seed; every admitted write is actually signed.
+pub const OWNER: u64 = 7;
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(1);
+pub fn owner_key() -> ed25519::PrivateKey {
+    ed25519::PrivateKey::from_seed(OWNER)
+}
 
 pub struct Harness {
     // dropped BEFORE `dir` (fields drop in declaration order): the daemon's Drop
@@ -71,26 +60,45 @@ impl Harness {
                     Box::new(agent::AgentModule::new(
                         "agent",
                         Box::new(sdk_testkit::MemStore::new()),
-                        "saga",
-                        None,
+                        agent::Siblings {
+                            identity: "identity".into(),
+                            attribution: "attribution".into(),
+                            dispatch: "dispatch".into(),
+                        },
                     )),
+                    Box::new(identity::Identity::new(
+                        "identity",
+                        Box::new(sdk_testkit::MemStore::new()),
+                        "mcp-test".into(),
+                    )),
+                    Box::new(
+                        chat::Chat::new("chat", Box::new(sdk_testkit::MemStore::new()))
+                            .with_identity("identity")
+                            .with_attribution("attribution"),
+                    ),
                     Box::new(saga::SagaModule::new(
                         "saga",
                         Box::new(sdk_testkit::MemStore::new()),
                     )),
                     Box::new(tasks::Tasks::new(
                         "tasks",
+                        "identity",
+                        "attribution",
                         Box::new(sdk_testkit::MemStore::new()),
                     )),
                     Box::new(dispatch::DispatchModule::new(
                         "dispatch",
                         "saga",
+                        "identity",
                         Box::new(sdk_testkit::MemStore::new()),
                     )),
-                    Box::new(tagging::TaggingModule::new(
-                        "tagging",
-                        Box::new(sdk_testkit::MemStore::new()),
-                    )),
+                    Box::new(
+                        attribution::AttributionModule::new(
+                            "attribution",
+                            Box::new(sdk_testkit::MemStore::new()),
+                        )
+                        .with_subscribers(["agent"]),
+                    ),
                     Box::new(
                         forge::Forge::with_blobs("forge", forge_base, blobs).expect("forge module"),
                     ),
@@ -98,7 +106,7 @@ impl Harness {
                         "runs",
                         "chat",
                         "saga",
-                        "tagging",
+                        "attribution",
                         "dispatch",
                         "agent",
                         Some("tasks".into()),
@@ -107,12 +115,38 @@ impl Harness {
                 ])
                 .expect("genesis")
             },
-            vec!["agent".into()],
+            [
+                "identity",
+                "agent",
+                "attribution",
+                "runs",
+                "chat",
+                "tasks",
+                "saga",
+                "dispatch",
+                "forge",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             Some(blob_root),
         );
 
         let harness = Harness { daemon, dir };
-        harness.register_agent(allowed_actions, forge_read);
+        let created = harness.submit(
+            "identity",
+            serde_json::to_value(identity::IdentityMsg::Create {
+                name: "Alice".into(),
+                scheme: identity::KeyScheme::Ed25519,
+            })
+            .unwrap(),
+            OWNER,
+        );
+        assert!(
+            created.get("height").is_some(),
+            "identity creation: {created}"
+        );
+        harness.register_model(AGENT_ID, "Quackbot", allowed_actions, forge_read);
         harness
     }
 
@@ -120,32 +154,126 @@ impl Harness {
         self.daemon.node_url()
     }
 
-    /// register the agent under `OWNER` with the given grant. submitted with the
-    /// owner as the external origin, which is what makes `AgentRecord.owner`
-    /// `SagaOrigin::External(b"alice")` — the value the tool plane reads back and
-    /// submits its writes as.
-    fn register_agent(&self, allowed_actions: &[&str], forge_read: &[&str]) {
-        let mut actions: Vec<&str> = allowed_actions.to_vec();
-        // the registry canonicalizes to a sorted, deduped set; submit it that
-        // way so the record's bytes are the ones the test expects.
-        actions.sort_unstable();
-        actions.dedup();
-        let payload = json!({
-            "register_agent": {
-                "agent_id": AGENT_ID,
-                "display_name": "Quackbot",
-                "capability": "codex",
-                // no prompt pin: an agent IS its curated skills now, and this
-                // one curates none — the tool plane is what it is here to use.
-                "allowed_actions": actions,
-                "caps": {"forge_read": forge_read},
-            }
-        });
-        let reply = self.submit("agent", payload, OWNER);
-        assert!(
-            reply.get("height").is_some(),
-            "registering the agent must commit a block, got {reply}"
+    pub fn register_model(
+        &self,
+        id: &str,
+        name: &str,
+        allowed_actions: &[&str],
+        forge_read: &[&str],
+    ) -> u64 {
+        let provisioned = self.submit(
+            "agent",
+            serde_json::to_value(agent::AgentMsg::Provision {
+                name: name.into(),
+                program: runs::model_program(id),
+            })
+            .unwrap(),
+            OWNER,
         );
+        assert!(
+            provisioned.get("height").is_some(),
+            "provision: {provisioned}"
+        );
+        let reply = self.query(
+            "identity",
+            serde_json::to_value(identity::IdentityQuery::All {
+                from: 0,
+                limit: identity::MAX_QUERY_LIMIT,
+            })
+            .unwrap(),
+        );
+        let identity::IdentityReply::Accounts(accounts) =
+            serde_json::from_value(reply).expect("identity reply")
+        else {
+            panic!("account list");
+        };
+        let account = accounts
+            .into_iter()
+            .find(|account| {
+                account.name == name && matches!(account.control, identity::Control::Program { .. })
+            })
+            .expect("provisioned account")
+            .number;
+        let registered = self.submit(
+            "runs",
+            serde_json::to_value(runs::RunsMsg::ConfigureModel {
+                operation: runs::ModelMsg::RegisterModel {
+                    account,
+                    agent_id: id.into(),
+                    display_name: name.into(),
+                    capability: "codex".into(),
+                    allowed_actions: allowed_actions
+                        .iter()
+                        .map(|action| (*action).into())
+                        .collect(),
+                    recipe_hash: None,
+                    skills: None,
+                    caps: Some(runs::ResourceCaps {
+                        forge_read: forge_read.iter().map(|repo| (*repo).into()).collect(),
+                        ..Default::default()
+                    }),
+                },
+            })
+            .unwrap(),
+            OWNER,
+        );
+        assert!(
+            registered.get("height").is_some(),
+            "register model: {registered}"
+        );
+        account
+    }
+
+    /// Start actual consensus work without a provider accepting it. The read
+    /// tools can then prove their live-run binding without an invented run id.
+    pub fn pending_run(&self) -> String {
+        for message in [
+            chat::ChatMsg::CreateChannel {
+                channel_id: "mcp-read".into(),
+                name: "MCP read".into(),
+                post_policy: chat::PostPolicy::Open,
+            },
+            chat::ChatMsg::PostMessage {
+                channel_id: "mcp-read".into(),
+                message_id: "anchor".into(),
+                blocks: vec![chat::Block::paragraph("read the current grant")],
+                thread: None,
+            },
+        ] {
+            let reply = self.submit("chat", serde_json::to_value(message).unwrap(), OWNER);
+            assert!(reply.get("height").is_some(), "chat fixture: {reply}");
+        }
+        let reply = self.submit(
+            "runs",
+            serde_json::to_value(runs::RunsMsg::RequestRun {
+                agent_id: AGENT_ID.into(),
+                channel_id: "mcp-read".into(),
+                anchor_seq: 1,
+                demands: Default::default(),
+                skills: Vec::new(),
+            })
+            .unwrap(),
+            OWNER,
+        );
+        assert!(reply.get("height").is_some(), "run fixture: {reply}");
+        let settled = self
+            .daemon
+            .drain_ready_work()
+            .expect("commit queued program work");
+        assert!(settled.height > reply["height"].as_u64().expect("request height"));
+        let reply = self.query(
+            "runs",
+            serde_json::to_value(runs::RunsQuery::PendingRuns).unwrap(),
+        );
+        let runs::RunsReply::PendingRuns(runs) =
+            serde_json::from_value(reply).expect("pending run reply")
+        else {
+            panic!("pending runs");
+        };
+        runs.into_iter()
+            .find(|run| run.agent_id == AGENT_ID)
+            .expect("the actual pending run")
+            .run_id
     }
 
     /// a `ducktape mcp` subprocess wired exactly as the node's provisioner wires
@@ -280,11 +408,26 @@ impl Harness {
 
     /// submit an op straight at the node — the test's own seeding lane, and the
     /// oracle every write assertion is checked against.
-    pub fn submit(&self, target: &str, payload: Value, origin: &str) -> Value {
-        self.post(
-            "/v1/submit",
-            &json!({"target": target, "payload": payload, "origin": origin}),
+    pub fn submit(&self, target: &str, payload: Value, seed: u64) -> Value {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let frame = node::encode_frame(
+            &signer,
+            FRAME_SEQ.fetch_add(1, Ordering::Relaxed),
+            &sdk::Msg {
+                target: target.into(),
+                payload: sdk::wire::encode(&payload),
+            },
+        );
+        let (_status, raw) = nettest::try_http_bytes_with(
+            self.daemon.port(),
+            "POST",
+            "/v1/submit/frame",
+            "application/octet-stream",
+            &[],
+            &frame,
         )
+        .expect("signed submit");
+        serde_json::from_slice(&raw).expect("submit reply")
     }
 
     /// query the node directly — how a test reads back what the MCP server

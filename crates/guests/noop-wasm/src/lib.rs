@@ -27,6 +27,14 @@ impl Guest for Component {
     /// what the host must know to run this component: which substrate to
     /// wrap it over, which network parameters to seed, how queries read. a
     /// pure constant — the host reads it before any dispatch, with no env.
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Map,
