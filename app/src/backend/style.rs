@@ -64,38 +64,11 @@ pub fn titlebar_inset() -> f64 {
     if cfg!(target_os = "macos") { 68.0 } else { 0.0 }
 }
 
-/// Tints an icon with one step of the artifact's ink ramp. The asset itself is
-/// drawn on `currentColor`, so the tone — not a second asset — is what makes a
-/// muted rail icon and an accent action icon different.
-pub fn icon_tint(
-    theme: &iced::Theme,
-    _status: iced::widget::svg::Status,
-    tone: impl AsRef<str>,
-) -> iced::widget::svg::Style {
-    let ramp = if theme_is_dark(theme) {
-        design::ink::tone_dark
-    } else {
-        design::ink::tone
-    };
-    iced::widget::svg::Style {
-        color: Some(rgb(ramp(tone.as_ref()))),
-    }
-}
-
 /// Whether the live palette is the dark reading. The generated theme's base
 /// text color IS `app_text`, so light text means a dark surface — no theme
 /// name string to allocate and compare per style call.
 pub(crate) fn theme_is_dark(theme: &iced::Theme) -> bool {
     theme.palette().text.r > 0.5
-}
-
-/// An artifact hex literal as an opaque iced color.
-fn rgb(hex: u32) -> iced::Color {
-    iced::Color::from_rgb8(
-        ((hex >> 16) & 0xff) as u8,
-        ((hex >> 8) & 0xff) as u8,
-        (hex & 0xff) as u8,
-    )
 }
 
 /// The token set matching the live palette reading.
