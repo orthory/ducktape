@@ -13,6 +13,7 @@ version.workspace = true
 guest = ["dep:ducktape-module-sdk"]
 
 [dependencies]
+node-work = { workspace = true }
 # wasm-only, behind `guest`: the port harness. a standalone-workspace path
 # crate, pulled only when the guest build compiles this crate for wasm32.
 ducktape-module-sdk = { workspace = true, optional = true }
@@ -20,6 +21,9 @@ sdk = { workspace = true }
 agent = { workspace = true }
 identity = { workspace = true }
 capability = { workspace = true }
+governance = { workspace = true }
+modules = { workspace = true }
+valset = { workspace = true }
 borsh = { workspace = true }
 # default-features = false on chat/tasks/pages/saga: only their consensus wire
 # types cross this edge, and the `runs` guest builds this crate for
@@ -53,7 +57,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-valset = { workspace = true }
+syn = { version = "2", features = ["full"] }
 # the host-side qmdb store handle the chat test fixtures inject.
 statesync = { workspace = true }
 # the shared programmable `TestCtx` (dev-only) — serves the dispatch sibling read.

@@ -31,25 +31,25 @@ pub const MIN_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 /// cannot be salvaged by retrying, so it must fail at submit-adjacent time.
 pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// headroom multiplier over the measured tree, for an image the guest WRITES
-/// into: it needs room for the run's output, not just its input.
-const HEADROOM: u64 = 3;
-
-/// spare room over the measured tree for an image nothing writes into. Not
-/// headroom — ext4's own metadata (inodes, bitmaps, the journal) does not fit
+/// Spare room over the input tree for filesystem metadata.
+/// ext4's own metadata (inodes, bitmaps, the journal) does not fit
 /// in the file bytes alone, and `mke2fs -d` fails with `No space left` if the
 /// image is sized at exactly the payload.
-const READ_ONLY_MARGIN_PERCENT: u64 = 20;
+const IMAGE_METADATA_MARGIN_PERCENT: u64 = 20;
 
-/// the image size for a WRITABLE tree: measured × [`HEADROOM`], floored at
-/// [`MIN_WORKSPACE_BYTES`] and refused above [`MAX_WORKSPACE_BYTES`].
+/// A writable tree gets the existing byte limit as sparse capacity. Input size
+/// does not predict output size: a small source checkout can produce a much
+/// larger build. Only written blocks consume host disk; the guest filesystem
+/// enforces the limit when a run writes.
 pub fn sized_for(workdir: &Path) -> Result<u64, String> {
     let measured = tree_bytes(workdir)?;
-    size_or_refuse(
-        "workspace",
-        workdir,
-        measured.saturating_mul(HEADROOM).max(MIN_WORKSPACE_BYTES),
-    )
+    size_or_refuse("workspace", workdir, with_metadata(measured))?;
+    Ok(MAX_WORKSPACE_BYTES)
+}
+
+fn with_metadata(measured: u64) -> u64 {
+    let margin = measured / 100 * IMAGE_METADATA_MARGIN_PERCENT;
+    measured.saturating_add(margin).max(MIN_WORKSPACE_BYTES)
 }
 
 /// the image size for a READ-ONLY tree: measured plus a metadata margin, and
@@ -62,14 +62,7 @@ pub fn sized_for(workdir: &Path) -> Result<u64, String> {
 /// zeroes nothing could ever write to.
 pub fn sized_for_read_only(dir: &Path) -> Result<u64, String> {
     let measured = tree_bytes(dir)?;
-    let margin = measured / 100 * READ_ONLY_MARGIN_PERCENT;
-    size_or_refuse(
-        "read-only inputs",
-        dir,
-        measured
-            .saturating_add(margin)
-            .max(MIN_WORKSPACE_BYTES),
-    )
+    size_or_refuse("read-only inputs", dir, with_metadata(measured))
 }
 
 /// the size decision alone, split out so the refusal is unit-testable without
@@ -670,7 +663,7 @@ mod tests {
             .expect("the cap itself is allowed");
     }
 
-    /// A read-only image gets a metadata margin, NOT the writable image's ×3.
+    /// A read-only image gets a metadata margin, without writable capacity.
     ///
     /// This decided real runs: a run's read-only inputs are its PATH commands,
     /// and where those include a build directory they measure gigabytes. At ×3
@@ -690,7 +683,10 @@ mod tests {
 
         let writable = sized_for(&root).expect("writable size");
         let read_only = sized_for_read_only(&root).expect("read-only size");
-        assert_eq!(writable, payload * 3, "writable is measured × HEADROOM");
+        assert_eq!(
+            writable, MAX_WORKSPACE_BYTES,
+            "writable has room for outputs"
+        );
         assert!(
             read_only < writable,
             "read-only {read_only} must be under writable {writable}"
@@ -703,12 +699,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An empty workspace still needs a journal, so the floor applies rather
-    /// than the measured zero.
+    /// A small input must have room for a build independent of its input size.
     #[test]
-    fn an_empty_workspace_is_floored_not_zero_sized() {
+    fn an_empty_workspace_can_produce_a_large_output_without_preallocating_it() {
+        use std::io::Write as _;
+        if !have_e2fsprogs() {
+            return;
+        }
         let root = scratch("floor");
-        assert_eq!(sized_for(&root).expect("size"), MIN_WORKSPACE_BYTES);
+        let src = root.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let image = root.join("workspace.img");
+        assert_eq!(sized_for(&src).expect("size"), MAX_WORKSPACE_BYTES);
+        build(&src, &image, sized_for(&src).unwrap()).unwrap();
+        let meta = std::fs::metadata(&image).unwrap();
+        assert!(
+            meta.blocks() * 512 < meta.len() / 2,
+            "capacity must be sparse"
+        );
+        let payload = root.join("output");
+        let mut file = std::fs::File::create(&payload).unwrap();
+        let block = [7u8; 64 * 1024];
+        for _ in 0..1024 {
+            file.write_all(&block).unwrap();
+        }
+        drop(file);
+        let result = Command::new(crate::host_tools::find_system_tool("debugfs").unwrap())
+            .current_dir(&root)
+            .args(["-w", "-R", "write output /grown"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let out = root.join("readback");
+        read_back(&image, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("grown")).unwrap(),
+            std::fs::read(payload).unwrap()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

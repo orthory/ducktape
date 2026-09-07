@@ -139,6 +139,26 @@ pub struct DelegationView {
 // the same direct construction API as the other module operations.
 #[allow(clippy::large_enum_variant)]
 pub enum RunsMsg {
+    /// A program commits an immutable deployment request for the node executors.
+    RequestModuleUpdate {
+        request_id: String,
+        run_id: String,
+        source: ModuleUpdateSource,
+        update: ModuleUpdateSpec,
+    },
+    /// A validator confirms local residency of this request's immutable artifact.
+    MarkModuleArtifactStaged {
+        sequence: u64,
+    },
+    /// Anyone may reconcile a request against its actual registry/governance outcome.
+    ReconcileModuleUpdate {
+        sequence: u64,
+    },
+    /// A validator reports an invalid deployment before its proposal exists.
+    RefuseModuleUpdate {
+        sequence: u64,
+        reason: String,
+    },
     /// Configure model work for an existing keyless program account.
     ConfigureModel {
         operation: crate::ModelMsg,
@@ -358,6 +378,15 @@ pub struct RunAuthorityView {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
+    NodeWork {
+        node_key: Vec<u8>,
+        height: u64,
+        consensus_time: u64,
+    },
+    NextModuleUpdate,
+    ModuleUpdate {
+        sequence: u64,
+    },
     Model {
         query: crate::ModelQuery,
     },
@@ -395,6 +424,8 @@ pub enum RunsQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
+    NodeWork(Option<node_work::Directive>),
+    ModuleUpdate(Option<ModuleUpdateView>),
     Model(crate::ModelReply),
     ActionRequest(Option<ActionRequestView>),
     PendingRuns(Vec<PendingRun>),
@@ -425,6 +456,56 @@ pub fn encode_reply(r: &RunsReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<RunsReply, String> {
     sdk::wire::decode(b)
+}
+
+/// A prebuilt artifact file within the output commit and its SHA-256 digest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateSpec {
+    pub module_id: String,
+    pub artifact: String,
+    pub code_hash: String,
+    pub after: u64,
+}
+
+/// The host-pushed output, bound before the program receives the deployment action.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateSource {
+    pub repo: String,
+    pub branch: String,
+    pub commit: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModuleUpdateStatus {
+    Requested,
+    Activated { height: u64 },
+    Rejected { reason: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateRequest {
+    pub sequence: u64,
+    pub request_id: String,
+    pub account: sdk::AccountNumber,
+    pub run_id: String,
+    pub source: ModuleUpdateSource,
+    pub update: ModuleUpdateSpec,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleUpdateView {
+    pub request: ModuleUpdateRequest,
+    pub status: ModuleUpdateStatus,
+}
+
+/// Every validator joins the same ceremony; a completed request never reuses its id.
+pub fn module_update_proposal_id(sequence: u64) -> String {
+    format!("program-module:{sequence}")
 }
 
 /// A run tool request is proposed work until a program's real target call completes.

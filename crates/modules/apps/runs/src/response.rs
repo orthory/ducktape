@@ -565,6 +565,7 @@ impl RunsModule {
             .await;
         self.emit_duckfs_effects(ctx, run_id, entry, &response.actions)
             .await;
+        self.emit_module_updates(ctx, run_id, entry, &result, &response.actions);
         self.emit_response(ctx, run_id, entry, Lane::Settle, response)
             .await;
         // the binding is the sink COMMITTED at dispatch (#1835), never the
@@ -754,6 +755,12 @@ impl RunsModule {
                 return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
             }
             match action {
+                AgentAction::UpdateModule(update) => {
+                    if !matches!(lane, Lane::Settle) {
+                        return Err("modules.update requires the final response and its committed forge output".into());
+                    }
+                    update.validate()?;
+                }
                 // an agent SPEAKING — its own channel, its own moment — as
                 // opposed to reply_blocks, which only answer where the agent was
                 // engaged. that is the wider power, so it rides its own grant
@@ -1411,6 +1418,7 @@ impl RunsModule {
         }
         for (index, action) in response.actions.into_iter().enumerate() {
             let msg = match action {
+                AgentAction::UpdateModule(_) => continue,
                 AgentAction::PostMessage {
                     channel_id,
                     text,
