@@ -20,7 +20,10 @@ use tasks::{
     encode_job_event as encode_jobs_event, encode_job_msg as encode_msg,
     encode_job_query as encode_query,
 };
-use tasks::{MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS, Tasks as Jobs};
+use tasks::{
+    MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD, MAX_SPEC,
+    MAX_WORKERS, Tasks as Jobs,
+};
 
 // the merged work module's genesis id -- the job board now lives here.
 const JOBS: &str = "tasks";
@@ -630,26 +633,76 @@ fn max_jobs_cap_is_overlay_aware() {
     block_on(async {
         let mut jobs = jobs_on_mem();
         // fill the board to exactly MAX_JOBS distinct live ids, committing each
-        // so the live-count stays O(1).
+        // so the live-count stays O(1). the submitter rotates every
+        // MAX_LIVE_JOBS_PER_SUBMITTER ids, so the GLOBAL cap is what trips
+        // here and not the per-submitter one.
         for i in 0..MAX_JOBS {
+            let submitter = ext(&format!("submitter-{}", i / MAX_LIVE_JOBS_PER_SUBMITTER));
             apply(
                 &mut jobs,
                 1,
-                ext("submitter"),
+                submitter,
                 submit(&format!("job-{i:05}"), "k", ""),
             )
             .await;
         }
-        // the next distinct id is refused.
+        // the next distinct id is refused -- from a fresh submitter, so only
+        // the board-wide cap can be the reason.
         let err = stage(
             &mut jobs,
             1,
-            ext("submitter"),
+            ext("submitter-fresh"),
             submit("job-overflow", "k", ""),
         )
         .await
         .expect_err("board full");
         assert!(matches!(err, Error::Module(m) if m.contains("job board full")));
+    });
+}
+
+/// ONE submitter cannot fill the shared board: it is refused BY NAME at
+/// [`MAX_LIVE_JOBS_PER_SUBMITTER`] while another account still submits, and a
+/// prune -- the only path that frees a slot -- lets it back in for exactly one.
+#[test]
+fn one_submitter_cannot_fill_the_board() {
+    block_on(async {
+        let mut jobs = jobs_on_mem();
+        for i in 0..MAX_LIVE_JOBS_PER_SUBMITTER {
+            apply(
+                &mut jobs,
+                1,
+                ext("greedy"),
+                submit(&format!("greedy-{i:05}"), "k", ""),
+            )
+            .await;
+        }
+
+        let err = stage(&mut jobs, 1, ext("greedy"), submit("one-more", "k", ""))
+            .await
+            .expect_err("the submitter is at its cap");
+        assert!(
+            matches!(&err, Error::Module(m) if m.contains("job submitter at cap")),
+            "the refusal names the cap: {err}"
+        );
+        assert!(get(&jobs, "one-more").await.is_none(), "nothing staged");
+
+        // the board is nowhere near MAX_JOBS: a second account still submits.
+        apply(&mut jobs, 2, ext("polite"), submit("polite-1", "k", "")).await;
+        assert!(get(&jobs, "polite-1").await.is_some());
+
+        // a terminal job still holds its slot -- only the prune frees one.
+        apply(&mut jobs, 3, ext("greedy"), cancel("greedy-00000")).await;
+        stage(&mut jobs, 3, ext("greedy"), submit("one-more", "k", ""))
+            .await
+            .expect_err("a cancelled record still occupies the board");
+        jobs.abort_block().await.expect("abort");
+
+        apply(&mut jobs, 4, ext("greedy"), prune("greedy-00000")).await;
+        apply(&mut jobs, 5, ext("greedy"), submit("one-more", "k", "")).await;
+        assert!(get(&jobs, "one-more").await.is_some());
+        stage(&mut jobs, 6, ext("greedy"), submit("and-another", "k", ""))
+            .await
+            .expect_err("back at the cap after the one freed slot");
     });
 }
 

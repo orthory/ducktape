@@ -29,7 +29,10 @@
 //!
 //! # state
 //!
-//! one record per job (`j/{job_id}`), the live-job census in `j#`, and the
+//! one record per job (`j/{job_id}`), the live-job census in `j#`, the
+//! per-submitter census in `j@{submitter}` (so no ONE account can fill a
+//! shared board -- [`MAX_LIVE_JOBS_PER_SUBMITTER`], the task board's
+//! `MAX_OPEN_TASKS_PER_OWNER` shape), and the
 //! registered worker set in `w#`. a transition reads ONE record, rewrites it,
 //! and stages the result -- no board walk, and a `Prune` stages a delete that
 //! drops the key (and its bytes) from the root at commit. the census is a
@@ -61,12 +64,23 @@ pub const MAX_SPEC: usize = 64 * 1024;
 pub const MAX_PAYLOAD: usize = 64 * 1024;
 /// max distinct live job ids on the board.
 pub const MAX_JOBS: usize = 65536;
+/// max live job records ONE submitter may hold at once, well under
+/// [`MAX_JOBS`]: no single account can fill a shared board with its own
+/// [`MAX_SPEC`]-sized records (64 MiB is this cap's whole byte ceiling per
+/// submitter), and [`JobsMsg::Prune`] is what lets a submitter recede from it.
+/// "live" means the same thing the board census means: the RECORD exists.
+/// finalizing or cancelling a job does not free the slot, because the record
+/// (and its spec bytes) is still on the board -- only a prune drops it.
+pub const MAX_LIVE_JOBS_PER_SUBMITTER: usize = 1024;
 /// lower clamp for a claim lease, in views.
 pub const MIN_LEASE_VIEWS: u64 = 10;
 /// upper clamp for a claim lease, in views.
 pub const MAX_LEASE_VIEWS: u64 = 10_000;
 /// after this many claims, an expired reclaim fails the job instead of requeuing.
 pub const MAX_ATTEMPTS: u64 = 8;
+/// the result payload a reclaim writes when it gives up on a job. the index
+/// mapper folds the same string, so the two tiers cannot drift.
+pub const ATTEMPTS_EXHAUSTED_RESULT: &str = "attempts exhausted";
 /// max registered worker modules notified on each successful submit.
 pub const MAX_WORKERS: usize = 16;
 /// max bytes of a worker module id.
@@ -76,6 +90,10 @@ pub const MAX_WORKER_MODULE_ID: usize = 256;
 const RECORD_PREFIX: &[u8] = b"j/";
 /// the live-job census (u64 LE) -- what [`MAX_JOBS`] is checked against.
 const COUNT_KEY: &[u8] = b"j#";
+/// the per-submitter live-job census (u64 LE), one record per submitter --
+/// what [`MAX_LIVE_JOBS_PER_SUBMITTER`] is checked against. a zero count drops
+/// the key, the same rule [`stage_count`] follows.
+const SUBMITTER_COUNT_PREFIX: &[u8] = b"j@";
 /// the registered worker set (a json `BTreeSet<ModuleId>`, at most
 /// [`MAX_WORKERS`] entries).
 const WORKERS_KEY: &[u8] = b"w#";
@@ -111,9 +129,9 @@ async fn require(staged: &StagedStore, job_id: &str) -> Result<Job, Error> {
         .ok_or_else(|| Error::Module(format!("job not found: {job_id}")))
 }
 
-/// count of distinct live job ids, reading through the staged overlay.
-async fn live_count(staged: &StagedStore) -> Result<u64, Error> {
-    let Some(bytes) = staged.get(COUNT_KEY).await? else {
+/// one census counter, reading through the staged overlay. an absent key is 0.
+async fn read_census(staged: &StagedStore, key: &[u8]) -> Result<u64, Error> {
+    let Some(bytes) = staged.get(key).await? else {
         return Ok(0);
     };
     let raw: [u8; 8] = bytes
@@ -121,6 +139,32 @@ async fn live_count(staged: &StagedStore) -> Result<u64, Error> {
         .try_into()
         .map_err(|_| Error::Module("job census record is not a u64".into()))?;
     Ok(u64::from_le_bytes(raw))
+}
+
+/// count of distinct live job ids, reading through the staged overlay.
+async fn live_count(staged: &StagedStore) -> Result<u64, Error> {
+    read_census(staged, COUNT_KEY).await
+}
+
+fn submitter_count_key(submitter: &str) -> Vec<u8> {
+    let mut key = SUBMITTER_COUNT_PREFIX.to_vec();
+    key.extend_from_slice(submitter.as_bytes());
+    key
+}
+
+/// count of one submitter's live job records, through the staged overlay.
+async fn submitter_count(staged: &StagedStore, submitter: &str) -> Result<u64, Error> {
+    read_census(staged, &submitter_count_key(submitter)).await
+}
+
+/// stage a submitter's census (see [`SUBMITTER_COUNT_PREFIX`] on the zero case).
+fn stage_submitter_count(staged: &mut StagedStore, submitter: &str, count: u64) {
+    let key = submitter_count_key(submitter);
+    if count == 0 {
+        staged.delete(key);
+        return;
+    }
+    staged.stage(key, count.to_le_bytes().to_vec());
 }
 
 /// stage the census. an EMPTY board drops the key entirely, so a board pruned
@@ -257,6 +301,12 @@ async fn submit(
     }
 
     let submitter = actor_from_origin(origin)?;
+    let submitter_live = submitter_count(staged, &submitter).await?;
+    if submitter_live >= MAX_LIVE_JOBS_PER_SUBMITTER as u64 {
+        return Err(Error::Module(format!(
+            "job submitter at cap: {MAX_LIVE_JOBS_PER_SUBMITTER} live jobs"
+        )));
+    }
     let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
     stage_job(
         staged,
@@ -274,6 +324,7 @@ async fn submit(
         },
     )?;
     stage_count(staged, count + 1);
+    stage_submitter_count(staged, &submitter, submitter_live + 1);
     Ok(JobsEvent::Submitted {
         job_id,
         kind,
@@ -401,7 +452,7 @@ async fn reclaim(staged: &mut StagedStore, job_id: String, height: u64) -> Resul
         job.status = JobStatus::Failed;
         job.result = Some(JobResult {
             ok: false,
-            payload: "attempts exhausted".into(),
+            payload: ATTEMPTS_EXHAUSTED_RESULT.into(),
         });
     } else {
         job.status = JobStatus::Pending;
@@ -453,6 +504,10 @@ async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Res
     let count = live_count(staged).await?;
     staged.delete(record_key(&job_id));
     stage_count(staged, count.saturating_sub(1));
+    // the prune is the ONLY path that frees a board slot -- both censuses
+    // recede together, the record's disappearance being what each counts.
+    let submitter_live = submitter_count(staged, &job.submitter).await?;
+    stage_submitter_count(staged, &job.submitter, submitter_live.saturating_sub(1));
     Ok(())
 }
 
