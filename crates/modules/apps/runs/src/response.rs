@@ -1062,17 +1062,17 @@ impl RunsModule {
                 let bytes = ctx
                     .query(
                         pages,
-                        &pages::encode_query(&pages::PageQuery::CommentThread {
+                        &pages::encode_query(&pages::PageQuery::CommentThreadHead {
                             thread_id: thread_id.into(),
                         }),
                     )
                     .await
                     .map_err(|e| e.to_string())?;
                 match pages::decode_reply(&bytes).map_err(|e| e.to_string())? {
-                    pages::PageReply::CommentThread(Some(view)) => {
-                        (view.thread.target, view.thread.comment_ids.len())
+                    pages::PageReply::CommentThreadHead(Some(head)) => {
+                        (head.target, head.comment_count as usize)
                     }
-                    pages::PageReply::CommentThread(None) => {
+                    pages::PageReply::CommentThreadHead(None) => {
                         let target = new_target
                             .ok_or_else(|| format!("pages thread is missing: {thread_id}"))?;
                         let bytes = ctx

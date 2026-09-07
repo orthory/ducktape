@@ -696,6 +696,14 @@ impl Ctx for CaptureCtx {
                             .cloned(),
                     )))
                 }
+                pages::PageQuery::CommentThreadHead { thread_id } => {
+                    let view = self.page_threads.get(&thread_id).cloned().or_else(|| {
+                        self.taken_page_ids.contains(&thread_id).then(|| dummy_thread_view(&thread_id))
+                    });
+                    Ok(pages::encode_reply(&pages::PageReply::CommentThreadHead(view.map(|view| pages::CommentThreadHead {
+                        target: view.thread.target, comment_count: view.thread.comment_ids.len() as u64,
+                    }))))
+                }
                 pages::PageQuery::CommentThread { thread_id } => {
                     Ok(pages::encode_reply(&pages::PageReply::CommentThread(
                         self.page_threads.get(&thread_id).cloned().or_else(|| {

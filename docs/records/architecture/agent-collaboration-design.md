@@ -78,7 +78,8 @@ attributed run whose binding fails does not start its provider.
 destination, Runs resolves it from committed source context: the original chat
 thread, the Pages comment thread, a shared reply thread on the mentioned block,
 or the job discussion. Live, final and failure replies use the same resolver
-and execute as the program account. An action-only final response keeps its
+and execute as the program account. Pages reply validation reads thread metadata
+without loading the discussion bodies. An action-only final response keeps its
 actions without inventing another source reply.
 
 The host forwards the destination object without decoding a modality enum.

@@ -110,19 +110,6 @@ pub(super) fn tools() -> Vec<Tool> {
             handler: job_get,
         },
         Tool {
-            name: "ducktape_page_thread",
-            description: "Read a Pages comment thread and its comments before replying to it.",
-            schema: || {
-                schema(&[(
-                    "thread_id",
-                    "string",
-                    true,
-                    "The Pages comment thread to read.",
-                )])
-            },
-            handler: page_thread_get,
-        },
-        Tool {
             name: "ducktape_pages",
             description: "Read one bounded page of page ids and titles. Pass next_after as after \
                           to continue.",
@@ -313,13 +300,6 @@ fn job_get(run: &Run, args: &Value) -> Result<Value> {
         job_id: arg_str(args, "job_id")?,
     });
     run.node.query(TARGET_TASKS, encode(&query)?)
-}
-
-fn page_thread_get(run: &Run, args: &Value) -> Result<Value> {
-    let query = PageQuery::CommentThread {
-        thread_id: arg_str(args, "thread_id")?,
-    };
-    run.node.query(TARGET_PAGES, encode(&query)?)
 }
 
 fn pages_list(run: &Run, args: &Value) -> Result<Value> {
