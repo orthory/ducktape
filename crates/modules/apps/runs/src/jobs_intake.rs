@@ -234,7 +234,7 @@ impl RunsModule {
         )
     }
 
-    async fn job_claimed_by_run(
+    pub(super) async fn job_claimed_by_run(
         &self,
         ctx: &dyn Ctx,
         job_id: &str,

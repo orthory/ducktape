@@ -108,7 +108,6 @@ async fn awaiting_pr_with_actions(
                         allowed_actions: Some(vec![
                             runs::ACTION_TASKS_CREATE.into(),
                             runs::ACTION_CHAT_POST.into(),
-                            runs::ACTION_CHAT_POST_MESSAGE.into(),
                             runs::ACTION_MODULES_UPDATE.into(),
                         ]),
                         recipe_hash: None,
@@ -223,6 +222,7 @@ async fn awaiting_pr_with_actions(
             msg(
                 "runs",
                 &runs::RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: run.run_id.clone(),
                     session_key: vec![9; 32],
                 },
@@ -236,10 +236,9 @@ async fn awaiting_pr_with_actions(
                 "runs",
                 &runs::RunsMsg::AgentAction {
                     run_id: run.run_id.clone(),
-                    action: runs::AgentAction::PostMessage {
-                        channel_id: "forge:demo:1".into(),
+                    action: runs::AgentAction::Reply {
                         text: "Working on this issue".into(),
-                        thread: None,
+                        destination: None,
                     },
                 },
             ),
@@ -256,6 +255,26 @@ async fn awaiting_pr_with_actions(
             ..
         }
     ));
+    let bytes = network
+        .host
+        .query(
+            "chat",
+            &chat::encode_query(&chat::ChatQuery::Message {
+                message_id: runs::post_message_id(&run.run_id, "s0"),
+            }),
+        )
+        .await
+        .unwrap();
+    let chat::ChatReply::Message(Some(progress)) = chat::decode_reply(&bytes).unwrap() else {
+        panic!("the program must commit the live reply before the provider finishes");
+    };
+    assert_eq!(progress.head.author, chat::Party::Account(2));
+    assert_eq!(progress.head.origin, sdk::Origin::Program(2));
+    assert_eq!(progress.head.thread, Some(1));
+    assert_eq!(
+        progress.head.blocks,
+        vec![chat::Block::paragraph("Working on this issue")]
+    );
     let result = sdk::wire::encode(&serde_json::json!({
         "ducktape_runner_result": 1,
         "response_text": serde_json::json!({
@@ -323,6 +342,7 @@ fn history_links_the_actual_program_allocation_after_another_item_wins_the_next_
         };
         assert_eq!(reply.head.author, chat::Party::Account(2));
         assert_eq!(reply.head.origin, sdk::Origin::Program(2));
+        assert_eq!(reply.head.thread, Some(1));
         assert_eq!(
             history(&network, &run.run_id).await.unwrap().pr_number,
             Some(3)

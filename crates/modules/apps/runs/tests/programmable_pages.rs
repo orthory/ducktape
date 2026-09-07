@@ -166,6 +166,7 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                     msg(
                         "runs",
                         &runs::RunsMsg::OpenAgentSession {
+                            attempt: 0,
                             run_id: run.run_id.clone(),
                             session_key: vec![10; 32],
                         },
@@ -213,6 +214,24 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
             };
             assert_eq!(todo.author, pages::Party::Account(1));
             assert!(!todo.checked);
+            for text in ["Review started.", "Review still in progress."] {
+                network
+                    .submit(
+                        sdk::Origin::External(vec![10; 32]),
+                        msg(
+                            "runs",
+                            &runs::RunsMsg::AgentAction {
+                                run_id: run.run_id.clone(),
+                                action: runs::AgentAction::Reply {
+                                    text: text.into(),
+                                    destination: None,
+                                },
+                            },
+                        ),
+                    )
+                    .await;
+                network.drain().await;
+            }
             let result = sdk::wire::encode(&serde_json::json!({
                 "ducktape_runner_result": 1,
                 "response_text": "Reviewed the tagged source.",
@@ -242,7 +261,24 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
             assert_eq!(thread.thread.target, target);
             assert_eq!(thread.thread.opener, pages::Party::Account(2));
             assert_eq!(thread.comments[0].author, pages::Party::Account(2));
-            assert_eq!(thread.comments[0].text, "Reviewed the tagged source.");
+            assert_eq!(
+                thread
+                    .comments
+                    .iter()
+                    .map(|comment| comment.text.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Review started.",
+                    "Review still in progress.",
+                    "Reviewed the tagged source."
+                ]
+            );
+            assert!(
+                thread
+                    .comments
+                    .iter()
+                    .all(|comment| comment.author == pages::Party::Account(2))
+            );
             assert_eq!(network.runs().await.len(), 1, "the page run closed");
         }
     });
@@ -307,5 +343,126 @@ fn another_module_cannot_present_its_attribution_as_a_page_block_source() {
                 .unwrap()
                 .contains("no composer for the attribution source")
         );
+    });
+}
+
+#[test]
+fn a_comment_trigger_replies_in_its_thread_and_can_choose_another_destination() {
+    block_on(async {
+        let mut network = Network::new().await;
+        network.provision().await;
+        configure_pages(&mut network).await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "pages",
+                    &pages::PageMsg::AddComment {
+                        thread_id: "review".into(),
+                        comment_id: "question".into(),
+                        target: "spec".into(),
+                        text: "Builder, review this?".into(),
+                        anchor: None,
+                        mentions: vec![2],
+                    },
+                ),
+            )
+            .await;
+        network.drain().await;
+        let run = network
+            .runs()
+            .await
+            .into_iter()
+            .find(|run| run.channel_id == "runs:pages:review")
+            .unwrap();
+        let (saga_id, _) = saga_for(&network, &run).await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::Accept {
+                        saga_id,
+                        attempt: 0,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::OpenAgentSession {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                        session_key: vec![10; 32],
+                    },
+                ),
+            )
+            .await;
+        for (text, destination) in [
+            ("Answering the comment.", None),
+            (
+                "Leaving a note on the todo.",
+                Some(runs::ReplyDestination::Page {
+                    target: "todo".into(),
+                }),
+            ),
+            (
+                "Back to the review.",
+                Some(runs::ReplyDestination::PageThread {
+                    thread_id: "review".into(),
+                }),
+            ),
+        ] {
+            network
+                .submit(
+                    sdk::Origin::External(vec![10; 32]),
+                    msg(
+                        "runs",
+                        &runs::RunsMsg::AgentAction {
+                            run_id: run.run_id.clone(),
+                            action: runs::AgentAction::Reply {
+                                text: text.into(),
+                                destination: destination.map(Into::into),
+                            },
+                        },
+                    ),
+                )
+                .await;
+            network.drain().await;
+        }
+        let pages::PageReply::CommentThread(Some(thread)) = page(
+            &network,
+            pages::PageQuery::CommentThread {
+                thread_id: "review".into(),
+            },
+        )
+        .await
+        else {
+            panic!("review thread");
+        };
+        assert_eq!(thread.comments.len(), 3);
+        assert_eq!(thread.comments[1].text, "Answering the comment.");
+        assert_eq!(thread.comments[2].text, "Back to the review.");
+        assert!(
+            thread.comments[1..]
+                .iter()
+                .all(|comment| comment.author == pages::Party::Account(2))
+        );
+        let pages::PageReply::CommentThread(Some(thread)) = page(
+            &network,
+            pages::PageQuery::CommentThread {
+                thread_id: format!("agent/{}/thread/s1", run.dispatch_id),
+            },
+        )
+        .await
+        else {
+            panic!("explicit todo thread");
+        };
+        assert_eq!(thread.thread.target, "todo");
+        assert_eq!(thread.comments[0].author, pages::Party::Account(2));
+        assert_eq!(thread.comments[0].text, "Leaving a note on the todo.");
     });
 }

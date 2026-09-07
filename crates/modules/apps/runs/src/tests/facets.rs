@@ -848,7 +848,7 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
         .at(8)
         .with_dispatch_origin()
         .with_registry(&granted)
-        .with_transcript("general", transcript(2))
+        .with_transcript("forge:app:7", transcript(2))
         .with_forge_ref("app", "agent/x")
         .with_forge_ref("app", "main")
         .with_forge_item(

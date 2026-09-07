@@ -41,7 +41,16 @@ fn session_ctx(registry: &Registry, run_id: &str, origin: Origin) -> CaptureCtx 
 
 fn open(run_id: &str, key: &[u8]) -> Msg {
     admin(&RunsMsg::OpenAgentSession {
+        attempt: 0,
         run_id: run_id.into(),
+        session_key: key.to_vec(),
+    })
+}
+
+fn open_attempt(run_id: &str, attempt: u32, key: &[u8]) -> Msg {
+    admin(&RunsMsg::OpenAgentSession {
+        run_id: run_id.into(),
+        attempt,
         session_key: key.to_vec(),
     })
 }
@@ -1018,15 +1027,12 @@ fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
     let live = sessions(&m);
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].session_key, NEW_SESSION_KEY.to_vec());
-    assert_eq!(live[0].holder, NEW_ASSIGNEE.to_vec());
+    assert_eq!(live[0].lease.holder, NEW_ASSIGNEE.to_vec());
 
-    // and the new holder cannot re-open on top of its own live session.
+    // The same binding may be delivered twice without resetting its counters.
     let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
-    let err = exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap_err();
-    assert!(
-        matches!(&err, Error::Module(reason) if reason.contains("already has an open agent session")),
-        "{err:?}"
-    );
+    exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap();
+    assert_eq!(sessions(&m), live);
 }
 
 #[test]
@@ -1126,4 +1132,381 @@ fn the_run_authority_query_answers_the_ceiling_the_read_plane_must_apply() {
 
     // a run nobody is executing proves no ceiling — the read plane must refuse.
     assert_eq!(authority_of(&m, "chat\u{1f}general\u{1f}9\u{1f}bot"), None);
+}
+
+#[test]
+fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
+    for (parent, expected_root) in [(None, 3), (Some(1), 1)] {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let mut m = configured(&registry);
+        let mut messages = transcript(2);
+        messages.push(message_in(
+            "general",
+            3,
+            Party::Key(vec![1; 32]),
+            "work here",
+            parent,
+        ));
+        let mut ctx = CaptureCtx::new()
+            .at(3)
+            .with_program_origin()
+            .with_registry(&registry)
+            .with_transcript("general", messages.clone());
+        exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
+        commit(&mut m);
+        let run = run_id_for("general", 3, "bot");
+        let mut ctx = session_ctx(&registry, &run, Origin::External(ASSIGNEE.to_vec()));
+        exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).unwrap();
+        commit(&mut m);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+            .with_transcript("general", messages);
+        exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "Working on it".into(),
+                    destination: None,
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.chat_msgs(),
+            vec![ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: post_message_id(&run, "s0"),
+                thread: Some(expected_root),
+                blocks: vec![Block::paragraph("Working on it")],
+            }]
+        );
+    }
+}
+
+#[test]
+fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
+    for (grants, text, expected) in [
+        (
+            vec![ACTION_CHAT_POST_MESSAGE],
+            "hello",
+            "not allowed to chat.post",
+        ),
+        (vec![ACTION_CHAT_POST], "  ", "non-empty text"),
+    ] {
+        let (mut m, registry, run) = with_open_session(&grants, &[]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: text.into(),
+                    destination: None,
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains(expected)),
+            "{error:?}"
+        );
+        assert_eq!(sessions(&m)[0].actions, 0);
+    }
+    {
+        let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+        let entry = m.pending.get_mut(&dispatch_id_for(&run)).unwrap();
+        entry.channel_id.clear();
+        entry.anchor_seq = 0;
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                    destination: None,
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains("no reply destination")),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn same_node_retries_rotate_keys_and_preserve_the_run_budget_and_snapshot() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    exec(&mut m, &mut ctx, &act(&run, comment("b-p"))).unwrap();
+    commit(&mut m);
+    let retried =
+        |origin| session_ctx(&registry, &run, origin).with_lease_attempt(&run, &ASSIGNEE, 1);
+    let mut old = retried(Origin::External(SESSION_KEY.to_vec()));
+    assert!(exec(&mut m, &mut old, &act(&run, comment("b-p"))).is_err());
+    let mut holder = retried(Origin::External(ASSIGNEE.to_vec()));
+    assert!(
+        exec(&mut m, &mut holder, &open(&run, &CHILD_SESSION_KEY)).is_err(),
+        "a stale attempt cannot bind under a fresh lease"
+    );
+    exec(
+        &mut m,
+        &mut holder,
+        &open_attempt(&run, 1, &CHILD_SESSION_KEY),
+    )
+    .unwrap();
+    commit(&mut m);
+    assert_eq!(sessions(&m)[0].actions, 1);
+    assert_eq!(sessions(&m)[0].lease.attempt, 1);
+    assert!(exec(&mut m, &mut old, &act(&run, comment("b-p"))).is_err());
+    let root = m.root();
+    let mut joiner = module().with_pages_module("pages");
+    joiner.install(&m.snapshot(), root).unwrap();
+    assert_eq!(sessions(&joiner), sessions(&m));
+    for _ in 1..MAX_ACTIONS_PER_SESSION {
+        let mut ctx = retried(Origin::External(CHILD_SESSION_KEY.to_vec()));
+        exec(&mut joiner, &mut ctx, &act(&run, comment("b-p"))).unwrap();
+        commit(&mut joiner);
+    }
+    exec(
+        &mut joiner,
+        &mut holder,
+        &open_attempt(&run, 1, &CHILD_SESSION_KEY),
+    )
+    .unwrap();
+    let mut ctx = retried(Origin::External(CHILD_SESSION_KEY.to_vec()));
+    let error = exec(&mut joiner, &mut ctx, &act(&run, comment("b-p"))).unwrap_err();
+    assert!(
+        matches!(error, Error::Module(ref reason) if reason.contains("spent its budget")),
+        "{error:?}"
+    );
+    assert_eq!(sessions(&joiner)[0].actions, MAX_ACTIONS_PER_SESSION);
+}
+
+#[test]
+fn returning_to_a_previous_holder_does_not_revive_its_old_key() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+    for (holder, attempt, key) in [
+        (NEW_ASSIGNEE, 1, CHILD_SESSION_KEY),
+        (ASSIGNEE, 2, [0x55; 32]),
+    ] {
+        let mut ctx = session_ctx(&registry, &run, Origin::External(holder.to_vec()))
+            .with_lease_attempt(&run, &holder, attempt);
+        exec(&mut m, &mut ctx, &open_attempt(&run, attempt, &key)).unwrap();
+        commit(&mut m);
+        ctx.env.origin = Origin::External(SESSION_KEY.to_vec());
+        assert!(
+            exec(
+                &mut m,
+                &mut ctx,
+                &act(
+                    &run,
+                    AgentAction::Reply {
+                        text: "stale".into(),
+                        destination: None,
+                    }
+                )
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+        .with_saga_assignee(
+            &crate::sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run)),
+            &ASSIGNEE,
+        );
+    let error = exec(
+        &mut m,
+        &mut ctx,
+        &act(
+            &run,
+            AgentAction::Reply {
+                text: "too late".into(),
+                destination: None,
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::Module(ref reason) if reason.contains("no execution lease")),
+        "{error:?}"
+    );
+    ctx.env.origin = Origin::External(ASSIGNEE.to_vec());
+    assert!(exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).is_err());
+    assert_eq!(sessions(&m)[0].actions, 0);
+}
+
+#[test]
+fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
+    for (destination, expected) in [
+        (
+            crate::ReplyDestination::Chat {
+                channel_id: "general".into(),
+                thread: Some(1),
+            },
+            "chat.post_message",
+        ),
+        (
+            crate::ReplyDestination::Page {
+                target: "b-p".into(),
+            },
+            "pages.comment",
+        ),
+        (
+            crate::ReplyDestination::Job {
+                job_id: "job-1".into(),
+            },
+            "jobs.comment",
+        ),
+    ] {
+        let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                    destination: Some(destination.into()),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains(expected), "{error}");
+        assert_eq!(sessions(&m)[0].actions, 0);
+        assert!(
+            ctx.chat_msgs().is_empty() && ctx.page_msgs().is_empty() && ctx.job_msgs().is_empty()
+        );
+    }
+    let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["other"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    let error = exec(
+        &mut m,
+        &mut ctx,
+        &act(
+            &run,
+            AgentAction::Reply {
+                text: "hello".into(),
+                destination: Some(
+                    crate::ReplyDestination::Page {
+                        target: "b-p".into(),
+                    }
+                    .into(),
+                ),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(format!("{error}").contains("pages_write"));
+    assert_eq!(sessions(&m)[0].actions, 0);
+}
+
+#[test]
+fn a_reply_batch_counts_page_comments_before_emitting_any() {
+    let (m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
+    let mut thread = dummy_thread_view("review");
+    thread.thread.target = "b-p".into();
+    thread.thread.comment_ids = (0..pages::MAX_COMMENTS_PER_THREAD - 1)
+        .map(|i| format!("comment-{i}"))
+        .collect();
+    let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+        .with_page_thread(thread);
+    let reply = AgentAction::Reply {
+        text: "hello".into(),
+        destination: Some(
+            crate::ReplyDestination::PageThread {
+                thread_id: "review".into(),
+            }
+            .into(),
+        ),
+    };
+    let entry = m.pending_entry(&dispatch_id_for(&run)).unwrap();
+    let response = AgentResponse {
+        reply_blocks: Vec::new(),
+        actions: vec![reply.clone(), reply],
+        commit_message: None,
+    };
+    let error =
+        block_on(m.validate_response(&ctx, &run, entry, Lane::Settle, response)).unwrap_err();
+    assert!(error.contains("thread is full"), "{error}");
+    assert!(ctx.page_msgs().is_empty());
+}
+
+#[test]
+fn reply_destination_validation_stays_in_the_module() {
+    for destination in [
+        serde_json::json!({"kind":"chat", "channel_id":"general", "author":1}),
+        serde_json::json!({"kind":"job", "thread_id":"wrong"}),
+        serde_json::json!({"kind":"unknown"}),
+    ] {
+        let (mut m, registry, run) = with_open_session(&crate::KNOWN_ACTIONS, &["*"]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                    destination: Some(destination),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("invalid reply destination"));
+        assert_eq!(sessions(&m)[0].actions, 0);
+        assert!(
+            ctx.chat_msgs().is_empty() && ctx.page_msgs().is_empty() && ctx.job_msgs().is_empty()
+        );
+    }
+}
+
+#[test]
+fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_job() {
+    let (m, registry, run) = with_open_session(&[crate::ACTION_JOBS_COMMENT], &[]);
+    let mut entry = m.pending_entry(&dispatch_id_for(&run)).unwrap().clone();
+    entry.job_id = Some("job-1".into());
+    entry.job_claim_height = 3;
+    for (claim_height, destination, accepted) in [
+        (3, None, true),
+        (4, None, false),
+        (
+            4,
+            Some(
+                crate::ReplyDestination::Job {
+                    job_id: "job-1".into(),
+                }
+                .into(),
+            ),
+            true,
+        ),
+    ] {
+        let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+            .with_claimed_job("job-1", claim_height);
+        let response = AgentResponse {
+            reply_blocks: Vec::new(),
+            actions: vec![AgentAction::Reply {
+                text: "progress".into(),
+                destination,
+            }],
+            commit_message: None,
+        };
+        let result = block_on(m.validate_response(&ctx, &run, &entry, Lane::Settle, response));
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        if let Err(reason) = result {
+            assert!(reason.contains("original job claim"), "{reason}");
+        }
+        assert!(ctx.job_msgs().is_empty(), "validation must not emit");
+    }
 }

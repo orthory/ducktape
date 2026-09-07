@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     /// the CONSENSUS run id the composer stamps — see
-    /// [`crate::provision::WorkspaceSpec::consensus_run_id`].
+    /// [`crate::provision::WorkspaceSpec::agent`].
     const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}7\u{1f}bot";
 
     /// a duckfs-sourced portable envelope — the byte shape the runs composer emits

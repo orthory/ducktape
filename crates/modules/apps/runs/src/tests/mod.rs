@@ -54,7 +54,7 @@ struct CaptureCtx {
     /// dispatch ids that are still AwaitingResult (their saga carries the live
     /// lease the session lane authorizes against). one only in `taken_dispatches`
     /// is delivered, and a delivered run runs nowhere. the value is the lease
-    /// holder, mirrored into `saga_assignees` by `with_lease_holder`.
+    /// holder, mirrored into `sagas` by `with_lease_holder`.
     dispatch_assignees: BTreeMap<String, Vec<u8>>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
@@ -66,9 +66,8 @@ struct CaptureCtx {
     /// (the compose lane's committed item lookup) and, as summaries, by the
     /// ListItems arm (the sink's duplicate-PR guard).
     forge_items: BTreeMap<(String, u64), forge::ItemDetail>,
-    /// saga_id -> the winning attempt's lease holder, served by the "saga"
-    /// Get arm as a Done saga (the sink's executing-node attribution).
-    saga_assignees: BTreeMap<String, Vec<u8>>,
+    /// Saga views distinguish pending execution leases from terminal results.
+    sagas: BTreeMap<String, saga::SagaView>,
     /// page_id -> the canonical whole page in preorder, sliced by the "pages"
     /// GetPage arm (the `duck://page/<id>` injection lane); GetBlock scans the
     /// same pages by block id (the pages-effects target resolution).
@@ -115,7 +114,7 @@ impl CaptureCtx {
             jobs: BTreeMap::new(),
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
-            saga_assignees: BTreeMap::new(),
+            sagas: BTreeMap::new(),
             pages: BTreeMap::new(),
             page_query_count: Cell::new(0),
             page_query_fail_after: None,
@@ -167,7 +166,8 @@ impl CaptureCtx {
     /// register the node key holding `saga_id`'s winning lease, served by
     /// the "saga" Get arm (the sink's executing-node attribution).
     fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
-        self.saga_assignees.insert(saga_id.into(), key.to_vec());
+        self.sagas
+            .insert(saga_id.into(), saga_view(key, 0, saga::SagaStatus::Done));
         self
     }
     /// register a committed page (whole preorder Vec, root first) served in
@@ -266,11 +266,15 @@ impl CaptureCtx {
     /// serve `key` as the node holding `run_id`'s execution lease — an awaiting
     /// dispatch (the "saga" Get resolves its committed lease to `key`), the ONLY
     /// origin the session lane lets open a session.
-    fn with_lease_holder(mut self, run_id: &str, key: &[u8]) -> Self {
+    fn with_lease_holder(self, run_id: &str, key: &[u8]) -> Self {
+        self.with_lease_attempt(run_id, key, 0)
+    }
+
+    fn with_lease_attempt(mut self, run_id: &str, key: &[u8], attempt: u32) -> Self {
         let dispatch_id = dispatch_id_for(run_id);
-        self.saga_assignees.insert(
+        self.sagas.insert(
             crate::sink::saga_id_for_dispatch("runs", &dispatch_id),
-            key.to_vec(),
+            saga_view(key, attempt, saga::SagaStatus::Pending),
         );
         self.dispatch_assignees.insert(dispatch_id, key.to_vec());
         self
@@ -299,6 +303,8 @@ impl CaptureCtx {
                     lease_views: JOB_RUN_LEASE_VIEWS,
                 }),
                 result: None,
+                comments: Vec::new(),
+                created_at_revision: 1,
                 created_at_height: height,
                 updated_at_height: height,
             },
@@ -690,6 +696,14 @@ impl Ctx for CaptureCtx {
                             .cloned(),
                     )))
                 }
+                pages::PageQuery::CommentThreadHead { thread_id } => {
+                    let view = self.page_threads.get(&thread_id).cloned().or_else(|| {
+                        self.taken_page_ids.contains(&thread_id).then(|| dummy_thread_view(&thread_id))
+                    });
+                    Ok(pages::encode_reply(&pages::PageReply::CommentThreadHead(view.map(|view| pages::CommentThreadHead {
+                        target: view.thread.target, comment_count: view.thread.comment_ids.len() as u64,
+                    }))))
+                }
                 pages::PageQuery::CommentThread { thread_id } => {
                     Ok(pages::encode_reply(&pages::PageReply::CommentThread(
                         self.page_threads.get(&thread_id).cloned().or_else(|| {
@@ -715,27 +729,7 @@ impl Ctx for CaptureCtx {
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
                 saga::SagaQuery::Get { saga_id } => {
-                    // a Done saga still carrying its winning attempt's
-                    // lease holder — exactly what the saga module commits.
-                    let view = self.saga_assignees.get(&saga_id).map(|key| saga::SagaView {
-                        origin: saga::SagaOrigin::Module("dispatch".into()),
-                        reply_to: Some("dispatch".into()),
-                        reply_payload: Vec::new(),
-                        spec: Vec::new(),
-                        capability: Some("model-1".into()),
-                        status: saga::SagaStatus::Done,
-                        attempt: 0,
-                        max_attempts: RUN_MAX_ATTEMPTS,
-                        assignee: Some(key.clone()),
-                        pinned_assignee: None,
-                        lease_views: None,
-                        lease_expires_at: None,
-                        deadline: None,
-                        result: Some(Vec::new()),
-                        error: None,
-                        created_at: 0,
-                        updated_at: 0,
-                    });
+                    let view = self.sagas.get(&saga_id).cloned();
                     Ok(saga::encode_reply(&saga::SagaReply::Saga(view)))
                 }
                 _ => Err(Error::QueryUnsupported),
@@ -1179,8 +1173,30 @@ fn awaiting_run(actions: &[&str]) -> (RunsModule, Registry, String) {
 }
 /// the canned registry for the jobs lane: "duck" with task grants.
 fn job_registry() -> Registry {
-    registry(&[("duck", &[ACTION_TASKS_CREATE])])
+    registry(&[("duck", &[ACTION_TASKS_CREATE, crate::ACTION_JOBS_COMMENT])])
 }
+fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaView {
+    saga::SagaView {
+        origin: saga::SagaOrigin::Module("dispatch".into()),
+        reply_to: Some("dispatch".into()),
+        reply_payload: Vec::new(),
+        spec: Vec::new(),
+        capability: Some("model-1".into()),
+        status,
+        attempt,
+        max_attempts: RUN_MAX_ATTEMPTS,
+        assignee: Some(key.to_vec()),
+        pinned_assignee: None,
+        lease_views: None,
+        lease_expires_at: None,
+        deadline: None,
+        result: Some(Vec::new()),
+        error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
 mod composition;
 mod delivery;
 mod facets;

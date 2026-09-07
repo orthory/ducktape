@@ -125,7 +125,10 @@ fn spawn_session_actor(
                                     run_id: consensus_run_id(),
                                     agent_id: "quackbot".into(),
                                     session_key: Vec::new(),
-                                    holder: Vec::new(),
+                                    lease: runs::ExecutionLease {
+                                        holder: Vec::new(),
+                                        attempt: 0,
+                                    },
                                     opened_at: 0,
                                     actions: 0,
                                 }])
@@ -254,9 +257,12 @@ fn consensus_run_id() -> String {
 fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
     WorkspaceSpec {
         run_id: "s1:0".into(),
-        consensus_run_id: Some(consensus_run_id()),
-        agent_id: agent.map(Into::into),
-        agent_display_name: agent.map(Into::into),
+        agent: agent.map(|id| compute_service::AgentExecution {
+            run_id: consensus_run_id(),
+            attempt: 0,
+            agent_id: id.into(),
+            display_name: id.into(),
+        }),
         source: WorkspaceSource::Duckfs {
             source_prefix: "/shared/agent-workspaces/quackbot".into(),
             source_snapshot: None,
@@ -432,6 +438,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         [
             runs::RunsMsg::OpenAgentSession {
                 run_id,
+                attempt,
                 session_key,
             },
         ] => {
@@ -440,6 +447,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
                 &consensus_run_id(),
                 "the bind names the run in the id space runs can resolve"
             );
+            assert_eq!(*attempt, 0);
             session_key.clone()
         }
         other => panic!("expected exactly one session bind, got {other:?}"),
@@ -472,6 +480,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         action_url,
         action_token,
         &serde_json::json!({"message":{"open_agent_session":{
+            "attempt": 0,
             "run_id": consensus_run_id(),
             "session_key": vec![0; runs::SESSION_KEY_LEN],
         }}}),
@@ -561,8 +570,8 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
         .expect("provision");
 
     let env = ws.env();
-    // the WRITE half is what a session buys; the consensus run id is identity
-    // and rides every provisioned run.
+    assert!(!env.contains_key("DUCKTAPE_RUN_AGENT"));
+    assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
     assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
     assert!(!env.contains_key(session::ENV_ACTION_URL));
     assert!(
@@ -573,73 +582,20 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
 }
 
 #[tokio::test]
-async fn an_envelope_with_no_consensus_run_id_opens_no_session_and_submits_no_bind() {
+async fn a_refused_bind_fails_provision_and_removes_the_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let (handle, rx, _hub) = NodeHandle::channel();
-    let (_actor, binds, _actions) = spawn_session_actor(rx, Ok(()));
-
-    // a pre-field (or foreign) envelope: an AGENT run, but no run id consensus
-    // would recognize. binding on the spec's own `{saga_id}:{attempt}` would ask
-    // `runs` to open a session against a run that does not exist — so we ask for
-    // nothing at all and degrade to the read-only plane.
-    let spec = WorkspaceSpec {
-        consensus_run_id: None,
-        ..duckfs_spec(Some("quackbot"), Vec::new())
-    };
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
-        .provision(&spec)
-        .await
-        .expect("a run without a consensus id still gets its workspace");
-
-    let env = ws.env();
-    assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
-    // no consensus run id on the envelope ⇒ none to export either.
-    assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
-    assert!(
-        binds.lock().unwrap().is_empty(),
-        "no run to bind to ⇒ no op is spent asking"
-    );
-    // the READ half is untouched: the run still executes.
-    assert_eq!(
-        env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
-        Some("quackbot")
-    );
-    ws.cleanup().await;
-}
-
-#[tokio::test]
-async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (handle, rx, _hub) = NodeHandle::channel();
-    // the shape of a node that is somehow not the run's committed lease-holder.
     let (_actor, binds, _actions) = spawn_session_actor(rx, Err("runs: not the run's assignee"));
-
-    // the run STILL provisions: a session is an additive capability, and losing
-    // it must never cost the run its workspace (it can still return a response).
-    let ws = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
-        .with_node_url(Some("http://127.0.0.1:8844".into()))
+    let result = NodedProvisioner::new(crate::agent_provision::test_link(handle).await, tmp.path())
         .provision(&duckfs_spec(Some("quackbot"), Vec::new()))
-        .await
-        .expect("a refused session does not fail the provision");
-
-    let env = ws.env();
-    assert_eq!(binds.lock().unwrap().len(), 1, "the bind was attempted");
-    assert!(
-        !env.contains_key("DUCKTAPE_RUN_SESSION_KEY")
-            && !env.contains_key(session::ENV_ACTION_TOKEN),
-        "no session, no key — the agent must not hold a key consensus refused"
-    );
-    // the READ half of the tool plane is untouched: this is exactly the
-    // pre-session behaviour, not a broken run.
-    assert_eq!(
-        env.get("DUCKTAPE_NODE").map(String::as_str),
-        Some("http://127.0.0.1:8844")
-    );
-    assert_eq!(
-        env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
-        Some("quackbot")
-    );
-    ws.cleanup().await;
+        .await;
+    let Err(error) = result else {
+        panic!("the model must not start with a refused session");
+    };
+    assert!(error.contains("open agent session"), "{error}");
+    assert!(error.contains("not the run's assignee"), "{error}");
+    assert_eq!(binds.lock().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 type ReceiptState = std::sync::Arc<std::sync::Mutex<runs::ActionStatus>>;
@@ -671,7 +627,10 @@ fn spawn_receipt_actor(
                                 run_id: consensus_run_id(),
                                 agent_id: "quackbot".into(),
                                 session_key: Vec::new(),
-                                holder: Vec::new(),
+                                lease: runs::ExecutionLease {
+                                    holder: Vec::new(),
+                                    attempt: 0,
+                                },
                                 opened_at: 0,
                                 actions: 0,
                             }])
@@ -730,7 +689,8 @@ async fn tool_http_waits_for_the_actual_committed_outcome_and_surfaces_target_fa
         let link = test_link(handle).await;
         let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
             .await
-            .unwrap();
+            .unwrap()
+            .expect("agent session");
         let request = request_tool_action(&session);
         observed
             .recv()
@@ -810,7 +770,8 @@ async fn disconnecting_the_registered_receipt_stream_fails_the_pending_tool_requ
         NodeLink::new(format!("http://{address}")).with_workspace_credential(directory.path());
     let session = super::session::open(&link, &duckfs_spec(Some("quackbot"), Vec::new()))
         .await
-        .unwrap();
+        .unwrap()
+        .expect("agent session");
     let request = request_tool_action(&session);
     observed.recv().await.unwrap();
     assert!(!request.is_finished());

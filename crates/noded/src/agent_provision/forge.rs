@@ -388,7 +388,13 @@ pub(super) async fn provision(
     // the clone EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&node, spec).await;
+    let session = match super::session::open(&node, spec).await {
+        Ok(session) => session,
+        Err(error) => {
+            super::cleanup_dirs(workspace_args.run_dir.clone(), ro_dir.clone()).await;
+            return Err(error);
+        }
+    };
     let mut env = super::run_env(
         &workspace_args.run_dir,
         ro_dir.as_deref(),
@@ -396,8 +402,17 @@ pub(super) async fn provision(
         spec,
         session.as_ref(),
     );
-    let agent_id = spec.agent_id.as_deref().unwrap_or("agent");
-    let agent_name = sanitize_display_name(spec.agent_display_name.as_deref().unwrap_or(agent_id));
+    let agent_id = spec
+        .agent
+        .as_ref()
+        .map(|agent| agent.agent_id.as_str())
+        .unwrap_or("agent");
+    let agent_name = sanitize_display_name(
+        spec.agent
+            .as_ref()
+            .map(|agent| agent.display_name.as_str())
+            .unwrap_or(agent_id),
+    );
     env.insert("GIT_AUTHOR_NAME".into(), agent_name);
     env.insert(
         "GIT_AUTHOR_EMAIL".into(),
@@ -418,8 +433,7 @@ pub(super) async fn provision(
         node,
         forge_push: *forge_push,
         source: spec.source.clone(),
-        agent_id: spec.agent_id.clone(),
-        agent_display_name: spec.agent_display_name.clone(),
+        agent: spec.agent.clone(),
         _session: session,
         committer_name: lane.committer_name.clone(),
         env,
@@ -515,8 +529,7 @@ struct ForgeWorkspace {
     /// compose-height `forge_push` verdict; false for old envelopes.
     forge_push: bool,
     source: WorkspaceSource,
-    agent_id: Option<String>,
-    agent_display_name: Option<String>,
+    agent: Option<compute_service::AgentExecution>,
     committer_name: String,
     env: BTreeMap<String, String>,
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
@@ -532,9 +545,7 @@ impl ForgeWorkspace {
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
-            consensus_run_id: None,
-            agent_id: None,
-            agent_display_name: None,
+            agent: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
             // receipts never assemble a document, so the grant is moot here.
@@ -1006,11 +1017,10 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let push_url = self.push_url.clone();
         let node = self.node.clone();
         let forge_push = self.forge_push;
-        let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
-        let agent_display_name = self
-            .agent_display_name
-            .clone()
-            .unwrap_or_else(|| agent_id.clone());
+        let (agent_id, agent_display_name) = match &self.agent {
+            Some(agent) => (agent.agent_id.clone(), agent.display_name.clone()),
+            None => ("agent".into(), "agent".into()),
+        };
         let committer_name = self.committer_name.clone();
         let proposal = proposal.map(str::to_owned);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -1047,17 +1057,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     }
 
     async fn cleanup(&self) {
-        let run_dir = self.run_dir.clone();
-        // the skill ro root is the run's debris too — it sits beside the
-        // worktree, so `worktree remove` never touches it.
-        let ro_dir = self.ro_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            cleanup_blocking(&run_dir);
-            if let Some(ro) = &ro_dir {
-                let _ = std::fs::remove_dir_all(ro);
-            }
-        })
-        .await;
+        super::cleanup_dirs(self.run_dir.clone(), self.ro_dir.clone()).await;
     }
 }
 

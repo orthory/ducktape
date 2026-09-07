@@ -77,6 +77,7 @@ pub struct JobRow {
     /// the reported outcome, once terminal via `Finalize`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<JobResultRow>,
+    pub comments: Vec<crate::JobComment>,
     pub created_height: u64,
     pub created_at: u64,
     pub updated_height: u64,
@@ -373,6 +374,25 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
         }
     };
     match msg {
+        JobsMsg::Comment {
+            job_id,
+            comment_id,
+            text,
+            ..
+        } => {
+            let Some(mut row) = load(&job_id)? else {
+                return Ok(out);
+            };
+            row.comments.push(crate::JobComment {
+                id: comment_id,
+                author: assigned_party(op)?,
+                text,
+                height: op.height,
+            });
+            row.updated_height = op.height;
+            row.updated_at = op.time;
+            put_job_row(&mut out, &row)?;
+        }
         JobsMsg::Submit { job_id, kind, spec } => {
             let row = JobRow {
                 job_id,
@@ -383,6 +403,7 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
                 attempt: 0,
                 claim: None,
                 result: None,
+                comments: Vec::new(),
                 created_height: op.height,
                 created_at: op.time,
                 updated_height: op.height,
@@ -746,6 +767,42 @@ mod tests {
             panic!("wrong reply shape")
         };
         jobs
+    }
+
+    #[test]
+    fn job_comments_fold_with_attribution_without_moving_status_counts() {
+        let mut map = BTreeMap::new();
+        fold_job_msg(
+            &mut map,
+            1,
+            &JobsMsg::Submit {
+                job_id: "j".into(),
+                kind: "build".into(),
+                spec: "spec".into(),
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            2,
+            &JobsMsg::Comment {
+                created_at_revision: 1,
+                job_id: "j".into(),
+                comment_id: "c".into(),
+                text: "Working".into(),
+            },
+        );
+        let rows = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}));
+        assert_eq!(
+            rows[0].comments,
+            vec![crate::JobComment {
+                id: "c".into(),
+                author: Party::Module("runs".into()),
+                text: "Working".into(),
+                height: 2
+            }]
+        );
+        assert_eq!(rows[0].updated_height, 2);
+        assert_eq!(counts(&map).pending, 1);
     }
 
     #[test]

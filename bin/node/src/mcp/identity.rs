@@ -69,11 +69,9 @@ pub struct Run {
     /// exported for every provisioned run, session or not: it is identity, not
     /// a credential, and the read plane needs it to fetch the run's ceiling.
     run_id: Option<String>,
-    /// `None` when the node opened no session for this run (an older node, or a
-    /// run whose `OpenAgentSession` was refused). every WRITE then refuses,
-    /// loudly — there is no credential to prove the write came from this agent,
-    /// and this binary will not fall back to a lane that would file it under
-    /// somebody else's name.
+    /// Absent when this MCP server starts without a scoped action endpoint.
+    /// Writes then refuse: only a provisioned run has the credential to act
+    /// under its program account.
     action: Option<ActionControl>,
     provider_control: Option<ProviderControl>,
     /// monotonic within the process — the tail of every minted id.
