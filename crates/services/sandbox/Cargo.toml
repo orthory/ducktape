@@ -19,8 +19,9 @@ tracing = { workspace = true }
 # the service-root singleton test claims a real directory twice.
 tempfile = "3"
 # the vm-smoke example needs a runtime of its own; the library stays
-# runtime-agnostic.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# runtime-agnostic. "test-util" drives the tunnel idle-timeout tests on a
+# paused clock instead of real sleeps.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [features]
 # the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross
