@@ -1223,13 +1223,25 @@ mod tests {
         let err = resolve_dev_shape(raw).expect_err("a zero beat is not a cadence");
         assert!(err.contains("block_time_ms"), "{err}");
 
-        // and 1ms — the smallest real beat — still resolves.
-        let fast: DevSeedToml = toml::from_str(&format!(
+        // a beat under the drain-tick floor is refused too: this shape boots
+        // the SAME pump_heartbeat/DRAIN_TICK-driven node, so 1ms is no more a
+        // cadence here than it is at the descriptor boundary.
+        let too_fast: DevSeedToml = toml::from_str(&format!(
             "id = 9\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [9]\nblock_time_ms = 1\n{bundle}"
         ))
         .expect("parse dev config");
-        resolve_dev_shape(fast).expect("1ms is a cadence");
+        let err = resolve_dev_shape(too_fast).expect_err("1ms is below the drain tick");
+        assert!(err.contains("block_time_ms"), "{err}");
+
+        // the floor itself still resolves.
+        let at_floor: DevSeedToml = toml::from_str(&format!(
+            "id = 9\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [9]\nblock_time_ms = {}\n{bundle}",
+            workspace_config::MIN_BLOCK_TIME_MS
+        ))
+        .expect("parse dev config");
+        resolve_dev_shape(at_floor).expect("the floor is a cadence");
     }
 
     /// ISOLATED FROM THE PARALLEL SUITE ON PURPOSE — `make test` runs it, but

@@ -19,6 +19,7 @@
 //! | `t#` | the task-id enumeration index (a json `BTreeSet<String>`) |
 //! | `j/{job_id}` | one [`Job`] record (json) |
 //! | `j#` | the live job count (u64 LE) -- what [`MAX_JOBS`] is checked against |
+//! | `j@{submitter}` | that submitter's live job count (u64 LE) -- what [`MAX_LIVE_JOBS_PER_SUBMITTER`] is checked against |
 //! | `w#` | the registered worker set (a json `BTreeSet<ModuleId>`) |
 //!
 //! the store hashes each logical key (`sdk::store_key`) and cannot enumerate,
@@ -45,8 +46,9 @@ mod job_board;
 mod task_board;
 
 pub use job_board::{
-    MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_PAYLOAD, MAX_SPEC,
-    MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
+    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS,
+    MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD, MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS,
+    MIN_LEASE_VIEWS,
 };
 pub use task_board::{MAX_LIST_LIMIT, MAX_OPEN_TASKS_PER_OWNER, MAX_TASK_ID, MAX_TASKS};
 

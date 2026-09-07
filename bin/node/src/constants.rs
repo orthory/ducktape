@@ -90,6 +90,10 @@ pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TI
 /// for block handling, not a pacer: finalized blocks drain (and pending ops
 /// flush) event-driven the moment they land.
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
+// the idle beat floor (`workspace_config::validate_block_time_ms`) is refused
+// below whatever this tick is — they MUST agree, or a founded network's floor
+// promises a beat the heartbeat still can't keep.
+const _: () = assert!(DRAIN_TICK.as_millis() as u64 == workspace_config::MIN_BLOCK_TIME_MS);
 /// the pace of `refresh_operations` (the /metrics exposition parse feeding
 /// status' consensus/storage sections): the status cell publishes boundary
 /// facts per drain pass, but the exposition parse is the pricey part and one

@@ -27,7 +27,7 @@ _ducktape() {
     local wallet_flags=(--json)
     local gateway_verbs=(bind unbind list help)
     local gateway_flags=(--workspace -n --network --label --port --account)
-    local fs_verbs=(ls cat stat history diff checkout status commit pin help)
+    local fs_verbs=(ls cat stat history diff checkout status commit pin unpin help)
     local fs_flags=(-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key --trust-node)
     local service_verbs=(run list enable disable status help)
     local service_flags=(--config --workspace -n --network --json --yes -y --enable --no-enable)
