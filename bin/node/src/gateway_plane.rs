@@ -44,16 +44,25 @@ const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// request budget lets a handful of idle sockets starve every gateway request
 /// on the node — the airlock broker's credential relay included.
 const MAX_CONCURRENT_UPGRADES: usize = 64;
+/// Response bodies draining to a peer at once. A THIRD budget, for the same
+/// reason upgrades have their own: a drain lives as long as the peer keeps
+/// reading, so charging it to the request budget lets 16 peers that never read
+/// starve every gateway request on the node.
+const MAX_CONCURRENT_STREAMS: usize = 64;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
 
-/// The plane's two concurrency budgets, held by both halves. They are separate
-/// on purpose: a request permit is released at the response head, an upgrade
-/// permit at socket close, so one budget for both lets idle sockets starve
-/// every request. A request QUEUES for its permit; an upgrade is REFUSED,
-/// because queueing behind sockets that may never close is a hang.
+/// The plane's three concurrency budgets, held by both halves. They are
+/// separate on purpose, because each permit has a different life: a request
+/// permit ends at the response head, a stream permit at the last body frame,
+/// an upgrade permit at socket close. One budget for all three lets bodies
+/// nobody reads and sockets nobody closes starve every gateway request on the
+/// node. A request QUEUES for its permit, with a deadline; a stream or an
+/// upgrade is REFUSED, because queueing behind work that may never finish is a
+/// hang.
 struct GatewayBudget {
     requests: Arc<tokio::sync::Semaphore>,
+    streams: Arc<tokio::sync::Semaphore>,
     upgrades: Arc<tokio::sync::Semaphore>,
 }
 
@@ -61,16 +70,47 @@ impl GatewayBudget {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            streams: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
             upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
         })
     }
 
+    /// Queue for a request permit, but only for [`PROXY_IO_TIMEOUT`]: a queued
+    /// request that ages out in the caller is indistinguishable from a hung
+    /// node, so the wait is bounded and the refusal is named.
     async fn admit_request(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.requests).acquire_owned().await.ok()
+        tokio::time::timeout(PROXY_IO_TIMEOUT, Arc::clone(&self.requests).acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    fn admit_stream(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.streams).try_acquire_owned().ok()
     }
 
     fn admit_upgrade(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&self.upgrades).try_acquire_owned().ok()
+    }
+}
+
+/// The request permit a serve task holds, plus the budget it swaps that permit
+/// into a stream permit on at the response head. The swap is the point: the
+/// request budget then covers only the deadline-bound work up to the head, and
+/// the unbounded-in-length drain is charged to the stream budget instead.
+struct RequestSlot {
+    budget: Arc<GatewayBudget>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl RequestSlot {
+    /// Trade the request permit for a stream permit, or `None` when the stream
+    /// budget is full — the head has not been written yet, so the caller can
+    /// still answer with a clean refusal.
+    fn into_stream_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let stream = self.budget.admit_stream()?;
+        drop(self.permit);
+        Some(stream)
     }
 }
 
@@ -156,6 +196,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             // the loop must keep draining the lane, or a full
                             // budget wedges every `lane.send` behind it.
                             let Some(_permit) = budget.admit_request().await else {
+                                tracing::warn!(
+                                    target: "ducktape::gateway",
+                                    reason = "request_budget_full",
+                                    open = MAX_CONCURRENT_REQUESTS,
+                                    "gateway request refused"
+                                );
+                                let _ = reply.send(Err(GatewayFailure::Unavailable(
+                                    "gateway request budget is full".into(),
+                                )));
                                 return;
                             };
                             // The deadline covers everything up to the response
@@ -183,6 +232,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                             &own_node,
                                             head_for_server,
                                             Some(body_for_server),
+                                            None,
                                             server_end,
                                         )
                                         .await;
@@ -353,10 +403,36 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                     serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                     return;
                 }
-                let Some(_permit) = budget.admit_request().await else {
+                let Some(permit) = budget.admit_request().await else {
+                    tracing::warn!(
+                        target: "ducktape::gateway",
+                        reason = "request_budget_full",
+                        open = MAX_CONCURRENT_REQUESTS,
+                        "inbound gateway request refused"
+                    );
+                    let _ = write_proxy_response(
+                        &mut stream,
+                        Err(GatewayFailure::Unavailable(
+                            "gateway request budget is full".into(),
+                        )),
+                    )
+                    .await;
                     return;
                 };
-                serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
+                let slot = RequestSlot {
+                    budget: Arc::clone(&budget),
+                    permit,
+                };
+                serve_proxy_stream(
+                    &commands,
+                    &scope,
+                    &requester.0,
+                    head,
+                    None,
+                    Some(slot),
+                    stream,
+                )
+                .await;
             });
         }
     });
@@ -411,14 +487,18 @@ struct LoopbackScope<'a> {
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
-/// stream (overlay). The deadline covers the body read + serve up to the
-/// response HEAD; the body drain streams beyond it.
+/// stream (overlay). `slot`: the request permit this exchange holds, swapped
+/// for a stream permit at the response head; `None` on the self-serve server
+/// side, whose caller holds the permit for the exchange. The deadline covers
+/// the body read + serve up to the response HEAD; the drain past it is bounded
+/// per frame instead, by [`write_proxy_response`].
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<Vec<u8>>,
+    slot: Option<RequestSlot>,
     mut stream: S,
 ) {
     let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
@@ -444,7 +524,41 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             "gateway proxy request timed out".into(),
         ))
     });
+    let (outcome, _drain_permit) = charge_drain(outcome, slot);
     let _ = write_proxy_response(&mut stream, outcome).await;
+}
+
+/// Swap the serve task's request permit for a stream permit before the head
+/// goes out. A response with no permit to swap (the self-serve server side)
+/// drains unbudgeted; a full stream budget replaces the response with a
+/// refusal, which is still clean because the head has not been written yet.
+fn charge_drain(
+    outcome: Result<GatewayResponse, GatewayFailure>,
+    slot: Option<RequestSlot>,
+) -> (
+    Result<GatewayResponse, GatewayFailure>,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    match (outcome, slot) {
+        (Ok(response), Some(slot)) => match slot.into_stream_permit() {
+            Some(permit) => (Ok(response), Some(permit)),
+            None => {
+                tracing::warn!(
+                    target: "ducktape::gateway",
+                    reason = "stream_budget_full",
+                    open = MAX_CONCURRENT_STREAMS,
+                    "gateway response drain refused"
+                );
+                (
+                    Err(GatewayFailure::Unavailable(
+                        "gateway stream budget is full".into(),
+                    )),
+                    None,
+                )
+            }
+        },
+        (outcome, _) => (outcome, None),
+    }
 }
 
 /// Read the response head, then hand the stream to the body pump. Returns AT
@@ -511,18 +625,7 @@ async fn serve_current(
             "gateway proxy: request body length mismatch".into(),
         ));
     }
-    let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != scope.own_node {
-        return Err(GatewayFailure::Forbidden(
-            "gateway request does not name this publisher".into(),
-        ));
-    }
-    if !gateway::request_matches_record(head, &record) {
-        return Err(GatewayFailure::Conflict(
-            "gateway request does not match the current signed route".into(),
-        ));
-    }
-    revalidate_route_authority(commands, &record).await?;
+    let record = current_route(commands, scope.own_node, head).await?;
     let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
@@ -540,6 +643,31 @@ async fn serve_current(
             proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
     }
+}
+
+/// The caller-independent half of the gate: the route still resolves (a
+/// tombstone does not), still names THIS node as its publisher, still matches
+/// the head the caller signed for, and its signer is still a member of the
+/// account with a verifying signature. Every request re-runs it, and so does a
+/// live WebSocket bridge on its re-authorization tick.
+async fn current_route(
+    commands: &mpsc::Sender<NodeCommand>,
+    own_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+) -> Result<gateway::RouteRecord, GatewayFailure> {
+    let record = resolve_route(commands, head.account_id, &head.name).await?;
+    if record.statement.publisher_node.as_slice() != own_node {
+        return Err(GatewayFailure::Forbidden(
+            "gateway request does not name this publisher".into(),
+        ));
+    }
+    if !gateway::request_matches_record(head, &record) {
+        return Err(GatewayFailure::Conflict(
+            "gateway request does not match the current signed route".into(),
+        ));
+    }
+    revalidate_route_authority(commands, &record).await?;
+    Ok(record)
 }
 
 async fn resolve_route(
@@ -1222,25 +1350,14 @@ async fn authorize_ws(
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
-) -> Result<String, GatewayFailure> {
+) -> Result<WsGrant, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
     if !head.upgrade {
         return Err(GatewayFailure::Invalid(
             "gateway proxy: not an upgrade".into(),
         ));
     }
-    let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != scope.own_node {
-        return Err(GatewayFailure::Forbidden(
-            "gateway request does not name this publisher".into(),
-        ));
-    }
-    if !gateway::request_matches_record(head, &record) {
-        return Err(GatewayFailure::Conflict(
-            "gateway request does not match the current signed route".into(),
-        ));
-    }
-    revalidate_route_authority(commands, &record).await?;
+    let record = current_route(commands, scope.own_node, head).await?;
     let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
@@ -1258,7 +1375,85 @@ async fn authorize_ws(
         ));
     }
     let port = loopback_port(scope, caller_node, record.statement.account_id, head)?;
-    Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
+    Ok(WsGrant {
+        url: format!("ws://127.0.0.1:{port}{}", head.path_and_query),
+        caller,
+    })
+}
+
+/// What an authorized upgrade carries into the bridge: the loopback URL to
+/// dial, and the account the caller PROVED at open. The proof itself expires in
+/// [`CALLER_POP_FRESHNESS_SECS`] and is minted per request, so a live bridge
+/// cannot re-derive its caller — it re-checks the audience against this one.
+#[derive(Debug)]
+struct WsGrant {
+    url: String,
+    caller: Option<u64>,
+}
+
+/// Close code a bridged socket gets when its route stops authorizing it — the
+/// owner tombstoned it, bumped its revision, narrowed the audience, or dropped
+/// the signing key. 1008 is the WebSocket "policy violation" code.
+const WS_REVOKED_CLOSE: u16 = 1008;
+/// How often a live bridge re-runs the caller-independent half of its
+/// authorization. The HTTP path re-gates every request; a socket must not
+/// outlive its grant by more than one tick.
+const WS_REAUTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Resolve once a live bridge's grant stops holding. Ticks forever while the
+/// route still resolves to this publisher, its signer is still a member, and
+/// the caller proved at open is still inside the audience.
+async fn ws_revoked(
+    commands: mpsc::Sender<NodeCommand>,
+    own_node: [u8; 32],
+    head: gateway::ProxyRequestHead,
+    caller: Option<u64>,
+) {
+    let mut ticks = tokio::time::interval(WS_REAUTH_INTERVAL);
+    ticks.tick().await; // the first tick fires immediately; the gate just ran.
+    loop {
+        ticks.tick().await;
+        let Err(_failure) = reauthorize_ws(&commands, &own_node, &head, caller).await else {
+            continue;
+        };
+        tracing::warn!(
+            target: "ducktape::gateway",
+            reason = "ws_reauth_failed",
+            "gateway websocket bridge revoked"
+        );
+        return;
+    }
+}
+
+/// The re-runnable half of [`authorize_ws`]: everything a tombstone, a
+/// revision bump, an audience narrowing, or a removed signer key invalidates
+/// while a socket is open. The caller's own proof is NOT re-verified — it is
+/// per-request and expires — so the account it proved at open is passed in.
+async fn reauthorize_ws(
+    commands: &mpsc::Sender<NodeCommand>,
+    own_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+    caller: Option<u64>,
+) -> Result<(), GatewayFailure> {
+    let record = current_route(commands, own_node, head).await?;
+    let route = record
+        .statement
+        .route
+        .as_ref()
+        .expect("resolve_route rejects tombstones");
+    let in_audience =
+        gateway::audience_allows(&route.policy.audience, record.statement.account_id, caller);
+    if !in_audience {
+        return Err(GatewayFailure::Forbidden(
+            "caller is outside the signed route audience".into(),
+        ));
+    }
+    if !route.policy.allow_upgrade {
+        return Err(GatewayFailure::Forbidden(
+            "route does not permit a WebSocket upgrade".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bridge a WebSocket upgrade to the route's loopback upstream. Owns the mesh
@@ -1273,15 +1468,15 @@ async fn serve_ws<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let url = match authorize_ws(commands, scope, caller_node, head).await {
-        Ok(url) => url,
+    let grant = match authorize_ws(commands, scope, caller_node, head).await {
+        Ok(grant) => grant,
         Err(failure) => {
             let _ = write_frame(&mut stream, &failure_frame(&failure)).await;
             let _ = stream.flush().await;
             return;
         }
     };
-    let upstream = match tokio_tungstenite::connect_async(&url).await {
+    let upstream = match tokio_tungstenite::connect_async(&grant.url).await {
         Ok((upstream, _response)) => upstream,
         Err(error) => {
             let _ = write_frame(
@@ -1306,7 +1501,17 @@ async fn serve_ws<S>(
     {
         return;
     }
-    ws_pump(stream, upstream).await;
+    ws_pump(
+        stream,
+        upstream,
+        ws_revoked(
+            commands.clone(),
+            *scope.own_node,
+            head.clone(),
+            grant.caller,
+        ),
+    )
+    .await;
 }
 
 /// Resolve once a bridged socket has been silent in BOTH directions for
@@ -1324,11 +1529,47 @@ async fn ws_idle_deadline(activity: Arc<tokio::sync::Notify>) {
     );
 }
 
+/// What one poll of the upstream socket yields for the mesh direction. A
+/// discriminant, not a flag: `select!` arms cannot `break`/`continue` the outer
+/// loop (those would target the macro's own loop), so the poll DECIDES and the
+/// loop body acts on the decision.
+enum MeshStep {
+    Send(gateway::ProxyFrame),
+    Skip,
+    Stop,
+}
+
+fn upstream_step(
+    message: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+) -> MeshStep {
+    use tokio_tungstenite::tungstenite::Message;
+    match message {
+        Some(Ok(Message::Text(text))) => MeshStep::Send(gateway::ProxyFrame::WsFrame {
+            binary: false,
+            payload: text.as_bytes().to_vec(),
+        }),
+        Some(Ok(Message::Binary(bytes))) => MeshStep::Send(gateway::ProxyFrame::WsFrame {
+            binary: true,
+            payload: bytes.to_vec(),
+        }),
+        Some(Ok(Message::Close(frame))) => MeshStep::Send(gateway::ProxyFrame::WsClose {
+            code: frame.map(|frame| u16::from(frame.code)).unwrap_or(1000),
+        }),
+        Some(Ok(_)) => MeshStep::Skip,
+        Some(Err(_)) | None => MeshStep::Stop,
+    }
+}
+
 /// Two independent tasks (mesh→upstream, upstream→mesh); when either direction
-/// ends — or the bridge goes two-way idle — the others are aborted so both
-/// sockets drop and each peer sees EOF.
-async fn ws_pump<S, U>(stream: S, upstream: U)
+/// ends — or the bridge goes two-way idle, or `revoked` resolves because the
+/// route stopped authorizing this caller — the others are aborted so both
+/// sockets drop and each peer sees EOF. A revocation writes a
+/// [`WS_REVOKED_CLOSE`] frame first, so the caller learns why.
+async fn ws_pump<S, U, R>(stream: S, upstream: U, revoked: R)
 where
+    R: std::future::Future<Output = ()> + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: futures::Stream<
             Item = Result<
@@ -1371,21 +1612,18 @@ where
         }
     });
     let mut to_mesh = tokio::spawn(async move {
-        while let Some(message) = ws_rx.next().await {
-            let frame = match message {
-                Ok(Message::Text(text)) => gateway::ProxyFrame::WsFrame {
-                    binary: false,
-                    payload: text.as_bytes().to_vec(),
-                },
-                Ok(Message::Binary(bytes)) => gateway::ProxyFrame::WsFrame {
-                    binary: true,
-                    payload: bytes.to_vec(),
-                },
-                Ok(Message::Close(frame)) => gateway::ProxyFrame::WsClose {
-                    code: frame.map(|frame| u16::from(frame.code)).unwrap_or(1000),
-                },
-                Ok(_) => continue,
-                Err(_) => break,
+        let mut revoked = std::pin::pin!(revoked);
+        loop {
+            let step = tokio::select! {
+                () = &mut revoked => MeshStep::Send(gateway::ProxyFrame::WsClose {
+                    code: WS_REVOKED_CLOSE,
+                }),
+                message = ws_rx.next() => upstream_step(message),
+            };
+            let frame = match step {
+                MeshStep::Send(frame) => frame,
+                MeshStep::Skip => continue,
+                MeshStep::Stop => break,
             };
             let closing = matches!(frame, gateway::ProxyFrame::WsClose { .. });
             if write_frame(&mut mesh_write, &frame).await.is_err() {
@@ -1610,39 +1848,61 @@ async fn read_frame<S: AsyncRead + Unpin>(
 /// channel as `MAX_CHUNK_BYTES` `BodyChunk` frames (flushed per chunk — SSE
 /// latency), then `End`. A pre-head failure is a single `Failure` frame; a
 /// mid-stream failure emits `Failure` after the chunks already sent (the
-/// caller aborts — truncation). The drain deliberately has NO deadline.
+/// caller aborts — truncation). Every frame goes out under
+/// [`push_frame`]'s progress deadline, so a peer that stops reading ends the
+/// drain instead of parking the serve task and its permit for good.
 async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     outcome: Result<GatewayResponse, GatewayFailure>,
 ) -> std::io::Result<()> {
-    match outcome {
-        Ok(mut response) => {
-            if let Err(error) = gateway::validate_response_head(&response.head) {
-                write_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await?;
-                return stream.flush().await;
-            }
-            write_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
-            stream.flush().await?;
-            while let Some(item) = response.body.recv().await {
-                match item {
-                    Ok(chunk) => {
-                        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
-                            write_frame(stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec()))
-                                .await?;
-                        }
-                        stream.flush().await?;
-                    }
-                    Err(failure) => {
-                        write_frame(stream, &failure_frame(&failure)).await?;
-                        return stream.flush().await;
-                    }
-                }
-            }
-            write_frame(stream, &gateway::ProxyFrame::End).await?;
-        }
-        Err(failure) => write_frame(stream, &failure_frame(&failure)).await?,
+    let mut response = match outcome {
+        Ok(response) => response,
+        Err(failure) => return push_frame(stream, &failure_frame(&failure)).await,
+    };
+    if let Err(error) = gateway::validate_response_head(&response.head) {
+        return push_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await;
     }
-    stream.flush().await
+    push_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
+    while let Some(item) = response.body.recv().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(failure) => return push_frame(stream, &failure_frame(&failure)).await,
+        };
+        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
+            push_frame(stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec())).await?;
+        }
+    }
+    push_frame(stream, &gateway::ProxyFrame::End).await
+}
+
+/// One frame written and flushed under a per-frame progress deadline. The
+/// drain's only other bound is the peer's willingness to read: an overlay
+/// stream whose window a non-reading peer has filled blocks `write_all`
+/// forever, and the serve task holds a permit while it does. No progress for
+/// [`PROXY_IO_TIMEOUT`] ends the exchange; the caller sees EOF.
+async fn push_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &gateway::ProxyFrame,
+) -> std::io::Result<()> {
+    let written = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
+        write_frame(stream, frame).await?;
+        stream.flush().await
+    })
+    .await;
+    match written {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                reason = "stream_write_stalled",
+                "gateway response drain cut"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "gateway response write made no progress",
+            ))
+        }
+    }
 }
 
 /// Caller side, head only: `ResponseHead` (validated) or the failure that
@@ -1787,6 +2047,166 @@ mod tests {
         assert!(
             budget.admit_upgrade().is_some(),
             "a closed socket frees one"
+        );
+    }
+
+    /// The same wedge one rung down: a drain lives as long as the peer keeps
+    /// reading, so it must not be charged to the request budget either — and a
+    /// full request budget must refuse fast, not age out in the caller.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_streams_never_spend_the_request_budget() {
+        let budget = GatewayBudget::new();
+        let drains: Vec<_> = (0..MAX_CONCURRENT_STREAMS)
+            .map(|_| budget.admit_stream().expect("under the stream cap"))
+            .collect();
+        assert!(
+            budget.admit_stream().is_none(),
+            "the (N+1)th drain is refused, never queued behind bodies nobody reads"
+        );
+        assert!(
+            budget.admit_request().await.is_some(),
+            "a plain request runs with every drain parked"
+        );
+
+        // A full request budget answers, it does not hang: the acquire has its
+        // own deadline.
+        let taken: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                budget
+                    .requests
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the request budget is untouched by drains")
+            })
+            .collect();
+        assert!(budget.admit_request().await.is_none());
+        drop(taken);
+        drop(drains);
+        assert!(
+            budget.admit_stream().is_some(),
+            "a finished drain frees one"
+        );
+    }
+
+    /// A permit swapped at the head is only half the fix: the drain itself must
+    /// end when the peer stops reading, or the serve task parks forever holding
+    /// its stream permit. The reader here stays OPEN and never reads, so the
+    /// duplex fills and the write makes no progress — the issue's peer exactly.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_reading_peer_ends_the_drain() {
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        let (tx, body) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                if tx
+                    .send(Ok(bytes::Bytes::from(vec![0u8; 64 * 1024])))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let response = GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body,
+        };
+        let error = write_proxy_response(&mut writer, Ok(response))
+            .await
+            .expect_err("a peer that never reads must end the drain");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the drain ends on its own progress deadline: {error:?}"
+        );
+    }
+
+    /// The revocation wire: when the grant stops holding mid-socket, the caller
+    /// gets a policy close, not a bare EOF it cannot explain.
+    #[tokio::test]
+    async fn a_revoked_bridge_closes_with_a_policy_code() {
+        let (server_end, mut caller_end) = tokio::io::duplex(64 * 1024);
+        // an upstream that never speaks: only the revocation can end this.
+        let (upstream, _upstream_peer) = tokio::io::duplex(1024);
+        let upstream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            upstream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        tokio::spawn(ws_pump(server_end, upstream, std::future::ready(())));
+        let mut buf = Vec::new();
+        let frame = read_frame(&mut caller_end, &mut buf).await.unwrap();
+        assert!(
+            matches!(
+                frame,
+                gateway::ProxyFrame::WsClose {
+                    code: WS_REVOKED_CLOSE
+                }
+            ),
+            "a revoked bridge closes with the policy code: {frame:?}"
+        );
+    }
+
+    /// A tombstoned route stops authorizing a socket that is already open —
+    /// the check a live bridge re-runs on its tick.
+    #[tokio::test]
+    async fn reauthorization_refuses_a_tombstoned_route() {
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+            user_pop: None,
+        };
+
+        // Still published: the caller proved at open stays inside the audience.
+        let (commands, mut requests) = mpsc::channel(4);
+        let member_for_reply = member.clone();
+        tokio::spawn(async move {
+            for bytes in [
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(account(
+                    1,
+                    &member_for_reply,
+                )))),
+            ] {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+        reauthorize_ws(&commands, &publisher, &head, Some(1))
+            .await
+            .expect("a live route keeps its bridge");
+
+        // Tombstoned: the very next tick refuses.
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the route query")
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(None),
+            ))));
+        });
+        let error = reauthorize_ws(&commands, &publisher, &head, Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::NotFound(_)),
+            "a tombstoned route must revoke its open bridge: {error:?}"
         );
     }
 
