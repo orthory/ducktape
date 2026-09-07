@@ -75,8 +75,10 @@ pub(super) enum PageError {
     DuplicateComment,
     /// an append named a target that differs from the thread's.
     TargetMismatch,
-    /// edit/delete of a comment by someone other than its stored `author`, or
-    /// a thread move by someone other than its stored `opener`.
+    /// edit/delete of a comment by someone other than its stored `author`, a
+    /// thread move by someone other than its stored `opener`, or a resolve/
+    /// re-open by someone who is neither the thread's `opener` nor a page
+    /// editor of its target block.
     NotAuthor,
     /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
     TextTooLarge,

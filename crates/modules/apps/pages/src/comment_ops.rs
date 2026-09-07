@@ -413,11 +413,24 @@ impl Pages {
                 thread_id,
                 resolved,
             } => {
+                // The opener and the target page's editors may resolve or
+                // reopen a thread. Preserve exact signed-key authority for
+                // records created before that key joined an account.
                 let author = authority.actor.clone();
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
+                let block = self
+                    .load_block(&thread.target)
+                    .await
+                    .map_err(|_| PageError::Corrupt)?
+                    .ok_or(PageError::Corrupt)?;
+                let may_resolve =
+                    authority.owns(&thread.opener) || self.may_edit(&block.page, authority).await?;
+                if !may_resolve {
+                    return Err(PageError::NotAuthor);
+                }
                 thread.resolved = resolved;
                 thread.resolved_by = if resolved { Some(author) } else { None };
                 self.store_thread(&thread)
