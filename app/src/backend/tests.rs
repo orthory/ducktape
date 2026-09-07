@@ -6,7 +6,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use iced::futures::StreamExt as _;
 
 use super::*;
-use crate::{ForgeTab, MembersFilter, MessageAction, ShellTab};
+use crate::{ForgeTab, MessageAction, ShellTab};
 
 mod docs;
 mod messages;

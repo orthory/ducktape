@@ -211,12 +211,23 @@ on governance_view_event(event)
     GovIntent.execute
       run every governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
 
-// The quorum-gated membership actions the roster detail panel offers. They
-// share `gov_voting` with vote/execute: one governance write is in flight.
-on gov_propose(action, target_key)
-  return if !connected || !empty(gov_voting)
-  gov_voting = target_key
-  run every governance_propose(connected_rpc, password, action, gov_voting) -> gov_acted _ | gov_act_failed _
+// What the Members view asks of the app. `copy` is the same act as
+// `copy_to_clipboard`; the ballot shares `gov_voting` with vote/execute — one
+// governance write is in flight — and an agent's pause is an owner-gated
+// write, immediate, no ballot.
+on members_view_event(event)
+  return if !connected
+  match roster_intent(event)
+    RosterIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
+    RosterIntent.agent_status
+      run every set_agent_status(connected_rpc, password, event_text(event, "agent_id"), event_flag(event, "paused")) -> agent_status_set _ | mutation_failed _
+    RosterIntent.propose
+      return if !empty(gov_voting) || empty(event_text(event, "key"))
+      gov_voting = event_text(event, "key")
+      run every governance_propose(connected_rpc, password, event_text(event, "action"), gov_voting) -> gov_acted _ | gov_act_failed _
 
 on gov_acted(_result)
   gov_voting = ""
@@ -255,10 +266,6 @@ on dm_peers_failed(cause)
 // roster's Pause control passes `true` and its Resume control passes `false`;
 // a row wired from `agent.status` would have to invert. The registry is the
 // authority on whether the signing owner may apply the requested state.
-on agent_set_status(agent_id, paused)
-  return if !connected
-  run every set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _
-
 on agent_status_set(_result)
   agents_generation = agents_generation + 1
   error = ""

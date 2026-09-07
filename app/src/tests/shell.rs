@@ -1004,21 +1004,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .collect()
     }
 
-    let members = component(SCREENS.as_str(), "MembersScreen");
-    let members_state = local_state(members);
-    for field in [
-        "filter:MembersFilter = MembersFilter.all",
-        "selected = \"\"",
-    ] {
-        assert!(
-            members_state.contains(&field),
-            "MembersScreen owns `{field}`"
-        );
-    }
-    for handler in ["on pick_members_filter(next)", "on open_member(key)"] {
-        assert!(members.contains(handler), "MembersScreen owns `{handler}`");
-    }
-
     let explorer = component(SCREENS.as_str(), "ExplorerScreen");
     let explorer_state = local_state(explorer);
     for field in [

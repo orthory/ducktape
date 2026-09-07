@@ -1220,12 +1220,14 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/shell.ice",
         "ui/screens/chat.ice",
         "ui/screens/forge.ice",
-        // The Approvals screen ships as a module-owned view; its source is
-        // held to the same conventions as the native ones.
+        // The Approvals, Members and Agents screens ship as module-owned
+        // views; their sources are held to the same conventions as the
+        // native ones.
         "../../crates/views/governance/src/ui/app.ice",
+        "../../crates/views/members/src/ui/app.ice",
+        "../../crates/views/agents/src/ui/app.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
-        "ui/screens/roster.ice",
         "ui/screens/settings.ice",
         "ui/screens/shell.ice",
         "ui/screens/storage.ice",
@@ -1269,7 +1271,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/pages.ice",
             "ui/components/shell.ice",
             "ui/screens/forge.ice",
-            "ui/screens/roster.ice",
             "ui/screens/shell.ice",
             "ui/screens/storage.ice",
         ],
@@ -1403,12 +1404,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/forge.ice", "for repo in repos"),
         ("screens/forge.ice", "for entry in tree_entries"),
         ("screens/forge.ice", "for review in forge_item_reviews"),
-        (
-            "screens/roster.ice",
-            "for member in filter_members(rows, filter)",
-        ),
-        ("screens/roster.ice", "for member in rows"),
-        ("screens/roster.ice", "for agent in rows"),
         ("screens/node.ice", "for peer in node_peers"),
         ("components/huddle.ice", "for tile in rows"),
         ("components/node.ice", "for entry in rows"),

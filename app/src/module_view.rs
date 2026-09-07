@@ -105,11 +105,78 @@ fn intent(event: &ModuleViewEvent) -> Option<Intent> {
     serde_json::from_str(&event.detail).ok()
 }
 
+// ---------- the roster seats ----------
+
+/// The Members tab: the roster as the app has it, drawn by the `members`
+/// view. Its intents come back as `copy` (`text`, `label`), `agent_status`
+/// (`agent_id`, `paused`) and `propose` (`action`, `key`), each a JSON object
+/// in `detail` the `event_text` / `event_flag` readings pick apart.
+pub fn members_view(
+    dark: bool,
+    connected: bool,
+    admin: bool,
+    answered: bool,
+    rows: &[crate::backend::MemberRow],
+) -> Element<'static, ModuleViewEvent> {
+    let props = serde_json::json!({
+        "rows": rows,
+        "admin": admin,
+        "connected": connected,
+        "answered": answered,
+        "dark": dark,
+    });
+    module_view("members", serde_json::to_vec(&props).expect("props encode"))
+}
+
+/// The Agents tab: the registry as the app has it, drawn by the `agents`
+/// view. Nothing comes back — the register is read-only there.
+pub fn agents_view(
+    dark: bool,
+    connected: bool,
+    answered: bool,
+    rows: &[crate::backend::AgentRow],
+) -> Element<'static, ModuleViewEvent> {
+    let props = serde_json::json!({
+        "rows": rows,
+        "connected": connected,
+        "answered": answered,
+        "dark": dark,
+    });
+    module_view("agents", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn roster_intent(event: &ModuleViewEvent) -> crate::RosterIntent {
+    match event.kind.as_str() {
+        "agent_status" => crate::RosterIntent::AgentStatus,
+        "propose" => crate::RosterIntent::Propose,
+        _ => crate::RosterIntent::Copy,
+    }
+}
+
+/// The string under `field` in an intent's JSON detail; empty when absent.
+pub fn event_text(event: &ModuleViewEvent, field: &str) -> String {
+    detail(event)
+        .and_then(|detail| detail.get(field)?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The flag under `field` in an intent's JSON detail; false when absent.
+pub fn event_flag(event: &ModuleViewEvent, field: &str) -> bool {
+    detail(event)
+        .is_some_and(|detail| detail.get(field).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
+    serde_json::from_str(&event.detail).ok()
+}
+
 /// The operations a view may ask of the app, by module. An intent outside
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         "governance" => &["vote", "execute"],
+        "members" => &["copy", "agent_status", "propose"],
+        "agents" => &[],
         _ => &[],
     }
 }
@@ -832,7 +899,35 @@ mod tests {
     #[test]
     fn only_declared_intents_are_routed() {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
+        assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
+        assert!(intents_of("agents").is_empty());
         assert!(intents_of("chat").is_empty());
+    }
+
+    /// A roster intent is read field by field off its JSON; a missing or
+    /// malformed field is empty or false, which the handler's guards refuse.
+    #[test]
+    fn a_roster_intent_is_read_field_by_field() {
+        let pause = event(
+            "agent_status",
+            r#"{"agent_id":"reviewer-bot","paused":true}"#,
+        );
+        assert!(matches!(
+            roster_intent(&pause),
+            crate::RosterIntent::AgentStatus
+        ));
+        assert_eq!(event_text(&pause, "agent_id"), "reviewer-bot");
+        assert!(event_flag(&pause, "paused"));
+        let ballot = event("propose", r#"{"action":"add_validator","key":"res-1"}"#);
+        assert!(matches!(
+            roster_intent(&ballot),
+            crate::RosterIntent::Propose
+        ));
+        assert_eq!(event_text(&ballot, "key"), "res-1");
+        assert!(!event_flag(&ballot, "paused"));
+        let broken = event("copy", "not json");
+        assert!(matches!(roster_intent(&broken), crate::RosterIntent::Copy));
+        assert_eq!(event_text(&broken, "text"), "");
     }
 
     /// Every text in the tree the host holds, in tree order.
@@ -931,6 +1026,116 @@ mod tests {
                 detail: r#"{"proposal_id":"prop-1","approve":true}"#.into(),
             }]
         );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The staged path for `module`, or None with a note when `make views`
+    /// has not run.
+    fn staged(module: &str) -> Option<std::path::PathBuf> {
+        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../target/views/{module}_view.wasm"));
+        if staged.is_file() {
+            return Some(staged);
+        }
+        eprintln!("skipped: no {} — run `make views`", staged.display());
+        None
+    }
+
+    /// The bundled Members view through the host: it boots offline, takes
+    /// the roster, opens a record on a press, and the record's write comes
+    /// back as the intent the handler signs.
+    #[test]
+    fn the_staged_members_view_boots_takes_the_roster_and_pauses_an_agent() {
+        let Some(staged) = staged("members") else {
+            return;
+        };
+        let mut guest = Guest::load_from("members", &staged).expect("the view loads");
+        guest.redraw(&None);
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "rows": [
+                    {"key": "val-1", "label": "Ada", "role": "validator",
+                     "is_this_node": true, "is_agent": false, "model": "", "live": true},
+                    {"key": "reviewer-bot", "label": "Reviewer Bot", "role": "agent",
+                     "is_this_node": false, "is_agent": true, "model": "review", "live": true}
+                ],
+                "admin": true, "connected": true, "answered": true, "dark": false
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in [
+            "1 human · 1 agent",
+            "Ada",
+            "this node",
+            "Reviewer Bot",
+            "AGENT",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+
+        guest.deliver(Output::Activate(button_message(&guest, "Reviewer Bot")));
+        guest.redraw(&props);
+        assert!(
+            texts(&guest).iter().any(|text| text == "agent id"),
+            "the record opened: {:?}",
+            texts(&guest)
+        );
+        guest.deliver(Output::Activate(button_message(&guest, "Pause agent")));
+        guest.redraw(&props);
+        assert_eq!(
+            guest.intents,
+            [ModuleViewEvent {
+                kind: "agent_status".into(),
+                detail: r#"{"agent_id":"reviewer-bot","paused":true}"#.into(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Agents view through the host: offline plate, then the
+    /// register, and nothing ever leaves it.
+    #[test]
+    fn the_staged_agents_view_boots_and_takes_the_register() {
+        let Some(staged) = staged("agents") else {
+            return;
+        };
+        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
+        guest.redraw(&None);
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "rows": [{
+                    "id": "reviewer-bot", "name": "Reviewer Bot", "initials": "RB",
+                    "capability": "review", "status": "paused", "owner_handle": "eddy",
+                    "live": false, "skill_count": 3, "cap_count": 2
+                }],
+                "connected": true, "answered": true, "dark": false
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["1 agent · 0 working", "Reviewer Bot", "PAUSED", "eddy"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert!(guest.intents.is_empty());
         assert!(guest.fault.is_none());
     }
 
