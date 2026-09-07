@@ -386,10 +386,21 @@ cargo test -p node-bin --test chat_module_upgrade_e2e \
   -- --ignored --nocapture
 ```
 
-The test seeds only faulty source, vendored dependencies, a normal module
-contract and its faulty artifact. The agent receives an ordinary repair issue
-and the production provider invocation. It must repair source, build inside
-Firecracker and request deployment. Host assertions check preserved state,
-corrected increments, independent source reproduction and restart. The host's
-reference answer stays outside the guest. Evidence is retained under
-`target/self-heal/evidence/`; the provider trace is owner-readable only.
+This is a guided, single-validator integration test using `hello-wasm`, whose
+source identifies it as the reference module and includes test operations. The
+repository supplies the expected increment of one, vendored dependencies, an
+offline build script, artifact packaging and deployment instructions. The
+injected fault changes one arithmetic constant. The agent receives the repair
+issue through chat and uses the production provider invocation to edit source,
+build inside Firecracker and request deployment.
+
+The host harness provisions the network, registers the faulty module, opens
+the issue and posts the mention. After activation it independently rebuilds
+the delivered source, checks preserved state and corrected increments, restarts
+the node and checks again. Those recovery checks are host assertions; the
+agent's run ends with its deployment request. Clean source history and the
+repaired artifact are withheld, while the required behavior and build procedure
+are supplied. Transcript checks establish absence of a host-only canary and
+evidence path, not absence of task guidance or awareness of a test. Evidence is
+retained under `target/self-heal/evidence/`; the provider trace is owner-readable
+only.

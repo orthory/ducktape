@@ -1,6 +1,8 @@
-//! Opt-in live repair. The model receives only the faulty repository and an
-//! ordinary issue. Fault selection, reference code, and behavioral assertions
-//! stay in this host test; no answer or replacement artifact enters the guest.
+//! Guided live integration using the reference counter. The guest receives
+//! faulty source, its expected behavior, an offline build recipe and deployment
+//! instructions. The host owns fault injection, setup and recovery assertions.
+//! No clean source revision or repaired artifact is supplied. The transcript
+//! checks cover the host-only canary and evidence path, not absence of hints.
 
 use super::*;
 use std::sync::{Arc, Mutex};
