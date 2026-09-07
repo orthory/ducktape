@@ -101,6 +101,70 @@ pub enum GatewayFailure {
 
 pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
 
+/// How long a caller waits for a slot on the gateway lane. The reply deadline
+/// alone is not enough: a saturated plane stops draining the lane, and an
+/// un-deadlined `send` there hangs the axum handler with no response at all.
+const LANE_ADMIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a caller waits for the publisher's response head.
+const PROXY_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// WebSocket doors one page (an account's route) may hold open at once. The
+/// handshake `Origin` cannot key this — CEF sends the literal "null" for a
+/// `duck://` page — so the grant's route is the page.
+const MAX_OPEN_WS_DOORS_PER_PAGE: usize = 4;
+
+/// Take a slot on the gateway lane, bounded by [`LANE_ADMIT_TIMEOUT`]. Every
+/// caller goes through here: an un-deadlined `send` on a lane the plane has
+/// stopped draining is a request that never answers at all.
+async fn reserve_lane(lane: GatewayLane) -> Option<tokio::sync::mpsc::OwnedPermit<GatewayJob>> {
+    tokio::time::timeout(LANE_ADMIT_TIMEOUT, lane.reserve_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
+/// Open-door count per page, so one page cannot park every upgrade slot on the
+/// node. A [`WsDoorGuard`] releases its slot when the bridge task ends.
+#[derive(Default)]
+pub(crate) struct WsDoorLimit {
+    open: std::sync::Mutex<std::collections::HashMap<(u64, gateway::RouteName), usize>>,
+}
+
+pub(crate) struct WsDoorGuard {
+    limit: Arc<WsDoorLimit>,
+    page: (u64, gateway::RouteName),
+}
+
+impl WsDoorLimit {
+    /// Take a slot for `page`, or `None` when the page already holds
+    /// [`MAX_OPEN_WS_DOORS_PER_PAGE`].
+    pub(crate) fn admit(self: &Arc<Self>, page: (u64, gateway::RouteName)) -> Option<WsDoorGuard> {
+        let mut open = self.open.lock().expect("ws door limit poisoned");
+        let count = open.entry(page.clone()).or_insert(0);
+        if *count >= MAX_OPEN_WS_DOORS_PER_PAGE {
+            return None;
+        }
+        *count += 1;
+        Some(WsDoorGuard {
+            limit: Arc::clone(self),
+            page,
+        })
+    }
+}
+
+impl Drop for WsDoorGuard {
+    fn drop(&mut self) {
+        let mut open = self.limit.open.lock().expect("ws door limit poisoned");
+        let std::collections::hash_map::Entry::Occupied(mut entry) = open.entry(self.page.clone())
+        else {
+            return;
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+}
+
 /// Dedicated least-privilege browser origin for gateway rendering: a separate
 /// loopback listener, never the node API origin. Held on [`NodeHandle`].
 #[derive(Clone)]
@@ -109,6 +173,8 @@ pub(crate) struct BrowserGateway {
     /// Single-use tokens for the WebSocket side door (audit S3), shared between
     /// the `/.duck/ws-token` mint and the `/.duck/ws/{token}` upgrade.
     pub(crate) ws_tokens: Arc<WsTokenStore>,
+    /// Per-page cap on simultaneously open WebSocket doors.
+    pub(crate) ws_doors: Arc<WsDoorLimit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,16 +310,18 @@ async fn proxy_current(
         ));
     };
     let (reply, rx) = oneshot::channel();
-    lane.send(GatewayJob::Http {
+    let job = GatewayJob::Http {
         publisher_node,
         max_response_bytes,
         head,
         body,
         reply,
-    })
-    .await
-    .map_err(|_| GatewayFailure::Unavailable("gateway plane is not available".into()))?;
-    let response = tokio::time::timeout(Duration::from_secs(15), rx)
+    };
+    let slot = reserve_lane(lane)
+        .await
+        .ok_or_else(|| GatewayFailure::Unavailable("gateway lane is saturated".into()))?;
+    slot.send(job);
+    let response = tokio::time::timeout(PROXY_REPLY_TIMEOUT, rx)
         .await
         .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("gateway plane dropped the request".into()))??;
@@ -536,9 +604,9 @@ impl futures::Stream for HeadCommitFence {
                     Poll::Pending
                 }
             },
-            FenceState::FailureAfterFlush(failure) => Poll::Ready(Some(Err(
-                std::io::Error::other(format!("{failure:?}")),
-            ))),
+            FenceState::FailureAfterFlush(failure) => {
+                Poll::Ready(Some(Err(std::io::Error::other(format!("{failure:?}")))))
+            }
             FenceState::Finished => Poll::Ready(None),
         }
     }
@@ -698,7 +766,24 @@ fn gateway_failure_response(failure: GatewayFailure) -> Response {
 #[serde(deny_unknown_fields)]
 struct WsTokenRequest {
     authority: String,
-    origin: String,
+    /// The origin-form socket path the page's `new WebSocket()` targets
+    /// (e.g. `/socket`) — dialed verbatim at the publisher, so it must name a
+    /// real upstream path rather than letting every route's socket resolve to
+    /// `/`. Validated by [`validate_ws_socket_path`].
+    path: String,
+}
+
+/// The mint request's requested socket path: origin-form (shares
+/// [`gateway::validate_origin_form`]'s start/length/charset rules) and, unlike
+/// a generic proxied path, never containing a `..` segment — this path is
+/// forwarded to the publisher's own dial, not resolved through DuckFS, but a
+/// traversal-shaped value has no legitimate reading here either.
+fn validate_ws_socket_path(path: &str) -> Result<(), String> {
+    gateway::validate_origin_form(path)?;
+    if path.contains("..") {
+        return Err("gateway ws token: path must not contain '..'".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -707,12 +792,16 @@ struct WsTokenReply {
 }
 
 /// Mint a single-use WS side-door token. Called by the duck:// scheme handler
-/// when the page fetches its synthetic same-origin `/.duck/ws`; the handler
-/// passes the page's origin and its authority, which the node resolves to the
-/// bound route just as the content path does. Native/console-guarded like the
-/// other browser-gateway control routes.
+/// when the page fetches its synthetic same-origin `/.duck/ws`, naming the
+/// authority it wants a socket for. The bound origin is derived from the
+/// REQUEST, never the body: like `gateway_browser_proxy` on this same router,
+/// the caller must carry an `x-duck-authority` header, that header must match
+/// the `authority` being minted for, and any `Origin` header must be exactly
+/// `duck://<authority>` — a missing `x-duck-authority`, a mismatched one, or a
+/// mismatched (including missing) `Origin` all refuse the mint.
 async fn gateway_ws_token_mint(
     State(handle): State<NodeHandle>,
+    headers: HeaderMap,
     Json(request): Json<WsTokenRequest>,
 ) -> Response {
     let Some(browser_gateway) = handle.browser_gateway.clone() else {
@@ -721,16 +810,47 @@ async fn gateway_ws_token_mint(
             "gateway browsing is disabled",
         );
     };
-    if request.origin.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "origin is required");
+    let Some(header_authority) = headers
+        .get("x-duck-authority")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
+    };
+    if header_authority != request.authority {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "duck authority header does not match the requested authority",
+        );
     }
+    let page_origin = format!("duck://{header_authority}");
+    let origin_matches = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin == page_origin);
+    if !origin_matches {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "cross-origin websocket token mint denied",
+        );
+    }
+    if let Err(error) = validate_ws_socket_path(&request.path) {
+        return error_response(StatusCode::BAD_REQUEST, &error);
+    }
+    // The mint request is an ordinary HTTP POST, so a caller proof rides it
+    // exactly as it would the proxy lane — read here and carried, unverified,
+    // to the publisher's own `caller_account` check at door time.
+    let user_pop = match user_pop_headers(&headers) {
+        Ok(pop) => pop,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
     let (account_id, name) = match resolve_duck_authority(&handle, &request.authority).await {
         Ok(resolved) => resolved,
         Err(failure) => return gateway_failure_response(failure),
     };
-    let token = browser_gateway
-        .ws_tokens
-        .mint(request.origin, account_id, name);
+    let token =
+        browser_gateway
+            .ws_tokens
+            .mint(page_origin, account_id, name, request.path, user_pop);
     Json(WsTokenReply { token }).into_response()
 }
 
@@ -760,6 +880,13 @@ async fn gateway_ws_door(
     let Some(grant) = browser_gateway.ws_tokens.consume(&token, &origin) else {
         return error_response(StatusCode::FORBIDDEN, "invalid or expired websocket token");
     };
+    let page = (grant.account_id, grant.name.clone());
+    let Some(door) = browser_gateway.ws_doors.admit(page) else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "this page already holds its websocket doors open",
+        );
+    };
     let record = match current_route(&handle, grant.account_id, &grant.name).await {
         Ok(record) => record,
         Err(_) => return error_response(StatusCode::BAD_GATEWAY, "route no longer resolves"),
@@ -772,13 +899,19 @@ async fn gateway_ws_door(
         name: grant.name,
         revision: record.statement.revision,
         method: gateway::RouteMethod::Get,
-        path_and_query: "/".into(),
+        path_and_query: grant.path,
         headers: vec![],
         body_len: 0,
         upgrade: true,
-        user_pop: None,
+        user_pop: grant.user_pop,
     };
-    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, lane, publisher, head))
+    // Reserve the lane slot BEFORE answering 101: once the socket is upgraded
+    // there is no status left to send, so a saturated lane has to be a 503 on
+    // the handshake rather than a socket that opens and then hangs.
+    let Some(slot) = reserve_lane(lane).await else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway lane is saturated");
+    };
+    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, slot, publisher, head, door))
 }
 
 /// Bridge a browser WebSocket to the gateway upgrade lane: translate axum
@@ -786,25 +919,22 @@ async fn gateway_ws_door(
 /// closes.
 async fn bridge_axum_ws(
     socket: WebSocket,
-    lane: GatewayLane,
+    slot: tokio::sync::mpsc::OwnedPermit<GatewayJob>,
     publisher: [u8; 32],
     head: gateway::ProxyRequestHead,
+    // Held for the life of the bridge: the page's door slot comes back when
+    // this task ends.
+    _door: WsDoorGuard,
 ) {
     use futures::{SinkExt as _, StreamExt as _};
     let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
     let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
-    if lane
-        .send(GatewayJob::Upgrade {
-            publisher_node: publisher,
-            head,
-            to_browser: to_browser_tx,
-            from_browser: from_browser_rx,
-        })
-        .await
-        .is_err()
-    {
-        return;
-    }
+    slot.send(GatewayJob::Upgrade {
+        publisher_node: publisher,
+        head,
+        to_browser: to_browser_tx,
+        from_browser: from_browser_rx,
+    });
     let (mut sink, mut stream) = socket.split();
     let mut browser_to_plane = tokio::spawn(async move {
         while let Some(Ok(message)) = stream.next().await {
@@ -861,6 +991,50 @@ mod tests {
     use axum::routing::get;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    /// A plane that stopped draining must not turn every gateway request into a
+    /// handler that never answers: admission gives up at the deadline, and the
+    /// caller turns that into a status.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_lane_gives_up_at_the_deadline_instead_of_hanging() {
+        let (lane, _jobs) = tokio::sync::mpsc::channel::<GatewayJob>(1);
+        let held = reserve_lane(lane.clone()).await.expect("the only slot");
+        let started = tokio::time::Instant::now();
+        assert!(
+            reserve_lane(lane.clone()).await.is_none(),
+            "a full lane must refuse, not block forever"
+        );
+        assert_eq!(started.elapsed(), LANE_ADMIT_TIMEOUT);
+        drop(held);
+        assert!(
+            reserve_lane(lane).await.is_some(),
+            "the slot comes back when the job leaves the lane"
+        );
+    }
+
+    #[test]
+    fn a_page_holds_a_bounded_number_of_websocket_doors() {
+        let limit: Arc<WsDoorLimit> = Arc::default();
+        let page = (7u64, gateway::RouteName::named("app"));
+        let doors: Vec<_> = (0..MAX_OPEN_WS_DOORS_PER_PAGE)
+            .map(|_| limit.admit(page.clone()).expect("under the cap"))
+            .collect();
+        assert!(
+            limit.admit(page.clone()).is_none(),
+            "the (N+1)th door on one page is refused"
+        );
+        // Another page keeps its own budget.
+        assert!(
+            limit
+                .admit((7, gateway::RouteName::named("other")))
+                .is_some()
+        );
+        drop(doors);
+        assert!(
+            limit.admit(page).is_some(),
+            "closing a socket returns its door slot"
+        );
+    }
+
     /// Serve ONE `200` response whose body is the fenced relay over `rx`, do a
     /// raw HTTP/1.1 GET against it, and return every byte the socket delivered
     /// before the server hung up. EOF is the synchronization event: Hyper
@@ -912,7 +1086,9 @@ mod tests {
     #[tokio::test]
     async fn head_commits_before_a_queued_body_failure_aborts() {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
-        tx.send(Ok(Bytes::from(vec![b'c'; 64 * 1024]))).await.unwrap();
+        tx.send(Ok(Bytes::from(vec![b'c'; 64 * 1024])))
+            .await
+            .unwrap();
         tx.send(Err(GatewayFailure::Unavailable("cap".into())))
             .await
             .unwrap();

@@ -10,15 +10,13 @@
 //! verbatim with `duck-guest-init`.
 //!
 //! This crate is pure muscle — it decides nothing about WHICH executor runs or
-//! with what credentials. That is `capability-host`'s job, and it is the only
+//! with what credentials. That is `provider-host`'s job, and it is the only
 //! in-tree caller of the run path.
 
 use std::path::Path;
 
 // unix-only: the VMM client speaks over unix sockets and the storage path
 // shells out to e2fsprogs.
-#[cfg(unix)]
-pub mod egress;
 #[cfg(unix)]
 pub mod firecracker_api;
 pub mod guest_paths;
@@ -39,18 +37,16 @@ pub mod workspace_image;
 #[cfg(unix)]
 pub mod executor_image;
 
-#[cfg(unix)]
-pub use egress::tap_egress_nftables;
 pub use guest_paths::GuestLayout;
 #[cfg(unix)]
 pub use host_tools::{find_executable, find_on_path, find_system_tool};
 #[cfg(unix)]
-pub use microvm::{MicroVm, MicroVmIo};
+pub use microvm::{MicroVm, MicroVmIo, ScratchDir};
 pub use sandbox::{SandboxBackend, Vmm};
 pub use workspace_image::GuestAsset;
 
 /// whether `p` is a file this process could exec. the shared predicate behind
-/// both PATH walks: the sandbox runtime probe here, and capability-host's
+/// both PATH walks: the sandbox runtime probe here, and the provider's
 /// executor discovery.
 pub fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;

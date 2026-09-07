@@ -1,0 +1,25 @@
+# modules — the network module-code registry. It commits each hot-swappable
+# module's active code hash and at most one readiness-gated scheduled swap.
+[package]
+name = "modules"
+version.workspace = true
+edition.workspace = true
+
+[features]
+guest = ["dep:ducktape-module-sdk"]
+
+[dependencies]
+ducktape-module-sdk = { workspace = true, optional = true }
+sdk = { workspace = true }
+# the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
+valset = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
+futures = { workspace = true }
+sdk-testkit = { workspace = true }

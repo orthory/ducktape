@@ -45,11 +45,12 @@
 //!   next-block delivery — the ONLY result intake);
 //! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
 //! - `Origin::Module(agent)` → an [`AgentEvent`] (the registry hook): the
-//!   registry's same-block notification that an agent landed or changed
-//!   capability, answered here by registering/retuning the agent's
-//!   dispatch-plane recipe. unlike every other module intake this one MAY
-//!   error — it rides the registry write's own block, and aborting that
-//!   block is exactly the atomicity the recipe seam needs;
+//!   registry's same-block notification that an agent landed, changed
+//!   capability, or left the registry, answered here by
+//!   registering/retuning/removing the agent's dispatch-plane recipe. unlike
+//!   every other module intake this one MAY error — it rides the registry
+//!   write's own block, and aborting that block is exactly the atomicity the
+//!   recipe seam needs;
 //! - `Origin::Module(saga)` → a dead-letter no-op. nothing here rides the
 //!   saga directly, but any submitter can point a saga trigger's `reply_to`
 //!   at this module — the tombstone keeps that callback from ever aborting
@@ -122,11 +123,11 @@ use agent::{
     AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
     MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
+    SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
 };
 use chat::{
-    Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
@@ -136,7 +137,7 @@ use dispatch::{
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
 use files::{
-    Change as FilesChange, Content as FilesContent, FilesMsg, FilesQuery, FilesReply,
+    Change as FilesChange, Content as FilesContent, EntryInfo, FilesMsg, FilesQuery, FilesReply,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };
@@ -145,7 +146,7 @@ use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSync
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tagging::{
-    EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
+    Author, EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
 };
 use tasks::{
@@ -377,6 +378,7 @@ mod agent_intake;
 mod dispatch_flow;
 mod engagement;
 mod facets;
+use facets::WireSink;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
 // tracker/refs mirrors, and the item-session workspace/sink composition.
 mod forge_source;
@@ -434,36 +436,21 @@ struct PendingState {
     job_id: Option<String>,
     /// the claim height this job-backed run is bound to; chat runs use 0.
     job_claim_height: u64,
-    /// the run-creating origin — a cancel capability alongside the owner.
+    /// the ACCOUNT the run speaks for: the explicit requester, or the author
+    /// whose post engaged the agent — never the plane that carried the event.
+    /// it is both a cancel capability alongside the owner and the chat standing
+    /// an agent's own posts are held to (`requester_may_post`).
     requester: SagaOrigin,
+    /// the sink COMMITTED at dispatch — the binding delivery enforces (#1835).
+    /// an executing node's echoed result sink is compared against this, never
+    /// trusted on its own: a mismatch degrades delivery to `Chain`.
+    sink: WireSink,
     created_at: u64,
 }
 
 impl PendingState {
     fn run_id(&self) -> String {
         self.run_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RunAuthority {
-    allowed_actions: Vec<String>,
-    caps: ResourceCaps,
-}
-
-impl RunAuthority {
-    fn from_record(record: &AgentRecord) -> Self {
-        Self {
-            allowed_actions: record.allowed_actions.clone(),
-            caps: record.caps.clone(),
-        }
-    }
-
-    fn apply(&self, record: &AgentRecord) -> AgentRecord {
-        let mut ceiling = record.clone();
-        ceiling.allowed_actions = self.allowed_actions.clone();
-        ceiling.caps = self.caps.clone();
-        ceiling.scoped_for_call(record)
     }
 }
 
@@ -479,6 +466,9 @@ struct DelegationState {
 struct PreparedDispatch {
     thread_root: Option<u64>,
     payload: Vec<u8>,
+    /// the requested sink composed into `payload`'s `result_contract` —
+    /// captured here so the caller can commit it into `PendingState` (#1835).
+    sink: WireSink,
 }
 
 // ---- the module -----------------------------------------------------------
@@ -519,7 +509,7 @@ pub struct RunsModule {
     /// a failure).
     pages: Option<ModuleId>,
     /// this network's chain id, from the genesis `__config` record
-    /// (`topology::CONFIG_CHAIN_ID`) — the ONLY way a fixed component learns
+    /// (`sdk::genesis_config::CHAIN_ID`) — the ONLY way a fixed component learns
     /// which network it is running on. Genesis config, NOT committed state
     /// (never in `root()`). Every `duck://` link this module renders into an
     /// agent's context stamps its `?net=` half from it; empty (dev tools,

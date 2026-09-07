@@ -10,6 +10,7 @@ extern crate::backend
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
+  CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
@@ -109,7 +110,7 @@ extern crate::backend
   pure icon(name:&str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
-  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, forge_discussion:[ChatMessage], forge_item_channel:str, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
+  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, has_older_history:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, forge_discussion:[ChatMessage], forge_item_channel:str, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
   pure resync_planes(load_chat:bool, load_pages:bool) -> str
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, fold_serial:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
@@ -120,15 +121,24 @@ extern crate::backend
   pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure merge_landing_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure merge_thread_refresh(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
-  pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
+  pure resynced_messages(loaded:bool, chain_moved:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
   pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  pure history_has_older(messages:[ChatMessage]) -> bool
   pure oldest_message_seq(messages:[ChatMessage]) -> i64
   pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
   pure message_selection_after_window(messages:[ChatMessage], seq:i64, rev:i64, action:MessageAction, draft:str) -> MessageSelection
+  // THE COPY RANGE. Addressed by the seqs at its two ends because history
+  // prepends — an index is stale the moment an older page merges in.
+  pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
+  pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
+  pure copy_range_text(messages:&[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_label(count:i64) -> str
+  pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
+  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
+  pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
   // Chat's message/thread menus still place themselves this way; the name is
@@ -161,6 +171,16 @@ extern crate::backend
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
+  // Whether the close that just unregistered a slot ends the process: true
+  // only off macOS, where no status item exists to live in, once no window
+  // is left.
+  pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
+  // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
+  // to raise, so the row must open a window instead of focusing a fresh id.
+  pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon
+  // The same decision for the call's window: the LIVE pill and the tray's
+  // huddle row both mean "put it in front of me", whether or not one is up.
+  pure huddle_summon(huddle:window-id?) -> WindowSummon
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a
@@ -196,6 +216,18 @@ extern crate::backend
   pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
+  // The command modifier held, off the modifier stream: the cheap half that
+  // arms the quit route. It asks `command()` — the SAME modifier the chord
+  // below asks for — because a route armed on one modifier and a chord judged
+  // on another is a chord that never fires off a Mac.
+  pure command_held(modifiers:key-modifiers) -> bool
+  pure shift_held(modifiers:key-modifiers) -> bool
+  pure is_copy_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> bool
+  // WHICH command chord this press is, if any — the one answer, so ⌘Q and ⌘W
+  // are defined in one place instead of re-spelled per handler. Both key
+  // readings, like every other chord here: the logical key follows the layout,
+  // the physical one is what a non-QWERTY layout still calls Q and W.
+  pure command_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> CommandChord
   NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
@@ -221,10 +253,11 @@ extern crate::backend
   pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
-  files_mkdir(rpc:str, path:str) -> bool ! AppError
-  files_remove(rpc:str, path:str) -> bool ! AppError
-  files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
-  files_upload(rpc:str, dir:str, dropped:str) -> bool ! AppError
+  pure files_write_gate(dir:str, me:str) -> str
+  files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
+  files_remove(rpc:str, password:str, path:str) -> bool ! AppError
+  files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError
+  files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   FsDiffEntry(path:str, kind:str)
   FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
   files_diff(rpc:str, from:str, generation:i64) -> FsDiff ! HydrationError
@@ -252,7 +285,7 @@ extern crate::backend
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
   sync current_wall_seconds() -> i64
   pure mmss(seconds:i64) -> str
-  sync network_label(account_name:str, rpc:str) -> str
+  pure network_label(chain_id:str, rpc:str) -> str
   pure tray_badge(unread:i64) -> str
   pure tray_tooltip(network:str, status:str) -> str
   pure tray_bell_row(unread:i64) -> str
@@ -408,6 +441,8 @@ extern crate::backend
   load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
+  load_desktop_notifications() -> bool
+  save_desktop_notifications(enabled:bool) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase
@@ -424,7 +459,7 @@ extern crate::backend
   pure mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
   ChatSidebarRow(channel:ChatChannel, unread:bool)
   DmSidebarRow(peer:DmPeer, unread:bool)
-  pure chat_sidebar_rooms(channels:[ChatChannel], peers:[DmPeer], me:str, reads:[ChannelRead]) -> [ChatSidebarRow]
+  pure chat_sidebar_rooms(channels:[ChatChannel], peers:[DmPeer], reads:[ChannelRead]) -> [ChatSidebarRow]
   pure chat_sidebar_dms(channels:[ChatChannel], peers:[DmPeer], reads:[ChannelRead]) -> [DmSidebarRow]
   pure channel_switch_facts(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64, current_name:str) -> ChannelSwitchFacts
   // A load's rows FOLD into the sidebar list; they do not replace it. The
@@ -432,6 +467,7 @@ extern crate::backend
   // live stream is still folding into.
   pure upsert_channel_rows(channels:[ChatChannel], refreshed:[ChatChannel]) -> [ChatChannel]
   pure near_scroll_top(relative_offset:f64) -> bool
+  pure near_scroll_tail(relative_offset:f64) -> bool
   // The composer instances' keys (ducktape-ui#697). The ENDPOINT is in both:
   // a channel id is a user-chosen string, so two networks' `#general` are two
   // rooms — the park store this replaced had to be emptied by hand on every
@@ -443,7 +479,8 @@ extern crate::backend
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
-  pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
+  pure keep_channels(loaded:bool, chain_moved:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
+  pure chain_moved(held:str, live:str) -> bool
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
@@ -506,8 +543,8 @@ extern crate::backend
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
-  pure dm_channel_id(a:str, b:str) -> str
-  pure dm_peer_of_channel(peer:str, me:str, channel:str) -> str
+  pure dm_room_of_peer(peers:[DmPeer], peer:str) -> str
+  pure dm_peer_of_channel(peer:str, peers:[DmPeer], channel:str) -> str
   pure dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
   pure no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError

@@ -5,15 +5,16 @@
 //!
 //! this is the laptop-sleep regression net for the desktop node. a slept
 //! machine leaves exactly this shape behind: the frozen node goes silent, so
-//! the peer's next read runs into `MESH_IO_TIMEOUT` (15s) and tears the
-//! connection down; on wake the follower holds half-open sockets and must
-//! heal through teardown → redial → catch-up. the 25s freeze is deliberately
-//! ABOVE the 15s deadline so the founder-side teardown really happens — under
-//! the old 60s default the founder would still be holding the dead-quiet
-//! connection when the resident thaws. (linux cannot fake the one macOS-only
-//! aggravation — `CLOCK_UPTIME_RAW` pausing across sleep, which makes the
-//! wakened node itself burn its full residual deadline — so the bound on that
-//! side is the constant itself, asserted where it is defined.)
+//! the peer's next read runs into `MESH_IO_TIMEOUT` (`overlay_net::userspace
+//! ::seam::IO_TIMEOUT`) and tears the connection down; on wake the follower
+//! holds half-open sockets and must heal through teardown → redial →
+//! catch-up. `FREEZE` is deliberately built ABOVE that deadline (deadline +
+//! slack) so the founder-side teardown really happens — under the old 60s
+//! default the founder would still be holding the dead-quiet connection when
+//! the resident thaws. (linux cannot fake the one macOS-only aggravation —
+//! `CLOCK_UPTIME_RAW` pausing across sleep, which makes the wakened node
+//! itself burn its full residual deadline — so the bound on that side is the
+//! constant itself, asserted where it is defined.)
 //!
 //! run alone (cluster e2es flake under parallel load):
 //!   cargo test -p node-bin --test suspend_resume_e2e -- --nocapture --test-threads=1
@@ -31,9 +32,18 @@ use common::NetworkShapeCluster;
 /// pre-synced boundary is several blocks of slack.
 const CONVERGE: Duration = Duration::from_secs(180);
 
-/// freeze long enough that the founder's 15s read deadline fires mid-freeze
-/// and tears the resident's connections down — the slept-laptop shape.
-const FREEZE: Duration = Duration::from_secs(25);
+/// slack above the founder's read deadline: enough that the deadline firing
+/// mid-freeze is never a photo finish on a slow box.
+const FREEZE_SLACK: Duration = Duration::from_secs(10);
+
+/// freeze long enough that the founder's read deadline
+/// (`overlay_net::userspace::seam::IO_TIMEOUT`, the mesh's only half-open
+/// detector) fires mid-freeze and tears the resident's connections down —
+/// the slept-laptop shape. derived from that constant plus slack, not a
+/// restated literal, so the two can never drift apart.
+const FREEZE: Duration = Duration::from_secs(
+    overlay_net::userspace::seam::IO_TIMEOUT.as_secs() + FREEZE_SLACK.as_secs(),
+);
 
 /// the thaw-to-caught-up bound. healing is deadline-driven: the resident's
 /// own dead reads fail fast (its sockets got FIN/RST while frozen), the

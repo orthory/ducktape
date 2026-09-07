@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chat::AuthorRef;
 use identity::{IdentityQuery, IdentityReply};
 use sdk::{Ctx, Error, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -32,8 +33,8 @@ use crate::oid::{OID_RAW_LEN, Oid};
 use crate::refs::{INTEGRATION_BRANCH, RepoState, StagedRef, is_protected_branch, norm_branch};
 use crate::tracker::{self, Tracker, author_from_origin, parse_hex_oid};
 use crate::{
-    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, PushCert, RefUpdate, ReviewVerdict, decode_msg,
-    norm_repo,
+    ForgeMsg, ItemKind, MAX_BRANCHES_PER_REPO, MAX_REFS_PER_PUSH, MAX_REPOS_PER_OWNER, PushCert,
+    RefUpdate, ReviewVerdict, decode_msg, norm_repo,
 };
 
 /// the Identity module's genesis-constant id — the account registry every
@@ -181,6 +182,15 @@ fn stage_updates(
             new.is_some().then(|| digest.unwrap()),
         )?;
     }
+    // the branch ceiling reads the map this push would PUBLISH, so a delete
+    // always passes and a push that both deletes and creates is judged on its
+    // net effect. the branch map IS the count — no counter to persist.
+    let live_branches = state.published_refs().len();
+    if live_branches > MAX_BRANCHES_PER_REPO {
+        return Err(Error::Module(format!(
+            "forge: repo is at its branch cap ({MAX_BRANCHES_PER_REPO}); delete a branch first"
+        )));
+    }
     Ok(())
 }
 
@@ -243,6 +253,7 @@ impl ForgeState {
         ctx: &mut dyn Ctx,
         payload: &[u8],
         chat_target: Option<&str>,
+        chain_id: &str,
     ) -> Result<(), Error> {
         let now = ctx.env().consensus_time;
         match decode_msg(payload).map_err(Error::Module)? {
@@ -253,7 +264,10 @@ impl ForgeState {
                 cert,
             } => {
                 let name = norm_repo(&repo)?;
-                let principal = Self::push_principal(ctx, &name, cert.as_ref(), &updates).await?;
+                let principal = self
+                    .push_principal(ctx, chain_id, &name, cert.as_ref(), &updates)
+                    .await?;
+                self.settle_owner(ctx, &name).await?;
                 self.stage_push_refs(&name, principal, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
@@ -371,7 +385,9 @@ impl ForgeState {
 
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
-                self.require_merge_owner(&name, &target, &principal)?;
+                let actor = author_from_origin(&ctx.env().origin)?;
+                self.settle_owner(ctx, &name).await?;
+                self.require_merge_authorized(&name, &target, number, &actor, &principal)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
                 // under the merger, and the merge must have been computed
@@ -501,10 +517,13 @@ impl ForgeState {
 
     /// the principal a PUSH speaks for: with a push certificate, the SSH key
     /// that signed it (its account, when it has one) — `git push --signed`
-    /// through any node, verified here by every validator; without one, the
+    /// through any node, verified here by every validator against THIS
+    /// network's own chain id (`pushcert::signer`, #1773); without one, the
     /// frame origin ([`Self::principal_of_origin`]).
     async fn push_principal(
+        &mut self,
         ctx: &dyn Ctx,
+        chain_id: &str,
         repo: &str,
         cert: Option<&PushCert>,
         updates: &[RefUpdate],
@@ -512,10 +531,41 @@ impl ForgeState {
         let Some(cert) = cert else {
             return Self::principal_of_origin(ctx).await;
         };
-        let signer = crate::pushcert::signer(cert, repo, updates)
+        let signer = crate::pushcert::signer(cert, chain_id, repo, updates)
             .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
         let account = Self::identity_account(ctx, &signer).await?;
         Ok(account.map_or(signer, identity::account_principal))
+    }
+
+    /// settle a repo's stored owner onto the ACCOUNT that owns it, the moment
+    /// Identity knows the owning key.
+    ///
+    /// a repo birthed by a key Identity knew nothing about stores that RAW
+    /// key. the principal every op derives is not stored, it is re-derived per
+    /// op — so admitting that key to an account later makes every push speak
+    /// for the account principal while the stored owner still names the key,
+    /// and the owner is locked out of their own repo. the stored bytes have to
+    /// follow the derivation.
+    ///
+    /// the settle is ONE-WAY and PERSISTED: once a repo is owned by an
+    /// account, removing the key from that account does not hand ownership
+    /// back to the key. it runs before every owner check, on the same
+    /// block-scratch tracker as the op itself, so a refused block drops it
+    /// with everything else.
+    async fn settle_owner(&mut self, ctx: &dyn Ctx, repo: &str) -> Result<(), Error> {
+        let Some(owner) = self.tracker_view().owner(repo).map(<[u8]>::to_vec) else {
+            return Ok(());
+        };
+        let already_an_account = identity::principal_account(&owner).is_some();
+        if already_an_account {
+            return Ok(());
+        }
+        let Some(number) = Self::identity_account(ctx, &owner).await? else {
+            return Ok(());
+        };
+        self.staged_tracker_mut()
+            .claim_owner(repo, identity::account_principal(number));
+        Ok(())
     }
 
     /// stage an atomic multi-branch push: validate the update list, settle
@@ -534,7 +584,9 @@ impl ForgeState {
     /// the push that BIRTHS a repo pins its owner; afterwards only that owner
     /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
     /// member — the GitHub flow this module documents, and what the dogfood
-    /// loop's second node pushes under its own key.
+    /// loop's second node pushes under its own key. a raw-key owner follows
+    /// its key onto an account the first time Identity knows it
+    /// ([`Self::settle_owner`], run by the caller before this).
     fn stage_push_refs(
         &mut self,
         name: &str,
@@ -572,7 +624,16 @@ impl ForgeState {
         // the CAS runs AFTER, so a stale prev_oid from the rightful owner still
         // reports the non-fast-forward, not an authorization refusal.
         match self.tracker_view().owner(name).map(<[u8]>::to_vec) {
-            None => self.staged_tracker_mut().claim_owner(name, principal),
+            None => {
+                let owned = self.tracker_view().repos_owned_by(&principal);
+                if owned >= MAX_REPOS_PER_OWNER {
+                    return Err(Error::Module(format!(
+                        "forge: you already own {MAX_REPOS_PER_OWNER} repos; a repo cannot be \
+                         released, so no more may be birthed"
+                    )));
+                }
+                self.staged_tracker_mut().claim_owner(name, principal)
+            }
             Some(owner) => require_owner_for_protected(name, &owner, &principal, &updates)?,
         }
 
@@ -595,19 +656,49 @@ impl ForgeState {
         }
     }
 
-    /// refuse a merge onto a PROTECTED target branch from anyone but the repo
-    /// owner. `MergePr` is a SECOND raw ref-move door: `merge_oid` is
-    /// client-computed and its parentage is unverifiable in consensus, and
-    /// `OpenPr` lets any member open a PR onto `main` — so gating `PushRefs`
-    /// alone would close nothing.
-    fn require_merge_owner(&self, name: &str, target: &str, principal: &[u8]) -> Result<(), Error> {
-        if !is_protected_branch(target) {
-            return Ok(());
+    /// gate a `MergePr`. `MergePr` is a SECOND raw ref-move door: `merge_oid`
+    /// is client-computed and its parentage is unverifiable in consensus, and
+    /// `OpenPr` lets any member open a PR onto any target — so gating
+    /// `PushRefs` alone would close nothing.
+    ///
+    /// a PROTECTED target keeps the stricter, unchanged rule: the repo owner
+    /// only. every other target opens to whoever forge already vouches for
+    /// independently of `SubmitReview` — the PR's author, or the repo owner.
+    ///
+    /// `SubmitReview` has no standing gate (any account may review any PR)
+    /// and forge has no collaborator/member list to check a reviewer against,
+    /// so a review's author is NOT sound merge standing (#1760): admitting
+    /// `reviewers.contains(actor)` here let a stranger file one throwaway
+    /// review, then merge with the very next op. this is the smallest sound
+    /// rule available without inventing a membership list forge doesn't
+    /// have: reviews are still stored and shown, they just don't unlock a
+    /// merge.
+    fn require_merge_authorized(
+        &self,
+        name: &str,
+        target: &str,
+        number: u64,
+        actor: &AuthorRef,
+        principal: &[u8],
+    ) -> Result<(), Error> {
+        let owner = self.tracker_view().owner(name);
+        let is_owner = owner == Some(principal);
+        if is_protected_branch(target) {
+            return if is_owner {
+                Ok(())
+            } else {
+                Err(Error::Module(format!(
+                    "forge: only the owner of repo {name:?} may merge onto protected branch \
+                     {target:?}"
+                )))
+            };
         }
-        if self.tracker_view().owner(name) != Some(principal) {
+        let author = self.tracker_view().pr_author(name, number)?;
+        let may_merge = actor == &author || is_owner;
+        if !may_merge {
             return Err(Error::Module(format!(
-                "forge: only the owner of repo {name:?} may merge onto protected branch \
-                 {target:?}"
+                "forge: only pull request #{number}'s author or the owner of repo {name:?} may \
+                 merge it"
             )));
         }
         Ok(())
@@ -1241,5 +1332,93 @@ mod tests {
         let mut extra = encode_ref_target(&target);
         extra.push(0);
         assert!(decode_ref_target(&extra).is_err());
+    }
+
+    /// a single-branch create/delete push, the shape both cap tests drive.
+    fn update(branch: &str, prev: Option<Oid>, new: Option<Oid>) -> Vec<RefUpdate> {
+        vec![RefUpdate {
+            ref_name: branch.into(),
+            prev_oid: prev.map(|o| o.as_bytes().to_vec()),
+            new_oid: new.map(|o| o.as_bytes().to_vec()),
+        }]
+    }
+
+    #[test]
+    fn one_principal_may_not_birth_repos_without_bound() {
+        // nothing releases an owner, so an uncapped birth path grows every
+        // validator's tracker, root preimage and on-disk repo count forever.
+        let mut state = ForgeState::default();
+        let digest = Some(vec![7u8; 32]);
+        for i in 0..MAX_REPOS_PER_OWNER {
+            state
+                .stage_push_refs(
+                    &format!("r{i}"),
+                    vec![1],
+                    update("main", None, Some(oid('a'))),
+                    digest.clone(),
+                )
+                .unwrap();
+        }
+        let refused = state
+            .stage_push_refs(
+                "one-too-many",
+                vec![1],
+                update("main", None, Some(oid('a'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("you already own"),
+            "the cap+1-th birth is refused: {refused}"
+        );
+        // the ceiling is per OWNER, not per network.
+        state
+            .stage_push_refs(
+                "someone-else",
+                vec![2],
+                update("main", None, Some(oid('a'))),
+                digest,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_push_may_not_grow_a_repo_past_its_branch_cap() {
+        let full: BTreeMap<String, Oid> = (0..MAX_BRANCHES_PER_REPO)
+            .map(|i| (format!("b{i}"), oid('a')))
+            .collect();
+        let mut state = ForgeState::default();
+        state
+            .repos
+            .insert("alpha".into(), RepoState::with_refs(full));
+        state.tracker.claim_owner("alpha", vec![1]);
+        let digest = Some(vec![7u8; 32]);
+
+        let refused = state
+            .stage_push_refs(
+                "alpha",
+                vec![1],
+                update("new", None, Some(oid('c'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("branch cap"),
+            "the cap+1-th branch is refused: {refused}"
+        );
+        // the host drops every staged fate of a rejected block (`abort_block`).
+        state.repos.get_mut("alpha").unwrap().abort();
+        // a delete is always allowed — it is the only way back under the cap.
+        state
+            .stage_push_refs("alpha", vec![1], update("b0", Some(oid('a')), None), None)
+            .unwrap();
+        state
+            .stage_push_refs(
+                "alpha",
+                vec![1],
+                update("new", None, Some(oid('c'))),
+                digest,
+            )
+            .unwrap();
     }
 }

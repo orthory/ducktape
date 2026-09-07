@@ -25,17 +25,26 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `node/` — `ducktape-node@.service` (instance = workspace selector for
   `ducktape node run -n`), `ducktape-service@.service` (instance = kind for
   `ducktape service run compute|agent|airlock`) and the `copytruncate`
-  logrotate drop-in for `daemon.log` / `<kind>.log`. The install, port and
+  logrotate drop-in for `daemon.log` / `<kind>.log`. `install.sh` runs the
+  Linux install end to end (`--dry-run` prints it). The install, port and
   log recipe is `docs/deploy/node-service.md`; what to back up is
   `docs/deploy/backup-and-keys.md`.
+- `node/dev.ducktape.node.plist` + `node/install-macos.sh` — the macOS half:
+  a per-user LaunchAgent template and the script that renders it for one
+  workspace and hands it to `launchctl bootstrap gui/$(id -u)`
+  (`--dry-run` prints the rendered plist, `--uninstall` boots it out).
 
 ## Sandbox (microVM) hosts
 
 - `build-guest-rootfs.sh` — builds the guest kernel + rootfs image a Linux
   host's Firecracker sandbox boots each run from.
-- `macos-preflight.sh` — checks a macOS host for the vz backend (the
-  Virtualization.framework shim in `bin/duck-vz-shim`, the Kata kernel, the
-  file-descriptor limit the app lane needs).
+- `macos-preflight.sh` — checks a macOS host for everything the vz backend
+  needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
+  target, the entitled `bin/duck-vz-shim` on PATH, the guest kernel + rootfs)
+  and reports release-signing readiness — the Developer ID identities in the
+  keychain and the `ICE_NOTARY_*` variables — informationally, since a local
+  build needs neither. `--prompt` (what `make dev` passes) offers to run the
+  fixes it can.
 - `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
   snapshot-restore timing lanes for the microVM sandbox.
 
@@ -81,12 +90,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 ## Wasm guests
 
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
-  from this checkout and from a copy of the tree at a different absolute path
-  and asserts the bytes are identical, so a committed artifact never depends on
-  the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
-- `make wasm-index-check` — the other reproducibility gate, a Makefile target
-  with no script here: it rebuilds each committed `index.wasm` from its source
-  and cmps it against the bytes in the tree. Also needs the wasm32 target.
+  twice, in two scratch directories, and asserts the bytes are identical and
+  carry no host path, so a committed artifact never depends on the builder's
+  `/home/...`. Needs the wasm32 target, `wasm-tools` and a pushed HEAD.
+- `make wasm-rebuild-check` — the other reproducibility gate, a Makefile target
+  with no script here: it rebuilds every committed guest (each `component.wasm`
+  and `index.wasm`) out of the repository at HEAD, seeded from its committed
+  `guest.lock`, and cmps it against the bytes in the tree. Same needs.
 - `make audit` — the third out-of-band gate: `cargo deny check advisories` over
   the committed `Cargo.lock`, under the repo-root `deny.toml` where every
   carried advisory names why it is carried and what clears it. Needs `cargo

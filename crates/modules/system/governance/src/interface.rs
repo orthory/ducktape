@@ -44,35 +44,46 @@ pub enum GovAction {
     /// account shares; `false` restores one ballot per validator node. this
     /// proposal itself is always decided by the mode frozen when it was opened.
     SetShareMode { enabled: bool },
-    /// AUTHORIZE a height-gated wasm module code swap: emits `LifecycleMsg::
-    /// ScheduleSwap { name, module_id, activation_height, code_hash }` on execution.
-    /// governance only authorizes — the code registry is the sole authority for
-    /// the min-lead / at-most-one / no-op-swap gates, and the swap arms purely
-    /// on height (the bytes travel out-of-band, content-addressed by the hash).
+    /// AUTHORIZE a height-gated wasm module code swap: on execution, computes
+    /// `activation_height = execute_height + activation_lead` and emits
+    /// `ModulesMsg::ScheduleSwap { name, module_id, activation_height, code_hash }`.
+    /// the lead is RELATIVE (blocks after EXECUTION, not propose): an absolute
+    /// height chosen at propose time can go stale if the ballot outlasts it,
+    /// permanently rejecting the Execute (governance issue #1775). governance
+    /// only authorizes — the code registry is the sole authority for the
+    /// min-lead / at-most-one / no-op-swap gates, and the swap arms purely on
+    /// height (the bytes travel out-of-band, content-addressed by the hash).
     UpdateModule {
         name: String,
         module_id: String,
-        activation_height: u64,
+        /// blocks after the EXECUTE height at which the swap activates;
+        /// validated at Propose against [`crate::MIN_ACTIVATION_LEAD`] and
+        /// [`crate::MAX_ACTIVATION_LEAD`].
+        activation_lead: u64,
         /// sha256 of the target component bytes (32 bytes).
         code_hash: Vec<u8>,
     },
-    /// AUTHORIZE the post-genesis ADMISSION of a brand-new wasm module: emits
-    /// `LifecycleMsg::ScheduleRegister { name, module_id, activation_height,
-    /// code_hash }` on execution. governance only authorizes — the code
-    /// registry owns the not-already-registered / min-lead gates, the R = n
-    /// readiness quorum arms it, and the host instantiates the module from the
-    /// content-addressed bytes at the activation boundary. cancellation before
-    /// the boundary rides `CancelModuleUpdate` (an admission cancel removes
-    /// the registry entry entirely).
+    /// AUTHORIZE the post-genesis ADMISSION of a brand-new wasm module: on
+    /// execution, computes `activation_height = execute_height +
+    /// activation_lead` and emits `ModulesMsg::ScheduleRegister { name,
+    /// module_id, activation_height, code_hash }`. governance only authorizes
+    /// — the code registry owns the not-already-registered / min-lead gates,
+    /// the R = n readiness quorum arms it, and the host instantiates the
+    /// module from the content-addressed bytes at the activation boundary.
+    /// cancellation before the boundary rides `CancelModuleUpdate` (an
+    /// admission cancel removes the registry entry entirely).
     RegisterModule {
         name: String,
         module_id: String,
-        activation_height: u64,
+        /// blocks after the EXECUTE height at which the module activates;
+        /// validated at Propose against [`crate::MIN_ACTIVATION_LEAD`] and
+        /// [`crate::MAX_ACTIVATION_LEAD`].
+        activation_lead: u64,
         /// sha256 of the initial component bytes (32 bytes).
         code_hash: Vec<u8>,
     },
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
-    /// `LifecycleMsg::CancelSwap { name, module_id }` on execution.
+    /// `ModulesMsg::CancelSwap { name, module_id }` on execution.
     CancelModuleUpdate { name: String, module_id: String },
     /// set (or clear, with `standing: None`) one target's required submit
     /// standing in the acl module: emits `AclMsg::SetPolicy` on execution.
@@ -134,7 +145,11 @@ pub enum GovMsg {
     Vote { proposal_id: String, approve: bool },
     /// tally and settle. anyone may trigger it after the deadline, or early
     /// once the proposal's frozen rule can no longer be reversed. passing
-    /// membership actions emit their valset op as a follow-up in the same block.
+    /// membership actions emit their valset op as a follow-up in the same
+    /// block. only executable inside a bounded window: past
+    /// `deadline + EXECUTION_GRACE` the proposal is refused and reaped as
+    /// Rejected on the spot instead of tallying a frozen electorate that may
+    /// no longer hold standing.
     Execute { proposal_id: String },
     /// redeem an invite: no ballot — MINTING was the admission decision. the
     /// op carries the token's fields plus the joiner key and its

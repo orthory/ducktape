@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the
 //! ADAPTER way: the NATIVE `capability` crate is compiled to wasm32 unmodified
-//! and adapted to the `ducktape:module` world through `guest-adapter`, so the
+//! and adapted to the `ducktape:module` world through `ducktape-module-sdk`, so the
 //! module's logic is single-sourced (a behavior change in the native crate IS
 //! the wasm change).
 //!
@@ -58,14 +58,15 @@ use crate::CapabilityRegistry;
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "capability";
 
-use guest_adapter::WitStore;
+use ducktape_module_sdk::WitStore;
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
 // no genesis config: capability carries no per-network parameter; the valset
 // sibling id is genesis-constant wiring, compiled in like every other port's.
-guest_adapter::store_guest! {
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: CapabilityRegistry,
+    shape: ducktape_module_sdk::store_shape(),
     new: CapabilityRegistry::new(MODULE_ID, Box::new(WitStore), Some("valset".into())),
 }

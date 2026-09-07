@@ -5,9 +5,8 @@ version.workspace = true
 
 # the shared sandbox muscle: HOW a node-local child is spawned in isolation.
 # the SandboxBackend seam + its boot probe, the Firecracker microVM each run
-# gets, the workspace it is handed as a block device, and the egress nft
-# ruleset for its tap. carved out of capability-host, which remains the only
-# in-tree caller of the run path.
+# gets, and the workspace it is handed as a block device. carved out of
+# provider-host, which remains the only in-tree caller of the run path.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,7 +24,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
 # the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross
-# a crate boundary, so the variant capability-host's unit tests construct hangs
+# a crate boundary, so the variant provider-host's unit tests construct hangs
 # off this feature instead — off in every shipped build, so a released binary
 # still cannot express a bare spawn.
 testkit = []

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Quota, Spawner, Supervisor};
@@ -21,9 +21,9 @@ use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::join_gate;
-use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
+use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
 use crate::sync::catchup::derive_pending_boot;
-use crate::sync::serve::{SyncStateRequest, drive_sync_request};
+use crate::sync::serve::{drive_sync_request, SyncStateRequest};
 use crate::{overlay_book, voice};
 use futures::StreamExt as _;
 use statesync::SyncServer;
@@ -64,6 +64,8 @@ pub(super) struct RuntimeWiring {
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
+    /// the send half of that seam, for this node's own root divergence watch.
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     /// unix seconds of the last served state-sync request — the drain reads it
     /// to defer oplog pruning while a syncer is actively pulling (the sync
     /// retention lease, see sync/serve.rs).
@@ -191,6 +193,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
     } = wire_serve_lanes(
         context,
@@ -240,6 +243,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
         relay_ingress,
     }
@@ -253,6 +257,10 @@ pub(super) struct ServeLanes {
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
+    /// the SEND half of the same seam, for a node-local reader: the root
+    /// divergence watch asks this node for its own tip coordinates exactly as
+    /// a peer would (see `sync::divergence`).
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -323,6 +331,7 @@ pub(super) fn wire_serve_lanes(
         blob_proof,
     );
     let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watch_state_tx = sync_state_tx.clone();
     let state_tx = sync_state_tx;
     let sync_lease_serve = sync_lease.clone();
     let mut sync_tx = sync_tx;
@@ -342,6 +351,10 @@ pub(super) fn wire_serve_lanes(
             // (nothing) to both parties. these paths are peer-drivable and a
             // blocked joiner retries forever, so they latch instead of flooding.
             static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+            // the co-client demux's own drops latch on their OWN keys: a peer
+            // can drive these, and sharing REFUSED's counter would let them
+            // starve a genuine refusal of its stride-100 print.
+            static COCLIENT_DROP: noded::log::Latch = noded::log::Latch::new(100);
             while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
@@ -359,19 +372,66 @@ pub(super) fn wire_serve_lanes(
                 };
                 // OUR blob-fetch answers ride the same authed envelope with
                 // ZEROED auth fields (the transport authenticates replies):
-                // complete the pending waiter by id BEFORE the proof gate
-                // below, which would otherwise drop them. a malformed body
-                // on a matched id drops the waiter — that fetch times out
-                // and rotates, never misreads as a peer's request.
-                if let Some(waiter) = blob_pending
+                // complete the pending waiter BEFORE the proof gate below,
+                // which would otherwise drop them. a malformed body on a
+                // matched id drops the waiter — that fetch times out and
+                // rotates, never misreads as a peer's request.
+                //
+                // the id ALONE never completes a waiter: the frame must also
+                // come from the peer the request was addressed to. `TipCoords`
+                // is the one lane here whose whole value is WHO answered, and
+                // it carries no proof, so a third party that guessed an id
+                // could otherwise speak for a co-validator.
+                let addressed_to = blob_pending
                     .lock()
                     .expect("pending blob lock")
-                    .remove(&rpc_id)
-                {
-                    if let Ok(resp) = statesync::decode_response(body) {
-                        let _ = waiter.send(resp);
+                    .get(&rpc_id)
+                    .map(|fetch| fetch.peer.clone());
+                let unsigned = requester.iter().all(|b| *b == 0) && proof.iter().all(|b| *b == 0);
+                match blob_fetch::classify_coclient_frame(
+                    rpc_id,
+                    &peer,
+                    addressed_to.as_ref(),
+                    unsigned,
+                ) {
+                    blob_fetch::CoClientVerdict::PeerRequest => {}
+                    blob_fetch::CoClientVerdict::Response => {
+                        let waiter = blob_pending
+                            .lock()
+                            .expect("pending blob lock")
+                            .remove(&rpc_id);
+                        if let (Some(waiter), Ok(resp)) = (waiter, statesync::decode_response(body))
+                        {
+                            let _ = waiter.reply.send(resp);
+                        }
+                        continue; // ours — never a request to serve.
                     }
-                    continue; // ours — never a request to serve.
+                    blob_fetch::CoClientVerdict::PeerMismatch => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("coclient_peer_mismatch") {
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "coclient_peer_mismatch",
+                                attempts,
+                                "co-client reply dropped — it came from a peer this \
+                                 request was not addressed to"
+                            );
+                        }
+                        continue;
+                    }
+                    blob_fetch::CoClientVerdict::LateReply => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("late_reply") {
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "late_reply",
+                                attempts,
+                                "co-client reply dropped — it arrived after its \
+                                 request had already timed out"
+                            );
+                        }
+                        continue;
+                    }
                 }
                 // FAIL-CLOSED. a transport-key standing gate is
                 // IMPOSSIBLE at this seam: a pre-admission joiner and an
@@ -493,11 +553,17 @@ pub(super) fn wire_serve_lanes(
                     req => {
                         // renew the sync retention lease: this node is
                         // actively serving a syncer, so the drain defers
-                        // oplog pruning until the lease lapses.
-                        sync_lease_serve.store(
-                            crate::sync::serve::unix_now_secs(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        // oplog pruning until the lease lapses. only the
+                        // state-bearing lanes renew it (see
+                        // `sync::serve::renews_sync_lease`) — the
+                        // coordinates-only TipCoords poll and the
+                        // never-pruned IndexOps backfill must not.
+                        if crate::sync::serve::renews_sync_lease(&req) {
+                            sync_lease_serve.store(
+                                crate::sync::serve::unix_now_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
@@ -522,6 +588,7 @@ pub(super) fn wire_serve_lanes(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx: watch_state_tx,
         sync_lease,
     }
 }

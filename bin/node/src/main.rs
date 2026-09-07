@@ -64,6 +64,9 @@ mod compute;
 mod config;
 mod constants;
 mod cred_cli;
+// the enclave-operator verbs (`user cred inspect|seal`) — real TEE quote
+// verification behind the opt-in `verify` feature. The verbs and their flags
+// exist in every build; without the feature they refuse at dispatch.
 mod cred_seal;
 mod drain_actions;
 mod executors;
@@ -76,12 +79,14 @@ mod host_reads;
 mod host_resources;
 mod host_state;
 mod join_gate;
+mod known_nodes;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
 mod mesh_book;
 mod mesh_window;
 mod module_cli;
+mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
@@ -132,7 +137,9 @@ use util::hex;
 
 fn main() {
     resource_limits::cap_malloc_arenas();
-    // before any subscriber exists, so the warning is stderr's to carry.
+    // before any subscriber exists — it must precede the first descriptor this
+    // process opens — so stderr carries the failure and the outcome is RECORDED
+    // for `report_open_file_limit` to put in `daemon.log` once the sink is up.
     if let Err(err) = node::resource_limits::raise_open_file_limit() {
         eprintln!("[node] warning: could not raise open-file limit: {err}");
     }
@@ -337,8 +344,68 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     // below error was ever recorded at all.
     let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
+    report_open_file_limit();
 
     run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
+}
+
+/// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that
+/// there is a subscriber to carry it.
+///
+/// This is not decoration. The raise runs before any sink exists, so its only
+/// previous record was a stderr line nothing tees — and a raise that silently
+/// left the process on the launchd default (`launchctl limit maxfiles` is
+/// `256 unlimited`) is indistinguishable, from the log, from one that worked.
+/// The node then dies minutes later with an `EMFILE` from whatever opened last,
+/// and nothing in the file says why.
+fn report_open_file_limit() {
+    use node::resource_limits::{MINIMUM_OPEN_FILES, startup_outcome};
+
+    let Some(outcome) = startup_outcome() else {
+        return;
+    };
+    let limit = match outcome {
+        Ok(limit) => limit,
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::node",
+                reason = "open_file_limit_unraised",
+                error = %error,
+                "open-file limit left at the inherited default"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        target: "ducktape::node",
+        soft_limit = limit.soft,
+        hard_limit = limit.hard,
+        raised = limit.raised,
+        "open-file limit"
+    );
+    if !limit.is_sufficient() {
+        tracing::warn!(
+            target: "ducktape::node",
+            reason = "open_file_limit_too_low",
+            soft_limit = limit.soft,
+            needed = MINIMUM_OPEN_FILES,
+            "open-file limit is below what a node needs; expect EMFILE under load"
+        );
+    }
+}
+
+/// the browser gateway serves on a running node (never under `--sync-only`)
+/// that configures it and has a real overlay to route through. The app API's
+/// bind address is not a condition: the gateway is its own listener pinned to
+/// 127.0.0.1, refuses loopback routes aimed at this node's API ports by port,
+/// and its CSP excludes the API port — none of which depends on where `/v1`
+/// is bound.
+fn gateway_can_start(
+    sync_only: bool,
+    gateway_listen: Option<&str>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+) -> bool {
+    !sync_only && gateway_listen.is_some() && wireguard_listen.is_some()
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -348,29 +415,6 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn gateway_can_start(
-    sync_only: bool,
-    gateway_listen: Option<&str>,
-    http_listen: Option<&str>,
-    wireguard_listen: Option<std::net::SocketAddr>,
-) -> bool {
-    let api_is_loopback = http_listen
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| address.ip().is_loopback());
-    // a configured gateway suppressed ONLY by a non-loopback app surface is a
-    // silent degradation — say why, or the operator debugs a dead listener.
-    if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
-        tracing::warn!(
-            target: "ducktape::gateway",
-            http_listen = http_listen.unwrap_or_default(),
-            reason = "api_not_loopback",
-            "gateway disabled; the browser gateway only starts when the node API binds a \
-             loopback address"
-        );
-    }
-    !sync_only && gateway_listen.is_some() && api_is_loopback && wireguard_listen.is_some()
-}
-
 fn run_node(
     resolved: Resolved,
     // this daemon's own `node.toml` — kept whole rather than re-derived from
@@ -473,12 +517,7 @@ fn run_node(
         boot::mesh::preflight_mesh_listen(listen)?;
     }
 
-    let gateway_enabled = gateway_can_start(
-        sync_only,
-        gateway_listen.as_deref(),
-        http_listen.as_deref(),
-        wireguard_listen,
-    );
+    let gateway_enabled = gateway_can_start(sync_only, gateway_listen.as_deref(), wireguard_listen);
 
     // the announce's own base, kept before `http_listen` moves into the bind.
     let announce_base = http_listen.as_deref().map(config::http_base_of);
@@ -497,6 +536,7 @@ fn run_node(
         gateway_commands,
         terminals,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
@@ -517,6 +557,7 @@ fn run_node(
         // the owner-gated admin namespace resolves ownership against this node's
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice.
         node_key: signer.public_key().as_ref().to_vec(),
+        signer: signer.clone(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;
 
@@ -630,20 +671,36 @@ fn run_node(
             status.wire_netstack_swapper(move |request| {
                 let metrics = swap_metrics.clone();
                 Box::pin(async move {
-                    let outcome = reachability_plane::swap_netstack(request).await;
-                    match &outcome {
-                        Ok(backend) => {
-                            metrics.set_netstack_backend(backend.clone());
-                            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
-                        }
-                        Err(reason) => metrics.record_netstack_swap(
-                            noded::NetstackSwapOutcome::Refused,
-                            Some(reason.clone()),
-                        ),
+                    use reachability_plane::SwapAnswer;
+                    let answer = reachability_plane::swap_netstack(request).await;
+                    reachability_plane::record_swap(&metrics, &answer);
+                    // the route answers 200 with the new backend, or 409 with
+                    // the reason — a swap no machine was ever asked for reads
+                    // to the operator exactly like one a machine refused.
+                    match answer {
+                        SwapAnswer::Swapped(backend) => Ok(backend),
+                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => Err(reason),
                     }
-                    outcome
                 })
             });
+            // and the GOVERNANCE trigger for the same plane, on its own task:
+            // the module code registry carries the designated component as a
+            // commitment record, and this reconciler converges the plane onto
+            // it one block wake at a time. Deliberately not the module
+            // boundary — that one is fail-closed and rides the drain, and the
+            // reachability machine is per-node, root-hash-free, pre-genesis
+            // networking (`netstack_governance`).
+            //
+            // The command sender is the http surface's own (the gateway plane
+            // holds another clone): the reconciler READS committed state the
+            // same way `/v1/query` does.
+            tokio::spawn(netstack_governance::reconcile(
+                label.clone(),
+                metrics.clone(),
+                gateway_commands.clone(),
+                blobs.clone(),
+                stream_hub.subscribe_blocks(),
+            ));
         }
         status.publish(noded::NodeStatus {
             version: build_version(),
@@ -687,6 +744,7 @@ fn run_node(
                 metrics.clone(),
                 storage_for_sync,
                 namespace,
+                identity_chain_id,
                 blobs,
                 &index,
                 &genesis,
@@ -760,6 +818,7 @@ fn run_node(
                 signer.clone(),
                 label.clone(),
                 namespace.clone(),
+                identity_chain_id.clone(),
                 peers.clone(),
                 validators.clone(),
                 wireguard_listen,
@@ -781,6 +840,7 @@ fn run_node(
                 gateway_commands.clone(),
                 terminals,
                 session_requests,
+                remote_sessions.clone(),
                 local_gateway_via,
                 node_api_ports,
                 &stream_hub,
@@ -876,6 +936,7 @@ fn run_node(
             gateway_commands,
             terminals,
             session_requests,
+            remote_sessions,
             local_gateway_via,
             node_api_ports,
             stream_hub,

@@ -13,8 +13,8 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use crate::constants::DRAIN_TICK;
-use crate::reachability_plane::GateOutcomes;
+use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
+use crate::reachability_plane::{GateOutcomes, insert_gate_outcome};
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
@@ -23,6 +23,19 @@ use crate::{join_gate, overlay_book, relay_runtime};
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
     recovery::Recovery<commonware_runtime::tokio::Context>,
+>;
+
+/// held app-surface submit replies, keyed by the submitted frame's content
+/// address: every caller that submitted THIS frame, and the instant the first
+/// of them stops waiting. a list because one FrameId is one consensus unit
+/// however many callers submitted it — replacing the entry would drop the
+/// first caller's reply for an op that finalized.
+type PendingSubmits = std::collections::HashMap<
+    node::FrameId,
+    (
+        Vec<futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>>,
+        std::time::SystemTime,
+    ),
 >;
 
 /// a join gate held open awaiting its `Redeem` frame's consensus fate. the
@@ -42,12 +55,21 @@ struct GatePending {
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from.
-fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
-    outcomes
-        .lock()
-        .expect("gate outcomes lock")
-        .insert(joiner, reply);
+/// shared map the joiner's next retransmit is answered from. `now` stamps
+/// the entry for [`crate::reachability_plane::sweep_gate_outcomes`] and the
+/// cap eviction in [`insert_gate_outcome`].
+fn settle_gate(
+    outcomes: &GateOutcomes,
+    joiner: Vec<u8>,
+    reply: join_gate::IntroReply,
+    now: std::time::SystemTime,
+) {
+    insert_gate_outcome(
+        &mut outcomes.lock().expect("gate outcomes lock"),
+        joiner,
+        reply,
+        now,
+    );
 }
 
 /// assemble this node's boundary facts and publish them into the shared
@@ -63,23 +85,14 @@ pub(super) fn publish_boundary_status(
     metrics: &noded::NodeMetrics,
     status_public_key: &str,
 ) {
-    let modules = crate::constants::MODULE_IDS
-        .iter()
-        .map(|m| noded::ModuleStatus {
-            id: (*m).into(),
-            root: node
-                .host()
-                .module_root(m)
-                .map(|r| crate::util::hex(&r))
-                .unwrap_or_default(),
-            category: noded::ModuleCategory::of(m),
-        })
-        .collect();
+    let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
-        height: node.finalized().map(|f| f.height).unwrap_or(0),
-        modules,
+        height,
+        consensus_time: node.stamp_consensus_time(height),
+        consensus_time_unit: node.consensus_time_policy().into(),
+        modules: crate::util::module_statuses(node.host()),
         public_key: status_public_key.into(),
         // the cell overlays the boot-wired chain id on every read.
         chain_id: String::new(),
@@ -105,6 +118,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
+    /// the digests the modules registry currently names — shared with the
+    /// code plane's push admission gate, so both sides of #1833 read one set.
+    pub(super) code_registry: crate::code_plane::CodeRegistry,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
@@ -150,6 +166,10 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) workspace: std::path::PathBuf,
 }
 
+/// one finished pending-swap code fetch: the digest, and the error if the
+/// bytes did not land.
+type FetchOutcome = ([u8; 32], Option<crate::blob_fetch::BlobFetchError>);
+
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
     node: ValidatorNode,
@@ -164,6 +184,9 @@ struct ValidatorRuntime<'a> {
     media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
+    /// the digests the modules registry currently names — shared with the
+    /// code plane's push admission gate, so both sides of #1833 read one set.
+    code_registry: crate::code_plane::CodeRegistry,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     relay_tx: super::MeshSender,
     gate_outcomes: GateOutcomes,
@@ -184,15 +207,8 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
-    /// read only by the SIGUSR1 task-dump arm, which exists on Linux alone.
-    #[cfg_attr(
-        not(all(
-            tokio_unstable,
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )),
-        allow(dead_code)
-    )]
+    /// where a SIGUSR1 task dump lands, and the directory the drain's
+    /// workspace guard re-stats.
     workspace: std::path::PathBuf,
     /// the earliest instant the NEXT `refresh_operations` may run — the
     /// exposition parse is the pricey part of a status publish, so it is
@@ -201,15 +217,9 @@ struct ValidatorRuntime<'a> {
     expected: usize,
     applied: usize,
     converged: bool,
-    pending_submits: std::collections::HashMap<
-        node::FrameId,
-        (
-            futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::SystemTime,
-        ),
-    >,
+    pending_submits: PendingSubmits,
     pending_relays:
-        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::SystemTime)>,
+        std::collections::HashMap<node::FrameId, (Vec<ed25519::PublicKey>, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
     /// keyed by frame id (the settle-then-answer seam, resolved in `on_drain`).
     pending_gates: std::collections::HashMap<node::FrameId, GatePending>,
@@ -230,8 +240,20 @@ struct ValidatorRuntime<'a> {
     /// `checkpoint_due`: an idle chain's nop blocks must not buy a full
     /// re-encode of the manifest already on disk (#1308).
     last_written_root: Option<sdk::StateRoot>,
+    /// consecutive checkpoints that deferred `prune_oplog` for a warm sync
+    /// lease. capped at [`drain::MAX_PRUNE_DEFERRALS`]: past the cap the
+    /// checkpoint prunes anyway (see `drain::drain_pass`) so a joiner that
+    /// never releases the lease cannot pin the retained journal forever.
+    prune_deferrals: u32,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
+    /// when this loop last SEALED a block, and how many stall windows have
+    /// passed since — the halt detector (`drain_pass`). every way this loop
+    /// can stop producing blocks is silent by construction (a wedged release
+    /// gate delivers nothing, a non-idle orderer FIFO makes the beat restamp
+    /// forever), so the absence of blocks is itself the event to narrate.
+    last_seal: std::time::SystemTime,
+    stall_windows: u64,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
     /// the sender half of the finalization delivery wake — re-installed on
@@ -249,11 +271,28 @@ struct ValidatorRuntime<'a> {
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
-    /// completed pending-swap code fetches, reaped at each readiness pump so
-    /// a failed fetch retries next tick (the sender rides in each task).
-    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
-    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
+    /// completed pending-swap code fetches and their outcome (`None` = the
+    /// bytes landed), reaped at each readiness pump: a failed fetch is counted,
+    /// backed off and — on the first failure and every Nth after it — reported
+    /// there, where the attempt counter lives. The sender rides in each task.
+    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<FetchOutcome>,
+    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<FetchOutcome>,
     next_drain: std::time::SystemTime,
+    /// the workspace directory as it was at boot, and the next instant the
+    /// drain re-checks it is still there — the fail-stop for a workspace
+    /// deleted underneath a running node. `None` when boot could not stat it:
+    /// the node then runs unguarded rather than dying over a stat.
+    workspace_mark: Option<crate::util::WorkspaceMark>,
+    next_workspace_check: std::time::SystemTime,
+    /// consecutive checks that found the workspace's mark file missing while
+    /// the directory itself was unchanged. Not a deletion — it paces the
+    /// warning for a filesystem that will never accept the rewrite.
+    workspace_mark_lost_checks: u64,
+    /// consecutive drain ticks whose committed valset read failed. Paces the
+    /// warning for a host query that keeps erroring (#1820) — a failed read
+    /// is not an observation, so the cutover step is skipped for that tick
+    /// rather than fed an empty set.
+    valset_read_failed_checks: u64,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -271,6 +310,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         mut sync_state_rx,
@@ -319,21 +359,22 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // frame's content address, resolved when the frame drains (or expired
     // after SUBMIT_HOLD), plus the last block height published to ws
     // subscribers.
+    //
+    // a LIST of callers per frame, not one: the same signed frame submitted
+    // twice is ONE consensus unit (custody is keyed by FrameId), and a second
+    // insert that replaced the first sender would drop that caller's reply on
+    // the floor — a 503 for an op that finalized. every caller holding the
+    // same id gets the same outcome, and the FIRST one's deadline governs.
     let mut http_ingress = http_cmds;
-    let pending_submits: std::collections::HashMap<
-        node::FrameId,
-        (
-            futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::SystemTime,
-        ),
-    > = std::collections::HashMap::new();
+    let pending_submits: PendingSubmits = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
     // the frame's content address: resolved by the SAME drain that resolves
-    // local holds, expired on the same SUBMIT_HOLD budget. the peer is where
-    // the Reply goes.
+    // local holds, expired on the same SUBMIT_HOLD budget. the peers are where
+    // the Reply goes — a list for the same reason, since two residents can
+    // relay one frame.
     let pending_relays: std::collections::HashMap<
         node::FrameId,
-        (ed25519::PublicKey, std::time::SystemTime),
+        (Vec<ed25519::PublicKey>, std::time::SystemTime),
     > = std::collections::HashMap::new();
     // join gates held open awaiting their Redeem frame's consensus fate, and
     // the joiner→frame in-flight index that dedups a re-Request while settling.
@@ -352,6 +393,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::BTreeMap::new();
     // recovery cadence: sealed blocks since the last checkpoint manifest.
     let blocks_since_checkpoint: u64 = 0;
+    // no lease-deferred prune owed yet at boot.
+    let prune_deferrals: u32 = 0;
     // no cooldown owed at boot: the first checkpoint's own cost is the
     // estimate every later one is held off by.
     let checkpoint_not_before = context.current();
@@ -477,6 +520,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let (delivery_wake_tx, mut delivery_wake) = tokio::sync::mpsc::unbounded_channel::<()>();
     node.orderer().set_delivery_wake(delivery_wake_tx.clone());
 
+    // pinned BEFORE the directory moves into the runtime: the identity of the
+    // workspace this node is serving, so the drain can tell "still mine" from
+    // "deleted, and my own journal write put the path back".
+    let workspace_mark = crate::util::WorkspaceMark::read(&workspace);
     let mut runtime = ValidatorRuntime {
         context,
         node,
@@ -491,6 +538,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         gate_outcomes,
@@ -526,8 +574,11 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blocks_since_checkpoint,
         checkpoint_not_before,
         last_written_root: None,
+        prune_deferrals,
         last_reach_view,
         last_flush,
+        last_seal: context.current(),
+        stall_windows: 0,
         pending_retarget,
         heartbeat_disabled,
         delivery_wake_tx,
@@ -540,6 +591,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         fetch_done_tx,
         fetch_done_rx,
         next_drain: context.current() + DRAIN_TICK,
+        workspace_mark,
+        next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
+        workspace_mark_lost_checks: 0,
+        valset_read_failed_checks: 0,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.
@@ -688,7 +743,7 @@ async fn graceful_checkpoint(
 ) {
     if let Some(f) = node.finalized() {
         let pos = node.sink_mut().oplog_pos().await;
-        if let Ok(manifest) = Manifest::capture(
+        let captured = Manifest::capture(
             node.host(),
             Some(f.height),
             orchestrator.epoch(),
@@ -700,7 +755,12 @@ async fn graceful_checkpoint(
                 .map(|cutover| cutover.cutover_view()),
             pos,
             next_seq,
-        ) {
+        );
+        // the replay guard rides the checkpoint: the journal suffix a
+        // checkpoint leaves is shallower than the protocol window, so a
+        // restart that rebuilt from the suffix alone would refuse fewer
+        // replayed batches than its peers.
+        if let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) {
             let _ = node.sink_mut().write_manifest(&manifest).await;
         }
     }

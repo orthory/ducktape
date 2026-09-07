@@ -24,11 +24,12 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
-    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatSpan, append_thread_page, author_display, author_name, bounded_chat_window,
-    bounded_thread_window, chat_message, contains_pending_message, mark_message_groups,
-    merge_landing_messages, merge_message_send_result, merge_pending_messages,
-    merge_thread_refresh, parse_message_with_members, rollback_pending_message, short_label,
+    BoundAccount, CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember,
+    ChatMessage, ChatReaction, ChatReader, ChatSpan, MentionCandidates, NameDirectory,
+    append_thread_page, author_display, author_name, bounded_chat_window, bounded_thread_window,
+    chat_message, contains_pending_message, mark_message_groups, merge_landing_messages,
+    merge_message_send_result, merge_pending_messages, merge_thread_refresh,
+    parse_message_with_mentions, rollback_pending_message, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
@@ -396,6 +397,7 @@ mod live;
 mod load;
 mod model;
 mod node;
+mod notify;
 mod picture;
 mod roster;
 mod rpc;
@@ -416,6 +418,7 @@ pub use live::*;
 pub use load::*;
 pub use model::*;
 pub use node::*;
+pub use notify::*;
 pub use picture::*;
 pub use roster::*;
 pub use rpc::*;

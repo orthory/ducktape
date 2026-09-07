@@ -123,9 +123,9 @@ struct StatusCellInner {
     netstack_swapper: std::sync::OnceLock<Arc<NetstackSwapper>>,
 }
 
-/// Which machine the operator wants the reachability plane on. The component
-/// path is read on the NODE, not by the caller: the route takes a path on the
-/// node's own disk, exactly like `module-code` staging.
+/// Which machine the reachability plane is wanted on. The component path is
+/// read on the NODE, not by the caller: the route takes a path on the node's
+/// own disk, exactly like `module-code` staging.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetstackSwapRequest {
@@ -133,6 +133,13 @@ pub enum NetstackSwapRequest {
     Native,
     /// `{"component": "<path>"}` — a `ducktape:netstack` component on disk.
     Component(PathBuf),
+    /// component bytes already in hand — the governance reconciler's variant:
+    /// the designated component is a verified chunk on the node's blob plane,
+    /// so writing it to disk to read it straight back would be the only I/O
+    /// in the path. NOT on the wire (`serde(skip)`): the admin route is a
+    /// path route by design, and no caller ships bytes through it.
+    #[serde(skip)]
+    Bytes(Vec<u8>),
 }
 
 /// Swap the reachability plane's backend, answering the new backend's name or
@@ -342,6 +349,22 @@ pub struct NodeHandle {
     /// routes to 503. An entry confers no standing: `ducktape service enable`
     /// is the consent boundary.
     pub(crate) services: crate::services::ServiceCatalog,
+    /// how many `POST /v1/index/{module}/view` calls (each a wasm query) or
+    /// `GET /v1/index/status` calls (each a fold-trigger queue scan) may run
+    /// concurrently off an axum worker — see
+    /// [`crate::index::MAX_CONCURRENT_INDEX_VIEWS`]. one shared pool, not one
+    /// per route: both are unauthenticated reads that can burn a worker
+    /// thread's worth of CPU, so they compete for the same budget. `Arc` so
+    /// every clone of this handle (one per accepted connection) shares the
+    /// same gate; always present, since each route already 503s a handle
+    /// with no index store wired.
+    pub(crate) index_view_gate: Arc<tokio::sync::Semaphore>,
+    /// this node's own mesh-identity signer — the SAME key `NodeStatus.public_key`
+    /// publishes. wired directly (not through the `cmds` actor lane) so
+    /// `POST /v1/huddle/node-proof` answers synchronously, like `status` does.
+    /// `None` on a daemon with no mesh identity (the embedded local daemon,
+    /// router tests) — that route 503s there.
+    pub(crate) node_signer: Option<commonware_cryptography::ed25519::PrivateKey>,
 }
 
 impl NodeHandle {
@@ -376,6 +399,10 @@ impl NodeHandle {
             session_lane: None,
             remote_sessions: crate::term_remote::RemoteSessions::default(),
             services: crate::services::ServiceCatalog::default(),
+            index_view_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::index::MAX_CONCURRENT_INDEX_VIEWS,
+            )),
+            node_signer: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -422,6 +449,18 @@ impl NodeHandle {
     /// only the p2p validator wires one — it owns the overlay the plane rides.
     pub fn with_code_stage(mut self, lane: crate::module_code::CodeStageLane) -> Self {
         self.code_stage = Some(lane);
+        self
+    }
+
+    /// wire this node's own mesh-identity signer so `POST /v1/huddle/node-proof`
+    /// can mint a `JoinHuddle.node_proof` for it — the SAME key `node_key` in
+    /// [`Self::with_admin`] names. only a daemon with a real mesh identity
+    /// wires one; a handle without it 503s the route.
+    pub fn with_node_signer(
+        mut self,
+        signer: commonware_cryptography::ed25519::PrivateKey,
+    ) -> Self {
+        self.node_signer = Some(signer);
         self
     }
 
@@ -480,8 +519,11 @@ impl NodeHandle {
         self.session_lane.as_ref()
     }
 
-    /// the guest-side session-id → host-node registry (always present).
-    pub(crate) fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
+    /// the guest-side session-id → host-node registry (always present). Public
+    /// because the term plane's inbound feeds gate on it: a session's chunks and
+    /// command rows are accepted only from the peer this registry names as its
+    /// host.
+    pub fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
         &self.remote_sessions
     }
 
@@ -503,6 +545,7 @@ impl NodeHandle {
         self.browser_gateway = Some(BrowserGateway {
             listen,
             ws_tokens: Arc::new(WsTokenStore::new()),
+            ws_doors: Arc::default(),
         });
         self
     }

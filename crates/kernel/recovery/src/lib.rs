@@ -403,6 +403,8 @@ pub struct Manifest {
     pub root_hash: StateRoot,
     /// every module's root at `height` — the replay baseline.
     pub roots: Vec<(ModuleId, StateRoot)>,
+    /// Executable commitments at this checkpoint, including the module registry.
+    pub codes: Vec<(ModuleId, Vec<u8>)>,
     /// canonical snapshot bytes for the modules that do NOT persist
     /// themselves (the in-memory cohort), keyed by module id. a disk-cohort
     /// module (`sdk::Module::block_durable`) is deliberately absent: it
@@ -420,6 +422,17 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
+    /// the node's REPLAY WINDOW at `height`: the `(height, batch id)` pairs it
+    /// had journaled, oldest first, capped at [`node::REPLAY_WINDOW_HEIGHTS`].
+    ///
+    /// the journal suffix a checkpoint leaves behind is SHORTER than the
+    /// protocol window — that is the point of checkpointing — so a restart
+    /// that rebuilt the window from the suffix alone would refuse fewer
+    /// replayed batches than a peer that never restarted, and the two fork on
+    /// the difference. carrying it here makes the window a property of the
+    /// node's persisted state instead of its uptime: restore seeds from this
+    /// and the suffix extends it.
+    pub applied_frames: Vec<(u64, node::FrameId)>,
 }
 
 impl Manifest {
@@ -441,6 +454,7 @@ impl Manifest {
     fn check_field_caps(&self) -> Result<(), Error> {
         let counts = [
             ("module roots", self.roots.len()),
+            ("module codes", self.codes.len()),
             ("participant keys", self.participants.len()),
             ("resident keys", self.residents.len()),
             ("snapshots", self.snapshots.len()),
@@ -451,7 +465,38 @@ impl Manifest {
                  enforces"
             )));
         }
+        if self.applied_frames.len() > node::REPLAY_WINDOW_HEIGHTS {
+            return Err(Error::FieldOverCap(format!(
+                "{} replay window entries is over the {}-entry protocol depth this crate's own \
+                 reader enforces",
+                self.applied_frames.len(),
+                node::REPLAY_WINDOW_HEIGHTS
+            )));
+        }
         let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
+        for (id, hash) in &self.codes {
+            let invalid_hash = hash.len() != 32;
+            if invalid_hash {
+                return Err(Error::FieldOverCap(format!(
+                    "module {id}'s code hash must be 32 bytes"
+                )));
+            }
+        }
+        let ids = self
+            .roots
+            .iter()
+            .map(|(id, _)| id)
+            .chain(self.codes.iter().map(|(id, _)| id))
+            .chain(self.snapshots.iter().map(|(id, _)| id));
+        for id in ids {
+            let oversized_id = over_cap(id.len());
+            if oversized_id {
+                return Err(Error::FieldOverCap(
+                    "module id exceeds checkpoint field cap".into(),
+                ));
+            }
+        }
+
         if let Some((id, bytes)) = self.snapshots.iter().find(|(_, b)| over_cap(b.len())) {
             return Err(Error::FieldOverCap(format!(
                 "module {id}'s snapshot is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
@@ -495,6 +540,11 @@ impl Manifest {
         }
         put_root(&mut out, &self.root_hash);
         put_roots(&mut out, &self.roots);
+        put_u64(&mut out, self.codes.len() as u64);
+        for (id, hash) in &self.codes {
+            put_bytes(&mut out, id.as_bytes());
+            put_bytes(&mut out, hash);
+        }
         put_u64(&mut out, self.snapshots.len() as u64);
         for (id, bytes) in &self.snapshots {
             put_bytes(&mut out, id.as_bytes());
@@ -503,6 +553,11 @@ impl Manifest {
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
         put_keys(&mut out, &self.residents);
+        put_u64(&mut out, self.applied_frames.len() as u64);
+        for (height, id) in &self.applied_frames {
+            put_u64(&mut out, *height);
+            out.extend_from_slice(id);
+        }
         out
     }
 
@@ -523,6 +578,22 @@ impl Manifest {
         };
         let root_hash = read_root(&mut c, "root hash")?;
         let roots = get_roots(&mut c)?;
+        let count = c.u64("module code count")? as usize;
+        if count > MAX_LIST_LEN {
+            return Err(Error::Corrupt(
+                "module code count exceeds sanity cap".into(),
+            ));
+        }
+        let mut codes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = c.string("module code id")?;
+            let hash = c.bytes("module code hash")?;
+            let valid_hash = hash.len() == 32;
+            if !valid_hash {
+                return Err(Error::Corrupt("module code hash must be 32 bytes".into()));
+            }
+            codes.push((id, hash.to_vec()));
+        }
         let n = c.u64("snapshots count")? as usize;
         if n > MAX_LIST_LEN {
             return Err(Error::Corrupt(format!("{n} snapshots exceeds sanity cap")));
@@ -535,6 +606,18 @@ impl Manifest {
         let oplog_pos = c.u64("oplog pos")?;
         let next_seq = c.u64("next seq")?;
         let residents = get_keys(&mut c)?;
+        let w = c.u64("replay window count")? as usize;
+        if w > node::REPLAY_WINDOW_HEIGHTS {
+            return Err(Error::Corrupt(format!(
+                "{w} replay window entries exceeds the {}-entry protocol depth",
+                node::REPLAY_WINDOW_HEIGHTS
+            )));
+        }
+        let mut applied_frames = Vec::with_capacity(w);
+        for _ in 0..w {
+            let height = c.u64("replay window height")?;
+            applied_frames.push((height, c.array::<32>("replay window batch id")?));
+        }
         c.finish("manifest")?;
         Ok(Self {
             height,
@@ -545,9 +628,11 @@ impl Manifest {
             pending_cutover_view,
             root_hash,
             roots,
+            codes,
             snapshots,
             oplog_pos,
             next_seq,
+            applied_frames,
         })
     }
 
@@ -592,6 +677,7 @@ impl Manifest {
             pending_cutover_view,
             oplog_pos,
             next_seq,
+            None,
             || std::time::Duration::ZERO,
         )
         .map(|(manifest, _)| manifest)
@@ -601,6 +687,10 @@ impl Manifest {
     /// capture, read off the caller's clock (`now`) — the checkpoint runs on
     /// the node's select loop, and an aggregate `capture_ms` cannot name the
     /// module that spent it (#1018).
+    ///
+    /// `sealed_root` is the root the block at `height` SEALED, when the caller
+    /// knows it: the capture is then verified against it and refuses rather
+    /// than writing a manifest for a root no block committed.
     #[allow(clippy::too_many_arguments)]
     pub fn capture_timed(
         host: &Host,
@@ -612,6 +702,7 @@ impl Manifest {
         pending_cutover_view: Option<u64>,
         oplog_pos: u64,
         next_seq: u64,
+        sealed_root: Option<StateRoot>,
         now: impl FnMut() -> std::time::Duration,
     ) -> Result<(Self, Vec<(sdk::ModuleId, std::time::Duration)>), Error> {
         // ONE pass over the registry: the capture computes every module root
@@ -634,6 +725,31 @@ impl Manifest {
             now,
         );
         let root_hash = snapshot.root_hash;
+        // THE CAPTURE COMPUTES A LIVE ROOT, IT DOES NOT VERIFY ONE. a caller
+        // that knows which root `height` SEALED passes it here, and a manifest
+        // whose live root is anything else is refused: the host can sit ahead of
+        // the sealed boundary (a code-swap realization that stalled before
+        // applying the block seats a module and moves the registry root), and a
+        // manifest labelled `height` carrying a root no block sealed makes
+        // recovery's final compare fatal on every subsequent boot.
+        if let Some(sealed) = sealed_root
+            && sealed != root_hash
+        {
+            tracing::warn!(
+                target: "ducktape::recovery",
+                event = "node_checkpoint_failed",
+                reason = "root_hash_unsealed",
+                height = height.unwrap_or_default(),
+                "checkpoint capture refused: the live root is not the one the block sealed"
+            );
+            return Err(Error::Storage(format!(
+                "checkpoint capture at height {}: live root {:?} is not the sealed root {:?} \
+                 — refusing to write a manifest no block committed",
+                height.unwrap_or_default(),
+                root_hash,
+                sealed,
+            )));
+        }
         // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
         // bytes back per module, so a manifest missing one module's snapshot is
         // a checkpoint that cannot restore — and writing it would prune the
@@ -657,6 +773,16 @@ impl Manifest {
             .iter()
             .map(|m| (m.id.clone(), m.root))
             .collect();
+        let codes = snapshot
+            .modules
+            .iter()
+            .filter_map(|module| {
+                module
+                    .code_hash
+                    .clone()
+                    .map(|hash| (module.id.clone(), hash))
+            })
+            .collect();
         let snapshots = snapshot
             .modules
             .into_iter()
@@ -675,12 +801,28 @@ impl Manifest {
                 pending_cutover_view,
                 root_hash,
                 roots,
+                codes,
                 snapshots,
                 oplog_pos,
                 next_seq,
+                // the window is the ORDERED LANE's, not the host's: capture
+                // reads state, and the node hands its window in with
+                // [`Manifest::with_replay_window`].
+                applied_frames: Vec::new(),
             },
             capture_cost,
         ))
+    }
+
+    /// stamp the capturing node's replay window onto a captured manifest —
+    /// the one seam between the ordered lane's guard and the checkpoint that
+    /// has to restore it. truncated to the newest [`node::REPLAY_WINDOW_HEIGHTS`]
+    /// entries, exactly as the live window bounds itself.
+    #[must_use]
+    pub fn with_replay_window(mut self, window: Vec<(u64, node::FrameId)>) -> Self {
+        let over = window.len().saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+        self.applied_frames = window[over..].to_vec();
+        self
     }
 }
 
@@ -735,9 +877,20 @@ pub struct Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
 {
-    journal: OpJournal<E>,
+    /// `Arc`-wrapped so [`Recovery::frame_reader`] can hand a serve task its
+    /// own cheap handle: every journal method already synchronizes through
+    /// its own internal lock (`&self`, not `&mut self`), so cloning the `Arc`
+    /// is the whole cost of taking a Frames read off the consensus loop.
+    journal: std::sync::Arc<OpJournal<E>>,
     manifest_store: Meta<E>,
     cert_store: Meta<E>,
+    /// `height -> journal position of that height's [`Record::Block`]`,
+    /// covering every block currently retained. built once at [`Self::open`]
+    /// from a single full-journal scan, then kept current on every append
+    /// ([`Self::pre_apply`]) and prune ([`Self::prune_oplog`]) — the seek aid
+    /// that lets [`Self::read_finalized_frames`] jump straight to a height's
+    /// record instead of decoding the journal from its start on every call.
+    height_index: BTreeMap<u64, u64>,
     /// the out-of-band source of component BYTES for code-registry swaps.
     /// replay reconciles running module code against the committed registry
     /// before each re-applied block (`Host::realize_module_swaps`) — a block
@@ -804,12 +957,37 @@ where
         )
         .await
         .map_err(storage_err)?;
+        let height_index = Self::build_height_index(&journal).await?;
         Ok(Self {
-            journal,
+            journal: std::sync::Arc::new(journal),
             manifest_store,
             cert_store,
+            height_index,
             code_source: std::sync::Arc::new(host::NoCodeSource),
         })
+    }
+
+    /// scan the retained journal once (at boot) to map every retained
+    /// height to the journal position of its [`Record::Block`]. this is the
+    /// one place that still pays a full-journal decode — every later
+    /// [`Self::read_finalized_frames`] call seeks straight to a position
+    /// this index (as maintained by append/prune) already names.
+    async fn build_height_index(journal: &OpJournal<E>) -> Result<BTreeMap<u64, u64>, Error> {
+        let mut index = BTreeMap::new();
+        let reader = journal.reader().await;
+        let bounds = reader.bounds();
+        let stream = reader
+            .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+            .await
+            .map_err(storage_err)?;
+        pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            let (pos, bytes) = item.map_err(storage_err)?;
+            if let Record::Block { height, .. } = Record::decode(&bytes)? {
+                index.insert(height, pos);
+            }
+        }
+        Ok(index)
     }
 
     /// wire the out-of-band component-byte source for code-registry swaps (the
@@ -909,82 +1087,175 @@ where
             .prune(pos)
             .await
             .map(|_| ())
-            .map_err(storage_err)
+            .map_err(storage_err)?;
+        self.height_index
+            .retain(|_, &mut record_pos| record_pos >= pos);
+        Ok(())
     }
 
-    /// read sealed recovery frames in `(after_height, up_to_height]`.
+    /// read at most `limit` sealed recovery frames in `(after_height,
+    /// up_to_height]`.
     ///
     /// This is the durable equivalent of a restart's replay suffix. The local
     /// checkpoint height is the retained suffix boundary: asking below it is a
     /// pruned-range condition, even if old journal bytes have not yet been
     /// physically removed.
+    ///
+    /// seeks straight to `after_height`'s successor via [`Self::height_index`]
+    /// and stops decoding once `limit` frames are collected — a caller no
+    /// longer pays for the retained journal's full size, only for the batch
+    /// it asked for.
     pub async fn read_finalized_frames(
         &self,
         after_height: u64,
         up_to_height: u64,
+        limit: usize,
     ) -> Result<Vec<JournalFrame>, Error> {
-        if after_height > up_to_height {
-            return Err(Error::Corrupt(format!(
-                "invalid frame range ({after_height}, {up_to_height}]"
-            )));
-        }
-        if after_height == up_to_height {
-            return Ok(Vec::new());
-        }
+        let manifest_height = self.manifest()?.and_then(|m| m.height);
+        read_finalized_frames_from(
+            &self.journal,
+            &self.height_index,
+            manifest_height,
+            after_height,
+            up_to_height,
+            limit,
+        )
+        .await
+    }
 
-        let mut records: Vec<Record> = Vec::new();
+    /// a cheap, self-contained handle for serving [`Self::read_finalized_frames`]
+    /// off whatever loop holds `&mut Recovery`: the journal's `Arc` clones in
+    /// O(1) (every journal method already synchronizes through its own
+    /// internal lock) and the height index is a bounded snapshot. a caller
+    /// hands this to a spawned task and moves on immediately, instead of
+    /// awaiting the decode inline.
+    pub fn frame_reader(&self) -> Result<FrameReader<E>, Error> {
+        Ok(FrameReader {
+            journal: std::sync::Arc::clone(&self.journal),
+            height_index: self.height_index.clone(),
+            manifest_height: self.manifest()?.and_then(|m| m.height),
+        })
+    }
+}
+
+/// [`Recovery::frame_reader`]'s handle: everything [`read_finalized_frames_from`]
+/// needs, owned independently of `Recovery` itself.
+pub struct FrameReader<E: Context> {
+    journal: std::sync::Arc<OpJournal<E>>,
+    height_index: BTreeMap<u64, u64>,
+    manifest_height: Option<u64>,
+}
+
+impl<E: Context> FrameReader<E> {
+    /// see [`Recovery::read_finalized_frames`].
+    pub async fn read_finalized_frames(
+        &self,
+        after_height: u64,
+        up_to_height: u64,
+        limit: usize,
+    ) -> Result<Vec<JournalFrame>, Error> {
+        read_finalized_frames_from(
+            &self.journal,
+            &self.height_index,
+            self.manifest_height,
+            after_height,
+            up_to_height,
+            limit,
+        )
+        .await
+    }
+}
+
+/// shared body of [`Recovery::read_finalized_frames`] and
+/// [`FrameReader::read_finalized_frames`]: seeks the journal to the position
+/// of the first retained record above `after_height` (via `height_index`)
+/// rather than decoding from the journal's start, and stops once `up_to_height`
+/// or `limit` frames have been collected.
+/// test-only tripwire: counts every record [`read_finalized_frames_from`]
+/// decodes, so a unit test can assert the height-index seek keeps that count
+/// near the requested batch instead of the whole retained journal (#1814).
+#[cfg(test)]
+static TEST_DECODED_RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn read_finalized_frames_from<E: Context>(
+    journal: &OpJournal<E>,
+    height_index: &BTreeMap<u64, u64>,
+    manifest_height: Option<u64>,
+    after_height: u64,
+    up_to_height: u64,
+    limit: usize,
+) -> Result<Vec<JournalFrame>, Error> {
+    if after_height > up_to_height {
+        return Err(Error::Corrupt(format!(
+            "invalid frame range ({after_height}, {up_to_height}]"
+        )));
+    }
+    if after_height == up_to_height || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // the honest retention floor is the journal's own first retained block
+    // (the lowest key the height index carries). the latest MANIFEST height
+    // is only a proxy: it advances on every periodic checkpoint even when
+    // the physical prune is deferred (the sync retention lease), and
+    // refusing against it starves a slow syncer of frames that are still
+    // right here — the rebootstrap treadmill. an empty index has no floor of
+    // its own, so the manifest boundary remains the anchor there.
+    let Some(&first_retained) = height_index.keys().next() else {
+        if let Some(retained_start) = manifest_height
+            && after_height < retained_start
         {
-            let reader = self.journal.reader().await;
-            let bounds = reader.bounds();
-            let stream = reader
-                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
-                .await
-                .map_err(storage_err)?;
-            pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                let (_pos, bytes) = item.map_err(storage_err)?;
-                records.push(Record::decode(&bytes)?);
-            }
-        }
-
-        // the honest retention floor is the journal's own first retained
-        // block. the latest MANIFEST height is only a proxy: it advances on
-        // every periodic checkpoint even when the physical prune is deferred
-        // (the sync retention lease), and refusing against it starves a slow
-        // syncer of frames that are still right here — the rebootstrap
-        // treadmill. an empty journal has no floor of its own, so the
-        // manifest boundary remains the anchor there.
-        let first_retained = records.iter().find_map(|record| match record {
-            Record::Block { height, .. } => Some(*height),
-            _ => None,
-        });
-        let Some(retained_start) = first_retained else {
-            if let Some(retained_start) = self.manifest()?.and_then(|m| m.height)
-                && after_height < retained_start
-            {
-                return Err(Error::RangePruned {
-                    after_height,
-                    retained_start,
-                });
-            }
-            return Ok(Vec::new());
-        };
-        // report the lowest ANCHORABLE height: a client at `first - 1` can be
-        // served (its next frame is the first retained one), so that is the
-        // floor it can act on — and it matches the checkpoint the physical
-        // prune trails in the steady state.
-        let retained_start = retained_start.saturating_sub(1);
-        if after_height < retained_start {
             return Err(Error::RangePruned {
                 after_height,
                 retained_start,
             });
         }
+        return Ok(Vec::new());
+    };
+    // report the lowest ANCHORABLE height: a client at `first - 1` can be
+    // served (its next frame is the first retained one), so that is the
+    // floor it can act on — and it matches the checkpoint the physical
+    // prune trails in the steady state.
+    let retained_start = first_retained.saturating_sub(1);
+    if after_height < retained_start {
+        return Err(Error::RangePruned {
+            after_height,
+            retained_start,
+        });
+    }
 
-        let mut out = Vec::new();
-        let mut pending: Option<(u64, Vec<u8>)> = None;
-        for record in records {
-            match record {
+    // the seek target: the position of the first retained block strictly
+    // above `after_height`. nothing in range means nothing to decode.
+    let seek = height_index
+        .range((
+            std::ops::Bound::Excluded(after_height),
+            std::ops::Bound::Unbounded,
+        ))
+        .next();
+    let Some((&start_height, &start_pos)) = seek else {
+        return Ok(Vec::new());
+    };
+    if start_height > up_to_height {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut pending: Option<(u64, Vec<u8>)> = None;
+    {
+        let reader = journal.reader().await;
+        let stream = reader
+            .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), start_pos)
+            .await
+            .map_err(storage_err)?;
+        pin_mut!(stream);
+        while out.len() < limit {
+            let Some(item) = stream.next().await else {
+                break;
+            };
+            let (_pos, bytes) = item.map_err(storage_err)?;
+            #[cfg(test)]
+            TEST_DECODED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match Record::decode(&bytes)? {
                 Record::Block { height, frame } => {
                     if height <= after_height {
                         continue;
@@ -1032,13 +1303,13 @@ where
                 Record::Pinned { .. } | Record::Cutover { .. } => {}
             }
         }
-        if let Some((height, _)) = pending {
-            return Err(Error::Corrupt(format!(
-                "block {height} in requested range is missing its seal"
-            )));
-        }
-        Ok(out)
     }
+    if let Some((height, _)) = pending {
+        return Err(Error::Corrupt(format!(
+            "block {height} in requested range is missing its seal"
+        )));
+    }
+    Ok(out)
 }
 
 // the live sink: append and sync records as the ordered lane drives it. sync
@@ -1078,8 +1349,9 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
+            let pos = self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
+            self.height_index.insert(height, pos);
             Ok(())
         }
     }
@@ -1144,11 +1416,17 @@ where
 /// derives its row from the frame's content, not the dispatch trace — the
 /// trace alone cannot reproduce it.
 pub struct FoldedBlock<'a> {
+    /// The deployments realized for this replayed block.
+    pub host: &'a Host,
     pub height: u64,
     pub frame: &'a [u8],
     pub disposition: Disposition,
     pub root_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
+    /// the host's module set after this block — what the seal records. a
+    /// module the block's boundary admitted appears here for the first
+    /// time, so a derived tier can cover it before its first op folds.
+    pub roots: &'a [(ModuleId, StateRoot)],
 }
 
 /// observer of every sealed block the journal replay walks, in height order —
@@ -1195,6 +1473,14 @@ pub struct Recovered {
     /// armed by a block ABOVE the checkpoint (the checkpoint itself records
     /// one armed at or below it via `pending_cutover_view`).
     pub blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
+    /// the restored REPLAY WINDOW — the checkpoint's own
+    /// [`Manifest::applied_frames`] extended by every sealed block the journal
+    /// suffix walked, one entry per height in ascending order, bounded to
+    /// [`node::REPLAY_WINDOW_HEIGHTS`]. the boot path hands these to
+    /// `OrderedNode::seed_replay_window`, so a restarted node's window is as
+    /// deep as a peer that never restarted rather than as deep as whatever
+    /// journal the last checkpoint happened to leave behind.
+    pub applied_frames: Vec<(u64, node::FrameId)>,
     /// replay accounting, for the boot log line.
     pub applied: usize,
     pub skipped: usize,
@@ -1248,6 +1534,10 @@ where
         let mut residents = manifest.residents.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
+        // the replay window starts at the CHECKPOINT's, not empty: the journal
+        // suffix below only reaches back to the checkpoint, and a window
+        // shorter than a peer's is a fork waiting on a replayed batch.
+        let mut applied_frames: Vec<(u64, node::FrameId)> = manifest.applied_frames.clone();
         let mut pending: Option<(u64, Vec<u8>)> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -1390,11 +1680,13 @@ where
                             match disposition {
                                 // a rejected block never had content anywhere.
                                 Disposition::Rejected => sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
                                     root_hash,
                                     dispatches: &[],
+                                    roots: &roots,
                                 }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
@@ -1453,11 +1745,13 @@ where
                             .await?;
                             if let Some(sink) = sink.as_mut() {
                                 sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             for (id, root) in &changed {
@@ -1531,11 +1825,13 @@ where
                                 // re-execution; only the COMMIT scope was
                                 // selective.
                                 sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             // every re-committed and exact-post module must now
@@ -1561,6 +1857,7 @@ where
                         }
                     }
                     blocks.push((height, roots.clone()));
+                    applied_frames.push((height, node::frame_id(&frame)));
                     for (id, root) in roots {
                         expected.insert(id, root);
                     }
@@ -1586,6 +1883,7 @@ where
                     apply_block(host, height, &frame, None, code_source.as_ref()).await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
+                        host,
                         height,
                         frame: &frame,
                         disposition,
@@ -1593,6 +1891,7 @@ where
                         // below; this is that same post-block boundary.
                         root_hash: host.root_hash(),
                         dispatches: &dispatches,
+                        roots: &host.module_roots(),
                     });
                 }
                 disposition
@@ -1656,11 +1955,13 @@ where
                     }
                     if let Some(sink) = sink.as_mut() {
                         sink.folded_block(&FoldedBlock {
+                            host,
                             height,
                             frame: &frame,
                             disposition,
                             root_hash: host.root_hash(),
                             dispatches: &dispatches,
+                            roots: &host.module_roots(),
                         });
                     }
                     disposition
@@ -1677,6 +1978,7 @@ where
                 .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
             blocks.push((height, seal.roots.clone()));
+            applied_frames.push((height, node::frame_id(&frame)));
             tip_height = Some(height);
             tip_hash = host.root_hash();
             rolled_forward = true;
@@ -1704,6 +2006,19 @@ where
             )));
         }
 
+        // the checkpoint's window and the journal suffix overlap wherever the
+        // retained journal reaches back below the checkpoint height (a
+        // root-idempotent block is walked and skipped, but still remembered).
+        // one entry per height, newest last, bounded to the protocol depth —
+        // a duplicate would cost a window slot and shorten this node's reach
+        // against a peer's.
+        applied_frames.sort_by_key(|(height, _)| *height);
+        applied_frames.dedup_by_key(|(height, _)| *height);
+        let over = applied_frames
+            .len()
+            .saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+        applied_frames.drain(..over);
+
         Ok(Recovered {
             height: tip_height,
             root_hash: tip_hash,
@@ -1713,6 +2028,7 @@ where
             residents,
             frames,
             blocks,
+            applied_frames,
             applied,
             skipped,
             rolled_forward,
@@ -1812,7 +2128,7 @@ async fn replay_batch(
     // before re-applying or the sealed roots cannot reproduce. the registry
     // is disk-durable and reopens AHEAD of this window — its tip says nothing
     // about which code sealed `height` — so realization keys on the registry's
-    // activation HISTORY at `height` (`lifecycle::code_at`): the identical
+    // activation HISTORY at `height` (`modules::code_at`): the identical
     // swap points the live node realized, walked in either direction.
     // fail-closed on missing/tampered bytes.
     host.realize_module_swaps(height, code_source)
@@ -2163,6 +2479,7 @@ mod tests {
 
     fn sample_manifest() -> Manifest {
         Manifest {
+            codes: vec![("registry".into(), vec![7; 32])],
             height: Some(42),
             epoch: 1,
             view_base: 30,
@@ -2177,7 +2494,16 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
+            applied_frames: vec![(40, [0xA1; 32]), (41, [0xA2; 32]), (42, [0xA3; 32])],
         }
+    }
+
+    #[test]
+    fn checkpoint_writer_refuses_invalid_deployment_hash_width() {
+        let mut manifest = sample_manifest();
+        manifest.codes[0].1.pop();
+        assert!(manifest.check_field_caps().is_err());
+        assert!(Manifest::decode(&manifest.encode()).is_err());
     }
 
     #[test]
@@ -2279,5 +2605,57 @@ mod tests {
             cert: b"certificate".to_vec(),
         };
         assert_eq!(FloorCert::decode(&c.encode()).expect("roundtrip"), c);
+    }
+
+    /// #1814: `read_finalized_frames` must SEEK to the requested range via
+    /// `height_index`, not decode the retained journal from its start. a
+    /// journal of 200 blocks (400 records) asked for its last 3 frames
+    /// should decode a small handful of records, not anything close to 400.
+    #[test]
+    fn read_finalized_frames_seeks_instead_of_scanning_the_whole_journal() {
+        use commonware_runtime::{Runner as _, Supervisor as _};
+
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut recovery = Recovery::open(context.child("seek_index"))
+                .await
+                .expect("open recovery");
+            const TOTAL: u64 = 200;
+            for height in 1..=TOTAL {
+                recovery
+                    .pre_apply(height, &[height as u8])
+                    .await
+                    .expect("wal record");
+                recovery
+                    .seal(&BlockSeal {
+                        height,
+                        disposition: Disposition::Applied,
+                        roots: vec![],
+                        root_hash: StateRoot([0u8; 32]),
+                    })
+                    .await
+                    .expect("seal");
+            }
+
+            TEST_DECODED_RECORDS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let tail = recovery
+                .read_finalized_frames(TOTAL - 3, TOTAL, 10)
+                .await
+                .expect("tail read");
+            assert_eq!(tail.len(), 3);
+            assert_eq!(tail[0].height, TOTAL - 2);
+            assert_eq!(tail[2].height, TOTAL);
+
+            // the journal holds 2*TOTAL records (a Block + Seal per height);
+            // a scan from the journal's start would decode close to all of
+            // them. the height index instead lands the stream within a
+            // handful of records of the requested tail.
+            let decoded = TEST_DECODED_RECORDS.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                decoded <= 10,
+                "expected a bounded tail read, decoded {decoded} of {} records",
+                2 * TOTAL
+            );
+        });
     }
 }

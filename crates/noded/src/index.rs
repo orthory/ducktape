@@ -3,7 +3,6 @@
 //! daemon that runs no network), boundary stamping, and the `/v1/index/*` +
 //! `/v1/blocks` snapshot read lane.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -25,71 +24,9 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 // passing its own genesis module list.
 // ---------------------------------------------------------------------------
 
-/// the index guests a node installs: id → mapper bytes for every module the
-/// topology declares one for. Each module's fluentabi mapper is built by
-/// `guest-builder --index` and committed beside its crate (`make
-/// wasm-modules` refreshes the set); a network's genesis carries the set its
-/// founder built, so every node on that network folds with the same mapper.
-///
-/// Declared-equals-actual either way it is built: a module the topology says
-/// ships a guest that the source lacks is a refusal by name, never a bare
-/// index quietly serving nothing.
-pub struct IndexGuests(BTreeMap<String, Vec<u8>>);
-
-impl IndexGuests {
-    /// the guests a founding set holds for `module_ids` — the daemons that
-    /// run no network (noded, simnode, the dev shape) install from here.
-    pub fn from_dir<S: AsRef<str>>(dir: &std::path::Path, module_ids: &[S]) -> Result<Self, String> {
-        let mut guests = BTreeMap::new();
-        for id in declared_index_guests(module_ids) {
-            let path = workspace_config::index_guest_path(dir, id);
-            let bytes = std::fs::read(&path).map_err(|err| {
-                format!(
-                    "module {id} ships an index guest but {} is unreadable: {err} \
-                     (run `make wasm-modules`, or `cargo build` to stage the founding set)",
-                    path.display()
-                )
-            })?;
-            guests.insert(id.to_string(), bytes);
-        }
-        Ok(Self(guests))
-    }
-
-    /// the guests a genesis carries for `module_ids` — a node on a network
-    /// installs from its workspace genesis, never from a directory.
-    pub fn from_genesis<S: AsRef<str>>(
-        genesis: &workspace_config::Genesis,
-        module_ids: &[S],
-    ) -> Result<Self, String> {
-        let mut guests = BTreeMap::new();
-        for id in declared_index_guests(module_ids) {
-            let bytes = genesis.index_guest(id).ok_or_else(|| {
-                format!(
-                    "module {id} ships an index guest but the genesis carries none for it — \
-                     this genesis was composed from a different topology"
-                )
-            })?;
-            guests.insert(id.to_string(), bytes.to_vec());
-        }
-        Ok(Self(guests))
-    }
-
-    fn get(&self, id: &str) -> Option<&[u8]> {
-        self.0.get(id).map(Vec::as_slice)
-    }
-}
-
-/// the ids of `module_ids` whose topology spec declares an index guest.
-fn declared_index_guests<S: AsRef<str>>(module_ids: &[S]) -> impl Iterator<Item = &str> {
-    module_ids
-        .iter()
-        .map(AsRef::as_ref)
-        .filter(|id| topology::TOPOLOGY.spec(id).is_some_and(|m| m.index_guest))
-}
-
 /// open the per-module index store under `<storage>/index`, deciding nothing
 /// about guests yet: each database keeps serving the guest its last converge
-/// installed until [`converge_index_guests`] runs. The split is what lets a
+/// installed until [`converge_host_modules`] runs. The split is what lets a
 /// node bring its index routes up before it holds a genesis (a joiner
 /// fetches its genesis off the mesh after the surfaces start). an open
 /// failure is fatal-with-remedy for the caller: the tier is rebuildable, so
@@ -110,26 +47,86 @@ pub fn open_index_store<S: AsRef<str>>(
         })
 }
 
-/// converge every module's database onto its guest in `guests` (or onto no
-/// guest, for a module that ships none): the install half of
-/// [`open_index_store`], run once the guests are known.
-pub fn converge_index_guests(
-    index: &indexer::IndexStore,
-    guests: &IndexGuests,
-) -> Result<(), String> {
-    let modules: Vec<indexer::IndexModule> = index
-        .module_ids()
-        .map(|id| indexer::IndexModule {
-            id,
-            guest: guests.get(id),
-        })
+/// Install the mapper belonging to each running deployment. Called after
+/// composition and before a sealed block reaches the derived tier, so genesis,
+/// live admission, code replacement and recovery all use the same path.
+///
+/// A converge failure the index store itself scoped to one module (a
+/// rejected mapper — `index.is_poisoned()` still reads false) is logged and
+/// skipped: that module's own reads and writes stay refused until it
+/// reconverges, but every OTHER module — this loop's remaining entries, and
+/// the block the caller applies right after this returns — must keep
+/// indexing. Only a converge failure that poisoned the whole store (the
+/// engine itself, not the candidate bytes) aborts here.
+pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> Result<(), String> {
+    let modules: Vec<indexer::IndexModule<'_>> = host
+        .module_index_guests()
+        .map(|(id, guest)| indexer::IndexModule { id, guest })
         .collect();
-    index.converge(&modules).map_err(|err| {
-        format!(
-            "install index guests at {}: {err} (derived tier — delete the directory to rebuild)",
-            index.base().display()
-        )
-    })
+    index_host_modules(index, modules.iter().map(|module| module.id))?;
+    for module in modules {
+        // `converge`/`converge_deployment` below may move `module` (built
+        // into a one-element slice), so its id — and whether it was ALREADY
+        // failed before this attempt — are captured first for the log line
+        // that can follow the match.
+        let module_id = module.id;
+        let was_failed = index.is_module_failed(module_id);
+        let result = match host.module_code_hash(module_id) {
+            Some(hash) => index.converge_deployment(&module, &hash),
+            None => index.converge(&[module]),
+        };
+        let Err(error) = result else { continue };
+        if index.is_poisoned() {
+            return Err(format!("converge deployed index guests: {error}"));
+        }
+        // this loop runs every block for as long as a rejected mapper stays
+        // deployed (converge_host_modules is called per fold, not per
+        // deployment change), so `warn` fires ONLY on the transition into
+        // `Failed` — a repeat of the identical rejection is `debug`, per the
+        // "no info/warn more than once per block" logging rule.
+        if was_failed {
+            tracing::debug!(
+                target: "ducktape::index",
+                reason = "module_mapper_still_rejected",
+                module = module_id,
+                error = %error,
+                "module's index guest is still rejected, unchanged since the last attempt"
+            );
+            continue;
+        }
+        tracing::warn!(
+            target: "ducktape::index",
+            reason = "module_mapper_rejected",
+            module = module_id,
+            error = %error,
+            "module's index guest failed to converge — its fold and views stay \
+             refused until it reconverges; every other module keeps indexing"
+        );
+    }
+    Ok(())
+}
+
+/// the index covers every module the host runs: open a database for each id
+/// of `modules` the store lacks — a module the modules registry admitted
+/// after the store opened — leaving the ones it holds untouched. idempotent,
+/// and free when nothing was admitted. called after every compose and before
+/// every block fold, so an admitted module's feed begins at the block that
+/// seated it. The database opens bare; `converge_host_modules` installs the
+/// optional mapper from the running deployment before feeding that block.
+pub fn index_host_modules<'a>(
+    index: &indexer::IndexStore,
+    modules: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for id in modules {
+        index.open_module(id).map_err(|err| {
+            format!(
+                "open index database for module {id} at {}: {err} \
+                 (derived tier — delete the directory to rebuild)",
+                index.base().display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// flatten a dispatch origin into the index's plain origin tag: external
@@ -206,7 +203,7 @@ pub fn stale_modules(
     index: &indexer::IndexStore,
     boundary: u64,
 ) -> Result<Vec<String>, indexer::Error> {
-    let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
+    let modules = index.module_ids();
     let mut stale = Vec::new();
     for module in modules {
         if index.applied_height(&module)? >= boundary {
@@ -269,6 +266,13 @@ struct IndexOpsResponse {
     next_after: Option<String>,
 }
 
+/// hard cap on how many payload bytes [`op_row_json`] will hex- or json-embed
+/// inline (#1809): ordinary duckfs traffic puts megabyte stage chunks in op
+/// payloads, and hex doubles that. a payload over this ships as
+/// `payload_bytes` + `payload_truncated` instead — the full bytes stay
+/// reachable by op id, this row just stops being the way to fetch them.
+const MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// one borsh op row as this lane's json projection.
 fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
     let mut out = serde_json::json!({
@@ -277,10 +281,15 @@ fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
         "time": row.time,
         "origin": row.origin,
     });
-    let payload_json: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
-    match payload_json {
-        Some(value) => out["payload"] = value,
-        None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+    if row.payload.len() > MAX_INLINE_PAYLOAD_BYTES {
+        out["payload_bytes"] = serde_json::Value::from(row.payload.len());
+        out["payload_truncated"] = serde_json::Value::Bool(true);
+    } else {
+        let payload_json: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
+        match payload_json {
+            Some(value) => out["payload"] = value,
+            None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+        }
     }
     if !row.assigned.is_empty() {
         let assigned_json: Option<serde_json::Value> = serde_json::from_slice(&row.assigned).ok();
@@ -309,6 +318,33 @@ fn index_error(err: indexer::Error) -> Response {
     error_response(status, &err.to_string())
 }
 
+/// acquire the shared [`NodeHandle::index_view_gate`] permit and run `work`
+/// on `spawn_blocking`'s pool — the one place every `Lane::Open` index read
+/// (`index_status`, `index_view`, and, since #1809, `index_ops`/`index_scan`/
+/// `blocks`) gets off the axum worker and behind the same concurrency cap.
+/// `try_acquire_owned` refuses immediately (429) once the gate is full rather
+/// than queuing the Nth caller behind the rest; a panicked blocking task
+/// answers 500 instead of dropping the connection silently.
+async fn gated_blocking<F, T>(handle: &NodeHandle, work: F) -> Result<T, Response>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
+        return Err(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            INDEX_VIEW_AT_CAPACITY,
+        ));
+    };
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Ok(value),
+        Err(_) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index task panicked",
+        )),
+    }
+}
+
 /// GET /v1/index/status — each module's applied watermark (the op FEED, not
 /// the derived view), the poison flag, backfill floors, and every fold
 /// trigger's health (`pending` backlog + last drain error): the watermark
@@ -317,71 +353,105 @@ fn index_error(err: indexer::Error) -> Response {
 /// which this surface makes visible. boundary-stamped modules also report
 /// their backfill floor: content below it was never in the feed — the gap
 /// stays visible instead of papered over.
+///
+/// `fold_status` per module costs fluent31 an iteration over that trigger's
+/// whole pending-queue range (no cheap counter exists — see the "ASKING IS
+/// NOT FREE" note on `IndexStore::fold_status`), so a backlogged module makes
+/// this call as expensive as [`index_view`]'s wasm query. The route stays
+/// `Lane::Open`, so it gets the exact same treatment: the sampling loop runs
+/// off the axum worker on [`gated_blocking`], the same permit `index_view`
+/// uses (one pool for every unauthenticated read that can burn a worker
+/// thread, not a second cap to size) — the Nth concurrent caller past
+/// capacity 429s immediately rather than queuing behind the scan.
 pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
+    match gated_blocking(&handle, move || index_status_body(&store)).await {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(response)) => *response,
+        Err(response) => response,
+    }
+}
+
+/// the synchronous per-module scan behind [`index_status`], split out so it
+/// can run on `spawn_blocking`'s pool: three `Result`-returning store reads
+/// per module, any of which can name the response outright as an early
+/// `Err`, so this returns a `Response` on the error path rather than
+/// threading `indexer::Error` back through a `?` the caller would have to
+/// re-translate. `Response` boxed on the error path — clippy's
+/// `result_large_err`, since a `Response` dwarfs the `Ok` payload.
+fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, Box<Response>> {
     let mut modules = serde_json::Map::new();
     let mut backfilled = serde_json::Map::new();
     let mut fold = serde_json::Map::new();
     for id in store.module_ids() {
-        match store.applied_height(id) {
+        match store.applied_height(&id) {
             Ok(height) => {
                 modules.insert(id.to_string(), height.into());
             }
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
-        match store.backfill_height(id) {
+        match store.backfill_height(&id) {
             Ok(Some(floor)) => {
                 backfilled.insert(id.to_string(), floor.into());
             }
             Ok(None) => {}
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
-        match store.fold_status(id) {
+        match store.fold_status(&id) {
             Ok(Some(status)) => match serde_json::to_value(&status) {
                 Ok(value) => {
                     fold.insert(id.to_string(), value);
                 }
                 Err(_) => {
-                    return error_response(
+                    return Err(Box::new(error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "fold status did not serialize",
-                    );
+                    )));
                 }
             },
             Ok(None) => {}
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
     }
-    Json(serde_json::json!({
+    Ok(serde_json::json!({
         "poisoned": store.is_poisoned(),
         "modules": modules,
         "backfilled": backfilled,
         "fold": fold,
     }))
-    .into_response()
 }
 
 /// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
 /// log, oldest-first. rows are the stored envelopes verbatim; page forward by
-/// echoing `next_after` as the next call's `after`.
+/// echoing `next_after` as the next call's `after`. #1809: the synchronous
+/// fluent31 scan runs behind the same [`gated_blocking`] permit as
+/// `index_view`/`index_status` — it is the identical off-worker, capped-fan-in
+/// read on this `Lane::Open` surface.
 pub(crate) async fn index_ops(
     State(handle): State<NodeHandle>,
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
-    let page = match store.scan(
-        &module,
-        indexer::OP_PREFIX.as_bytes(),
-        params.after.as_deref().map(str::as_bytes),
-        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
-    ) {
-        Ok(page) => page,
-        Err(err) => return index_error(err),
+    let after = params.after.clone();
+    let limit = params.limit.unwrap_or(INDEX_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || {
+        store.scan(
+            &module,
+            indexer::OP_PREFIX.as_bytes(),
+            after.as_deref().map(str::as_bytes),
+            limit,
+        )
+    })
+    .await;
+    let page = match outcome {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let mut ops = Vec::with_capacity(page.entries.len());
     for (_key, value) in &page.entries {
@@ -414,6 +484,30 @@ pub(crate) async fn index_ops(
 /// and stay untouched, and a caller that does not care never sees it.
 pub const FOLDED_HEADER: &str = "x-ducktape-folded";
 
+/// how many `POST /v1/index/{module}/view` or `GET /v1/index/status` calls
+/// may run concurrently, ONE shared pool across both routes. Both are
+/// `Lane::Open` — any caller that can dial the HTTP port reaches them, no PoP
+/// or workspace secret required — and each does real off-worker CPU: `view`
+/// runs fluent31's `Db::query` SYNCHRONOUSLY against ~1e9 fuel
+/// (`fluent31::Options::wasm_fuel`, the only per-call budget fluent31
+/// exposes: no separate wall-clock/epoch deadline exists to set alongside
+/// it); `status` iterates every module's fold-trigger pending-queue range
+/// (fluent31 exposes no cheaper counter). Both now run on
+/// [`tokio::task::spawn_blocking`]'s own pool so neither can pin an axum
+/// worker outright, but that pool is still this same process's CPU —
+/// unbounded fan-in there would let N unauthenticated callers burn every
+/// core the process has, including bin/node's consensus thread. Must stay
+/// small: a value near or above the runtime's worker-thread count buys
+/// nothing over no cap at all.
+pub(crate) const MAX_CONCURRENT_INDEX_VIEWS: usize = 4;
+
+/// the refusal body when the concurrency gate above is already full — a
+/// stable, greppable token, not prose, so an operator can tell "the node is
+/// out of index-read slots" apart from every other 429 on this surface.
+/// shared by `index_view` and `index_status`: they refuse into the same pool
+/// for the same reason, so they carry the same token.
+const INDEX_VIEW_AT_CAPACITY: &str = "index view refused: reason=index_view_at_capacity";
+
 /// POST /v1/index/{module}/view — the module's materialized view, served by
 /// its registered mapper. request body and reply are module-defined json
 /// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
@@ -430,30 +524,25 @@ pub(crate) async fn index_view(
     Path(module): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
-    // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
-    // the order decides which way the mismatch falls. read first and the tip
-    // can only be OLDER than the rows served — the caller waits one more round
-    // trip. read after and it can be NEWER, claiming a row this reply does not
-    // contain, which is the exact bug the tip exists to close.
-    //
-    // and ADVISORY, never a precondition: a read error here degrades to "no
-    // header", the same answer an unstamped module gives. everything about
-    // this key is best-effort (absent = unknown, a malformed value = unknown),
-    // and `IndexStore::view` promises a poisoned store still serves views —
-    // stale but consistent. failing the whole read because one bookkeeping key
-    // would not load empties the caller's sidebar over nothing. an unknown
-    // module still 404s: `store.view` below answers that.
-    let folded = store.fold_tip(&module).ok().flatten();
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
-    let mut response = match store.view(&module, &req_bytes) {
-        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
-        },
-        Err(err) => index_error(err),
+    let query_module = module.clone();
+    // One deployment guard covers watermark and view. The HTTP gate bounds
+    // concurrent engine work, and the synchronous reads run off the worker.
+    let outcome = gated_blocking(&handle, move || {
+        store.view_with_tip(&query_module, &req_bytes)
+    })
+    .await;
+    let indexer::IndexedView { bytes, folded } = match outcome {
+        Ok(Ok(view)) => view,
+        Ok(Err(error)) => return index_error(error),
+        Err(response) => return response,
+    };
+    let mut response = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
     };
     if let Some((height, seq)) = folded {
         // infallible on purpose: ABSENT is the one honest way to say "no tip"
@@ -475,18 +564,25 @@ pub(crate) async fn index_scan(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
     let prefix = params.prefix.unwrap_or_default();
-    let page = match store.scan(
-        &module,
-        prefix.as_bytes(),
-        params.after.as_deref().map(str::as_bytes),
-        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
-    ) {
-        Ok(page) => page,
-        Err(err) => return index_error(err),
+    let after = params.after.clone();
+    let limit = params.limit.unwrap_or(INDEX_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || {
+        store.scan(
+            &module,
+            prefix.as_bytes(),
+            after.as_deref().map(str::as_bytes),
+            limit,
+        )
+    })
+    .await;
+    let page = match outcome {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let entries = page
         .entries
@@ -532,16 +628,22 @@ pub struct BlocksParams {
 /// empty `ops`) at each ascension tip. it is a truthful record of what that
 /// node saw; a consumer that presents these rows as blocks-with-content owes
 /// its own filter.
+///
+/// #1809: `recent_block_rows` runs behind the same [`gated_blocking`] permit
+/// as every other synchronous store read on this `Lane::Open` surface.
 pub(crate) async fn blocks(
     State(handle): State<NodeHandle>,
     Query(params): Query<BlocksParams>,
 ) -> Response {
-    let Some(store) = handle.index.as_ref() else {
+    let Some(store) = handle.index.clone() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
-    let rows = match store.recent_block_rows(params.limit.unwrap_or(BLOCKS_DEFAULT_LIMIT)) {
-        Ok(rows) => rows,
-        Err(err) => return index_error(err),
+    let limit = params.limit.unwrap_or(BLOCKS_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || store.recent_block_rows(limit)).await;
+    let rows = match outcome {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let mut blocks: Vec<Box<serde_json::value::RawValue>> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -562,43 +664,154 @@ pub(crate) async fn blocks(
 
 #[cfg(test)]
 mod tests {
-    /// THE WATERMARK MUST BE READ BEFORE THE VIEW. The two reads take two MVCC
-    /// snapshots, and the ORDER is the whole correctness argument: read the tip
-    /// first and it can only be older than the rows served (the caller waits
-    /// one more round trip — safe); read it after and it can be newer, vouching
-    /// for a row this very reply does not contain — which is exactly the
-    /// acceptance-vs-application bug the header exists to close.
-    ///
-    /// Pinned as a source shape because no behavioural test can see it: both
-    /// orders answer identically except in the interleaving that makes the
-    /// wrong one wrong.
+    /// #1809: a payload over [`super::MAX_INLINE_PAYLOAD_BYTES`] ships as
+    /// `payload_bytes` + `payload_truncated` instead of a multi-megabyte hex
+    /// string — the full bytes stay reachable by op id, this row just stops
+    /// hexing them.
     #[test]
-    fn the_view_reads_its_fold_watermark_before_the_snapshot() {
-        const SRC: &str = include_str!("index.rs");
-        let body = SRC
-            .split("pub(crate) async fn index_view(")
-            .nth(1)
-            .expect("index_view is declared")
-            .split("\n/// ")
-            .next()
-            .expect("index_view body");
-        let tip = body
-            .find("store.fold_tip(")
-            .expect("the view reads the tip");
-        let view = body.find("store.view(").expect("the view serves the view");
-        assert!(
-            tip < view,
-            "the fold watermark must be read BEFORE the view snapshot"
+    fn op_row_json_truncates_an_oversized_payload() {
+        let row = indexer::OpRow {
+            height: 1,
+            seq: 0,
+            time: 1_000,
+            origin: indexer::OriginTag::external("jess"),
+            payload: vec![0u8; super::MAX_INLINE_PAYLOAD_BYTES + 1],
+            assigned: Vec::new(),
+        };
+        let json = super::op_row_json(&row);
+        assert_eq!(
+            json["payload_bytes"],
+            serde_json::json!(super::MAX_INLINE_PAYLOAD_BYTES + 1)
         );
-        // AND IT MUST NOT BE ABLE TO REFUSE THE READ. The tip is advisory —
-        // absent is unknown, malformed is unknown — so an engine error on it
-        // has to degrade to "no header" too. Turning it into a precondition
-        // would answer 500 to a request that could have served the rows fine,
-        // against `IndexStore::view`'s own promise that a poisoned store still
-        // serves views. Nothing between the two reads may leave the function.
-        assert!(
-            !body[tip..view].contains("return"),
-            "an unreadable fold watermark must not refuse the view"
+        assert_eq!(json["payload_truncated"], serde_json::json!(true));
+        assert!(json.get("payload").is_none());
+        assert!(json.get("payload_hex").is_none());
+    }
+
+    /// an in-budget payload keeps embedding verbatim — the truncation branch
+    /// must not swallow ordinary rows.
+    #[test]
+    fn op_row_json_embeds_a_small_payload_verbatim() {
+        let row = indexer::OpRow {
+            height: 1,
+            seq: 0,
+            time: 1_000,
+            origin: indexer::OriginTag::external("jess"),
+            payload: br#"{"hello":"world"}"#.to_vec(),
+            assigned: Vec::new(),
+        };
+        let json = super::op_row_json(&row);
+        assert_eq!(json["payload"], serde_json::json!({"hello": "world"}));
+        assert!(json.get("payload_bytes").is_none());
+        assert!(json.get("payload_truncated").is_none());
+    }
+
+    /// #1717: once `MAX_CONCURRENT_INDEX_VIEWS` callers are already "running"
+    /// (holding a permit, as the wasm query would while it runs), the NEXT
+    /// `index_view` call refuses with 429 rather than queuing behind them —
+    /// this is the whole point of `try_acquire_owned` over `acquire_owned`.
+    #[tokio::test]
+    async fn index_view_refuses_once_the_concurrency_gate_is_full() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
         );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        // saturate the gate exactly as N concurrent in-flight views would.
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        let refused = super::index_view(
+            axum::extract::State(handle.clone()),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        // releasing a permit reopens the gate for the next caller.
+        drop(held);
+        let admitted = super::index_view(
+            axum::extract::State(handle),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// #1727: `index_status` refuses at capacity exactly like `index_view`
+    /// does, because it draws from the SAME gate — no second semaphore sized
+    /// separately for the same worker-thread budget.
+    #[tokio::test]
+    async fn index_status_refuses_once_the_concurrency_gate_is_full() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        let refused = super::index_status(axum::extract::State(handle.clone())).await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        drop(held);
+        let admitted = super::index_status(axum::extract::State(handle)).await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// the pool is shared, not merely identically-sized: permits held by
+    /// in-flight `index_view` calls also starve `index_status`, and vice
+    /// versa — the whole point of routing both through one semaphore instead
+    /// of two gates that happen to share a constant.
+    #[tokio::test]
+    async fn index_view_and_index_status_share_one_gate() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        // saturate the gate via `index_view`'s side...
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        // ...and confirm `index_status` sees the SAME exhausted pool.
+        let refused = super::index_status(axum::extract::State(handle.clone())).await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        drop(held);
+        let admitted = super::index_status(axum::extract::State(handle)).await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }

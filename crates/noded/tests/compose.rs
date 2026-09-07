@@ -1,13 +1,20 @@
 //! the composer over REAL substrates: the repo's fixture components, qmdb
 //! stores on a temp runtime, an empty blob plane — genesis, then a reopen of
-//! the same stores with a Map snapshot re-installed.
+//! the same stores off the modules registry with a map snapshot re-installed;
+//! and the ONE wasm path's refusals, by name.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use commonware_runtime::{Runner as _, Supervisor as _};
-use noded::bundle::DirCodeSource;
-use noded::compose::{Bindings, Boot, BoxFut, Substrates, compose};
-use sdk::{MerkleStore, StateRoot, StateSyncHandle};
+use commonware_runtime::Runner as _;
+use host::CapturePayloads;
+use noded::bundle::{DirCodeSource, qmdb_stores};
+use noded::compose::{
+    Admissions, Bindings, Boot, BoxFut, Start, Substrates, check_realizable, compose, wasm_module,
+};
+use sdk::{Module, StateRoot, StateSyncHandle};
+use sdk_testkit::TestCtx;
+use wasm_host::{Backing, Shape};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel/host/tests/fixtures")
@@ -16,7 +23,12 @@ fn fixtures() -> PathBuf {
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
-const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle", "runs"];
+const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "runs"];
+
+const BINDINGS: Bindings<'static> = Bindings {
+    invite: b"t",
+    chain_id: "t",
+};
 
 fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<'static, ()>) {
     let dir = tempfile::tempdir().unwrap();
@@ -26,60 +38,48 @@ fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<
     commonware_runtime::tokio::Runner::new(cfg).start(|context| body(context, root));
 }
 
+fn substrates(dir: &std::path::Path) -> Substrates {
+    Substrates {
+        forge_repo: dir.join("forge"),
+        duckfs_dir: dir.join("duckfs"),
+        blobs: blobstore::BlobHandle::default(),
+    }
+}
+
 #[test]
-fn composes_wasm_store_map_and_native_over_injected_stores() {
+fn composes_only_wasm_over_injected_stores() {
     run(|context, dir| {
         Box::pin(async move {
-            let (code, by_id) =
-                DirCodeSource::open(&fixtures(), &["acl", "governance", "runs"]).unwrap();
+            let (code, by_id) = DirCodeSource::open(&fixtures(), SELECTION).unwrap();
             let validators = vec![vec![7u8; 32]];
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &validators,
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
 
             // ---- genesis ----
-            let modules = compose(
-                SELECTION,
+            let genesis = compose(
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &validators,
+                    bundle: &by_id,
+                },
             )
             .await
             .unwrap();
-            let ids: Vec<String> = modules.iter().map(|m| m.id().to_string()).collect();
-            assert_eq!(
-                ids,
-                SELECTION.iter().map(|s| s.to_string()).collect::<Vec<_>>()
-            );
-            let runs = modules.iter().find(|m| m.id() == "runs").unwrap();
-            let Ok(StateSyncHandle::SnapshotBytes(runs_snapshot)) = runs.state_sync_handle() else {
-                panic!("a Map tenant syncs by snapshot bytes");
-            };
-            let genesis = host::Host::genesis(modules).unwrap();
-            assert!(
-                genesis.module_code_hash("valset").is_none(),
-                "native modules carry no code hash"
-            );
+            let mut ids: Vec<String> = genesis
+                .module_roots()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort_unstable();
+            let mut want: Vec<String> = SELECTION.iter().map(|s| s.to_string()).collect();
+            want.sort_unstable();
+            assert_eq!(ids, want);
+            for id in SELECTION {
+                assert_eq!(genesis.module_code_hash(id).unwrap(), by_id[*id]);
+            }
             assert_eq!(
                 genesis.module_code_hash("acl").unwrap(),
                 by_id["acl"].to_vec()
@@ -93,31 +93,41 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
                 "governance's genesis config was seeded into its store"
             );
             let genesis_root = genesis.root_hash();
-            let runs_root = genesis.module_root("runs").unwrap();
+            let (captured, _) =
+                genesis.capture_current_snapshot(0, CapturePayloads::All, || Duration::ZERO);
+            let runs = captured.module("runs").expect("runs composed");
+            let StateSyncHandle::SnapshotBytes(runs_snapshot) = runs.state_sync.clone() else {
+                panic!("a map tenant syncs by snapshot bytes");
+            };
+            let runs_root = runs.root;
             drop(genesis);
 
-            // ---- reopen the same stores: no re-seed, the Map tenant installs
+            // ---- reopen the same stores at block zero: the wasm set comes off
+            // the modules registry, no store re-seeds, the map tenant installs
             // its snapshot, and the composed root-hash is the genesis one ----
-            let mut snapshots = |id: &'static str| -> SnapshotFut<'_> {
+            let mut snapshots = |id: &str, backing: Backing| -> SnapshotFut<'_> {
+                assert_ne!(
+                    backing,
+                    Backing::Store,
+                    "a store-backed module is never asked"
+                );
                 let bytes = runs_snapshot.clone();
-                Box::pin(async move {
-                    let is_runs = id == "runs";
-                    Ok(is_runs.then_some((bytes, runs_root)))
-                })
+                let is_runs = id == "runs";
+                Box::pin(async move { Ok(is_runs.then_some((bytes, runs_root))) })
             };
             let reopened = compose(
-                SELECTION,
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
+                &BINDINGS,
                 Boot::Reopen {
+                    height: 0,
+                    codes: &by_id,
                     snapshots: &mut snapshots,
                 },
             )
             .await
             .unwrap();
-            let reopened = host::Host::genesis(reopened).unwrap();
             assert_eq!(
                 reopened.root_hash(),
                 genesis_root,
@@ -128,86 +138,59 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
 }
 
 #[test]
-fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
+fn genesis_module_membership_comes_from_the_bundle() {
     run(|context, dir| {
         Box::pin(async move {
-            let (code, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
-            let (_, with_extra) = DirCodeSource::open(&fixtures(), &["acl", "governance"]).unwrap();
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &[],
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
-            let Err(err) = compose(
-                &["acl", "governance"],
+            let (code, by_id) = DirCodeSource::open(&fixtures(), &["directory"]).unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let genesis = compose(
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &by_id,
+                },
             )
             .await
-            else {
-                panic!("a wasm module with no genesis code hash composed");
-            };
+            .unwrap();
+            assert!(genesis.module_root("directory").is_some());
+            assert!(genesis.module_root("acl").is_none());
+            assert!(genesis.module_root("runs").is_none());
             assert!(
-                err.contains("governance"),
-                "the refusal names the module: {err}"
+                genesis.module_status().await.unwrap().is_none(),
+                "an omitted registry is not inserted by the binary"
             );
-            let Err(err) = compose(
-                &["not-a-module"],
-                &code,
-                &mut stores,
-                &substrates,
-                &bindings,
-                Boot::Genesis,
-            )
-            .await
-            else {
-                panic!("an id outside the topology composed");
-            };
-            assert!(
-                err.contains("not-a-module"),
-                "an unknown id is refused by name: {err}"
-            );
-            // a stray extra hash would seed the lifecycle registry (and move
-            // the genesis root) for a module the selection never composes.
-            let extra = Bindings {
-                code_hashes: &with_extra,
-                ..bindings
-            };
-            let Err(err) = compose(
-                &["acl"],
-                &code,
-                &mut stores,
-                &substrates,
-                &extra,
-                Boot::Genesis,
-            )
-            .await
-            else {
-                panic!("an extra code hash composed");
-            };
-            assert!(
-                err.contains("governance"),
-                "the extra key is refused by name: {err}"
-            );
+            assert_eq!(genesis.module_roots().len(), 1);
+        })
+    });
+}
+
+#[test]
+fn genesis_refuses_unsafe_ids() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let (code, by_id) = DirCodeSource::open(&fixtures(), &["directory"]).unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            for id in ["../outside", "bad/id"] {
+                let bundle =
+                    std::collections::BTreeMap::from([(id.to_string(), by_id["directory"])]);
+                let result = compose(
+                    &code,
+                    &mut stores,
+                    &substrates,
+                    &BINDINGS,
+                    Boot::Genesis {
+                        validators: &[],
+                        bundle: &bundle,
+                    },
+                )
+                .await;
+                assert!(result.is_err(), "{id}");
+            }
         })
     });
 }
@@ -222,10 +205,14 @@ impl host::CodeSource for LiarSource {
     async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         std::fs::read(&self.0).ok()
     }
+
+    fn origin(&self) -> &'static str {
+        "test_liar"
+    }
 }
 
 /// a code source is a lookup, not a guarantee: bytes that do not hash to the
-/// genesis entry never seat, or the running code and the lifecycle registry
+/// genesis entry never seat, or the running code and the modules registry
 /// would silently disagree.
 #[test]
 fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
@@ -234,34 +221,17 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
             let (_, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
             // the liar answers acl's hash with governance's component.
             let liar = LiarSource(fixtures().join("governance.component.wasm"));
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &[],
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
             let Err(err) = compose(
-                &["acl"],
                 &liar,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &by_id,
+                },
             )
             .await
             else {
@@ -271,6 +241,468 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
                 err.contains("acl") && err.contains("do not match"),
                 "the mismatch is refused by module name: {err}"
             );
+        })
+    });
+}
+
+/// a shape this host cannot realize is refused BY NAME, before any substrate
+/// is touched: an odb declaration under an id the host has no substrate for,
+/// or a config key no network binds. the same check the readiness probe runs
+/// before a validator signals a swap ready.
+#[test]
+fn a_shape_the_host_cannot_realize_is_refused_by_name() {
+    let odb = Shape {
+        backing: Backing::Odb,
+        config: Vec::new(),
+        committed_queries: false,
+    };
+    let err = check_realizable("kanban", &odb).unwrap_err();
+    assert!(
+        err.contains("kanban") && err.contains("odb"),
+        "an odb declaration without a substrate names the module: {err}"
+    );
+    check_realizable("files", &odb).expect("files has an odb substrate");
+    check_realizable("forge", &odb).expect("forge has an odb substrate");
+
+    let unknown_key = Shape {
+        backing: Backing::Store,
+        config: vec!["tenant".into()],
+        committed_queries: false,
+    };
+    let err = check_realizable("kanban", &unknown_key).unwrap_err();
+    assert!(
+        err.contains("kanban") && err.contains("tenant"),
+        "an unbound config key names the module and the key: {err}"
+    );
+    let bound = Shape {
+        backing: Backing::Store,
+        config: vec![
+            sdk::genesis_config::INVITE.into(),
+            sdk::genesis_config::CHAIN_ID.into(),
+        ],
+        committed_queries: true,
+    };
+    check_realizable("kanban", &bound).expect("the network binds both keys");
+}
+
+/// a post-genesis admission builds through the SAME wasm path a genesis
+/// tenant took: the factory wraps the bytes over the substrate they declare
+/// (a map-declared fixture over a fresh map) and refuses a declaration the
+/// host cannot realize under that id (the odb-declared fixture under an id
+/// with no substrate), by name.
+#[test]
+fn admissions_build_through_the_one_wasm_path() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let hello = std::fs::read(fixtures().join("hello.component.wasm")).unwrap();
+            let object = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
+            )
+            .unwrap();
+            let substrates = substrates(&dir);
+            let admissions = Admissions::new(&context, &substrates, &BINDINGS);
+            let admitted = host::ModuleFactory::instantiate(
+                &admissions,
+                "hello",
+                &module_artifact::ModuleArtifact::component(hello).encode(),
+            )
+            .await
+            .expect("a map-declared component admits over a fresh map");
+            let host::Admitted::Module(module) = admitted else {
+                panic!("the hello fixture is a `ducktape:module`");
+            };
+            assert_eq!(module.id(), "hello");
+            let err = host::ModuleFactory::instantiate(
+                &admissions,
+                "kanban",
+                &module_artifact::ModuleArtifact::component(object).encode(),
+            )
+            .await
+            .err()
+            .expect("an odb declaration under an id with no substrate is refused");
+            assert!(
+                err.to_string().contains("kanban"),
+                "the refusal names the module: {err}"
+            );
+            // and the ONE refusal that is not fail-closed: bytes that are no
+            // `ducktape:module` at all are another plane's commitment record.
+            let netstack = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../networking/netstack-machine/component.wasm"),
+            )
+            .unwrap();
+            let admitted = host::ModuleFactory::instantiate(
+                &admissions,
+                "netstack",
+                &module_artifact::ModuleArtifact::component(netstack).encode(),
+            )
+            .await
+            .expect("a foreign-world component is answered, not errored");
+            assert!(
+                matches!(admitted, host::Admitted::ForeignAbi),
+                "the netstack guest is no module admission"
+            );
+            // and the same answer one step earlier: bytes carrying no artifact
+            // frame at all. Erroring here stalls the code plane on every node
+            // forever, for a record this boundary never owned.
+            let admitted = host::ModuleFactory::instantiate(&admissions, "raw", b"\0asm\x01\0\0\0")
+                .await
+                .expect("unframed bytes are answered, not errored");
+            assert!(
+                matches!(admitted, host::Admitted::ForeignAbi),
+                "no artifact frame is no module admission"
+            );
+        })
+    });
+}
+
+/// an ODB-BACKED tenant reads its network's chain id through the same
+/// `sdk::genesis_config` seam a Map/Store tenant does — the kernel half of
+/// #1773: `compose::wasm_module` used to skip the `Backing::Odb` arm
+/// entirely, so a component like forge (or this fixture, wearing files' odb
+/// substrate) never saw a `__config` record and could not learn its chain id.
+#[test]
+fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let object = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
+            )
+            .unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let bindings = Bindings {
+                invite: b"t",
+                chain_id: "net#odb-1773",
+            };
+            let mut module = wasm_module(
+                "files",
+                &module_artifact::ModuleArtifact::component(object).encode(),
+                &mut stores,
+                &substrates,
+                &bindings,
+                Start::Fresh {
+                    parameters: &sdk::genesis_config::encode_config(&[]),
+                },
+            )
+            .await
+            .expect("an odb-declared component wraps over the files substrate");
+
+            let mut ctx = TestCtx::at_height(0);
+            let matching = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), bindings.chain_id.as_bytes()].concat(),
+            };
+            module
+                .execute(&mut ctx, &matching)
+                .await
+                .expect("the guest read chain_id straight out of __config");
+
+            let mismatched = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), b"some-other-chain".as_slice()].concat(),
+            };
+            module
+                .execute(&mut ctx, &mismatched)
+                .await
+                .expect_err("a wrong expectation against the same __config is rejected");
+        })
+    });
+}
+
+struct ArtifactSource(std::collections::BTreeMap<Vec<u8>, Vec<u8>>);
+
+impl ArtifactSource {
+    fn add(&mut self, artifact: module_artifact::ModuleArtifact) -> [u8; 32] {
+        let hash = artifact.hash();
+        self.0.insert(hash.to_vec(), artifact.encode());
+        hash
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl host::CodeSource for ArtifactSource {
+    async fn fetch(&self, hash: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(hash).cloned()
+    }
+
+    fn origin(&self) -> &'static str {
+        "test_artifacts"
+    }
+}
+
+async fn registry_op(
+    host: &mut host::Host,
+    height: u64,
+    origin: sdk::Origin,
+    op: modules::ModulesMsg,
+) {
+    host.submit_at(
+        host::BlockContext {
+            height,
+            consensus_time: height,
+            origin,
+        },
+        sdk::Msg {
+            target: "modules".into(),
+            payload: modules::encode_msg(&op),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn ready(host: &mut host::Host, height: u64, member: &[u8], id: &str, hash: [u8; 32]) {
+    registry_op(
+        host,
+        height,
+        sdk::Origin::External(member.to_vec()),
+        modules::ModulesMsg::SwapReady {
+            name: format!("deploy-{id}"),
+            module_id: id.into(),
+            code_hash: hash.to_vec(),
+        },
+    )
+    .await;
+}
+
+async fn schedule_swap(host: &mut host::Host, height: u64, id: &str, hash: [u8; 32], at: u64) {
+    registry_op(
+        host,
+        height,
+        sdk::Origin::System,
+        modules::ModulesMsg::ScheduleSwap {
+            name: format!("deploy-{id}"),
+            module_id: id.into(),
+            activation_height: at,
+            code_hash: hash.to_vec(),
+        },
+    )
+    .await;
+}
+
+/// Both registries are actual Wasm. A live admission carries its mapper, an
+/// update can remove that mapper, and the registry can replace ITSELF. Reopen
+/// uses authenticated deployment hashes, including the registry's new code.
+#[test]
+fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
+    use commonware_cryptography::Signer as _;
+    use module_artifact::ModuleArtifact;
+    use sdk::Origin;
+    run(|context, dir| {
+        Box::pin(async move {
+            let member = commonware_cryptography::ed25519::PrivateKey::from_seed(1)
+                .public_key()
+                .as_ref()
+                .to_vec();
+            let mut source = ArtifactSource(Default::default());
+            let mut codes = std::collections::BTreeMap::new();
+            for id in ["modules", "valset"] {
+                let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
+                codes.insert(id.to_string(), source.add(ModuleArtifact::component(bytes)));
+            }
+            let pages = std::fs::read(fixtures().join("pages.component.wasm")).unwrap();
+            let mapper = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../modules/apps/pages/index.wasm"),
+            )
+            .unwrap();
+            let indexed = source.add(ModuleArtifact {
+                component: pages.clone(),
+                index: Some(mapper),
+            });
+            let bare = source.add(ModuleArtifact::component(pages));
+            assert_ne!(indexed, bare, "mapper removal is a different deployment");
+            let mut replacement = std::fs::read(fixtures().join("modules.component.wasm")).unwrap();
+            // A valid custom section changes the deployment identity while keeping
+            // the registry ABI and storage layout, so the replacement can reopen it.
+            replacement.extend_from_slice(&[0, 6, 5, b'p', b'r', b'o', b'o', b'f']);
+            let registry_replacement = source.add(ModuleArtifact::component(replacement));
+            assert_ne!(registry_replacement, codes["modules"]);
+
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let mut host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: std::slice::from_ref(&member),
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+            host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &BINDINGS)));
+            let initial_root = host.root_hash();
+            for (fixture, reason) in [("hello", "backing"), ("identity", "configuration")] {
+                let bytes =
+                    std::fs::read(fixtures().join(format!("{fixture}.component.wasm"))).unwrap();
+                let deployment = ModuleArtifact::component(bytes).encode();
+                let error = host
+                    .check_module_replacement("valset", &deployment)
+                    .unwrap_err();
+                assert!(error.to_string().contains(reason), "{error}");
+                assert_eq!(
+                    host.root_hash(),
+                    initial_root,
+                    "a preflight changes no running module"
+                );
+            }
+            host.check_module_replacement("valset", &source.0[&codes["valset"].to_vec()])
+                .unwrap();
+            assert_eq!(host.root_hash(), initial_root);
+
+            let index =
+                indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
+            noded::converge_host_modules(&index, &host).unwrap();
+            noded::compose::validate_deployment("pages", &source.0[&indexed.to_vec()], &index)
+                .unwrap();
+            let mut invalid_mapper = ModuleArtifact::decode(&source.0[&indexed.to_vec()]).unwrap();
+            invalid_mapper.index = Some(b"not wasm".to_vec());
+            assert!(
+                noded::compose::validate_deployment("pages", &invalid_mapper.encode(), &index)
+                    .is_err()
+            );
+
+            registry_op(
+                &mut host,
+                1,
+                Origin::System,
+                modules::ModulesMsg::ScheduleRegister {
+                    name: "deploy-pages".into(),
+                    module_id: "pages".into(),
+                    activation_height: 10,
+                    code_hash: indexed.to_vec(),
+                },
+            )
+            .await;
+            ready(&mut host, 2, &member, "pages", indexed).await;
+            host.realize_module_swaps(9, &source).await.unwrap();
+            assert!(host.module_root("pages").is_none());
+            assert!(!index.module_ids().iter().any(|id| id == "pages"));
+            host.realize_module_swaps(10, &source).await.unwrap();
+            registry_op(&mut host, 10, Origin::System, modules::ModulesMsg::Advance).await;
+            noded::converge_host_modules(&index, &host).unwrap();
+            assert_eq!(host.module_code_hash("pages").unwrap(), indexed);
+            let out = host
+                .submit_at(
+                    host::BlockContext {
+                        height: 11,
+                        consensus_time: 11,
+                        origin: Origin::External(member.clone()),
+                    },
+                    sdk::Msg {
+                        target: "pages".into(),
+                        payload: br#"{"create_page":{"page_id":"first","title":"First"}}"#.to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            noded::projection::apply_block_to_index(&index, 11, 11, None, &out.dispatches, &host);
+            index.wait_folds_drained().unwrap();
+            let query = br#"{"list_pages":{}}"#;
+            let view: serde_json::Value =
+                serde_json::from_slice(&index.view("pages", query).unwrap()).unwrap();
+            assert_eq!(
+                view["pages"]["pages"].as_array().unwrap().len(),
+                1,
+                "{view}"
+            );
+            assert!(
+                !index
+                    .scan("pages", b"page/", None, 10)
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            let state = host.module_root("pages").unwrap();
+            schedule_swap(&mut host, 12, "pages", bare, 20).await;
+            ready(&mut host, 13, &member, "pages", bare).await;
+            host.realize_module_swaps(19, &source).await.unwrap();
+            noded::converge_host_modules(&index, &host).unwrap();
+            assert!(index.view("pages", query).is_ok());
+            let before = host.root_hash();
+            host.realize_module_swaps(20, &source).await.unwrap();
+            assert_eq!(
+                host.module_root("pages").unwrap(),
+                state,
+                "code replacement preserves state"
+            );
+            assert_ne!(
+                host.root_hash(),
+                before,
+                "global root authenticates the deployment"
+            );
+            registry_op(&mut host, 20, Origin::System, modules::ModulesMsg::Advance).await;
+            noded::converge_host_modules(&index, &host).unwrap();
+            assert!(matches!(
+                index.view("pages", query),
+                Err(indexer::Error::ViewUnsupported)
+            ));
+            assert!(
+                index
+                    .scan("pages", b"page/", None, 10)
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert!(
+                !index
+                    .scan("pages", indexer::OP_PREFIX.as_bytes(), None, 10)
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+
+            schedule_swap(&mut host, 21, "modules", registry_replacement, 30).await;
+            ready(&mut host, 22, &member, "modules", registry_replacement).await;
+            host.realize_module_swaps(30, &source).await.unwrap();
+            registry_op(&mut host, 30, Origin::System, modules::ModulesMsg::Advance).await;
+            assert_eq!(
+                host.module_code_hash("modules").unwrap(),
+                registry_replacement
+            );
+            let status = host.module_status().await.unwrap().unwrap();
+            assert_eq!(
+                status
+                    .iter()
+                    .find(|m| m.module_id == "modules")
+                    .unwrap()
+                    .active_code_hash,
+                registry_replacement
+            );
+            codes.insert("modules".into(), registry_replacement);
+            codes.insert("pages".into(), bare);
+            let root = host.root_hash();
+            drop(host);
+            let mut snapshots =
+                |_: &str, _: Backing| -> SnapshotFut<'_> { Box::pin(async { Ok(None) }) };
+            let reopened = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Reopen {
+                    height: 30,
+                    codes: &codes,
+                    snapshots: &mut snapshots,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.root_hash(), root);
+            assert_eq!(
+                reopened.module_code_hash("modules").unwrap(),
+                registry_replacement
+            );
+            noded::converge_host_modules(&index, &reopened).unwrap();
+            assert!(matches!(
+                index.view("pages", query),
+                Err(indexer::Error::ViewUnsupported)
+            ));
         })
     });
 }

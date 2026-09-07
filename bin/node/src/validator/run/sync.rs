@@ -100,6 +100,24 @@ impl ValidatorRuntime<'_> {
                         .map(|fc| fc.cert.clone()),
                     generation,
                     mesh_window,
+                    // the replay guard a joiner inherits, cut at the boundary
+                    // it will seat on: an entry above that height names a
+                    // batch the joiner has not reached and must still apply.
+                    applied_frames: match node.finalized() {
+                        Some(f) => node
+                            .replay_window()
+                            .into_iter()
+                            .filter(|(height, _)| *height <= f.height)
+                            .collect(),
+                        None => Vec::new(),
+                    },
+                    // this orchestrator's own armed cutover, if any — a seat
+                    // built from this boundary resumes with the SAME ceiling
+                    // instead of observing the already-changed valset itself
+                    // and arming a later one (#1821).
+                    pending_cutover_view: orchestrator
+                        .pending_cutover()
+                        .map(|cutover| cutover.cutover_view()),
                 };
                 let finalized_for_sync = node
                     .finalized()
@@ -161,11 +179,30 @@ impl ValidatorRuntime<'_> {
                 up_to_height,
                 reply,
             } => {
-                let read = node
-                    .sink_mut()
-                    .read_finalized_frames(after_height, up_to_height)
-                    .await;
-                let _ = reply.send(read);
+                // the decode is a bounded seek-and-read since #1814, but it
+                // is still real journal I/O — spawned onto its own task so a
+                // slow disk stalls a joiner's reply, never this loop's next
+                // `select_biased!` arm (drain, `/v1/query`, ...). the handle
+                // is self-contained (its own `Arc`'d journal and a snapshot
+                // of the height index), so nothing here holds `node` past
+                // this match arm.
+                match node.sink_mut().frame_reader() {
+                    Ok(reader) => {
+                        tokio::spawn(async move {
+                            let read = reader
+                                .read_finalized_frames(
+                                    after_height,
+                                    up_to_height,
+                                    statesync::FRAME_BATCH_LEN,
+                                )
+                                .await;
+                            let _ = reply.send(read);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             SyncStateRequest::IndexOps {
                 module,
@@ -226,7 +263,7 @@ impl ValidatorRuntime<'_> {
                 // own state — the same read point `read_valset_residents` uses
                 // elsewhere, between drains, no deadlock.
                 let host = node.host();
-                let members = read_valset_members(host).await;
+                let members = read_valset_members(host).await.unwrap_or_default();
                 let residents = read_valset_residents(host).await;
                 let standing = members
                     .iter()

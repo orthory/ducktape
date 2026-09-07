@@ -26,7 +26,10 @@
 use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
-use crate::{JobStatus, JobsMsg, TaskMsg, TaskStatus, WorkMsg, decode_work_msg};
+use crate::{
+    ATTEMPTS_EXHAUSTED_RESULT, JobStatus, JobsMsg, MAX_ATTEMPTS, TaskMsg, TaskStatus, WorkMsg,
+    decode_work_msg,
+};
 
 /// default page size for by-status listing (the cap is the scan clamp).
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -236,7 +239,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
 fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, Fail> {
     let mut out = Writes::new();
     match msg {
-        TaskMsg::CreateTask { task_id, title } => put_row(
+        TaskMsg::CreateTask {
+            task_id,
+            title,
+            owner: _,
+        } => put_row(
             &mut out,
             &TaskRow {
                 task_id,
@@ -261,6 +268,15 @@ fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, 
             row.updated_at = op.time;
             put_row(&mut out, &row)?;
         }
+        TaskMsg::DeleteTask { task_id } => {
+            // absent row == the task predates this index; nothing to remove.
+            let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
+                return Ok(out);
+            };
+            let row = decode_row(&bytes)?;
+            index_guest::delete(&mut out, by_status_key(&row.status, &task_id));
+            index_guest::delete(&mut out, task_key(&task_id));
+        }
     }
     Ok(out)
 }
@@ -272,8 +288,7 @@ fn decode_job_row(bytes: &[u8]) -> Result<JobRow, Fail> {
 /// stage the two entries one job row materializes to — point lookup +
 /// status partition.
 fn put_job_row(out: &mut Writes, row: &JobRow) -> Result<(), Fail> {
-    let bytes =
-        serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+    let bytes = serde_json::to_vec(row).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
     index_guest::put(out, job_key(&row.job_id), bytes.clone());
     index_guest::put(out, job_by_status_key(&row.status, &row.job_id), bytes);
     Ok(())
@@ -379,15 +394,41 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             };
             row.result = Some(JobResultRow { ok, payload });
             row.claim = None;
-            let to = if ok { JobStatus::Done } else { JobStatus::Failed };
+            let to = if ok {
+                JobStatus::Done
+            } else {
+                JobStatus::Failed
+            };
             transition_job(read, &mut out, row, to, op)?;
         }
-        JobsMsg::Release { job_id } | JobsMsg::Reclaim { job_id } => {
+        JobsMsg::Release { job_id } => {
             let Some(mut row) = load(&job_id)? else {
                 return Ok(out);
             };
             row.claim = None;
             transition_job(read, &mut out, row, JobStatus::Pending, op)?;
+        }
+        JobsMsg::Reclaim { job_id } => {
+            let Some(mut row) = load(&job_id)? else {
+                return Ok(out);
+            };
+            // an applied reclaim has TWO outcomes in the board, and the fold
+            // mirrors the board's own decision over the SAME constant: below
+            // MAX_ATTEMPTS the job requeues; at it the board gives up, fails
+            // the job with `ATTEMPTS_EXHAUSTED_RESULT`, and keeps the claim
+            // for the record. folding both as Pending would list a
+            // permanently failed job as claimable forever.
+            let attempts_exhausted = row.attempt >= MAX_ATTEMPTS;
+            if attempts_exhausted {
+                row.result = Some(JobResultRow {
+                    ok: false,
+                    payload: ATTEMPTS_EXHAUSTED_RESULT.to_string(),
+                });
+                transition_job(read, &mut out, row, JobStatus::Failed, op)?;
+            } else {
+                row.claim = None;
+                transition_job(read, &mut out, row, JobStatus::Pending, op)?;
+            }
         }
         JobsMsg::Cancel { job_id } => {
             let Some(row) = load(&job_id)? else {
@@ -456,7 +497,9 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             let page = read.scan_page(
                 prefix.as_bytes(),
                 after.as_deref().map(str::as_bytes),
-                limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_JOB_LIST_LIMIT),
+                limit
+                    .unwrap_or(DEFAULT_LIST_LIMIT)
+                    .clamp(1, MAX_JOB_LIST_LIMIT),
             );
             let mut jobs = Vec::with_capacity(page.entries.len());
             for (_key, value) in &page.entries {
@@ -522,6 +565,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship the indexer".into(),
+                owner: None,
             },
         );
         fold(
@@ -530,6 +574,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t2".into(),
                 title: "write the spec".into(),
+                owner: None,
             },
         );
 
@@ -578,6 +623,7 @@ mod tests {
                 &TaskMsg::CreateTask {
                     task_id: format!("t{i}"),
                     title: format!("task {i}"),
+                    owner: None,
                 },
             );
         }
@@ -625,8 +671,7 @@ mod tests {
     }
 
     fn fold_job_msg(map: &mut BTreeMap<Vec<u8>, Vec<u8>>, height: u64, msg: &JobsMsg) {
-        let writes =
-            fold_op(&job_op(height, OriginTag::module("runs"), msg), map).expect("fold");
+        let writes = fold_op(&job_op(height, OriginTag::module("runs"), msg), map).expect("fold");
         apply_to_map(map, writes);
     }
 
@@ -692,10 +737,7 @@ mod tests {
         assert_eq!((counted.pending, counted.processing), (1, 1));
         let processing = jobs(&map, serde_json::json!({"jobs": {"status": "processing"}}));
         assert_eq!(processing[0].attempt, 1);
-        assert_eq!(
-            processing[0].claim.as_ref().map(|c| c.lease_views),
-            Some(8)
-        );
+        assert_eq!(processing[0].claim.as_ref().map(|c| c.lease_views), Some(8));
 
         fold_job_msg(
             &mut map,
@@ -712,7 +754,13 @@ mod tests {
         assert!(done[0].claim.is_none(), "a finalized job sheds its claim");
         assert_eq!(done[0].result.as_ref().map(|r| r.ok), Some(true));
 
-        fold_job_msg(&mut map, 5, &JobsMsg::Prune { job_id: "j1".into() });
+        fold_job_msg(
+            &mut map,
+            5,
+            &JobsMsg::Prune {
+                job_id: "j1".into(),
+            },
+        );
         assert_eq!(counts(&map).done, 0);
         assert!(jobs(&map, serde_json::json!({"jobs": {}})).len() == 1);
 
@@ -725,7 +773,13 @@ mod tests {
                 lease_views: 4,
             },
         );
-        fold_job_msg(&mut map, 7, &JobsMsg::Release { job_id: "j2".into() });
+        fold_job_msg(
+            &mut map,
+            7,
+            &JobsMsg::Release {
+                job_id: "j2".into(),
+            },
+        );
         let counted = counts(&map);
         assert_eq!((counted.pending, counted.processing), (1, 0));
         let all = jobs(&map, serde_json::json!({"jobs": {}}));
@@ -792,6 +846,90 @@ mod tests {
         };
         assert!(jobs.is_empty(), "job-000 is build/, filtered from the page");
         assert!(has_more, "the cursor keeps going past the filtered page");
+    }
+
+    /// the board requeues an expired reclaim until MAX_ATTEMPTS and FAILS the
+    /// job on the one after that; the fold has to make the same call, or the
+    /// dead job stays listed under pending and the census over-counts forever.
+    #[test]
+    fn reclaim_requeues_until_attempts_are_exhausted_then_fails() {
+        let mut map = BTreeMap::new();
+        fold_job_msg(
+            &mut map,
+            1,
+            &JobsMsg::Submit {
+                job_id: "j1".into(),
+                kind: "build/wasm".into(),
+                spec: "{}".into(),
+            },
+        );
+
+        // the reclaim guard reads the attempt count a CLAIM bumped, so the
+        // first MAX_ATTEMPTS - 1 rounds requeue and the MAX_ATTEMPTS'th fails.
+        for round in 0..MAX_ATTEMPTS - 1 {
+            fold_job_msg(
+                &mut map,
+                2 + round * 2,
+                &JobsMsg::Claim {
+                    job_id: "j1".into(),
+                    lease_views: 10,
+                },
+            );
+            fold_job_msg(
+                &mut map,
+                3 + round * 2,
+                &JobsMsg::Reclaim {
+                    job_id: "j1".into(),
+                },
+            );
+            let pending = jobs(&map, serde_json::json!({"jobs": {"status": "pending"}}));
+            assert_eq!(pending.len(), 1, "requeued after reclaim {}", round + 1);
+            assert_eq!(pending[0].attempt, round + 1);
+            assert!(pending[0].claim.is_none(), "a requeue sheds its claim");
+        }
+        assert_eq!(counts(&map).pending, 1);
+
+        // the MAX_ATTEMPTS'th claim exhausts them, so its reclaim FAILS the job.
+        fold_job_msg(
+            &mut map,
+            100,
+            &JobsMsg::Claim {
+                job_id: "j1".into(),
+                lease_views: 10,
+            },
+        );
+        fold_job_msg(
+            &mut map,
+            101,
+            &JobsMsg::Reclaim {
+                job_id: "j1".into(),
+            },
+        );
+
+        let counted = counts(&map);
+        assert_eq!(
+            (counted.pending, counted.processing, counted.failed),
+            (0, 0, 1),
+            "the census moves to failed, not back to pending"
+        );
+        assert!(
+            jobs(&map, serde_json::json!({"jobs": {"status": "pending"}})).is_empty(),
+            "a dead job is never listed as claimable"
+        );
+        let failed = jobs(&map, serde_json::json!({"jobs": {"status": "failed"}}));
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].attempt, MAX_ATTEMPTS);
+        assert_eq!(
+            failed[0].result,
+            Some(JobResultRow {
+                ok: false,
+                payload: ATTEMPTS_EXHAUSTED_RESULT.to_string(),
+            })
+        );
+        assert!(
+            failed[0].claim.is_some(),
+            "the board keeps the claim on an exhausted job, for the record"
+        );
     }
 
     #[test]

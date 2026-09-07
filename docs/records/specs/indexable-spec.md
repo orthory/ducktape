@@ -44,7 +44,7 @@ The tier is two loops, coupled only through each module's database:
 
 - **the host writer** (`IndexStore::apply_block`, called by the node's block
   loop): writes one borsh `OpRow` per applied dispatch under
-  `op/{height:016x}/{seq:04x}` plus the watermark (`meta/height`), one atomic
+  `op/{height:016x}/{seq:08x}` plus the watermark (`meta/height`), one atomic
   batch per module per block. No domain logic; this is the whole host side.
 - **the fold** (the module's index guest): a fluent31 **changes-mode
   trigger** (`"fold"`) on the `op/` range delivers every committed op row to
@@ -88,8 +88,12 @@ warm boot free — a matching marker skips every wasm compile.
 
 Because the guest lives in the database's engine keyspace, no wipe this tier
 performs can touch it — `mark_backfilled`'s clear and `converge_guest`'s clear
-both sweep only user keys. Every node installs its own mapper from its bundled
-artifacts at open; nothing ships code over the wire.
+both sweep only user keys. Every node installs the mapper from the module's
+running deployment at open and activation. The component and optional mapper
+travel together through the blob plane under one deployment hash. A changed
+mapper refolds the retained feed; removing it clears its derived rows. Readers
+wait through the replacement, and a view's advisory watermark is read under
+the same deployment guard as its rows.
 
 ### 3.1 Authoring shape: decide pure, write thin
 
@@ -107,8 +111,8 @@ A mapper is two files in the module crate:
   decided writes, and exports the roles via `index_guest::fold!`/`view!`.
   The whole file is ~15 lines; `guest-builder --index` packages it into the
   committed `index.wasm` (`make wasm-modules` refreshes,
-  `wasm-modules-check` guards presence and `make wasm-index-check` guards the
-  bytes against a rebuild of the source).
+  `wasm-modules-check` guards presence and `make wasm-rebuild-check` guards
+  the bytes against a rebuild of the source).
 
 Within one op a read never sees that op's own writes (they apply after the
 decision); across ops in one feed batch it sees everything earlier — the
@@ -333,7 +337,7 @@ source floored no lower than this node ends the matter there.
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.
 So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
-`op/{height:016x}/{seq:04x}` is block-and-drain order: the changes-mode trigger
+`op/{height:016x}/{seq:08x}` is block-and-drain order: the changes-mode trigger
 folds every row correctly as it lands, and the fold tip advances monotonically
 to the last backfilled row. Doing this later — against a folding, serving node
 — would hand a guest history backwards, and is a defect rather than a slow path.
@@ -348,7 +352,7 @@ the lane trusts the serving node — accepted, because the read model is how a
 node renders at all, and the joiner already trusted this exact node enough to
 accept canonical state from it. What is still enforced, once, at the trust
 boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
-canonical `op/{height:016x}/{seq:04x}` rendering of its own position,
+canonical `op/{height:016x}/{seq:08x}` rendering of its own position,
 `(height, seq)` ascends strictly across the whole walk, every height is at or
 below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
 key, the source's watermark covers the requested boundary (a source that folded
@@ -359,7 +363,7 @@ being asked for).
 The key check is byte equality, not a successful parse, and the difference is
 load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
 width and a leading `+`: `op/2/0` parses to `(2, 0)` while sorting AFTER
-`op/0000000000000009/0000`. Such a key would satisfy every other check above
+`op/0000000000000009/00000000`. Such a key would satisfy every other check above
 and still break the one invariant this lane rests on — and the damage is
 durable and silent, because the next `converge_guest` refold replays `op/` in
 KEY order and would rebuild every derived view from history running backwards.

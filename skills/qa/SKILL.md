@@ -237,15 +237,24 @@ operator_token_mismatch` (right type, wrong secret). `DUCKTAPE_ADMIN=off`
 removes the routes entirely — 404. The token is still minted there, because it
 is no longer the admin namespace's alone (below).
 
-**The DATA plane wants a credential too.** Every MUTATING `/v1` route —
-`/v1/submit`, `/v1/invite`, the duckfs writes, `/v1/files/object/{path}`
-PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`, `/v1/log-filter` — takes
-EITHER a per-request user signature or that same operator credential, in the
-same `x-ducktape-admin-token` header. Reads stay open. So a QA `curl` that
-writes carries `-H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"`,
-and a `401 signature_missing` on a route that used to work means exactly that
-header is missing. The forge's `git-receive-pack` wants the same credential
-through git's `http.extraHeader`, or a `git push --signed` certificate.
+**The DATA plane wants a credential too, in two strengths.** Every MUTATING
+`/v1` route takes EITHER a per-request signature or that same operator
+credential, in the same `x-ducktape-admin-token` header. Reads stay open.
+
+- MODULE-BOUND — `/v1/submit`, the duckfs writes, `/v1/files/object/{path}`
+  PUT/DELETE, `POST /v1/fs/workspaces` and its commit — take ANY key's
+  signature: the key becomes the op's origin and the module authorizes it.
+- NODE-LEVEL — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`,
+  `DELETE /v1/fs/workspaces/{id}` — take the operator credential or a signature
+  by the node's own operator key (its active wallet key at boot). A signature by
+  any other key is `403 not_operator`.
+
+So a QA `curl` that writes carries
+`-H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"`, a `401
+signature_missing` on a route that used to work means exactly that header is
+missing, and a `403 not_operator` means the right shape with the wrong key. The
+forge's `git-receive-pack` wants the same credential through git's
+`http.extraHeader`, or a `git push --signed` certificate.
 
 Never paste either credential (or a token file's contents) into a report. For
 merged-worktree cleanup, dry-run

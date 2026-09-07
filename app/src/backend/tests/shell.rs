@@ -265,11 +265,37 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // `user:{hex}` — the previous fixture invented prefixed entries and
     // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
+    let my_passkey = [0xacu8; 32];
     let peer = [0xbbu8; 32];
+    // A seat taken with the person's passkey is the person's: the directory
+    // binds both keys to one account, and the roster recognises it.
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&me),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&my_passkey),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&peer),
+            BoundAccount {
+                number: 2,
+                name: "peer".into(),
+            },
+        ),
+    ]));
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
-                user: hex_encode(&me),
+                user: hex_encode(&my_passkey),
                 node: "0a0a".into(),
                 joined_at: 10,
             },
@@ -279,17 +305,52 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
                 joined_at: 20,
             },
         ],
-        Some(&me),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
     assert!(!roster[1].is_you && !roster[1].is_agent);
+    assert_eq!(roster[0].label, "me");
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
     // The fan-out the live session polls for is this roster's NODE keys with
     // our own row removed — the hub admits and fans out by node identity, and
     // a set that carried our own key would aim this device's media at itself.
-    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
+    assert_eq!(
+        huddle_recipient_nodes(roster, None),
+        vec!["0b0b".to_string()]
+    );
+}
+
+#[test]
+fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
+    // A `node_proof` only proves ITS OWN user holds that node's key — nothing
+    // stops a stale or replayed roster row from naming a DIFFERENT user
+    // alongside THIS node's key. `is_you` alone would miss it (that row is
+    // not "mine"), and fanning media to your own node is a loopback echo.
+    let me = [0xaau8; 32];
+    let peer = [0xbbu8; 32];
+    let names = NameDirectory::new(BTreeMap::new());
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                user: hex_encode(&me),
+                node: "0a0a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                user: hex_encode(&peer),
+                node: "0a0a".into(),
+                joined_at: 20,
+            },
+        ],
+        ChatReader::new(Some(&me), &names),
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("0a0a")),
+        Vec::<String>::new(),
+        "the peer row names this device's own node — never fan media there"
+    );
 }
 
 #[test]
@@ -593,25 +654,22 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             repo_menu,
         )
     };
-    let target = |tab: ShellTab,
-                  bell: bool,
-                  create: bool,
-                  thread_action: MessageAction,
-                  repo_menu: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            bell,
-            create,
-            thread_action,
-            MessageAction::Toolbar,
-            false,
-            false,
-            String::new(),
-            repo_menu,
-        )
-    };
+    let target =
+        |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction, repo_menu: bool| {
+            escape_target(
+                escape.clone(),
+                tab,
+                false,
+                bell,
+                create,
+                thread_action,
+                MessageAction::Toolbar,
+                false,
+                false,
+                String::new(),
+                repo_menu,
+            )
+        };
 
     // A stale chat menu names no layer from another tab — for BOTH readers.
     let stale_thread_menu = |tab: ShellTab| {
@@ -673,7 +731,13 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
     assert_eq!(
-        target(ShellTab::Governance, true, false, MessageAction::Toolbar, false),
+        target(
+            ShellTab::Governance,
+            true,
+            false,
+            MessageAction::Toolbar,
+            false
+        ),
         "bell"
     );
     assert_eq!(
@@ -856,6 +920,7 @@ fn workspace_facts_come_from_the_crate_that_wrote_them() {
         bootstrap: vec![],
         reach: vec![],
         coordination: None,
+        block_time_ms: workspace_config::DEFAULT_BLOCK_TIME_MS,
         modules: vec![],
         genesis: String::new(),
     }
@@ -882,7 +947,6 @@ wireguard_advertised = "auto"
 primary_coordinator = "none"
 coordinator_relay = "none"
 checkpoint_blocks = 32
-block_time_ms = 1000
 "#,
     )
     .unwrap();

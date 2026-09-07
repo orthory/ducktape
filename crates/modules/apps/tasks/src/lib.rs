@@ -19,6 +19,7 @@
 //! | `t#` | the task-id enumeration index (a json `BTreeSet<String>`) |
 //! | `j/{job_id}` | one [`Job`] record (json) |
 //! | `j#` | the live job count (u64 LE) -- what [`MAX_JOBS`] is checked against |
+//! | `j@{submitter}` | that submitter's live job count (u64 LE) -- what [`MAX_LIVE_JOBS_PER_SUBMITTER`] is checked against |
 //! | `w#` | the registered worker set (a json `BTreeSet<ModuleId>`) |
 //!
 //! the store hashes each logical key (`sdk::store_key`) and cannot enumerate,
@@ -47,10 +48,11 @@ mod task_board;
 // re-export both boards' public caps so external callers keep referring to
 // `tasks::MAX_PAYLOAD` / `tasks::MAX_TASK_ID`.
 pub use job_board::{
-    MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_PAYLOAD, MAX_SPEC,
-    MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
+    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS,
+    MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD, MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS,
+    MIN_LEASE_VIEWS,
 };
-pub use task_board::{MAX_LIST_LIMIT, MAX_TASK_ID, MAX_TASKS};
+pub use task_board::{MAX_LIST_LIMIT, MAX_OPEN_TASKS_PER_OWNER, MAX_TASK_ID, MAX_TASKS};
 
 // the derived-tier materialized view over the task board: the PURE decision
 // core (fold + view over index_guest::StateRead), compiled everywhere and
@@ -65,8 +67,8 @@ pub mod index;
 mod index_guest;
 
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
-    StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
 };
 
 /// write-time cap on ONE stored record. the concrete store's codec bounds a
@@ -134,6 +136,20 @@ pub(crate) fn stage_record(
     Ok(())
 }
 
+/// derive the acting identity from the dispatch origin -- the ONLY authorship
+/// path, shared by both boards. an empty external origin (the pre-consensus
+/// `Origin::External(vec![])` default) is not an authenticated actor and is
+/// rejected; the string form is the shared [`Origin::actor_string`]
+/// convention. a module origin is allowed and recorded as the module.
+pub(crate) fn actor_from_origin(origin: &Origin) -> Result<String, Error> {
+    if matches!(origin, Origin::External(bytes) if bytes.is_empty()) {
+        return Err(Error::Module(
+            "external origin must carry a non-empty submitter id".into(),
+        ));
+    }
+    Ok(origin.actor_string())
+}
+
 #[async_trait::async_trait(?Send)]
 impl Module for Tasks {
     fn id(&self) -> ModuleId {
@@ -163,8 +179,9 @@ impl Module for Tasks {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_work_msg(&msg.payload).map_err(Error::Module)? {
             WorkMsg::Task(task_msg) => {
-                let consensus_time = ctx.env().consensus_time;
-                task_board::execute(&mut self.staged, task_msg, consensus_time).await
+                let env = ctx.env();
+                let (origin, consensus_time) = (env.origin.clone(), env.consensus_time);
+                task_board::execute(&mut self.staged, &origin, task_msg, consensus_time).await
             }
             WorkMsg::Job(job_msg) => {
                 let id = self.id.clone();

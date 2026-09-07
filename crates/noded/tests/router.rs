@@ -79,6 +79,13 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
     });
 }
 
+/// the fake node's own consensus key — every real serve path carries one
+/// ([`bin/node`'s `operator_wallet_key`] wiring), so a test node modeling one
+/// must too: a keyless node now refuses to verify ANY signature at all
+/// ([`WriteRefusal::NodeUnidentified`]), which would make a signed-request
+/// test here indistinguishable from that refusal instead of exercising it.
+const NODE_KEY: [u8; 32] = [0x11; 32];
+
 /// a fake node that carries an operator credential, the way every real serve
 /// path does ([`AdminConfig::minted`]). The mutating routes admit EITHER a user
 /// signature or that credential, so a test node without one could not model a
@@ -87,6 +94,7 @@ fn local_node() -> (NodeHandle, mpsc::Receiver<NodeCommand>, noded::StreamHub) {
     let (handle, cmd_rx, events) = NodeHandle::channel();
     let handle = handle.with_admin(AdminConfig {
         operator_token: Some(OPERATOR.to_string()),
+        node_key: Some(NODE_KEY.to_vec()),
         ..Default::default()
     });
     (handle, cmd_rx, events)
@@ -115,14 +123,17 @@ fn caller() -> commonware_cryptography::ed25519::PrivateKey {
 
 /// one SIGNED mutating request, built the way every in-tree client builds one:
 /// through `noded::signed_req::request_headers`, never a hand-rolled trio.
-/// `local_node()` carries no node key, so the salt is empty here.
+/// salted against `local_node()`'s [`NODE_KEY`], the node these requests are
+/// always aimed at in this file.
 fn signed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
     let bytes = serde_json::to_vec(&body).unwrap();
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
-    for (name, value) in noded::signed_req::request_headers(&caller(), method, uri, &[], &bytes) {
+    for (name, value) in
+        noded::signed_req::request_headers(&caller(), method, uri, &NODE_KEY, &bytes)
+    {
         req = req.header(name, value);
     }
     req.body(Body::from(bytes)).unwrap()
@@ -207,6 +218,7 @@ async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
         ("POST", "/v1/files/stage"),
         ("POST", "/v1/files/commit"),
         ("POST", "/v1/files/pin"),
+        ("DELETE", "/v1/files/pin/keep"),
         ("POST", "/v1/files/watch"),
         ("PUT", "/v1/files/object/shared/a.txt"),
         ("DELETE", "/v1/files/object/shared/a.txt"),
@@ -284,35 +296,73 @@ async fn the_operator_credential_does_not_travel_off_box() {
     assert_eq!(body_json(response).await["reason"], "signature_missing");
 }
 
-/// a SIGNED submit acts as its key: the verified signer overrides the
-/// caller-supplied `origin`, which is only ever a claim (#1312).
+/// `/v1/submit` re-signs the framed op with the NODE's own consensus key
+/// (`bin/node`'s ingress/park), so any caller reaching it mints an op as the
+/// VALIDATOR — the gate must therefore take only the operator (#1808): a
+/// self-minted key is refused before the actor ever sees it, and only the
+/// operator's OWN signature (never a claim in the body) names the origin.
 #[tokio::test]
-async fn a_signed_submit_is_authored_by_the_signer_not_the_claim() {
-    let (handle, cmd_rx, _events) = local_node();
-    spawn_fake_actor(cmd_rx, None);
+async fn submit_refuses_a_self_minted_key_and_the_operators_signature_wins_over_the_claim() {
+    let operator_key = commonware_cryptography::ed25519::PrivateKey::from_seed(9009);
+    let node = || {
+        let (handle, cmd_rx, events) = NodeHandle::channel();
+        let handle = handle.with_admin(AdminConfig {
+            operator_token: Some(OPERATOR.to_string()),
+            owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            node_key: Some(NODE_KEY.to_vec()),
+            ..Default::default()
+        });
+        (handle, cmd_rx, events)
+    };
+    let submit_body = serde_json::json!({
+        "target": "chat",
+        "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
+        "origin": "somebody-else",
+    });
+    let sign_as = |signer: &commonware_cryptography::ed25519::PrivateKey,
+                   body: &serde_json::Value| {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/submit")
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in
+            noded::signed_req::request_headers(signer, "POST", "/v1/submit", &NODE_KEY, &bytes)
+        {
+            req = req.header(name, value);
+        }
+        req.body(Body::from(bytes)).unwrap()
+    };
 
+    // a key nobody knows, signed correctly: refused before the actor runs.
+    let (handle, cmd_rx, _events) = node();
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("a self-minted submit reached the node actor");
+        }
+    });
     let response = noded::router(handle)
-        .oneshot(signed(
-            "POST",
-            "/v1/submit",
-            serde_json::json!({
-                "target": "chat",
-                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
-                "origin": "somebody-else",
-            }),
-        ))
+        .oneshot(sign_as(&caller(), &submit_body))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["reason"], "not_operator");
 
+    // the operator's own key: admitted, and it names the origin — never the
+    // body's `origin` claim (#1312).
+    let (handle, cmd_rx, _events) = node();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(sign_as(&operator_key, &submit_body))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    // the fake actor echoes the stamped origin through `from_utf8_lossy`, so
-    // the comparison is made on the same terms: what landed is the acting key,
-    // not the string the body claimed.
     let stamped = body_json(response).await["root_hash"]
         .as_str()
         .expect("origin echo")
         .to_string();
-    let acting = String::from_utf8_lossy(caller().public_key().as_ref()).into_owned();
+    let acting = String::from_utf8_lossy(operator_key.public_key().as_ref()).into_owned();
     assert_eq!(stamped, acting);
 }
 
@@ -355,12 +405,25 @@ async fn an_unproven_push_is_refused() {
         .body(Body::from(unsigned_push_body()))
         .unwrap();
     let response = noded::router(handle).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // CONSUME-AND-REFUSE: the pack was received, so the answer is git's own
+    // report-status with the ref rejected — what git prints as
+    // `! [remote rejected] main -> main (<reason>)`. An HTTP error here is
+    // what git reports as "the remote end hung up unexpectedly", with the
+    // reason lost.
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let report = String::from_utf8_lossy(&bytes);
     assert!(
-        body_json(response).await["error"]
-            .as_str()
-            .is_some_and(|msg| msg.contains("git push --signed")),
-        "the refusal names the two proofs a push can carry"
+        report.contains("unpack ok"),
+        "a report-status answers the push: {report}"
+    );
+    assert!(
+        report.contains("ng refs/heads/main "),
+        "the ref is rejected, not the connection: {report}"
+    );
+    assert!(
+        report.contains("git push --signed"),
+        "the refusal names the two proofs a push can carry: {report}"
     );
 }
 
@@ -390,6 +453,136 @@ async fn an_operator_credentialed_push_is_admitted() {
         StatusCode::UNAUTHORIZED,
         "the operator credential is a proof this route accepts"
     );
+}
+
+/// THE NODE-LEVEL ROUTES, one per credential. `signed_write_guard` proves
+/// possession of a SELF-CHOSEN key, which is the right bar only where the key
+/// rides on to a module's `check_authority`. These four handlers read no acting
+/// identity at all — they mint a year-long mesh invite, retune the process's
+/// tracing filter, spawn a host pty, and `remove_dir_all` a managed checkout —
+/// so a fresh keypair must buy nothing on any of them.
+///
+/// The admitted half is the other half of the contract: the operator token and
+/// the node's configured operator key BOTH still work, which is what keeps
+/// `ducktape node log-filter` (the active wallet key) and the app's invite
+/// mint (the token) alive. A route that has nothing wired answers 503/400/204
+/// past the gate — the assertion is only that the gate did not stop it.
+#[tokio::test]
+async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() {
+    // the operator's own wallet key, as `bin/node`'s `operator_wallet_key`
+    // reads it out of this host's keystore at boot.
+    let operator_key = commonware_cryptography::ed25519::PrivateKey::from_seed(4242);
+    let node = || {
+        let (handle, cmd_rx, events) = NodeHandle::channel();
+        let handle = handle.with_admin(AdminConfig {
+            operator_token: Some(OPERATOR.to_string()),
+            owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            node_key: Some(NODE_KEY.to_vec()),
+            ..Default::default()
+        });
+        (handle, cmd_rx, events)
+    };
+    let sign_as = |signer: &commonware_cryptography::ed25519::PrivateKey,
+                   method: &str,
+                   uri: &str,
+                   bytes: Vec<u8>| {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in
+            noded::signed_req::request_headers(signer, method, uri, &NODE_KEY, &bytes)
+        {
+            req = req.header(name, value);
+        }
+        req.body(Body::from(bytes)).unwrap()
+    };
+
+    for (method, uri, body) in [
+        ("POST", "/v1/invite", r#"{"ttl_days":365}"#),
+        ("POST", "/v1/log-filter", "info"),
+        (
+            "POST",
+            "/v1/term/sessions",
+            r#"{"agent":"echo","mode":"single"}"#,
+        ),
+        ("POST", "/v1/term/sessions/abc/close", ""),
+        ("DELETE", "/v1/fs/workspaces/abc", ""),
+        (
+            "POST",
+            "/v1/huddle/node-proof",
+            r#"{"channel_id":"general","user":"aa"}"#,
+        ),
+    ] {
+        // a key nobody knows, signed correctly. the whole vector.
+        let (handle, _cmds, _events) = node();
+        let response = noded::router(handle)
+            .oneshot(sign_as(&caller(), method, uri, body.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must refuse a self-minted key"
+        );
+        assert_eq!(body_json(response).await["reason"], "not_operator");
+
+        // the operator's key, which the node was told about.
+        let (handle, _cmds, _events) = node();
+        let response = noded::router(handle)
+            .oneshot(sign_as(
+                &operator_key,
+                method,
+                uri,
+                body.as_bytes().to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status() != StatusCode::FORBIDDEN
+                && response.status() != StatusCode::UNAUTHORIZED,
+            "{method} {uri} must admit the operator key, got {}",
+            response.status()
+        );
+
+        // ...and the operator credential from a loopback peer.
+        let (handle, _cmds, _events) = node();
+        let request = with_operator(with_peer(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            "127.0.0.1:40000",
+        ));
+        let response = noded::router(handle).oneshot(request).await.unwrap();
+        assert!(
+            response.status() != StatusCode::FORBIDDEN
+                && response.status() != StatusCode::UNAUTHORIZED,
+            "{method} {uri} must admit the operator credential, got {}",
+            response.status()
+        );
+    }
+}
+
+/// the OTHER half of the split: a module-bound route still takes any acting
+/// key, because the key becomes the op's origin and the module decides. A node
+/// that tightened these too would break every duckfs client.
+#[tokio::test]
+async fn a_module_bound_route_still_admits_any_acting_key() {
+    let (handle, _cmds, _events) = local_node();
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/fs/workspaces",
+            serde_json::json!({ "prefix": "/shared/x" }),
+        ))
+        .await
+        .unwrap();
+    // no workspace root wired → 503, which is PAST the gate. the point is that
+    // an unknown key was not refused.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// a signature that does not bind THIS body is not a signature for THIS
@@ -684,6 +877,8 @@ async fn status_reports_root_hash_height_and_module_roots() {
         version: "9.9.9".into(),
         root_hash: "cd".repeat(32),
         height: 3,
+        consensus_time: 3,
+        consensus_time_unit: noded::ConsensusTimeUnit::Height,
         modules: vec![ModuleStatus {
             id: "chat".into(),
             root: "ef".repeat(32),
@@ -714,6 +909,8 @@ async fn status_reports_root_hash_height_and_module_roots() {
     assert_eq!(body["version"], "9.9.9");
     assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
+    assert_eq!(body["consensus_time"], 3);
+    assert_eq!(body["consensus_time_unit"], "height");
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
     // the catalog category rides on the wire as a lowercase string.
@@ -974,6 +1171,9 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
                 noded::NetstackSwapRequest::Component(_) => {
                     Err("foreign contract: ducktape:netstack@0.2.0".to_string())
                 }
+                // the governance reconciler's variant: node-internal, never
+                // decoded from a request body (asserted below).
+                noded::NetstackSwapRequest::Bytes(_) => Err("bytes are not a route".to_string()),
             }
         })
     });
@@ -1015,19 +1215,24 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
     );
 
     // a misspelled key must be a 400, never a request that silently swapped
-    // nothing.
-    let response = router
-        .oneshot(post(
-            "/v1/admin/netstack/swap",
-            serde_json::json!({ "backends": "native" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body_json(response).await["reason"],
-        "netstack_swap_body_invalid"
-    );
+    // nothing — and so must the node-internal bytes variant: this route reads
+    // a path on the node's own disk, and nothing off-box ships it component
+    // bytes.
+    for body in [
+        serde_json::json!({ "backends": "native" }),
+        serde_json::json!({ "backend": { "bytes": [0, 97, 115, 109] } }),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(post("/v1/admin/netstack/swap", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["reason"],
+            "netstack_swap_body_invalid"
+        );
+    }
 }
 
 /// THE regression this gate exists for: a LOOPBACK process with no operator
@@ -1137,7 +1342,9 @@ async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
     let (handle, cmd_rx) = operator_handle();
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
-        .oneshot(stage(vec![7u8; 3 * 1024 * 1024]))
+        .oneshot(stage(
+            module_artifact::ModuleArtifact::component(vec![7u8; 3 * 1024 * 1024]).encode(),
+        ))
         .await
         .unwrap();
     assert_eq!(

@@ -21,6 +21,7 @@ commonware-actor = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-resolver = { workspace = true }
 commonware-codec = { workspace = true }
+tracing = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
 # the enqueue signal (tokio::sync::Notify) and the propose-side event select —

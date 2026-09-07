@@ -16,7 +16,14 @@
 //! current validators UNION residents:
 //! a joined-but-not-promoted node provides real executors too, and its
 //! announce is what lets dispatch route work to it. without a valset (the
-//! single-node daemon) any external key may self-announce.
+//! single-node daemon) any external key may self-announce. the gate is not
+//! announce-time-only: [`Module::query_with`] re-checks standing on every
+//! `Providers` / `CapableProviders` read, so a node that leaves, is revoked,
+//! or drops out of the resident window stops being returned even though its
+//! stale record is still in the roster — nothing needs to delete the record
+//! for the node to stop being handed work. (liveness of a standing node —
+//! whether it is actually up — is a separate concern this module does not
+//! address.)
 //!
 //! an `Announce` may additionally carry `resources`: announced numeric
 //! capacity per open-set dimension ("cores" -> 8, "mem_gb" -> 32), riding the
@@ -225,6 +232,21 @@ impl CapabilityRegistry {
         self.entry(node)
             .await?
             .ok_or_else(|| Error::Module("missing node record".into()))
+    }
+
+    /// An empty roster has no standing to check. This also lets a network
+    /// without valset read its empty provider list while announcements stay gated.
+    async fn standing_nodes(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<Vec<Vec<u8>>, Error> {
+        let nodes = self.node_roster().await?;
+        let empty_roster = nodes.is_empty();
+        if empty_roster {
+            return Ok(nodes);
+        }
+        let standing = valset::members_and_residents(ctx, valset_id).await?;
+        Ok(nodes
+            .into_iter()
+            .filter(|node| standing.contains(node))
+            .collect())
     }
 
     /// the node roster — every announced node key, sorted. record and roster
@@ -456,9 +478,60 @@ impl Module for CapabilityRegistry {
         }
     }
 
+    /// read projection with access to host-routed reads of sibling modules:
+    /// the standing re-check the announce-time gate alone cannot provide.
+    /// `Providers` / `CapableProviders` are DISPATCH-CONSUMED (saga's
+    /// `assignment_pool` feeds them straight into `pick_assignee`), so a node
+    /// that announced while gated and later lost standing — left the valset,
+    /// was revoked, or a resident promotion window closed — must stop being
+    /// handed work even though its stale record is still in the roster.
+    /// gated once per query (not once per roster entry), then intersected
+    /// with the tag/resource filter every read already applies; an ungated
+    /// registry (no valset — the single-node daemon) falls through to
+    /// [`Module::query`] unchanged.
+    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let Some(valset_id) = self.valset_id.clone() else {
+            return self.query(req).await;
+        };
+        Ok(match decode_query(req).map_err(Error::Module)? {
+            CapabilityQuery::Providers { capability } => {
+                let mut providers = Vec::new();
+                for node in self.standing_nodes(ctx, &valset_id).await? {
+                    let has_capability =
+                        self.rostered_entry(&node).await?.tags.contains(&capability);
+                    if has_capability {
+                        providers.push(node);
+                    }
+                }
+                encode_reply(&CapabilityReply::Providers(providers))
+            }
+            CapabilityQuery::CapableProviders {
+                capability,
+                demands,
+            } => {
+                let mut providers = Vec::new();
+                for node in self.standing_nodes(ctx, &valset_id).await? {
+                    let entry = self.rostered_entry(&node).await?;
+                    let covers = demands
+                        .iter()
+                        .all(|(k, v)| entry.resources.get(k).is_some_and(|have| have >= v));
+                    if entry.tags.contains(&capability) && covers {
+                        providers.push(node);
+                    }
+                }
+                encode_reply(&CapabilityReply::Providers(providers))
+            }
+            _ => return self.query(req).await,
+        })
+    }
+
     /// read projection — committed plus this block's staged changes (the
     /// staged-over-committed store view). the provider scans walk the roster
-    /// by derived key (≤ [`MAX_ANNOUNCED_NODES`] point reads).
+    /// by derived key (≤ [`MAX_ANNOUNCED_NODES`] point reads). standing is not
+    /// re-checked here — see [`Self::query_with`], the ctx-routed lane every
+    /// real caller (saga's `assignment_pool` included) goes through; this
+    /// stays the ungated (no-valset) fallback plus a plain point-read path
+    /// for the same-crate tests.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         Ok(match decode_query(req).map_err(Error::Module)? {
             CapabilityQuery::Providers { capability } => {
@@ -647,6 +720,41 @@ mod tests {
             other => panic!("expected Providers reply, got {other:?}"),
         }
     }
+    /// the ctx-routed read lane real callers (saga's `assignment_pool`) go
+    /// through — the standing re-check lives in [`CapabilityRegistry::
+    /// query_with`], never in [`CapabilityRegistry::query`] alone.
+    fn providers_with(c: &CapabilityRegistry, ctx: &TestCtx, capability: &str) -> Vec<Vec<u8>> {
+        let reply = futures::executor::block_on(c.query_with(
+            ctx,
+            &encode_query(&CapabilityQuery::Providers {
+                capability: capability.into(),
+            }),
+        ))
+        .unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::Providers(p) => p,
+            other => panic!("expected Providers reply, got {other:?}"),
+        }
+    }
+    fn capable_providers_with(
+        c: &CapabilityRegistry,
+        ctx: &TestCtx,
+        capability: &str,
+        demands: &[(&str, u64)],
+    ) -> Vec<Vec<u8>> {
+        let reply = futures::executor::block_on(c.query_with(
+            ctx,
+            &encode_query(&CapabilityQuery::CapableProviders {
+                capability: capability.into(),
+                demands: demands.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            }),
+        ))
+        .unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            CapabilityReply::Providers(p) => p,
+            other => panic!("expected Providers reply, got {other:?}"),
+        }
+    }
     /// an ungated registry (no valset) over a MemStore double — most tests
     /// exercise state mechanics, not the member gate (the qmdb continuity
     /// proof lives in `tests/sync_round_trip.rs`).
@@ -807,6 +915,61 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_roster_answers_without_valset_but_cannot_announce() {
+        let mut registry = CapabilityRegistry::new(
+            "capability",
+            Box::new(MemStore::new()),
+            Some("valset".into()),
+        );
+        let mut ctx = ctx_external(&[7; 32]);
+        assert!(providers_with(&registry, &ctx, "codex").is_empty());
+        assert!(capable_providers_with(&registry, &ctx, "codex", &[]).is_empty());
+        assert!(
+            futures::executor::block_on(registry.execute(&mut ctx, &announce(&["codex"]))).is_err()
+        );
+    }
+
+    /// A node that loses standing is excluded from provider queries even if
+    /// its announcement remains stored. Nodes with standing still appear.
+    #[test]
+    fn providers_excludes_a_node_that_lost_standing_after_announcing() {
+        let mut c = CapabilityRegistry::new(
+            "capability",
+            Box::new(MemStore::new()),
+            Some("valset".into()),
+        );
+        let stripped = vec![10u8; 32];
+        let standing = vec![11u8; 32];
+
+        // both nodes announce while they hold standing.
+        let mut ctx = ctx_with_members(&stripped, vec![stripped.clone(), standing.clone()]);
+        futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
+        let mut ctx = ctx_with_members(&standing, vec![stripped.clone(), standing.clone()]);
+        futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+
+        // the roster still holds both records — nothing deleted `stripped`.
+        assert_eq!(
+            providers(&c, "codex"),
+            vec![stripped.clone(), standing.clone()]
+        );
+
+        // valset now reports only `standing` (revoke, leave, or a closed
+        // resident window all collapse to the same "no longer in the set").
+        let post_revoke = ctx_with_members(&stripped, vec![standing.clone()]);
+        assert_eq!(
+            providers_with(&c, &post_revoke, "codex"),
+            vec![standing.clone()],
+            "a stripped-standing node must not be returned"
+        );
+        assert_eq!(
+            capable_providers_with(&c, &post_revoke, "codex", &[]),
+            vec![standing],
+            "CapableProviders re-checks standing too"
+        );
+    }
+
+    #[test]
     fn malformed_tags_are_rejected() {
         let mut c = ungated();
         let me = vec![8u8; 32];
@@ -814,23 +977,19 @@ mod tests {
         let too_long = "x".repeat(MAX_TAG_LEN + 1);
         for bad in ["", too_long.as_str(), "UPPER", "spa ce", "uni∂ode"] {
             let mut ctx = ctx_external(&me);
-            let err = futures::executor::block_on(c.execute(&mut ctx, &announce(&[bad])))
-                .unwrap_err();
+            let err =
+                futures::executor::block_on(c.execute(&mut ctx, &announce(&[bad]))).unwrap_err();
             assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
         }
         // too many tags rejects too.
         let many: Vec<String> = (0..=MAX_CAPABILITIES).map(|i| format!("t{i}")).collect();
         let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let mut ctx = ctx_external(&me);
-        let err = futures::executor::block_on(c.execute(&mut ctx, &announce(&many_refs)))
-            .unwrap_err();
+        let err =
+            futures::executor::block_on(c.execute(&mut ctx, &announce(&many_refs))).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "got {err:?}");
         futures::executor::block_on(c.commit_block()).unwrap();
-        assert_eq!(
-            c.root(),
-            empty,
-            "rejected announcements staged nothing"
-        );
+        assert_eq!(c.root(), empty, "rejected announcements staged nothing");
     }
 
     #[test]

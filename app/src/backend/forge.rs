@@ -120,7 +120,7 @@ pub async fn load_forge_repo(
             generation,
             repo,
             branches,
-            items: forge::client::item_rows(&summaries),
+            items: forge::client::item_rows(&summaries, &names()),
         })
     }
     .await
@@ -166,7 +166,7 @@ pub async fn load_forge_item(
                 .ok()
                 .and_then(|reply| serde_json::from_value(reply["pr_diff"].clone()).ok()),
         };
-        let view = forge::client::item_view(&detail, diff.as_ref());
+        let view = forge::client::item_view(&detail, diff.as_ref(), &names());
         let branches = match view.source_branch.is_empty() {
             true => String::new(),
             false => format!("{} → {}", view.source_branch, view.target_branch),
@@ -222,9 +222,10 @@ pub async fn load_forge_discussion(
 ) -> Result<ForgeDiscussionData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
+        let names = names();
         let (message_page, members) = tokio::try_join!(
             load_messages(&rpc, &channel_id),
-            load_channel_members(&rpc, &channel_id)
+            load_channel_members(&rpc, &channel_id, &names)
         )?;
         Ok(ForgeDiscussionData {
             channel_id,
@@ -369,7 +370,12 @@ pub async fn merge_forge_pr(
             MergeBuild::Clean { merge_oid, pack } => (merge_oid, pack),
         };
         let client = rpc_client(&rpc)?;
-        let pack_digest = client.put_blob(pack).await?.to_lowercase();
+        // The pack lands in the blob store under the person's own signature,
+        // the same key the `MergePr` frame below is signed with.
+        let blobs = client
+            .clone()
+            .with_write_auth(data_plane_signer(&client, password.clone()).await?);
+        let pack_digest = blobs.put_blob(pack).await?.to_lowercase();
         signed_write(
             &client,
             "forge",

@@ -105,6 +105,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
         let valset = Valset::new(
             "valset",
             Box::new(QmdbStore::init(context.child("source_valset"), "valset").await),
+            "governance",
         );
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
@@ -328,9 +329,14 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             // --- snapshot lane: directory, saga, forge ------------------------
             let entry = manifest.entry("directory").unwrap();
             assert_eq!(entry.kind, PayloadKind::Snapshot);
-            let bytes = fetch_snapshot(&client, boundary, "directory")
-                .await
-                .expect("directory snapshot");
+            let bytes = fetch_snapshot(
+                &client,
+                boundary,
+                "directory",
+                statesync::MAX_SNAPSHOT_BYTES,
+            )
+            .await
+            .expect("directory snapshot");
             let mut join_directory = Directory::new("directory");
             join_directory
                 .install(&bytes, entry.root)
@@ -354,6 +360,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
                     .await
                     .expect("sync_from"),
                 ),
+                "governance",
             );
             assert_eq!(join_valset.root(), valset_root);
 
@@ -380,7 +387,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             assert_eq!(join_saga.root(), saga_root);
 
             let entry = manifest.entry("forge").unwrap();
-            let bytes = fetch_snapshot(&client, boundary, "forge")
+            let bytes = fetch_snapshot(&client, boundary, "forge", statesync::MAX_SNAPSHOT_BYTES)
                 .await
                 .expect("forge snapshot");
             let mut join_forge =

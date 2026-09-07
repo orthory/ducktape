@@ -12,7 +12,13 @@ fn main() -> iced::Result {
     // sockets and the node it hosts hit that as a bare EMFILE. raised AFTER
     // install_log so the outcome lands in app.log like everything else.
     match node::resource_limits::raise_open_file_limit() {
-        Ok(soft_limit) => tracing::info!(target: "ducktape::app", soft_limit, "open-file limit"),
+        Ok(limit) => tracing::info!(
+            target: "ducktape::app",
+            soft_limit = limit.soft,
+            hard_limit = limit.hard,
+            raised = limit.raised,
+            "open-file limit"
+        ),
         Err(err) => tracing::warn!(
             target: "ducktape::app",
             reason = "open_file_limit_unraised",

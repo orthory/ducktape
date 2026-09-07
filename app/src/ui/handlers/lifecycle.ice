@@ -30,6 +30,17 @@ on set_appearance_dark
 
 on appearance_saved(_written)
 
+// The banner preference, the same arrangement: pin the reading, persist it
+// last, and treat a failed write as costing the NEXT boot's default.
+on desktop_notifications_loaded(enabled)
+  desktop_notifications = enabled
+
+on set_desktop_notifications(enabled)
+  desktop_notifications = enabled
+  run replace lane=notify_save save_desktop_notifications(enabled) -> desktop_notifications_saved _
+
+on desktop_notifications_saved(_written)
+
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
 // that lived here collapsed to identity calls and is gone. Typed drafts
@@ -61,6 +72,8 @@ on reconnect
   dm_rows = []
   messages = []
   has_older_history = false
+  // A reconnect mounts a fresh timeline at its tail — see `state/chat.ice`.
+  chat_at_tail = true
   // The history lane was invalidated above, so its old socket and button state
   // end together even when that socket would never have answered.
   history_loading = false
@@ -154,12 +167,14 @@ on workspace_connected(next)
   return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
-  network_name = network_label(account_name, connected_rpc)
+  network_name = network_label(network_chain_id, connected_rpc)
   status = next.status
   block_height = next.height
   channels = next.channels
+  // The chain this list was learned from — see `live_resynced`.
+  chat_chain_id = network_chain_id
   channel_reads = initial_channel_reads(next.channels, channel_reads)
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
@@ -167,7 +182,12 @@ on workspace_connected(next)
   // `chat_hit_loaded`.
   history_view = false
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // THE SERVER'S `has_more`, ALONE. The `|| history_has_older(messages)` that
+  // used to ride here read "the oldest loaded root has seq > 1", and root
+  // sequences have holes (a thread reply consumes one without becoming a
+  // root), so it stood true at the real beginning of every busy channel and
+  // pinned "Load older messages" on forever.
+  has_older_history = next.has_older_history
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   // THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S by construction now:
@@ -176,7 +196,7 @@ on workspace_connected(next)
   // (ducktape-ui#697).
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -267,7 +287,7 @@ on live_updated(next)
         run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
         run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.chat
-      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
       channels = folded_chat.channels
       messages = folded_chat.messages
       has_older_history = folded_chat.has_older_history
@@ -340,6 +360,13 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
           try request -> done request
           done -> dm_peers_load_selected _
+        // An identity op moves the name directory, and every chat label on
+        // screen is rendered through it — so the chat plane is re-read the
+        // way a resync reads it, names first.
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
+          try request -> done request
+          done -> names_moved_selected _
         flow
           from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
           try request -> done request
@@ -360,6 +387,15 @@ on live_updated(next)
 on live_resynced(next)
   return if next.generation != hydration_generation
   hydration_retry_attempt = 0
+  // HAS THE NETWORK ITSELF MOVED UNDER THIS CONSOLE? A workspace switch keeps
+  // the endpoint (the node comes back on the same loopback port), so nothing
+  // reconnects: the websocket drops, resyncs, and every fold below only ever
+  // ADDS — which is how the previous workspace's `#general` went on standing in
+  // the sidebar of a network that has no such room, clickable, with nothing
+  // behind it. `network_chain_id` is the node's own pushed status document
+  // (`node_status_pushed`), so this costs no round trip; `chat_chain_id` is the
+  // chain the rows on screen were learned from.
+  let chain_left_behind = chain_moved(chat_chain_id, network_chain_id)
   // FOLD, DO NOT REPLACE — the same rule `chat_updated` states, for the same
   // reason. This read left the node several queries ago, and `channel_reads` is
   // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
@@ -368,13 +404,9 @@ on live_resynced(next)
   // message. `upsert_channel_rows` — which `keep_channels` runs BEHIND its
   // loaded pick, so a plane-only resync never pays for the fold — keeps
   // `head_seq` monotonic and keeps a row the answer does not carry at all: a
-  // channel created while it was in flight.
-  //
-  // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
-  // or an archive folded during the round trip is overwritten here. That one
-  // self-heals — the next chat-carrying resync re-reads the renamed row — where
-  // the badge did not, which is why only the cursor's invariant is enforced.
-  channels = keep_channels(next.chat_loaded, next.channels, channels)
+  // channel created while it was in flight. Across a chain there is no such
+  // race to protect and no such row to keep, and the answer replaces outright.
+  channels = keep_channels(next.chat_loaded, chain_left_behind, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
   // it is still the window's own answer. `load_chat_data` replies with the
@@ -388,12 +420,20 @@ on live_resynced(next)
   // a merge across a gap leaves a hole nothing can page in. It takes
   // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
   // resyncs are plane-only, and the merge is a full copy of the window.
-  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel)
+  messages = resynced_messages(next.chat_loaded, chain_left_behind, next.messages, messages, active_channel, next.active_channel)
+  // The rows on screen now belong to the chain this answer came from.
+  chat_chain_id = keep_str(next.chat_loaded && !empty(network_chain_id), network_chain_id, chat_chain_id)
   // A resync that replaced the window left the banner describing rows that are
   // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
   // the window and keeps the banner with it.
   history_view = history_view && !next.chat_loaded
-  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || history_has_older(messages), has_older_history)
+  // TWO SERVER ANSWERS, NEVER A LOCAL GUESS. This reply's `has_more` describes
+  // the floor of the CANONICAL TAIL PAGE, and `resynced_messages` above may have
+  // spliced that page onto older pages the reader had loaded — whose own floor
+  // the last `history_loaded` already answered for. So the two are OR'd, and the
+  // reader at the true beginning of a channel (both false) keeps her button
+  // down, which is the whole point of taking the index's word for it.
+  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || has_older_history, has_older_history)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
   // this is the one dropper that must ask. Conditional, not a flat clear: a
   // same-channel resync leaves a legitimate page in flight, and `history_loaded`
@@ -442,7 +482,7 @@ on live_resynced(next)
   // today's `active_channel`), so `chat_loaded` alone still blanks him.
   // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
   // window, and the landing it names re-derives the peer itself.
-  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, account_number, active_channel), active_dm_peer)
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, dm_peers, active_channel), active_dm_peer)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
@@ -477,7 +517,7 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
@@ -654,7 +694,6 @@ on select_shell_tab(next)
   // cannot repaint a screen the reader already left.
   shell_credentials_generation = shell_credentials_generation + 1
   shell_credentials_loading = connected && shell_tab == ShellTab.shell
-  has_older_history = history_has_older(messages)
   // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
   // `live_updated`'s tab gate: the cursor stood still while the pane was
   // unmounted, so this is where the room she is coming back to is caught up —
@@ -671,7 +710,7 @@ on select_shell_tab(next)
   unread_boundary = keep_i64(chat_tab_arrivals, channel_last_read(channel_reads, chat_tab_channel), unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
   // these surfaces is mounted under an arm of `match tab`. Left set, an armed
@@ -840,6 +879,13 @@ on dm_peers_load_selected(request)
   return if obsolete_request
   run replace lane=dm_peers_load load_dm_peers(request.rpc, request.generation) -> dm_peers_loaded _ | dm_peers_failed _
 
+on names_moved_selected(request)
+  let obsolete_request = request.rpc != connected_rpc || request.generation != hydration_generation
+  return if obsolete_request
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+
 on forge_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation
   let unmounted = shell_tab != ShellTab.forge
@@ -925,9 +971,31 @@ subscribe
   // whose target is not on screen is a no-op.
   keyboard press status=ignored -> content_scroll_key _
   window file-dropped -> fs_file_dropped _
-  // A daemon outlives its windows, so process exit is an explicit decision:
-  // when the LAST tracked window closes, leave.
+  // A daemon outlives its windows: a close just unregisters the slot (below).
+  // The process leaves only when someone says so — the tray's Quit, or ⌘Q.
   window closed with-id -> window_was_closed _
+  // ⌘Q AND ⌘W, WITHOUT TAXING EVERY KEYSTROKE. macOS binds both through an app
+  // menu this app does not have, so it reads them itself. A key-press
+  // subscription publishes a proxied message and an unconditional iced rebuild
+  // for EVERY key it sees (the cost the `status=ignored` note above is about),
+  // so an always-on route just to catch two chords would double what typing
+  // costs. The modifier stream is the cheap half — it fires only when a
+  // modifier goes down or up — so it arms the expensive half, and the press
+  // route exists only while ⌘ is actually held. It carries no `connected` term
+  // on purpose: both chords have to work on the launch window too.
+  keyboard modifiers -> modifier_state_changed _
+  keyboard press status=ignored when cmd_held -> command_chord_pressed _
+  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself AND by the tab it
+  // belongs to. A reader with nothing selected has no such route at all —
+  // which is why this is not an arm on the quit/close chord, whose route is
+  // armed by ⌘ alone and so runs on every screen. The tab term is the same
+  // rule applied twice: a range left standing in chat must not tax a keystroke
+  // typed in Pages, Forge or the console. `status=ignored` keeps a focused
+  // field's own copy.
+  keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
+  // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
+  // console, the last opened) would close a window nobody was looking at.
+  window focused with-id -> window_focused _
   run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
@@ -955,31 +1023,80 @@ subscribe
   // buffer has drifted from the last text known written.
   every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
 
-// The daemon's exit rule: closing a window unregisters it, and the process
-// leaves with the last one. The handoff paths (`console_opened`,
-// `onboarding_reopened`) close their predecessor AFTER the successor is
-// registered, so this never fires with a survivor still tracked.
-// The huddle window is deliberately NOT in the survivor guard: closing it is a
-// dock, not an exit, and a lone huddle window must never keep the daemon alive
-// after its console is gone.
+// CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
+// This unregisters the slot the closed window held; on a Mac the daemon goes
+// on in the status item with no window at all, the way a menu-bar app does,
+// and leaving is an explicit act — the tray's "Quit Ducktape" or ⌘Q
+// (`command_chord_pressed`) — never the side effect of a red button. Off macOS
+// there is no status item, so a window is the only handle on the process and
+// the last close leaves; `last_window_closed_exits` is the one place that
+// decides. The handoff paths (`console_opened`, `onboarding_reopened`) close
+// their predecessor after the successor is registered, so a handoff never
+// counts as the last close.
 on window_was_closed(id)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
-  return if (onboarding_win != none) || (console_win != none)
+  let leaving = last_window_closed_exits(console_win, onboarding_win)
+  return if !leaving
   exit
 
-// THE STATUS ITEM'S MENU. The daemon leaves with its last tracked window
-// (above), so one of the two is always there to raise; `window_target` on
-// the untracked slot names a fresh id, and focusing a window that does not
-// exist is a no-op.
+// THE STATUS ITEM'S MENU. Since a close no longer ends the process, "Open" has
+// to be able to OPEN: with both slots empty there is nothing to raise, and
+// `window_target` on an untracked slot names a fresh id whose focus is a no-op,
+// so a raise-only menu row would do nothing at all. One predicate, one branch.
 on tray_open
-  parallel
-    task window focus target=window_target(console_win)
-    task window focus target=window_target(onboarding_win)
+  let raising = tray_open_action(console_win, onboarding_win)
+  match raising
+    WindowSummon.open
+      task window open onboarding -> onboarding_opened _
+    WindowSummon.raise
+      parallel
+        task window focus target=window_target(console_win)
+        task window focus target=window_target(onboarding_win)
 
 on tray_quit
   exit
+
+// ⌘ IS HELD OR IT IS NOT. The whole of this state, set from the one event that
+// knows it — it exists to arm the key-press route above, and nothing reads it
+// for anything else.
+on modifier_state_changed(mods)
+  cmd_held = command_held(mods)
+  shift_held = shift_held(mods)
+
+// THE LAUNCH WINDOW'S OWN CHROME. It is undecorated (app.ice), so the rail at
+// the top of `HubColumn` carries what the OS strip used to: a press anywhere
+// along it hands the drag to the window server, and the × closes the window.
+// Closing is not quitting — `window_was_closed` only unregisters it, and the
+// status item is still there to open another.
+on drag_launch_window
+  task window drag
+
+on close_launch_window
+  task window close target=window_target(onboarding_win)
+
+// WHICH WINDOW HAS FOCUS. Read by ⌘W and nothing else.
+on window_focused(id)
+  focused_win = some(id)
+
+// THE COMMAND CHORDS, ON ONE DISPATCH. The classification is one pure extern
+// so ⌘Q and ⌘W are answered in a single place, and this branches once on what
+// it says. The route that delivers the press is armed by `cmd_held`, so an
+// ordinary keystroke never reaches here at all.
+on command_chord_pressed(event)
+  let chord = command_chord(event.key, event.physical_key, event.modifiers)
+  match chord
+    CommandChord.quit
+      exit
+    CommandChord.close_window
+      task window close target=window_target(focused_win)
+    // ⌘ plus any other key is not ours. The route is armed by the modifier
+    // alone, so this is the ORDINARY case — every ⌘C, ⌘V and ⌘A lands here —
+    // and the arm exists because the match is exhaustive on purpose: a chord
+    // added to the enum has to be routed before this file compiles again.
+    CommandChord.ignored
+      return if true
 
 // The rest of the menu is the console's: the bell, a tab, a key. With no
 // console there is nothing to show them in, so each returns rather than

@@ -79,7 +79,7 @@
 //! that built the sim boots with nothing installed.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/acl/governance/lifecycle
+//! separated, and repeatable) appends the kv/valset/acl/governance/modules
 //! system modules AFTER the default 15, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
@@ -137,8 +137,8 @@ use host::BlockOp;
 use host::worker;
 use indexer::IndexStore;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
-use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
-use noded::compose::{Bindings, Boot, Substrates, compose};
+use noded::bundle::{DirCodeSource, qmdb_stores};
+use noded::compose::{Admissions, Bindings, Boot, Substrates, compose};
 use noded::{
     BlockDisposition, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus, NodeCommand,
     NodeHandle, NodeStatus, ORACLE_ORIGIN, StreamHub, hex_bytes, hex_root,
@@ -168,8 +168,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
 /// plausible in the ui while staying identical across runs.
-const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
-const SIM_BLOCK_MS: u64 = 1_000;
+pub const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
+pub const SIM_BLOCK_MS: u64 = 1_000;
 
 /// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.
@@ -369,13 +369,21 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
         modules_dir,
         install_log,
     } = opts;
+    // opt-in wasmtime compilation cache for the sim/test lane only: the sim
+    // suite's 13-plus test binaries all compile the same genesis, so sharing
+    // a cache dir across them turns wall time way down. A real node binary
+    // never calls this hook, so no environment variable can turn the cache
+    // on in production.
+    if let Some(dir) = std::env::var_os("DUCKTAPE_WASM_CACHE_DIR") {
+        wasm_host::enable_compilation_cache(std::path::PathBuf::from(dir));
+    }
     // the founding set every wasm tenant (and every index guest) composes
     // from. the default is the set the build staged beside this executable —
     // the sim is a dev tool that must boot from a bare checkout, and a bare
     // checkout that built it has that set.
     let modules_dir = match modules_dir {
         Some(dir) => dir,
-        None => workspace_config::modules_dir()?,
+        None => workspace_config::sim_modules_dir()?,
     };
 
     // the status module list and the index tier both extend only under valset
@@ -405,10 +413,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // the sim runs the SAME wasm index guests as the real daemons, from the
     // same founding set its components came from.
     let index = noded::open_index_store(&storage, &module_ids)?;
-    noded::converge_index_guests(
-        &index,
-        &noded::IndexGuests::from_dir(&modules_dir, &module_ids)?,
-    )?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder
@@ -480,7 +484,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
                 valset_keys,
                 invite_binding,
                 public_key,
-                module_ids,
                 cmd_rx,
                 control_rx,
                 stream_hub,
@@ -756,9 +759,6 @@ struct Sim {
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
-    /// the registered module ids, in registry order — the exact set `status`
-    /// reports (topology `sim_base`, or that plus `sim_valset` under the flag).
-    module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
     public_key: String,
@@ -786,7 +786,6 @@ fn run_sim(
     valset_keys: Vec<Vec<u8>>,
     invite_binding: Vec<u8>,
     public_key: String,
-    module_ids: Vec<&'static str>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
     stream_hub: StreamHub,
@@ -806,7 +805,6 @@ fn run_sim(
         // registries seeded from the sim's bindings. governance composes as
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
-        let selection: &[&'static str] = &module_ids;
         let substrates = Substrates {
             forge_repo,
             duckfs_dir,
@@ -815,21 +813,22 @@ fn run_sim(
         let bindings = Bindings {
             invite: &invite_binding,
             chain_id: LOCAL_CHAIN_ID,
-            validators: &valset_keys,
-            code_hashes: &code_hashes,
         };
         let mut stores = qmdb_stores(&context);
-        let modules = compose(
-            selection,
+        let mut host = compose(
             &code,
             &mut stores,
             &substrates,
             &bindings,
-            Boot::Genesis,
+            Boot::Genesis {
+                validators: &valset_keys,
+                bundle: &code_hashes,
+            },
         )
         .await
         .expect("sim genesis composes");
-        let host = host_from(modules).expect("genesis");
+        host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
+        noded::converge_host_modules(&index, &host).expect("deployed index guests converge");
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -878,7 +877,6 @@ fn run_sim(
             blobs,
             index,
             stream_hub,
-            module_ids,
             public_key,
             handle,
             fatal,
@@ -1149,6 +1147,11 @@ impl Sim {
         // lane, so `project_block` fills it (where the old direct-host path left
         // it empty).
         for projection in noded::projection::project_block(&drained, system, &self.blobs) {
+            // a height that sealed nothing is not a block: never fold one (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let time = ConsensusTimePolicy::Epoch {
                 base_ms: SIM_EPOCH_MS,
                 block_ms: SIM_BLOCK_MS,
@@ -1160,6 +1163,7 @@ impl Sim {
                 time,
                 projection.record,
                 &projection.dispatches,
+                self.node.host(),
             );
             if let Some(root_hash) = projection.sealed_hash {
                 self.stream_hub.publish_block(
@@ -1333,22 +1337,24 @@ impl Sim {
 
     fn status(&self) -> NodeStatus {
         let host = self.node.host();
-        let modules = self
-            .module_ids
-            .iter()
-            .map(|id| ModuleStatus {
-                id: (*id).into(),
-                root: host
-                    .module_root(id)
-                    .map(|root| hex_root(&root))
-                    .unwrap_or_default(),
-                category: ModuleCategory::of(id),
+        // the host's live set, sorted by id: the genesis selection plus every
+        // module the registry admitted since.
+        let modules = host
+            .module_roots()
+            .into_iter()
+            .map(|(id, root)| ModuleStatus {
+                category: ModuleCategory::of(&id),
+                root: hex_root(&root),
+                id,
             })
             .collect();
+        let height = self.height();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
-            height: self.height(),
+            height,
+            consensus_time: self.node.stamp_consensus_time(height),
+            consensus_time_unit: self.node.consensus_time_policy().into(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
             // key as "no peer-routed features here" (no huddle voice). the

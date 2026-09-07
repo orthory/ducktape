@@ -204,6 +204,18 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.account_number = me.into();
+    // THE DIRECTORY IS WHAT SAYS A ROOM IS A DM — `load_dm_peers` stamps each
+    // row's `channel_id` from the account number IT resolved, and all three DM
+    // decisions read that one field. A fixture that only sets `account_number`
+    // is a console whose account load has not landed, which is exactly the state
+    // that used to scatter DMs into the room list.
+    app.dm_peers = vec![backend::DmPeer {
+        key: peer.into(),
+        name: "Peer".into(),
+        initials: "P".into(),
+        is_agent: false,
+        channel_id: dm.clone(),
+    }];
     app.active_dm_peer = peer.into();
     app.active_channel = dm.clone();
 
@@ -279,9 +291,10 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     );
     app.loading = false;
 
-    // a key in no account derives no DM id, so it holds no DM — the same
-    // answer `chat_sidebar_rooms` gives when `me` is empty
-    app.account_number = String::new();
+    // A DIRECTORY THAT RESOLVED NO ACCOUNT OF OURS carries no channel id, so it
+    // claims no room — the same answer `chat_sidebar_rooms` gives, from the same
+    // field, which is the point of there being only one derivation.
+    app.dm_peers[0].channel_id = String::new();
     app.active_dm_peer = peer.into();
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
         &dm,
@@ -1068,7 +1081,11 @@ fn unread_indicators_are_wired_client_local_only() {
         assert!(lifecycle.contains(gate), "{gate}");
     }
     let live = inlined(include_str!("../backend/live.rs"));
-    assert!(lifecycle.contains("history_view, shell_tab == ShellTab.chat, unread_boundary"));
+    assert!(
+        lifecycle.contains(
+            "history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary"
+        )
+    );
     assert!(live.contains("let reads_live_tail = !history_view && chat_visible"));
     assert!(live.contains("if reads_live_tail"));
 
@@ -1076,4 +1093,65 @@ fn unread_indicators_are_wired_client_local_only() {
     let backend_ice = inlined(include_str!("../ui/extern/backend.ice"));
     assert!(!backend_ice.contains("read_cursor"));
     assert!(!backend_ice.contains("mark_read(rpc"));
+}
+
+/// A DM RECORD IS A NETWORK-VISIBLE CHANNEL ROW, so a DM between two OTHER
+/// people arrives in this device's channel list like any room — and, being in
+/// no peer's `channel_id`, it used to fall through the directory exclusion and
+/// draw under CHANNELS with a `#` glyph and that person's name, right beside
+/// their real DIRECT row. It reads as "clicking a DM created a channel".
+///
+/// Mine belong in DIRECT and theirs belong nowhere on my screen, so no derived
+/// two-party id is ever a CHANNELS row. A channel a person deliberately NAMED
+/// `dm-standup` is not one of those and stays listed — the test pins the shape
+/// rule, not a `dm-` prefix.
+#[test]
+fn another_members_dm_is_not_a_channel_of_mine() {
+    let channel = |id: &str| backend::ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        archived: false,
+        members_only: false,
+        huddle_count: 0,
+        head_seq: 4,
+    };
+    // the live network's shape: me(1) ↔ orthory(2), me(1) ↔ orthory-ops(3),
+    // and orthory(2) ↔ orthory-ops(3) — the last one none of my business.
+    let mine = backend::dm_channel_id("1".into(), "2".into());
+    let also_mine = backend::dm_channel_id("1".into(), "3".into());
+    let theirs = backend::dm_channel_id("2".into(), "3".into());
+
+    let rooms = backend::chat_sidebar_rooms(
+        vec![
+            channel("general"),
+            channel("dm-standup"),
+            channel(&mine),
+            channel(&also_mine),
+            channel(&theirs),
+        ],
+        vec![
+            backend::DmPeer {
+                key: "2".into(),
+                name: "orthory".into(),
+                initials: "O".into(),
+                is_agent: false,
+                channel_id: mine.clone(),
+            },
+            backend::DmPeer {
+                key: "3".into(),
+                name: "orthory-ops".into(),
+                initials: "O".into(),
+                is_agent: false,
+                channel_id: also_mine.clone(),
+            },
+        ],
+        Vec::new(),
+    );
+
+    let listed: Vec<&str> = rooms.iter().map(|row| row.channel.id.as_str()).collect();
+    assert_eq!(
+        listed,
+        ["general", "dm-standup"],
+        "no derived DM id is a CHANNELS row — not mine, and not theirs"
+    );
 }

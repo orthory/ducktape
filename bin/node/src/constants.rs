@@ -7,8 +7,14 @@ use std::time::Duration;
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
 /// frame size — transfers are ranged/streamed, so no single message ever
-/// approaches it.
-pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
+/// approaches it. ONE shared cap with the operator-facing stage route
+/// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
+/// larger than what an operator could ever stage locally.
+pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
+/// one warning when the committed valset read first fails, then one per this
+/// many further drain passes, for a host query that keeps erroring (#1820).
+/// shared by the validator drain and the replica park loop.
+pub(crate) const VALSET_READ_WARN_EVERY: u64 = 600;
 /// how many source conversations a code-blob fetch tries before reporting
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
@@ -27,7 +33,7 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // pending ops the moment nothing of ours is in flight (`pump_eager_flush`),
 // so the network's own agreement speed paces blocks and ops aggregate behind
 // the one batch in flight. IDLE is the only timed cadence: the heartbeat
-// beats one nop block per block time (node.toml `block_time_ms`) so an idle
+// beats one nop block per block time (network.toml `block_time_ms`) so an idle
 // chain still finalizes (its height keeps ticking) and any pending cutover
 // still crosses — paced to the same interval the leader's idle-propose holds
 // a view open, so the idle beat never outpaces the view hold.
@@ -57,6 +63,12 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_B
 // (`sync::serve::encode_bounded_response`) — that is the last line; this pin
 // keeps the honest path from ever needing it.
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+// the replay window a manifest carries is the SAME window the drain enforces:
+// a joiner seating on a shallower one applies a re-proposed batch its peers
+// refuse. `statesync` does not link `node`, so the equality is pinned here,
+// where both are in scope. the window's wire cost rides under the cap above.
+const _: () = assert!(statesync::MAX_APPLIED_FRAMES == node::REPLAY_WINDOW_HEIGHTS);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES * 40 + (64 << 10));
 /// inbound backlog per channel. NOT backpressure: commonware's peer actor
 /// DROPS an inbound message when the application buffer is full (it never
 /// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`
@@ -78,11 +90,20 @@ pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TI
 /// for block handling, not a pacer: finalized blocks drain (and pending ops
 /// flush) event-driven the moment they land.
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
+// the idle beat floor (`workspace_config::validate_block_time_ms`) is refused
+// below whatever this tick is — they MUST agree, or a founded network's floor
+// promises a beat the heartbeat still can't keep.
+const _: () = assert!(DRAIN_TICK.as_millis() as u64 == workspace_config::MIN_BLOCK_TIME_MS);
 /// the pace of `refresh_operations` (the /metrics exposition parse feeding
 /// status' consensus/storage sections): the status cell publishes boundary
 /// facts per drain pass, but the exposition parse is the pricey part and one
 /// per second bounds its cost — and the staleness — at once.
 pub(crate) const OPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// how often the drain re-checks that this node's workspace directory is still
+/// the one it booted on (`WorkspaceMark`). One `stat` per second is free next
+/// to a block, and a second is far inside the window between a workspace being
+/// deleted and the next journal write panicking somewhere in consensus.
+pub(crate) const WORKSPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
@@ -128,17 +149,6 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 64;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order — the
-/// `production` selection of the single-source [`topology`]. pinned to the
-/// composed host's registry by the parity test in `host_state`; the
-/// topology's own tests pin the selection to today's 19 (the founder bundles
-/// each wasm tenant's component; the descriptor commits its hash).
-///
-/// A module here is in the root-hash: every node must run it, agree on its root
-/// at every height, and keep doing so forever. Experiments therefore live
-/// unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
-
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.

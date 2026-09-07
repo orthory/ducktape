@@ -236,19 +236,43 @@ fn pin_table_full_at_max_pins() {
     let mut f = open_files(&d);
     let head = seed_head(&mut f, 1);
     // fill the pin table honestly in ONE block: MAX_PINS distinct names, all
-    // pointing at the resolvable head (a cheap in-memory BTreeMap fill).
+    // pointing at the resolvable head (a cheap in-memory BTreeMap fill), spread
+    // across MAX_PINS / MAX_PINS_PER_OWNER owners so the per-owner cap (#1801)
+    // never trips before the global one this test targets.
+    let owners_needed = files::MAX_PINS / files::MAX_PINS_PER_OWNER;
     for i in 0..files::MAX_PINS {
-        exec(
-            &mut f,
-            sdk::Origin::System,
-            2,
-            pin_op(&head, &format!("p{i}")),
-        )
-        .expect("pin fits under the cap");
+        let owner = md(&format!("owner{}", i % owners_needed));
+        exec(&mut f, owner, 2, pin_op(&head, &format!("p{i}")))
+            .expect("pin fits under the global and per-owner caps");
     }
-    let err =
-        exec(&mut f, sdk::Origin::System, 2, pin_op(&head, "overflow")).expect_err("cap reached");
+    // the table is now exactly full: even a FRESH owner (nowhere near its own
+    // per-owner share) is refused by the global cap.
+    let err = exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow"))
+        .expect_err("cap reached");
     assert_module_err(&err, "pin table is full");
+    abort_block(&mut f);
+}
+
+/// the per-owner share of the global table (#1801): the `MAX_PINS_PER_OWNER`th
+/// pin from one owner lands, the next from the SAME owner is refused with a
+/// stable reason distinct from the global cap, and a DIFFERENT owner is
+/// unaffected.
+#[test]
+fn pin_per_owner_cap_is_independent_of_other_owners() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    let head = seed_head(&mut f, 1);
+
+    for i in 0..files::MAX_PINS_PER_OWNER {
+        exec(&mut f, md("alice"), 2, pin_op(&head, &format!("a{i}")))
+            .expect("alice's pin fits under her share");
+    }
+    let err = exec(&mut f, md("alice"), 2, pin_op(&head, "one-too-many"))
+        .expect_err("alice hit her per-owner cap");
+    assert_module_err(&err, "pin quota exceeded");
+
+    // bob's share is untouched by alice filling hers.
+    exec(&mut f, md("bob"), 2, pin_op(&head, "b0")).expect("bob still pins");
     abort_block(&mut f);
 }
 

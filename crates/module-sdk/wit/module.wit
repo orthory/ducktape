@@ -1,0 +1,150 @@
+package ducktape:module@0.1.0;
+
+/// the deterministic host surface a wasm module may touch during dispatch.
+/// this is the wasm-boundary twin of `sdk::Ctx`: own-state read/write is
+/// host-owned and staged until block commit; cross-module reads are
+/// host-routed; writes leave as emitted intents, never reentrant calls.
+/// deliberately NO clock / rng / net / direct blob — determinism by omission.
+interface host {
+  /// the deterministic environment for this dispatch (block-constant fields
+  /// are identical on every validator; NOT wall clock, NOT per-node).
+  record env {
+    height: u64,
+    consensus-time: u64,
+    me: string,
+    origin: origin,
+  }
+
+  /// who triggered THIS dispatch.
+  variant origin {
+    external(list<u8>),
+    from-module(string),
+    system,
+  }
+
+  /// the deterministic error a module may surface. `rejected` is a clean,
+  /// deterministic no-op-on-every-honest-validator failure.
+  variant error {
+    rejected(string),
+    not-found,
+    unsupported,
+  }
+
+  /// where a module's COMMITTED state lives: the substrate the host wraps
+  /// the component over and computes `root()` from. a property of the code
+  /// — the same bytes always want the same substrate — so the component
+  /// declares it (`module-shape`) and the host refuses any other.
+  enum backing {
+    /// a host-owned key/value map: root = sha256 over the canonical
+    /// encoding, sync = installable snapshot bytes. any key shape. (`map`
+    /// is a WIT keyword, hence the escape; the name is `map`.)
+    %map,
+    /// a host-constructed authenticated store (qmdb): root = the store's
+    /// merkle root, sync = the store's resolver lane. every state key is a
+    /// 32-byte digest.
+    store,
+    /// a host-side content-addressed substrate (duckfs odb, a repo) the host
+    /// provides for this module's id: root = the substrate's fold of its
+    /// refs image, the object plane is live, queries are served host-side.
+    odb,
+  }
+
+  /// what the host must know to run this component. read once from the
+  /// bytes on every path a module enters a host (genesis, admission, a
+  /// reopen, a code swap), before they are wrapped over a substrate.
+  record module-shape {
+    backing: backing,
+    /// the per-network genesis parameters the host seeds into this module's
+    /// reserved `__config` record when it starts fresh (`chain_id`,
+    /// `invite`); empty = not network-bound.
+    config: list<string>,
+    /// the query lane answers from committed state alone, regardless of
+    /// caller: for a module whose between-block reads must never observe a
+    /// same-block staged write.
+    committed-queries: bool,
+  }
+
+  /// deterministic environment for this dispatch.
+  get-env: func() -> env;
+
+  /// own authenticated state. the host owns the store and computes this
+  /// module's root() from it; writes are staged and only published at the
+  /// block-commit boundary (discarded on abort).
+  state-get: func(key: list<u8>) -> option<list<u8>>;
+  /// Read the preceding block's committed state, bypassing staged writes.
+  state-get-committed: func(key: list<u8>) -> option<list<u8>>;
+  state-set: func(key: list<u8>, value: list<u8>);
+  state-delete: func(key: list<u8>);
+
+  /// snapshot root of a sibling module as of the START of this dispatch.
+  module-root: func(target: string) -> option<list<u8>>;
+  /// live, read-only, host-routed read of a sibling module.
+  query-module: func(target: string, req: list<u8>) -> result<list<u8>, error>;
+
+  // ---- object plane -------------------------------------------------------
+  // a content-addressed object store the host owns beside this module's own
+  // state (duckfs's odb behind the host boundary — NOT a shared byte plane;
+  // duckfs-private in intent even though the surface is world-level). the
+  // determinism envelope is BY OMISSION, exactly like the rest of this world:
+  //   * READS (`object-stat` / `object-get`) resolve ONLY refs-reachable
+  //     structural objects — consensus-uniform bytes every honest validator
+  //     possesses — plus this block's own staged puts. an id no validator can
+  //     reach answers `none` identically everywhere (never a per-node fork).
+  //   * WRITES (`object-put`) are STAGED effects: visible to same-block
+  //     stat/get immediately, published (or discarded) at the real block
+  //     boundary with duckfs's durability ordering (objects → sync → refs).
+  // an id is `sha256(kind-tag ‖ body)`, so a put's answer is a pure function of
+  // its inputs — the same on every validator, which is what lets a staged put
+  // feed the same-dispatch read overlay without a consensus round.
+
+  /// metadata-only read: `(kind-tag, body-byte-length)` of a refs-reachable
+  /// object (or this block's staged put), or `none` if absent. answered from
+  /// metadata alone — NEVER a full body read on the consensus path (the duckfs
+  /// stat contract). a memo miss pauses the run for the host to resolve.
+  object-stat: func(id: list<u8>) -> option<tuple<u8, u64>>;
+  /// full read: the TAGGED body `kind-tag ‖ body` of a refs-reachable object
+  /// (or this block's staged put), or `none` if absent. a memo miss pauses the
+  /// run for the host to resolve against the committed object store.
+  object-get: func(id: list<u8>) -> option<list<u8>>;
+  /// stage a put and return its 32-byte id. the host computes
+  /// `id = sha256(kind-tag ‖ body)` and returns the id ALONE — a hash mismatch
+  /// is impossible when the host computes it, so this cannot fail here; the
+  /// fail-closed verification belongs where a STAGED put is later PUBLISHED
+  /// against an id (the disk backing's block-boundary publish). the staged put
+  /// is visible to same-block `object-stat` / `object-get` and is discarded if
+  /// the block aborts.
+  object-put: func(kind: u8, body: list<u8>) -> list<u8>;
+
+  /// emit a write intent — re-dispatched as a follow-up op, never reentrant.
+  emit-msg: func(target: string, payload: list<u8>);
+  /// emit an observability event — leaves the state machine.
+  emit-event: func(source: string, payload: list<u8>);
+  /// declare this dispatch's assigned stamp — values the module ASSIGNED
+  /// applying this op (a sequence, a revision), recorded on the dispatch
+  /// trace and carried on the derived-tier op-feed row. module-encoded,
+  /// host-opaque; last write wins within one dispatch.
+  set-assigned: func(stamp: list<u8>);
+}
+
+/// the contract every wasm module implements. the guest is PURE logic over
+/// the host surface; it owns no durable memory across dispatches (the host
+/// re-instantiates per call), so state lives entirely behind `host.state-*`.
+world module {
+  use host.{error, module-shape};
+  import host;
+
+  /// this component's shape: what the host must know to run it. a pure
+  /// constant of the code — it touches no import (the host reads it outside
+  /// any dispatch, with no env set) and never changes between two calls.
+  export shape: func() -> module-shape;
+  /// Initialize fresh state from caller-supplied parameters. State writes are
+  /// staged atomically; initialization cannot emit follow-up operations.
+  export initialize: func(params: list<u8>) -> result<_, error>;
+  /// Complete this block's state changes before the host publishes its store.
+  /// Called once for each dispatched module, never on an aborted block.
+  export finalize-block: func() -> result<_, error>;
+  /// dispatch entry: apply an incoming op payload addressed to this module.
+  export execute: func(payload: list<u8>) -> result<_, error>;
+  /// read-only projection of this module's state.
+  export query: func(req: list<u8>) -> result<list<u8>, error>;
+}

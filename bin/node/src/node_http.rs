@@ -11,6 +11,33 @@
 //! to `/v1/submit/frame`; its verified signer is the op's origin. `/v1/query`
 //! reads committed module state.
 
+use commonware_cryptography::Signer as _;
+
+/// ONE blocking client for this process's whole `/v1` lane.
+///
+/// `reqwest::blocking::Client::new()` is neither free nor infallible: each one
+/// spawns its own tokio runtime on its own thread with its own connection pool,
+/// and it PANICS when the build fails. Under `EMFILE` that is how a descriptor
+/// shortage became a dead `announce-watch` thread — the watcher builds three
+/// clients per 10 s tick, so it was the first thing in the process to ask the
+/// kernel for a descriptor it could not have, and it asked through a `.expect`.
+/// One client, built once and reused, also keeps the loopback keep-alive
+/// connection instead of dialing a fresh socket per request.
+///
+/// A failed build is NOT cached: it is transient by nature (that is what EMFILE
+/// is), and a poisoned lane would outlive the shortage that caused it. Two
+/// racing builds are possible and harmless — the loser is dropped.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|error| format!("could not build the http client: {error}"))?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
 /// Submit one NODE-AUTHORED module op over `/v1/submit` `{target, payload}` and
 /// return the commit height from the receipt. A non-2xx status carries the
 /// node's rejection string.
@@ -43,7 +70,7 @@ pub(crate) fn submit(
 /// `Origin::External`, which is what lets an account's key act for itself.
 pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
     const PATH: &str = "/v1/submit/frame";
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{base}{PATH}"))
         .header("content-type", "application/octet-stream")
         .body(frame.to_vec())
@@ -80,18 +107,75 @@ pub(crate) fn query(
     Ok(serde_json::from_str(&body)?)
 }
 
-/// This node's own consensus key, read from `/v1/status`.
+/// This node's own consensus key, read from a plain, unauthenticated
+/// `GET /v1/status`.
 ///
-/// Every data-plane signature is BOUND to it ([`noded::signed_req`]), so one
-/// minted for this node can never be replayed against another node the same key
-/// acts on. It comes from the node ITSELF rather than from a local workspace,
-/// which is what lets a signed verb work against a node this host holds no
-/// config for.
+/// Every data-plane signature is BOUND to whatever key this returns
+/// ([`noded::signed_req`]), so trusting it verbatim lets whatever answers on
+/// `base` — including a proxy sitting in front of the real node, or one
+/// substituting another node's key — choose what a caller's signature binds
+/// to. [`pinned_node_key`] is the one thing that may still call this: the
+/// first-contact read that seeds a trust-on-first-use pin. Nothing else
+/// should sign against this value directly (#1824).
 pub(crate) fn node_public_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let status = get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
     Ok(crate::config::unhex(
         status["public_key"].as_str().unwrap_or_default(),
     )?)
+}
+
+/// The node identity a signature may safely bind to — pinned from a source
+/// the dialled endpoint does not control, never [`node_public_key`]'s plain
+/// claim.
+///
+/// Two cases:
+/// - `base` is one of the operator's OWN registered workspaces
+///   ([`crate::cli_args::workspace_for_base`]): its `node.toml` already names
+///   the key, read locally with no network round trip — nothing an answer on
+///   `base` says can change it.
+/// - anything else: trust-on-first-use, pinned in the wallet dir
+///   ([`crate::known_nodes`]). The first answer this CLI ever sees for `base`
+///   is trusted and remembered; every answer after that must match it, or the
+///   request is refused (reason: `node_key_mismatch`) unless the caller passed
+///   `trust_node` to re-pin.
+pub(crate) fn pinned_node_key(
+    base: &str,
+    trust_node: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Ok(pinned_node_key_in(
+        &keystore::wallet::duck_root()?,
+        base,
+        trust_node,
+    )?)
+}
+
+/// [`pinned_node_key`] over an explicit wallet dir — split out so a test can
+/// drive it against a temp dir instead of the operator's real keystore.
+fn pinned_node_key_in(
+    duck: &std::path::Path,
+    base: &str,
+    trust_node: bool,
+) -> Result<Vec<u8>, String> {
+    if let Ok(dir) = crate::cli_args::workspace_for_base(base) {
+        let resolved = crate::config::resolve(&dir.join("node.toml"))?;
+        return Ok(resolved.signer.public_key().as_ref().to_vec());
+    }
+    let reported = node_public_key(base).map_err(|error| error.to_string())?;
+    match crate::known_nodes::pinned(duck, base)? {
+        None => {
+            crate::known_nodes::trust(duck, base, &reported)?;
+            Ok(reported)
+        }
+        Some(pinned) if pinned == reported => Ok(pinned),
+        Some(_) if trust_node => {
+            crate::known_nodes::trust(duck, base, &reported)?;
+            Ok(reported)
+        }
+        Some(_) => Err(format!(
+            "{base} answered with a different node key than the one pinned for it \
+             (reason: node_key_mismatch) — if you trust this change, re-run with --trust-node"
+        )),
+    }
 }
 
 /// Why a node-local read did not produce an answer.
@@ -176,7 +260,8 @@ pub(crate) fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailu
 /// Read one node-local JSON surface over GET (the `/v1` read routes that are
 /// not module queries, e.g. the volatile service catalog).
 pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, ReadFailure> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()
+        .map_err(ReadFailure::Rejected)?
         .get(format!("{base}{path}"))
         .send()
         .map_err(|error| transport_failure(path, &error))?;
@@ -224,9 +309,7 @@ fn post_with(
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
-    let mut request = reqwest::blocking::Client::new()
-        .post(format!("{base}{path}"))
-        .json(body);
+    let mut request = client()?.post(format!("{base}{path}")).json(body);
     if let Some(token) = operator_token {
         request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
     }
@@ -378,5 +461,107 @@ mod tests {
             panic!("a served 500 must not be reported as a stopped node");
         };
         assert!(detail.contains("500"), "{detail}");
+    }
+
+    /// A fake `GET /v1/status` responder whose reported `public_key` can be
+    /// changed between requests (`set`) — the shape a real proxy takes when it
+    /// substitutes another node's key mid-conversation. `Connection: close` so
+    /// the shared client dials fresh each time instead of reusing a socket
+    /// this thread already answered on.
+    struct FakeStatus {
+        key: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl FakeStatus {
+        fn spawn(initial_key: Vec<u8>) -> (String, Self) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let base = format!("http://{}", listener.local_addr().expect("addr"));
+            let key = std::sync::Arc::new(std::sync::Mutex::new(initial_key));
+            let served = key.clone();
+            std::thread::spawn(move || {
+                use std::io::{BufRead as _, BufReader, Write as _};
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
+                    let mut line = String::new();
+                    // drain the request head; the body this endpoint reads is
+                    // never more than headers.
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if line == "\r\n" || line.is_empty() => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    let hex = duckfs_core::to_hex(&served.lock().unwrap());
+                    let body = format!("{{\"public_key\":\"{hex}\"}}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            (base, Self { key })
+        }
+
+        fn set(&self, key: Vec<u8>) {
+            *self.key.lock().unwrap() = key;
+        }
+    }
+
+    /// the first answer this CLI ever sees for an unregistered node's url is
+    /// trusted and remembered, and signs with it.
+    #[test]
+    fn a_first_contact_pin_signs_with_what_the_node_reports() {
+        let duck = tempfile::TempDir::new().unwrap();
+        let real_key = vec![0x11; 32];
+        let (base, _server) = FakeStatus::spawn(real_key.clone());
+
+        let pinned = pinned_node_key_in(duck.path(), &base, false).expect("first contact pins");
+        assert_eq!(pinned, real_key);
+    }
+
+    /// the vulnerability #1824 fixes: a proxy or a substituted node answering
+    /// with a DIFFERENT key than the one already trusted for this url must be
+    /// refused, never silently re-signed against.
+    #[test]
+    fn a_later_mismatch_is_refused_without_trust_node() {
+        let duck = tempfile::TempDir::new().unwrap();
+        let real_key = vec![0x22; 32];
+        let (base, server) = FakeStatus::spawn(real_key.clone());
+
+        pinned_node_key_in(duck.path(), &base, false).expect("first contact pins");
+        server.set(vec![0x99; 32]); // a proxy substitutes another node's key.
+
+        let refused =
+            pinned_node_key_in(duck.path(), &base, false).expect_err("a changed key is refused");
+        assert!(refused.contains("node_key_mismatch"), "{refused}");
+        // the pin itself must not have moved.
+        assert_eq!(
+            crate::known_nodes::pinned(duck.path(), &base).unwrap(),
+            Some(real_key)
+        );
+    }
+
+    /// `--trust-node` is the ONLY way an already-pinned key changes.
+    #[test]
+    fn trust_node_re_pins_to_whatever_is_reported_now() {
+        let duck = tempfile::TempDir::new().unwrap();
+        let real_key = vec![0x33; 32];
+        let (base, server) = FakeStatus::spawn(real_key.clone());
+
+        pinned_node_key_in(duck.path(), &base, false).expect("first contact pins");
+        let rotated_key = vec![0x44; 32];
+        server.set(rotated_key.clone());
+
+        let pinned = pinned_node_key_in(duck.path(), &base, true).expect("--trust-node re-pins");
+        assert_eq!(pinned, rotated_key);
+        assert_eq!(
+            crate::known_nodes::pinned(duck.path(), &base).unwrap(),
+            Some(rotated_key)
+        );
     }
 }

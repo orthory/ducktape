@@ -172,7 +172,12 @@ pub struct IntroRequest {
     pub expires_unix_secs: u64,
     /// the joiner's X25519 WireGuard public key, raw.
     pub wg_public_key: Vec<u8>,
-    /// the joiner's signature binding `wg_public_key` to its identity.
+    /// the joiner's wall clock when it minted THIS datagram — signature
+    /// covered inside `wg_sig` alongside the WireGuard key, so a captured
+    /// intro cannot be replayed past [`INTRO_FRESHNESS_SECS`] ([`verify_intro`]).
+    pub issued_unix_secs: u64,
+    /// the joiner's signature binding `wg_public_key` and `issued_unix_secs`
+    /// to its identity.
     pub wg_sig: Vec<u8>,
 }
 
@@ -245,17 +250,40 @@ pub fn decode_intro_ack(b: &[u8]) -> Result<IntroAck, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 
-/// build the intro for `token` as `joiner`, announcing `wg_public_key`.
+/// how long a joiner's signed `issued_unix_secs` may lag (or lead) the
+/// gating member's wall clock before [`verify_intro`] refuses the intro as
+/// stale — a captured sealed datagram is opaque and needs no key material to
+/// replay, so this is the only thing bounding how long a replay repoints the
+/// inviter's tunnel endpoint. The joiner builds its intro ONCE per race and
+/// retransmits the SAME signed bytes for up to the join race window
+/// (`reachability::INVITE_JOIN_WINDOW_MS`, 90 s) — every retransmit inside
+/// that race must still verify, so this MUST exceed the whole window plus
+/// clock skew, not just one retransmit interval. Twice the race window is
+/// comfortable slack.
+pub const INTRO_FRESHNESS_SECS: u64 = 2 * (reachability::INVITE_JOIN_WINDOW_MS / 1_000);
+
+/// the reason token a stale or future-dated intro is refused with.
+pub const INTRO_STALE: &str = "intro_stale";
+
+/// build the intro for `token` as `joiner`, announcing `wg_public_key`,
+/// signed as issued at `issued_unix_secs` (the joiner's own wall clock).
 pub fn intro_request(
     joiner: &ed25519::PrivateKey,
     binding: &[u8],
     token: &InviteToken,
     wg_public_key: [u8; 32],
+    issued_unix_secs: u64,
 ) -> IntroRequest {
     use commonware_codec::Encode as _;
     use commonware_cryptography::Signer as _;
     let proof = crate::config::sign_join_proof(joiner, binding, token);
-    let wg_msg = [binding, token.nonce.as_slice(), &wg_public_key].concat();
+    let wg_msg = [
+        binding,
+        token.nonce.as_slice(),
+        &wg_public_key,
+        &issued_unix_secs.to_be_bytes(),
+    ]
+    .concat();
     let wg_sig = joiner.sign(INTRO_WG_NAMESPACE, &wg_msg);
     IntroRequest {
         issuer: token.issuer.as_ref().to_vec(),
@@ -265,6 +293,7 @@ pub fn intro_request(
         proof: proof.encode().as_ref().to_vec(),
         expires_unix_secs: token.expires_unix_secs,
         wg_public_key: wg_public_key.to_vec(),
+        issued_unix_secs,
         wg_sig: wg_sig.encode().as_ref().to_vec(),
     }
 }
@@ -280,10 +309,17 @@ pub struct VerifiedIntro {
 }
 
 /// verify an intro against this network's binding: the token issuer
-/// signature, the joiner's proof-of-possession, and the WireGuard-key
-/// binding signature. membership checks are the CALLER's, exactly like
-/// [`verify_join_request`].
-pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro, String> {
+/// signature, the joiner's proof-of-possession, the WireGuard-key binding
+/// signature, and the signed `issued_unix_secs` freshness against `now`
+/// (the gating member's wall clock) — a datagram signed more than
+/// [`INTRO_FRESHNESS_SECS`] in the past or the future is refused, so a
+/// captured sealed intro cannot be replayed indefinitely. membership checks
+/// are the CALLER's, exactly like [`verify_join_request`].
+pub fn verify_intro(
+    msg: &IntroRequest,
+    binding: &[u8],
+    now_unix_secs: u64,
+) -> Result<VerifiedIntro, String> {
     use commonware_cryptography::Verifier as _;
     let verified = verify_join_request(msg, binding)?;
     let wg_public_key: [u8; 32] = msg
@@ -293,9 +329,20 @@ pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro,
         .map_err(|_| "wireguard key must be 32 bytes".to_string())?;
     let wg_sig = ed25519::Signature::decode(msg.wg_sig.as_slice())
         .map_err(|e| format!("wireguard key signature: {e}"))?;
-    let wg_msg = [binding, verified.nonce.as_slice(), &wg_public_key].concat();
+    let wg_msg = [
+        binding,
+        verified.nonce.as_slice(),
+        &wg_public_key,
+        &msg.issued_unix_secs.to_be_bytes(),
+    ]
+    .concat();
     if !verified.joiner.verify(INTRO_WG_NAMESPACE, &wg_msg, &wg_sig) {
         return Err("wireguard key binding does not verify".into());
+    }
+    let too_old = now_unix_secs.saturating_sub(msg.issued_unix_secs) > INTRO_FRESHNESS_SECS;
+    let too_new = msg.issued_unix_secs.saturating_sub(now_unix_secs) > INTRO_FRESHNESS_SECS;
+    if too_old || too_new {
+        return Err(INTRO_STALE.into());
     }
     Ok(VerifiedIntro {
         joiner: verified.joiner,
@@ -322,12 +369,15 @@ mod tests {
     /// signature is [`verify_intro`]'s to check, not [`verify_join_request`]'s.
     const WG_KEY: [u8; 32] = [9u8; 32];
 
+    /// a fixed "now" the freshness tests build issued-at timestamps around.
+    const NOW: u64 = 1_700_000_000;
+
     #[test]
     fn a_join_request_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
-        let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
+        let msg = intro_request(&joiner, BINDING, &token, WG_KEY, NOW);
 
         let verified = verify_join_request(&msg, BINDING).expect("verifies");
         assert_eq!(verified.joiner, joiner.public_key());
@@ -345,7 +395,7 @@ mod tests {
         let token = mint_for(&issuer);
         for seed in [2u64, 3, 4] {
             let joiner = ed25519::PrivateKey::from_seed(seed);
-            let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
+            let msg = intro_request(&joiner, BINDING, &token, WG_KEY, NOW);
             let v = verify_join_request(&msg, BINDING).expect("bearer verifies for any key");
             assert_eq!(v.joiner, joiner.public_key());
         }
@@ -356,7 +406,7 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
-        let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
+        let msg = intro_request(&joiner, BINDING, &token, WG_KEY, NOW);
 
         // another network refuses the same announce.
         assert!(verify_join_request(&msg, b"other-net").is_err());
@@ -444,11 +494,11 @@ mod tests {
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
         let wg_key = [9u8; 32];
-        let msg = intro_request(&joiner, BINDING, &token, wg_key);
+        let msg = intro_request(&joiner, BINDING, &token, wg_key, NOW);
         let decoded = decode_intro(&encode_intro(&msg)).expect("roundtrip");
         assert_eq!(decoded, msg);
 
-        let verified = verify_intro(&decoded, BINDING).expect("verifies");
+        let verified = verify_intro(&decoded, BINDING, NOW).expect("verifies");
         assert_eq!(verified.joiner, joiner.public_key());
         assert_eq!(verified.issuer, issuer.public_key());
         assert_eq!(verified.wg_public_key, wg_key);
@@ -456,11 +506,42 @@ mod tests {
         // a substituted WireGuard key fails its binding signature.
         let mut forged = msg.clone();
         forged.wg_public_key = vec![8u8; 32];
-        let err = verify_intro(&forged, BINDING).expect_err("refused");
+        let err = verify_intro(&forged, BINDING, NOW).expect_err("refused");
         assert!(err.contains("wireguard key binding"), "{err}");
 
         // another network refuses the same intro.
-        assert!(verify_intro(&msg, b"other-net").is_err());
+        assert!(verify_intro(&msg, b"other-net", NOW).is_err());
+    }
+
+    /// a captured intro cannot be replayed indefinitely: past
+    /// [`INTRO_FRESHNESS_SECS`] the gating member refuses it with the
+    /// stable [`INTRO_STALE`] reason, in either direction (stale in the
+    /// past, or implausibly signed in the future); a fresh one still
+    /// verifies at the same wall clock.
+    #[test]
+    fn a_stale_or_future_intro_is_refused_a_fresh_one_verifies() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let token = mint_for(&issuer);
+
+        let beyond = INTRO_FRESHNESS_SECS + 1;
+        let stale = intro_request(&joiner, BINDING, &token, WG_KEY, NOW - beyond);
+        let err = verify_intro(&stale, BINDING, NOW).expect_err("refused");
+        assert_eq!(err, INTRO_STALE);
+
+        let future = intro_request(&joiner, BINDING, &token, WG_KEY, NOW + beyond);
+        let err = verify_intro(&future, BINDING, NOW).expect_err("refused");
+        assert_eq!(err, INTRO_STALE);
+
+        // inside the bound (e.g. a retransmit late in the join race) still
+        // verifies — this is exactly what makes the window wide enough for
+        // the once-signed intro this joiner retransmits for the whole race.
+        let late_in_race =
+            intro_request(&joiner, BINDING, &token, WG_KEY, NOW - INTRO_FRESHNESS_SECS);
+        assert!(verify_intro(&late_in_race, BINDING, NOW).is_ok());
+
+        let fresh = intro_request(&joiner, BINDING, &token, WG_KEY, NOW);
+        assert!(verify_intro(&fresh, BINDING, NOW).is_ok());
     }
 
     #[test]

@@ -20,6 +20,69 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 `DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app binary nor on
 `PATH`.
 
+## Release build (macOS: signed and notarized)
+
+`make app` builds `Ducktape.app` and `Ducktape-<version>-<arch>.dmg` under
+`target/ice-bundle/` and signs both **ad-hoc**, which runs on the machine that
+built it and nowhere else — Gatekeeper refuses an ad-hoc bundle that arrived
+over the network. A bundle that leaves this Mac is signed with a Developer ID
+identity and notarized by Apple. `cargo-ice bundle` does both itself, off four
+environment variables; `make app` inherits the environment, so exporting them
+is the whole configuration.
+
+1. **The signing identity.** A "Developer ID Application" certificate from the
+   Apple Developer Program, in the login keychain. The exact string is what
+   `ICE_CODESIGN_IDENTITY` takes:
+
+   ```sh
+   security find-identity -v -p codesigning   # "Developer ID Application: … (TEAMID)"
+   ```
+
+   With it set, the `.app` and the `.dmg` are signed with `--timestamp
+   --options runtime` — the hardened runtime and a trusted timestamp are both
+   preconditions for notarization.
+
+2. **The notary key.** An App Store Connect API key: **App Store Connect →
+   Users and Access → Integrations → Team Keys**, created with the *Developer*
+   role. The `.p8` downloads **once**. Store it outside this repo (a repo copy
+   is a leaked signing credential), and keep the Key ID and the Issuer UUID the
+   same page shows.
+
+3. **Build.**
+
+   ```sh
+   export ICE_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
+   export ICE_NOTARY_KEY="$HOME/.appstoreconnect/AuthKey_XXXXXXXXXX.p8"
+   export ICE_NOTARY_KEY_ID=XXXXXXXXXX
+   export ICE_NOTARY_ISSUER=00000000-0000-0000-0000-000000000000
+   make app-release          # refuses if ICE_CODESIGN_IDENTITY is unset
+   ```
+
+   The three `ICE_NOTARY_*` go together: all three set adds `xcrun notarytool
+   submit --wait` on the DMG followed by `xcrun stapler staple`, so the ticket
+   travels inside the image and a first launch with no network still passes.
+   Set without `ICE_CODESIGN_IDENTITY`, cargo-ice refuses before the upload
+   rather than after Apple's wait. Set none and the build prints the identity
+   it used and says what to export to notarize.
+
+4. **Verify** — on the built artifacts, before shipping them:
+
+   ```sh
+   spctl -a -vv target/ice-bundle/Ducktape.app      # accepted, source=Notarized Developer ID
+   xcrun stapler validate target/ice-bundle/Ducktape-*.dmg
+   codesign -dv --verbose=4 target/ice-bundle/Ducktape.app   # Authority + TeamIdentifier
+   ```
+
+`ops/macos-preflight.sh` reports both halves — the Developer ID identities in
+the keychain and whether the three notary variables are exported with the key
+file present — as an informational section; it never fails on them, because a
+local build needs neither.
+
+The microVM shim signs the same way: `bin/duck-vz-shim/build.sh` takes
+`CODESIGN_IDENTITY` (ad-hoc `-` by default) and passes the
+`com.apple.security.virtualization` entitlement whichever identity it is given
+— Virtualization.framework refuses the binary without that entitlement.
+
 ## Visual language
 
 The canonical shared UI uses warm ink-on-paper neutrals and a sparse

@@ -18,13 +18,17 @@
 //! `keyscheme` (`Secp256r1` = the assertion envelope, `Secp256k1` =
 //! `personal_sign` over [`keyscheme::personal_message`]).
 //!
-//! Two ceremony facts every caller sequences around:
+//! Three ceremony facts every caller sequences around:
 //! - a passkey REGISTRATION is two touches: `create` yields the public key,
 //!   then `get` over the `AddKey` frame preimage proves possession (a
 //!   `webauthn.create` attestation carries no signature we can verify);
 //! - a wallet is two touches: it reveals no public key on its own, so touch 1
 //!   signs [`reveal_message`] and the key is recovered from that signature,
-//!   touch 2 signs the real preimage.
+//!   touch 2 signs the real preimage;
+//! - a LOGIN is two touches for the same reason: an add-key consent names the
+//!   account it admits into, and a passkey only says which account it belongs
+//!   to by answering ([`account_request`] -> [`assertion_account`]). Touch 1
+//!   asks; touch 2 ([`login_request`]) is the consent, bound to that answer.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -172,10 +176,23 @@ pub fn parse_result(json: &str) -> Result<Outcome, String> {
         ));
     }
     match op.as_str() {
-        "create" => Ok(Outcome::Create {
-            credential_id: binary(&value, "credentialId")?,
-            public_key: binary(&value, "publicKey")?,
-        }),
+        "create" => {
+            // the browser is a trust boundary: the page compresses the SPKI
+            // point itself, and a key spelled any other way is one the chain
+            // would refuse as an origin AFTER a consent and a second touch had
+            // already been spent on it.
+            let public_key = binary(&value, "publicKey")?;
+            if !KeyScheme::Secp256r1.pubkey_wellformed(&public_key) {
+                return Err(format!(
+                    "the auth page returned {} bytes that are not a compressed SEC1 P-256 point",
+                    public_key.len()
+                ));
+            }
+            Ok(Outcome::Create {
+                credential_id: binary(&value, "credentialId")?,
+                public_key,
+            })
+        }
         "get" => Ok(Outcome::Get {
             authenticator_data: binary(&value, "authenticatorData")?,
             client_data_json: binary(&value, "clientDataJSON")?,
@@ -234,53 +251,74 @@ fn hex_0x(text: &str) -> Result<Vec<u8>, String> {
 /// a one-shot loopback HTTP listener the page delivers its result to. Bound
 /// on an ephemeral 127.0.0.1 port; [`Listener::wait`] serves exactly one
 /// result POST and returns.
+///
+/// The port alone is not a secret — any local process, or any web origin the
+/// user has open, can connect to it. `state` (32 random bytes, carried as a
+/// path segment the page echoes back verbatim, since it posts to `cb`
+/// exactly as given) binds the answer to THIS ceremony: [`serve_one`] refuses
+/// every request whose path does not match rather than trusting whoever
+/// connects first.
 pub struct Listener {
     listener: TcpListener,
+    state: String,
 }
 
 impl Listener {
     pub fn bind() -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        Ok(Self { listener })
+        let raw: [u8; 32] = rand::random();
+        Ok(Self {
+            listener,
+            state: B64.encode(raw),
+        })
     }
 
     /// the `cb` to put in the request URL — loopback, which is all the page
-    /// will deliver to.
+    /// will deliver to, with the ceremony's `state` in the path.
     pub fn callback_url(&self) -> String {
         let port = self
             .listener
             .local_addr()
             .map(|addr| addr.port())
             .unwrap_or_default();
-        format!("http://127.0.0.1:{port}/")
+        format!("http://127.0.0.1:{port}/cb/{}", self.state)
     }
 
-    /// block until the page POSTs a result (a stray GET — a favicon probe, a
-    /// tab reload — is answered and ignored), then answer it and return.
+    /// block until the page POSTs a result to `/cb/<state>` — anything else
+    /// (a wrong path, a stray GET, a malformed body) is answered and ignored,
+    /// never ends the wait — then answer it and return. Only [`abandon`],
+    /// which is handed this same `callback_url`, can end the wait early.
     pub fn wait(self) -> Result<Outcome, String> {
+        let path = format!("/cb/{}", self.state);
         loop {
             let (stream, _) = self
                 .listener
                 .accept()
                 .map_err(|e| format!("auth callback listener: {e}"))?;
-            if let Some(outcome) = serve_one(stream)? {
+            if let Some(outcome) = serve_one(stream, &path)? {
                 return Ok(outcome);
             }
         }
     }
 }
 
-/// one HTTP exchange: `Some(outcome)` for a result POST, `None` for anything
-/// else (answered with a holding page).
-fn serve_one(mut stream: TcpStream) -> Result<Option<Outcome>, String> {
-    let (method, body) = read_request(&mut stream)?;
+/// one HTTP exchange: `Some(outcome)` for a result POST landing on
+/// `expected_path`, `None` for anything else (answered and ignored — a wrong
+/// path gets a 404, a non-POST or a malformed body gets a holding/error page,
+/// but the wait keeps going in every case).
+fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcome>, String> {
+    let (method, path, body) = read_request(&mut stream)?;
+    if path != expected_path {
+        respond(&mut stream, 404, "Not found.");
+        return Ok(None);
+    }
     if method != "POST" {
         respond(&mut stream, 200, "Waiting for the ceremony to finish…");
         return Ok(None);
     }
     let Some(result) = form_field(&body, "result") else {
         respond(&mut stream, 400, "The callback carried no result.");
-        return Err("auth page POSTed no `result` field".into());
+        return Ok(None);
     };
     match parse_result(&result) {
         Ok(outcome) => {
@@ -298,18 +336,17 @@ fn serve_one(mut stream: TcpStream) -> Result<Option<Outcome>, String> {
     }
 }
 
-/// the request line's method and the body (`content-length` bounded).
-fn read_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+/// the request line's method and path, and the body (`content-length`
+/// bounded).
+fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
         .read_line(&mut line)
         .map_err(|e| format!("auth callback: {e}"))?;
-    let method = line
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
     let mut content_length = 0usize;
     loop {
         line.clear();
@@ -334,12 +371,13 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     reader
         .read_exact(&mut body)
         .map_err(|e| format!("auth callback body: {e}"))?;
-    Ok((method, body))
+    Ok((method, path, body))
 }
 
 fn respond(stream: &mut TcpStream, status: u16, text: &str) {
     let reason = match status {
         200 => "OK",
+        404 => "Not Found",
         _ => "Bad Request",
     };
     // the same card the page and the relay's "Done" wear (ops/auth-page).
@@ -412,14 +450,13 @@ fn form_decode(value: &[u8]) -> Vec<u8> {
 /// give up on a ceremony: deliver an error result to `callback_url` ourselves,
 /// so a [`Listener::wait`] blocked on it returns `Err` and its thread ends —
 /// the one way to unblock a std accept. Best-effort; a listener already gone
-/// needs nothing.
+/// needs nothing. `callback_url` is the exact URL [`Listener::callback_url`]
+/// handed out, path (and state) included, so this lands on the same
+/// `serve_one` check any other request has to pass.
 pub fn abandon(callback_url: &str, reason: &str) {
-    let Some(port) = callback_url
-        .trim_start_matches("http://127.0.0.1:")
-        .trim_end_matches('/')
-        .parse::<u16>()
-        .ok()
-    else {
+    let rest = callback_url.trim_start_matches("http://127.0.0.1:");
+    let (port_text, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let Ok(port) = port_text.parse::<u16>() else {
         return;
     };
     let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
@@ -428,7 +465,7 @@ pub fn abandon(callback_url: &str, reason: &str) {
     let result = serde_json::json!({ "op": "", "error": "abandoned", "message": reason });
     let body = format!("result={}", url_encode(&result.to_string()));
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+        "POST /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -653,11 +690,49 @@ pub fn wallet_pubkey(reveal: &[u8], outcome: &Outcome) -> Result<Vec<u8>, String
         .ok_or_else(|| "the wallet signature does not recover to a key".to_string())
 }
 
-/// QR login: the `get` a passkey answers to CONSENT to admitting
-/// `device_key` (ed25519) at its `generation` on `chain_id` — the identity
-/// module's own `AddKey` preimage, hashed into the challenge.
-pub fn login_request(chain_id: &str, device_key: &[u8], generation: u64) -> Request {
-    let preimage = identity::add_key_preimage(chain_id, KeyScheme::Ed25519, device_key, generation);
+/// login, touch 1: a `get` that asks the passkey nothing but WHICH account it
+/// belongs to. Its challenge is random and authorizes nothing — no consent is
+/// minted from this answer; the account it reveals is what touch 2's consent
+/// is bound to.
+pub fn account_request() -> Request {
+    Request::Get {
+        challenge: create_challenge(),
+    }
+}
+
+/// the account a passkey assertion names in its `userHandle`. Unsigned, so it
+/// is a HINT: it picks which account to ask about, and [`login_add_key`] then
+/// accepts only a consent a key OF that account actually signed.
+pub fn assertion_account(outcome: &Outcome) -> Result<u64, String> {
+    let Outcome::Get { user_handle, .. } = outcome else {
+        return Err("expected a passkey assertion (op=get)".into());
+    };
+    user_handle.ok_or_else(|| {
+        "the passkey names no account (no userHandle) — register it with \
+         `ducktape account key add --passkey` from a member device"
+            .to_string()
+    })
+}
+
+/// login, touch 2: the `get` a passkey answers to CONSENT to admitting
+/// `device_key` (ed25519) into `account` at its `generation` on `chain_id`,
+/// until `expires_at` — the identity module's own `AddKey` preimage, hashed
+/// into the challenge.
+pub fn login_request(
+    chain_id: &str,
+    device_key: &[u8],
+    generation: u64,
+    account: u64,
+    expires_at: u64,
+) -> Request {
+    let preimage = identity::add_key_preimage(
+        chain_id,
+        KeyScheme::Ed25519,
+        device_key,
+        generation,
+        account,
+        expires_at,
+    );
     let challenge = keyscheme::webauthn_challenge(identity::IDENTITY_ADD_KEY_NS, &preimage);
     Request::Get { challenge }
 }
@@ -667,24 +742,18 @@ pub fn login_request(chain_id: &str, device_key: &[u8], generation: u64) -> Requ
 /// carries. Which of the account's `Secp256r1` keys signed is the caller's to
 /// find — by verifying the proof against each.
 pub fn login_consent(outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
+    let number = assertion_account(outcome)?;
     let Outcome::Get {
         authenticator_data,
         client_data_json,
         signature,
-        user_handle,
+        ..
     } = outcome
     else {
         return Err("expected a passkey assertion (op=get)".into());
     };
-    let Some(number) = user_handle else {
-        return Err(
-            "the passkey names no account (no userHandle) — register it with \
-             `ducktape account key add --passkey` from a member device"
-                .into(),
-        );
-    };
     Ok((
-        *number,
+        number,
         keyscheme::webauthn_proof(authenticator_data, client_data_json, signature),
     ))
 }
@@ -700,8 +769,16 @@ pub fn login_add_key(
     account: &identity::AccountView,
     label: Option<String>,
     proof: Vec<u8>,
+    expires_at: u64,
 ) -> Result<identity::IdentityMsg, String> {
-    let preimage = identity::add_key_preimage(chain_id, KeyScheme::Ed25519, device_key, generation);
+    let preimage = identity::add_key_preimage(
+        chain_id,
+        KeyScheme::Ed25519,
+        device_key,
+        generation,
+        account.number,
+        expires_at,
+    );
     let signer = account
         .keys
         .iter()
@@ -725,6 +802,8 @@ pub fn login_add_key(
         label,
         authorizer: identity::Authorizer {
             key: signer.pubkey.clone(),
+            account: account.number,
+            expires_at,
             proof,
         },
     })
@@ -785,16 +864,24 @@ mod tests {
 
     #[test]
     fn results_decode_and_a_failure_names_itself() {
-        let create = parse_result(
-            r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7,"attestationObject":"","clientDataJSON":""}"#,
-        )
+        let registered = passkey_pubkey(&passkey(0x51));
+        let create = parse_result(&format!(
+            r#"{{"op":"create","credentialId":"AQID","publicKey":"{}","alg":-7,"attestationObject":"","clientDataJSON":""}}"#,
+            B64.encode(&registered)
+        ))
         .unwrap();
         assert_eq!(
             create,
             Outcome::Create {
                 credential_id: vec![1, 2, 3],
-                public_key: vec![2, 3, 4]
+                public_key: registered
             }
+        );
+        // a key the page did not compress is refused right here, before a
+        // consent or a second touch is spent on it.
+        assert!(
+            parse_result(r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7}"#)
+                .is_err()
         );
         let get = parse_result(
             r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
@@ -838,40 +925,62 @@ mod tests {
         assert!(parse_result(r#"{"op":"get","authenticatorData":"AQ"}"#).is_err());
     }
 
-    /// the page's delivery, as bytes on the wire: a form POST to the callback,
-    /// answered 200 with a page the user reads, the outcome handed back.
+    /// split a `callback_url` into the loopback port and the path the page
+    /// (or a test peer) must hit.
+    fn port_and_path(cb: &str) -> (u16, String) {
+        let rest = cb.trim_start_matches("http://127.0.0.1:");
+        let (port, path) = rest.split_once('/').unwrap();
+        (port.parse().unwrap(), format!("/{path}"))
+    }
+
+    fn send(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    }
+
+    const REAL_BODY: &str = "result=%7B%22op%22%3A%22eth%22%2C%22address%22%3A%220xab%22%2C%22signature%22%3A%220x01%22%2C%22message%22%3A%22AQID%22%7D&x=y+z";
+
+    fn post(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// the page's delivery, as bytes on the wire: only a POST to the exact
+    /// `/cb/<state>` path lands the result — a wrong path (someone else's
+    /// process, a stray probe) is 404'd and the wait keeps going, and a
+    /// right-path POST missing its `result` field is 400'd rather than
+    /// aborting the ceremony.
     #[test]
-    fn the_listener_serves_one_form_post_and_ignores_a_probe() {
+    fn the_listener_ignores_the_wrong_path_and_serves_the_real_post() {
         let listener = Listener::bind().unwrap();
-        let cb = listener.callback_url();
-        let port: u16 = cb
-            .trim_start_matches("http://127.0.0.1:")
-            .trim_end_matches('/')
-            .parse()
-            .unwrap();
+        let (port, path) = port_and_path(&listener.callback_url());
         let served = std::thread::spawn(move || listener.wait());
 
-        // a stray GET first (a favicon probe) — answered, not the result.
-        let mut probe = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        probe
-            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        let mut answer = String::new();
-        probe.read_to_string(&mut answer).unwrap();
-        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        // wrong path entirely (an unrelated local peer guessing at paths).
+        let answer = send(port, "GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
 
-        let body = "result=%7B%22op%22%3A%22eth%22%2C%22address%22%3A%220xab%22%2C%22signature%22%3A%220x01%22%2C%22message%22%3A%22AQID%22%7D&x=y+z";
-        let mut post = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        post.write_all(
-            format!(
-                "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        let mut answer = String::new();
-        post.read_to_string(&mut answer).unwrap();
+        // a POST with the real body but the WRONG path — same as an attacker
+        // who doesn't know this ceremony's state — must not land the result.
+        let answer = send(port, &post("/cb/wrong-state", REAL_BODY));
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+
+        // right path, but a stray GET (a tab reload) — held, not landed.
+        let answer = send(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("Waiting"), "{answer}");
+
+        // right path, malformed body — refused, but the wait keeps going.
+        let answer = send(port, &post(&path, "not a form body"));
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        // right path, real body — this is the one that lands.
+        let answer = send(port, &post(&path, REAL_BODY));
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("return to ducktape"), "{answer}");
 
@@ -974,8 +1083,9 @@ mod tests {
     fn a_login_assertion_is_the_add_key_consent() {
         let sk = passkey(2);
         let device_key = [7u8; 32];
-        let request = login_request("chain-a", &device_key, 0);
-        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 0);
+        let request = login_request("chain-a", &device_key, 0, 11, 900);
+        let preimage =
+            identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 0, 11, 900);
         assert_eq!(
             request,
             Request::Get {
@@ -1035,7 +1145,8 @@ mod tests {
             bio: None,
             updated_at: 0,
         };
-        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4);
+        let preimage =
+            identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4, 11, 900);
         let (a, c, s) =
             passkey_assertion_parts(&mine, RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let proof = keyscheme::webauthn_proof(&a, &c, &s);
@@ -1046,6 +1157,7 @@ mod tests {
             &account,
             Some("laptop".into()),
             proof.clone(),
+            900,
         )
         .unwrap();
         assert_eq!(
@@ -1055,17 +1167,19 @@ mod tests {
                 label: Some("laptop".into()),
                 authorizer: identity::Authorizer {
                     key: passkey_pubkey(&mine),
+                    account: 11,
+                    expires_at: 900,
                     proof: proof.clone(),
                 },
             },
             "the passkey that signed is the authorizer"
         );
         // another generation, or a passkey off the account: no signer.
-        assert!(login_add_key("chain-a", &device_key, 5, &account, None, proof).is_err());
+        assert!(login_add_key("chain-a", &device_key, 5, &account, None, proof, 900).is_err());
         let (a, c, s) =
             passkey_assertion_parts(&passkey(4), RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let foreign = keyscheme::webauthn_proof(&a, &c, &s);
-        assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign).is_err());
+        assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign, 900).is_err());
     }
 
     /// abandoning delivers the page's error shape to the callback, so the

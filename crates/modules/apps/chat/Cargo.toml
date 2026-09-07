@@ -14,9 +14,9 @@ version.workspace = true
 # drives but never depends on.
 [features]
 # the wasm consensus port (src/guest.rs): the store-backed dispatch shell over
-# guest-adapter. non-default and wasm-only — enabled solely by the
+# ducktape-module-sdk. non-default and wasm-only — enabled solely by the
 # guest-builder's synthesized cdylib workspace, never by the native gate.
-guest = ["dep:guest-adapter"]
+guest = ["dep:ducktape-module-sdk"]
 # the wasm index mapper shell (src/index_guest.rs): wires the pure index core
 # into the fluent31 engine. wasm-only — enabled solely by
 # `guest-builder --index`.
@@ -27,14 +27,22 @@ sdk = { workspace = true }
 # wasm-only, behind `guest`: the port harness (WitStore / WitCtx / host
 # imports / the dispatch-shell macros). a standalone-workspace path crate,
 # pulled only when the guest build compiles this crate for wasm32.
-guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+ducktape-module-sdk = { workspace = true, optional = true }
 # the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not
 # the engine: the default surface is pure types, wasm32-clean, and is all the
 # native build sees. the engine shell rides the `index-guest` feature.
 index_guest = { workspace = true }
 # types-only: the tag-report edge (chat translates its shapes, the plane routes).
 tagging = { workspace = true }
+# the ONE resolver (`OfKey`) that turns a DM creator's signing key into its
+# account number — `CreateDmChannel` derives the channel id from the pair of
+# account numbers, so a squatter cannot mint another pair's DM (see
+# `Chat::resolve_dm_creator`).
+identity = { workspace = true }
 async-trait = { workspace = true }
+# the one verifier every signed artifact dispatches through — `JoinHuddle`'s
+# `node_proof` rides the same ed25519 path a member key's frame does.
+keyscheme = { workspace = true }
 # NFC label normalization for the derived tag index (src/index/tags.rs) —
 # unconditional like the index core it serves (pure, wasm32-clean).
 unicode-normalization = { workspace = true }
@@ -46,6 +54,8 @@ sha2 = { workspace = true }
 [dev-dependencies]
 host = { workspace = true }
 sdk-testkit = { workspace = true }
+# the ed25519 keypairs a `JoinHuddle.node_proof` test signs with.
+commonware-cryptography = { workspace = true }
 # the tests drive the module the way a host does: construct the concrete
 # QmdbStore and inject it as `Box<dyn MerkleStore>`.
 statesync = { workspace = true }

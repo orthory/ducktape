@@ -254,8 +254,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         ed25519::PrivateKey::from_seed(12),
     );
     // Two people, two nodes — the huddle's roster is (user, node) pairs, and
-    // it is the NODE half the media plane speaks.
-    let (my_node, peer_node) = ([0xa1u8; 32], [0xb2u8; 32]);
+    // it is the NODE half the media plane speaks. Each node signs its own
+    // `node_proof` over the join (proof of possession).
+    let (my_node, peer_node) = (
+        ed25519::PrivateKey::from_seed(21),
+        ed25519::PrivateKey::from_seed(22),
+    );
+    let my_node_pub = my_node.public_key().as_ref().to_vec();
+    let peer_node_pub = peer_node.public_key().as_ref().to_vec();
 
     submit_test(
         &rpc,
@@ -276,7 +282,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: my_node.to_vec(),
+            node: my_node_pub.clone(),
+            node_proof: my_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", me.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
@@ -287,15 +300,24 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: peer_node.to_vec(),
+            node: peer_node_pub.clone(),
+            node_proof: peer_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", peer.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
 
     let mine = me.public_key().as_ref().to_vec();
-    let (_channel, roster) = load_channel_facts(&rpc, "eng", Some(&mine))
+    let names = NameDirectory::default();
+    let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
         .await
-        .expect("the huddle's channel reads back");
+        .expect("the huddle's channel reads back")
+        .expect("the huddle's channel is on this node");
     assert_eq!(roster.len(), 2, "both people are on the roster");
     assert_eq!(
         roster.iter().filter(|row| row.is_you).count(),
@@ -303,10 +325,10 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "exactly one row is this device's — the id vocabulary has to match"
     );
 
-    let nodes = huddle_recipient_nodes(roster);
+    let nodes = huddle_recipient_nodes(roster, None);
     assert_eq!(
         nodes,
-        vec![hex_encode(&peer_node)],
+        vec![hex_encode(&peer_node_pub)],
         "the fan-out is the OTHER node's key: ours in it would aim this \
          device's media at itself, and the peer's missing from it is the \
          silence this whole poll exists to end"
@@ -320,6 +342,83 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     );
     // `shutdown`, not a drop: the handle's last executor reference cannot be
     // dropped on this async thread (see `SimHandle::shutdown`).
+    sim.shutdown();
+}
+
+/// A ROOM THIS NODE CANNOT SEE IS A LANDING, NOT A RED BANNER.
+///
+/// Both halves of it were reported by one resident in one session: she joined a
+/// second network in an app that was still holding the first one's room id, and
+/// the node she joined spent minutes in `joining` with an unfolded chat index
+/// answering `{"channel": null}` for every id there is. Either way the switch
+/// loader read a channel record that is not there, and either way the console
+/// put "channel record was not found" over the timeline — a node-broken reading
+/// of two states that are neither broken nor hers to fix.
+///
+/// So the walk here is the second state THEN the first: an index with nothing
+/// in it answers with no room at all, and an index that has folded answers with
+/// the room there is to read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    let me = ed25519::PrivateKey::from_seed(11);
+
+    // The joining resident: nothing folded yet, so no id resolves — including
+    // the one the sidebar is asking for.
+    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is an empty console, not a failed load");
+    assert!(
+        unfolded.active_channel.is_empty() && unfolded.channels.is_empty(),
+        "a workspace with no rooms to see lands on no room, honestly empty"
+    );
+
+    submit_test(
+        &rpc,
+        &me,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "eng".into(),
+            name: "Engineering".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &me,
+        2,
+        "chat",
+        chat::encode_msg(&ChatMsg::PostMessage {
+            channel_id: "eng".into(),
+            message_id: "message-1".into(),
+            blocks: vec![chat::Block::paragraph("first")],
+            thread: None,
+            as_agent: None,
+        }),
+    )
+    .await;
+
+    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is a landing, not a failed load");
+    assert_eq!(
+        landed.active_channel, "eng",
+        "the id nothing answers for resolves to the landing channel"
+    );
+    assert_eq!(landed.active_channel_name, "Engineering");
+    assert_eq!(landed.messages.len(), 1, "and it lands with its timeline");
     sim.shutdown();
 }
 
@@ -848,7 +947,7 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
 ///
 /// The heartbeat rides every block, and an idle chain nop-fills once per
-/// block time (node.toml `block_time_ms`) — so anything this update
+/// block time (network.toml `block_time_ms`) — so anything this update
 /// triggers runs at ~1 Hz forever, on a chain where nothing happened. A load
 /// hung off it would be a poll wearing a consensus costume, and `/v1/query` is
 /// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing

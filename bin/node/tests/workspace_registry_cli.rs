@@ -119,7 +119,7 @@ fn init_writes_the_sandbox_table_exactly_when_the_host_can_start_the_adapter() {
     // an executable named like the adapter, and its hard deps beside it: PATH
     // is the only half of the probe a test owns.
     let bins = tempfile::tempdir().expect("fake bin dir");
-    for bin in ["firecracker", "mke2fs", "debugfs", "nft"] {
+    for bin in ["firecracker", "mke2fs", "debugfs"] {
         let fake = bins.path().join(bin);
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake runtime");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
@@ -293,7 +293,7 @@ fn init_writes_module_hashes_and_the_genesis() {
         "the descriptor pins the whole file"
     );
     let genesis = workspace_config::Genesis::decode(&bytes).expect("decodes");
-    let hashes = genesis.component_hashes();
+    let hashes = genesis.module_hashes();
     for m in &d.modules {
         assert_eq!(
             workspace_config::hex_bytes(&hashes[&m.id]),
@@ -302,10 +302,78 @@ fn init_writes_module_hashes_and_the_genesis() {
             m.id
         );
     }
-    let guests: Vec<&str> = genesis.index_guests.iter().map(|a| a.id.as_str()).collect();
-    let mut want = topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION);
+    // the index guests are exactly the `<id>.index.wasm` files the founding
+    // set holds for the genesis set: the build stages one iff the module's
+    // crate declares a guest, so presence is the declaration.
+    let guests: Vec<&str> = genesis
+        .modules
+        .iter()
+        .filter(|a| genesis.index_guest(&a.id).is_some())
+        .map(|a| a.id.as_str())
+        .collect();
+    let founding_set = std::path::Path::new(common::founding_set());
+    let mut want: Vec<&str> = topology::TOPOLOGY
+        .wasm_ids(topology::PRODUCTION)
+        .into_iter()
+        .filter(|id| workspace_config::index_guest_path(founding_set, id).is_file())
+        .collect();
     want.sort_unstable();
-    assert_eq!(guests, want, "every declared index guest rides in the genesis");
+    assert!(
+        want.contains(&"chat"),
+        "the founding set carries chat's index guest, or this pin proves nothing"
+    );
+    assert_eq!(guests, want, "every index guest the set holds rides in the genesis");
+}
+
+#[test]
+fn init_accepts_a_module_absent_from_the_binary_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/examples/directory/component.wasm"),
+        workspace_config::component_path(&source, "directory"),
+    )
+    .unwrap();
+    let workspace = tmp.path().join("network");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args([
+            "node",
+            "init",
+            "--name",
+            "custom",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
+        .arg(&workspace)
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_ok(&output, "init with supplied directory module");
+    let genesis = workspace_config::Genesis::load(&workspace.join("genesis")).unwrap();
+    assert_eq!(
+        genesis
+            .modules
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["directory"]
+    );
+    assert!(
+        genesis
+            .modules
+            .iter()
+            .all(|a| genesis.index_guest(&a.id).is_none())
+    );
 }
 
 /// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the
@@ -324,7 +392,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
-    let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
+    let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
     want.sort_unstable();
     assert_eq!(ids, want);
@@ -476,10 +544,45 @@ fn a_member_join_refuses_a_genesis_that_is_not_the_networks() {
     );
 }
 
-/// a bundle missing a component is named by the file the operator has to go
-/// look for — not by a hash mismatch three boots later.
+/// #1840: discovery alone (filenames, ids, Borsh/mapper framing) never loads
+/// the bytes as wasm, so a zero-byte or truncated component used to compose
+/// and hash fine and mint a network that could never run a block. `init` must
+/// compile every artifact before writing anything.
 #[test]
-fn init_names_the_missing_component() {
+fn init_refuses_a_zero_byte_component_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/examples/directory/component.wasm"),
+        workspace_config::component_path(&source, "directory"),
+    )
+    .unwrap();
+    // a stray, truncated, or aborted-build artifact: decodes fine, compiles
+    // to nothing.
+    std::fs::write(workspace_config::component_path(&source, "oops"), b"").unwrap();
+    let workspace = tmp.path().join("network");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "zero-byte", "--primary-coordinator", "none", "--dir"])
+        .arg(&workspace)
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "a zero-byte artifact must refuse init");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(workspace_config::component_path(&source, "oops").to_str().unwrap()),
+        "names the artifact path: {error}"
+    );
+    assert!(!workspace.exists(), "nothing is written on refusal: {}", workspace.display());
+}
+
+/// An empty founding directory cannot define a module set. The diagnostic
+/// names the supplied directory without inventing a required catalog entry.
+#[test]
+fn init_refuses_an_empty_module_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
@@ -491,5 +594,7 @@ fn init_names_the_missing_component() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("acl.component.wasm"));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("holds no module components"), "{error}");
+    assert!(error.contains(empty.to_str().unwrap()), "{error}");
 }

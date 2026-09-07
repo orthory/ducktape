@@ -19,6 +19,11 @@ serde = { workspace = true }
 # the guest-converge marker hashes artifact bytes so warm boots skip compiles.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# readiness parity with fluent31's own `install_module` (pinned, cannot
+# expose the check itself): compiling candidate bytes here to read their
+# export section is the cheapest way to require the same `memory` export
+# install will require, without moving the fluent31 rev.
+wasmtime = { workspace = true }
 # `ducktape::index`: the open height, a refold's two ends, and a poison — a
 # few lines per boot, never one per block.
 tracing = { workspace = true }

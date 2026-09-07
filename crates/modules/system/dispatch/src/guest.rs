@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER
 //! way: the NATIVE `dispatch` crate is compiled to wasm32 unmodified and adapted
-//! to the `ducktape:module` world through `guest-adapter`, so the module's logic
+//! to the `ducktape:module` world through `ducktape-module-sdk`, so the module's logic
 //! is single-sourced (a behavior change in the native crate IS the wasm change).
 //!
 //! dispatch is a SELF-CONTAINED consensus plane: its `execute` reads only
@@ -8,9 +8,9 @@
 //! (`emit_msg` to saga, `emit_event` breadcrumbs) through the wit imports. it
 //! makes no cross-module `query-module` reads inside execute, so — unlike the
 //! `tagging`/`runs` tenants — it needs no memoized sibling replay on the accept
-//! path. its query surface is COMMITTED-ONLY regardless of caller, which the
-//! host wires with `.with_committed_queries()`: that drops the outer staged
-//! overlay for a query round, so `WitStore` answers the native module's
+//! path. its query surface is COMMITTED-ONLY regardless of caller, which this
+//! component declares (`shape().committed_queries`): the host drops the outer
+//! staged overlay for a query round, so `WitStore` answers the native module's
 //! `get_committed` reads from committed state exactly as the native store does.
 //!
 //! ## the STORE-BACKED dispatch model
@@ -50,12 +50,18 @@ const MODULE_ID: &str = "dispatch";
 /// not committed state, so the guest carries the production wiring verbatim.
 const SAGA_MODULE_ID: &str = "saga";
 
-use guest_adapter::WitStore;
+use ducktape_module_sdk::WitStore;
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
-guest_adapter::store_guest! {
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: DispatchModule,
+    // the query lane is committed-only regardless of caller: the between-block
+    // delivery injection must never observe a same-block staged write.
+    shape: ducktape_module_sdk::host::ModuleShape {
+        committed_queries: true,
+        ..ducktape_module_sdk::store_shape()
+    },
     new: DispatchModule::new(MODULE_ID, SAGA_MODULE_ID, Box::new(WitStore)),
 }

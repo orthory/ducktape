@@ -4,7 +4,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;
@@ -25,6 +25,24 @@ fn read_count() -> u64 {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    /// the declared shape: plain host-KV keys over a map the host owns, no
+    /// network config, read-your-writes queries.
+    fn shape() -> host::ModuleShape {
+        host::ModuleShape {
+            backing: host::Backing::Map,
+            config: Vec::new(),
+            committed_queries: false,
+        }
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         // env is available (proves the import); this module doesn't branch on it.
         let _env = host::get_env();

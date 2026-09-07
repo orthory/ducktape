@@ -128,12 +128,10 @@ it is (`../../deploy/backup-and-keys.md`).
 Bounds by design: a DIRECT candidate's intro listener is the peer's own UDP
 (`wg_port + 1`), so a direct path needs that member's port
 underlay-reachable (one forwarded UDP port suffices; the joiner needs
-nothing), while a coordinated path needs no forwarded port at all. Under a
-real kernel-TUN effect the userspace rendezvous is inactive, so coordinated
-candidates are dropped from the race — an all-coordinated invite on a TUN
-node hits the honest terminal immediately rather than hanging. The
+nothing), while a coordinated path needs no forwarded port at all. The
 TCP-carrier halves of the join are proven by
-`bin/node/tests/join_request_e2e.rs`.
+`bin/node/tests/join_request_e2e.rs`, and the whole ceremony on a live
+overlay by `bin/node/tests/wireguard_tunnel_e2e.rs`.
 
 ## 6. Cold restart
 
@@ -198,5 +196,11 @@ product, and this design needs none.
 - `crates/networking/reachability/tests/rendezvous_simnat.rs` — the
   production resolver punching over a simulated NAT topology.
 - `bin/node/tests/join_request_e2e.rs` — the TCP-carrier halves of the join.
+- `bin/node/tests/wireguard_tunnel_e2e.rs` — the tunnel-first invite end to
+  end on a live overlay, two nodes in their own network namespaces: the
+  `dt-*` interface up, the tunnel carrying at both members' ULAs, the mesh
+  dial at the joiner's ULA, no kernel TCP listener on the mesh port on either
+  side, and the joiner still folding blocks with every underlay TCP packet
+  between them rejected. Skips where `ip netns` is unavailable.
 - `crates/networking/wireguard/tests/tunnel_e2e.rs` — the fixed
   mesh-version vector every node must reproduce.

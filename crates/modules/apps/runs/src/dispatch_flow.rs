@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
-    DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
-    SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query, chat_decode_reply,
-    chat_encode_query, dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query,
-    dispatch_id_for, envelope, files_decode_reply, files_encode_query, inject, recipe_id_for,
+    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
+    ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply,
+    MAX_PAYLOAD_BYTES, MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule,
+    SagaOrigin, SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query,
+    chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
+    dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
+    inject, recipe_id_for,
 };
 use crate::facets::WireSink;
 
@@ -117,6 +118,58 @@ impl RunsModule {
         match dispatch_decode_reply(&reply) {
             Ok(DispatchReply::Dispatch(view)) => Ok(view.is_some()),
             _ => Err("unexpected dispatch reply for a dispatch lookup".into()),
+        }
+    }
+
+    // ---- explicit-request admission ---------------------------------------
+
+    /// chat's answer to "may `user` post to `channel_id`" — the standing an
+    /// explicit `RequestRun` submitter must hold before this module pins that
+    /// channel's transcript and posts a reply into it under module authority.
+    /// post standing covers read (chat's [`ChatReply::may_post`] implies
+    /// `may_read`), so this one query is the whole gate. an unexpected or
+    /// failed reply answers `false` — the submission fails closed rather than
+    /// leaking a channel it could not confirm.
+    pub(super) async fn may_post(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self.channel_access(ctx, user, channel_id).await?.may_post)
+    }
+
+    /// chat's answer to "may `user` SEE `channel_id`" — the standing an
+    /// account must hold before this module pins that channel's transcript
+    /// into a dispatch payload its owner's provider will read.
+    pub(super) async fn may_read(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self.channel_access(ctx, user, channel_id).await?.may_read)
+    }
+
+    async fn channel_access(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<ChannelAccess, String> {
+        let reply = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.to_string(),
+                    user: user.to_vec(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("chat access query failed: {e}"))?;
+        match chat_decode_reply(&reply) {
+            Ok(ChatReply::Access(access)) => Ok(access),
+            _ => Err("unexpected chat reply for an access query".into()),
         }
     }
 
@@ -327,14 +380,9 @@ impl RunsModule {
                 None => extra.to_string(),
             });
         }
-        let payload = envelope::render_payload(
-            &self.id,
-            agent,
-            run_id,
-            &transcript,
-            portable,
-        )
-        .into_bytes();
+        let sink = portable.sink.clone();
+        let payload =
+            envelope::render_payload(&self.id, agent, run_id, &transcript, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
@@ -344,6 +392,7 @@ impl RunsModule {
         Ok(PreparedDispatch {
             thread_root,
             payload,
+            sink,
         })
     }
 
@@ -412,6 +461,7 @@ impl RunsModule {
             &[(page_id, blocks)],
             &self.net_query(),
         ));
+        let sink = portable.sink.clone();
         let payload = envelope::render_page_comment_payload(
             agent,
             run_id,
@@ -431,6 +481,7 @@ impl RunsModule {
         Ok(PreparedDispatch {
             thread_root: None,
             payload,
+            sink,
         })
     }
 
@@ -507,6 +558,7 @@ impl RunsModule {
                 job_id: None,
                 job_claim_height: 0,
                 requester,
+                sink: prepared.sink,
                 created_at: now,
             }),
         );

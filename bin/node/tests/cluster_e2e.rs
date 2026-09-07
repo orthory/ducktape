@@ -239,6 +239,7 @@ fn cluster_lifecycle() {
             let payload = tasks::encode_task_msg(&TaskMsg::CreateTask {
                 task_id: format!("cutover-filler-{filler}"),
                 title: "x".into(),
+                owner: None,
             });
             let _ = cluster.rpc(
                 0,
@@ -554,6 +555,7 @@ fn quorum_tolerates_one_fault() {
         &tasks::encode_task_msg(&TaskMsg::CreateTask {
             task_id: "after-fault".into(),
             title: "alive".into(),
+            owner: None,
         }),
     );
     for reader in [1, 2] {

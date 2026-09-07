@@ -2,10 +2,15 @@
 //! git-native workspace source pinned from COMMITTED forge state.
 //!
 //! this module owns the three compose rules that make a forge item a SESSION:
-//! the per-item work branch (`agent/item-<n>` for issues, the PR's own source
-//! branch for PRs — that one rule IS the PR=session feature), the pinned base
-//! commit (the work-branch tip when born, else the dev tip an issue forks
-//! from), and the requested `Pr` sink. everything here reads committed state
+//! the per-item work branch — `agent/item-<n>`, for BOTH an issue and a PR
+//! (#1836: the run never works a branch it does not own, so a PR's own
+//! source branch — set by whoever opened the PR — never becomes a push
+//! target) — the pinned base commit (the work branch's own tip when born,
+//! else the fork point: the dev tip for an issue, the PR's own source branch
+//! tip for a PR), and the requested `Pr` sink, which opens/updates a PR from
+//! the work branch onto the item's own base (dev for an issue, the PR's own
+//! source branch for a PR — so a human reviews the agent's change INTO their
+//! PR branch). everything here reads committed state
 //! at compose height (I1): item lookup and refs go through the ctx query lane
 //! with local serde MIRRORS of forge's wire types — `forge` stays a DEV-ONLY
 //! dependency of runs (vendored libgit2 stays out of the production build),
@@ -217,11 +222,17 @@ impl RunsModule {
             .forge_item(ctx, &forge, repo, item_ref.number)
             .await?
             .ok_or_else(|| format!("no forge item {repo}#{}", item_ref.number))?;
-        // 3. the work branch — per ITEM, not per run (session identity):
-        //    an issue works `agent/item-<n>`; a PR works ITS OWN source
-        //    branch, so the session's pushes update the open PR in place.
-        let branch = match item.kind {
-            ForgeItemKind::Issue => format!("agent/item-{}", item_ref.number),
+        // 3. the work branch — per ITEM, not per run (session identity), and
+        //    ALWAYS `agent/item-<n>` (#1836): a run only ever pushes a
+        //    branch it owns, never a branch named by whoever opened the
+        //    triggering item (a PR's `source_branch` is attacker-chosen).
+        let branch = format!("agent/item-{}", item_ref.number);
+        // 4. the item's own base — what an unborn work branch forks from,
+        //    and what the requested sink's PR targets: dev for an issue, the
+        //    PR's OWN source branch for a PR (so a human reviews the agent's
+        //    change into their PR branch, never past it).
+        let item_base_branch = match item.kind {
+            ForgeItemKind::Issue => INTEGRATION_BRANCH.to_string(),
             ForgeItemKind::Pr => item
                 .source_branch
                 .clone()
@@ -230,7 +241,7 @@ impl RunsModule {
                     format!("forge pr {repo}#{} has no source branch", item_ref.number)
                 })?,
         };
-        // 4. the pinned base commit + branch_born, from COMMITTED refs.
+        // 5. the pinned base commit + branch_born, from COMMITTED refs.
         let refs = self.forge_refs(ctx, &forge, repo).await?;
         let tip = |name: &str| {
             refs.iter()
@@ -238,39 +249,23 @@ impl RunsModule {
                 .map(|r| r.head.clone())
         };
         let (commit, branch_born) = match tip(&branch) {
-            // the branch is born: the session continues — fork ITS tip.
+            // the agent branch is already born: the session continues —
+            // fork ITS tip, not the item's base (later runs build on the
+            // agent's own prior work, not the moving base).
             Some(tip) => (tip, true),
-            None => match item.kind {
-                // first run for an issue: fork the dev tip; the provisioner
-                // creates the branch (zero-oid CAS base).
-                ForgeItemKind::Issue => (
-                    tip(INTEGRATION_BRANCH).ok_or_else(|| {
-                        format!("repo {repo} has no {INTEGRATION_BRANCH} branch to fork")
-                    })?,
-                    false,
-                ),
-                // a PR's work branch IS its source branch, born by
-                // construction while the PR exists; a deleted source is a
-                // real compose failure, never a silent re-create.
-                ForgeItemKind::Pr => {
-                    return Err(format!(
-                        "forge pr {repo}#{} source branch {branch} is not born",
-                        item_ref.number
-                    ));
-                }
-            },
+            // first run for this item: fork the item's base; the
+            // provisioner creates the agent branch (zero-oid CAS base).
+            None => (
+                tip(&item_base_branch).ok_or_else(|| {
+                    format!("repo {repo} has no {item_base_branch} branch to fork")
+                })?,
+                false,
+            ),
         };
-        // 5. the requested sink: a PR of the work branch onto the item's
-        //    target (issues target dev). title/body stay empty — delivery
-        //    derives them from the message facet.
-        let target_branch = match item.kind {
-            ForgeItemKind::Pr => item
-                .target_branch
-                .clone()
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| INTEGRATION_BRANCH.to_string()),
-            ForgeItemKind::Issue => INTEGRATION_BRANCH.to_string(),
-        };
+        // 6. the requested sink: a PR of the work branch onto the item's
+        //    base. title/body stay empty — delivery derives them from the
+        //    message facet.
+        let target_branch = item_base_branch;
         let sink = WireSink::Pr {
             repo: repo.to_string(),
             source_branch: branch.clone(),
@@ -278,7 +273,7 @@ impl RunsModule {
             title: String::new(),
             body: String::new(),
         };
-        // 6. the deterministic item-context section (byte-capped in inject).
+        // 7. the deterministic item-context section (byte-capped in inject).
         let context = inject::render_item_context(repo, &item, &branch);
         // skills are duckfs subtrees in every lane: resolve them against the
         // committed duckfs head exactly as the duckfs lane does (W2).

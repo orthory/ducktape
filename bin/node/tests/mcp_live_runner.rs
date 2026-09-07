@@ -26,7 +26,7 @@
 //! cargo test -p node-bin --test mcp_live_runner -- --ignored --nocapture
 //! ```
 //!
-//! keep the argv below in lockstep with `capability-host`'s claude spec — the
+//! keep the argv below in lockstep with `provider-host`'s claude spec — the
 //! test is worthless if it proves a different command line than the one
 //! production runs.
 

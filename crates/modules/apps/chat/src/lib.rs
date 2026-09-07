@@ -61,6 +61,10 @@ mod index_guest;
 
 use std::collections::BTreeSet;
 
+use identity::{
+    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
+    encode_query as identity_encode_query,
+};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -137,6 +141,15 @@ fn member_key(channel_id: &str, user: &[u8]) -> Vec<u8> {
     key
 }
 
+/// one creator's channel-creation counter — what [`MAX_CHANNELS_PER_CREATOR`]
+/// is checked against.
+fn creator_count_key(user: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9 + 8 + user.len());
+    key.extend_from_slice(b"chancount");
+    component(&mut key, user);
+    key
+}
+
 /// derive the message author from the dispatch origin — the only authorship
 /// path. the pre-consensus default `Origin::External(vec![])` must not pass as
 /// an authenticated user.
@@ -177,12 +190,10 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
 fn tag_author(author: &AuthorRef) -> tagging::Author {
     match author {
         AuthorRef::User(key) => tagging::Author::User(key.clone()),
-        AuthorRef::Agent { module, agent_id } => {
-            tagging::Author::Entity(tagging::EntityRef {
-                module: module.clone(),
-                entity: agent_id.clone(),
-            })
-        }
+        AuthorRef::Agent { module, agent_id } => tagging::Author::Entity(tagging::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
         AuthorRef::Module(module) => tagging::Author::Module(module.clone()),
         AuthorRef::System => tagging::Author::System,
     }
@@ -224,6 +235,10 @@ pub struct Chat {
     /// registries). the plane owns the loop rule and the subscription check;
     /// chat only translates its shapes at this edge.
     tagging: Option<ModuleId>,
+    /// the identity sibling `CreateDmChannel` resolves a creator's signing
+    /// key through (`OfKey`). `None` = no sibling on this host (tests,
+    /// minimal registries) — such a host refuses every `CreateDmChannel`.
+    identity: Option<ModuleId>,
 }
 
 impl Chat {
@@ -234,12 +249,19 @@ impl Chat {
             id: id.into(),
             staged: StagedStore::new(store),
             tagging: None,
+            identity: None,
         }
     }
 
     /// report every post to `tagging` as a [`tagging::TagEvent`].
     pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
         self.tagging = Some(tagging.into());
+        self
+    }
+
+    /// resolve `CreateDmChannel`'s creator through `identity`'s `OfKey`.
+    pub fn with_identity(mut self, identity: impl Into<ModuleId>) -> Self {
+        self.identity = Some(identity.into());
         self
     }
 
@@ -355,6 +377,31 @@ impl Chat {
         }
     }
 
+    /// one external user's standing in one channel, answered from chat's own
+    /// gates — [`ChatQuery::Access`]. a module that acts on a user's behalf
+    /// (automations firing that user's rule) asks HERE instead of re-deriving
+    /// the admission rule, because a second copy of it is a second rule.
+    /// an unknown channel answers `false` to both: the caller fails closed.
+    async fn channel_access(&self, channel_id: &str, user: &[u8]) -> Result<ChannelAccess, Error> {
+        let Some(channel) = self.channel(channel_id).await? else {
+            return Ok(ChannelAccess {
+                may_read: false,
+                may_post: false,
+            });
+        };
+        // reading is not policied per-message: an OPEN channel is readable by
+        // any authenticated user, a members-only one only by its members.
+        let is_open = matches!(channel.post_policy, PostPolicy::Open);
+        let may_read = is_open || self.is_member(channel_id, user).await?;
+        // the post answer is the post GATE, run verbatim — archival and policy
+        // included — so the two can never drift apart.
+        let may_post = self
+            .check_post_policy(&channel, &AuthorRef::User(user.to_vec()))
+            .await
+            .is_ok();
+        Ok(ChannelAccess { may_read, may_post })
+    }
+
     /// enforce the reserved channel-id namespace: ids containing ':' belong
     /// to modules, and a module may only mint ids under its own `"{module}:"`
     /// prefix (e.g. forge's per-issue discussion channels `forge:<repo>:<n>`),
@@ -437,10 +484,22 @@ impl Chat {
         Self::validate_non_empty("channel_id", &channel_id)?;
         Self::validate_non_empty("name", &name)?;
         Self::validate_channel_namespace(author, &channel_id)?;
+        // the `dm-` shape is reserved for `CreateDmChannel`, the only op that
+        // resolves a creator's OWN account and derives the id from it — a
+        // plain `CreateChannel` naming that shape is exactly the squat this
+        // gate closes (see the module doc on `CreateDmChannel`).
+        if client::is_derived_dm_channel(&channel_id) {
+            return Err(Error::Module(
+                "chat: dm- channel ids are reserved; open a DM with CreateDmChannel".into(),
+            ));
+        }
         if self.channel(&channel_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "channel already exists: {channel_id}"
             )));
+        }
+        if let AuthorRef::User(user) = author {
+            self.check_creator_cap(user).await?;
         }
 
         // a user-created channel is owned by its creator (only the owner may
@@ -466,7 +525,109 @@ impl Chat {
             &channel,
             MAX_CHANNEL_RECORD_BYTES,
             "channel",
-        )
+        )?;
+        if let AuthorRef::User(user) = author {
+            self.bump_creator_count(user).await?;
+        }
+        Ok(())
+    }
+
+    /// open the two-party DM room with `counterpart`: derive the id from the
+    /// SIGNING key's own identity account (never trusted from the payload) so
+    /// only one of the pair may ever mint it, always seat `MembersOnly`
+    /// regardless of what a squatter might otherwise request, and own it by
+    /// its creator like any other user-made channel.
+    async fn stage_dm_channel(
+        &mut self,
+        ctx: &dyn Ctx,
+        author: &AuthorRef,
+        counterpart: u64,
+        name: String,
+        created_at: u64,
+    ) -> Result<String, Error> {
+        let AuthorRef::User(user) = author else {
+            return Err(Error::Module(
+                "chat: a DM channel must be opened by a user".into(),
+            ));
+        };
+        Self::validate_non_empty("name", &name)?;
+        let creator = self.resolve_dm_creator(ctx, user).await?;
+        if creator == counterpart {
+            return Err(Error::Module(
+                "chat: a DM's two accounts must differ".into(),
+            ));
+        }
+        let channel_id = client::dm_channel_id(&creator.to_string(), &counterpart.to_string());
+        if self.channel(&channel_id).await?.is_some() {
+            return Err(Error::Module(format!(
+                "channel already exists: {channel_id}"
+            )));
+        }
+        self.check_creator_cap(user).await?;
+        let channel = Channel {
+            id: channel_id.clone(),
+            name,
+            created_at,
+            head_seq: 0,
+            post_policy: PostPolicy::MembersOnly,
+            hooks: Vec::new(),
+            pinned: Vec::new(),
+            huddle: Vec::new(),
+            owner: Some(user.clone()),
+            archived: false,
+        };
+        self.store_bounded(
+            channel_key(&channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )?;
+        self.bump_creator_count(user).await?;
+        Ok(channel_id)
+    }
+
+    /// the identity account `key` belongs to, through the ONE resolver
+    /// (`OfKey`) — a key of no account has no standing to open a DM.
+    async fn resolve_dm_creator(&self, ctx: &dyn Ctx, key: &[u8]) -> Result<u64, Error> {
+        let identity_id = self.identity.as_ref().ok_or_else(|| {
+            Error::Module("chat: this host has no identity sibling wired for DM channels".into())
+        })?;
+        let reply = ctx
+            .query(
+                identity_id,
+                &identity_encode_query(&IdentityQuery::OfKey { key: key.to_vec() }),
+            )
+            .await?;
+        match identity_decode_reply(&reply).map_err(Error::Module)? {
+            IdentityReply::Account(Some(account)) => Ok(account.number),
+            IdentityReply::Account(None) => Err(Error::Module(
+                "chat: this key belongs to no identity account".into(),
+            )),
+            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+                Err(Error::Module("chat: unexpected identity reply".into()))
+            }
+        }
+    }
+
+    /// refuse channel creation once `user` is at [`MAX_CHANNELS_PER_CREATOR`]
+    /// — there is no `DeleteChannel` op, so this is the only thing bounding
+    /// one account's share of the (permanent) channel set.
+    async fn check_creator_cap(&self, user: &[u8]) -> Result<(), Error> {
+        let count: u64 = self.load(&creator_count_key(user)).await?.unwrap_or(0);
+        if count as usize >= MAX_CHANNELS_PER_CREATOR {
+            return Err(Error::Module(format!(
+                "chat: you already have {MAX_CHANNELS_PER_CREATOR} channels open"
+            )));
+        }
+        Ok(())
+    }
+
+    /// record that `user` just created a channel — the counter
+    /// [`Self::check_creator_cap`] reads.
+    async fn bump_creator_count(&mut self, user: &[u8]) -> Result<(), Error> {
+        let count: u64 = self.load(&creator_count_key(user)).await?.unwrap_or(0);
+        self.store(creator_count_key(user), &(count + 1));
+        Ok(())
     }
 
     /// rename a channel. reuses `CreateChannel`'s name validation (non-empty +
@@ -885,7 +1046,10 @@ impl Chat {
         // idempotent: an unchanged membership stages nothing, so the qmdb op
         // log — and the root — is byte-identical to no write at all. the point
         // record is the policy read; the roster VIEW lives on the index tier.
-        let already_member = self.get_raw(&member_key(channel_id, &user)).await?.is_some();
+        let already_member = self
+            .get_raw(&member_key(channel_id, &user))
+            .await?
+            .is_some();
         if already_member == member {
             return Ok(());
         }
@@ -899,13 +1063,17 @@ impl Chat {
 
     /// join (or start) the channel's huddle. only external users may — the
     /// roster is a room of people, so module/system origins are rejected —
-    /// and members-only channels gate exactly like posting. re-joining with
-    /// the same node key stages nothing (idempotent, byte-identical op log).
+    /// and members-only channels gate exactly like posting. `node_proof` must
+    /// verify as `node`'s own signature over this join (proof of possession —
+    /// see [`interface::huddle_join_preimage`]), refused with
+    /// `huddle_node_proof_invalid` otherwise. re-joining with the same node
+    /// key stages nothing (idempotent, byte-identical op log).
     async fn stage_join_huddle(
         &mut self,
         author: AuthorRef,
         channel_id: &str,
         node: Vec<u8>,
+        node_proof: Vec<u8>,
         now: u64,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
@@ -919,6 +1087,10 @@ impl Chat {
                 "huddle node key must be {HUDDLE_NODE_KEY_BYTES} bytes, got {}",
                 node.len()
             )));
+        }
+        let preimage = huddle_join_preimage(channel_id, user);
+        if !keyscheme::KeyScheme::Ed25519.verify(&node, HUDDLE_JOIN_NS, &preimage, &node_proof) {
+            return Err(Error::Module("huddle_node_proof_invalid".into()));
         }
         let mut channel = self.require_channel(channel_id).await?;
         self.check_post_policy(&channel, &author).await?;
@@ -972,8 +1144,22 @@ impl Chat {
         )
     }
 
+    /// whether `actor` may evict `target` from `channel`'s huddle: the
+    /// channel's admin always may (`check_channel_admin` — the owner, or any
+    /// module/agent/system origin). a self-sweep is legitimate too, but it is
+    /// routed to `stage_leave_huddle` before this predicate ever runs, not
+    /// decided here. there is no third arm: `HuddleMember` carries only
+    /// `joined_at`, set once at join and never refreshed on liveness, so the
+    /// module holds no call-presence signal a staleness rule could read —
+    /// only the admin authority remains.
+    fn may_sweep(channel: &Channel, actor: &AuthorRef) -> bool {
+        Self::check_channel_admin(channel, actor).is_ok()
+    }
+
     /// evict `user` from the channel's huddle (staleness cleanup — see
-    /// `ChatMsg::SweepHuddle`). gated like posting; absent target = no-op.
+    /// `ChatMsg::SweepHuddle`). a poster naming themself is a leave in
+    /// disguise; naming anyone else is an admin-only eviction (`may_sweep`).
+    /// absent target = no-op either way.
     async fn stage_sweep_huddle(
         &mut self,
         author: AuthorRef,
@@ -981,13 +1167,20 @@ impl Chat {
         user: &[u8],
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
-        let AuthorRef::User(_) = &author else {
+        let AuthorRef::User(actor) = &author else {
             return Err(Error::Module(
                 "only external users may sweep a huddle".into(),
             ));
         };
+        if actor.as_slice() == user {
+            return self.stage_leave_huddle(author, channel_id).await;
+        }
         let mut channel = self.require_channel(channel_id).await?;
-        self.check_post_policy(&channel, &author).await?;
+        if !Self::may_sweep(&channel, &author) {
+            return Err(Error::Module(format!(
+                "only the channel admin may sweep another user's huddle entry in {channel_id}"
+            )));
+        }
         let before = channel.huddle.len();
         channel.huddle.retain(|m| m.user != user);
         if channel.huddle.len() == before {
@@ -1097,13 +1290,23 @@ impl Module for Chat {
                 self.stage_channel(&author, channel_id, name, post_policy, now)
                     .await
             }
+            ChatMsg::CreateDmChannel { counterpart, name } => {
+                let channel_id = self
+                    .stage_dm_channel(ctx, &author, counterpart, name, now)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::DmChannel { channel_id }));
+                Ok(())
+            }
             ChatMsg::RenameChannel { channel_id, name } => {
                 self.stage_rename(&author, &channel_id, name).await
             }
             ChatMsg::SetChannelArchived {
                 channel_id,
                 archived,
-            } => self.stage_set_archived(&author, &channel_id, archived).await,
+            } => {
+                self.stage_set_archived(&author, &channel_id, archived)
+                    .await
+            }
             ChatMsg::PostMessage {
                 channel_id,
                 message_id,
@@ -1230,8 +1433,13 @@ impl Module for Chat {
                 self.stage_membership(&author, &channel_id, user, member)
                     .await
             }
-            ChatMsg::JoinHuddle { channel_id, node } => {
-                self.stage_join_huddle(author, &channel_id, node, now).await
+            ChatMsg::JoinHuddle {
+                channel_id,
+                node,
+                node_proof,
+            } => {
+                self.stage_join_huddle(author, &channel_id, node, node_proof, now)
+                    .await
             }
             ChatMsg::LeaveHuddle { channel_id } => {
                 self.stage_leave_huddle(author, &channel_id).await
@@ -1256,6 +1464,9 @@ impl Module for Chat {
             ))),
             ChatQuery::Message { message_id } => Ok(encode_reply(&ChatReply::Message(
                 self.message_by_id(&message_id).await?,
+            ))),
+            ChatQuery::Access { channel_id, user } => Ok(encode_reply(&ChatReply::Access(
+                self.channel_access(&channel_id, &user).await?,
             ))),
         }
     }

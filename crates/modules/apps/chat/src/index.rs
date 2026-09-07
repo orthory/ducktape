@@ -522,6 +522,32 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 },
             )?;
         }
+        ChatMsg::CreateDmChannel {
+            counterpart: _,
+            name,
+        } => {
+            let ChatAssigned::DmChannel { channel_id } = decode_stamp(op)? else {
+                return Err(Fail::new(
+                    FAIL_ASSIGNED_DECODE,
+                    "applied CreateDmChannel carried a non-DmChannel stamp",
+                ));
+            };
+            let is_user = matches!(op.origin.kind, OriginKind::External);
+            let owner = is_user.then(|| op.origin.id.clone().unwrap_or_default());
+            put_channel(
+                &mut out,
+                &ChannelRow {
+                    id: channel_id,
+                    name,
+                    created_at: op.time,
+                    post_policy: PostPolicy::MembersOnly,
+                    owner,
+                    archived: false,
+                    hooks: Vec::new(),
+                    huddle: Vec::new(),
+                },
+            )?;
+        }
         ChatMsg::RenameChannel { channel_id, name } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
@@ -759,7 +785,9 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 index_guest::delete(&mut out, key);
             }
         }
-        ChatMsg::JoinHuddle { channel_id, node } => {
+        ChatMsg::JoinHuddle {
+            channel_id, node, ..
+        } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
@@ -1710,6 +1738,7 @@ mod tests {
             &ChatMsg::JoinHuddle {
                 channel_id: "g".into(),
                 node: vec![0xab; 32],
+                node_proof: vec![0; 64],
             },
         );
         let ChatViewReply::Channel(Some(info)) =

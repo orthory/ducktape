@@ -132,6 +132,11 @@ pub struct NatClient {
     coords: Vec<SocketAddr>,
     signer: ed25519::PrivateKey,
     cap: Option<CoordCap>,
+    /// `(minted_at, cookie)` — the last return-routability cookie this
+    /// client learned from a `BindResponse`, and when. `register`/`readvertise`
+    /// refresh it via [`Self::fresh_cookie`] once it ages past
+    /// [`COOKIE_REFRESH_SECS`], so neither pays a bind round trip on every call.
+    cookie: std::sync::Mutex<(u64, [u8; 32])>,
 }
 
 impl NatClient {
@@ -154,6 +159,7 @@ impl NatClient {
             coords,
             signer,
             cap,
+            cookie: std::sync::Mutex::new((0, [0u8; 32])),
         })
     }
 
@@ -176,6 +182,7 @@ impl NatClient {
             coords,
             signer,
             cap,
+            cookie: std::sync::Mutex::new((0, [0u8; 32])),
         })
     }
 
@@ -196,14 +203,22 @@ impl NatClient {
         self.sock.local_addr()
     }
 
-    pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
+    /// `BindRequest`/`BindResponse` round trip against `self.coord`: the
+    /// coordinator-observed reflexive AND the return-routability cookie a
+    /// first-seen/expired `Register`/`Readvertise` must echo (see
+    /// `auth::CookieKey`). `discover_reflexive` and `try_bind_cookie` both
+    /// bottom out here so neither duplicates the "only the coordinator's own
+    /// reply counts" check; both also cache the cookie via
+    /// [`Self::cache_cookie`], so a plain `discover_reflexive` call keeps
+    /// `register`/`readvertise` from re-binding right after.
+    async fn bind_cookie(&self) -> std::io::Result<(SocketAddr, [u8; 32])> {
         self.sock
             .send_to(
                 &self.authed(Msg::BindRequest { from: self.key }),
                 self.coord,
             )
             .await?;
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         loop {
             let (n, from) = self.sock.recv_from(&mut buf).await?;
             // Only the coordinator's own reply is trustworthy: anyone else
@@ -212,10 +227,61 @@ impl NatClient {
             if from != self.coord {
                 continue;
             }
-            if let Ok(Msg::BindResponse { reflexive }) = Msg::decode(&buf[..n]) {
-                return Ok(reflexive);
+            if let Ok(Msg::BindResponse { reflexive, cookie }) = Msg::decode(&buf[..n]) {
+                self.cache_cookie(cookie);
+                return Ok((reflexive, cookie));
             }
         }
+    }
+
+    pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
+        self.bind_cookie().await.map(|(reflexive, _)| reflexive)
+    }
+
+    /// Remember a cookie this client just learned from a `BindResponse`,
+    /// stamped with the current time so [`Self::fresh_cookie`] knows when to
+    /// mint a new one.
+    fn cache_cookie(&self, cookie: [u8; 32]) {
+        *self.cookie.lock().unwrap() = (now_secs(), cookie);
+    }
+
+    /// [`Self::bind_cookie`], but never worth blocking [`Self::register`] over:
+    /// a coordinator that never answers `BindRequest` (unreachable, or —
+    /// under `AuthPolicy::Private` — refusing an unadmitted caller) must not
+    /// hang the caller's `register`, which is otherwise a fire-and-forget
+    /// send. `None` on timeout or any transport error. The bound is generous
+    /// (well past a cross-continent RTT) because it is only paid once every
+    /// [`COOKIE_REFRESH_SECS`], not per call.
+    async fn try_bind_cookie(&self) -> Option<[u8; 32]> {
+        const AUTO_BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        tokio::time::timeout(AUTO_BIND_TIMEOUT, self.bind_cookie())
+            .await
+            .ok()?
+            .ok()
+            .map(|(_, cookie)| cookie)
+    }
+
+    /// The cookie a first-seen `Register`/`Readvertise` echoes, refreshed
+    /// only when stale. A cookie's own validity window is two minutes
+    /// (`CookieKey::verify` accepts the current or previous minute), so
+    /// refreshing well inside that — before every `register`/keepalive
+    /// `readvertise`, but only when the cached one has aged past
+    /// [`COOKIE_REFRESH_SECS`] — means the common case (a cookie already
+    /// cached from `discover_reflexive`/`discover_reflexive_failover` at
+    /// establishment) costs no extra round trip at all.
+    async fn fresh_cookie(&self) -> [u8; 32] {
+        const COOKIE_REFRESH_SECS: u64 = 50;
+        let stale = {
+            let (minted_at, _) = *self.cookie.lock().unwrap();
+            now_secs().saturating_sub(minted_at) >= COOKIE_REFRESH_SECS
+        };
+        if stale {
+            // `try_bind_cookie` already caches on success via `bind_cookie`;
+            // on timeout the stale cached cookie (possibly still [0u8; 32])
+            // is used as-is rather than blocking the caller any further.
+            self.try_bind_cookie().await;
+        }
+        self.cookie.lock().unwrap().1
     }
 
     /// Discover this node's reflexive address, trying each coordinator hint in
@@ -256,7 +322,8 @@ impl NatClient {
                     if from != c {
                         continue;
                     }
-                    if let Ok(Msg::BindResponse { reflexive }) = Msg::decode(&buf[..n]) {
+                    if let Ok(Msg::BindResponse { reflexive, cookie }) = Msg::decode(&buf[..n]) {
+                        self.cache_cookie(cookie);
                         return Ok::<SocketAddr, std::io::Error>(reflexive);
                     }
                 }
@@ -277,9 +344,25 @@ impl NatClient {
         ))
     }
 
+    /// Register this node's reflexive with the coordinator. A first-seen (or
+    /// expired) registration needs a return-routability cookie, so this
+    /// mints a fresh one with a bounded bind round trip first — bounded,
+    /// because `register` is otherwise fire-and-forget (it never used to
+    /// wait for anything), and a coordinator that never answers `BindRequest`
+    /// (unreachable, or refusing an unadmitted caller under
+    /// `AuthPolicy::Private`) must not turn that into an indefinite hang. A
+    /// same-source refresh of an already-live mapping ignores the cookie
+    /// entirely, so a timed-out bind costs that registration nothing.
     pub async fn register(&self) -> std::io::Result<()> {
+        let cookie = self.fresh_cookie().await;
         self.sock
-            .send_to(&self.authed(Msg::Register { key: self.key }), self.coord)
+            .send_to(
+                &self.authed(Msg::Register {
+                    key: self.key,
+                    cookie,
+                }),
+                self.coord,
+            )
             .await?;
         Ok(())
     }
@@ -290,13 +373,19 @@ impl NatClient {
     /// re-observes the datagram's NEW source and applies the nonce-staleness
     /// guard, so a replayed/reordered lower-or-equal nonce cannot supersede the
     /// fresh mapping — unlike `register`, whose nonce-0 baseline a stale
-    /// duplicate could otherwise roll back.
+    /// duplicate could otherwise roll back. Also carries a cookie: a
+    /// `Readvertise` for a key with no LIVE mapping needs one exactly like a
+    /// first-seen `Register` does (a keepalive of an already-live mapping
+    /// ignores it), which happens whenever this node's own registration aged
+    /// out before this keepalive caught up.
     pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
+        let cookie = self.fresh_cookie().await;
         self.sock
             .send_to(
                 &self.authed(Msg::Readvertise {
                     key: self.key,
                     nonce,
+                    cookie,
                 }),
                 self.coord,
             )
@@ -405,7 +494,7 @@ impl NatClient {
             };
             let from_coord = from == self.coord;
             match msg {
-                Msg::BindResponse { reflexive } if from_coord => {
+                Msg::BindResponse { reflexive, .. } if from_coord => {
                     return Ok(SocketEvent::Rendezvous(ClientEvent::BindResponse {
                         reflexive,
                     }));
@@ -1059,10 +1148,43 @@ mod tests {
             inner,
         }
         .encode_inline();
+        // Comfortably over the 4-worker bounded window (`AUTH_QUEUE_DEPTH` *
+        // workers, see `run_coordinator_workers_with_metrics`) so the flood
+        // still saturates it, without paying for 5000 ed25519 verifications
+        // the assertions never needed.
+        const FLOOD_SIZE: u64 = 1024;
         let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        for _ in 0..5_000 {
+        for _ in 0..FLOOD_SIZE {
             flood.send_to(&forged, coord_addr).await.unwrap();
         }
+
+        // Wait for the coordinator's OWN signal that the flood is drained,
+        // before sending anything valid. A back-to-back burst this size can
+        // outrun the destination socket's receive buffer even on loopback —
+        // some datagrams are legitimately dropped by the kernel before the
+        // coordinator ever reads them — so this waits for the received
+        // counter to stop growing (nothing left buffered) with nothing left
+        // inflight, rather than an exact count the flood may never reach.
+        let drained = timeout(Duration::from_secs(10), async {
+            let mut last_received = metrics.snapshot().received;
+            loop {
+                tokio::task::yield_now().await;
+                let snapshot = metrics.snapshot();
+                let quiesced = snapshot.inflight == 0 && snapshot.received == last_received;
+                last_received = snapshot.received;
+                if quiesced {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("coordinator drains the flood");
+        assert!(drained.received > 0, "flood reached the coordinator");
+        assert_eq!(
+            drained.rejected, drained.received,
+            "every forged datagram the coordinator received must be rejected"
+        );
+        assert!(drained.saturated != 0, "flood reached the bounded window");
 
         let valid_signer = ed25519::PrivateKey::from_seed(912);
         let valid_key = {
@@ -1073,35 +1195,14 @@ mod tests {
         let valid = NatClient::bind(valid_key, vec![coord_addr], valid_signer, None)
             .await
             .unwrap();
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if timeout(Duration::from_millis(100), valid.discover_reflexive())
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("valid requests recover after the flood");
+        timeout(Duration::from_secs(5), valid.discover_reflexive())
+            .await
+            .expect("valid requests recover after the flood")
+            .expect("discover_reflexive succeeds against a drained coordinator");
 
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let snapshot = metrics.snapshot();
-                if snapshot.rejected != 0 && snapshot.inflight == 0 {
-                    break snapshot;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map(|snapshot| {
-            assert!(snapshot.authenticated != 0);
-            assert!(snapshot.replies != 0);
-            assert!(snapshot.saturated != 0, "flood reached the bounded window");
-        })
-        .expect("coordinator drains its bounded queue after overload");
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.authenticated != 0);
+        assert!(snapshot.replies != 0);
 
         coordinator.abort();
         let _ = coordinator.await;
@@ -1366,7 +1467,11 @@ mod tests {
         let forged = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5555);
         forger
             .send_to(
-                &Msg::BindResponse { reflexive: forged }.encode(),
+                &Msg::BindResponse {
+                    reflexive: forged,
+                    cookie: [0u8; 32],
+                }
+                .encode(),
                 client_dst,
             )
             .await
@@ -1652,8 +1757,11 @@ mod tests {
     #[tokio::test]
     async fn wire_readvertise_supersedes_stale_mapping_over_the_real_udp_path() {
         // The nonce-gated rebind must be reachable over the LIVE protocol, not
-        // only via the in-process `Coordinator::readvertise` API: a rebound node
-        // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
+        // only via the in-process `Coordinator::readvertise` API: a member
+        // sends `Msg::Readvertise` over UDP and a peer re-resolves against it.
+        // A DIFFERENT socket's Readvertise for the same key — an on-path
+        // replay of a captured keepalive, or a genuine NAT rebind; the wire
+        // cannot tell them apart — must NOT hijack the live mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         tokio::spawn(run_coordinator(
@@ -1676,9 +1784,20 @@ mod tests {
             .expect("lookup a");
         assert_eq!(a_first.port(), a.local_addr().await.unwrap().port());
 
-        // A rebinds: model the fresh reflexive with a NEW socket, and republish it
-        // over the wire under a strictly-higher nonce. The coordinator observes
-        // the new socket's source and must supersede the stale mapping.
+        // A keepalives from its OWN socket under a higher nonce over the wire:
+        // the mapping's nonce advances, and B keeps resolving A's real socket.
+        a.readvertise(1).await.unwrap();
+        let a_second = timeout(Duration::from_secs(2), b.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup a after keepalive");
+        assert_eq!(
+            a_second.port(),
+            a_first.port(),
+            "the wire Readvertise superseded the stale nonce, not the source"
+        );
+
+        // A DIFFERENT socket sends a higher-nonce Readvertise for A's key.
         let a2 = NatClient::bind(a_key, vec![coord_addr], a_signer, None)
             .await
             .unwrap();
@@ -1686,28 +1805,55 @@ mod tests {
         assert_ne!(
             a2_port,
             a_first.port(),
-            "the rebound socket has a fresh port"
+            "a2 is a genuinely different socket"
         );
-        a2.readvertise(1).await.unwrap();
+        a2.readvertise(2).await.unwrap();
 
-        // B re-resolves and now sees A's NEW mapping, not the stale one. Poll to
-        // absorb cross-socket datagram-scheduling jitter (bounded).
-        let mut resolved = None;
-        for _ in 0..50 {
-            if let Ok(Ok(addr)) = timeout(Duration::from_millis(100), b.lookup(a_key)).await
-                && addr.port() == a2_port
-            {
-                resolved = Some(addr);
-                break;
+        // Poll to absorb cross-socket datagram-scheduling jitter (bounded): the
+        // lookup must keep resolving A's ORIGINAL socket, never a2's.
+        for _ in 0..20 {
+            if let Ok(Ok(addr)) = timeout(Duration::from_millis(100), b.lookup(a_key)).await {
+                assert_eq!(
+                    addr.port(),
+                    a_first.port(),
+                    "a different-source Readvertise must never hijack the live mapping"
+                );
             }
         }
-        let new = resolved.expect("B must re-resolve A's superseding mapping over the wire");
-        assert_eq!(new.port(), a2_port);
-        assert_ne!(
-            new.port(),
-            a_first.port(),
-            "the wire Readvertise superseded the stale mapping end-to-end"
-        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_after_cookie_ages_out_rebinds_and_stays_registered() {
+        // `fresh_cookie` only re-binds once the cached cookie is older than
+        // its refresh window; backdating the cached mint time (rather than a
+        // real 50s+ sleep) exercises that refresh path deterministically.
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
+
+        let (a_key, a) = public_client(15, vec![coord_addr]).await;
+        let (_, b) = public_client(16, vec![coord_addr]).await;
+        b.register().await.unwrap();
+
+        // Simulate an aged-out cookie cache: an ancient mint time, and a
+        // cookie value that would never verify for anything.
+        *a.cookie.lock().unwrap() = (0, [0u8; 32]);
+
+        // A's own registration is first-seen — its keepalive Readvertise
+        // needs a valid cookie exactly like a first-seen Register would. If
+        // the stale cache were reused as-is (never refreshed), the
+        // coordinator would refuse it and B's lookup below would resolve to
+        // nothing.
+        a.readvertise(1).await.unwrap();
+
+        let resolved = timeout(Duration::from_secs(2), b.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("the aged-out cookie was refreshed, so the readvertise registered A");
+        assert_eq!(resolved.port(), a.local_addr().await.unwrap().port());
     }
 
     #[tokio::test]
@@ -1872,6 +2018,7 @@ mod tests {
             .send_to(
                 &Msg::BindResponse {
                     reflexive: client_addr,
+                    cookie: [0u8; 32],
                 }
                 .encode(),
                 client_addr,

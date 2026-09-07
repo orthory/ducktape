@@ -58,11 +58,12 @@ pub fn founding_set() -> &'static str {
     })
 }
 
-/// the beat every harness node runs at (node.toml `block_time_ms`). the suites
-/// wait on block counts — checkpoints, epochs, finalization — so their
-/// wall-clock scales 1:1 with it, and every simplex timer scales with it too:
-/// the number is a policy choice for the whole lane, not a tuning of any one
-/// wait.
+/// the beat every harness network is FOUNDED at (`node init --block-time-ms`,
+/// which lands in the descriptor); a joiner inherits it off the invite and has
+/// no flag of its own. the suites wait on block counts — checkpoints, epochs,
+/// finalization — so their wall-clock scales 1:1 with it, and every simplex
+/// timer scales with it too: the number is a policy choice for the whole lane,
+/// not a tuning of any one wait.
 pub const TEST_BLOCK_TIME_MS: u64 = 100;
 
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
@@ -86,7 +87,7 @@ pub const TEST_BLOCK_TIME_MS: u64 = 100;
 /// process is gone. A LIVE pid is never touched (sibling test binaries run
 /// concurrently), and pid reuse only makes the sweep skip a directory — it can
 /// never make it delete a live one.
-fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
+pub fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
     sweep_abandoned_e2e_dirs();
     tempfile::Builder::new()
         .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
@@ -141,12 +142,14 @@ pub struct NodeProc {
     pub id: u64,
     child: Child,
     pub log: PathBuf,
+    /// what this process is, for a wait's panic message.
+    what: String,
     feed: Arc<OutputFeed>,
 }
 
 impl NodeProc {
     /// spawn `cmd` as process `id`, its output draining into `log` and the feed.
-    fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
+    pub fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
         let (reader, writer) = std::io::pipe().expect("pipe for the process output");
         let stderr = writer.try_clone().expect("clone the pipe's write end");
         let child = cmd
@@ -171,6 +174,7 @@ impl NodeProc {
             id,
             child,
             log,
+            what: what.to_string(),
             feed,
         }
     }
@@ -179,6 +183,44 @@ impl NodeProc {
     fn wait_marker(&self, marker: &str, deadline: Instant) -> Result<String, Unanswered> {
         self.feed
             .wait(deadline, |unseen| find_marker(unseen, marker))
+    }
+
+    /// block until ONE line carries EVERY needle, and answer with that line.
+    ///
+    /// Matches against [`strip_ansi`]ed text: a `key=value` needle can never
+    /// match the raw bytes, because the node's stderr colours every field name
+    /// and its `=` separately.
+    pub fn expect_line(&self, needles: &[&str], timeout: Duration) -> String {
+        self.expect_line_where(
+            &format!("one line carrying all of {needles:?}"),
+            timeout,
+            |line| needles.iter().all(|needle| line.contains(needle)),
+        )
+    }
+
+    /// block until an ANSI-stripped line satisfies `accept`, and answer with
+    /// that line; `wanted` names it in the panic when the process never does.
+    pub fn expect_line_where(
+        &self,
+        wanted: &str,
+        timeout: Duration,
+        accept: impl Fn(&str) -> bool,
+    ) -> String {
+        self.feed
+            .wait(Instant::now() + timeout, |unseen| {
+                strip_ansi(unseen)
+                    .lines()
+                    .find(|line| accept(line))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{} {} without printing {wanted};\n{}",
+                    self.what,
+                    why.verb(),
+                    self.tail(60)
+                )
+            })
     }
 
     /// which of `markers` a line carried first.
@@ -191,6 +233,25 @@ impl NodeProc {
         })
     }
 
+    /// block until `marker` has appeared at least `count` times in total.
+    ///
+    /// every offered slice is counted exactly once (the feed only ever
+    /// offers a line to a probe once — see `OutputFeed::wait`), so this
+    /// tallies markers across repeated wakes rather than re-scanning from
+    /// the top each time.
+    fn wait_marker_count(
+        &self,
+        marker: &str,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<usize, Unanswered> {
+        let mut seen = 0usize;
+        self.feed.wait(deadline, |unseen| {
+            seen += unseen.lines().filter(|line| line.contains(marker)).count();
+            (seen >= count).then_some(seen)
+        })
+    }
+
     /// block until the process closes its output — it exited — then reap it.
     fn wait_exit(&mut self, deadline: Instant) -> Result<std::process::ExitStatus, Unanswered> {
         self.feed.wait_closed(deadline)?;
@@ -200,6 +261,14 @@ impl NodeProc {
     /// everything the process has written so far.
     fn text(&self) -> String {
         self.feed.text()
+    }
+
+    /// how many lines printed so far contain `marker`.
+    fn marker_count(&self, marker: &str) -> usize {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(marker))
+            .count()
     }
 
     /// the last `lines` lines the process wrote.
@@ -667,8 +736,6 @@ impl NetworkShapeCluster {
                 // LIVE public coordinator from inside the test.
                 "--primary-coordinator",
                 "none",
-                "--block-time-ms",
-                &TEST_BLOCK_TIME_MS.to_string(),
             ])
             .output()
             .expect("run join")
@@ -922,6 +989,31 @@ impl NetworkShapeCluster {
             .unwrap_or_else(|why| {
                 panic!(
                     "network-shape node idx {idx} {} without printing {marker:?};\n{}",
+                    why.verb(),
+                    self.all_log_tails(60),
+                )
+            })
+    }
+
+    /// how many times node `idx` has printed `marker` so far.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
+    /// wait until node `idx` has printed `marker` at least `count` times.
+    pub fn wait_marker_count(
+        &self,
+        idx: usize,
+        marker: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker_count(marker, count, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "network-shape node idx {idx} {} before printing {marker:?} {count} times;\n{}",
                     why.verb(),
                     self.all_log_tails(60),
                 )
@@ -1511,6 +1603,13 @@ impl Cluster {
             })
     }
 
+    /// how many times node `idx` has printed `marker` so far — the ABSENCE
+    /// assertion `wait_marker` cannot express.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
     /// wait until node `idx`'s COMPUTE DAEMON prints a line containing `marker`.
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
@@ -1537,6 +1636,22 @@ impl Cluster {
                     daemon.tail(60),
                 )
             })
+    }
+
+    /// every value that followed `marker` on a line of node `idx`'s COMPUTE
+    /// DAEMON output, in the order the daemon printed them.
+    ///
+    /// unlike `wait_compute_marker` (blocks for the FIRST match) this reads
+    /// what the continuously-drained feed already holds: a fact this quick to
+    /// fire and this transient on disk — a run dir materializes and is
+    /// cleaned up inside one run — can only be witnessed as an event stream,
+    /// never a filesystem sample that might land between the create and the
+    /// cleanup. See `portable_workspace_e2e`'s `materialized_dirs`.
+    pub fn compute_markers(&self, idx: usize, marker: &str) -> Vec<String> {
+        let daemon = self.daemons[idx]
+            .as_ref()
+            .expect("node has a compute daemon (set `compute_grant` before spawn)");
+        extract_markers(&daemon.text(), marker)
     }
 
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
@@ -1941,7 +2056,10 @@ use nettest::alloc_ports;
 
 /// Wait until `probe` answers, re-evaluating it on each block wake from the
 /// node whose app surface listens on `http_port` — the one body behind both
-/// clusters' `await_committed`. `tails` renders the diagnosis on failure.
+/// clusters' `await_committed`. `tails` renders the diagnosis on failure,
+/// alongside the committed height at entry and at timeout: equal heights name
+/// a halt ("height did not move from H") instead of reading like a merely
+/// slow predicate.
 fn await_committed_on<T>(
     http_port: u16,
     idx: usize,
@@ -1956,11 +2074,21 @@ fn await_committed_on<T>(
         return value;
     }
     let mut blocks = block_feed_on(http_port, idx, timeout);
+    let height_at_entry = blocks.sync_height().ok();
     loop {
         if let Err(why) = blocks.next_block() {
+            let height_at_timeout = blocks.height();
+            let height_note = match (height_at_entry, height_at_timeout) {
+                (Some(entry), Some(timeout)) if entry == timeout => {
+                    format!("height did not move from {entry}")
+                }
+                _ => format!(
+                    "height was {height_at_entry:?} at entry, {height_at_timeout:?} at timeout"
+                ),
+            };
             panic!(
                 "timed out after {timeout:?} waiting for {what} \
-                 (via node idx {idx}): {why};\n{}",
+                 (via node idx {idx}): {why}; {height_note};\n{}",
                 tails()
             );
         }
@@ -1984,7 +2112,19 @@ fn block_feed_on(http_port: u16, idx: usize, timeout: Duration) -> BlockFeed {
     BlockFeed {
         socket,
         deadline: Instant::now() + timeout,
+        last_height: None,
     }
+}
+
+/// The committed height a `heartbeat` frame carries, or `None` for anything
+/// else on the wire (a control frame, or a frame this node never sends on an
+/// unsubscribed connection).
+fn heartbeat_height(text: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if value["type"] != "heartbeat" {
+        return None;
+    }
+    value["height"].as_u64()
 }
 
 /// A live feed of one node's heartbeat frames — the harness's wake seam for
@@ -1992,17 +2132,21 @@ fn block_feed_on(http_port: u16, idx: usize, timeout: Duration) -> BlockFeed {
 ///
 /// The node sends a `heartbeat` frame to every ws client on every block wake,
 /// nop fillers included, so an unsubscribed connection is already the changed
-/// feed (the compute daemon's own intake rides the same frame). Blocking on that
-/// socket means the thread wakes on the chain's own event and re-reads only when
-/// there is something new to read.
+/// feed (the compute daemon's own intake rides the same frame). Blocking on
+/// that socket means the thread wakes on the chain's own event and re-reads
+/// only when there is something new to read.
 ///
-/// **It is not purely event-driven, and the difference matters.**
-/// `crates/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
-/// `tokio::time::interval`, and nothing in the frame distinguishes the two — so
-/// this is a ≤3s poll that additionally wakes per block. What it buys over the
-/// 300ms client-side spin it replaces is real but bounded: it cannot fire early
-/// on a slow box, it re-reads only on the node's own schedule, and an idle chain
-/// costs nothing. Calling it "waits on events, never on time" would be false.
+/// **A `heartbeat` frame alone is not proof of that**, and the difference
+/// matters: `crates/noded/src/stream.rs` also emits a byte-identical
+/// `heartbeat` on a 3s `tokio::time::interval` regardless of progress, and
+/// nothing in the frame's shape distinguishes the two — only its `height`
+/// does. Reading every frame as a wake made a HALTED chain (stuck at the same
+/// height, ticking forever) indistinguishable from a merely slow predicate,
+/// since the 3s ticks kept `next_block` returning `Ok` with nothing new to
+/// show for it. This tracks the last height it saw and only reports a wake
+/// when that height MOVED; an unchanged-height tick is consumed as the
+/// liveness fallback it is — proof the connection is alive, not that a block
+/// committed — and looped past.
 ///
 /// The socket read timeout is the FAILURE path only — a node that has stopped
 /// sending anything must fail with a diagnosis rather than hang CI forever. No
@@ -2012,11 +2156,50 @@ pub struct BlockFeed {
         tokio_tungstenite::tungstenite::stream::MaybeTlsStream<TcpStream>,
     >,
     deadline: Instant,
+    /// the last committed height this feed observed, or `None` before its
+    /// first heartbeat. `next_block` reports a wake only on a change from
+    /// this.
+    last_height: Option<u64>,
 }
 
 impl BlockFeed {
-    /// Block until the node reports its next block wake.
+    /// The last committed height this feed observed — `None` before its
+    /// first heartbeat (see [`Self::sync_height`]).
+    pub fn height(&self) -> Option<u64> {
+        self.last_height
+    }
+
+    /// Establish the feed's baseline height, reading frames until the first
+    /// `heartbeat` arrives. A no-op once a height is already known: callers
+    /// that only care about the NEXT wake go straight to [`Self::next_block`],
+    /// which calls this itself.
+    pub fn sync_height(&mut self) -> Result<u64, String> {
+        if let Some(height) = self.last_height {
+            return Ok(height);
+        }
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err("no heartbeat received".into());
+            }
+            let frame = self
+                .socket
+                .read()
+                .map_err(|error| format!("block feed read failed: {error}"))?;
+            let Message::Text(text) = frame else { continue };
+            let Some(height) = heartbeat_height(&text) else {
+                continue;
+            };
+            self.last_height = Some(height);
+            return Ok(height);
+        }
+    }
+
+    /// Block until the node reports a committed height past the last one this
+    /// feed saw — a genuine block event, not merely a liveness tick at the
+    /// same height (see the type doc).
     pub fn next_block(&mut self) -> Result<(), String> {
+        let baseline = self.sync_height()?;
         use tokio_tungstenite::tungstenite::Message;
         loop {
             if Instant::now() >= self.deadline {
@@ -2033,13 +2216,42 @@ impl BlockFeed {
             // an unsubscribed connection carries heartbeats and nothing else,
             // but a control frame still has to be stepped over.
             let Message::Text(text) = frame else { continue };
-            let woke = serde_json::from_str::<serde_json::Value>(&text)
-                .is_ok_and(|value| value["type"] == "heartbeat");
-            if woke {
+            let Some(height) = heartbeat_height(&text) else {
+                continue;
+            };
+            self.last_height = Some(height);
+            if height != baseline {
                 return Ok(());
             }
         }
     }
+}
+
+/// Drop every ANSI escape sequence from `text`.
+///
+/// The node's stderr layer colours unconditionally — it never consults a tty —
+/// so a captured line reads `phase\x1b[0m\x1b[2m=\x1b[0m"serving"`, and any
+/// assertion on a `field=value` pair has to strip first. Message text is
+/// uncoloured, which is why the marker waits above never needed this.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI (`ESC [`) runs to a final byte in `@`..=`~`; any other escape is
+        // two characters, and its second one was just consumed.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn find_marker(text: &str, marker: &str) -> Option<String> {
@@ -2047,6 +2259,21 @@ fn find_marker(text: &str, marker: &str) -> Option<String> {
         line.find(marker)
             .map(|at| line[at + marker.len()..].trim().to_string())
     })
+}
+
+/// every value that followed `marker` on a line of `text`, ANSI-stripped
+/// first: unlike a message-only marker, `compute_markers` reads lines that
+/// can carry a coloured field list after the message (see `compute_markers`
+/// on `Cluster`), so slicing on the raw bytes risks handing back escape
+/// codes instead of the bare value.
+fn extract_markers(text: &str, marker: &str) -> Vec<String> {
+    strip_ansi(text)
+        .lines()
+        .filter_map(|line| {
+            line.find(marker)
+                .map(|at| line[at + marker.len()..].trim().to_string())
+        })
+        .collect()
 }
 
 fn log_tail(text: &str, lines: usize) -> String {
@@ -2186,6 +2413,12 @@ pub fn create_account(
         .number
 }
 
+/// the expiry every consent an e2e mints carries. `consensus_time` is the
+/// block height on a validator network, and a cluster test drives a few
+/// hundred blocks at most — so this is past every one of them and inside
+/// `identity::MAX_CONSENT_TTL` of each.
+pub const CONSENT_EXPIRES: u64 = 100_000;
+
 /// admit `new_key` into `member`'s account through node `idx`: `member`
 /// consents at `new_key`'s CURRENT generation, and the JOINING key signs the
 /// `AddKey` frame (the op's origin is the key being admitted). Waits until
@@ -2214,6 +2447,10 @@ pub fn add_key(
             &joining,
             generation,
             None,
+            account_of_key(cluster, idx, member.public_key().as_ref())
+                .expect("the consenting member belongs to an account")
+                .number,
+            CONSENT_EXPIRES,
         )),
     );
     cluster.await_committed(
@@ -2222,4 +2459,23 @@ pub fn add_key(
         USER_LANE_FINALIZE,
         || account_of_key(cluster, idx, &joining),
     )
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::extract_markers;
+
+    #[test]
+    fn extract_markers_strips_ansi_before_slicing() {
+        // shaped like a real fmt-layer capture: coloured level/target ANSI
+        // ahead of the message, then a trailing coloured field the message
+        // itself does not carry (e.g. another field on the same event).
+        // The marker sits in the plain-text message, but a naive byte slice
+        // to end-of-line would still hand back the trailing escape codes —
+        // extract_markers must return the bare path only.
+        let line = "\x1b[2m2026-09-05\x1b[0m \x1b[34mDEBUG\x1b[0m run dir materialized \
+                     kind=rw path=/tmp/run-1\x1b[2m note\x1b[0m\x1b[2m=\x1b[0mok";
+        let got = extract_markers(line, "run dir materialized kind=rw path=");
+        assert_eq!(got, vec!["/tmp/run-1 note=ok".to_string()]);
+    }
 }

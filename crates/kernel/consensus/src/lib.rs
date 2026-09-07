@@ -467,10 +467,12 @@ impl ConsensusHandle {
 /// which is what keeps the 1-tx-1-block regime dead without a timer. raising it
 /// slows the idle height tick 1:1.
 ///
-/// the cadence is per-node policy (node.toml `block_time_ms`), not part of
-/// agreement: every timer below is a fixed multiple of the beat, so a node on
-/// a faster beat keeps the one relation that matters — the node's heartbeat
-/// never outpaces the hold it lands in.
+/// the cadence is a NETWORK fact, not per-node policy: it is founded into the
+/// network descriptor (`network.toml` `block_time_ms`, inside the genesis
+/// fingerprint) and every member inherits it off the invite. it has to be —
+/// every timer below is a fixed multiple of the LOCAL beat, so the relation
+/// that keeps a view advancing by one finalized block (`leader_timeout` >=
+/// the leader's `idle_hold`) only holds while every member beats the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     pub block_time: std::time::Duration,
@@ -1035,28 +1037,31 @@ impl PayloadFetcher {
 /// the SYNC reporter (inside the engine task) inserts; the SYNC `poll_delivered`
 /// (in `OrderedNode`) takes.
 ///
-/// PRECONDITION: the reporter observes finalizations in ascending view order
-/// (true under perfect links — simplex finalizes views monotonically per node).
-/// the `BTreeMap` orders WITHIN one poll; the precondition is what makes the
-/// cross-poll order correct. `seen` makes application exactly-once even if a
-/// re-finalization race ever re-reports a digest — no watermark cursor (a
-/// cursor would silently drop a late lower view, a bug not robustness).
+/// the reporter does NOT observe finalizations in ascending view order: a
+/// mid-epoch joiner (or any lagging validator) sees the live tip FIRST and
+/// backfills the gap views below it. so the log is KEYED BY VIEW and the
+/// release walks it from its minimum upward — record order never reaches the
+/// host. `seen` makes application exactly-once even if a re-finalization race
+/// ever re-reports a digest — no watermark cursor (a cursor would silently
+/// drop a late lower view, a bug not robustness).
 #[derive(Clone, Default)]
 pub struct FinalizedInbox {
     inner: Arc<Mutex<FinalizedInner>>,
 }
 
-/// the dense-index ordered-release gate. the SYNC reporter records each
-/// finalization in ascending-view order onto `log`; a store HIT resolves its
-/// bytes into `ready` at once (the eager path), a MISS leaves the slot AWAITING an
-/// async resolver fetch that later calls [`FinalizedInbox::fill_fetched`]. `drain`
-/// releases the LONGEST all-ready PREFIX from the queue's front, so a slot still
-/// waiting on a fetch HALTS the prefix — everything behind it waits, never
-/// dropped, never reordered. `submit_at` applies in call order and the qmdb root
-/// is order-dependent, so this is what makes a fetched (late) op converge.
+/// the view-keyed ordered-release gate. the SYNC reporter records each
+/// finalization onto `log` UNDER ITS VIEW (in whatever order the engine
+/// reports it); a store HIT resolves its bytes into `ready` at once (the eager
+/// path), a MISS leaves the slot AWAITING an async resolver fetch that later
+/// calls [`FinalizedInbox::fill_fetched`]. `drain` releases the LONGEST
+/// all-ready prefix IN ASCENDING VIEW ORDER starting at the minimum unreleased
+/// view, so a slot still waiting on a fetch HALTS the release — everything
+/// above it waits, never dropped, never reordered. `submit_at` applies in call
+/// order and the qmdb root is order-dependent, so ascending release is what
+/// makes a fetched (late) op — and a backfilled view — converge.
 ///
 /// on an all-HIT (eager) node every slot is ready the instant it lands, so the
-/// prefix is always the whole log: behavior is byte-identical to a take-all drain
+/// release is the whole log: behavior is byte-identical to a take-all drain
 /// and every existing eager-path suite stays green. `seen` makes `record`
 /// exactly-once; `fill_fetched` is deliberately NOT seen-gated — it completes a
 /// slot `record` already logged. release pops the slot off the queue, so release
@@ -1075,10 +1080,11 @@ pub struct FinalizedInbox {
 /// re-finalization-race window.
 #[derive(Default)]
 struct FinalizedInner {
-    /// UNRELEASED committed digests in finalization (ascending-view) order — the
-    /// release order. released slots are popped off the front, so this only ever
-    /// holds the awaiting window, not all history.
-    log: VecDeque<(u64, Digest)>,
+    /// UNRELEASED committed digests KEYED BY FINALIZED VIEW — the map's own
+    /// ascending key order IS the release order, whatever order `record` saw
+    /// them in. released slots are removed, so this only ever holds the
+    /// awaiting window, not all history.
+    log: BTreeMap<u64, Digest>,
     /// resolved bytes per digest (store hit at `record`, or fetched later).
     /// entries leave on release, so this is bounded by the unreleased window.
     ready: HashMap<Digest, Vec<u8>>,
@@ -1104,7 +1110,7 @@ impl FinalizedInbox {
         Self::default()
     }
 
-    /// record a finalized `(view, digest)`. appends to the ordered log and, on a
+    /// record a finalized `(view, digest)`. logs it UNDER ITS VIEW and, on a
     /// store HIT, resolves its bytes now. returns `true` when the slot is left
     /// AWAITING a fetch (a store miss WITH the resolver enabled) so the caller
     /// issues `resolver.fetch(digest)`. a miss WITHOUT a resolver drops the slot
@@ -1123,18 +1129,33 @@ impl FinalizedInbox {
         // views are deliberately NOT asserted ascending here: a mid-epoch
         // joiner's (or any lagging validator's) engine reports the live tip
         // finalization FIRST and then backfills the gap views below it, so
-        // `record` legitimately sees descending views. that is safe
-        // downstream — the node's `drain_delivered` skips frames at or below
-        // its applied floor by agreed height, deterministically everywhere.
+        // `record` legitimately sees descending views. record ORDER never
+        // reaches the host — the log is keyed by view and `drain` releases
+        // from the minimum upward, identically on every validator.
+        //
+        // one view finalizes at most one digest (a second would need two
+        // conflicting quorums), so an occupied view is not a slot to
+        // overwrite — refuse it rather than silently dropping a finalization
+        // the release already owes.
+        let occupied_by_another = inner.log.get(&view).is_some_and(|d| *d != digest);
+        if occupied_by_another {
+            tracing::warn!(
+                target: "ducktape::consensus",
+                view,
+                reason = "view_already_finalized",
+                "refusing a second finalization digest at one view"
+            );
+            return false;
+        }
         if let Some(bytes) = store.get(&digest) {
-            inner.log.push_back((view, digest));
+            inner.log.insert(view, digest);
             inner.ready.insert(digest, bytes);
             // a ready slot landed — the release prefix may have grown.
             ping_wake(&inner);
             false
         } else if resolver_enabled {
             // miss: log the slot so it holds its place; the async fetch fills it.
-            inner.log.push_back((view, digest));
+            inner.log.insert(view, digest);
             true
         } else {
             // no resolver: nothing can ever resolve this digest — drop (old path).
@@ -1173,32 +1194,32 @@ impl FinalizedInbox {
     /// the lowest recorded-but-unreleased view (`None` when fully drained) —
     /// the RELEASE POINT a floor persistence checks a certificate against: a
     /// certificate whose view sits strictly below every unreleased slot has
-    /// everything at or below it released. a minimum (not the front) because
-    /// the log is record-ordered, and a backfilling node records descending
-    /// views.
+    /// everything at or below it released. the log is view-keyed, so this is
+    /// its first key — and it is exactly where the next [`FinalizedInbox::
+    /// drain`] starts releasing.
     pub fn min_unreleased_view(&self) -> Option<u64> {
         self.inner
             .lock()
             .expect("finalized inbox poisoned")
             .log
-            .iter()
-            .map(|(view, _)| *view)
-            .min()
+            .keys()
+            .next()
+            .copied()
     }
 
-    /// release the longest all-ready PREFIX of the log, in finalization
-    /// (ascending-view) order. a slot whose bytes have not resolved yet halts
-    /// the prefix; each released slot is POPPED off the queue so every frame
+    /// release the longest all-ready prefix IN ASCENDING VIEW ORDER, starting
+    /// at the minimum unreleased view. a slot whose bytes have not resolved
+    /// yet halts the release; each released slot is REMOVED so every frame
     /// emits exactly once and the log stays bounded by the awaiting window.
     /// non-blocking.
     fn drain(&self) -> Vec<(u64, Vec<u8>)> {
         let mut inner = self.inner.lock().expect("finalized inbox poisoned");
         let mut out = Vec::new();
-        while let Some(&(view, digest)) = inner.log.front() {
+        while let Some((&view, &digest)) = inner.log.first_key_value() {
             match inner.ready.remove(&digest) {
                 Some(bytes) => {
                     out.push((view, bytes));
-                    inner.log.pop_front();
+                    inner.log.remove(&view);
                 }
                 None => break,
             }
@@ -2298,6 +2319,54 @@ mod tests {
         inbox.record(5, digest_of(b"tip first"), &store, true);
         inbox.record(3, digest_of(b"backfill below it"), &store, true);
         assert_eq!(inbox.min_unreleased_view(), Some(3));
+    }
+
+    #[test]
+    fn drain_releases_a_backfilled_view_before_the_tip_recorded_first() {
+        // the same tip-then-backfill order the min-view test uses, with BOTH
+        // bytes in the store. release order must be the AGREED view order
+        // (3 then 5), never the record order — the host applies in call order
+        // and the qmdb root is op-log-order-dependent, so a descending release
+        // forks this node's root against every peer that applied 3 then 5.
+        let store = ContentStore::new();
+        let tip = store.put(b"view 5 tip".to_vec());
+        let backfill = store.put(b"view 3 backfill".to_vec());
+        let inbox = FinalizedInbox::new();
+        assert!(!inbox.record(5, tip, &store, false));
+        assert!(!inbox.record(3, backfill, &store, false));
+        assert_eq!(
+            inbox.drain(),
+            vec![
+                (3, b"view 3 backfill".to_vec()),
+                (5, b"view 5 tip".to_vec()),
+            ],
+        );
+        assert!(inbox.drain().is_empty(), "released slots are removed");
+        assert_eq!(inbox.min_unreleased_view(), None);
+    }
+
+    #[test]
+    fn an_unready_low_view_halts_the_release_of_a_ready_higher_one() {
+        // a backfilled view still AWAITING its fetch must hold everything
+        // above it: releasing view 5 now and view 3 later is the same fork.
+        let store = ContentStore::new();
+        let tip = store.put(b"view 5 tip".to_vec());
+        let missing = digest_of(b"view 3 not in the store");
+        let inbox = FinalizedInbox::new();
+        assert!(!inbox.record(5, tip, &store, true));
+        assert!(
+            inbox.record(3, missing, &store, true),
+            "a store miss with a resolver leaves the slot awaiting"
+        );
+        assert!(
+            inbox.drain().is_empty(),
+            "the unready minimum view halts the release"
+        );
+        inbox.fill_fetched(missing, b"view 3 fetched".to_vec());
+        assert_eq!(
+            inbox.drain(),
+            vec![(3, b"view 3 fetched".to_vec()), (5, b"view 5 tip".to_vec()),],
+        );
     }
 
     #[test]

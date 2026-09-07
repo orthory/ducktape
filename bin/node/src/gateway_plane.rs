@@ -7,8 +7,9 @@
 //! audience/method/body/header policy, and only then touches DuckFS or one
 //! exact node-local loopback upstream.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -32,9 +33,87 @@ const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// emits events/keepalives well inside this; a silent-forever upstream would
 /// otherwise pin its accept permit (16 total) and its serve task for good.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Two-way silence that ends a bridged WebSocket. Nothing else bounds one: a
+/// socket lives until a peer closes it, and an idle bridge otherwise parks its
+/// upgrade permit and both pump tasks for good.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ERROR_BYTES: usize = 512;
+/// One-shot HTTP exchanges either half runs at once.
+const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// Live WebSocket bridges either half runs at once. A SEPARATE budget: an
+/// upgrade holds its permit for the socket's whole life, so sharing the
+/// request budget lets a handful of idle sockets starve every gateway request
+/// on the node — the airlock broker's credential relay included.
+const MAX_CONCURRENT_UPGRADES: usize = 64;
+/// Response bodies draining to a peer at once. A THIRD budget, for the same
+/// reason upgrades have their own: a drain lives as long as the peer keeps
+/// reading, so charging it to the request budget lets 16 peers that never read
+/// starve every gateway request on the node.
+const MAX_CONCURRENT_STREAMS: usize = 64;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
+
+/// The plane's three concurrency budgets, held by both halves. They are
+/// separate on purpose, because each permit has a different life: a request
+/// permit ends at the response head, a stream permit at the last body frame,
+/// an upgrade permit at socket close. One budget for all three lets bodies
+/// nobody reads and sockets nobody closes starve every gateway request on the
+/// node. A request QUEUES for its permit, with a deadline; a stream or an
+/// upgrade is REFUSED, because queueing behind work that may never finish is a
+/// hang.
+struct GatewayBudget {
+    requests: Arc<tokio::sync::Semaphore>,
+    streams: Arc<tokio::sync::Semaphore>,
+    upgrades: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatewayBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            streams: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
+        })
+    }
+
+    /// Queue for a request permit, but only for [`PROXY_IO_TIMEOUT`]: a queued
+    /// request that ages out in the caller is indistinguishable from a hung
+    /// node, so the wait is bounded and the refusal is named.
+    async fn admit_request(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(PROXY_IO_TIMEOUT, Arc::clone(&self.requests).acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    fn admit_stream(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.streams).try_acquire_owned().ok()
+    }
+
+    fn admit_upgrade(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.upgrades).try_acquire_owned().ok()
+    }
+}
+
+/// The request permit a serve task holds, plus the budget it swaps that permit
+/// into a stream permit on at the response head. The swap is the point: the
+/// request budget then covers only the deadline-bound work up to the head, and
+/// the unbounded-in-length drain is charged to the stream budget instead.
+struct RequestSlot {
+    budget: Arc<GatewayBudget>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl RequestSlot {
+    /// Trade the request permit for a stream permit, or `None` when the stream
+    /// budget is full — the head has not been written yet, so the caller can
+    /// still answer with a clean refusal.
+    fn into_stream_permit(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let stream = self.budget.admit_stream()?;
+        drop(self.permit);
+        Some(stream)
+    }
+}
 
 pub struct SpawnConfig {
     pub label: String,
@@ -97,18 +176,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let commands = commands.clone();
         let client_workspace = workspace.clone();
         let client_ports = node_api_ports.clone();
-        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let budget = GatewayBudget::new();
         tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
-                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-                    return;
-                };
                 let slot = Arc::clone(&slot);
                 let commands = commands.clone();
                 let workspace = client_workspace.clone();
                 let node_api_ports = client_ports.clone();
+                let budget = Arc::clone(&budget);
                 tokio::spawn(async move {
-                    let _permit = permit;
                     match job {
                         GatewayJob::Http {
                             publisher_node,
@@ -117,6 +193,21 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             body,
                             reply,
                         } => {
+                            // The permit is taken HERE, not in the recv loop:
+                            // the loop must keep draining the lane, or a full
+                            // budget wedges every `lane.send` behind it.
+                            let Some(_permit) = budget.admit_request().await else {
+                                tracing::warn!(
+                                    target: "ducktape::gateway",
+                                    reason = "request_budget_full",
+                                    open = MAX_CONCURRENT_REQUESTS,
+                                    "gateway request refused"
+                                );
+                                let _ = reply.send(Err(GatewayFailure::Unavailable(
+                                    "gateway request budget is full".into(),
+                                )));
+                                return;
+                            };
                             // The deadline covers everything up to the response
                             // HEAD; the body streams beyond it (WS precedent).
                             let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
@@ -142,6 +233,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                             &own_node,
                                             head_for_server,
                                             Some(body_for_server),
+                                            None,
                                             server_end,
                                         )
                                         .await;
@@ -174,6 +266,19 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             to_browser,
                             from_browser,
                         } => {
+                            // Its own budget, and the (N+1)th is REFUSED, not
+                            // queued: a queued upgrade would wait on sockets
+                            // that may never close.
+                            let Some(_permit) = budget.admit_upgrade() else {
+                                tracing::warn!(
+                                    target: "ducktape::gateway",
+                                    reason = "upgrade_budget_full",
+                                    open = MAX_CONCURRENT_UPGRADES,
+                                    "gateway upgrade refused"
+                                );
+                                let _ = to_browser.send(noded::GatewayWsMsg::Close(1013)).await;
+                                return;
+                            };
                             if publisher_node == own_node {
                                 // Loopback: pipe our own serve_ws to the caller
                                 // pump over a local duplex.
@@ -240,19 +345,19 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         planes.register("gateway", Service::Gateway, plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
-        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let budget = GatewayBudget::new();
         loop {
             let Some((requester, hello, mut stream)) = service.accept().await else {
-                return;
-            };
-            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                 return;
             };
             let commands = commands.clone();
             let workspace = workspace.clone();
             let node_api_ports = node_api_ports.clone();
+            let budget = Arc::clone(&budget);
+            // Mirrors the client lane: which budget a stream draws on is only
+            // knowable after its head decodes, so the permit is taken inside
+            // the task and the accept loop keeps draining.
             tokio::spawn(async move {
-                let _permit = permit;
                 if hello.intent != gateway::PROXY_INTENT {
                     let _ = write_proxy_response(
                         &mut stream,
@@ -280,10 +385,55 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
+                    let Some(_permit) = budget.admit_upgrade() else {
+                        tracing::warn!(
+                            target: "ducktape::gateway",
+                            reason = "upgrade_budget_full",
+                            open = MAX_CONCURRENT_UPGRADES,
+                            "inbound gateway upgrade refused"
+                        );
+                        let _ = write_proxy_response(
+                            &mut stream,
+                            Err(GatewayFailure::Unavailable(
+                                "gateway upgrade budget is full".into(),
+                            )),
+                        )
+                        .await;
+                        return;
+                    };
                     serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                     return;
                 }
-                serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
+                let Some(permit) = budget.admit_request().await else {
+                    tracing::warn!(
+                        target: "ducktape::gateway",
+                        reason = "request_budget_full",
+                        open = MAX_CONCURRENT_REQUESTS,
+                        "inbound gateway request refused"
+                    );
+                    let _ = write_proxy_response(
+                        &mut stream,
+                        Err(GatewayFailure::Unavailable(
+                            "gateway request budget is full".into(),
+                        )),
+                    )
+                    .await;
+                    return;
+                };
+                let slot = RequestSlot {
+                    budget: Arc::clone(&budget),
+                    permit,
+                };
+                serve_proxy_stream(
+                    &commands,
+                    &scope,
+                    &requester.0,
+                    head,
+                    None,
+                    Some(slot),
+                    stream,
+                )
+                .await;
             });
         }
     });
@@ -338,14 +488,18 @@ struct LoopbackScope<'a> {
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
-/// stream (overlay). The deadline covers the body read + serve up to the
-/// response HEAD; the body drain streams beyond it.
+/// stream (overlay). `slot`: the request permit this exchange holds, swapped
+/// for a stream permit at the response head; `None` on the self-serve server
+/// side, whose caller holds the permit for the exchange. The deadline covers
+/// the body read + serve up to the response HEAD; the drain past it is bounded
+/// per frame instead, by [`write_proxy_response`].
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<Vec<u8>>,
+    slot: Option<RequestSlot>,
     mut stream: S,
 ) {
     let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
@@ -371,7 +525,41 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             "gateway proxy request timed out".into(),
         ))
     });
+    let (outcome, _drain_permit) = charge_drain(outcome, slot);
     let _ = write_proxy_response(&mut stream, outcome).await;
+}
+
+/// Swap the serve task's request permit for a stream permit before the head
+/// goes out. A response with no permit to swap (the self-serve server side)
+/// drains unbudgeted; a full stream budget replaces the response with a
+/// refusal, which is still clean because the head has not been written yet.
+fn charge_drain(
+    outcome: Result<GatewayResponse, GatewayFailure>,
+    slot: Option<RequestSlot>,
+) -> (
+    Result<GatewayResponse, GatewayFailure>,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    match (outcome, slot) {
+        (Ok(response), Some(slot)) => match slot.into_stream_permit() {
+            Some(permit) => (Ok(response), Some(permit)),
+            None => {
+                tracing::warn!(
+                    target: "ducktape::gateway",
+                    reason = "stream_budget_full",
+                    open = MAX_CONCURRENT_STREAMS,
+                    "gateway response drain refused"
+                );
+                (
+                    Err(GatewayFailure::Unavailable(
+                        "gateway stream budget is full".into(),
+                    )),
+                    None,
+                )
+            }
+        },
+        (outcome, _) => (outcome, None),
+    }
 }
 
 /// Read the response head, then hand the stream to the body pump. Returns AT
@@ -438,18 +626,7 @@ async fn serve_current(
             "gateway proxy: request body length mismatch".into(),
         ));
     }
-    let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != scope.own_node {
-        return Err(GatewayFailure::Forbidden(
-            "gateway request does not name this publisher".into(),
-        ));
-    }
-    if !gateway::request_matches_record(head, &record) {
-        return Err(GatewayFailure::Conflict(
-            "gateway request does not match the current signed route".into(),
-        ));
-    }
-    revalidate_route_authority(commands, &record).await?;
+    let record = current_route(commands, scope.own_node, head).await?;
     let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
@@ -462,13 +639,36 @@ async fn serve_current(
         ));
     }
     match &route.target {
-        gateway::RouteTarget::DuckFs { .. } => {
-            serve_duckfs(commands, scope.own_node, head, &record).await
-        }
+        gateway::RouteTarget::DuckFs { .. } => serve_duckfs(commands, head, &record).await,
         gateway::RouteTarget::LoopbackHttp => {
             proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
     }
+}
+
+/// The caller-independent half of the gate: the route still resolves (a
+/// tombstone does not), still names THIS node as its publisher, still matches
+/// the head the caller signed for, and its signer is still a member of the
+/// account with a verifying signature. Every request re-runs it, and so does a
+/// live WebSocket bridge on its re-authorization tick.
+async fn current_route(
+    commands: &mpsc::Sender<NodeCommand>,
+    own_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+) -> Result<gateway::RouteRecord, GatewayFailure> {
+    let record = resolve_route(commands, head.account_id, &head.name).await?;
+    if record.statement.publisher_node.as_slice() != own_node {
+        return Err(GatewayFailure::Forbidden(
+            "gateway request does not name this publisher".into(),
+        ));
+    }
+    if !gateway::request_matches_record(head, &record) {
+        return Err(GatewayFailure::Conflict(
+            "gateway request does not match the current signed route".into(),
+        ));
+    }
+    revalidate_route_authority(commands, &record).await?;
+    Ok(record)
 }
 
 async fn resolve_route(
@@ -644,14 +844,29 @@ async fn revalidate_route_authority(
 /// the reply detail and the log reason alike.
 const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
 
+/// the refusal a record earns when the label IS bound here — for someone
+/// else's account. A stable token, the reply detail and the log reason alike.
+const ROUTE_ACCOUNT_MISMATCH: &str = "route_account_mismatch";
+
 /// Resolve a loopback route's upstream port — the ONE seam both the HTTP
-/// proxy and the WebSocket upgrade dial through. A loopback route may name
-/// any local daemon EXCEPT this node's own surfaces: proxying the mesh into
-/// `/v1` (or upgrading into `/v1/ws/...`) hands every member this node's
-/// unauthenticated API (submit as this node, mint invites, log-filter).
+/// proxy and the WebSocket upgrade dial through.
+///
+/// Keyed on `(account, label)`, never the label alone: consensus lets ANY
+/// account publish a route naming ANY node as its publisher (the module says
+/// so outright), so a label-only lookup lets a member republish a label this
+/// operator bound, under their own account with an audience, method set and
+/// `allow_authorization` of their choosing, and reach the port bound for
+/// someone else. The bind IS the consent, and the account it was bound for is
+/// the half of the key that carries it.
+///
+/// A loopback route may name any local daemon EXCEPT this node's own surfaces:
+/// proxying the mesh into `/v1` (or upgrading into `/v1/ws/...`) hands every
+/// member this node's unauthenticated API (submit as this node, mint invites,
+/// log-filter).
 fn loopback_port(
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
+    account: u64,
     head: &gateway::ProxyRequestHead,
 ) -> Result<u16, GatewayFailure> {
     // one process-wide latch keyed on the cause: a flood from one route hides
@@ -660,9 +875,26 @@ fn loopback_port(
     static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     let routes =
         crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
+    let Some(port) = routes.port(account, &head.name) else {
+        if !routes.bound_for_another_account(account, &head.name) {
+            return Err(GatewayFailure::NotFound(
+                "global gateway route has no local loopback upstream".into(),
+            ));
+        }
+        if let Some(attempts) = REFUSED.hit(ROUTE_ACCOUNT_MISMATCH) {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                caller = %hex_bytes(caller_node),
+                route = %head.name.local_key(),
+                account,
+                upgrade = head.upgrade,
+                reason = ROUTE_ACCOUNT_MISMATCH,
+                attempts,
+                "gateway route REFUSED — this node bound that label for another account"
+            );
+        }
+        return Err(GatewayFailure::Forbidden(ROUTE_ACCOUNT_MISMATCH.into()));
+    };
     let targets_node_api = scope.node_api_ports.contains(&port);
     if !targets_node_api {
         return Ok(port);
@@ -694,7 +926,7 @@ async fn proxy_loopback(
         .route
         .as_ref()
         .expect("current route is live");
-    let port = loopback_port(scope, caller_node, head)?;
+    let port = loopback_port(scope, caller_node, record.statement.account_id, head)?;
     // Connect + per-read deadlines only: a TOTAL timeout would kill long
     // streamed (SSE) bodies, but a silent-forever upstream must not pin its
     // accept permit — the idle read timeout reclaims it. The head is still
@@ -875,18 +1107,167 @@ async fn proxy_loopback(
 /// (≤ 64 MiB) is assembled across windows.
 const READ_WINDOW: u64 = 1024 * 1024;
 
-fn gateway_path(own_node: &[u8; 32], label: &str, relative: &str) -> String {
+/// Where a content route's bytes live — in the route OWNER's own DuckFS home,
+/// keyed by `label`. The route's `MemberAuthorization.signer` is the exact
+/// member key of the statement's account that vouched for it, so its actor
+/// string (`sdk::Origin::External(signer).actor_string()`, i.e.
+/// `ext:<hex(signer)>`) is the one home tree `files`' `check_authority`
+/// already lets that same key write through an ordinary wallet-signed
+/// `ducktape fs` op — no other actor (in particular not this node's own
+/// consensus key) can ever write there. `label` scopes multiple routes signed
+/// by the same key.
+fn gateway_path(owner_signer: &[u8], label: &str, relative: &str) -> String {
     format!(
-        "/home/ext:{}/.duck/gateway/{}/{}",
-        hex_bytes(own_node),
-        label,
-        relative
+        "/home/{}/.duck/gateway/{label}/{relative}",
+        sdk::Origin::External(owner_signer.to_vec()).actor_string(),
     )
+}
+
+/// Repeated requests at an unchanged DuckFS head never need to re-read and
+/// re-hash the manifest: `manifest_sha256` is the route's signed content
+/// identity (two reads that verify against it always see byte-identical
+/// bytes), so once a lookup for (route, head, path) has been verified it
+/// stays correct until the head moves — the route component is the signed
+/// hash itself, not the owner/label used only to locate the DuckFS bytes, so
+/// a route republished under a new manifest (a new hash) cannot hit a stale
+/// entry left by the old one. Keyed by the request path rather than the
+/// resolved content path so a cache hit skips `manifest_file_for_path` too.
+/// Bounded with oldest-first eviction; a moved head is simply a new key, so
+/// nothing needs a timer or explicit invalidation.
+const MANIFEST_CACHE_CAP: usize = 4096;
+
+type ManifestCacheKey = (String, String, String);
+
+#[derive(Default)]
+struct ManifestCache {
+    entries: HashMap<ManifestCacheKey, gateway::ContentFile>,
+    order: VecDeque<ManifestCacheKey>,
+}
+
+impl ManifestCache {
+    fn insert(&mut self, key: ManifestCacheKey, file: gateway::ContentFile) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+            if self.order.len() > MANIFEST_CACHE_CAP
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, file);
+    }
+}
+
+static MANIFEST_CACHE: LazyLock<Mutex<ManifestCache>> =
+    LazyLock::new(|| Mutex::new(ManifestCache::default()));
+
+/// Resolve the manifest entry for `path_and_query`, reading and verifying the
+/// manifest only on a cache miss.
+async fn resolve_content_file(
+    commands: &mpsc::Sender<NodeCommand>,
+    owner_signer: &[u8],
+    label: &str,
+    manifest_sha256: &str,
+    snapshot: &duckfs_core::DigestHex,
+    path_and_query: &str,
+    max_response_bytes: u64,
+) -> Result<gateway::ContentFile, GatewayFailure> {
+    let cache_key = (
+        manifest_sha256.to_string(),
+        snapshot.clone(),
+        path_and_query.to_string(),
+    );
+    if let Some(file) = MANIFEST_CACHE
+        .lock()
+        .expect("manifest cache poisoned")
+        .entries
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(file);
+    }
+
+    // The manifest is a DuckFS file addressed by the signed hash: read it,
+    // verify the exact bytes, then trust its file table.
+    let manifest_bytes = read_duckfs_file(
+        commands,
+        &gateway_path(owner_signer, label, gateway::MANIFEST_FILE),
+        snapshot,
+        gateway::MAX_MANIFEST_BYTES,
+    )
+    .await?;
+    if hex_bytes(&Sha256::digest(&manifest_bytes)) != *manifest_sha256 {
+        return Err(GatewayFailure::Forbidden(
+            "manifest does not match the signed hash".into(),
+        ));
+    }
+    let manifest: gateway::RouteManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
+        })?;
+    gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
+
+    let file = gateway::manifest_file_for_path(&manifest, path_and_query)
+        .map_err(GatewayFailure::NotFound)?
+        .clone();
+    // Serve-time cap: the file table is off consensus, so the signed response
+    // cap is enforced here rather than at admission.
+    if file.size > max_response_bytes {
+        return Err(GatewayFailure::Forbidden(
+            "file exceeds the signed response cap".into(),
+        ));
+    }
+    MANIFEST_CACHE
+        .lock()
+        .expect("manifest cache poisoned")
+        .insert(cache_key, file.clone());
+    Ok(file)
+}
+
+/// `*` or an exact quoted match against `etag`, per RFC 7232 §3.2's
+/// comma-separated list — content routes only ever emit strong validators, so
+/// no weak-comparison handling is needed.
+fn if_none_match_hits(header_value: &str, etag: &str) -> bool {
+    header_value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate == etag)
+}
+
+fn content_type_header(file: &gateway::ContentFile) -> gateway::ProxyHeader {
+    gateway::ProxyHeader {
+        name: "content-type".into(),
+        value: file.mime.clone(),
+    }
+}
+
+fn etag_header(etag: &str) -> gateway::ProxyHeader {
+    gateway::ProxyHeader {
+        name: "etag".into(),
+        value: etag.to_string(),
+    }
+}
+
+fn build_response_head(
+    status: u16,
+    headers: Vec<gateway::ProxyHeader>,
+) -> Result<gateway::ProxyResponseHead, GatewayFailure> {
+    let head = gateway::ProxyResponseHead { status, headers };
+    gateway::validate_response_head(&head).map_err(GatewayFailure::Unavailable)?;
+    Ok(head)
+}
+
+fn empty_gateway_response(
+    status: u16,
+    headers: Vec<gateway::ProxyHeader>,
+) -> Result<GatewayResponse, GatewayFailure> {
+    let head = build_response_head(status, headers)?;
+    let (_tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
+    Ok(GatewayResponse { head, body: rx })
 }
 
 async fn serve_duckfs(
     commands: &mpsc::Sender<NodeCommand>,
-    own_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
@@ -910,44 +1291,42 @@ async fn serve_duckfs(
         ));
     }
     let label = head.name.local_key();
+    let owner_signer = record.authorization.signer.as_slice();
     // Pin one DuckFS snapshot across the manifest read and the file read so a
     // publisher-local mutation cannot race them.
     let snapshot = duckfs_head(commands).await?;
 
-    // The manifest is a DuckFS file addressed by the signed hash: read it,
-    // verify the exact bytes, then trust its file table.
-    let manifest_bytes = read_duckfs_file(
+    let file = resolve_content_file(
         commands,
-        &gateway_path(own_node, label, gateway::MANIFEST_FILE),
+        owner_signer,
+        label,
+        manifest_sha256,
         &snapshot,
-        gateway::MAX_MANIFEST_BYTES,
+        &head.path_and_query,
+        route.policy.max_response_bytes,
     )
     .await?;
-    if hex_bytes(&Sha256::digest(&manifest_bytes)) != *manifest_sha256 {
-        return Err(GatewayFailure::Forbidden(
-            "manifest does not match the signed hash".into(),
-        ));
-    }
-    let manifest: gateway::RouteManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|error| {
-            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
-        })?;
-    gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
+    let etag = format!("\"{}\"", file.sha256);
+    let etag_matches = gateway::header_value(&head.headers, "if-none-match")
+        .is_some_and(|value| if_none_match_hits(value, &etag));
 
-    let file = gateway::manifest_file_for_path(&manifest, &head.path_and_query)
-        .map_err(GatewayFailure::NotFound)?;
-    // Serve-time cap: the file table is off consensus, so the signed response
-    // cap is enforced here rather than at admission.
-    if file.size > route.policy.max_response_bytes {
-        return Err(GatewayFailure::Forbidden(
-            "file exceeds the signed response cap".into(),
-        ));
+    // HEAD and a matching If-None-Match both answer from the manifest entry
+    // alone, with no file read: the manifest is already verified against its
+    // own signed hash, so the entry's `sha256` is an authenticated ETag for
+    // bytes the file read would only re-derive.
+    if head.method == gateway::RouteMethod::Head {
+        return empty_gateway_response(200, vec![content_type_header(&file), etag_header(&etag)]);
     }
-    // HEAD still authenticates the exact bytes before advertising the ETag, so
-    // a same-sized local mutation cannot make a stale file look current.
-    let mut bytes = read_duckfs_file(
+    if etag_matches {
+        return empty_gateway_response(304, vec![etag_header(&etag)]);
+    }
+
+    // A GET past an ETag miss still authenticates the exact bytes before
+    // serving them, so a same-sized local mutation cannot make a stale file
+    // look current.
+    let bytes = read_duckfs_file(
         commands,
-        &gateway_path(own_node, label, &file.path),
+        &gateway_path(owner_signer, label, &file.path),
         &snapshot,
         file.size,
     )
@@ -957,23 +1336,8 @@ async fn serve_duckfs(
             "DuckFS bytes do not match the manifest".into(),
         ));
     }
-    if head.method == gateway::RouteMethod::Head {
-        bytes.clear();
-    }
-    let response_head = gateway::ProxyResponseHead {
-        status: 200,
-        headers: vec![
-            gateway::ProxyHeader {
-                name: "content-type".into(),
-                value: file.mime.clone(),
-            },
-            gateway::ProxyHeader {
-                name: "etag".into(),
-                value: format!("\"{}\"", file.sha256),
-            },
-        ],
-    };
-    gateway::validate_response_head(&response_head).map_err(GatewayFailure::Unavailable)?;
+    let response_head =
+        build_response_head(200, vec![content_type_header(&file), etag_header(&etag)])?;
     // Content responses stay buffered internally; wrap the one blob as a
     // single-chunk stream (the frame writer re-splits at MAX_CHUNK_BYTES).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
@@ -1112,25 +1476,14 @@ async fn authorize_ws(
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
-) -> Result<String, GatewayFailure> {
+) -> Result<WsGrant, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
     if !head.upgrade {
         return Err(GatewayFailure::Invalid(
             "gateway proxy: not an upgrade".into(),
         ));
     }
-    let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != scope.own_node {
-        return Err(GatewayFailure::Forbidden(
-            "gateway request does not name this publisher".into(),
-        ));
-    }
-    if !gateway::request_matches_record(head, &record) {
-        return Err(GatewayFailure::Conflict(
-            "gateway request does not match the current signed route".into(),
-        ));
-    }
-    revalidate_route_authority(commands, &record).await?;
+    let record = current_route(commands, scope.own_node, head).await?;
     let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
@@ -1147,8 +1500,86 @@ async fn authorize_ws(
             "route does not permit a WebSocket upgrade".into(),
         ));
     }
-    let port = loopback_port(scope, caller_node, head)?;
-    Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
+    let port = loopback_port(scope, caller_node, record.statement.account_id, head)?;
+    Ok(WsGrant {
+        url: format!("ws://127.0.0.1:{port}{}", head.path_and_query),
+        caller,
+    })
+}
+
+/// What an authorized upgrade carries into the bridge: the loopback URL to
+/// dial, and the account the caller PROVED at open. The proof itself expires in
+/// [`CALLER_POP_FRESHNESS_SECS`] and is minted per request, so a live bridge
+/// cannot re-derive its caller — it re-checks the audience against this one.
+#[derive(Debug)]
+struct WsGrant {
+    url: String,
+    caller: Option<u64>,
+}
+
+/// Close code a bridged socket gets when its route stops authorizing it — the
+/// owner tombstoned it, bumped its revision, narrowed the audience, or dropped
+/// the signing key. 1008 is the WebSocket "policy violation" code.
+const WS_REVOKED_CLOSE: u16 = 1008;
+/// How often a live bridge re-runs the caller-independent half of its
+/// authorization. The HTTP path re-gates every request; a socket must not
+/// outlive its grant by more than one tick.
+const WS_REAUTH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Resolve once a live bridge's grant stops holding. Ticks forever while the
+/// route still resolves to this publisher, its signer is still a member, and
+/// the caller proved at open is still inside the audience.
+async fn ws_revoked(
+    commands: mpsc::Sender<NodeCommand>,
+    own_node: [u8; 32],
+    head: gateway::ProxyRequestHead,
+    caller: Option<u64>,
+) {
+    let mut ticks = tokio::time::interval(WS_REAUTH_INTERVAL);
+    ticks.tick().await; // the first tick fires immediately; the gate just ran.
+    loop {
+        ticks.tick().await;
+        let Err(_failure) = reauthorize_ws(&commands, &own_node, &head, caller).await else {
+            continue;
+        };
+        tracing::warn!(
+            target: "ducktape::gateway",
+            reason = "ws_reauth_failed",
+            "gateway websocket bridge revoked"
+        );
+        return;
+    }
+}
+
+/// The re-runnable half of [`authorize_ws`]: everything a tombstone, a
+/// revision bump, an audience narrowing, or a removed signer key invalidates
+/// while a socket is open. The caller's own proof is NOT re-verified — it is
+/// per-request and expires — so the account it proved at open is passed in.
+async fn reauthorize_ws(
+    commands: &mpsc::Sender<NodeCommand>,
+    own_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+    caller: Option<u64>,
+) -> Result<(), GatewayFailure> {
+    let record = current_route(commands, own_node, head).await?;
+    let route = record
+        .statement
+        .route
+        .as_ref()
+        .expect("resolve_route rejects tombstones");
+    let in_audience =
+        gateway::audience_allows(&route.policy.audience, record.statement.account_id, caller);
+    if !in_audience {
+        return Err(GatewayFailure::Forbidden(
+            "caller is outside the signed route audience".into(),
+        ));
+    }
+    if !route.policy.allow_upgrade {
+        return Err(GatewayFailure::Forbidden(
+            "route does not permit a WebSocket upgrade".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bridge a WebSocket upgrade to the route's loopback upstream. Owns the mesh
@@ -1163,15 +1594,15 @@ async fn serve_ws<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let url = match authorize_ws(commands, scope, caller_node, head).await {
-        Ok(url) => url,
+    let grant = match authorize_ws(commands, scope, caller_node, head).await {
+        Ok(grant) => grant,
         Err(failure) => {
             let _ = write_frame(&mut stream, &failure_frame(&failure)).await;
             let _ = stream.flush().await;
             return;
         }
     };
-    let upstream = match tokio_tungstenite::connect_async(&url).await {
+    let upstream = match tokio_tungstenite::connect_async(&grant.url).await {
         Ok((upstream, _response)) => upstream,
         Err(error) => {
             let _ = write_frame(
@@ -1196,13 +1627,75 @@ async fn serve_ws<S>(
     {
         return;
     }
-    ws_pump(stream, upstream).await;
+    ws_pump(
+        stream,
+        upstream,
+        ws_revoked(
+            commands.clone(),
+            *scope.own_node,
+            head.clone(),
+            grant.caller,
+        ),
+    )
+    .await;
+}
+
+/// Resolve once a bridged socket has been silent in BOTH directions for
+/// [`WS_IDLE_TIMEOUT`]. Each pump direction notifies on every message, so this
+/// waits on the bridge's own traffic with a deadline — not on a sleep loop.
+async fn ws_idle_deadline(activity: Arc<tokio::sync::Notify>) {
+    while tokio::time::timeout(WS_IDLE_TIMEOUT, activity.notified())
+        .await
+        .is_ok()
+    {}
+    tracing::debug!(
+        target: "ducktape::gateway",
+        reason = "ws_idle",
+        "gateway websocket bridge closed"
+    );
+}
+
+/// What one poll of the upstream socket yields for the mesh direction. A
+/// discriminant, not a flag: `select!` arms cannot `break`/`continue` the outer
+/// loop (those would target the macro's own loop), so the poll DECIDES and the
+/// loop body acts on the decision.
+enum MeshStep {
+    Send(gateway::ProxyFrame),
+    Skip,
+    Stop,
+}
+
+fn upstream_step(
+    message: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+) -> MeshStep {
+    use tokio_tungstenite::tungstenite::Message;
+    match message {
+        Some(Ok(Message::Text(text))) => MeshStep::Send(gateway::ProxyFrame::WsFrame {
+            binary: false,
+            payload: text.as_bytes().to_vec(),
+        }),
+        Some(Ok(Message::Binary(bytes))) => MeshStep::Send(gateway::ProxyFrame::WsFrame {
+            binary: true,
+            payload: bytes.to_vec(),
+        }),
+        Some(Ok(Message::Close(frame))) => MeshStep::Send(gateway::ProxyFrame::WsClose {
+            code: frame.map(|frame| u16::from(frame.code)).unwrap_or(1000),
+        }),
+        Some(Ok(_)) => MeshStep::Skip,
+        Some(Err(_)) | None => MeshStep::Stop,
+    }
 }
 
 /// Two independent tasks (mesh→upstream, upstream→mesh); when either direction
-/// ends, the other is aborted so both sockets drop and each peer sees EOF.
-async fn ws_pump<S, U>(stream: S, upstream: U)
+/// ends — or the bridge goes two-way idle, or `revoked` resolves because the
+/// route stopped authorizing this caller — the others are aborted so both
+/// sockets drop and each peer sees EOF. A revocation writes a
+/// [`WS_REVOKED_CLOSE`] frame first, so the caller learns why.
+async fn ws_pump<S, U, R>(stream: S, upstream: U, revoked: R)
 where
+    R: std::future::Future<Output = ()> + Send + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: futures::Stream<
             Item = Result<
@@ -1219,6 +1712,9 @@ where
     use tokio_tungstenite::tungstenite::Message;
     let (mut mesh_read, mut mesh_write) = tokio::io::split(stream);
     let (mut ws_tx, mut ws_rx) = upstream.split();
+    let activity = Arc::new(tokio::sync::Notify::new());
+    let to_upstream_activity = Arc::clone(&activity);
+    let to_mesh_activity = Arc::clone(&activity);
     let mut to_upstream = tokio::spawn(async move {
         let mut buf = Vec::new();
         loop {
@@ -1232,6 +1728,7 @@ where
                     if ws_tx.send(message).await.is_err() {
                         break;
                     }
+                    to_upstream_activity.notify_one();
                 }
                 _ => {
                     let _ = ws_tx.close().await;
@@ -1241,42 +1738,46 @@ where
         }
     });
     let mut to_mesh = tokio::spawn(async move {
-        while let Some(message) = ws_rx.next().await {
-            let frame = match message {
-                Ok(Message::Text(text)) => gateway::ProxyFrame::WsFrame {
-                    binary: false,
-                    payload: text.as_bytes().to_vec(),
-                },
-                Ok(Message::Binary(bytes)) => gateway::ProxyFrame::WsFrame {
-                    binary: true,
-                    payload: bytes.to_vec(),
-                },
-                Ok(Message::Close(frame)) => gateway::ProxyFrame::WsClose {
-                    code: frame.map(|frame| u16::from(frame.code)).unwrap_or(1000),
-                },
-                Ok(_) => continue,
-                Err(_) => break,
+        let mut revoked = std::pin::pin!(revoked);
+        loop {
+            let step = tokio::select! {
+                () = &mut revoked => MeshStep::Send(gateway::ProxyFrame::WsClose {
+                    code: WS_REVOKED_CLOSE,
+                }),
+                message = ws_rx.next() => upstream_step(message),
+            };
+            let frame = match step {
+                MeshStep::Send(frame) => frame,
+                MeshStep::Skip => continue,
+                MeshStep::Stop => break,
             };
             let closing = matches!(frame, gateway::ProxyFrame::WsClose { .. });
             if write_frame(&mut mesh_write, &frame).await.is_err() {
                 break;
             }
             let _ = mesh_write.flush().await;
+            to_mesh_activity.notify_one();
             if closing {
                 break;
             }
         }
     });
+    let mut idle = tokio::spawn(ws_idle_deadline(activity));
     tokio::select! {
-        _ = &mut to_upstream => to_mesh.abort(),
-        _ = &mut to_mesh => to_upstream.abort(),
+        _ = &mut to_upstream => {}
+        _ = &mut to_mesh => {}
+        _ = &mut idle => {}
     }
+    to_upstream.abort();
+    to_mesh.abort();
+    idle.abort();
 }
 
 /// Caller side of a WebSocket upgrade: read the publisher's `101` ack, then
 /// bridge the browser's message channels to the mesh stream. Mirrors
 /// [`ws_pump`] with the roles reversed — the noded WS door owns the
-/// browser/axum translation. Returns once either direction closes. On a
+/// browser/axum translation. Returns once either direction closes, or once the
+/// bridge has been silent both ways for [`WS_IDLE_TIMEOUT`]. On a
 /// non-101 first frame (a `Failure` or garbage) it closes the browser side.
 async fn caller_ws_pump<S>(
     mut mesh: S,
@@ -1296,6 +1797,9 @@ async fn caller_ws_pump<S>(
         }
     }
     let (mut mesh_read, mut mesh_write) = tokio::io::split(mesh);
+    let activity = Arc::new(tokio::sync::Notify::new());
+    let to_browser_activity = Arc::clone(&activity);
+    let from_browser_activity = Arc::clone(&activity);
     let mut to_browser_task = tokio::spawn(async move {
         // Seed with any bytes already read past the 101 frame.
         loop {
@@ -1309,6 +1813,7 @@ async fn caller_ws_pump<S>(
                     if to_browser.send(message).await.is_err() {
                         break;
                     }
+                    to_browser_activity.notify_one();
                 }
                 Ok(gateway::ProxyFrame::WsClose { code }) => {
                     let _ = to_browser.send(GatewayWsMsg::Close(code)).await;
@@ -1336,15 +1841,21 @@ async fn caller_ws_pump<S>(
                 break;
             }
             let _ = mesh_write.flush().await;
+            from_browser_activity.notify_one();
             if closing {
                 break;
             }
         }
     });
+    let mut idle = tokio::spawn(ws_idle_deadline(activity));
     tokio::select! {
-        _ = &mut to_browser_task => from_browser_task.abort(),
-        _ = &mut from_browser_task => to_browser_task.abort(),
+        _ = &mut to_browser_task => {}
+        _ = &mut from_browser_task => {}
+        _ = &mut idle => {}
     }
+    to_browser_task.abort();
+    from_browser_task.abort();
+    idle.abort();
 }
 
 /// Drop any `Domain` attribute from a Set-Cookie value so gateway cookies stay
@@ -1386,8 +1897,23 @@ fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
             "gateway publisher is unavailable".to_string(),
         ),
     };
-    detail.truncate(MAX_ERROR_BYTES);
+    truncate_at_char_boundary(&mut detail, MAX_ERROR_BYTES);
     gateway::ProxyFrame::Failure(gateway::ProxyFailure { kind, detail })
+}
+
+/// Bound a failure detail without splitting a UTF-8 character. `String::truncate`
+/// panics on a byte index that is not a char boundary, and a detail reaches here
+/// carrying remote-supplied text (a decode error names what the peer sent), so a
+/// plain byte cut is a remote panic on the serve task.
+fn truncate_at_char_boundary(detail: &mut String, max_bytes: usize) {
+    if detail.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
 }
 
 fn failure_from(failure: gateway::ProxyFailure) -> GatewayFailure {
@@ -1448,39 +1974,61 @@ async fn read_frame<S: AsyncRead + Unpin>(
 /// channel as `MAX_CHUNK_BYTES` `BodyChunk` frames (flushed per chunk — SSE
 /// latency), then `End`. A pre-head failure is a single `Failure` frame; a
 /// mid-stream failure emits `Failure` after the chunks already sent (the
-/// caller aborts — truncation). The drain deliberately has NO deadline.
+/// caller aborts — truncation). Every frame goes out under
+/// [`push_frame`]'s progress deadline, so a peer that stops reading ends the
+/// drain instead of parking the serve task and its permit for good.
 async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     outcome: Result<GatewayResponse, GatewayFailure>,
 ) -> std::io::Result<()> {
-    match outcome {
-        Ok(mut response) => {
-            if let Err(error) = gateway::validate_response_head(&response.head) {
-                write_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await?;
-                return stream.flush().await;
-            }
-            write_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
-            stream.flush().await?;
-            while let Some(item) = response.body.recv().await {
-                match item {
-                    Ok(chunk) => {
-                        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
-                            write_frame(stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec()))
-                                .await?;
-                        }
-                        stream.flush().await?;
-                    }
-                    Err(failure) => {
-                        write_frame(stream, &failure_frame(&failure)).await?;
-                        return stream.flush().await;
-                    }
-                }
-            }
-            write_frame(stream, &gateway::ProxyFrame::End).await?;
-        }
-        Err(failure) => write_frame(stream, &failure_frame(&failure)).await?,
+    let mut response = match outcome {
+        Ok(response) => response,
+        Err(failure) => return push_frame(stream, &failure_frame(&failure)).await,
+    };
+    if let Err(error) = gateway::validate_response_head(&response.head) {
+        return push_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await;
     }
-    stream.flush().await
+    push_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
+    while let Some(item) = response.body.recv().await {
+        let chunk = match item {
+            Ok(chunk) => chunk,
+            Err(failure) => return push_frame(stream, &failure_frame(&failure)).await,
+        };
+        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
+            push_frame(stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec())).await?;
+        }
+    }
+    push_frame(stream, &gateway::ProxyFrame::End).await
+}
+
+/// One frame written and flushed under a per-frame progress deadline. The
+/// drain's only other bound is the peer's willingness to read: an overlay
+/// stream whose window a non-reading peer has filled blocks `write_all`
+/// forever, and the serve task holds a permit while it does. No progress for
+/// [`PROXY_IO_TIMEOUT`] ends the exchange; the caller sees EOF.
+async fn push_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &gateway::ProxyFrame,
+) -> std::io::Result<()> {
+    let written = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
+        write_frame(stream, frame).await?;
+        stream.flush().await
+    })
+    .await;
+    match written {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                reason = "stream_write_stalled",
+                "gateway response drain cut"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "gateway response write made no progress",
+            ))
+        }
+    }
 }
 
 /// Caller side, head only: `ResponseHead` (validated) or the failure that
@@ -1567,6 +2115,236 @@ use duckfs_core::to_hex as hex_bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept loop turns a decode error straight into `Invalid`, and the
+    /// name a peer sends is neither ASCII nor short. Bounding that detail must
+    /// answer with a frame, not panic the serve task.
+    #[test]
+    fn a_multibyte_header_name_yields_a_failure_frame_and_no_non_ascii() {
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("app"),
+            revision: 1,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/".into(),
+            headers: vec![gateway::ProxyHeader {
+                name: "€".repeat(200),
+                value: "v".into(),
+            }],
+            body_len: 0,
+            upgrade: false,
+            user_pop: None,
+        };
+        let meta = serde_json::to_vec(&head).expect("head serializes");
+        let error = gateway::decode_proxy_request_head(&meta).expect_err("name is malformed");
+        let frame = failure_frame(&GatewayFailure::Invalid(error));
+        let gateway::ProxyFrame::Failure(failure) = frame else {
+            panic!("a malformed head must map to a Failure frame");
+        };
+        assert!(failure.detail.is_ascii(), "detail must not echo peer bytes");
+        assert!(failure.detail.len() <= MAX_ERROR_BYTES);
+    }
+
+    /// The wedge: an upgrade holds its permit for the socket's whole life, so
+    /// a shared budget lets idle sockets starve every request on the node.
+    #[tokio::test]
+    async fn idle_upgrades_never_spend_the_request_budget() {
+        let budget = GatewayBudget::new();
+        let sockets: Vec<_> = (0..MAX_CONCURRENT_UPGRADES)
+            .map(|_| budget.admit_upgrade().expect("under the upgrade cap"))
+            .collect();
+        assert!(
+            budget.admit_upgrade().is_none(),
+            "the (N+1)th upgrade is refused, never queued behind live sockets"
+        );
+        // The whole point: requests still flow with every socket parked.
+        let requests: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                budget
+                    .requests
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the request budget is untouched by upgrades")
+            })
+            .collect();
+        drop(requests);
+        assert!(budget.admit_request().await.is_some());
+        drop(sockets);
+        assert!(
+            budget.admit_upgrade().is_some(),
+            "a closed socket frees one"
+        );
+    }
+
+    /// The same wedge one rung down: a drain lives as long as the peer keeps
+    /// reading, so it must not be charged to the request budget either — and a
+    /// full request budget must refuse fast, not age out in the caller.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_streams_never_spend_the_request_budget() {
+        let budget = GatewayBudget::new();
+        let drains: Vec<_> = (0..MAX_CONCURRENT_STREAMS)
+            .map(|_| budget.admit_stream().expect("under the stream cap"))
+            .collect();
+        assert!(
+            budget.admit_stream().is_none(),
+            "the (N+1)th drain is refused, never queued behind bodies nobody reads"
+        );
+        assert!(
+            budget.admit_request().await.is_some(),
+            "a plain request runs with every drain parked"
+        );
+
+        // A full request budget answers, it does not hang: the acquire has its
+        // own deadline.
+        let taken: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                budget
+                    .requests
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the request budget is untouched by drains")
+            })
+            .collect();
+        assert!(budget.admit_request().await.is_none());
+        drop(taken);
+        drop(drains);
+        assert!(
+            budget.admit_stream().is_some(),
+            "a finished drain frees one"
+        );
+    }
+
+    /// A permit swapped at the head is only half the fix: the drain itself must
+    /// end when the peer stops reading, or the serve task parks forever holding
+    /// its stream permit. The reader here stays OPEN and never reads, so the
+    /// duplex fills and the write makes no progress — the issue's peer exactly.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_reading_peer_ends_the_drain() {
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+        let (tx, body) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                if tx
+                    .send(Ok(bytes::Bytes::from(vec![0u8; 64 * 1024])))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let response = GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body,
+        };
+        let error = write_proxy_response(&mut writer, Ok(response))
+            .await
+            .expect_err("a peer that never reads must end the drain");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the drain ends on its own progress deadline: {error:?}"
+        );
+    }
+
+    /// The revocation wire: when the grant stops holding mid-socket, the caller
+    /// gets a policy close, not a bare EOF it cannot explain.
+    #[tokio::test]
+    async fn a_revoked_bridge_closes_with_a_policy_code() {
+        let (server_end, mut caller_end) = tokio::io::duplex(64 * 1024);
+        // an upstream that never speaks: only the revocation can end this.
+        let (upstream, _upstream_peer) = tokio::io::duplex(1024);
+        let upstream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            upstream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        tokio::spawn(ws_pump(server_end, upstream, std::future::ready(())));
+        let mut buf = Vec::new();
+        let frame = read_frame(&mut caller_end, &mut buf).await.unwrap();
+        assert!(
+            matches!(
+                frame,
+                gateway::ProxyFrame::WsClose {
+                    code: WS_REVOKED_CLOSE
+                }
+            ),
+            "a revoked bridge closes with the policy code: {frame:?}"
+        );
+    }
+
+    /// A tombstoned route stops authorizing a socket that is already open —
+    /// the check a live bridge re-runs on its tick.
+    #[tokio::test]
+    async fn reauthorization_refuses_a_tombstoned_route() {
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+            user_pop: None,
+        };
+
+        // Still published: the caller proved at open stays inside the audience.
+        let (commands, mut requests) = mpsc::channel(4);
+        let member_for_reply = member.clone();
+        tokio::spawn(async move {
+            for bytes in [
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(account(
+                    1,
+                    &member_for_reply,
+                )))),
+            ] {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+        reauthorize_ws(&commands, &publisher, &head, Some(1))
+            .await
+            .expect("a live route keeps its bridge");
+
+        // Tombstoned: the very next tick refuses.
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the route query")
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(None),
+            ))));
+        });
+        let error = reauthorize_ws(&commands, &publisher, &head, Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::NotFound(_)),
+            "a tombstoned route must revoke its open bridge: {error:?}"
+        );
+    }
+
+    #[test]
+    fn truncating_a_detail_never_splits_a_character() {
+        let mut detail = "€".repeat(400);
+        truncate_at_char_boundary(&mut detail, MAX_ERROR_BYTES);
+        assert_eq!(detail.len(), 510, "cut back to the last char boundary");
+        let mut short = "ok".to_string();
+        truncate_at_char_boundary(&mut short, MAX_ERROR_BYTES);
+        assert_eq!(short, "ok");
+    }
 
     #[tokio::test]
     async fn streamed_response_arrives_and_zero_cap_is_unbounded() {
@@ -1783,6 +2561,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -1938,6 +2717,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2129,6 +2909,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2242,6 +3023,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2455,6 +3237,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port: NODE_HTTP_PORT,
             }],
@@ -2545,6 +3328,215 @@ mod tests {
         assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 
+    /// The ws-door analog of `owner_only_route_denies_remote_account_before_loopback`
+    /// (#1754): with a real caller proof on the head, an Owner-audience upgrade
+    /// admits its own member; with `user_pop: None` (the door's old hardcoded
+    /// default) the exact same route is refused. `authorize_ws` alone is
+    /// enough — it resolves the loopback URL without dialing it.
+    #[tokio::test]
+    async fn owner_only_ws_upgrade_admits_its_owner_and_refuses_anonymous() {
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
+                name: gateway::RouteName::named("api"),
+                port: 9001,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+        let publisher = [2u8; 32];
+        let caller = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
+        let pop = user_pop(
+            &member,
+            &route.statement,
+            gateway::RouteMethod::Get,
+            "/socket",
+        );
+        let scope = LoopbackScope {
+            workspace: workspace.path(),
+            node_api_ports: &[],
+            own_node: &publisher,
+        };
+        let owned_head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+            user_pop: Some(pop),
+        };
+        let anonymous_head = gateway::ProxyRequestHead {
+            user_pop: None,
+            ..owned_head.clone()
+        };
+        let (commands, mut requests) = mpsc::channel(8);
+        let route_for_reply = route.clone();
+        let member_for_reply = member.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap()
+                else {
+                    panic!("expected a query")
+                };
+                let bytes = match target.as_str() {
+                    "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(
+                        Some(route_for_reply.clone()),
+                    ))),
+                    "identity" => identity::encode_reply(&identity::IdentityReply::Account(Some(
+                        account(1, &member_for_reply),
+                    ))),
+                    other => panic!("unexpected query target {other}"),
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+            // the owner leg resolves the caller's own key too.
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the caller's identity query")
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member_for_reply))),
+            )));
+        });
+        authorize_ws(&commands, &scope, &caller, &owned_head)
+            .await
+            .expect("the route's own member admits its ws door");
+
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the route query")
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the publisher authority query")
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+        });
+        let error = authorize_ws(&commands, &scope, &caller, &anonymous_head)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(_)),
+            "an anonymous caller (the door's old `user_pop: None` default) must not \
+             reach an Owner-audience ws door: {error:?}"
+        );
+    }
+
+    /// Consensus lets ANY account publish a route naming ANY node as its
+    /// publisher, so the label a node bound is not proof of consent: only the
+    /// (account, label) pair the operator bound is. A second account's record
+    /// with the same label, naming this node, must be refused BEFORE the
+    /// loopback dial — the refusal is `Forbidden(route_account_mismatch)`, and a
+    /// dial would have been `Unavailable` on a port nothing listens on.
+    #[tokio::test]
+    async fn a_second_accounts_route_cannot_ride_this_nodes_bind_for_that_label() {
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                // the operator bound `api` for account 1, and only account 1.
+                account: 1,
+                name: gateway::RouteName::named("api"),
+                port: 9000,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let mallory = ed25519::PrivateKey::from_seed(45);
+        // Mallory's OWN record: her account, her `Network` audience, this
+        // node named as publisher, the operator's label.
+        let mut route = signed_route(&mallory, publisher, gateway::RouteAudience::Network, false);
+        route.statement.account_id = 2;
+        route.authorization.signature = mallory
+            .sign(
+                gateway::GATEWAY_ROUTE_NS,
+                &gateway::route_signing_preimage(&route.statement).unwrap(),
+            )
+            .as_ref()
+            .to_vec();
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let replies: Vec<Vec<u8>> = vec![
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(account(
+                    2, &mallory,
+                )))),
+            ];
+            for bytes in replies {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+
+        let error = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &gateway::ProxyRequestHead {
+                account_id: 2,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: false,
+                user_pop: None,
+            },
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, GatewayFailure::Forbidden(reason) if reason == ROUTE_ACCOUNT_MISMATCH),
+            "a second account's record must not reach the port bound for another: {error:?}"
+        );
+    }
+
+    /// A manifest written by the route's own signer, under exactly the path
+    /// `gateway_path` reads from, must pass `files`' write authority for that
+    /// same signer — the mechanism #1753 fixed: the old path named this
+    /// node's consensus key, which no shipped write path can ever sign as.
+    #[test]
+    fn gateway_path_is_writable_by_its_own_owner() {
+        let member = ed25519::PrivateKey::from_seed(41);
+        let signer = member.public_key().as_ref().to_vec();
+        let actor = sdk::Origin::External(signer.clone()).actor_string();
+        let path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
+        let segments = duckfs_core::paths::canonical(&path).unwrap();
+        duckfs_core::paths::check_authority(&actor, &segments)
+            .expect("the route's own signer must be able to write its serving path");
+        // A different member's key must not reach the same tree.
+        let other = ed25519::PrivateKey::from_seed(42);
+        let other_actor =
+            sdk::Origin::External(other.public_key().as_ref().to_vec()).actor_string();
+        duckfs_core::paths::check_authority(&other_actor, &segments)
+            .expect_err("another key must not be able to write someone else's route content");
+    }
+
     fn stat_reply(path: String, size: u64) -> Vec<u8> {
         duckfs_core::encode_reply(&FilesReply::Stat(Some(duckfs_core::EntryInfo {
             path,
@@ -2556,10 +3548,19 @@ mod tests {
         })))
     }
 
-    async fn serve_content_head(
-        declared: &[u8],
-        actual: &[u8],
-    ) -> Result<GatewayResponse, GatewayFailure> {
+    /// A signed content route naming one manifest entry (`index.html`,
+    /// declared as `declared`'s exact bytes/hash), plus everything needed to
+    /// answer for its owner.
+    struct ContentCase {
+        publisher: [u8; 32],
+        member: ed25519::PrivateKey,
+        statement: gateway::RouteStatement,
+        route: gateway::RouteRecord,
+        manifest_bytes: Vec<u8>,
+        owner: identity::AccountView,
+    }
+
+    fn content_case(declared: &[u8]) -> ContentCase {
         let publisher = [2u8; 32];
         let member = ed25519::PrivateKey::from_seed(77);
         // The signed statement binds only the manifest hash; the manifest (a
@@ -2594,7 +3595,6 @@ mod tests {
                 },
             }),
         };
-        let pop = user_pop(&member, &statement, gateway::RouteMethod::Head, "/");
         let route = gateway::RouteRecord {
             authorization: gateway::MemberAuthorization {
                 signer: member.public_key().as_ref().to_vec(),
@@ -2606,61 +3606,103 @@ mod tests {
                     .as_ref()
                     .to_vec(),
             },
-            statement,
+            statement: statement.clone(),
         };
         let owner = account(1, &member);
-        let manifest_path = gateway_path(&publisher, "_apex", gateway::MANIFEST_FILE);
-        let file_path = gateway_path(&publisher, "_apex", "index.html");
-        let manifest_len = manifest_bytes.len() as u64;
-        let manifest_b64 = STANDARD.encode(&manifest_bytes);
-        let actual_b64 = STANDARD.encode(actual);
-        let actual_len = actual.len() as u64;
-        // Ordered replies: route → identity (authority) → identity (the
-        // caller's proof) → refs → manifest stat/read → file stat/read.
-        let replies: Vec<Vec<u8>> = vec![
-            gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
-            identity::encode_reply(&identity::IdentityReply::Account(Some(owner.clone()))),
-            identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
+        ContentCase {
+            publisher,
+            member,
+            statement,
+            route,
+            manifest_bytes,
+            owner,
+        }
+    }
+
+    /// Drive one `serve_current` call against `case` at DuckFS head
+    /// `head_hex`, queuing exactly: route → identity (authority) → identity
+    /// (caller proof) → refs, then — only when `queue_manifest` is set — the
+    /// manifest stat/read, then — only when `file_bytes` is `Some` — that
+    /// file's stat/read. Returns the response alongside how many queries were
+    /// actually answered, so a caller can assert the exact query count
+    /// (skipped as well as issued) rather than merely "it didn't hang".
+    ///
+    /// A query beyond what's queued panics immediately — a would-be file read
+    /// past a HEAD or a 304 needs no queued reply to fail loudly on.
+    async fn serve_content(
+        case: &ContentCase,
+        method: gateway::RouteMethod,
+        path_and_query: &str,
+        headers: Vec<gateway::ProxyHeader>,
+        head_hex: &str,
+        queue_manifest: bool,
+        file_bytes: Option<&[u8]>,
+    ) -> (Result<GatewayResponse, GatewayFailure>, usize) {
+        let pop = user_pop(&case.member, &case.statement, method, path_and_query);
+        let signer = case.member.public_key().as_ref().to_vec();
+        let mut replies: Vec<Vec<u8>> = vec![
+            gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
+                case.route.clone(),
+            )))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(case.owner.clone()))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(case.owner.clone()))),
             duckfs_core::encode_reply(&FilesReply::Refs(duckfs_core::RefsInfo {
-                head: Some("aa".repeat(32)),
+                head: Some(head_hex.to_string()),
                 pins: std::collections::BTreeMap::new(),
                 window_len: 1,
             })),
-            stat_reply(manifest_path, manifest_len),
-            duckfs_core::encode_reply(&FilesReply::Read {
-                b64: manifest_b64,
-                eof: true,
-            }),
-            stat_reply(file_path, actual_len),
-            duckfs_core::encode_reply(&FilesReply::Read {
-                b64: actual_b64,
-                eof: true,
-            }),
         ];
+        if queue_manifest {
+            let manifest_path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
+            replies.push(stat_reply(manifest_path, case.manifest_bytes.len() as u64));
+            replies.push(duckfs_core::encode_reply(&FilesReply::Read {
+                b64: STANDARD.encode(&case.manifest_bytes),
+                eof: true,
+            }));
+        }
+        if let Some(bytes) = file_bytes {
+            let file_path = gateway_path(&signer, "_apex", "index.html");
+            replies.push(stat_reply(file_path, bytes.len() as u64));
+            replies.push(duckfs_core::encode_reply(&FilesReply::Read {
+                b64: STANDARD.encode(bytes),
+                eof: true,
+            }));
+        }
         let (commands, mut requests) = mpsc::channel(8);
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answered_in_task = Arc::clone(&answered);
+        let (done, wait_done) = oneshot::channel();
         tokio::spawn(async move {
-            for bytes in replies {
-                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                    panic!("expected a query")
-                };
-                let _ = reply.send(Ok(bytes));
+            let mut queued = replies.into_iter();
+            while let Some(NodeCommand::Query { reply, .. }) = requests.next().await {
+                match queued.next() {
+                    Some(bytes) => {
+                        answered_in_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = reply.send(Ok(bytes));
+                    }
+                    None => panic!(
+                        "unexpected extra DuckFS/gateway query beyond the queued sequence \
+                         — an unwanted manifest or file read"
+                    ),
+                }
             }
+            let _ = done.send(());
         });
-        serve_current(
+        let result = serve_current(
             &commands,
             &LoopbackScope {
                 workspace: Path::new("."),
                 node_api_ports: &[],
-                own_node: &publisher,
+                own_node: &case.publisher,
             },
-            &publisher,
+            &case.publisher,
             &gateway::ProxyRequestHead {
                 account_id: 1,
                 name: gateway::RouteName::apex(),
                 revision: 1,
-                method: gateway::RouteMethod::Head,
-                path_and_query: "/".into(),
-                headers: vec![],
+                method,
+                path_and_query: path_and_query.into(),
+                headers,
                 body_len: 0,
                 upgrade: false,
                 // an `Owner` route: only the owner's own user proof admits.
@@ -2668,29 +3710,192 @@ mod tests {
             },
             &[],
         )
-        .await
+        .await;
+        // Dropping the sender closes the mock's request stream, which ends
+        // its loop — wait for that so the counter below is final.
+        drop(commands);
+        let _ = wait_done.await;
+        (result, answered.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     #[tokio::test]
-    async fn duckfs_head_verifies_signed_bytes_before_returning_no_body() {
-        let mut response = serve_content_head(b"safe", b"safe").await.unwrap();
+    async fn head_answers_from_manifest_without_reading_the_file() {
+        let declared = b"only the manifest is needed for HEAD";
+        let case = content_case(declared);
+        let (result, answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &"11".repeat(32),
+            true,
+            // No file bytes queued at all: a HEAD that still tried to read
+            // the file would panic in the mock rather than hang.
+            None,
+        )
+        .await;
+        let mut response = result.unwrap();
+        assert_eq!(response.head.status, 200);
         assert!(
             noded::collect_body(&mut response.body)
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(response.head.status, 200);
+        assert_eq!(
+            gateway::header_value(&response.head.headers, "etag"),
+            Some(format!("\"{}\"", hex_bytes(&Sha256::digest(declared))).as_str())
+        );
+        // route + identity×2 + refs + manifest stat/read, nothing else.
+        assert_eq!(answered, 6);
+    }
 
-        let mut empty = serve_content_head(b"", b"").await.unwrap();
+    #[tokio::test]
+    async fn matching_if_none_match_answers_304_without_reading_the_file() {
+        let declared = b"conditional get content";
+        let case = content_case(declared);
+        let etag = format!("\"{}\"", hex_bytes(&Sha256::digest(declared)));
+        let (result, answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![gateway::ProxyHeader {
+                name: "if-none-match".into(),
+                value: etag.clone(),
+            }],
+            &"22".repeat(32),
+            true,
+            // A match must not read the file either.
+            None,
+        )
+        .await;
+        let mut response = result.unwrap();
+        assert_eq!(response.head.status, 304);
+        assert!(
+            noded::collect_body(&mut response.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            gateway::header_value(&response.head.headers, "etag"),
+            Some(etag.as_str())
+        );
+        assert_eq!(answered, 6);
+    }
+
+    #[tokio::test]
+    async fn stale_head_misses_the_manifest_cache() {
+        let declared = b"cache probe content";
+        let case = content_case(declared);
+        let head_a = "33".repeat(32);
+        let head_b = "44".repeat(32);
+
+        // First request at head A: a cold cache, so the manifest read is
+        // queued and must happen.
+        let (first, first_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_a,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(first.unwrap().head.status, 200);
+        assert_eq!(first_answered, 6);
+
+        // Second request, the SAME head: no manifest reply is queued at all —
+        // a cache HIT is the only way this can still succeed.
+        let (second, second_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_a,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(second.unwrap().head.status, 200);
+        assert_eq!(second_answered, 4);
+
+        // Third request, a NEW head: a stale head is a cache MISS, so the
+        // manifest read is queued (and required) again.
+        let (third, third_answered) = serve_content(
+            &case,
+            gateway::RouteMethod::Head,
+            "/",
+            vec![],
+            &head_b,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(third.unwrap().head.status, 200);
+        assert_eq!(third_answered, 6);
+    }
+
+    #[tokio::test]
+    async fn get_verifies_the_actual_bytes_before_serving_them() {
+        let declared = b"safe-declared-content";
+        let case = content_case(declared);
+
+        // Matching bytes serve normally.
+        let (matched, _) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"55".repeat(32),
+            true,
+            Some(declared.as_slice()),
+        )
+        .await;
+        let mut matched = matched.unwrap();
+        assert_eq!(matched.head.status, 200);
+        assert_eq!(
+            noded::collect_body(&mut matched.body).await.unwrap(),
+            declared
+        );
+
+        // Tampered local bytes are caught even though the manifest (and the
+        // ETag it authenticates) still says `declared` — a fresh head, so
+        // this doesn't ride the previous call's cached manifest entry.
+        let (mismatched, _) = serve_content(
+            &case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"66".repeat(32),
+            true,
+            Some(b"evil-tampered-content".as_slice()),
+        )
+        .await;
+        let error = mismatched.unwrap_err();
+        assert!(matches!(error, GatewayFailure::Forbidden(_)));
+
+        // An empty file still issues its one confirming read and serves an
+        // empty body.
+        let empty_case = content_case(b"");
+        let (empty, _) = serve_content(
+            &empty_case,
+            gateway::RouteMethod::Get,
+            "/",
+            vec![],
+            &"77".repeat(32),
+            true,
+            Some(b"".as_slice()),
+        )
+        .await;
+        let mut empty = empty.unwrap();
+        assert_eq!(empty.head.status, 200);
         assert!(
             noded::collect_body(&mut empty.body)
                 .await
                 .unwrap()
                 .is_empty()
         );
-
-        let error = serve_content_head(b"safe", b"evil").await.unwrap_err();
-        assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 }

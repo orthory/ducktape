@@ -77,6 +77,8 @@ fn a_module_that_cannot_serve_is_refused_per_module_not_by_the_whole_boundary() 
         floor_cert: None,
         generation: 0,
         mesh_window: Vec::new(),
+        applied_frames: Vec::new(),
+        pending_cutover_view: None,
     };
     let finalized = host::FinalizedBlock {
         height: 12,
@@ -288,6 +290,7 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         residents: vec![],
         floor_cert: Some(vec![0xCC; 96]),
         entries: vec![ManifestEntry {
+            code_hash: None,
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),
             kind: PayloadKind::Resolver,
@@ -297,6 +300,8 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
                 op_count: 42,
             }),
         }],
+        applied_frames: vec![(76, [0xD1; 32]), (77, [0xD2; 32])],
+        pending_cutover_view: None,
     };
 
     let bytes = encode_response(&SyncResponse::Manifest(m.clone()));

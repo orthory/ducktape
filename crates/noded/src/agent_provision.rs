@@ -37,6 +37,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use agent::is_skill_mount_name;
 use compute_service::{
     ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
     assemble_context_doc, parse_skill_md,
@@ -189,18 +190,14 @@ fn run_slug(run_id: &str) -> String {
 }
 
 /// a W6 skill mount subpath is consensus-supplied data used as ONE host
-/// directory name — never a path. the envelope validates only non-emptiness
-/// (a `..` or `a/b` name would otherwise escape the ro root), so the trust
-/// boundary is HERE: a bounded charset, with `.`/`..` refused outright (both
-/// pass the charset alone).
+/// directory name — never a path. `agent::validate_skills` now enforces this
+/// exact shape at consensus time too, so a bad name is refused before it is
+/// ever committed; this call stays as the trust boundary of last resort (an
+/// older committed record, or a bug in the consensus-side check, must not
+/// let a `..` or `a/b` name escape the ro root). ONE predicate,
+/// [`agent::is_skill_mount_name`], gates both sides so they cannot drift.
 fn mount_dir_name(subpath: &str) -> Result<(), String> {
-    let safe = !subpath.is_empty()
-        && subpath != "."
-        && subpath != ".."
-        && subpath
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if safe {
+    if is_skill_mount_name(subpath) {
         Ok(())
     } else {
         Err(format!(
@@ -268,8 +265,11 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// are the write half of the tool plane. The endpoint signs only the two Runs
 /// messages scoped to this live run; the private key never enters child env.
 ///
-/// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
-/// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
+/// `DUCKTAPE_RUN_ID` is [`WorkspaceSpec::consensus_run_id`] — the CONSENSUS run
+/// id, the only id space `runs` resolves, and it is exported for every
+/// provisioned run whether or not a session was opened (identity, never a
+/// grant: the MCP read plane fetches the run's ceiling by it). it is
+/// deliberately NOT
 /// `spec.run_id` (`{saga_id}:{attempt}`, the on-disk dir key): the MCP server
 /// stamps this var onto every `RunsMsg::AgentAction` the agent submits, so a
 /// host-local id here would make every mid-run write name a run that does not
@@ -295,13 +295,19 @@ fn run_env(
     if let Some(agent) = &spec.agent_id {
         env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
     }
+    // the consensus run id is IDENTITY, not a credential, so it rides every
+    // provisioned run — with or without a session. the read plane needs it to
+    // fetch the run's admission ceiling, and a delegated run whose session was
+    // never opened must still be ceilinged.
+    if let Some(run_id) = &spec.consensus_run_id {
+        env.insert("DUCKTAPE_RUN_ID".into(), run_id.clone());
+    }
     if let Some(session) = session {
         env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
         env.insert(
             session::ENV_ACTION_TOKEN.into(),
             session.action_token.clone(),
         );
-        env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
     }
     env
 }
@@ -678,5 +684,74 @@ mod tests {
         for good in ["skill", "my-skill_v2", "..dots.ok..", "A.B"] {
             assert!(mount_dir_name(good).is_ok(), "{good:?} must be admitted");
         }
+    }
+
+    #[test]
+    fn mount_dir_name_agrees_with_the_consensus_side_predicate() {
+        // `agent::validate_skills` and this provisioner gate the SAME name
+        // shape through ONE function (`agent::is_skill_mount_name`) — this
+        // pins that `mount_dir_name` is nothing but a call into it, so the
+        // two can never drift apart again.
+        for name in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "name with space",
+            "name\0nul",
+            "skill",
+            "my-skill_v2",
+            "..dots.ok..",
+            "A.B",
+            "code review",
+            "qa",
+        ] {
+            assert_eq!(
+                mount_dir_name(name).is_ok(),
+                is_skill_mount_name(name),
+                "{name:?}: mount_dir_name and is_skill_mount_name disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_consensus_run_id_rides_every_provisioned_run_session_or_not() {
+        // the read plane fetches a delegated run's admission ceiling BY THIS ID,
+        // and a run whose session was never opened must still be ceilinged — so
+        // the id is exported independently of the write half. it is identity,
+        // not a credential: no grant crosses in the env.
+        let spec = WorkspaceSpec {
+            run_id: "s1:0".into(),
+            consensus_run_id: Some("chat\u{1f}general\u{1f}2\u{1f}bot".into()),
+            agent_id: Some("bot".into()),
+            agent_display_name: Some("Bot".into()),
+            source: WorkspaceSource::Duckfs {
+                source_prefix: "/shared/agent-workspaces/bot".into(),
+                source_snapshot: None,
+            },
+            ro_mounts: Vec::new(),
+            library_readable: false,
+        };
+        let env = run_env(Path::new("/tmp/ws"), None, None, &spec, None);
+        assert_eq!(
+            env.get("DUCKTAPE_RUN_ID").map(String::as_str),
+            spec.consensus_run_id.as_deref()
+        );
+        // the write half is absent without a session, and no grant rides along.
+        assert!(!env.contains_key(session::ENV_ACTION_URL));
+        assert!(!env.contains_key(session::ENV_ACTION_TOKEN));
+
+        // a receipt-only spec names no run, so it exports none.
+        let receipt = WorkspaceSpec {
+            consensus_run_id: None,
+            ..spec
+        };
+        assert!(
+            !run_env(Path::new("/tmp/ws"), None, None, &receipt, None)
+                .contains_key("DUCKTAPE_RUN_ID")
+        );
     }
 }

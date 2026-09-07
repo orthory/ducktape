@@ -13,6 +13,7 @@ use sdk::{Event, Msg, StateRoot};
 
 pub mod log_file;
 pub mod resource_limits;
+pub mod signed_req;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -29,6 +30,26 @@ pub enum Error {
     /// surfaces this and the caller fail-stops.
     #[error("recovery journal: {0}")]
     Journal(String),
+    /// the order delivered a block at a height this process has already
+    /// journaled. the composed qmdb root is op-log-order-dependent, so
+    /// applying out of order forks this node against every peer — and so does
+    /// silently dropping the block. as fatal as a boundary fault: the ordering
+    /// seam itself is broken, and the drain stops rather than compose a state
+    /// no validator agreed on.
+    #[error("delivered height {height} is at or below the applied height {applied}")]
+    OutOfOrder { height: u64, applied: u64 },
+    /// the block at `height` designates module code whose bytes this node
+    /// cannot yet resolve, so the drain is PAUSED there — not broken. the
+    /// frame is still at the front of the deferred queue and `applied` blocks
+    /// settled ahead of it; the next drain retries, and the retry IS the
+    /// fetch pump. a caller that fail-stops on this halts a chain that was
+    /// only waiting: at n=3 the quorum is all three.
+    #[error("module code for block {height} is not resolvable yet: {reason}")]
+    CodeStalled {
+        height: u64,
+        applied: usize,
+        reason: String,
+    },
     /// this node's orderer is a follower — it holds no consensus proposal
     /// rights, so nothing it submits can enter the agreed order. loud so a
     /// miswired write path fails at the seam instead of silently vanishing;
@@ -103,6 +124,40 @@ pub const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 /// [`OrderedNode::take_drained`]. the matching is internal to this seam:
 /// nothing requires it to equal the consensus lane's content digest.
 pub type FrameId = [u8; 32];
+
+/// how many recently-journaled blocks the replay window remembers — the
+/// protocol constant every validator applies, so the verdict on a re-finalized
+/// batch is the same everywhere.
+///
+/// a finalized batch that already applied can be re-proposed by anyone holding
+/// its bytes: consensus votes on availability alone, so it finalizes again at
+/// a NEW height and its members' signed ops execute a second time. this window
+/// is what refuses it. the bound is a memory/coverage trade: 4096 entries is
+/// ~160 KiB and, at the ~1 block/s an idle chain heartbeats, a bit over an
+/// hour of history — long enough to cover an epoch cutover, a restart, and the
+/// journal suffix a checkpoint retains.
+///
+/// the window is a property of PERSISTED STATE, not of uptime, and it has to
+/// stay that way: every boundary a node can start from carries it — the
+/// checkpoint (`recovery::Manifest::applied_frames`) and the synced boundary
+/// (`statesync::Manifest::applied_frames`) — so a cold seat and a validator
+/// that has been up for a month enforce the same depth. a node that started
+/// with an empty one would apply, for its first `REPLAY_WINDOW_HEIGHTS`
+/// blocks, a re-proposed batch its peers refuse: one batch, two roots.
+///
+/// a batch older than the window can still replay. a per-origin nonce
+/// enforced in replicated state is the unbounded successor and it is not this
+/// seam: there is no host-owned replicated store (`host::global_root`
+/// composes module roots and nothing else), and the node's own submit
+/// sequence does not survive a state-sync re-bootstrap — `bin/node` seats a
+/// re-bootstrapped identity at `next_seq = 1`, so a strictly-increasing
+/// per-origin check would refuse its every subsequent op.
+pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
+
+/// how often a standing code-swap stall re-warns: attempt 1, then every Nth.
+/// the drain retries every tick, so an unconditional warn would evict the
+/// 4096-line ring in minutes — taking the evidence around the stall with it.
+const CODE_STALL_WARN_EVERY: u64 = 64;
 
 /// compute a frame's [`FrameId`] from its exact encoded bytes. public so a
 /// boot-time observer holding journaled frame bytes derives the SAME id the
@@ -233,8 +288,10 @@ pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
 /// and the proof (exactly one valid encoding per frame — this is what makes
 /// an appended continuation section unrepresentable; every scheme's proof is
 /// self-delimiting so the boundary is the preimage's own end), an origin
-/// malformed for its scheme, or a proof that does not bind the whole
-/// preimage. the ordered drain treats any rejection as a deterministic no-op:
+/// malformed for its scheme — which INCLUDES a secp key spelled any way but
+/// the canonical 33-byte compressed SEC1 form, so one private key can never
+/// enter a block as two distinct origins — or a proof that does not bind the
+/// whole preimage. the ordered drain treats any rejection as a deterministic no-op:
 /// every honest validator rejects the identical forged frame identically.
 /// the verified `origin` becomes the block's `Origin::External(pubkey)` — raw
 /// key bytes, scheme not surfaced (a key's bytes cannot collide across
@@ -322,6 +379,43 @@ pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
 /// tiny length envelope can edge just over this — the real mesh 2 MiB p2p
 /// message cap gives the envelope headroom over this packing target.
 pub const MAX_BATCH_BYTES: usize = MAX_FRAME_BYTES;
+
+/// hard cap on how many MEMBERS one batch super-frame carries. the byte cap
+/// alone does not bound this: the smallest signed op frame is ~155 bytes, so
+/// `MAX_BATCH_BYTES` (1 MiB + 16 KiB) fits ~6.8k members in one block. Each
+/// member is one isolation unit in `Host::apply_block`, and one that stages
+/// then fails replays every accepted member before it, so the block's
+/// re-execution is bounded by `members * (1 + host::MAX_BLOCK_REPLAYS)` —
+/// 1024 members keep that under ~9.2k module executions.
+pub const MAX_BATCH_MEMBERS: usize = 1024;
+
+/// hard cap on how many frames [`OrderedNode`] holds in CUSTODY at once
+/// (`outstanding`, a superset of `pending_batch`). intake is unauthenticated —
+/// an open HTTP route and any mesh peer's relay both land here — and custody
+/// drains only as members apply at `MAX_BATCH_MEMBERS` per block, so without a
+/// cap one flood holds the process's memory until it dies. eight blocks' worth
+/// of backlog: enough that an honest burst never sees a refusal, small enough
+/// that the flood stops at a bounded queue.
+pub const MAX_CUSTODY_FRAMES: usize = 8 * MAX_BATCH_MEMBERS;
+
+/// hard cap on the BYTES held in custody. the count cap alone does not bound
+/// memory: `MAX_CUSTODY_FRAMES` max-size frames would be 8 GiB, and each is
+/// held twice (once in `pending_batch`, once in `outstanding`), so the real
+/// footprint is twice this number.
+pub const MAX_CUSTODY_BYTES: usize = 32 << 20;
+
+/// hard cap on how many frames ONE origin key holds in custody. the total caps
+/// alone let one key fill the whole mempool and starve every other submitter;
+/// this is the fairness bound. two full batches per origin: an honest burst
+/// routinely exceeds one block's worth of members, and it still takes four
+/// distinct keys to reach [`MAX_CUSTODY_FRAMES`].
+pub const MAX_CUSTODY_FRAMES_PER_ORIGIN: usize = 2 * MAX_BATCH_MEMBERS;
+
+/// hard cap on how many batches ONE [`OrderedNode::flush_batch`] proposes.
+/// each batch costs a disk pin plus an orderer proposal on the loop that also
+/// serves `/v1/query`, so a full mempool flushed in one turn stalls every
+/// other lane; the remainder stays enqueued (in FIFO order) for the next turn.
+pub const MAX_FLUSH_BATCHES_PER_TURN: usize = 8;
 
 /// encoded length of `n` as canonical unsigned LEB128.
 fn varint_len(mut n: u64) -> usize {
@@ -754,6 +848,15 @@ fn hex_root(root: &StateRoot) -> String {
     root.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// a mempool-cap refusal. the stable snake_case reason token leads the string
+/// so a submitter and a log line key on the same greppable name, and the bound
+/// it hit follows for the human reading it.
+fn custody_refused(reason: &str, bound: usize) -> Error {
+    Error::Host(sdk::Error::Module(format!(
+        "{reason}: this node's op mempool is at its {bound} bound — retry shortly"
+    )))
+}
+
 fn member_reason(reason: String) -> String {
     match reason
         .strip_prefix("Module(")
@@ -977,7 +1080,17 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// floor, and the exactly-once digest gate does not survive the process —
     /// so recovered history can be delivered again. skipping by the agreed
     /// height is deterministic; frames ABOVE the floor are genuinely new
-    /// (finalized pre-crash but never drained) and apply normally.
+    /// (finalized pre-crash but never drained) and apply normally. set ONCE at
+    /// [`OrderedNode::resume`] and never moved: it is the boundary between
+    /// "already durable elsewhere" and "this process applied it".
+    resume_floor: Option<u64>,
+    /// the highest app height this process has JOURNALED — advanced at every
+    /// block, right before its `pre_apply`. above `resume_floor` a delivered
+    /// height at or below this one cannot be a legitimate re-report: it is an
+    /// out-of-order delivery, and applying it would compose an op-log-ordered
+    /// qmdb root no peer can reproduce. the drain REFUSES it (see
+    /// [`Error::OutOfOrder`]) instead of skipping it silently — a silent skip
+    /// forks just as surely, and quietly.
     applied_floor: Option<u64>,
     /// the OBSERVATION BARRIER: when set, [`OrderedNode::drain_delivered`]
     /// ends its batch right after any block that CHANGES this module's root,
@@ -1003,6 +1116,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// loses accepted-but-unfinalized ops (the pre-existing crash window);
     /// the cutover is the NON-crash path this closes.
     outstanding: std::collections::HashMap<FrameId, (u64, Vec<u8>)>,
+    /// the BYTES of everything in `outstanding`, maintained beside it so the
+    /// intake cap is a comparison rather than a walk of the whole map on every
+    /// submitted frame (which is exactly the walk a flood would pay for).
+    custody_bytes: usize,
+    /// how many frames each ORIGIN key holds in `outstanding` — the per-origin
+    /// fairness cap's counter, maintained beside the map for the same reason.
+    /// an origin's entry is removed when its last frame resolves, so the map
+    /// is bounded by the frame count, not by how many keys have ever submitted.
+    custody_per_origin: std::collections::HashMap<Vec<u8>, usize>,
     /// ENQUEUED member frames awaiting a flush, in FIFO (enqueue) order.
     /// [`OrderedNode::submit_frame`] appends here (custody also begins in
     /// `outstanding`); [`OrderedNode::flush_batch`] drains it, greedily packs
@@ -1020,6 +1142,24 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// boundary instead of silently running stale code. `Arc` so the node and
     /// its recovery sink can share the one source.
     code_source: std::sync::Arc<dyn host::CodeSource>,
+    /// THE REPLAY WINDOW: the batch [`FrameId`]s this node has already
+    /// journaled, newest last, bounded to [`REPLAY_WINDOW_HEIGHTS`] entries.
+    /// consulted in the APPLY path (never in gossip verification — a peer
+    /// votes on a digest purely because it holds the bytes, so an old batch
+    /// re-proposed byte-identically finalizes normally) and so consulted by
+    /// every validator, at the same block, with the same verdict.
+    ///
+    /// it lives on the NODE, not the orderer: the orderer is rebuilt at every
+    /// epoch cutover with a fresh content store and a fresh exactly-once
+    /// digest set, and [`OrderedNode::cutover`] keeps the node — so the guard
+    /// survives the boundary the cutover used to re-open. a restart restores
+    /// it from the recovery journal via [`OrderedNode::seed_replay_window`].
+    replay_window: std::collections::VecDeque<(u64, FrameId)>,
+    /// the code-swap stall: `(height, attempts)` for the block whose
+    /// component bytes have not landed. a forever-retry loop that warned every
+    /// tick would evict the ring; the COUNTER is the diagnosis, so it rides a
+    /// latched warn. cleared the moment a boundary realizes.
+    code_stall: Option<(u64, u64)>,
     /// how each block's `consensus_time` is derived from its height (see
     /// [`ConsensusTimePolicy`]). defaults to `HeightIsTime` — the validator
     /// lane's pre-policy behavior, byte-for-byte.
@@ -1060,12 +1200,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             last_engine_view: None,
             view_ceiling: None,
             sink,
+            resume_floor: None,
             applied_floor: None,
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            custody_bytes: 0,
+            custody_per_origin: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            replay_window: std::collections::VecDeque::new(),
+            code_stall: None,
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1098,12 +1243,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             last_engine_view: None,
             view_ceiling: None,
             sink,
+            resume_floor: finalized.map(|f| f.height),
             applied_floor: finalized.map(|f| f.height),
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            custody_bytes: 0,
+            custody_per_origin: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            replay_window: std::collections::VecDeque::new(),
+            code_stall: None,
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1112,11 +1262,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         }
     }
 
+    /// RESTORE the replay window after a restart, from the journaled
+    /// `(height, batch frame id)` pairs a recovery replay walked — in
+    /// ascending height order. without this a restarted validator would apply
+    /// a batch its running peers refuse. the seed is truncated to the newest
+    /// [`REPLAY_WINDOW_HEIGHTS`] entries, exactly as the live path bounds it.
+    pub fn seed_replay_window(&mut self, applied: impl IntoIterator<Item = (u64, FrameId)>) {
+        self.replay_window.extend(applied);
+        while self.replay_window.len() > REPLAY_WINDOW_HEIGHTS {
+            self.replay_window.pop_front();
+        }
+    }
+
     /// wire the out-of-band component-byte source for code-registry swaps (the
     /// node injects a blobstore-backed one; tests inject an in-memory map). the
     /// default is [`host::NoCodeSource`] — see the field doc.
     pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
         self.code_source = src;
+    }
+
+    /// the replay window as it stands, ascending by height — what a promotion
+    /// hands the validator-ordered rebuild so the new node keeps refusing the
+    /// batches the follower-ordered one already journaled.
+    pub fn replay_window(&self) -> Vec<(u64, FrameId)> {
+        self.replay_window.iter().copied().collect()
     }
 
     /// dismantle the node into its host and sink — the promotion seam: a
@@ -1238,7 +1407,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // and rebuilding from `outstanding` carries BOTH the finalized-past-
         // ceiling discards AND anything accepted-but-never-flushed, with no
         // double-enqueue. resubmit in `seq` order so this origin's ops keep the
-        // order their submitter observed them acked in.
+        // order their submitter observed them acked in. the custody counters
+        // are untouched: the carry drains and reinserts the SAME set, so the
+        // bytes and per-origin quotas it accounts for are unchanged.
         self.pending_batch.clear();
         let mut carried: Vec<(FrameId, u64, Vec<u8>)> = self
             .outstanding
@@ -1264,6 +1435,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// field doc). idempotent; cleared by [`OrderedNode::cutover`].
     pub fn set_view_ceiling(&mut self, ceiling: u64) {
         self.view_ceiling = Some(ceiling);
+    }
+
+    /// the armed discard boundary, for a caller that must apply the SAME rule
+    /// before the drain does — a backfill lane taking frames from an
+    /// unverified source refuses what this node would discard, instead of
+    /// admitting the bytes and discovering the lie after the fold.
+    pub fn view_ceiling(&self) -> Option<u64> {
+        self.view_ceiling
     }
 
     /// the last ENGINE-relative finalized view this node drained — the number
@@ -1310,16 +1489,75 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         }
         decode_member(&frame)?;
         let id = frame_id(&frame);
+        let (origin, seq) = frame_origin_seq(&frame).expect("decode_member verified the envelope");
+        // ONE CUSTODY ENTRY PER FrameId. `outstanding` is the source of truth
+        // (`pending_batch` is a subset of it), so a frame already in custody is
+        // ACKNOWLEDGED IDEMPOTENTLY, never enqueued a second time: the batch
+        // codec is a plain concatenation and the drain applies every member, so
+        // a second copy in `pending_batch` would pack the SAME signed op twice
+        // into one batch and execute it twice at one height under one root hash
+        // on every validator. the caller gets the same id it got the first
+        // time, so a reply held against that id still resolves.
+        if self.outstanding.contains_key(&id) {
+            return Ok(id);
+        }
+        // the MEMPOOL CAPS. intake is unauthenticated on both doors, and
+        // custody drains only as members apply, so every accepted frame must
+        // pass a total bound (count and bytes) and a per-origin bound before it
+        // is held. refused as a plain deterministic error the submitter sees.
+        let over_frame_count = self.outstanding.len() >= MAX_CUSTODY_FRAMES;
+        if over_frame_count {
+            return Err(custody_refused("mempool_frames_full", MAX_CUSTODY_FRAMES));
+        }
+        let over_byte_budget = self.custody_bytes + frame.len() > MAX_CUSTODY_BYTES;
+        if over_byte_budget {
+            return Err(custody_refused("mempool_bytes_full", MAX_CUSTODY_BYTES));
+        }
+        let origin_held = self
+            .custody_per_origin
+            .get(&origin)
+            .copied()
+            .unwrap_or_default();
+        let over_origin_quota = origin_held >= MAX_CUSTODY_FRAMES_PER_ORIGIN;
+        if over_origin_quota {
+            return Err(custody_refused(
+                "mempool_origin_full",
+                MAX_CUSTODY_FRAMES_PER_ORIGIN,
+            ));
+        }
         // ENQUEUE, don't propose: the frame joins `pending_batch` (FIFO) and
         // enters custody. it is not pinned or proposed until [`flush_batch`]
         // packs it into a batch super-frame — that is where the durable pin +
         // orderer proposal happen, once per batch. custody begins HERE so a
         // cutover before the flush still carries the accepted-but-unflushed op
         // (the accept contract holds without a flush having run).
-        let (_, seq) = frame_origin_seq(&frame).expect("decode_member verified the envelope");
+        self.custody_bytes += frame.len();
+        *self.custody_per_origin.entry(origin).or_default() += 1;
         self.pending_batch.push((id, frame.clone()));
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
+    }
+
+    /// CUSTODY ENDS for one member: drop it from `outstanding` and give its
+    /// bytes and its origin's quota back. the ONE release site, so the caps'
+    /// counters cannot drift from the map they bound.
+    fn release_custody(&mut self, id: &FrameId) {
+        let Some((_, frame)) = self.outstanding.remove(id) else {
+            return;
+        };
+        self.custody_bytes -= frame.len();
+        let Some((origin, _)) = frame_origin_seq(&frame) else {
+            return;
+        };
+        let std::collections::hash_map::Entry::Occupied(mut held) =
+            self.custody_per_origin.entry(origin)
+        else {
+            return;
+        };
+        *held.get_mut() -= 1;
+        if *held.get() == 0 {
+            held.remove();
+        }
     }
 
     /// how many member frames are enqueued awaiting the next [`flush_batch`].
@@ -1327,50 +1565,71 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.pending_batch.len()
     }
 
+    /// how many frames this node holds in CUSTODY: accepted and neither applied
+    /// nor rejected yet. a superset of [`OrderedNode::pending_batch_len`] (a
+    /// flushed member is still in custody until it resolves), and the number
+    /// the mempool caps bound — so it, not the flush queue, is what a
+    /// "pending ops" gauge must report.
+    pub fn custody_len(&self) -> usize {
+        self.outstanding.len()
+    }
+
     /// FLUSH — drain `pending_batch` (FIFO), greedily pack the member frames
-    /// into batch super-frames up to [`MAX_BATCH_BYTES`], and for each batch
+    /// into batch super-frames up to [`MAX_BATCH_BYTES`] and
+    /// [`MAX_BATCH_MEMBERS`], and for each batch
     /// PIN its bytes then PROPOSE it to the orderer. returns the number of
-    /// batches submitted (`Ok(0)` when nothing was pending).
+    /// batches submitted (`Ok(0)` when nothing was pending). at most
+    /// [`MAX_FLUSH_BATCHES_PER_TURN`] batches leave in one call — a full
+    /// mempool proposed back to back would stall `/v1/query` on the same loop;
+    /// the FIFO remainder stays enqueued for the next turn.
     ///
     /// FIFO order is preserved end-to-end: a member's position in a batch is
     /// its enqueue order, which is the applied order — reordering would fork a
     /// single node's own op-log-order-dependent (qmdb) root. members stay in
     /// custody (`outstanding`); they leave only when a batch finalizes and the
     /// member resolves in [`drain_delivered`]. a new batch is started when
-    /// adding the next member would push the encoded batch past the cap; a
+    /// adding the next member would push the encoded batch past either cap; a
     /// single member is never split (it is `<= MAX_FRAME_BYTES`, so it always
     /// forms at least its own batch even if that batch edges over the packing
     /// target — the mesh cap has the headroom).
     pub async fn flush_batch(&mut self) -> Result<usize, Error> {
-        if self.pending_batch.is_empty() {
-            return Ok(0);
-        }
-        let pending = std::mem::take(&mut self.pending_batch);
         let mut batches = 0usize;
-        let mut members: Vec<Vec<u8>> = Vec::new();
-        // running encoded size of the members already in `members` (each
-        // member's `varint(len) || bytes`); the `varint(N)` header is added
-        // when projecting whether the next member still fits.
-        let mut members_bytes: usize = 0;
-        for (_id, frame) in pending {
-            let contrib = varint_len(frame.len() as u64) + frame.len();
-            let projected = varint_len(members.len() as u64 + 1) + members_bytes + contrib;
-            if !members.is_empty() && projected > MAX_BATCH_BYTES {
-                // adding this member would overflow the cap — seal the current
-                // batch and start a fresh one with this member.
-                self.propose_batch(&members).await?;
-                batches += 1;
-                members.clear();
-                members_bytes = 0;
+        while batches < MAX_FLUSH_BATCHES_PER_TURN {
+            let members = self.take_one_batch();
+            if members.is_empty() {
+                break;
             }
-            members.push(frame);
-            members_bytes += contrib;
-        }
-        if !members.is_empty() {
             self.propose_batch(&members).await?;
             batches += 1;
         }
         Ok(batches)
+    }
+
+    /// peel the longest FIFO PREFIX of `pending_batch` that fits ONE batch
+    /// super-frame's caps, in enqueue (= applied) order. a single member is
+    /// never split: the first member is always taken, even when it alone edges
+    /// the packing target over (it is `<= MAX_FRAME_BYTES`, and the mesh cap
+    /// has the headroom). empty exactly when nothing is enqueued.
+    fn take_one_batch(&mut self) -> Vec<Vec<u8>> {
+        // running encoded size of the members already counted (each member's
+        // `varint(len) || bytes`); the `varint(N)` header is added when
+        // projecting whether the next member still fits.
+        let mut members_bytes: usize = 0;
+        let mut count: usize = 0;
+        for (_id, frame) in &self.pending_batch {
+            let contrib = varint_len(frame.len() as u64) + frame.len();
+            let projected = varint_len(count as u64 + 1) + members_bytes + contrib;
+            let overflows = projected > MAX_BATCH_BYTES || count == MAX_BATCH_MEMBERS;
+            if count > 0 && overflows {
+                break;
+            }
+            members_bytes += contrib;
+            count += 1;
+        }
+        self.pending_batch
+            .drain(..count)
+            .map(|(_id, frame)| frame)
+            .collect()
     }
 
     /// encode one batch super-frame, durably PIN it, then PROPOSE it to the
@@ -1433,10 +1692,27 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // frame (it was applied and sealed before the restart); the engine
             // re-reported it from its reopened journal. dropping it by agreed
             // height is the same deterministic no-op everywhere.
-            if let Some(floor) = self.applied_floor
-                && height <= floor
-            {
+            let is_resume_replay = self.resume_floor.is_some_and(|floor| height <= floor);
+            if is_resume_replay {
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    reason = "resume_replay",
+                    "skipped a re-reported frame the recovered state already contains"
+                );
                 continue;
+            }
+            // MONOTONICITY. above the resume floor every height is this
+            // process's own to journal, so a delivery at or below the last one
+            // it journaled is not history — it is an out-of-order delivery,
+            // and the composed qmdb root is op-log-order-dependent. refuse
+            // loudly: applying it forks this node against every peer, and
+            // skipping it forks it just as hard while looking healthy.
+            if let Some(applied) = self.applied_floor
+                && height <= applied
+            {
+                return Err(Error::OutOfOrder { height, applied });
             }
             let batch_id = frame_id(&frame);
             // the CUTOVER CEILING: a batch finalized at or past the agreed
@@ -1475,6 +1751,52 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: None,
                     }),
                 }
+                // a discard seals nothing and journals nothing, so without
+                // this line a batch vanishes from the log entirely — the one
+                // shape that looks exactly like a halted chain (#1766).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    ceiling,
+                    reason = "cutover_ceiling",
+                    "discarded a batch finalized past the cutover ceiling"
+                );
+                continue;
+            }
+            // THE REPLAY WINDOW: this exact batch already applied at a recent
+            // height. consensus cannot catch this — a validator votes for any
+            // digest whose bytes it holds, so anyone who kept a finalized
+            // batch can re-propose it byte-identically and have it finalize at
+            // a NEW height, executing every member's signed op a second time.
+            // the refusal lives HERE, in the apply path, keyed on a protocol
+            // constant, so every validator reaches it at the same block with
+            // the same verdict. journaled Rejected like any other deterministic
+            // whole-batch no-op, so the height still seals.
+            let replayed = self
+                .replay_window
+                .iter()
+                .any(|(_, applied)| *applied == batch_id);
+            if replayed {
+                self.drained.push(DrainedFrame {
+                    id: batch_id,
+                    height,
+                    disposition: Disposition::Rejected,
+                    root_hash: self.host.root_hash(),
+                    op: None,
+                    reason: Some("batch replayed".to_string()),
+                });
+                self.seal(height, Disposition::Rejected).await?;
+                self.applied_floor = Some(height);
+                self.remember_applied(height, batch_id);
+                last_sealed_view = Some(view);
+                tracing::warn!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    reason = "batch_replayed",
+                    "refused a batch this node already applied"
+                );
                 continue;
             }
             // CODE-SWAP REALIZATION: reconcile every hot-swappable module's
@@ -1487,19 +1809,31 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // not apply this block on stale code — put the frame back (nothing
             // journaled yet) and surface the stall; the drain retries once the
             // bytes arrive. NEVER a fork: every honest node holding the bytes
-            // realizes identically, and one that doesn't stops here.
+            // realizes identically, and one that doesn't stops here. STALLED,
+            // not fatal: the frame goes back at the FRONT (nothing journaled
+            // yet) and the next drain retries it — the retry is the fetch
+            // pump. a caller that fail-stops here halts a chain that was only
+            // waiting for bytes.
             if let Err(e) = self
                 .host
                 .realize_module_swaps(height, self.code_source.as_ref())
                 .await
             {
                 self.deferred.push_front((view, frame));
-                return Err(Error::Host(e));
+                // the stalled frame was counted as processed on pop; it was
+                // not, and it will be counted again on the retry.
+                return Err(self.note_code_stall(height, e, applied.saturating_sub(1)));
             }
+            // a realized boundary clears the stall: the next miss counts from 1.
+            self.code_stall = None;
             // below the ceiling this batch RESOLVES here as ONE block at ONE
             // height. WAL discipline: the batch bytes are finalized and about to
             // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
             // forward from this record instead of losing a finalized batch.
+            // this height is now this process's own: journal it and advance the
+            // monotonicity floor together, so the next delivery below it is
+            // refused rather than composed into the root out of order.
+            self.applied_floor = Some(height);
             self.sink.pre_apply(height, &frame).await?;
             // an undecodable batch is a DETERMINISTIC whole-block no-op: every
             // honest node finalized the identical bytes and rejects them
@@ -1517,26 +1851,39 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: Some("batch decode failed".to_string()),
                     });
                     self.seal(height, Disposition::Rejected).await?;
+                    self.remember_applied(height, batch_id);
                     last_sealed_view = Some(view);
                     continue;
                 }
             };
-            // decode each member into the ops the block applies. no per-member
-            // dedup here on purpose: in honest operation a signed frame lives in
-            // exactly ONE proposer's mempool (relays fan to one validator,
-            // custody ends on apply, the cutover carry never double-applies), so
-            // a finalized batch never repeats a member; a byzantine duplicate is
-            // caught deterministically by the module's own (origin, seq) dedup —
-            // identically live and on recovery replay. a member that fails to
-            // decode is a deterministic no-op: EXCLUDED from the ops and recorded
-            // Rejected after the block settles (it shares the block root-hash).
-            // the rest carry their identity parallel to `ops`, in member (=
-            // applied, = enqueue/FIFO) order, for building the drained records.
+            // decode each member into the ops the block applies. a REPEATED
+            // member is skipped: the batch codec is a plain concatenation and
+            // both copies decode to the same origin + msg (`seq` is discarded),
+            // so applying both executes one signed op twice at one height. the
+            // local intake refuses a duplicate at `submit_frame`, but a
+            // byzantine proposer packs whatever it likes — so the skip lives
+            // HERE too, keyed on the member's own content address, and every
+            // honest node computes the identical skip set from the identical
+            // bytes. no fork, and no per-member log line (a repeated member is
+            // attacker-controlled: one debug per batch, carrying the count). a
+            // member that fails to decode is a deterministic no-op: EXCLUDED
+            // from the ops and recorded Rejected after the block settles (it
+            // shares the block root-hash). the rest carry their identity
+            // parallel to `ops`, in member (= applied, = enqueue/FIFO) order,
+            // for building the drained records.
             let mut ops: Vec<host::BlockOp> = Vec::new();
             let mut op_meta: Vec<MemberMeta> = Vec::new();
             let mut decode_fail: Vec<(FrameId, String)> = Vec::new();
+            let mut seen: std::collections::HashSet<FrameId> =
+                std::collections::HashSet::with_capacity(members.len());
+            let mut repeated = 0usize;
             for member in &members {
                 let mid = frame_id(member);
+                let is_repeat = !seen.insert(mid);
+                if is_repeat {
+                    repeated += 1;
+                    continue;
+                }
                 match self.take_decoded(member) {
                     Ok(op) => {
                         op_meta.push(MemberMeta {
@@ -1554,6 +1901,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     }
                     Err(e) => decode_fail.push((mid, e.to_string())),
                 }
+            }
+            if repeated > 0 {
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    repeated,
+                    reason = "batch_member_repeated",
+                    "skipped members a proposer packed more than once into one batch"
+                );
             }
             // the observation barrier compares the watched root across the WHOLE
             // batch — only an applied member can move it (rejected members roll
@@ -1602,6 +1959,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: Some(member_reason(e.to_string())),
                     });
                     self.seal(height, Disposition::Rejected).await?;
+                    self.remember_applied(height, batch_id);
                     last_sealed_view = Some(view);
                     continue;
                 }
@@ -1637,7 +1995,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     target: op_target,
                     payload: op_payload,
                 } = meta;
-                self.outstanding.remove(&mid);
+                self.release_custody(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
@@ -1676,7 +2034,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // share the block root-hash. custody ends — a decode-fail can never
             // apply, so it must not be carried at a cutover.
             for (mid, decode_reason) in decode_fail {
-                self.outstanding.remove(&mid);
+                self.release_custody(&mid);
                 self.drained.push(DrainedFrame {
                     id: mid,
                     height,
@@ -1692,6 +2050,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Disposition::Rejected
             };
             self.seal(height, block_disp).await?;
+            self.remember_applied(height, batch_id);
             // the block spine. NOTHING in this repo ever said "height H produced
             // root-hash X" — and fork triage, upgrade verification, and "is my node
             // keeping up" all start exactly there.
@@ -1710,7 +2069,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     "block committed"
                 );
             } else {
-                tracing::debug!(target: "ducktape::consensus", height, view, "idle block");
+                // the member counts ride it: an "idle block" carrying rejected
+                // members is a REAL op silently dying, not the heartbeat nop.
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    rejected = rejected_count,
+                    "idle block"
+                );
             }
             last_sealed_view = Some(view);
             // OBSERVATION BARRIER (once per batch): end the drain right after a
@@ -1745,6 +2112,46 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         Ok(applied)
     }
 
+    /// count one code-swap stall at `height` and narrate it on the first
+    /// attempt and every [`CODE_STALL_WARN_EVERY`] after — an unconditional
+    /// warn in a forever-retry loop is a log bomb that evicts the evidence,
+    /// and the attempt COUNT is the diagnosis.
+    fn note_code_stall(&mut self, height: u64, e: sdk::Error, applied: usize) -> Error {
+        let attempts = self
+            .code_stall
+            .filter(|(stalled, _)| *stalled == height)
+            .map_or(1, |(_, seen)| seen + 1);
+        self.code_stall = Some((height, attempts));
+        let reason = e.to_string();
+        let narrate = attempts == 1 || attempts.is_multiple_of(CODE_STALL_WARN_EVERY);
+        if narrate {
+            tracing::warn!(
+                target: "ducktape::consensus",
+                height,
+                attempts,
+                reason = "module_code_unresolved",
+                "the drain is stalled awaiting module code: {reason}"
+            );
+        }
+        Error::CodeStalled {
+            height,
+            applied,
+            reason,
+        }
+    }
+
+    /// remember a batch this node journaled, evicting past
+    /// [`REPLAY_WINDOW_HEIGHTS`]. called once per SEALED block, whatever its
+    /// disposition: a rejected batch re-proposed later is the same replay, and
+    /// the bound must be a pure count of sealed heights or two validators
+    /// would remember different depths.
+    fn remember_applied(&mut self, height: u64, batch: FrameId) {
+        self.replay_window.push_back((height, batch));
+        while self.replay_window.len() > REPLAY_WINDOW_HEIGHTS {
+            self.replay_window.pop_front();
+        }
+    }
+
     /// journal a settled block's outcome: disposition + the post-block root
     /// vector (the replay positions) + the composed root-hash.
     async fn seal(&mut self, height: u64, disposition: Disposition) -> Result<(), Error> {
@@ -1774,6 +2181,22 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// the current root-hash of the wrapped host.
     pub fn root_hash(&self) -> StateRoot {
         self.host.root_hash()
+    }
+
+    /// the `consensus_time` a block at `height` carries, under this node's
+    /// [`ConsensusTimePolicy`] — the same derivation
+    /// [`OrderedNode::drain_delivered`] stamps into every applied block's
+    /// `Env`. lets a status projection report the exact clock modules compare
+    /// `expires_at` against, whatever the policy (a block height on the
+    /// validator lane, a millisecond epoch on the sim lane).
+    pub fn stamp_consensus_time(&self, height: u64) -> u64 {
+        self.time_policy.stamp(height)
+    }
+
+    /// the [`ConsensusTimePolicy`] this node stamps blocks under — lets a
+    /// status projection report which UNIT `consensus_time` is expressed in.
+    pub fn consensus_time_policy(&self) -> ConsensusTimePolicy {
+        self.time_policy
     }
 
     /// take the events accumulated by applied blocks since the last call. the
@@ -1828,6 +2251,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// accessors cannot borrow both at once.
     pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
         (&mut self.sink, &self.host)
+    }
+
+    /// Readiness preflight against the running module's retained state shape.
+    pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), sdk::Error> {
+        self.host.check_module_replacement(id, bytes)
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

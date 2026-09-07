@@ -17,6 +17,7 @@ use workspace_config::{
     Coordination, DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS, Front, InviteToken,
     NetworkDescriptor, ReachDial, StoredInviteWireGuard, dialable, hex_bytes, ingress_of,
     load_coord_cap, load_invite_fronts, load_invite_token, load_invite_wireguard,
+    validate_block_time_ms,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -155,7 +156,7 @@ pub struct Resolved {
 /// signed for.
 #[derive(Debug)]
 pub struct GenesisModules {
-    /// id -> sha256 of the genesis component, for every wasm tenant.
+    /// id -> sha256 of the genesis deployment, for every wasm tenant.
     pub hashes: BTreeMap<String, [u8; 32]>,
     /// where the bytes come from.
     pub source: GenesisSource,
@@ -173,10 +174,7 @@ pub enum GenesisSource {
     FoundingSet(PathBuf),
 }
 
-// the component bundle's naming and hashing live beside the composer, where
-// the daemons that also read a bundle dir can reach them; `config::*` keeps
-// re-exporting both for `bin/node`'s own call sites.
-pub use noded::bundle::{component_path, hash_bundle};
+pub use workspace_config::component_path;
 
 /// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
 /// and, being a member of [`Resolved`], everything the NODE knows about the
@@ -465,8 +463,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     // non-empty by `load_valid_descriptor`, which BOTH paths run.
     let validators = descriptor.validator_keys()?;
     // one dial source of truth: reach_entries() folds bootstrap-synthesised
-    // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
-    // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
+    // Direct hints in with the typed `reach` hints (their union). Direct
+    // resolves to a mesh Ingress dialed directly; Coordinated routes are handed
     // to the nat client, which rendezvouses through the coordinator and
     // hole-punches to the target — but the target is still authenticated
     // end-to-end by its own key, so a coordinated peer is a real mesh member
@@ -553,7 +551,10 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_listen,
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks,
-        cadence: consensus::Cadence::from_millis(raw.block_time_ms),
+        // the beat is a genesis fact, not node plumbing: it rides the
+        // descriptor (and its fingerprint), so every member of a network runs
+        // the same simplex clock by construction.
+        cadence: consensus::Cadence::from_millis(descriptor.block_time_ms),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
@@ -768,6 +769,15 @@ fn resolve_advertised(
 /// the dev-seed shape: every peer dials every other through the
 /// index-aligned `peer_addrs` list (the mesh has no address gossip).
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
+    // the beat first — it is the one field nothing upstream has checked. the
+    // descriptor shapes go through `NetworkDescriptor::from_toml`/`unpack_invite`
+    // and the founding flag is range-limited, but `DevSeedToml::block_time_ms`
+    // is a plain Option<u64> read straight into the Cadence. Zero collapses
+    // every simplex timer (idle hold, leader timeout, the 2x certification and
+    // 10x retry) to Duration::ZERO — the hot spin the validator exists to
+    // refuse. Same rule, same error, at this boundary too.
+    let block_time_ms = raw.block_time_ms.unwrap_or(DEFAULT_BLOCK_TIME_MS);
+    validate_block_time_ms(block_time_ms)?;
     // the shared half first: it owns the storage/workspace derivation and must
     // run before any field of `raw` is moved out below.
     let service = service_dev_shape(&raw)?;
@@ -867,10 +877,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // a typo'd `listen` must be told about the typo, not about the bundle.
     let founding_set = PathBuf::from(&raw.modules);
     let genesis = GenesisModules {
-        hashes: hash_bundle(
-            &founding_set,
-            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-        )?,
+        hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),
         source: GenesisSource::FoundingSet(founding_set),
     };
     Ok(Resolved {
@@ -893,9 +900,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         invite_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
-        cadence: consensus::Cadence::from_millis(
-            raw.block_time_ms.unwrap_or(DEFAULT_BLOCK_TIME_MS),
-        ),
+        cadence: consensus::Cadence::from_millis(block_time_ms),
         invite_token: None,
         invite_wireguard: None,
         invite_fronts: Vec::new(),
@@ -974,6 +979,7 @@ mod tests {
             )],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1015,6 +1021,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1051,6 +1058,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1078,6 +1086,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1140,6 +1149,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1197,6 +1207,43 @@ mod tests {
         assert!(default.service.storage_dir.is_absolute());
     }
 
+    #[test]
+    fn the_dev_shape_refuses_a_zero_beat() {
+        // "as fast as possible" in a harness, or a typo: every Cadence timer
+        // is a multiple of the beat, so zero boots a node that spins views at
+        // CPU speed with no line saying why. The descriptor shapes already
+        // refuse it; this one must say the same thing.
+        let dir = tmp("devzerobeat");
+        let bundle = fake_bundle(&dir);
+        let raw: DevSeedToml = toml::from_str(&format!(
+            "id = 9\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [9]\nblock_time_ms = 0\n{bundle}"
+        ))
+        .expect("parse dev config");
+        let err = resolve_dev_shape(raw).expect_err("a zero beat is not a cadence");
+        assert!(err.contains("block_time_ms"), "{err}");
+
+        // a beat under the drain-tick floor is refused too: this shape boots
+        // the SAME pump_heartbeat/DRAIN_TICK-driven node, so 1ms is no more a
+        // cadence here than it is at the descriptor boundary.
+        let too_fast: DevSeedToml = toml::from_str(&format!(
+            "id = 9\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [9]\nblock_time_ms = 1\n{bundle}"
+        ))
+        .expect("parse dev config");
+        let err = resolve_dev_shape(too_fast).expect_err("1ms is below the drain tick");
+        assert!(err.contains("block_time_ms"), "{err}");
+
+        // the floor itself still resolves.
+        let at_floor: DevSeedToml = toml::from_str(&format!(
+            "id = 9\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+             peer_seeds = [9]\nblock_time_ms = {}\n{bundle}",
+            workspace_config::MIN_BLOCK_TIME_MS
+        ))
+        .expect("parse dev config");
+        resolve_dev_shape(at_floor).expect("the floor is a cadence");
+    }
+
     /// ISOLATED FROM THE PARALLEL SUITE ON PURPOSE — `make test` runs it, but
     /// in its own serial pass (`-- --ignored --test-threads=1`).
     ///
@@ -1247,6 +1294,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1310,6 +1358,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1333,7 +1382,6 @@ mod tests {
 
     #[test]
     fn dev_shape_hashes_its_modules_dir() {
-        use sha2::Digest as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
@@ -1359,13 +1407,13 @@ mod tests {
         );
         assert_eq!(
             r.genesis.hashes["pages"],
-            <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
-            "each hash is the sha256 of the component file on disk"
+            module_artifact::ModuleArtifact::component(b"pages".to_vec()).hash(),
+            "each hash commits the whole deployment from disk"
         );
     }
 
     #[test]
-    fn dev_shape_names_a_missing_component() {
+    fn dev_shape_refuses_an_empty_module_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
@@ -1381,14 +1429,8 @@ mod tests {
         )
         .expect("write node.toml");
         let err = resolve(&cfg).expect_err("an empty bundle dir is refused");
-        // the refusal names the FULL path of the first component it could not
-        // read — an operator pointed at the wrong directory needs the path,
-        // not a bare module id. `hash_bundle` walks BY ID, so "first" is the
-        // alphabetically first wasm module, not the first in topology order.
-        let mut ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-        ids.sort_unstable();
-        let missing = component_path(&modules, ids[0]);
-        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(err.contains(&modules.display().to_string()), "{err}");
+        assert!(err.contains("no module components"), "{err}");
     }
 
     /// a network with no modules is not a runnable network — its nodes would
@@ -1404,6 +1446,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: Vec::new(),
             genesis: "ab".repeat(32),
         }
@@ -1763,7 +1806,6 @@ mod tests {
             ("primary_coordinator", "\"none\""),
             ("coordinator_relay", "\"none\""),
             ("checkpoint_blocks", "32"),
-            ("block_time_ms", "1000"),
         ];
         defaults
             .iter()
@@ -1799,6 +1841,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1855,6 +1898,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1884,6 +1928,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };

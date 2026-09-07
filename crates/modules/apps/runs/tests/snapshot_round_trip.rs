@@ -23,13 +23,13 @@ use dispatch::{
     encode_reply as dispatch_encode_reply, encode_result_event as dispatch_encode_result_event,
 };
 use futures::executor::block_on;
-use tasks::{JobsEvent, encode_job_event as jobs_encode_event};
-use runs::{RunsModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
 use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply, encode_msg, encode_query,
 };
+use runs::{RunsModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
 use saga::SagaOrigin;
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use tasks::{JobsEvent, encode_job_event as jobs_encode_event};
 
 /// a minimal `Ctx`: drives `execute` with a controllable env, serves a canned
 /// agent registry and chat transcripts (context pins), and answers the
@@ -127,6 +127,14 @@ impl Ctx for TestCtx {
                         .find(|v| v.head.message_id == message_id)
                         .cloned(),
                 ))),
+                // every channel this fixture serves a transcript for is open
+                // standing — this round-trip test carries no membership case.
+                ChatQuery::Access { .. } => {
+                    Ok(chat_encode_reply(&ChatReply::Access(chat::ChannelAccess {
+                        may_read: true,
+                        may_post: true,
+                    })))
+                }
                 _ => Err(Error::QueryUnsupported),
             },
             other => Err(Error::UnknownModule(other.into())),
@@ -292,7 +300,11 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
     };
     assert_eq!(watches.len(), 4);
     let threaded = pending(&src, &run_id_for("general", 3, "ext-bot")).expect("threaded entry");
-    assert_eq!(threaded.thread_root, Some(1), "the option field is populated");
+    assert_eq!(
+        threaded.thread_root,
+        Some(1),
+        "the option field is populated"
+    );
     assert!(pending(&src, &run_id_for("dev", 1, "mod-bot")).is_some());
     let job = pending(&src, &job_run_id_for("job-1", "mod-bot", 2)).expect("job entry");
     assert_eq!(job.job_id, Some("job-1".into()));
@@ -354,7 +366,11 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
     let delivered_root = src.root();
     let mut joiner = module();
     joiner.install(&src.snapshot(), delivered_root).unwrap();
-    assert_eq!(joiner.root(), delivered_root, "canonical bytes round-trip unchanged");
+    assert_eq!(
+        joiner.root(),
+        delivered_root,
+        "canonical bytes round-trip unchanged"
+    );
     for q in [RunsQuery::Watches, RunsQuery::PendingRuns] {
         assert_eq!(query_reply(&joiner, &q), query_reply(&src, &q));
     }
@@ -520,6 +536,7 @@ fn minimal_offsets(snapshot: &[u8]) -> MinimalOffsets {
     let requester = cursor;
     cursor += 1;
     skip_lp(snapshot, &mut cursor); // external requester bytes
+    skip_lp(snapshot, &mut cursor); // sink json
     cursor += 8; // created_at
     cursor += 8; // empty sessions
     cursor += 8; // empty delegations

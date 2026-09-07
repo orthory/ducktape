@@ -111,7 +111,18 @@ fn main() {
         black_box(authenticated.handle_auth_replies(source, bind.clone(), NOW));
     });
 
-    let peer_register = auth_request(&peer_signer, peer, Msg::Register { key: peer }, NOW);
+    let peer_register = auth_request(
+        &peer_signer,
+        peer,
+        Msg::Register {
+            key: peer,
+            // No live mapping exists yet, so the cookie would need to verify
+            // for it to actually admit the key — irrelevant here, this bench
+            // only times `handle_auth_replies`'s dispatch cost either way.
+            cookie: [0u8; 32],
+        },
+        NOW,
+    );
     authenticated.handle_auth_replies(peer_source, peer_register.clone(), NOW);
     let lookup = auth_request(&signer, caller, Msg::Lookup { key: peer }, NOW);
     bench("authenticated lookup", 20_000, || {

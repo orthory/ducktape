@@ -95,6 +95,7 @@ impl RunsModule {
                 return Ok(());
             }
         };
+        let sink = portable.sink.clone();
         let payload =
             envelope::render_job_payload(&agent, &run_id, &job_id, &spec, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
@@ -138,6 +139,7 @@ impl RunsModule {
                 job_id: Some(job_id),
                 job_claim_height: claim_height,
                 requester,
+                sink,
                 created_at: now,
             }),
         );

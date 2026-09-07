@@ -165,5 +165,5 @@ restarting (`node-service.md`, "Restart, stop, upgrade") — the chain has no
 binary version and admits nothing on it. Neither has a rehearsed
 *recovery* procedure for the case where the swap halted the network; the
 live-upgrade e2e (`bin/node/tests/module_upgrade_e2e.rs`) covers a
-lifecycle refusal rolling `Execute` back in-kernel, not an operator
+registry refusal rolling `Execute` back in-kernel, not an operator
 undoing a finalized swap.

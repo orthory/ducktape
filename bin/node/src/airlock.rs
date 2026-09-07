@@ -123,8 +123,16 @@ fn serve_until(
     workspace: PathBuf,
     also_stop: impl std::future::Future<Output = ()> + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    crate::services::serve_until_stopped(also_stop, |stop| {
-        run(instance, storage, http_base, workspace, stop)
+    crate::services::serve_until_stopped(also_stop, |stop| async move {
+        let node = NodeLink::new(http_base).with_timeout(GRANT_QUERY_TIMEOUT);
+        // WHOSE routes this node agrees to serve under the airlock label,
+        // resolved before anything is published. A route entry is the
+        // operator's consent to one (account, label) pair: consensus lets ANY
+        // member publish a record naming this node as its publisher, so a label
+        // alone would let a stranger's record — with an audience and method set
+        // they wrote themselves — reach this lender's loopback API.
+        let account = route_account(&node).await?;
+        run(instance, storage, node, account, workspace, stop).await
     })
 }
 
@@ -134,7 +142,8 @@ fn serve_until(
 async fn run(
     instance: String,
     storage: PathBuf,
-    http_base: String,
+    node: NodeLink,
+    account: u64,
     workspace: PathBuf,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -152,7 +161,6 @@ async fn run(
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
 
-    let node = NodeLink::new(http_base).with_timeout(GRANT_QUERY_TIMEOUT);
     let router = store.router(committed_grant_check(node))?;
 
     // Register the loopback port only once the router exists: a route pointing
@@ -168,7 +176,7 @@ async fn run(
     // dropped after N consecutive connect-refusals in `gateway_plane`, or a lease
     // this beat renews. Deliberately not built here.
     let route = gateway::RouteName::named(AIRLOCK_ROUTE);
-    crate::gateway_routes::register(&workspace, route.clone(), port)
+    crate::gateway_routes::register(&workspace, account, route.clone(), port)
         .map_err(|error| format!("register airlock gateway route: {error}"))?;
 
     tracing::info!(
@@ -193,7 +201,12 @@ async fn run(
     // hand `gateway unbind` is corrected within one) and retire it on the way
     // out. Both are scoped to OUR port: a second daemon that took the route owns
     // it, and neither the beat nor the exit may touch a live entry that is its.
-    let refresh = tokio::spawn(refresh_route(workspace.clone(), route.clone(), port));
+    let refresh = tokio::spawn(refresh_route(
+        workspace.clone(),
+        account,
+        route.clone(),
+        port,
+    ));
     let served = tokio::select! {
         served = airlock::server::serve_router(listener, router) => served.map_err(Into::into),
         () = stop => Ok(()),
@@ -208,8 +221,20 @@ async fn run(
     // is to inject a tiny interval, which is a test waiting on time — worse than
     // no test. Deleting this line does not fail anything; keep it anyway.
     let _ = refresh.await;
-    retire_route(&workspace, &route, port);
+    retire_route(&workspace, account, &route, port);
     served
+}
+
+/// The account this daemon's loopback route is bound FOR: the one the
+/// operator's ACTIVE WALLET key is on, read from committed identity state. The
+/// same account [`crate::gateway_routes`]'s `gateway bind` records, so an
+/// operator-typed bind and this self-registration consent to the same pair.
+async fn route_account(node: &NodeLink) -> Result<u64, String> {
+    let key = crate::boot::surfaces::operator_wallet_key()
+        .ok_or("no active wallet on this host — `ducktape wallet create` first")?;
+    account_of_key(node, &key).await?.ok_or_else(|| {
+        "the active wallet key is on no account — `ducktape account create` first".to_string()
+    })
 }
 
 /// A forever-retry loop logs attempt 1, then every 30th — the counter IS the
@@ -226,12 +251,17 @@ fn beat_is_worth_a_line(beats: u64) -> bool {
 /// One counter PER CAUSE, each reset by the other: `attempts` has to mean
 /// "consecutive beats of THIS failure", or a run that alternates between a
 /// foreign owner and an unwritable workspace logs a total describing neither.
-async fn refresh_route(workspace: PathBuf, route: gateway::RouteName, port: u16) -> ! {
+async fn refresh_route(
+    workspace: PathBuf,
+    account: u64,
+    route: gateway::RouteName,
+    port: u16,
+) -> ! {
     let mut foreign_beats: u64 = 0;
     let mut failed_beats: u64 = 0;
     loop {
         tokio::time::sleep(crate::services::HEARTBEAT).await;
-        match crate::gateway_routes::reassert(&workspace, &route, port) {
+        match crate::gateway_routes::reassert(&workspace, account, &route, port) {
             Ok(RouteOwner::Vacant | RouteOwner::Ours) => {
                 foreign_beats = 0;
                 failed_beats = 0;
@@ -268,8 +298,8 @@ async fn refresh_route(workspace: PathBuf, route: gateway::RouteName, port: u16)
 /// Drop the loopback route on the way out — OURS only. Best effort: a workspace
 /// that has become unwritable must not turn a clean stop into a failed one, but
 /// leaving a live route pointing at a port nothing serves is worth a line.
-fn retire_route(workspace: &Path, route: &gateway::RouteName, port: u16) {
-    match crate::gateway_routes::retire(workspace, route, port) {
+fn retire_route(workspace: &Path, account: u64, route: &gateway::RouteName, port: u16) {
+    match crate::gateway_routes::retire(workspace, account, route, port) {
         Ok(RouteOwner::Vacant | RouteOwner::Ours) => {}
         // once per shutdown, and it explains why the route outlives us.
         Ok(RouteOwner::Foreign) => tracing::info!(
@@ -355,7 +385,24 @@ fn committed_grant_check(node: NodeLink) -> airlock::server::GrantCheck {
 /// who can reach the route, so everything about it is a stranger's input. An
 /// admission is the owner's audit record and goes to [`admit`] at `info`,
 /// because the person who needs it is the one who was not watching.
+///
+/// **Ordering mirrors [`delegated_answer`]'s doctrine**: a FREE refusal (one
+/// decided on bytes already in the question, no committed read needed) runs
+/// before the identity read. `WorkRef::Direct` is decided a priori — there is
+/// never a committed record of who asked for a pty, so this arm always
+/// refuses (`a_direct_session_never_delegates` pins it) — and must cost this
+/// node's command lane nothing. Reading the credential record before this
+/// match, as the code once did, meant every Direct question still paid one
+/// `/v1/query` round trip it could never turn into an admission: any
+/// admitted network member could loop a known credential name against a
+/// Direct question and saturate the lender's gateway plane for free.
 async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) -> GrantAnswer {
+    let saga_id = match &question.work {
+        // Nothing to delegate against. An interactive session takes this arm by
+        // construction: there is no committed record of who asked for a pty.
+        WorkRef::Direct => return refuse("credential_not_granted"),
+        WorkRef::Saga { saga_id } => saga_id,
+    };
     let record = match committed_credential_record(reader, &question.credential).await {
         Ok(Some(record)) => record,
         Ok(None) => return refuse("credential_record_absent"),
@@ -372,12 +419,7 @@ async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) ->
             return GrantAnswer::Undetermined;
         }
     };
-    match &question.work {
-        // Nothing to delegate against. An interactive session takes this arm by
-        // construction: there is no committed record of who asked for a pty.
-        WorkRef::Direct => refuse("credential_not_granted"),
-        WorkRef::Saga { saga_id } => delegated_answer(reader, &record, question, saga_id).await,
-    }
+    delegated_answer(reader, &record, question, saga_id).await
 }
 
 /// One resolved condition of the delegated check that needed a committed read.
@@ -952,8 +994,12 @@ mod tests {
     #[tokio::test]
     async fn an_admitted_draw_is_recorded_for_the_owner() {
         let state = Committed::new(SagaOrigin::External(OWNER_KEY.to_vec()), Some(EXEC_NODE));
-        let (answer, log) = logged(tracing::Level::INFO, &state, &question(EXEC_NODE, pointer()))
-            .await;
+        let (answer, log) = logged(
+            tracing::Level::INFO,
+            &state,
+            &question(EXEC_NODE, pointer()),
+        )
+        .await;
         assert_eq!(answer, GrantAnswer::Granted);
         // WHO — the node the transport vouched for, by its prefix.
         let caller = noded::hex_bytes(&EXEC_NODE[..CALLER_PREFIX_BYTES]);
@@ -978,8 +1024,12 @@ mod tests {
     #[tokio::test]
     async fn a_node_signed_saga_draws_on_nobody() {
         let state = Committed::new(SagaOrigin::External(EXEC_NODE.to_vec()), Some(EXEC_NODE));
-        let (answer, log) = logged(tracing::Level::TRACE, &state, &question(EXEC_NODE, pointer()))
-            .await;
+        let (answer, log) = logged(
+            tracing::Level::TRACE,
+            &state,
+            &question(EXEC_NODE, pointer()),
+        )
+        .await;
         assert_eq!(answer, GrantAnswer::Refused);
         assert!(
             log.contains(r#"reason="delegated_submitter_not_granted""#),
@@ -994,8 +1044,12 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_still_names_neither_the_credential_nor_the_caller() {
         let state = Committed::new(SagaOrigin::External(STRANGER_KEY.to_vec()), Some(EXEC_NODE));
-        let (answer, log) = logged(tracing::Level::TRACE, &state, &question(EXEC_NODE, pointer()))
-            .await;
+        let (answer, log) = logged(
+            tracing::Level::TRACE,
+            &state,
+            &question(EXEC_NODE, pointer()),
+        )
+        .await;
         assert_eq!(answer, GrantAnswer::Refused);
         assert!(
             log.contains(r#"reason="delegated_submitter_not_granted""#),
@@ -1018,8 +1072,12 @@ mod tests {
     #[tokio::test]
     async fn a_capture_below_the_events_level_records_nothing() {
         let state = Committed::new(SagaOrigin::External(STRANGER_KEY.to_vec()), Some(EXEC_NODE));
-        let (answer, log) = logged(tracing::Level::INFO, &state, &question(EXEC_NODE, pointer()))
-            .await;
+        let (answer, log) = logged(
+            tracing::Level::INFO,
+            &state,
+            &question(EXEC_NODE, pointer()),
+        )
+        .await;
         assert_eq!(answer, GrantAnswer::Refused);
         assert_eq!(log, "");
     }
@@ -1114,6 +1172,26 @@ mod tests {
             answered(&state, &question(EXEC_NODE, WorkRef::Direct)).await,
             GrantAnswer::Refused,
             "a delegable saga existing does not delegate a session that never named it"
+        );
+    }
+
+    /// **A Direct question is decided a priori and must cost zero reads.**
+    /// The refusal above (`a_direct_session_never_delegates`) proves the
+    /// ANSWER; this proves the COST — the fake reader panics on any call at
+    /// all, so this only stays green while the match on `question.work` runs
+    /// before `committed_credential_record`.
+    #[tokio::test]
+    async fn a_direct_question_performs_zero_reads() {
+        struct PanicsOnAnyRead;
+        #[async_trait::async_trait]
+        impl CommittedReader for PanicsOnAnyRead {
+            async fn read(&self, target: &str, _request: Vec<u8>) -> Result<Vec<u8>, String> {
+                panic!("a Direct question must never reach a committed read (target={target})");
+            }
+        }
+        assert_eq!(
+            answered(&PanicsOnAnyRead, &question(EXEC_NODE, WorkRef::Direct)).await,
+            GrantAnswer::Refused
         );
     }
 
@@ -1341,12 +1419,12 @@ mod tests {
     /// proxy, so its lifetime must be exactly the daemon's: published before the
     /// listener serves, gone once the daemon stops.
     ///
-    /// It drives [`serve_until`], which is [`serve`] minus only the config
-    /// unpacking — so it holds the arming ordering too. Arming installs a real
-    /// signal handler, which PANICS outside a reactor rather than erroring; a
-    /// refactor hoisting it out of `block_on` is a production-only crash with no
-    /// compile-time complaint, and a hand-rolled replica of the call site (the
-    /// guard this replaces) stayed green through exactly that mutation.
+    /// It enters through [`crate::services::serve_until_stopped`], the ONE
+    /// arming site every daemon uses — [`serve_until`] is that call plus the
+    /// account resolution a node has to answer. Arming installs a real signal
+    /// handler, which PANICS outside a reactor rather than erroring; a refactor
+    /// hoisting it out of `block_on` is a production-only crash with no
+    /// compile-time complaint.
     ///
     /// What it does NOT cover: the beat task's abort-then-join. See the comment
     /// on that line for why it has no honest test seam.
@@ -1364,18 +1442,26 @@ mod tests {
         let observed = Arc::new(std::sync::Mutex::new(None));
         let seen = observed.clone();
         let peek = (workspace.clone(), route.clone());
+        // the account the operator bound this label for; in production
+        // `serve_until` reads it off committed identity state first.
+        const ACCOUNT: u64 = 7;
         let stop = async move {
-            *seen.lock().unwrap() = crate::gateway_routes::load(&peek.0).unwrap().port(&peek.1);
+            *seen.lock().unwrap() = crate::gateway_routes::load(&peek.0)
+                .unwrap()
+                .port(ACCOUNT, &peek.1);
         };
 
-        serve_until(
-            "airlock#test".into(),
-            storage,
-            // never dialed: no session is opened in this test.
-            "http://127.0.0.1:1".into(),
-            workspace.clone(),
-            stop,
-        )
+        crate::services::serve_until_stopped(stop, |stop| {
+            run(
+                "airlock#test".into(),
+                storage,
+                // never dialed: no session is opened in this test.
+                NodeLink::new("http://127.0.0.1:1".to_string()),
+                ACCOUNT,
+                workspace.clone(),
+                stop,
+            )
+        })
         .expect("a stopped daemon exits cleanly");
 
         let served_on = observed
@@ -1389,7 +1475,7 @@ mod tests {
         assert_eq!(
             crate::gateway_routes::load(&workspace)
                 .unwrap()
-                .port(&route),
+                .port(ACCOUNT, &route),
             None,
             "a stopped daemon leaves no route pointing at a port any process may now bind"
         );

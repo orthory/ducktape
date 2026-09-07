@@ -71,8 +71,10 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(components.contains("\"human\"\n        PersonAvatar initials plate=30.0 ink=11.0"));
     assert!(components.contains("\"agent\"\n        AgentAvatar initials plate=30.0 ink=11.0"));
     assert!(!components.contains("avatar_style"));
-    // Rich bodies render structured blocks, not one flattened string.
-    assert!(components.contains("for block in message.blocks"));
+    // Rich bodies render structured blocks, not one flattened string — through
+    // the one renderer every body in the app shares.
+    assert!(components.contains("RichBody blocks=message.blocks size=13.5"));
+    assert!(components.contains("for block in blocks"));
     assert!(components.contains("if block.kind == \"code\""));
     assert!(components.contains("flex w=fill wrap=wrap"));
     // The hover toolbar uses the shared popover depth role instead of
@@ -378,20 +380,28 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // StatusCard and the tooltip frame stays transparent, so the `pr` gutter
     // can hold the card off the wall on the bell card's line.
     assert!(bar.contains("tooltip position=bottom gap=13.5 p=0.0 delay=90 style=transparent"));
-    // Per-frame extern bans. These two walk the disk (workspace tomls) or
-    // deep-clone the whole timeline through the extern ABI, so the view reads
-    // their STATE MIRRORS (`network_name`, `has_older_history`) instead. If
-    // either name returns to a view or screen file, the per-frame tax is back.
+    // A per-frame extern ban: `network_label` walks the disk (workspace tomls),
+    // so the view reads its STATE MIRROR (`network_name`) instead. If the name
+    // returns to a view or screen file, the per-frame tax is back.
     assert!(!SCREENS.contains("network_label("));
     assert!(!inlined(include_str!("../ui/view.ice")).contains("network_label("));
-    assert!(!SCREENS.contains("history_has_older("));
-    assert!(!inlined(include_str!("../ui/view.ice")).contains("history_has_older("));
     assert!(bar.contains("box pr=13.0\n              StatusCard "));
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
     ));
     assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
+
+    // THE WAY BACK TO NOW IS A FLOAT, NOT A BAND. There is no amber "Viewing
+    // history" strip: it pushed the conversation down 32px to say something the
+    // reader could already see, and it carried the one control that means "take
+    // me back to now" as far from now as the pane allows. The pill is a stack
+    // layer at the timeline's bottom edge, shown when the reader is away from
+    // the tail — a history window OR her own scroll.
+    assert!(!SCREENS.contains("text \"Viewing history\""));
+    assert!(SCREENS.contains("if !empty(messages) && (history_view || !at_live_tail)"));
+    assert!(SCREENS.contains("button \"↓  Jump to latest\""));
+    assert!(SCREENS.contains("emit(choose_channel, active_channel)"));
 
     // The endpoint field is GONE from Settings — the launch window's picker
     // owns which network; Settings keeps only Reconnect / Switch network.
@@ -1280,7 +1290,10 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
     // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
     // window and ~320 maximized — past every readability bound there is.
-    assert!(components.contains("col w=fill max-w=760.0 gap=5.0"));
+    assert!(components.contains(
+        "col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5"
+    ));
+    assert!(components.contains("col w=fill gap=5.0\n    for block in blocks"));
 
     // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
     // 14px spacer). The spacer sits OUTSIDE the hover capsule, so the gap
@@ -1421,8 +1434,12 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         //    proposal's quorum dots, the nav bar. Bounded by the row that
         //    contains them, and the chat ones already sit inside the stream's
         //    own `lazy`, so they are built once per row change, not per frame.
-        ("components/chat.ice", "for block in message.blocks"),
+        // `RichBody` is the one markdown renderer: a chat row, a forge body
+        // and a review comment each hand it ONE body's blocks.
+        ("components/chat.ice", "for block in blocks"),
         ("components/chat.ice", "for reaction in message.reactions"),
+        // One review's inline comments, bounded by the review that holds them.
+        ("components/forge.ice", "for comment in review.comments"),
         (
             "components/kit.ice",
             "for seat in quorum_dots(proposal.approvals, proposal.required_yes)",

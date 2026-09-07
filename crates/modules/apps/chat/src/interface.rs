@@ -34,6 +34,18 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 pub const MAX_HUDDLE_MEMBERS: usize = 32;
 /// a huddle member's node key: raw ed25519 public key bytes.
 pub const HUDDLE_NODE_KEY_BYTES: usize = 32;
+/// the domain separator [`huddle_join_preimage`]'s signature is minted under —
+/// [`crate::HUDDLE_NODE_KEY_BYTES`]'s key proves it holds the join's `node` key
+/// by signing over exactly this namespace plus the channel/user pair, so a
+/// join can never be replayed as a different scheme's proof.
+pub const HUDDLE_JOIN_NS: &[u8] = b"ducktape/huddle-join/v1";
+/// channels one creator (a user, or `CreateDmChannel`'s resolved account) may
+/// have open at once. there is no `DeleteChannel` op — every created channel
+/// is permanent — so this is the only thing bounding one account's share of
+/// the channel set. module/system origins are exempt (genesis-fixed trusted
+/// code). picked in the same spirit as forge's `MAX_OPEN_ITEMS_PER_ACTOR` /
+/// tasks' `MAX_OPEN_TASKS_PER_OWNER`.
+pub const MAX_CHANNELS_PER_CREATOR: usize = 256;
 
 /// who authored a message — derived from `Env.origin`, never from a payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,6 +209,14 @@ pub enum ChatMsg {
         name: String,
         post_policy: PostPolicy,
     },
+    /// open the two-party room with `counterpart`. the module derives the id
+    /// itself — `client::dm_channel_id(creator account, counterpart)`,
+    /// `creator` resolved from the signing key through `identity`'s `OfKey` —
+    /// so the id can never be spoofed to any other pair's DM. always seats
+    /// `PostPolicy::MembersOnly`, whatever `CreateChannel` might otherwise
+    /// allow. `dm-`-shaped ids are reserved: plain `CreateChannel` refuses one
+    /// from a user origin (see `Chat::stage_channel`).
+    CreateDmChannel { counterpart: u64, name: String },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
     /// the reserved `:` namespace gate + the record byte cap). channel-admin
     /// authority: only the channel's `owner` may rename an owned channel, and
@@ -268,18 +288,26 @@ pub enum ChatMsg {
     /// join (or start) the channel's huddle. external users only — huddles are
     /// human affordances; members-only channels gate like posting. idempotent:
     /// re-joining updates `node` (the joiner's node key, [`HUDDLE_NODE_KEY_BYTES`]
-    /// raw ed25519 bytes) and stages nothing when unchanged.
-    JoinHuddle { channel_id: String, node: Vec<u8> },
+    /// raw ed25519 bytes) and stages nothing when unchanged. `node_proof` is
+    /// `node`'s ed25519 signature over [`huddle_join_preimage`]`(channel_id,
+    /// user)` under [`HUDDLE_JOIN_NS`] — proof that the joining client holds
+    /// `node`'s private key, not just its public bytes (see
+    /// [`crate::verify_huddle_join_proof`]).
+    JoinHuddle {
+        channel_id: String,
+        node: Vec<u8>,
+        node_proof: Vec<u8>,
+    },
     /// leave the channel's huddle. leaving a huddle one is not in is a
     /// deterministic no-op; an empty roster means no huddle.
     LeaveHuddle { channel_id: String },
-    /// evict a huddle member — call liveness is not consensus-observable
-    /// (a crashed client cannot leave), so cleanup is social: any author the
-    /// channel's post policy admits may sweep a stale entry. deliberately NOT
-    /// channel-admin authority (unlike `SetMembership`): a huddle roster is
-    /// ephemeral call presence, not an admission list, and the only harm a
-    /// wrongful sweep does is a rejoin. sweeping an absent user is a
-    /// deterministic no-op.
+    /// evict a huddle member — call liveness is not consensus-observable (a
+    /// crashed client cannot leave), so cleanup needs two paths: a user
+    /// naming themself is a leave in disguise and always allowed; naming
+    /// anyone else is channel-admin authority (`SetMembership`'s rule),
+    /// because post policy alone lets any poster on an open channel name and
+    /// evict an unrelated, still-live participant. sweeping an absent user is
+    /// a deterministic no-op.
     SweepHuddle { channel_id: String, user: Vec<u8> },
 }
 
@@ -305,6 +333,25 @@ pub enum ChatQuery {
     },
     /// global message-id lookup — the id-collision probe.
     Message { message_id: String },
+    /// what ONE external user may do in ONE channel — the standing a module
+    /// acting on that user's behalf must gate on. chat owns the answer so a
+    /// caller never carries a second copy of the admission rule.
+    Access { channel_id: String, user: Vec<u8> },
+}
+
+/// chat's answer to [`ChatQuery::Access`]: one user's standing in one channel.
+/// an unknown channel answers `false` to both — a caller fails closed on a
+/// channel that does not exist.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAccess {
+    /// the user may see the channel's messages: a member, or any authenticated
+    /// user when the channel is [`PostPolicy::Open`]. archival does not close
+    /// reading.
+    pub may_read: bool,
+    /// the user's own `PostMessage` would be admitted — chat's post gate
+    /// verbatim, so an archived or members-only channel answers `false`.
+    pub may_post: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -313,6 +360,7 @@ pub enum ChatReply {
     Channel(Option<Channel>),
     Messages(Vec<MessageView>),
     Message(Option<MessageView>),
+    Access(ChannelAccess),
 }
 
 /// the hook notification payload: one follow-up [`sdk::Msg`]-shaped dispatch
@@ -341,6 +389,9 @@ pub enum ChatAssigned {
     Posted { seq: u64 },
     /// `EditMessage`: the new head's assigned revision.
     Edited { rev: u32 },
+    /// `CreateDmChannel`: the derived id the module minted from (creator,
+    /// counterpart) — the payload never carries it.
+    DmChannel { channel_id: String },
 }
 
 pub fn encode_msg(m: &ChatMsg) -> Vec<u8> {
@@ -381,4 +432,14 @@ pub fn encode_assigned(a: &ChatAssigned) -> Vec<u8> {
 
 pub fn decode_assigned(b: &[u8]) -> Result<ChatAssigned, String> {
     sdk::wire::decode(b)
+}
+
+/// the bytes a `JoinHuddle`'s `node_proof` signs: `channel_id ‖ user`, each
+/// length-prefixed so no delimiter collision lets one field's tail bleed into
+/// the next's head. Signed and verified under [`HUDDLE_JOIN_NS`].
+pub fn huddle_join_preimage(channel_id: &str, user: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    sdk::codec::push_str(&mut out, channel_id);
+    sdk::codec::push_bytes(&mut out, user);
+    out
 }

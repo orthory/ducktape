@@ -84,6 +84,22 @@ use sdk::{
 /// so a crafted id can never forge another receiver's key.
 const SEP: char = sdk::KEY_SEP;
 
+/// the recipe namespace `runs` derives an agent's recipe id into
+/// (`runs::recipe_id_for`, `agent/{agent_id}`) — reserved so no External
+/// account can squat an id here and permanently block that agent's
+/// registration.
+const RESERVED_AGENT_NS_PREFIX: &str = "agent/";
+
+/// the only module allowed to own a reserved `agent/` recipe id.
+const RESERVED_AGENT_NS_OWNER: &str = "runs";
+
+/// a recipe id in the reserved `agent/` namespace: registrable and
+/// removable only by [`RESERVED_AGENT_NS_OWNER`]'s module origin, never by
+/// an External account.
+fn is_reserved_recipe_id(recipe_id: &str) -> bool {
+    recipe_id.starts_with(RESERVED_AGENT_NS_PREFIX)
+}
+
 /// write-time cap on ONE stored record. the concrete store's codec bounds a
 /// stored value at 1 MiB AT DECODE TIME (`statesync::qmdb::store_config`): an
 /// oversized value would COMMIT fine and then panic every later read on every
@@ -253,7 +269,18 @@ impl DispatchModule {
         let recipe = staged_recipe(&self.staged, recipe_id)
             .await?
             .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))?;
-        if recipe.owner != Self::acting_origin(&ctx.env().origin)? {
+        let origin = Self::acting_origin(&ctx.env().origin)?;
+        // a reserved id is owned by its RESERVED_AGENT_NS_OWNER module by
+        // construction (only that origin can ever register one) — match by
+        // module id rather than exact recipe.owner equality, so the check
+        // still holds if a future hook emits the removal from a different
+        // op than the one that registered it.
+        let is_owner = if is_reserved_recipe_id(recipe_id) {
+            matches!(&origin, SagaOrigin::Module(m) if m == RESERVED_AGENT_NS_OWNER)
+        } else {
+            recipe.owner == origin
+        };
+        if !is_owner {
             return Err(Error::Module(format!(
                 "recipe {recipe_id:?} is not owned by this origin"
             )));
@@ -584,6 +611,14 @@ impl DispatchModule {
             recipe.max_attempts,
             &recipe.description,
         )?;
+        let origin = Self::acting_origin(&ctx.env().origin)?;
+        let claims_reserved_ns = is_reserved_recipe_id(&recipe_id)
+            && !matches!(&origin, SagaOrigin::Module(m) if m == RESERVED_AGENT_NS_OWNER);
+        if claims_reserved_ns {
+            return Err(Error::Module(format!(
+                "recipe id {recipe_id:?} is in the reserved {RESERVED_AGENT_NS_PREFIX:?} namespace"
+            )));
+        }
         if staged_recipe(&self.staged, &recipe_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "recipe {recipe_id:?} already exists"
@@ -592,7 +627,7 @@ impl DispatchModule {
         let now = ctx.env().consensus_time;
         let record = encode_recipe(&Recipe {
             recipe_id: recipe_id.clone(),
-            owner: Self::acting_origin(&ctx.env().origin)?,
+            owner: origin,
             description: recipe.description,
             capability: recipe.capability,
             routing: recipe.routing,

@@ -111,6 +111,28 @@ impl ResolverTarget {
 /// max snapshot bytes per [`SyncResponse::Chunk`]. sized so a chunk plus
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
+
+/// default cap on one module's ASSEMBLED snapshot payload
+/// ([`fetch_snapshot`]'s `max_bytes`). the serving peer chooses `total` and
+/// every chunk length on the wire, so without a ceiling here a byzantine
+/// peer drives an unbounded `Vec<u8>` allocation in a joining node — the
+/// bytes are only root-verified after the whole payload is resident. sized
+/// generously (hundreds of MiB): a legitimate module snapshot can be large,
+/// and this is a refusal floor, not a working-set budget. mirrors the blob
+/// lane's `MAX_MODULE_CODE_BYTES` (bin/node/src/constants.rs) without this
+/// crate depending on `node`.
+pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// default cap on one [`fetch_frames`] call's ASSEMBLED frame suffix. the
+/// serving peer chooses each `Frames` batch's contents, so without a ceiling
+/// here a source can stream an unbounded number of undecodable (but
+/// cost-free — `Disposition::Rejected` leaves roots unchanged) batches and
+/// drive the joiner's RSS up before a single frame is applied. mirrors
+/// [`MAX_SNAPSHOT_BYTES`]'s shape at a smaller size: a frame window is
+/// applied and discarded as it lands, so it never needs to hold hundreds of
+/// MiB at once — a caller that hits this refetches in a smaller window.
+pub const MAX_CATCHUP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
 /// work bound, not a byte guarantee: the node serve path separately budgets the
 /// exact encoded response against its configured mesh message cap.
@@ -119,6 +141,14 @@ pub const FRAME_BATCH_LEN: usize = 64;
 /// contract as [`FRAME_BATCH_LEN`]: a work bound, with the serve path
 /// budgeting the exact encoded response against the mesh message cap.
 pub const INDEX_OPS_BATCH_LEN: usize = 512;
+
+/// hard cap on [`Manifest::applied_frames`] — the replay-window depth a
+/// boundary carries. MUST equal the node's `REPLAY_WINDOW_HEIGHTS`: the
+/// window a joiner inherits has to be exactly as deep as the one its peers
+/// enforce, or the two disagree on a re-proposed batch and fork. this crate
+/// does not link `node`, so `bin/node` pins the equality with a compile-time
+/// assert. 4096 pairs is ~160 KiB on the wire, well inside the mesh cap.
+pub const MAX_APPLIED_FRAMES: usize = 4096;
 
 /// fixed bytes prepended to every authenticated statesync request and reply:
 /// requester(32) + proof(64) + request id(8).
@@ -168,6 +198,15 @@ pub enum SyncError {
     UnexpectedResponse(&'static str),
     #[error("module {module}: {reason}")]
     Module { module: ModuleId, reason: String },
+    #[error("module {module}: snapshot too large ({reason}, cap {cap} bytes)")]
+    TooLarge {
+        module: ModuleId,
+        /// stable snake_case token — never prose — so a caller (and the log
+        /// line it lands in) can tell which check refused without parsing
+        /// English.
+        reason: &'static str,
+        cap: u64,
+    },
     #[error("module {module}: pinned qmdb range pruned ({reason}); refetch manifest")]
     Pruned { module: ModuleId, reason: String },
     #[error("recovery frame range pruned after {requested_after}; retained from {retained_from}")]
@@ -255,6 +294,7 @@ pub struct FinalizedFrame {
 pub struct ManifestEntry {
     pub module_id: ModuleId,
     pub root: StateRoot,
+    pub code_hash: Option<Vec<u8>>,
     pub kind: PayloadKind,
     pub resolver_target: Option<ResolverTarget>,
 }
@@ -287,6 +327,27 @@ pub struct Manifest {
     /// the epoch's genesis floor instead).
     pub floor_cert: Option<Vec<u8>>,
     pub entries: Vec<ManifestEntry>,
+    /// the serving node's REPLAY WINDOW at `height`: the `(height, batch id)`
+    /// pairs it has journaled, oldest first, capped at
+    /// [`MAX_APPLIED_FRAMES`]. a joiner seats with this as its own window, so
+    /// it refuses the same re-proposed batches its peers refuse instead of
+    /// applying one at a fresh height and forking the root. every entry is at
+    /// or below `height`.
+    ///
+    /// an unauthenticated serving hint like the coordinates above: a lying
+    /// window makes the joiner refuse a batch its peers apply, which diverges
+    /// its root — the same failure a lying `view_base` produces, and a
+    /// fabricated world still cannot vote.
+    pub applied_frames: Vec<(u64, [u8; 32])>,
+    /// the view a valset change already committed but not yet cut over at
+    /// `height` (`None` when no change is armed). the served epoch's
+    /// `participants` may already lag the committed valset by design (see
+    /// above) — this is the serving orchestrator's OWN armed ceiling, so a
+    /// seat resumed from it (`ValsetOrchestrator::resume(.., pending)`) stops
+    /// at the same view every peer stops at instead of observing the
+    /// already-changed valset itself and arming a LATER ceiling that forks
+    /// the root.
+    pub pending_cutover_view: Option<u64>,
 }
 
 impl Manifest {
@@ -299,6 +360,19 @@ impl Manifest {
             height: self.height,
             root_hash: self.root_hash,
         }
+    }
+
+    /// the first module this boundary cannot transfer at all — the serving
+    /// node could not prepare a sync handle for it (or the module declares no
+    /// sync surface), so the capture holds no payload and pins no resolver
+    /// target. a joiner cannot rebuild such a module from this source at ANY
+    /// height: the fact belongs to the SOURCE, so the caller rotates to
+    /// another one rather than refetching this manifest.
+    pub fn undeliverable_module(&self) -> Option<&ModuleId> {
+        self.entries
+            .iter()
+            .find(|e| e.kind == PayloadKind::Unsupported)
+            .map(|e| &e.module_id)
     }
 }
 
@@ -730,6 +804,13 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
                 out.extend_from_slice(e.root.as_bytes());
+                match &e.code_hash {
+                    Some(hash) => {
+                        out.push(1);
+                        wire::put_bytes(&mut out, hash);
+                    }
+                    None => out.push(0),
+                }
                 out.push(e.kind.to_u8());
                 match &e.resolver_target {
                     Some(target) => {
@@ -744,6 +825,18 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             out.extend_from_slice(&(m.residents.len() as u64).to_le_bytes());
             for o in &m.residents {
                 wire::put_bytes(&mut out, o);
+            }
+            out.extend_from_slice(&(m.applied_frames.len() as u64).to_le_bytes());
+            for (height, id) in &m.applied_frames {
+                out.extend_from_slice(&height.to_le_bytes());
+                out.extend_from_slice(id);
+            }
+            match m.pending_cutover_view {
+                Some(view) => {
+                    out.push(1);
+                    out.extend_from_slice(&view.to_le_bytes());
+                }
+                None => out.push(0),
             }
         }
         SyncResponse::Chunk { total, bytes } => {
@@ -972,6 +1065,20 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             for _ in 0..n {
                 let module_id = wire::take_str(&mut buf)?;
                 let root = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+                let code_hash = match wire::take_u8(&mut buf)? {
+                    0 => None,
+                    1 => {
+                        let hash = wire::take_bytes(&mut buf)?;
+                        let valid_hash = hash.len() == ROOT_LEN;
+                        if !valid_hash {
+                            return Err(WireError::Codec(
+                                "module code hash must be 32 bytes".into(),
+                            ));
+                        }
+                        Some(hash.to_vec())
+                    }
+                    t => return Err(WireError::BadTag("module code hash", t)),
+                };
                 let kind = PayloadKind::from_u8(wire::take_u8(&mut buf)?)?;
                 let resolver_target = match wire::take_u8(&mut buf)? {
                     0 => None,
@@ -990,6 +1097,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 entries.push(ManifestEntry {
                     module_id,
                     root,
+                    code_hash,
                     kind,
                     resolver_target,
                 });
@@ -1007,6 +1115,24 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             for _ in 0..o {
                 residents.push(wire::take_bytes(&mut buf)?.to_vec());
             }
+            let w = wire::take_u64(&mut buf)?;
+            // the protocol depth is the cap, and a forged count can never
+            // drive allocation past it (each pair is a fixed 40 bytes).
+            if w > MAX_APPLIED_FRAMES as u64 {
+                return Err(WireError::Codec(format!(
+                    "replay window count {w} exceeds the {MAX_APPLIED_FRAMES}-entry cap"
+                )));
+            }
+            let mut applied_frames = Vec::with_capacity(w as usize);
+            for _ in 0..w {
+                let height = wire::take_u64(&mut buf)?;
+                applied_frames.push((height, wire::take_array::<32>(&mut buf)?));
+            }
+            let pending_cutover_view = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_u64(&mut buf)?),
+                t => return Err(WireError::BadTag("pending_cutover_view", t)),
+            };
             SyncResponse::Manifest(Manifest {
                 height,
                 root_hash,
@@ -1016,6 +1142,8 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 residents,
                 floor_cert,
                 entries,
+                applied_frames,
+                pending_cutover_view,
             })
         }
         1 => SyncResponse::Chunk {
@@ -1336,6 +1464,7 @@ impl CapturedPayload {
 #[derive(Debug, Clone)]
 struct CapturedModule {
     root: StateRoot,
+    code_hash: Option<Vec<u8>>,
     payload: CapturedPayload,
 }
 
@@ -1356,6 +1485,12 @@ pub struct BoundaryCoords {
     /// mesh's index namespace; see [`TipCoords::generation`].
     pub generation: u64,
     pub mesh_window: Vec<MeshWindowEntry>,
+    /// the serving node's replay window at this boundary, filtered to entries
+    /// at or below its height — see [`Manifest::applied_frames`].
+    pub applied_frames: Vec<(u64, [u8; 32])>,
+    /// the caller's own orchestrator's armed cutover, if any — rides straight
+    /// into [`Manifest::pending_cutover_view`].
+    pub pending_cutover_view: Option<u64>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1429,6 +1564,7 @@ pub async fn capture_boundary(
             m.id,
             CapturedModule {
                 root: m.root,
+                code_hash: m.code_hash,
                 payload,
             },
         );
@@ -1443,6 +1579,7 @@ pub async fn capture_boundary(
             m.id,
             CapturedModule {
                 root: m.root,
+                code_hash: m.code_hash,
                 payload: CapturedPayload::Unsupported,
             },
         );
@@ -1579,12 +1716,15 @@ impl SyncServer {
             participants: capture.coords.participants.clone(),
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
+            applied_frames: capture.coords.applied_frames.clone(),
+            pending_cutover_view: capture.coords.pending_cutover_view,
             entries: capture
                 .modules
                 .iter()
                 .map(|(id, m)| ManifestEntry {
                     module_id: id.clone(),
                     root: m.root,
+                    code_hash: m.code_hash.clone(),
                     kind: m.payload.kind(),
                     resolver_target: match &m.payload {
                         CapturedPayload::Resolver(target) => Some(target.clone()),
@@ -1906,12 +2046,25 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
     }
 }
 
-/// fetch a captured module's full snapshot payload, chunk by chunk.
+/// fetch a captured module's full snapshot payload, chunk by chunk, refusing
+/// to assemble more than `max_bytes` — see [`MAX_SNAPSHOT_BYTES`]. both
+/// `total` and each chunk's length are the SERVING peer's choice, so every
+/// bound here runs BEFORE the bytes it would refuse are appended: an
+/// oversized `total` refuses before the loop allocates anything, an
+/// oversized chunk refuses before it is appended, and a peer that keeps
+/// sending past its own declared `total` refuses too (it is lying, not
+/// generous).
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
     boundary: BoundaryId,
     module_id: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, SyncError> {
+    let too_large = |reason: &'static str| SyncError::TooLarge {
+        module: module_id.to_string(),
+        reason,
+        cap: max_bytes,
+    };
     let mut out: Vec<u8> = Vec::new();
     loop {
         let req = SyncRequest::Chunk {
@@ -1921,17 +2074,29 @@ pub async fn fetch_snapshot<C: SyncClient>(
         };
         match client.request(req).await? {
             SyncResponse::Chunk { total, bytes } => {
+                if total > max_bytes {
+                    return Err(too_large("declared_total_exceeds_cap"));
+                }
+                if bytes.len() > CHUNK_LEN {
+                    return Err(too_large("chunk_exceeds_chunk_len"));
+                }
                 if bytes.is_empty() && out.len() < total as usize {
                     return Err(SyncError::Module {
                         module: module_id.to_string(),
                         reason: "server returned an empty chunk mid-payload".into(),
                     });
                 }
+                let would_be = out.len() as u64 + bytes.len() as u64;
+                if would_be > max_bytes {
+                    return Err(too_large("accumulated_exceeds_cap"));
+                }
+                if would_be > total {
+                    // a peer that keeps sending past its own declared total
+                    // is lying about the total, the stream, or both.
+                    return Err(too_large("accumulated_exceeds_total"));
+                }
                 out.extend_from_slice(&bytes);
                 if out.len() as u64 >= total {
-                    // a lying `total` smaller than the stream is impossible:
-                    // the server slices from one captured Vec, and we stop at
-                    // exactly `total`.
                     out.truncate(total as usize);
                     return Ok(out);
                 }
@@ -1960,10 +2125,10 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// this node when it accepted canonical state from it: your own sync source.
 /// what IS enforced here, once, at the trust boundary:
 ///
-/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:04x}` — not merely
+/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:08x}` — not merely
 ///   parseable as one. [`index_guest::parse_op_key`] reads hex with
 ///   `from_str_radix`, which accepts any width and a leading `+`, so `op/2/0`
-///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/0000`. a
+///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/00000000`. a
 ///   non-canonical key would pass every ascent check here and then break key
 ///   order in the store — which the next refold replays as history running
 ///   backwards. the fixed width IS the ordering, so it is checked as bytes;
@@ -2089,18 +2254,31 @@ where
     }
 }
 
-/// fetch a finite, ordered recovery-frame suffix in bounded batches.
-pub async fn fetch_frames<C: SyncClient>(
+/// fetch a finite, ordered recovery-frame suffix in bounded batches,
+/// refusing to assemble more than `max_bytes` of frame payload — see
+/// [`MAX_CATCHUP_BYTES`]. mirrors [`fetch_snapshot`]'s cap shape: the check
+/// runs before a frame's bytes are added to the running total, never after.
+/// every caller is a served, UNVERIFIED range — a peer's own reported tip
+/// (the joiner catch-up lane) or a peer's own reported frames (a probe, a
+/// live-drain backfill) — so nothing here gets to skip the cap.
+pub async fn fetch_frames_capped<C: SyncClient>(
     client: &C,
     after_height: u64,
     up_to_height: u64,
+    max_bytes: u64,
 ) -> Result<Vec<FinalizedFrame>, SyncError> {
     if after_height > up_to_height {
         return Err(SyncError::Server(format!(
             "invalid frame range ({after_height}, {up_to_height}]"
         )));
     }
+    let too_large = |cap: u64| SyncError::TooLarge {
+        module: "recovery".to_string(),
+        reason: "catchup_frames_exceed_cap",
+        cap,
+    };
     let mut out = Vec::new();
+    let mut total_bytes = 0u64;
     let mut after = after_height;
     while after < up_to_height {
         let resp = client
@@ -2125,6 +2303,10 @@ pub async fn fetch_frames<C: SyncClient>(
                              ({after}, {up_to_height}]",
                             frame.height
                         )));
+                    }
+                    total_bytes += frame.frame.len() as u64;
+                    if total_bytes > max_bytes {
+                        return Err(too_large(max_bytes));
                     }
                     last = frame.height;
                     out.push(frame);
@@ -2377,6 +2559,52 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_entry_names_the_undeliverable_module() {
+        let entry = |id: &str, kind| ManifestEntry {
+            module_id: id.into(),
+            root: StateRoot([1u8; ROOT_LEN]),
+            code_hash: None,
+            kind,
+            resolver_target: None,
+        };
+        let manifest = |entries| Manifest {
+            height: 4,
+            root_hash: StateRoot([2u8; ROOT_LEN]),
+            epoch: 1,
+            view_base: 0,
+            participants: vec![],
+            residents: vec![],
+            floor_cert: None,
+            entries,
+            applied_frames: vec![],
+            pending_cutover_view: None,
+        };
+        // a source whose `kv` could not prepare a handle serves it as
+        // Unsupported: the joiner reads that off the manifest instead of
+        // discovering it as a missing pinned target mid-compose.
+        assert_eq!(
+            manifest(vec![
+                entry("valset", PayloadKind::Snapshot),
+                entry("kv", PayloadKind::Unsupported),
+            ])
+            .undeliverable_module()
+            .map(|m| m.as_str()),
+            Some("kv")
+        );
+        // every other kind is transferable — including Stateless, which
+        // carries no payload on purpose.
+        assert_eq!(
+            manifest(vec![
+                entry("valset", PayloadKind::Snapshot),
+                entry("kv", PayloadKind::Resolver),
+                entry("modules", PayloadKind::Stateless),
+            ])
+            .undeliverable_module(),
+            None
+        );
+    }
+
+    #[test]
     fn forge_object_response_round_trips_hit_and_miss() {
         for resp in [
             SyncResponse::ForgeObjects {
@@ -2420,6 +2648,7 @@ mod tests {
                 floor_cert: Some(vec![0xCC; 96]),
                 entries: vec![
                     ManifestEntry {
+                        code_hash: None,
                         module_id: "kv".into(),
                         root: StateRoot([1u8; ROOT_LEN]),
                         kind: PayloadKind::Resolver,
@@ -2430,15 +2659,21 @@ mod tests {
                         }),
                     },
                     ManifestEntry {
+                        code_hash: None,
                         module_id: "valset".into(),
                         root: StateRoot([2u8; ROOT_LEN]),
                         kind: PayloadKind::Snapshot,
                         resolver_target: None,
                     },
                 ],
+                // non-empty: exercises the replay-window wire tail.
+                applied_frames: vec![(6, [0xE1; 32]), (7, [0xE2; 32])],
+                // exercises the Some(view) pending-cutover wire tail.
+                pending_cutover_view: Some(9),
             }),
             // a fresh-epoch boundary: no finalization past the base yet, so
-            // no floor certificate — the joiner spawns on the genesis floor.
+            // no floor certificate — the joiner spawns on the genesis floor,
+            // and no valset change is armed.
             SyncResponse::Manifest(Manifest {
                 height: 12,
                 root_hash: StateRoot([8u8; ROOT_LEN]),
@@ -2448,6 +2683,8 @@ mod tests {
                 residents: vec![],
                 floor_cert: None,
                 entries: vec![],
+                applied_frames: vec![],
+                pending_cutover_view: None,
             }),
             SyncResponse::Chunk {
                 total: 10,
@@ -2470,8 +2707,8 @@ mod tests {
             SyncResponse::Error("nope".into()),
             SyncResponse::IndexOps {
                 rows: vec![
-                    ("op/0000000000000001/0000".into(), vec![1, 2, 3]),
-                    ("op/0000000000000002/000a".into(), Vec::new()),
+                    ("op/0000000000000001/00000000".into(), vec![1, 2, 3]),
+                    ("op/0000000000000002/0000000a".into(), Vec::new()),
                 ],
                 next_after: Some((2, 10)),
                 source_floor: Some(1),
@@ -2522,8 +2759,8 @@ mod tests {
         // upper bound for every shape — which is what a serve-side binary
         // search against a transport cap needs to stay sound.
         let rows = vec![
-            ("op/0000000000000001/0000".to_string(), vec![0xAB; 31]),
-            ("op/0000000000000009/0007".to_string(), Vec::new()),
+            ("op/0000000000000001/00000000".to_string(), vec![0xAB; 31]),
+            ("op/0000000000000009/00000007".to_string(), Vec::new()),
         ];
         let widest = encode_response(&SyncResponse::IndexOps {
             rows: rows.clone(),
@@ -2651,6 +2888,20 @@ mod tests {
         bytes.push(0); // floor_cert: None
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
+
+        // and the REPLAY WINDOW count: capped at the protocol depth, so a
+        // forged one is refused before it reserves 40 bytes an entry.
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; ROOT_LEN]);
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // participants
+        bytes.push(0); // floor_cert: None
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // entries
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // residents
+        bytes.extend_from_slice(&(MAX_APPLIED_FRAMES as u64 + 1).to_le_bytes());
+        assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
@@ -2666,9 +2917,11 @@ mod tests {
             residents: vec![],
             floor_cert: None,
             entries: vec![],
+            applied_frames: vec![(6, [0xE1; 32])],
+            pending_cutover_view: Some(11),
         });
         let bytes = encode_response(&resp);
-        // Drop bytes from the trailing entry/resident counts.
+        // Drop bytes from the trailing entry/resident/replay-window counts.
         for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(
@@ -2676,5 +2929,203 @@ mod tests {
                 "truncation at -{cut} must reject"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // fetch_snapshot: the served `total` and every chunk length are the
+    // PEER's choice, so the cap has to hold against a peer that lies in
+    // either. a scripted client stands in for the wire: it hands back a
+    // canned queue of responses with no server, no transport.
+    // ------------------------------------------------------------------
+
+    /// a `SyncClient` that plays back a fixed script of responses, one per
+    /// request, ignoring the request itself — enough to drive `fetch_snapshot`
+    /// without a real server.
+    #[derive(Clone)]
+    struct ScriptedClient {
+        responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SyncResponse>>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedClient {
+        fn new(responses: Vec<SyncResponse>) -> Self {
+            Self {
+                responses: std::sync::Arc::new(std::sync::Mutex::new(responses.into())),
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SyncClient for ScriptedClient {
+        fn request(
+            &self,
+            _req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.responses.lock().expect("script poisoned").pop_front();
+            async move { next.ok_or_else(|| SyncError::Transport("script exhausted".into())) }
+        }
+    }
+
+    fn test_boundary() -> BoundaryId {
+        BoundaryId {
+            height: 1,
+            root_hash: StateRoot([0u8; ROOT_LEN]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_oversized_total_before_any_chunk() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Chunk {
+            total: cap + 1,
+            bytes: vec![1, 2, 3],
+        }]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("declared total over cap must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "declared_total_exceeds_cap",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        // refused on the very first reply — never asked for a second chunk.
+        assert_eq!(client.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_an_oversized_chunk() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Chunk {
+            total: cap,
+            bytes: vec![0u8; CHUNK_LEN + 1],
+        }]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("a chunk over CHUNK_LEN must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "chunk_exceeds_chunk_len",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_a_stream_that_overruns_its_own_total() {
+        let cap = 1024u64;
+        // total says 10 bytes; the first chunk honestly delivers part of
+        // that, but the second keeps sending well past the declared total.
+        let client = ScriptedClient::new(vec![
+            SyncResponse::Chunk {
+                total: 10,
+                bytes: vec![1u8; 5],
+            },
+            SyncResponse::Chunk {
+                total: 10,
+                bytes: vec![2u8; 10],
+            },
+        ]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("a peer that sends past its own total is lying");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "accumulated_exceeds_total",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_assembles_an_honest_stream() {
+        let cap = 1024u64;
+        let total = 10u64;
+        let client = ScriptedClient::new(vec![
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![1u8, 2, 3],
+            },
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![4u8, 5, 6, 7],
+            },
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![8u8, 9, 10],
+            },
+        ]);
+        let bytes = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect("an honest, in-cap stream assembles");
+        assert_eq!(bytes, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(client.call_count(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // fetch_frames_capped: the served frame batch is the PEER's choice too —
+    // a source can stream any number of oversized "recovery frames" (they
+    // cost it nothing: an undecodable batch lands as Rejected with roots
+    // unchanged) to drive the joiner's RSS up before a single frame applies.
+    // ------------------------------------------------------------------
+
+    fn test_frame(height: u64, len: usize) -> FinalizedFrame {
+        FinalizedFrame {
+            height,
+            frame: vec![0u8; len],
+            disposition: FrameDisposition::Applied,
+            roots: vec![],
+            root_hash: StateRoot([0u8; ROOT_LEN]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_frames_capped_refuses_a_suffix_over_the_byte_cap() {
+        let cap = 16u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Frames {
+            frames: vec![test_frame(1, 10), test_frame(2, 10)],
+        }]);
+        let err = fetch_frames_capped(&client, 0, 2, cap)
+            .await
+            .expect_err("a suffix whose frames exceed the cap must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "catchup_frames_exceed_cap",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_frames_capped_assembles_an_in_cap_suffix() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Frames {
+            frames: vec![test_frame(1, 10), test_frame(2, 10)],
+        }]);
+        let frames = fetch_frames_capped(&client, 0, 2, cap)
+            .await
+            .expect("an in-cap suffix assembles");
+        assert_eq!(frames.len(), 2);
     }
 }

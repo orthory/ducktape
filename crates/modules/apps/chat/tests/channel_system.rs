@@ -8,14 +8,47 @@
 //! covered by the native tests in `src/index.rs`.
 
 use chat::Chat;
+use chat::client::dm_channel_id;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL,
-    MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
+    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS,
+    MAX_CHANNELS_PER_CREATOR, MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, PostPolicy, Span,
+    decode_event, decode_reply, encode_msg, encode_query, huddle_join_preimage,
 };
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use identity::{
+    AccountView, IdentityQuery, IdentityReply, decode_query as identity_decode_query,
+    encode_reply as identity_encode_reply,
+};
 use sdk::{Error, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
+
+/// a minimal identity double: `key` (a 32-byte user origin id, as `user()`
+/// mints) resolves to `number` through `OfKey`, and nothing else. registered
+/// on a [`TestCtx`] via `.on_query("identity", ...)`.
+fn identity_stub(accounts: Vec<(Vec<u8>, u64)>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    move |req| {
+        let IdentityQuery::OfKey { key } = identity_decode_query(req).map_err(Error::Module)?
+        else {
+            return Err(Error::Module(
+                "test identity stub only answers OfKey".into(),
+            ));
+        };
+        let account = accounts
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, number)| AccountView {
+                number: *number,
+                name: String::new(),
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            });
+        Ok(identity_encode_reply(&IdentityReply::Account(account)))
+    }
+}
 
 // build the module the way a host does: concrete store first, injected as
 // `Box<dyn MerkleStore>`. a macro (not an fn) so the tests need no
@@ -48,6 +81,26 @@ fn user(byte: u8) -> Origin {
 
 fn author_of(byte: u8) -> AuthorRef {
     AuthorRef::User(vec![byte; 32])
+}
+
+/// a deterministic node keypair for huddle tests — `seed` picks the key, so
+/// callers that need the SAME node across a re-join reuse the same seed.
+fn node_key(seed: u64) -> ed25519::PrivateKey {
+    ed25519::PrivateKey::from_seed(seed)
+}
+
+/// a `JoinHuddle` for `user_bytes` naming `node`, with a real proof of
+/// possession — the shape every huddle test now needs past the node-length
+/// gate.
+fn join_huddle(channel_id: &str, user_bytes: &[u8], node: &ed25519::PrivateKey) -> ChatMsg {
+    let node_key = node.public_key().as_ref().to_vec();
+    let preimage = huddle_join_preimage(channel_id, user_bytes);
+    let node_proof = node.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+    ChatMsg::JoinHuddle {
+        channel_id: channel_id.into(),
+        node: node_key,
+        node_proof,
+    }
 }
 
 fn module_msg(payload: ChatMsg) -> Msg {
@@ -86,6 +139,18 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
         blocks: vec![Block::paragraph(text)],
         thread,
         as_agent: None,
+    }
+}
+
+/// one user's standing in one channel, as the dispatch probe reads it.
+async fn access(module: &Chat, channel: &str, byte: u8) -> chat::ChannelAccess {
+    let req = ChatQuery::Access {
+        channel_id: channel.into(),
+        user: vec![byte; 32],
+    };
+    match query(module, req).await {
+        ChatReply::Access(access) => access,
+        other => panic!("expected Access, got {other:?}"),
     }
 }
 
@@ -1360,16 +1425,24 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        let join = |node_byte: u8| ChatMsg::JoinHuddle {
-            channel_id: "general".into(),
-            node: vec![node_byte; 32],
+        let node_a1 = node_key(0xa1);
+        let node_a2 = node_key(0xa2);
+        let node_b1 = node_key(0xb1);
+        let join = |user_bytes: &[u8], node: &ed25519::PrivateKey| {
+            join_huddle("general", user_bytes, node)
         };
         module
-            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join(&[1u8; 32], &node_a1)),
+            )
             .await
             .unwrap();
         module
-            .execute(&mut ctx_with_origin(21, user(2)), &module_msg(join(0xa2)))
+            .execute(
+                &mut ctx_with_origin(21, user(2)),
+                &module_msg(join(&[2u8; 32], &node_a2)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1386,7 +1459,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         };
         assert_eq!(channel.huddle.len(), 2);
         assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
-        assert_eq!(channel.huddle[0].node, vec![0xa1; 32]);
+        assert_eq!(channel.huddle[0].node, node_a1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20);
         assert_eq!(channel.huddle[1].user, vec![2u8; 32]);
         assert_eq!(channel.huddle[1].joined_at, 21);
@@ -1394,7 +1467,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with the same node key is idempotent: root unchanged.
         let settled = module.root();
         module
-            .execute(&mut ctx_with_origin(30, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(join(&[1u8; 32], &node_a1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1403,7 +1479,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with a NEW node key re-routes without duplicating the entry
         // or resetting join order.
         module
-            .execute(&mut ctx_with_origin(31, user(1)), &module_msg(join(0xb1)))
+            .execute(
+                &mut ctx_with_origin(31, user(1)),
+                &module_msg(join(&[1u8; 32], &node_b1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1419,7 +1498,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         };
         assert_eq!(channel.huddle.len(), 2);
         assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
-        assert_eq!(channel.huddle[0].node, vec![0xb1; 32]);
+        assert_eq!(channel.huddle[0].node, node_b1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20, "rejoin keeps join order");
 
         // leave removes exactly the leaver; the last leave empties the roster.
@@ -1463,6 +1542,78 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
 }
 
 #[test]
+fn huddle_join_refuses_a_node_proof_from_the_wrong_signer() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        module
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // the `node` field names `node_b`'s key, but the proof is `node_a`'s
+        // signature — proof of possession must fail: naming a key you do not
+        // hold is exactly the loopback/hijack this check exists to close.
+        let node_a = node_key(1);
+        let node_b = node_key(2);
+        let preimage = huddle_join_preimage("general", &[1u8; 32]);
+        let wrong_proof = node_a.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+        let err = module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: node_b.public_key().as_ref().to_vec(),
+                    node_proof: wrong_proof,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("huddle_node_proof_invalid"),
+            "{err:?}"
+        );
+
+        // the matching proof (same node, same preimage) succeeds.
+        module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_a)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // re-joining with a NEW node key needs a NEW proof: the old node's
+        // proof does not authorize the new node.
+        let preimage = huddle_join_preimage("general", &[1u8; 32]);
+        let stale_proof = node_a.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+        let err = module
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: node_b.public_key().as_ref().to_vec(),
+                    node_proof: stale_proof,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("huddle_node_proof_invalid"),
+            "{err:?}"
+        );
+        module
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_b)),
+            )
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
@@ -1477,10 +1628,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
             let err = module
                 .execute(
                     &mut ctx_with_origin(20, origin),
-                    &module_msg(ChatMsg::JoinHuddle {
-                        channel_id: "general".into(),
-                        node: vec![0xaa; 32],
-                    }),
+                    &module_msg(join_huddle("general", &[0xaa; 32], &node_key(0xaa))),
                 )
                 .await
                 .unwrap_err();
@@ -1494,6 +1642,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
                 &module_msg(ChatMsg::JoinHuddle {
                     channel_id: "general".into(),
                     node: vec![0xaa; 31],
+                    node_proof: Vec::new(),
                 }),
             )
             .await
@@ -1502,13 +1651,11 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
 
         // the roster cap rejects the 33rd participant.
         for i in 0..chat::MAX_HUDDLE_MEMBERS {
+            let i = i as u8;
             module
                 .execute(
-                    &mut ctx_with_origin(20, user(i as u8)),
-                    &module_msg(ChatMsg::JoinHuddle {
-                        channel_id: "general".into(),
-                        node: vec![i as u8; 32],
-                    }),
+                    &mut ctx_with_origin(20, user(i)),
+                    &module_msg(join_huddle("general", &[i; 32], &node_key(u64::from(i)))),
                 )
                 .await
                 .unwrap();
@@ -1516,10 +1663,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         let err = module
             .execute(
                 &mut ctx_with_origin(20, user(200)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xcc; 32],
-                }),
+                &module_msg(join_huddle("general", &[200; 32], &node_key(200))),
             )
             .await
             .unwrap_err();
@@ -1556,19 +1700,22 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        let join = ChatMsg::JoinHuddle {
-            channel_id: "core".into(),
-            node: vec![0xaa; 32],
-        };
+        let node = node_key(0xaa);
         // a non-member is turned away exactly like a non-member post.
         let err = module
-            .execute(&mut ctx_with_origin(20, user(2)), &module_msg(join.clone()))
+            .execute(
+                &mut ctx_with_origin(20, user(2)),
+                &module_msg(join_huddle("core", &[2u8; 32], &node)),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("members-only"));
         // the member joins fine.
         module
-            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join))
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("core", &[1u8; 32], &node)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1587,7 +1734,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
 }
 
 #[test]
-fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
+fn sweep_huddle_self_is_a_leave_and_is_idempotent() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
@@ -1597,19 +1744,16 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
         module
             .execute(
                 &mut ctx_with_origin(20, user(1)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xa1; 32],
-                }),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
             )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
 
-        // member B sweeps A's stale entry — A crashed and could not leave.
+        // A names itself — a sweep of yourself is a leave, always allowed.
         module
             .execute(
-                &mut ctx_with_origin(30, user(2)),
+                &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1628,13 +1772,13 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
         else {
             panic!("channel must exist");
         };
-        assert_eq!(channel.huddle.len(), 0, "sweep evicts the stale member");
+        assert_eq!(channel.huddle.len(), 0, "self-sweep evicts the caller");
 
         // sweeping an absent user is a deterministic no-op.
         let settled = module.root();
         module
             .execute(
-                &mut ctx_with_origin(31, user(2)),
+                &mut ctx_with_origin(31, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1648,45 +1792,97 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
 }
 
 #[test]
-fn sweep_huddle_gates_on_members_only_policy_like_posting() {
+fn sweep_huddle_of_another_user_by_a_non_admin_is_refused() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
+        // system-minted, so unowned: no user administers it.
         module
-            .execute(
-                &mut ctx_at(10),
-                &module_msg(ChatMsg::CreateChannel {
-                    channel_id: "core".into(),
-                    name: "CORE".into(),
-                    post_policy: PostPolicy::MembersOnly,
-                }),
-            )
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut ctx_at(10),
-                &module_msg(ChatMsg::SetMembership {
-                    channel_id: "core".into(),
-                    user: vec![1u8; 32],
-                    member: true,
-                }),
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
             )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
 
-        // a non-member's sweep is turned away exactly like a non-member post.
+        // any poster on the channel naming a DIFFERENT, still-live user is
+        // refused — this is the eviction #1625 closes.
         let err = module
             .execute(
-                &mut ctx_with_origin(20, user(2)),
+                &mut ctx_with_origin(30, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
-                    channel_id: "core".into(),
+                    channel_id: "general".into(),
                     user: vec![1u8; 32],
                 }),
             )
             .await
             .unwrap_err();
-        assert!(format!("{err:?}").contains("members-only"));
+        assert!(format!("{err:?}").contains("channel admin"), "{err:?}");
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 1, "the refused sweep changes nothing");
+    });
+}
+
+#[test]
+fn sweep_huddle_of_another_user_by_the_channel_admin_succeeds() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        // user(9) creates it, so user(9) is the owner (channel admin).
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(9)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        module
+            .execute(
+                &mut ctx_with_origin(30, user(9)),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "general".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(
+            channel.huddle.len(),
+            0,
+            "the admin's sweep evicts the member"
+        );
     });
 }
 
@@ -1940,10 +2136,7 @@ fn archived_channels_reject_writes_until_unarchived() {
                 seq: 1,
                 emoji: "wave".into(),
             },
-            ChatMsg::JoinHuddle {
-                channel_id: "general".into(),
-                node: vec![0xa1; 32],
-            },
+            join_huddle("general", &[2u8; 32], &node_key(0xa1)),
         ] {
             let err = module
                 .execute(&mut ctx_with_origin(13, user(2)), &module_msg(op))
@@ -2333,5 +2526,260 @@ fn users_cannot_archive_module_namespaced_channels() {
         )
         .await;
         assert_eq!(seqs(&reply), vec![1, 2]);
+    });
+}
+
+/// the standing probe a module acting on a user's behalf reads: chat answers
+/// what that ONE user may do in ONE channel, so the caller never carries a
+/// second copy of the admission rule. an absent channel is closed.
+#[test]
+fn access_answers_one_users_standing_from_chats_own_gates() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        // an absent channel is closed: the caller fails closed on it.
+        let absent = access(&module, "ghost", 1).await;
+        assert!(!absent.may_read && !absent.may_post);
+
+        // an OPEN channel admits any authenticated user, member or not.
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel("open")),
+            )
+            .await
+            .unwrap();
+        // a MEMBERS-ONLY channel admits only its roster — owning is not
+        // membership, exactly as the post gate has it.
+        module
+            .execute(
+                &mut ctx_with_origin(11, user(1)),
+                &module_msg(ChatMsg::CreateChannel {
+                    channel_id: "core".into(),
+                    name: "Core".into(),
+                    post_policy: PostPolicy::MembersOnly,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(12, user(1)),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "core".into(),
+                    user: vec![2; 32],
+                    member: true,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let stranger_open = access(&module, "open", 9).await;
+        assert!(stranger_open.may_read && stranger_open.may_post);
+        let owner_core = access(&module, "core", 1).await;
+        assert!(
+            !owner_core.may_read && !owner_core.may_post,
+            "owning is not membership"
+        );
+        let member_core = access(&module, "core", 2).await;
+        assert!(member_core.may_read && member_core.may_post);
+
+        // archiving closes POSTING (the post gate, verbatim) and leaves
+        // reading open.
+        module
+            .execute(
+                &mut ctx_with_origin(13, user(1)),
+                &module_msg(set_archived("core", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let archived = access(&module, "core", 2).await;
+        assert!(archived.may_read, "archival does not close reading");
+        assert!(!archived.may_post, "an archived channel takes no posts");
+    });
+}
+
+#[test]
+fn a_bare_dm_shaped_id_is_reserved_from_plain_create_channel() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        let squatted = dm_channel_id("1", "2");
+
+        // any user origin, including one of the pair itself, is refused —
+        // minting a dm- id always goes through CreateDmChannel.
+        let err = module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel(&squatted)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("reserved"));
+    });
+}
+
+#[test]
+fn a_third_account_can_never_mint_the_pairs_derived_dm_id() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat").with_identity("identity");
+        let alice_number = 1u64;
+        let bob_number = 2u64;
+        let mallory_number = 3u64;
+        let pairs = vec![
+            (vec![1u8; 32], alice_number),
+            (vec![3u8; 32], mallory_number),
+        ];
+        let their_dm = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
+
+        // mallory can only ever derive HER OWN pair's id — never alice &
+        // bob's — because the module resolves the creator from mallory's
+        // OWN key, not from anything the payload claims.
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(3))
+                    .on_query("identity", identity_stub(pairs.clone())),
+                &module_msg(ChatMsg::CreateDmChannel {
+                    counterpart: bob_number,
+                    name: "not alice and bob".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let minted = dm_channel_id(&mallory_number.to_string(), &bob_number.to_string());
+        assert_ne!(
+            minted, their_dm,
+            "mallory must land in her own DM, never alice's"
+        );
+        let ChatReply::Channel(None) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: their_dm,
+            },
+        )
+        .await
+        else {
+            panic!("alice & bob's DM must not exist — mallory never touched it");
+        };
+    });
+}
+
+#[test]
+fn a_participant_opens_their_derived_dm_and_both_get_seated() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat").with_identity("identity");
+        let alice_number = 1u64;
+        let bob_number = 2u64;
+        let pairs = vec![(vec![1u8; 32], alice_number)];
+        let expected_id = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
+
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)).on_query("identity", identity_stub(pairs)),
+                &module_msg(ChatMsg::CreateDmChannel {
+                    counterpart: bob_number,
+                    name: "Bob".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        // seat both ends, exactly like `app::open_dm`'s follow-up writes.
+        for byte in [1u8, 2u8] {
+            module
+                .execute(
+                    &mut ctx_with_origin(11, user(1)),
+                    &module_msg(ChatMsg::SetMembership {
+                        channel_id: expected_id.clone(),
+                        user: vec![byte; 32],
+                        member: true,
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        module.commit_block().await.unwrap();
+
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: expected_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("the derived DM must exist under its canonical id");
+        };
+        assert_eq!(channel.id, expected_id);
+        assert_eq!(channel.post_policy, PostPolicy::MembersOnly);
+
+        let alice_access = access(&module, &expected_id, 1).await;
+        let bob_access = access(&module, &expected_id, 2).await;
+        assert!(
+            alice_access.may_post && bob_access.may_post,
+            "both ends must be seated"
+        );
+    });
+}
+
+#[test]
+fn a_non_dm_channel_id_is_unaffected_by_the_dm_reservation() {
+    deterministic::Runner::default().start(|context| async move {
+        // no `.with_identity` at all — a host with no identity sibling wired
+        // must still create ordinary channels exactly as before.
+        let mut module = chat_on!(context, "chat");
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("an ordinary channel must still be created with no identity sibling");
+        };
+        assert_eq!(channel.id, "general");
+    });
+}
+
+#[test]
+fn a_creator_is_capped_and_a_different_origin_is_not() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        for n in 0..MAX_CHANNELS_PER_CREATOR as u64 {
+            module
+                .execute(
+                    &mut ctx_with_origin(n, user(1)),
+                    &module_msg(create_channel(&format!("room-{n}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let err = module
+            .execute(
+                &mut ctx_with_origin(MAX_CHANNELS_PER_CREATOR as u64, user(1)),
+                &module_msg(create_channel("one-too-many")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("already have"));
+
+        // a different origin is untouched by user(1)'s cap.
+        module
+            .execute(
+                &mut ctx_with_origin(MAX_CHANNELS_PER_CREATOR as u64 + 1, user(2)),
+                &module_msg(create_channel("someone-elses-room")),
+            )
+            .await
+            .unwrap();
     });
 }

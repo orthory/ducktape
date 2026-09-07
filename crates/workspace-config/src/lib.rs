@@ -31,6 +31,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_utils::Hostname;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 // The submodules are public as well as flat-re-exported: `config/resolve.rs`
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
@@ -101,6 +102,16 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     })
 }
 
+/// The simulator's packaged preset also includes its small KV test module.
+/// An explicit modules directory remains the caller's complete artifact set.
+pub fn sim_modules_dir() -> Result<PathBuf, String> {
+    let configured = std::env::var_os("DUCKTAPE_MODULES_DIR");
+    if let Some(dir) = configured {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(modules_dir()?.with_file_name("sim-modules"))
+}
+
 /// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
 /// `cargo build` binary in `target/<profile>/`, or an installed one), else
 /// `<exe dir>/../modules` (a test executable cargo runs from
@@ -139,20 +150,61 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 pub struct ModuleCode {
     /// the consensus-visible module id, the host registry key.
     pub id: String,
-    /// sha256 of the component bytes, 64 hex chars; IN the genesis fingerprint.
+    /// sha256 of the complete deployment, 64 hex chars; IN the genesis fingerprint.
     pub code_hash: String,
 }
 
-/// a module id is a bare identifier: non-empty, no `=`, no newline — the two
-/// bytes the genesis fingerprint uses as delimiters, so no two module sets can
-/// fold to one namespace. checked at every boundary a descriptor enters
-/// through (`from_toml`, the invite decoder, `module_hashes`).
+/// A module id is one filesystem name and contains none of the genesis
+/// fingerprint's delimiters. The same id addresses a module in consensus
+/// state, a descriptor, and the workspace's artifact directory.
 pub fn validate_module_id(id: &str) -> Result<(), String> {
     let is_empty = id.is_empty();
     let has_delimiter = id.contains('=') || id.contains('\n');
-    if is_empty || has_delimiter {
+    let has_path_separator = id.contains('/') || id.contains('\\') || id.contains('\0');
+    let is_relative_directory = matches!(id, "." | "..");
+    let invalid = is_empty || has_delimiter || has_path_separator || is_relative_directory;
+    if invalid {
         return Err(format!(
-            "module id {id:?} is not a bare identifier (empty, or contains '=' / newline)"
+            "module id {id:?} is not a bare identifier (empty, a path, or contains '=' / newline)"
+        ));
+    }
+    Ok(())
+}
+
+/// a chain id has the shape `mint_chain_id` produces: `<name>#<8 lowercase
+/// hex>`. Checked on a chain id that reaches the program from outside it
+/// (an invite's descriptor) — a shape `node init` never mints (no `#`, more
+/// than one, or a non-hex/non-lowercase/wrong-length suffix) is refused
+/// rather than trusted to sit next to a normally-minted id in the registry.
+pub fn validate_chain_id_shape(id: &str) -> Result<(), String> {
+    let malformed = || format!("chain id {id:?} is not <name>#<8 hex> — refusing to join it");
+    let (name, salt) = id.split_once('#').ok_or_else(malformed)?;
+    let is_hex_salt = salt.len() == 8 && salt.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_lowercase = salt.chars().all(|c| !c.is_ascii_uppercase());
+    if name.is_empty() || !is_hex_salt || !is_lowercase {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+/// the floor a beat must clear: the idle heartbeat (`pump_heartbeat` in
+/// `bin/node/src/validator/run/drain.rs`) only ever fires from the drain
+/// pump's own tick (`DRAIN_TICK` in `bin/node/src/constants.rs`), so a beat
+/// under this many ms cannot land as the one idle block per interval that
+/// `Cadence::idle_hold` (`crates/kernel/consensus/src/lib.rs`) requires — it
+/// would land as a nullify + finalize instead. `bin/node/src/constants.rs`
+/// carries a const assertion that `DRAIN_TICK` agrees with this value.
+pub const MIN_BLOCK_TIME_MS: u64 = 100;
+
+/// a beat under the drain-tick floor is not a cadence the idle heartbeat can
+/// keep: every consensus timer is a multiple of it, so an unpaceable beat
+/// either hot-spins (at zero) or breaks `idle_hold` (below the floor).
+/// checked at every boundary a descriptor enters through, exactly like
+/// [`validate_module_id`].
+pub fn validate_block_time_ms(ms: u64) -> Result<(), String> {
+    if ms < MIN_BLOCK_TIME_MS {
+        return Err(format!(
+            "block_time_ms must be at least {MIN_BLOCK_TIME_MS}ms (the node's idle drain tick)"
         ));
     }
     Ok(())
@@ -189,6 +241,14 @@ pub struct NetworkDescriptor {
     /// `node init` writes the file beside this descriptor; a joiner installs
     /// it (`install_genesis`) only after the bytes hash to this.
     pub genesis: String,
+    /// milliseconds between idle blocks — the network's BEAT, stated once by
+    /// the founder (`node init --block-time-ms`) and inherited by every
+    /// joiner. IN the genesis fingerprint because the invariant it carries is
+    /// cross-node: every simplex timer is a fixed multiple of the local beat
+    /// (`consensus::Cadence`), so a member running a faster one nullifies the
+    /// very views a slower leader fills on its own heartbeat. One beat per
+    /// network, or the members disagree about when a view is late.
+    pub block_time_ms: u64,
     /// the genesis wasm set: `(id, sha256 hex)` per wasm tenant, sorted by id.
     /// IN the genesis fingerprint — a node built against different components
     /// is a different network, never a block-0 fork. the bytes are the
@@ -219,6 +279,7 @@ impl NetworkDescriptor {
         }
         d.modules.sort_by(|a, b| a.id.cmp(&b.id));
         d.genesis = d.genesis.trim().to_ascii_lowercase();
+        validate_block_time_ms(d.block_time_ms)?;
         Ok(d)
     }
 
@@ -231,8 +292,12 @@ impl NetworkDescriptor {
         Self::from_toml(&text)
     }
 
+    /// write the descriptor via tmp-file + rename: this is the workspace's
+    /// identity file, rewritten on every invite mint and admit — a crash
+    /// mid-write must never leave a torn `network.toml` (see genesis.rs's
+    /// own `write_atomic`, which this shares).
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_toml()).map_err(|e| format!("write {path:?}: {e}"))
+        genesis::write_atomic(path, self.to_toml().as_bytes())
     }
 
     pub fn validator_keys(&self) -> Result<Vec<ed25519::PublicKey>, String> {
@@ -259,8 +324,9 @@ impl NetworkDescriptor {
 
     /// the namespace this network's nodes actually run under: the chain-id
     /// plus a GENESIS FINGERPRINT (sha256 over the sorted validator set +
-    /// the sorted `id=code_hash` module lines; bootstrap hints excluded — they
-    /// are advisory and legitimately differ between members). because the
+    /// the sorted `id=code_hash` module lines + the genesis pin + the beat;
+    /// bootstrap hints excluded — they are advisory and legitimately differ
+    /// between members). because the
     /// namespace domain-separates the mesh handshake, the simplex scheme, and
     /// the epoch genesis floor, a member holding a STALE descriptor (e.g. it
     /// missed a pre-genesis `admit` and kept the old validator list, or was
@@ -293,6 +359,8 @@ impl NetworkDescriptor {
         }
         hasher.update(b"\ngenesis=");
         hasher.update(self.genesis.trim().to_ascii_lowercase().as_bytes());
+        hasher.update(b"\nblock_time_ms=");
+        hasher.update(self.block_time_ms.to_string().as_bytes());
         let digest = hasher.finalize();
         // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
         // admitted key that leaves the fingerprint unchanged, resurrecting
@@ -372,12 +440,21 @@ impl NetworkDescriptor {
 
     /// record a dial hint (`host:port`, an IP or a hostname) for `key`, replacing
     /// any previous hint for the same key (a member's advertised addr can move).
-    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &str) {
+    ///
+    /// Returns whether the entry set actually changed, so a caller that only
+    /// rewrites the descriptor to record a bootstrap hint (every invite mint)
+    /// can skip the write when this key already carries this address.
+    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &str) -> bool {
         let hex = hex_bytes(key.as_ref());
+        let entry = format!("{hex}@{addr}");
+        if self.bootstrap.contains(&entry) {
+            return false;
+        }
         self.bootstrap
             .retain(|e| !e.starts_with(&format!("{hex}@")));
-        self.bootstrap.push(format!("{hex}@{addr}"));
+        self.bootstrap.push(entry);
         self.bootstrap.sort();
+        true
     }
 
     /// the reach hints, typed. if the descriptor carries explicit `reach`
@@ -409,7 +486,7 @@ impl NetworkDescriptor {
         let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            // only a typed DIRECT/FRONTED route supersedes a bootstrap-
+            // only a typed DIRECT route supersedes a bootstrap-
             // synthesised Direct for the same key (the member's dial address
             // moved/upgraded). a Coordinated route is an ADDITIONAL rendezvous
             // path, not a replacement — it must not erase a real direct dial
@@ -421,9 +498,7 @@ impl NetworkDescriptor {
             // plane's tunnels apply, so letting it evict the underlay hint
             // strands the member behind a plane that has not assembled yet
             // (first join, promotion reboot, same-host tests).
-            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_))
-                && !self.overlay_route(&hint)?
-            {
+            if matches!(hint.reach, Reach::Direct(_)) && !self.overlay_route(&hint)? {
                 typed_keys.insert(hint.expected_key.as_ref().to_vec());
             }
             typed.push(hint);
@@ -440,7 +515,7 @@ impl NetworkDescriptor {
     /// classified as an overlay route, never an underlay replacement.
     fn overlay_route(&self, hint: &ReachHint) -> Result<bool, String> {
         let addr = match &hint.reach {
-            Reach::Direct(a) | Reach::Fronted(a) => a,
+            Reach::Direct(a) => a,
             Reach::Coordinated(_) => return Ok(false),
         };
         let Some(Ingress::Socket(sock)) = ingress_of(addr)? else {
@@ -478,8 +553,8 @@ impl NetworkDescriptor {
         }
     }
 
-    /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
-    /// `Fronted` become an [`Ingress`] the mesh dials (a hostname stays a
+    /// reach hints resolved to typed dial routes, hostname-native: `Direct`
+    /// becomes an [`Ingress`] the mesh dials (a hostname stays a
     /// hostname, re-resolved per attempt); `Coordinated` becomes a route the
     /// nat client hole-punches through while still authenticating the
     /// target's own key end-to-end. advisory: an entry that cannot form a
@@ -496,7 +571,7 @@ impl NetworkDescriptor {
             std::collections::BTreeMap::new();
         for hint in self.reach_hints()? {
             let dial = match &hint.reach {
-                Reach::Direct(a) | Reach::Fronted(a) => match ingress_of(a)? {
+                Reach::Direct(a) => match ingress_of(a)? {
                     Some(ingress) => ReachDial::Direct(ingress),
                     None => continue, // unspecified ip / port 0 — advisory noise.
                 },
@@ -616,10 +691,9 @@ impl NetworkDescriptor {
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
-/// dials the ingress and authenticates `expected_key` end-to-end (a fronted
-/// path is transparent, so it looks the same to the dialer); `Coordinated`
-/// carries the coordinator's own ingress + identity so the nat client can
-/// rendezvous and hole-punch to the target.
+/// dials the ingress and authenticates `expected_key` end-to-end;
+/// `Coordinated` carries the coordinator's own ingress + identity so the nat
+/// client can rendezvous and hole-punch to the target.
 #[derive(Clone, Debug)]
 pub enum ReachDial {
     Direct(Ingress),
@@ -699,12 +773,43 @@ pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
 }
 
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
-/// workspace dir only ever holds one chain-id. a refreshed invite for the
-/// SAME chain-id (the documented re-join after a pre-genesis admit) may
+/// workspace dir only ever holds one network. a refreshed invite for the
+/// SAME network (the documented re-join after a pre-genesis admit) may
 /// replace it; anything else is almost certainly a paste into the wrong dir —
 /// and for a founder, an unrecoverable one (the time-salted chain-id cannot
 /// be re-minted).
-pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result<(), String> {
+///
+/// the chain-id alone cannot decide that: it is free text an invite carries
+/// verbatim, it appears in every invite the network ever hands out, and
+/// `decode_invite_at` proves only that a blob is self-consistent — never that
+/// its issuer belongs to the network it names. so an attacker who copies a
+/// victim's chain-id onto a descriptor of their OWN validators mints a blob
+/// that resolves to the victim's registry directory and overwrites a live
+/// network's descriptor, stranding its identity and history.
+///
+/// what actually identifies a network is the genesis fingerprint
+/// ([`NetworkDescriptor::genesis_namespace`]) — the mesh handshake, the
+/// simplex scheme and the epoch floor are all domain-separated by it, so two
+/// descriptors that differ in it can never exchange a frame. the ONE
+/// legitimate way it changes under a workspace is the pre-genesis `admit`
+/// refresh, which only ever GROWS the validator set over the same genesis pin,
+/// module set and beat. so that is the exemption — and it takes BOTH halves.
+///
+/// `issuer` is the invite's verified issuer: `decode_invite_at` checks the
+/// envelope signature against it before anything here runs, so it is the one
+/// value in a pasted blob an attacker cannot choose freely. ANY join into a
+/// live workspace — the same-fingerprint re-join as much as the admit refresh
+/// — is admitted only when that key is already a validator in the descriptor
+/// ON DISK, the set we trusted before this blob arrived. an attacker who
+/// copies our genesis facts into their own descriptor satisfies the SHAPE of a
+/// re-join (and can match the fingerprint outright, since the reach hints,
+/// coordination mode, fronts and WireGuard bootstrap it rewrites are all
+/// outside it), but signing as one of those keys needs a key they do not have.
+pub fn guard_join_descriptor(
+    dir: &Path,
+    incoming: &NetworkDescriptor,
+    issuer: &ed25519::PublicKey,
+) -> Result<(), String> {
     let path = dir.join("network.toml");
     if !path.exists() {
         return Ok(());
@@ -719,7 +824,55 @@ pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result
             incoming.chain_id
         ));
     }
+    let ours = validator_set(&existing);
+    let same_genesis = existing.genesis_namespace() == incoming.genesis_namespace();
+    let admit_shape = existing.genesis == incoming.genesis
+        && existing.modules == incoming.modules
+        && existing.block_time_ms == incoming.block_time_ms
+        && ours.is_subset(&validator_set(incoming));
+    if !same_genesis && !admit_shape {
+        return Err(format!(
+            "foreign_genesis: {} already belongs to genesis {} — refusing to replace its \
+             descriptor with an invite that reuses the chain-id {} over a DIFFERENT genesis {} \
+             (its validators, genesis pin, modules or beat are not yours); that invite was not \
+             issued by your network",
+            dir.display(),
+            existing.genesis_namespace(),
+            incoming.chain_id,
+            incoming.genesis_namespace(),
+        ));
+    }
+    // BOTH legitimate shapes land here, and BOTH need the signature. a
+    // matching fingerprint is not proof of membership: `genesis_namespace`
+    // covers the chain-id, validators, modules, genesis pin and beat and
+    // NOTHING else — `reach`, `coordination`, the invite's fronts and its
+    // WireGuard bootstrap all ride outside it, and `join_workspace` writes
+    // every one of them wholesale. so a stranger who copies a leaked invite's
+    // genesis facts verbatim and re-points the hints at hosts they control
+    // mints a blob whose fingerprint MATCHES ours. the envelope signature is
+    // the one field they cannot choose.
+    let signed_by_a_resident_validator = ours.contains(&hex_bytes(issuer.as_ref()));
+    if !signed_by_a_resident_validator {
+        return Err(format!(
+            "join_not_signed_by_a_member: {} already belongs to genesis {} — the invite carries \
+             the shape of a re-join, but it was signed by {}, which is not a validator of the \
+             descriptor on disk; anyone can copy your validator list into their own descriptor, \
+             only one of those validators can sign as one",
+            dir.display(),
+            existing.genesis_namespace(),
+            hex_bytes(issuer.as_ref()),
+        ));
+    }
     Ok(())
+}
+
+/// the validator entries as [`NetworkDescriptor::genesis_namespace`]
+/// fingerprints them — trimmed and lowercased, order-independent.
+fn validator_set(d: &NetworkDescriptor) -> std::collections::BTreeSet<String> {
+    d.validators
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .collect()
 }
 
 /// the `host:port` peers should dial, if one is real: prefer `advertised`, else
@@ -805,8 +958,6 @@ pub fn ingress_of(host_port: &str) -> Result<Option<Ingress>, String> {
 pub enum Reach {
     /// dial this `host:port` directly (today's bootstrap behaviour).
     Direct(String),
-    /// dial a transport forwarder that splices to the target.
-    Fronted(String),
     /// dial a coordinator (`coord_addr`) and ask it for a path to the target.
     Coordinated(CoordRef),
 }
@@ -835,7 +986,6 @@ impl ReachHint {
         let ek = hex_bytes(self.expected_key.as_ref());
         match &self.reach {
             Reach::Direct(a) => format!("direct:{ek}@{a}"),
-            Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
             Reach::Coordinated(c) => {
                 format!(
                     "coordinated:{ek}@{}#{}",
@@ -856,7 +1006,6 @@ impl ReachHint {
         let expected_key = decode_key(ek_hex)?;
         let reach = match tag {
             "direct" => Reach::Direct(addr_part.to_string()),
-            "fronted" => Reach::Fronted(addr_part.to_string()),
             "coordinated" => {
                 let (coord_addr, ck_hex) = addr_part
                     .rsplit_once('#')
@@ -875,21 +1024,27 @@ impl ReachHint {
     }
 }
 
-/// EVERY candidate statesync source, ordered: bootstrap-hinted validators
-/// first (a dial path is already configured), then the remaining validators.
-/// the rotating client fails over down this list — any validator can serve,
-/// because every payload verifies against consensus-agreed roots.
+/// EVERY candidate statesync source, ordered: the invite's bootstrap hints
+/// first (a dial path is already configured for them), then the descriptor's
+/// validators. the rotating client fails over down this list — any peer that
+/// serves the channel will do, because every payload verifies against
+/// consensus-agreed roots.
+///
+/// a hint is NEVER filtered against the descriptor's validator list: that list
+/// is the GENESIS one, frozen for the process's life, so filtering by it drops
+/// exactly the peer a joiner needs once the founders have been rotated out.
+/// the live set replaces this seed as soon as the joiner reads a tip.
 pub fn sync_source_candidates<A>(
     bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Vec<ed25519::PublicKey> {
-    let mut out: Vec<ed25519::PublicKey> = bootstrappers
-        .iter()
-        .map(|(k, _)| k)
-        .filter(|k| *k != me && validators.contains(k))
-        .cloned()
-        .collect();
+    let mut out: Vec<ed25519::PublicKey> = Vec::new();
+    for (k, _) in bootstrappers {
+        if k != me && !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
     for k in validators {
         if k != me && !out.contains(k) {
             out.push(k.clone());
@@ -924,7 +1079,29 @@ pub fn workspaces_root() -> Result<PathBuf, String> {
 /// arbitrary text) are made inert — the registry resolves by descriptor
 /// content, so the directory name is display-only.
 pub fn default_workspace_dir(chain_id: &str) -> Result<PathBuf, String> {
-    Ok(workspaces_root()?.join(chain_id.replace(std::path::MAIN_SEPARATOR, "-")))
+    let name = chain_id.replace(std::path::MAIN_SEPARATOR, "-");
+    if !is_workspace_dir_name(&name) {
+        return Err(format!(
+            "chain id {chain_id:?} is not a workspace directory name — the registry holds one \
+             directory per network, so an id that resolves to the registry root or its parent \
+             would scatter identity.key and network.toml over the ducktape home instead; pass \
+             --dir to choose a destination"
+        ));
+    }
+    Ok(workspaces_root()?.join(name))
+}
+
+/// does this name address a directory INSIDE the registry, and only that one?
+/// a chain-id reaches here straight out of an untrusted invite (`unpack_invite`
+/// asks only for UTF-8 under 255 bytes), and `""`, `"."` and `".."` all join
+/// to the registry root or its parent — a workspace written there is invisible
+/// to `list_workspaces`/`find_workspace_config`, which scan subdirectories, so
+/// `-n <chain-id>` could never address it again. one real path component, and
+/// nothing else.
+fn is_workspace_dir_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    let single = matches!(components.next(), Some(std::path::Component::Normal(_)));
+    single && components.next().is_none()
 }
 
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
@@ -947,9 +1124,20 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
             continue;
         }
         // an unreadable descriptor in one workspace must not break addressing
-        // the others — skip it.
-        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
-            continue;
+        // the others — skip it, but say so: silence here reads as "no such
+        // workspace" when the real story is a torn network.toml.
+        let d = match NetworkDescriptor::load(&descriptor_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    target: "ducktape::workspace",
+                    reason = "descriptor_unreadable",
+                    dir = %dir.display(),
+                    error = %e,
+                    "skipping workspace with an unreadable network.toml"
+                );
+                continue;
+            }
         };
         if d.chain_id == needle {
             return Ok(dir.join("node.toml"));
@@ -1049,8 +1237,18 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
         if !descriptor_path.is_file() {
             continue;
         }
-        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
-            continue;
+        let d = match NetworkDescriptor::load(&descriptor_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    target: "ducktape::workspace",
+                    reason = "descriptor_unreadable",
+                    dir = %dir.display(),
+                    error = %e,
+                    "skipping workspace with an unreadable network.toml"
+                );
+                continue;
+            }
         };
         out.push((d.chain_id, dir.join("node.toml")));
     }
@@ -1107,6 +1305,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
                 genesis: String::new(),
                 modules: Vec::new(),
             }
@@ -1122,6 +1321,98 @@ mod tests {
     }
 
     #[test]
+    fn list_and_find_skip_a_torn_descriptor_instead_of_erroring() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good#00000001");
+        std::fs::create_dir_all(&good).unwrap();
+        NetworkDescriptor {
+            chain_id: "good#00000001".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&good.join("network.toml"))
+        .unwrap();
+        // a torn (truncated mid-write) network.toml: present, but not
+        // parseable toml.
+        let torn = root.path().join("torn#00000002");
+        std::fs::create_dir_all(&torn).unwrap();
+        std::fs::write(torn.join("network.toml"), b"chain_id = \"torn#0000").unwrap();
+
+        let listed = list_workspaces_in(root.path()).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(ids, ["good#00000001"]);
+
+        // `find` still resolves the healthy workspace and does not surface
+        // the damaged one as a match or a hard error.
+        let found = find_workspace_config_in(root.path(), "good#00000001").unwrap();
+        assert!(found.ends_with("good#00000001/node.toml"));
+        assert!(find_workspace_config_in(root.path(), "torn").is_err());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_partial_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("network.toml");
+        let original = NetworkDescriptor {
+            chain_id: "atomic#00000001".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        };
+        original.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // save goes through a tmp file that is renamed into place: after a
+        // successful save, no `.tmp.<pid>` sibling is left behind, and the
+        // reader never sees anything but a complete descriptor.
+        let leftover_tmp = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|ext| ext != "toml"));
+        assert!(!leftover_tmp, "save left a tmp file behind");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // reloading yields the exact descriptor that was saved.
+        assert_eq!(
+            NetworkDescriptor::load(&path).unwrap().chain_id,
+            original.chain_id
+        );
+    }
+
+    #[test]
+    fn chain_id_shape_matches_what_mint_chain_id_produces() {
+        let minted = identity::mint_chain_id(
+            "dognet",
+            &commonware_cryptography::ed25519::PrivateKey::from_seed(1).public_key(),
+        );
+        assert!(validate_chain_id_shape(&minted).is_ok(), "{minted}");
+
+        for bad in [
+            "dognet",           // no salt at all
+            "dognet#",          // empty salt
+            "dognet#abcd123",   // 7 hex chars, not 8
+            "dognet#abcd12345", // 9 hex chars
+            "dognet#ABCD1234",  // uppercase
+            "dognet#zzzzzzzz",  // not hex
+            "#abcd1234",        // empty name
+            "dog#net#abcd1234", // more than one '#' (splits on the first)
+        ] {
+            assert!(
+                validate_chain_id_shape(bad).is_err(),
+                "{bad:?} should not pass as a minted chain id"
+            );
+        }
+    }
+
+    #[test]
     fn coordination_defaults_to_private_and_parses_public() {
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
@@ -1129,6 +1420,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1180,6 +1472,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1279,6 +1572,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
                 genesis: String::new(),
                 modules: Vec::new(),
             };
@@ -1302,6 +1596,29 @@ mod tests {
         assert!(err.contains("ambiguous"), "{err}");
     }
 
+    #[test]
+    fn a_traversal_chain_id_never_becomes_a_workspace_directory() {
+        // straight out of an untrusted invite: each of these joins to the
+        // registry root or its parent instead of a per-network directory.
+        for hostile in ["", ".", ".."] {
+            let err = default_workspace_dir(hostile)
+                .expect_err("a traversal chain id has no default workspace");
+            assert!(
+                err.contains("not a workspace directory name"),
+                "{hostile:?}: {err}"
+            );
+        }
+        // separators stay display-only: they collapse into one component
+        // rather than descending, and a minted chain-id is untouched.
+        assert!(is_workspace_dir_name(
+            &"a/b".replace(std::path::MAIN_SEPARATOR, "-")
+        ));
+        assert!(is_workspace_dir_name(
+            &"../..".replace(std::path::MAIN_SEPARATOR, "-")
+        ));
+        assert!(is_workspace_dir_name("ducktape#a1b2c3d4"));
+    }
+
     fn write_workspace(root: &Path, ws: &str, chain: &str, listen: &str, http: &str) -> PathBuf {
         let dir = root.join(ws);
         std::fs::create_dir_all(&dir).expect("mk workspace");
@@ -1311,6 +1628,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         }
@@ -1324,7 +1642,7 @@ mod tests {
              gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
-             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\nblock_time_ms = 1000\n"
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir
@@ -1384,6 +1702,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1405,6 +1724,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1424,6 +1744,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1468,6 +1789,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
@@ -1481,10 +1803,70 @@ mod tests {
         assert_eq!(reversed.genesis_namespace(), d.genesis_namespace());
     }
 
+    /// The beat is a genesis fact, so it is IN the fingerprint: two networks
+    /// alike in every other respect but the cadence cannot handshake. That is
+    /// what makes a mismatched member a loud connectivity failure instead of a
+    /// validator quietly nullifying the views its slower leader was filling.
+    #[test]
+    fn genesis_namespace_fingerprints_the_beat() {
+        let a = ed25519::PrivateKey::from_seed(5).public_key();
+        let d = NetworkDescriptor {
+            chain_id: "net#00000000".into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "ab".repeat(32),
+            modules: modules_fixture(),
+        };
+        let faster = NetworkDescriptor {
+            block_time_ms: 100,
+            ..d.clone()
+        };
+        assert_ne!(faster.genesis_namespace(), d.genesis_namespace());
+    }
+
+    /// a zero beat collapses every consensus timer to a hot spin, so it is
+    /// refused at both boundaries a descriptor enters through — the file and
+    /// (in the invite suite) the blob.
+    #[test]
+    fn a_zero_beat_is_refused_at_the_file_boundary() {
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 0\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&text).unwrap_err();
+        assert!(err.contains("block_time_ms"), "{err}");
+    }
+
+    /// the floor is the drain tick, not zero: a beat the idle heartbeat can't
+    /// keep is refused just as loudly as a zero beat, and it names the floor.
+    #[test]
+    fn a_beat_under_the_drain_tick_is_refused() {
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 99\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&text).unwrap_err();
+        assert!(err.contains("block_time_ms"), "{err}");
+        assert!(err.contains("100"), "{err}");
+
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 100\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        NetworkDescriptor::from_toml(&text).expect("the floor itself is accepted");
+    }
+
     #[test]
     fn descriptor_without_modules_does_not_parse() {
         let text = format!(
-            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n",
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 1000\n",
             "ab".repeat(32)
         );
         let err = NetworkDescriptor::from_toml(&text).unwrap_err();
@@ -1499,6 +1881,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
@@ -1549,28 +1932,181 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
         // empty dir: anything goes.
-        assert!(guard_join_descriptor(&dir, &ours).is_ok());
+        assert!(guard_join_descriptor(&dir, &ours, &a).is_ok());
         ours.save(&dir.join("network.toml")).expect("save");
 
-        // the refreshed invite (same chain-id, more members) is the re-join.
+        // the refreshed invite (same chain-id, more members), issued by the
+        // validator already on disk — the documented re-join.
         let mut refreshed = ours.clone();
         refreshed.admit(&ed25519::PrivateKey::from_seed(12).public_key());
-        assert!(guard_join_descriptor(&dir, &refreshed).is_ok());
+        assert!(guard_join_descriptor(&dir, &refreshed, &a).is_ok());
 
         // a different network's invite must never clobber this workspace.
         let foreign = NetworkDescriptor {
             chain_id: "other#22222222".into(),
             ..ours.clone()
         };
-        let err = guard_join_descriptor(&dir, &foreign).expect_err("foreign refused");
+        let err = guard_join_descriptor(&dir, &foreign, &a).expect_err("foreign refused");
         assert!(
             err.contains("home#11111111"),
             "error names the resident network: {err}"
         );
+    }
+
+    #[test]
+    fn join_guard_refuses_an_invite_that_reuses_the_chain_id_over_a_foreign_genesis() {
+        let ours_key = ed25519::PrivateKey::from_seed(31).public_key();
+        let theirs = ed25519::PrivateKey::from_seed(32).public_key();
+        let dir = tmp("joinguard-genesis");
+        let ours = NetworkDescriptor {
+            chain_id: "home#33333333".into(),
+            validators: vec![hex_bytes(ours_key.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "11".repeat(32),
+            modules: Vec::new(),
+        };
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // the whole attack: the chain-id is public, so it is copied verbatim;
+        // everything that decides which network this is belongs to the attacker.
+        let hostile = NetworkDescriptor {
+            validators: vec![hex_bytes(theirs.as_ref())],
+            genesis: "22".repeat(32),
+            ..ours.clone()
+        };
+        let err =
+            guard_join_descriptor(&dir, &hostile, &theirs).expect_err("foreign genesis refused");
+        assert!(err.starts_with("foreign_genesis:"), "{err}");
+        assert!(
+            err.contains(&ours.genesis_namespace()) && err.contains(&hostile.genesis_namespace()),
+            "error names both genesis fingerprints: {err}"
+        );
+
+        // and the beat alone is enough to make it a different network.
+        let faster = NetworkDescriptor {
+            block_time_ms: ours.block_time_ms + 1,
+            ..ours.clone()
+        };
+        assert!(
+            guard_join_descriptor(&dir, &faster, &ours_key).is_err(),
+            "beat differs"
+        );
+
+        // the pre-genesis admit refresh stays allowed: same genesis pin,
+        // modules and beat, and our validator is still in the set.
+        let mut admitted = ours.clone();
+        admitted.admit(&theirs);
+        assert_ne!(admitted.genesis_namespace(), ours.genesis_namespace());
+        guard_join_descriptor(&dir, &admitted, &ours_key)
+            .expect("the admit refresh is the re-join");
+
+        // dropping a validator we already trust is NOT a refresh.
+        let evicted = NetworkDescriptor {
+            validators: vec![hex_bytes(theirs.as_ref())],
+            ..ours.clone()
+        };
+        assert!(
+            guard_join_descriptor(&dir, &evicted, &ours_key).is_err(),
+            "a set that drops our own validator is not an admit refresh"
+        );
+    }
+
+    #[test]
+    fn join_guard_refuses_a_refresh_signed_by_someone_who_is_not_our_validator() {
+        let ours_key = ed25519::PrivateKey::from_seed(41).public_key();
+        let stranger = ed25519::PrivateKey::from_seed(42).public_key();
+        let dir = tmp("joinguard-issuer");
+        let ours = NetworkDescriptor {
+            chain_id: "home#44444444".into(),
+            validators: vec![hex_bytes(ours_key.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "11".repeat(32),
+            modules: Vec::new(),
+        };
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // the descriptor a patient attacker builds: it KEEPS our validators
+        // (so the admit-refresh shape holds) and adds its own, over our
+        // genesis pin, modules and beat. Only the signature gives it away.
+        let mut refresh = ours.clone();
+        refresh.admit(&stranger);
+        assert_ne!(refresh.genesis_namespace(), ours.genesis_namespace());
+
+        let err = guard_join_descriptor(&dir, &refresh, &stranger)
+            .expect_err("a refresh signed by a non-member is refused");
+        assert!(
+            err.starts_with("join_not_signed_by_a_member:"),
+            "its own reason token: {err}"
+        );
+        assert!(
+            err.contains(&hex_bytes(stranger.as_ref())),
+            "error names the issuer that signed it: {err}"
+        );
+
+        // the SAME descriptor, signed by the validator already on disk, is the
+        // documented re-join.
+        guard_join_descriptor(&dir, &refresh, &ours_key)
+            .expect("a refresh signed by a resident validator is the re-join");
+    }
+
+    #[test]
+    fn join_guard_refuses_a_same_genesis_blob_signed_by_a_stranger() {
+        let ours_key = ed25519::PrivateKey::from_seed(51).public_key();
+        let stranger = ed25519::PrivateKey::from_seed(52).public_key();
+        let dir = tmp("joinguard-same-genesis");
+        let ours = NetworkDescriptor {
+            chain_id: "home#55555555".into(),
+            validators: vec![hex_bytes(ours_key.as_ref())],
+            bootstrap: vec![],
+            reach: vec!["10.0.0.1:52200".into()],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "11".repeat(32),
+            modules: Vec::new(),
+        };
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // every genesis fact copied verbatim from a leaked invite, so the
+        // fingerprint MATCHES; only what rides outside it — the reach hints,
+        // the coordination mode, and (in the invite) the fronts and WireGuard
+        // bootstrap `join_workspace` writes wholesale — points at the
+        // attacker.
+        let hijack = NetworkDescriptor {
+            reach: vec!["attacker.example.com:52200".into()],
+            coordination: Some("public".into()),
+            ..ours.clone()
+        };
+        assert_eq!(
+            hijack.genesis_namespace(),
+            ours.genesis_namespace(),
+            "the hints this blob rewrites are outside the fingerprint"
+        );
+
+        let err = guard_join_descriptor(&dir, &hijack, &stranger)
+            .expect_err("a same-genesis blob signed by a non-member is refused");
+        assert!(
+            err.starts_with("join_not_signed_by_a_member:"),
+            "its own reason token: {err}"
+        );
+        assert!(
+            err.contains(&hex_bytes(stranger.as_ref())),
+            "error names the issuer that signed it: {err}"
+        );
+
+        // the same blob from a validator on disk is the documented re-join.
+        guard_join_descriptor(&dir, &hijack, &ours_key)
+            .expect("a same-genesis re-join signed by a resident validator is admitted");
     }
 
     #[test]
@@ -1586,6 +2122,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1605,6 +2142,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture_sorted(),
         };
@@ -1619,6 +2157,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: format!("  {}  ", "ab".repeat(32).to_ascii_uppercase()),
             modules: vec![
                 ModuleCode {
@@ -1670,7 +2209,8 @@ mod tests {
         // or a newline could make two distinct module sets fold to one
         // namespace. every entry point refuses it, naming the id.
         let toml = format!(
-            "chain_id = \"canon#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\n\
+            "chain_id = \"canon#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 1000\n\n\
              [[modules]]\nid = \"a=b\"\ncode_hash = \"{}\"\n",
             "ab".repeat(32),
             "11".repeat(32)
@@ -1684,6 +2224,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "x\ny".into(),
@@ -1712,6 +2253,7 @@ mod tests {
             ],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1740,10 +2282,6 @@ mod tests {
             ReachHint {
                 expected_key: ek.clone(),
                 reach: Reach::Direct("127.0.0.1:9000".into()),
-            },
-            ReachHint {
-                expected_key: ek.clone(),
-                reach: Reach::Fronted("front.example.com:443".into()),
             },
             ReachHint {
                 expected_key: ek.clone(),
@@ -1781,6 +2319,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1804,6 +2343,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1829,6 +2369,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1864,6 +2405,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1918,6 +2460,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1981,6 +2524,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2033,6 +2577,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2071,6 +2616,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2108,6 +2654,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2133,18 +2680,23 @@ mod tests {
     }
 
     #[test]
-    fn sync_source_candidates_prefer_validator_hints_and_never_self() {
+    fn sync_source_candidates_prefer_hints_and_never_self() {
         let me = ed25519::PrivateKey::from_seed(31).public_key();
-        let resident = ed25519::PrivateKey::from_seed(32).public_key();
+        let hinted = ed25519::PrivateKey::from_seed(32).public_key();
         let validator = ed25519::PrivateKey::from_seed(33).public_key();
         let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
         let validators = vec![me.clone(), validator.clone()];
 
-        // a non-validator hint sorts first but can never serve — skipped.
-        let hints = vec![(resident.clone(), addr), (validator.clone(), addr)];
+        // a hint outside the GENESIS validator list SURVIVES — it is the
+        // promoted member a joiner reaches once the founders are rotated out.
+        let hints = vec![
+            (hinted.clone(), addr),
+            (validator.clone(), addr),
+            (me.clone(), addr),
+        ];
         assert_eq!(
             sync_source_candidates(&hints, &validators, &me),
-            vec![validator.clone()]
+            vec![hinted.clone(), validator.clone()]
         );
 
         // no usable hint: any validator that is not us.

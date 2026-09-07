@@ -1,6 +1,6 @@
 //! the STORE-BACKED cutover-continuity proof for the saga ledger: the `saga`
 //! guest component (the NATIVE `saga` crate compiled to wasm behind
-//! `guest-adapter`) over `WasmModule::with_store(QmdbStore)` and the native
+//! `ducktape-module-sdk`) over `WasmModule::with_store(QmdbStore)` and the native
 //! `SagaModule` over the same store shape are ROOT-CONTINUOUS — the same op
 //! sequence commits the IDENTICAL qmdb merkle root after every block, not
 //! merely lockstep-moving distinct roots. both roots ARE the store's root;
@@ -66,7 +66,11 @@ fn key(tag: u8) -> Vec<u8> {
 }
 
 async fn seeded_valset(members: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     for m in members {
         valset.seed(m.clone()).await.expect("seed valset");
     }
@@ -657,13 +661,30 @@ async fn same_ops_inner(context: deterministic::Context) {
         false,
     )
     .await;
+    // B announces itself as a "nobody-has-this" provider — Accept's
+    // capability gate needs this on top of B's valset standing (a member
+    // key already has); an unannounced tag has no eligible claimant at all.
+    // Announce REPLACES the submitter's whole tag set, so this re-states B's
+    // earlier "llm"/"gpu" announcement too — the later t-re/t-cap scenarios
+    // still need B in those pools.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        &member_keys,
+        11,
+        Origin::External(b.clone()),
+        announce(&["llm", "gpu", "nobody-has-this"], &[("cores", 4)]),
+        false,
+    )
+    .await;
     // ...B claims it via Accept — the re-emitted work order names the winner —
     let (n_reqs, _) = roundtrip(
         &mut native,
         &mut wasm,
         &ids,
         &member_keys,
-        11,
+        12,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Accept {
             saga_id: sid(&a, "t-ann"),
@@ -679,7 +700,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        12,
+        13,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Accept {
             saga_id: sid(&a, "t-ann"),
@@ -694,7 +715,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        13,
+        14,
         Origin::External(b.clone()),
         oracle(&sid(&a, "t-ann"), 0, Ok(b"claimed-and-done".to_vec())),
         true,
@@ -708,7 +729,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        14,
+        15,
         Origin::External(a.clone()),
         saga_op(
             &Trig {
@@ -726,7 +747,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        15,
+        16,
         Origin::External(b.clone()),
         oracle(&sid(&a, "t-pin"), 0, Ok(b"pinned-done".to_vec())),
         true,
@@ -740,7 +761,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        16,
+        17,
         Origin::External(a.clone()),
         saga_op(
             &Trig {
@@ -757,7 +778,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        17,
+        18,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Cancel {
             saga_id: sid(&a, "t-cxl"),
@@ -770,7 +791,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        18,
+        19,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Cancel {
             saga_id: sid(&a, "t-cxl"),
@@ -786,7 +807,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        19,
+        20,
         Origin::External(a.clone()),
         saga_op(
             &Trig {
@@ -814,7 +835,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        21,
+        22,
         Origin::External(stranger),
         saga_op(&SagaMsg::RenewLease {
             saga_id: sid(&a, "t-renew"),
@@ -830,7 +851,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        22,
+        23,
         Origin::External(renew_holder),
         saga_op(&SagaMsg::RenewLease {
             saga_id: sid(&a, "t-renew"),
@@ -848,7 +869,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        23,
+        24,
         Origin::External(a.clone()),
         saga_op(
             &Trig {
@@ -872,7 +893,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        24,
+        25,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Reassign {
             saga_id: sid(&a, "t-re"),
@@ -886,7 +907,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        25,
+        26,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Reassign {
             saga_id: sid(&a, "t-re"),
@@ -908,7 +929,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        26,
+        27,
         Origin::External(b.clone()),
         saga_op(&SagaMsg::Prune {
             saga_ids: vec![sid(&a, "t-open"), sid(&a, "t-re")],
@@ -921,7 +942,7 @@ async fn same_ops_inner(context: deterministic::Context) {
         &mut wasm,
         &ids,
         &member_keys,
-        27,
+        28,
         Origin::External(a.clone()),
         saga_op(&SagaMsg::Prune {
             saga_ids: vec![sid(&a, "t-open"), sid(&a, "t-re")],

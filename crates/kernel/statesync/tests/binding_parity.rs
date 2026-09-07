@@ -45,7 +45,7 @@ use statesync::{
 
 /// a canned op-row key at `height` — the responder's stand-in row.
 fn statesync_op_key(height: u64) -> String {
-    format!("op/{height:016x}/0000")
+    format!("op/{height:016x}/00000000")
 }
 
 fn boundary() -> BoundaryId {
@@ -143,11 +143,14 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
             entries: vec![ManifestEntry {
+                code_hash: None,
                 module_id: "kv".into(),
                 root: StateRoot([3u8; 32]),
                 kind: PayloadKind::Snapshot,
                 resolver_target: None,
             }],
+            applied_frames: vec![(41, [0x5A; 32]), (42, [0x5B; 32])],
+            pending_cutover_view: Some(45),
         }),
         SyncRequest::Chunk { offset, .. } => SyncResponse::Chunk {
             total: 999,

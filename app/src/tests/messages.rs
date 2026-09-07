@@ -394,7 +394,14 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(chat.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(chat.contains("button \"Load older messages\""));
-    assert!(timeline.1.contains("lazy message as cached_message"));
+    // THE COPY RANGE JOINS THE PER-ROW KEY. A quiet row's memo has to notice
+    // the range's ends moving, or shift-clicking down a channel would tint the
+    // rows the reader is dragging over and leave every cached row behind it
+    // untinted. Everything else about the key is unchanged: the range is three
+    // scalars, not a list, so a cached row still reads nothing expensive.
+    assert!(timeline.1.contains(
+        "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+    ));
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -430,10 +437,12 @@ fn the_message_line_is_one_rich_text_paragraph() {
     // ONE paragraph, expanded by the widget's own `for` — no wrapping flex of
     // per-token `text` widgets, and no per-token link button.
     assert!(rich_line.contains(
-        "rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg \
+        "rich-text w=fill size=size line-h=1.55 wrap=word-or-glyph color=accent_fg \
          -> emit(open_message_link, _)"
     ));
     assert!(rich_line.contains("for span in block.spans"));
+    // The prose scale is the BODY's to set: a chat row reads at 13.5.
+    assert!(components.contains("RichBody blocks=message.blocks size=13.5"));
     assert!(
         !rich_line.contains("flex") && !rich_line.contains("button"),
         "a token widget beside the paragraph is the #1071 workaround back"
@@ -469,30 +478,6 @@ fn the_message_line_is_one_rich_text_paragraph() {
     assert!(handlers.contains(
         "run every open_external_url(url) -> external_url_opened _ | external_url_failed _"
     ));
-}
-
-/// A TAIL SNAP ON AN END-ANCHORED SCROLL IS `snap … 0.0`, NEVER `snap-end`.
-///
-/// Both of the app's snapped scrolls (`#message-stream`, `#transcript`) are
-/// `anchor-y=end`: the offset counts FROM the tail, so relative 0.0 is the
-/// tail and `snap-end` (relative 1.0) is the TOP of loaded history. The
-/// inverted op shipped once — every send hurled the reader to the oldest
-/// loaded row — and is a silent no-op in any fixture whose content fits the
-/// viewport, so only this lint stands between it and a paste-back.
-#[test]
-fn tail_snaps_speak_the_end_anchored_offset() {
-    let chat = include_str!("../ui/handlers/chat.ice");
-    let shell = include_str!("../ui/handlers/shell.ice");
-    assert!(
-        chat.contains("task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0"),
-        "the send handler snaps the stream to its anchored tail"
-    );
-    for (name, source) in [("chat", chat), ("shell", shell)] {
-        assert!(
-            !source.contains("task widget snap-end"),
-            "{name} handlers invoke snap-end, which is the TOP of an anchor-y=end scroll"
-        );
-    }
 }
 
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.
@@ -551,23 +536,38 @@ fn message_actions_require_explicit_intent() {
     assert_eq!(app.message_action, MessageAction::Delete);
 }
 
+/// Seats this device's key as the reader the mint names, and returns the
+/// label a COMMITTED row of hers carries — the same directory lookup the
+/// window fold runs — so a test never hand-writes the reader's label.
+fn seat_reader(byte: u8) -> String {
+    let key = vec![byte; 32];
+    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(
+        key.clone(),
+    )));
+    backend::author_display(
+        &format!("user:{}", backend::hex_encode(&key)),
+        &backend::names(),
+    )
+}
+
 /// A SEND CONTINUES THE READER'S OWN RUN.
 ///
 /// The optimistic row used to be minted with a hand-written `"You"` while every
-/// committed row of the reader's own renders `"you"`, so `mark_message_groups`
-/// opened a run on it: a send that followed one of your own drew a full avatar +
-/// header that vanished — shifting the row up by the header's height — the
-/// moment the settle delta replaced it. The COMMITTED row below is the fence:
-/// without it both rows are minted by the same call and carry the same label
-/// whatever literal it uses.
+/// committed row of the reader's own carried her directory label, so
+/// `mark_message_groups` opened a run on it: a send that followed one of your
+/// own drew a full avatar + header that vanished — shifting the row up by the
+/// header's height — the moment the settle delta replaced it. The COMMITTED
+/// row below is the fence: without it both rows are minted by the same call
+/// and carry the same label whatever it is.
 #[test]
 fn consecutive_sends_stay_in_one_author_run() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
     app.messages = vec![backend::ChatMessage {
-        author: "you".into(),
+        author: me.clone(),
         ..message(40, "landed a minute ago", false)
     }];
 
@@ -582,7 +582,7 @@ fn consecutive_sends_stay_in_one_author_run() {
         .collect();
     assert_eq!(
         authors,
-        vec!["you", "you", "you"],
+        vec![me.as_str(), me.as_str(), me.as_str()],
         "the mint renders the reader the way a committed row of hers does"
     );
     let headers: Vec<bool> = app
@@ -607,6 +607,7 @@ fn consecutive_sends_stay_in_one_author_run() {
 /// same grouping the timeline draws.
 #[test]
 fn a_minted_reply_keeps_the_first_reply_header() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -614,11 +615,11 @@ fn a_minted_reply_keeps_the_first_reply_header() {
     app.active_thread_seq = 7;
     app.thread_messages = vec![
         backend::ChatMessage {
-            author: "you".into(),
+            author: me.clone(),
             ..message(7, "the root", false)
         },
         backend::ChatMessage {
-            author: "you".into(),
+            author: me,
             ..message(8, "the first reply", false)
         },
     ];

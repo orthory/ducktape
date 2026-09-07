@@ -11,10 +11,11 @@
 //! cross-module path the native inbox tests exercise — asserting the wasm port
 //! derives the same Module-origin `source`.
 //!
-//! `rejections_inner` additionally pins the ACK OWNER GATE inside the compiled
-//! component. `env().origin` is the only authorization input that crosses the
-//! WIT boundary, so a gate keyed on it is exactly the kind that can be correct
-//! natively and inert in the guest: it has to be checked on both sides.
+//! `rejections_inner` additionally pins the ACK OWNER GATE and the DELIVER
+//! OWNER GATE inside the compiled component. `env().origin` is the only
+//! authorization input that crosses the WIT boundary, so a gate keyed on it
+//! is exactly the kind that can be correct natively and inert in the guest:
+//! it has to be checked on both sides.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
@@ -147,11 +148,19 @@ async fn same_ops_inner(context: &deterministic::Context) {
         "genesis roots must be continuous across the runtimes"
     );
 
+    // a fourth key that only ever self-delivers — exercising the "an external
+    // origin may deliver to its OWN queue" positive path distinctly from
+    // alice/bob, who ack theirs below.
+    let (dana, dana_q) = (key(0xD4), queue_of(&key(0xD4)));
+
     // every op family, in one deterministic sequence: deliveries from every
-    // origin shape (external, system, module follow-up, anonymous external),
-    // MarkRead/Clear incl. their idempotent and unknown-member no-op forms,
-    // and a post-clear delivery (next_seq never rewinds). `moves` says whether
-    // the op changes committed state — root movement must agree on BOTH sides.
+    // origin shape PERMITTED to deliver (external self-delivery, system,
+    // module follow-up), MarkRead/Clear incl. their idempotent and
+    // unknown-member no-op forms, and a post-clear delivery (next_seq never
+    // rewinds). `moves` says whether the op changes committed state — root
+    // movement must agree on BOTH sides. an external origin delivering
+    // OUTSIDE its own queue (the acl-gap fix) is proven a rejection, in
+    // lockstep, by `rejections_inner` instead.
     let ops: Vec<(Origin, Msg, bool)> = vec![
         (
             Origin::External(alice.clone()),
@@ -174,10 +183,10 @@ async fn same_ops_inner(context: &deterministic::Context) {
             },
             true,
         ),
-        // an anonymous external self-delivery (inbox accepts any origin).
+        // an authenticated external self-delivery to its OWN queue.
         (
-            Origin::External(Vec::new()),
-            deliver(&alice_q, "note", "self-note"),
+            Origin::External(dana.clone()),
+            deliver(&dana_q, "note", "self-note"),
             true,
         ),
         // the ack family is MEMBER-BOUND: every one of these rides the queue
@@ -365,6 +374,20 @@ async fn rejections_inner(context: &deterministic::Context) {
         .collect();
 
     let mut rejects: Vec<(Origin, Msg, &str)> = vec![
+        // the DELIVER OWNER GATE: a stranger may not deliver into alice's
+        // queue — the acl-gap fix (a member-mint flood and a queue-eviction
+        // flood both rode this path when it was ungated).
+        (
+            Origin::External(stranger.clone()),
+            deliver(&alice_q, "k", "flood"),
+            "may only deliver to its own queue",
+        ),
+        // an unauthenticated external cannot even self-deliver.
+        (
+            Origin::External(Vec::new()),
+            deliver("ext:", "k", "b"),
+            "may only deliver to its own queue",
+        ),
         (
             Origin::System,
             deliver("", "k", "b"),
@@ -443,7 +466,7 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     let mut native = native_host(context).await;
     let mut wasm = wasm_host_(context).await;
     let (alice, carol) = (key(0xA1), key(0xC3));
-    let (alice_q, bob_q) = (queue_of(&alice), queue_of(&key(0xB2)));
+    let (alice_q, carol_q) = (queue_of(&alice), queue_of(&carol));
 
     // ONE block, three ops: the second delivery's seq assignment READS the
     // first op's staged write (next_seq only exists in this block's overlay),
@@ -492,13 +515,15 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
 
     // ONE block where the SECOND member rejects: the runtime aborts the staged
     // overlay and replays the accepted member — committed state must equal the
-    // accepted subset alone, on both runtimes.
+    // accepted subset alone, on both runtimes. both deliveries are
+    // self-delivery (the only kind an external origin may make); carol's own
+    // oversized body is what rejects her, not the owner gate.
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let batch = vec![
-        (Origin::External(alice.clone()), deliver(&bob_q, "k", "ok")),
+        (Origin::External(alice.clone()), deliver(&alice_q, "k", "ok")),
         (
             Origin::External(carol.clone()),
-            deliver(&bob_q, "k", &"x".repeat(MAX_BODY_BYTES + 1)),
+            deliver(&carol_q, "k", &"x".repeat(MAX_BODY_BYTES + 1)),
         ),
     ];
     let n_out = native

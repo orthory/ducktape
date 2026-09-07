@@ -7,7 +7,7 @@
 //! store carrying one reserved key — [`CONFIG_KEY`] (`__config`), beside the
 //! guest adapter's `__state`/`__root` convention — whose value is the
 //! canonical encoding produced by [`encode_config`]. the guest reads it back
-//! each dispatch (`guest_adapter::load_config`), decodes it with
+//! each dispatch (`ducktape_module_sdk::load_config`), decodes it with
 //! [`decode_config`], and constructs the native module with those parameters.
 //!
 //! the config is CONSENSUS STATE: identical on every node of a network, part
@@ -29,6 +29,16 @@ use crate::codec::{Cursor, push_bytes, push_str};
 
 /// the reserved host-store key the config travels under.
 pub const CONFIG_KEY: &[u8] = b"__config";
+
+/// genesis-config key: the identity chain id (identity/gateway scope their
+/// certificates and `.duck` routes to it; `runs` stamps the `?net=` half of
+/// every `duck://` link it renders into an agent's context with it). a
+/// component names it in its declared shape; the host binds the network's
+/// value.
+pub const CHAIN_ID: &str = "chain_id";
+/// genesis-config key: the per-network invite namespace (governance verifies
+/// tokens and join proofs against it).
+pub const INVITE: &str = "invite";
 
 /// canonical bytes of a genesis parameter list. keys must be strictly
 /// increasing (one parameter set, one encoding) — the caller is the host's

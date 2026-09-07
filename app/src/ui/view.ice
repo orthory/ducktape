@@ -30,6 +30,8 @@ view
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          drag_launch_window -> drag_launch_window
+          close_launch_window -> close_launch_window
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -87,7 +89,7 @@ view
             disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
-    // docks (see `window_was_closed`); leaving the huddle closes it.
+    // only closes it (see `window_was_closed`); leaving the huddle closes it too.
     if huddle_win == some(window)
       HuddlePanel #huddle
         with
@@ -101,7 +103,6 @@ view
           stage=huddle_stage
           video_live=call_video_live
         events
-          dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
@@ -221,10 +222,10 @@ view
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped
               messages
               has_older_history
               history_view
+              at_live_tail=chat_at_tail
               history_loading
               unread_boundary
               unread_marker_seq
@@ -241,6 +242,9 @@ view
               thread_has_more
               thread_next_reply_seq
               thread_loading
+              copy_anchor_seq
+              copy_head_seq
+              copy_surface
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -249,8 +253,7 @@ view
               choose_channel -> choose_channel _
               choose_dm -> choose_dm _
               toggle_channel_settings -> toggle_channel_settings
-              pop_huddle -> pop_huddle
-              focus_huddle -> focus_huddle
+              show_huddle -> show_huddle
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
@@ -267,6 +270,9 @@ view
               begin_message_edit -> begin_message_edit _ _ _
               arm_message_delete -> arm_message_delete _ _ _
               clear_message_selection -> clear_message_selection
+              press_message -> press_message _ _
+              clear_copy_range -> clear_copy_range
+              copy_selected_messages -> copy_selected_messages
               add_reaction_submit -> add_reaction_submit _
               edit_message_submit -> edit_message_submit
               delete_message_submit -> delete_message_submit
@@ -416,6 +422,7 @@ view
               preview_picture=fs_preview_picture
               preview_width=fs_preview_width
               preview_height=fs_preview_height
+              write_refusal=files_write_gate(fs_path, settings_user_key)
               dark
             events
               open_message_link -> open_message_link _
@@ -575,6 +582,7 @@ view
               account_busy
               account_ticket
               appearance
+              desktop_notifications
               password
               status
               loading
@@ -606,6 +614,7 @@ view
               forget_workspace_submit -> forget_workspace_submit
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
+              set_desktop_notifications -> set_desktop_notifications _
         explorer:
           ExplorerScreen #explorer(connected_rpc)
             with
@@ -619,29 +628,6 @@ view
             events
               refresh_explorer -> refresh_explorer
               copy_to_clipboard -> copy_to_clipboard _ _
-        huddle:
-          box
-            with
-              w=fill
-              h=fill
-              align-x=end
-              align-y=end
-              pr=16.0
-              pb=16.0
-            col
-              // The pill says "you are still in a call elsewhere". It hides while
-              // the huddle has its own window, and where the live pill in the
-              // channel header already says so — the Chat tab, looking at the
-              // huddle's own channel. On every OTHER screen it must show even
-              // when that channel is the selected one, which the missing
-              // `shell_tab` term used to suppress.
-              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
-                HuddleDockedPill
-                  with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                  events
-                    pop_huddle -> pop_huddle
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

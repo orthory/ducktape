@@ -2,7 +2,7 @@ use super::{
     AgentSession, BTreeMap, DelegationState, DelegationStatus, Digest, Error,
     MAX_ACTIONS_PER_SESSION, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_PER_RUN,
     PendingState, RUN_KEY_SEPARATOR, RunAuthority, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot,
-    TurnPolicy, delegation_id_for, dispatch_id_for,
+    TurnPolicy, WireSink, delegation_id_for, dispatch_id_for,
 };
 use sdk::codec;
 use serde::de::DeserializeOwned;
@@ -17,6 +17,22 @@ use serde::de::DeserializeOwned;
 
 fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
     codec::push_opt_str(out, opt.as_deref());
+}
+
+/// the committed sink, as a length-prefixed JSON blob — same shape as the
+/// wire (`WireSink` is `runs`' own contract, not a wider committed-state one),
+/// but always present here (never optional): every pending entry commits a
+/// sink at dispatch, `Chain` included.
+fn put_sink(out: &mut Vec<u8>, sink: &WireSink) {
+    codec::push_bytes(
+        out,
+        &serde_json::to_vec(sink).expect("committed sink serializes"),
+    );
+}
+
+fn take_sink(cur: &mut codec::Cursor) -> Result<WireSink, String> {
+    serde_json::from_slice(&take_lp_bytes(cur)?)
+        .map_err(|error| format!("snapshot sink failed to decode: {error}"))
 }
 
 fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
@@ -82,6 +98,7 @@ pub(super) fn encode_committed(
         put_opt_string(&mut out, &p.job_id);
         out.extend_from_slice(&p.job_claim_height.to_le_bytes());
         put_origin(&mut out, &p.requester);
+        put_sink(&mut out, &p.sink);
         out.extend_from_slice(&p.created_at.to_le_bytes());
     }
 
@@ -94,6 +111,7 @@ pub(super) fn encode_committed(
         codec::push_bytes(&mut out, run_id.as_bytes());
         codec::push_bytes(&mut out, s.agent_id.as_bytes());
         codec::push_bytes(&mut out, &s.session_key);
+        codec::push_bytes(&mut out, &s.holder);
         out.extend_from_slice(&s.opened_at.to_le_bytes());
         out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
     }
@@ -323,6 +341,9 @@ fn validate_decoded_session(
     if s.session_key.len() != SESSION_KEY_LEN {
         return Err("snapshot session key is not a 32-byte ed25519 key".into());
     }
+    if s.holder.is_empty() {
+        return Err("snapshot session names no lease holder".into());
+    }
     if contains_run_separator(&s.agent_id) {
         return Err("snapshot session agent_id contains reserved unit separator".into());
     }
@@ -348,11 +369,12 @@ type Committed = (
 pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: a watch costs its id prefix and a policy
     // discriminant; a pending entry its three length prefixes, anchor, two
-    // option tags, claim height, origin discriminant, and created_at; a session
-    // its three length prefixes, opened_at, and the action counter.
+    // option tags, claim height, origin discriminant, the sink's length
+    // prefix, and created_at; a session its four length prefixes, opened_at,
+    // and the action counter.
     const MIN_WATCH_BYTES: u64 = 8 + 1;
-    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
-    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
+    const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 8;
+    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8 + 8;
     const MIN_DELEGATION_BYTES: u64 = 8 + 8;
 
     let mut cur = codec::Cursor::new(bytes);
@@ -388,6 +410,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let job_id = take_opt_string(&mut cur)?;
         let job_claim_height = take_u64(&mut cur)?;
         let requester = take_origin(&mut cur)?;
+        let sink = take_sink(&mut cur)?;
         let created_at = take_u64(&mut cur)?;
         let entry = PendingState {
             run_id,
@@ -401,6 +424,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             job_id,
             job_claim_height,
             requester,
+            sink,
             created_at,
         };
         validate_decoded_pending(&dispatch_id, &entry)?;
@@ -413,6 +437,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let run_id = take_lp_string(&mut cur)?;
         let agent_id = take_lp_string(&mut cur)?;
         let session_key = take_lp_bytes(&mut cur)?;
+        let holder = take_lp_bytes(&mut cur)?;
         let opened_at = take_u64(&mut cur)?;
         let actions = u32::try_from(take_u64(&mut cur)?)
             .map_err(|_| "snapshot session action count exceeds u32".to_string())?;
@@ -420,6 +445,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             run_id: run_id.clone(),
             agent_id,
             session_key,
+            holder,
             opened_at,
             actions,
         };

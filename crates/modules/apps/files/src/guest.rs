@@ -72,7 +72,7 @@ use sdk::{Ctx, Error, Msg, Origin};
 
 /// the guest's SINGLE state key — the raw refs image, whose `sha256` the host
 /// derives the module root from (`StateBacking::Odb`). there is NO `__root`
-/// twin (unlike guest-adapter's `SnapshotBytes` tenants): the host owns the
+/// twin (unlike ducktape-module-sdk's `SnapshotBytes` tenants): the host owns the
 /// root derivation, so the guest persists the image alone. MUST equal
 /// `wasm_host::REFS_KEY` (`b"__state"`) — a mismatch silently forks the network.
 /// guest-only: the native test drives `dispatch` directly and never touches the
@@ -226,7 +226,7 @@ pub fn dispatch<S: ObjectStore>(
 mod entry {
     use super::{dispatch, BLOCK_OBJECTS_KEY, REFS_KEY};
     use duckfs_core::{decode_refs, Fs, Refs};
-    use guest_adapter::{host, GuestOdb, WitCtx};
+    use ducktape_module_sdk::{host, GuestOdb, WitCtx};
     use sdk::Error;
 
     /// map an inner sdk error onto the wit surface — `Module` is the native
@@ -293,7 +293,21 @@ mod entry {
     /// `guest-builder` — this export is the whole of the guest's entry wiring.
     struct Component;
 
-    impl guest_adapter::Guest for Component {
+    impl ducktape_module_sdk::Guest for Component {
+        fn initialize(_params: Vec<u8>) -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
+        fn finalize_block() -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
+        /// an odb port: the host wraps this component over the duckfs
+        /// substrate it provides for the module's id.
+        fn shape() -> host::ModuleShape {
+            ducktape_module_sdk::odb_shape()
+        }
+
         fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
             FilesGuest::execute(payload)
         }
@@ -303,7 +317,7 @@ mod entry {
         }
     }
 
-    guest_adapter::export_module!(Component);
+    ducktape_module_sdk::export_module!(Component);
 }
 
 #[cfg(feature = "guest")]

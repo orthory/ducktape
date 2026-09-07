@@ -30,6 +30,8 @@ thiserror = { workspace = true }
 # is authenticated authorship under any scheme a key can carry.
 keyscheme = { workspace = true }
 commonware-cryptography = { workspace = true }
+# `signed_req`: the body digest inside a data-plane request's signed bytes.
+sha2 = { workspace = true }
 # `resource_limits`: getrlimit/setrlimit/sysconf for the open-file soft limit.
 libc = { workspace = true }
 
@@ -58,6 +60,9 @@ kv = { workspace = true }
 saga = { workspace = true }
 # the in-memory MerkleStore double the store-backed saga module is injected with.
 sdk-testkit = { workspace = true }
+# the code-swap stall test seeds the real code registry with a hash whose bytes
+# no source can serve — the fail-closed boundary the drain must PAUSE on.
+modules = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
 commonware-runtime = { workspace = true }
