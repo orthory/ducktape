@@ -574,7 +574,7 @@ pub struct InitArgs {
         long,
         value_name = "MS",
         default_value_t = config::DEFAULT_BLOCK_TIME_MS,
-        value_parser = clap::value_parser!(u64).range(1..),
+        value_parser = clap::value_parser!(u64).range(config::MIN_BLOCK_TIME_MS..),
     )]
     pub block_time_ms: u64,
     #[command(flatten)]
@@ -724,6 +724,34 @@ mod tests {
         assert_eq!(ttl_of(&["probe", "invite", "--ttl-days", "365"]), 365);
         assert!(parse(&["probe", "invite", "--ttl-days", "0"]).is_err());
         assert!(parse(&["probe", "invite", "--ttl-days", "366"]).is_err());
+    }
+
+    /// `init --block-time-ms` is refused below the drain-tick floor at parse
+    /// time, mirroring `workspace_config::validate_block_time_ms` — the CLI
+    /// and the descriptor boundary must refuse the exact same beats.
+    #[test]
+    fn init_block_time_ms_is_floored_at_the_drain_tick() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+        let block_time_of = |argv: &[&str]| match parse(argv).expect("parses").op {
+            OpCmd::Init(args) => args.block_time_ms,
+            other => panic!("not an init: {other:?}"),
+        };
+
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo"]),
+            config::DEFAULT_BLOCK_TIME_MS
+        );
+        assert_eq!(
+            block_time_of(&["probe", "init", "--name", "demo", "--block-time-ms", "100"]),
+            config::MIN_BLOCK_TIME_MS
+        );
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "99"]).is_err());
+        assert!(parse(&["probe", "init", "--name", "demo", "--block-time-ms", "0"]).is_err());
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,
