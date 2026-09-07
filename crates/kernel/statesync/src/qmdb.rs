@@ -287,7 +287,8 @@ where
             replay_buffer,
             compression: None,
             // the journal codec config IS the wire read-config (fixed-width key
-            // => `()`, value bounded at 1 MiB); reusing [`op_read_cfg`] keeps
+            // => `()`, value bounded at [`sdk::MAX_STORE_VALUE_BYTES`]);
+            // reusing [`op_read_cfg`] keeps
             // the two mirrored by construction instead of by comment.
             codec_config: op_read_cfg(),
             page_cache,

@@ -163,8 +163,9 @@ pub(crate) fn verify_manifest_floor(
     // CRYPTOGRAPHIC (the quorum's signatures), not the former structural
     // decode: a server cannot mint a floor its quorum never signed.
     let scheme = simplex_ed25519::Scheme::verifier(namespace, participants);
-    let finalization = consensus::verify_finalization(&mut commonware_utils::sys_rng(), &scheme, &cert)
-        .map_err(|e| {
+    let mut rng = commonware_utils::sys_rng();
+    let finalization =
+        consensus::verify_finalization(&mut rng, &scheme, &cert).map_err(|e| {
             format!(
                 "served finalization floor does not verify against the epoch's participant set: {e}"
             )

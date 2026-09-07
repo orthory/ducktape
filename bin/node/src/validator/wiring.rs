@@ -783,8 +783,7 @@ pub(super) async fn wire(
     // runs only when `wireguard_listen` is configured, on its OWN
     // plain-tokio OS thread (the app-surface split exactly), talking to
     // the mesh through the two pump tasks below.
-    let (reach_p2p_tx, mut reach_p2p_rx) =
-        network.register(CHANNEL_REACHABILITY, quota);
+    let (reach_p2p_tx, mut reach_p2p_rx) = network.register(CHANNEL_REACHABILITY, quota);
     // the join GATE's two connectors between the intro doorbell (the plane's
     // thread) and the validator run loop: verified gate requests
     // forward in over the channel; resolved outcomes ride back through the
