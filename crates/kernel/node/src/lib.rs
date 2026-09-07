@@ -389,6 +389,34 @@ pub const MAX_BATCH_BYTES: usize = MAX_FRAME_BYTES;
 /// 1024 members keep that under ~9.2k module executions.
 pub const MAX_BATCH_MEMBERS: usize = 1024;
 
+/// hard cap on how many frames [`OrderedNode`] holds in CUSTODY at once
+/// (`outstanding`, a superset of `pending_batch`). intake is unauthenticated —
+/// an open HTTP route and any mesh peer's relay both land here — and custody
+/// drains only as members apply at `MAX_BATCH_MEMBERS` per block, so without a
+/// cap one flood holds the process's memory until it dies. eight blocks' worth
+/// of backlog: enough that an honest burst never sees a refusal, small enough
+/// that the flood stops at a bounded queue.
+pub const MAX_CUSTODY_FRAMES: usize = 8 * MAX_BATCH_MEMBERS;
+
+/// hard cap on the BYTES held in custody. the count cap alone does not bound
+/// memory: `MAX_CUSTODY_FRAMES` max-size frames would be 8 GiB, and each is
+/// held twice (once in `pending_batch`, once in `outstanding`), so the real
+/// footprint is twice this number.
+pub const MAX_CUSTODY_BYTES: usize = 32 << 20;
+
+/// hard cap on how many frames ONE origin key holds in custody. the total caps
+/// alone let one key fill the whole mempool and starve every other submitter;
+/// this is the fairness bound. two full batches per origin: an honest burst
+/// routinely exceeds one block's worth of members, and it still takes four
+/// distinct keys to reach [`MAX_CUSTODY_FRAMES`].
+pub const MAX_CUSTODY_FRAMES_PER_ORIGIN: usize = 2 * MAX_BATCH_MEMBERS;
+
+/// hard cap on how many batches ONE [`OrderedNode::flush_batch`] proposes.
+/// each batch costs a disk pin plus an orderer proposal on the loop that also
+/// serves `/v1/query`, so a full mempool flushed in one turn stalls every
+/// other lane; the remainder stays enqueued (in FIFO order) for the next turn.
+pub const MAX_FLUSH_BATCHES_PER_TURN: usize = 8;
+
 /// encoded length of `n` as canonical unsigned LEB128.
 fn varint_len(mut n: u64) -> usize {
     let mut len = 1;
@@ -820,6 +848,15 @@ fn hex_root(root: &StateRoot) -> String {
     root.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// a mempool-cap refusal. the stable snake_case reason token leads the string
+/// so a submitter and a log line key on the same greppable name, and the bound
+/// it hit follows for the human reading it.
+fn custody_refused(reason: &str, bound: usize) -> Error {
+    Error::Host(sdk::Error::Module(format!(
+        "{reason}: this node's op mempool is at its {bound} bound — retry shortly"
+    )))
+}
+
 fn member_reason(reason: String) -> String {
     match reason
         .strip_prefix("Module(")
@@ -1079,6 +1116,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// loses accepted-but-unfinalized ops (the pre-existing crash window);
     /// the cutover is the NON-crash path this closes.
     outstanding: std::collections::HashMap<FrameId, (u64, Vec<u8>)>,
+    /// the BYTES of everything in `outstanding`, maintained beside it so the
+    /// intake cap is a comparison rather than a walk of the whole map on every
+    /// submitted frame (which is exactly the walk a flood would pay for).
+    custody_bytes: usize,
+    /// how many frames each ORIGIN key holds in `outstanding` — the per-origin
+    /// fairness cap's counter, maintained beside the map for the same reason.
+    /// an origin's entry is removed when its last frame resolves, so the map
+    /// is bounded by the frame count, not by how many keys have ever submitted.
+    custody_per_origin: std::collections::HashMap<Vec<u8>, usize>,
     /// ENQUEUED member frames awaiting a flush, in FIFO (enqueue) order.
     /// [`OrderedNode::submit_frame`] appends here (custody also begins in
     /// `outstanding`); [`OrderedNode::flush_batch`] drains it, greedily packs
@@ -1159,6 +1205,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            custody_bytes: 0,
+            custody_per_origin: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
             replay_window: std::collections::VecDeque::new(),
@@ -1200,6 +1248,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            custody_bytes: 0,
+            custody_per_origin: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
             replay_window: std::collections::VecDeque::new(),
@@ -1357,7 +1407,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // and rebuilding from `outstanding` carries BOTH the finalized-past-
         // ceiling discards AND anything accepted-but-never-flushed, with no
         // double-enqueue. resubmit in `seq` order so this origin's ops keep the
-        // order their submitter observed them acked in.
+        // order their submitter observed them acked in. the custody counters
+        // are untouched: the carry drains and reinserts the SAME set, so the
+        // bytes and per-origin quotas it accounts for are unchanged.
         self.pending_batch.clear();
         let mut carried: Vec<(FrameId, u64, Vec<u8>)> = self
             .outstanding
@@ -1437,16 +1489,75 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         }
         decode_member(&frame)?;
         let id = frame_id(&frame);
+        let (origin, seq) = frame_origin_seq(&frame).expect("decode_member verified the envelope");
+        // ONE CUSTODY ENTRY PER FrameId. `outstanding` is the source of truth
+        // (`pending_batch` is a subset of it), so a frame already in custody is
+        // ACKNOWLEDGED IDEMPOTENTLY, never enqueued a second time: the batch
+        // codec is a plain concatenation and the drain applies every member, so
+        // a second copy in `pending_batch` would pack the SAME signed op twice
+        // into one batch and execute it twice at one height under one root hash
+        // on every validator. the caller gets the same id it got the first
+        // time, so a reply held against that id still resolves.
+        if self.outstanding.contains_key(&id) {
+            return Ok(id);
+        }
+        // the MEMPOOL CAPS. intake is unauthenticated on both doors, and
+        // custody drains only as members apply, so every accepted frame must
+        // pass a total bound (count and bytes) and a per-origin bound before it
+        // is held. refused as a plain deterministic error the submitter sees.
+        let over_frame_count = self.outstanding.len() >= MAX_CUSTODY_FRAMES;
+        if over_frame_count {
+            return Err(custody_refused("mempool_frames_full", MAX_CUSTODY_FRAMES));
+        }
+        let over_byte_budget = self.custody_bytes + frame.len() > MAX_CUSTODY_BYTES;
+        if over_byte_budget {
+            return Err(custody_refused("mempool_bytes_full", MAX_CUSTODY_BYTES));
+        }
+        let origin_held = self
+            .custody_per_origin
+            .get(&origin)
+            .copied()
+            .unwrap_or_default();
+        let over_origin_quota = origin_held >= MAX_CUSTODY_FRAMES_PER_ORIGIN;
+        if over_origin_quota {
+            return Err(custody_refused(
+                "mempool_origin_full",
+                MAX_CUSTODY_FRAMES_PER_ORIGIN,
+            ));
+        }
         // ENQUEUE, don't propose: the frame joins `pending_batch` (FIFO) and
         // enters custody. it is not pinned or proposed until [`flush_batch`]
         // packs it into a batch super-frame — that is where the durable pin +
         // orderer proposal happen, once per batch. custody begins HERE so a
         // cutover before the flush still carries the accepted-but-unflushed op
         // (the accept contract holds without a flush having run).
-        let (_, seq) = frame_origin_seq(&frame).expect("decode_member verified the envelope");
+        self.custody_bytes += frame.len();
+        *self.custody_per_origin.entry(origin).or_default() += 1;
         self.pending_batch.push((id, frame.clone()));
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
+    }
+
+    /// CUSTODY ENDS for one member: drop it from `outstanding` and give its
+    /// bytes and its origin's quota back. the ONE release site, so the caps'
+    /// counters cannot drift from the map they bound.
+    fn release_custody(&mut self, id: &FrameId) {
+        let Some((_, frame)) = self.outstanding.remove(id) else {
+            return;
+        };
+        self.custody_bytes -= frame.len();
+        let Some((origin, _)) = frame_origin_seq(&frame) else {
+            return;
+        };
+        let std::collections::hash_map::Entry::Occupied(mut held) =
+            self.custody_per_origin.entry(origin)
+        else {
+            return;
+        };
+        *held.get_mut() -= 1;
+        if *held.get() == 0 {
+            held.remove();
+        }
     }
 
     /// how many member frames are enqueued awaiting the next [`flush_batch`].
@@ -1454,11 +1565,23 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.pending_batch.len()
     }
 
+    /// how many frames this node holds in CUSTODY: accepted and neither applied
+    /// nor rejected yet. a superset of [`OrderedNode::pending_batch_len`] (a
+    /// flushed member is still in custody until it resolves), and the number
+    /// the mempool caps bound — so it, not the flush queue, is what a
+    /// "pending ops" gauge must report.
+    pub fn custody_len(&self) -> usize {
+        self.outstanding.len()
+    }
+
     /// FLUSH — drain `pending_batch` (FIFO), greedily pack the member frames
     /// into batch super-frames up to [`MAX_BATCH_BYTES`] and
     /// [`MAX_BATCH_MEMBERS`], and for each batch
     /// PIN its bytes then PROPOSE it to the orderer. returns the number of
-    /// batches submitted (`Ok(0)` when nothing was pending).
+    /// batches submitted (`Ok(0)` when nothing was pending). at most
+    /// [`MAX_FLUSH_BATCHES_PER_TURN`] batches leave in one call — a full
+    /// mempool proposed back to back would stall `/v1/query` on the same loop;
+    /// the FIFO remainder stays enqueued for the next turn.
     ///
     /// FIFO order is preserved end-to-end: a member's position in a batch is
     /// its enqueue order, which is the applied order — reordering would fork a
@@ -1470,36 +1593,43 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// forms at least its own batch even if that batch edges over the packing
     /// target — the mesh cap has the headroom).
     pub async fn flush_batch(&mut self) -> Result<usize, Error> {
-        if self.pending_batch.is_empty() {
-            return Ok(0);
-        }
-        let pending = std::mem::take(&mut self.pending_batch);
         let mut batches = 0usize;
-        let mut members: Vec<Vec<u8>> = Vec::new();
-        // running encoded size of the members already in `members` (each
-        // member's `varint(len) || bytes`); the `varint(N)` header is added
-        // when projecting whether the next member still fits.
-        let mut members_bytes: usize = 0;
-        for (_id, frame) in pending {
-            let contrib = varint_len(frame.len() as u64) + frame.len();
-            let projected = varint_len(members.len() as u64 + 1) + members_bytes + contrib;
-            let overflows = projected > MAX_BATCH_BYTES || members.len() == MAX_BATCH_MEMBERS;
-            if !members.is_empty() && overflows {
-                // adding this member would overflow the cap — seal the current
-                // batch and start a fresh one with this member.
-                self.propose_batch(&members).await?;
-                batches += 1;
-                members.clear();
-                members_bytes = 0;
+        while batches < MAX_FLUSH_BATCHES_PER_TURN {
+            let members = self.take_one_batch();
+            if members.is_empty() {
+                break;
             }
-            members.push(frame);
-            members_bytes += contrib;
-        }
-        if !members.is_empty() {
             self.propose_batch(&members).await?;
             batches += 1;
         }
         Ok(batches)
+    }
+
+    /// peel the longest FIFO PREFIX of `pending_batch` that fits ONE batch
+    /// super-frame's caps, in enqueue (= applied) order. a single member is
+    /// never split: the first member is always taken, even when it alone edges
+    /// the packing target over (it is `<= MAX_FRAME_BYTES`, and the mesh cap
+    /// has the headroom). empty exactly when nothing is enqueued.
+    fn take_one_batch(&mut self) -> Vec<Vec<u8>> {
+        // running encoded size of the members already counted (each member's
+        // `varint(len) || bytes`); the `varint(N)` header is added when
+        // projecting whether the next member still fits.
+        let mut members_bytes: usize = 0;
+        let mut count: usize = 0;
+        for (_id, frame) in &self.pending_batch {
+            let contrib = varint_len(frame.len() as u64) + frame.len();
+            let projected = varint_len(count as u64 + 1) + members_bytes + contrib;
+            let overflows = projected > MAX_BATCH_BYTES || count == MAX_BATCH_MEMBERS;
+            if count > 0 && overflows {
+                break;
+            }
+            members_bytes += contrib;
+            count += 1;
+        }
+        self.pending_batch
+            .drain(..count)
+            .map(|(_id, frame)| frame)
+            .collect()
     }
 
     /// encode one batch super-frame, durably PIN it, then PROPOSE it to the
@@ -1726,28 +1856,34 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             };
-            // decode each member into the ops the block applies. no per-member
-            // dedup here on purpose: in honest operation a signed frame lives in
-            // exactly ONE proposer's mempool (relays fan to one validator,
-            // custody ends on apply, the cutover carry never double-applies), so
-            // a finalized batch never repeats a member. a byzantine proposer CAN
-            // repeat one inside a batch, and every honest node then executes it
-            // twice identically — a deterministic no-op on the ordering seam,
-            // not a fork. no module can catch it: `decode_frame` verifies the
-            // frame's `seq` and DISCARDS it, so a module only ever sees
-            // `Origin::External(pubkey)` and the msg. a per-origin nonce
-            // enforced in replicated state is what closes it; the batch-level
-            // replay window above covers only whole re-finalized batches. a
-            // member that fails to
-            // decode is a deterministic no-op: EXCLUDED from the ops and recorded
-            // Rejected after the block settles (it shares the block root-hash).
-            // the rest carry their identity parallel to `ops`, in member (=
-            // applied, = enqueue/FIFO) order, for building the drained records.
+            // decode each member into the ops the block applies. a REPEATED
+            // member is skipped: the batch codec is a plain concatenation and
+            // both copies decode to the same origin + msg (`seq` is discarded),
+            // so applying both executes one signed op twice at one height. the
+            // local intake refuses a duplicate at `submit_frame`, but a
+            // byzantine proposer packs whatever it likes — so the skip lives
+            // HERE too, keyed on the member's own content address, and every
+            // honest node computes the identical skip set from the identical
+            // bytes. no fork, and no per-member log line (a repeated member is
+            // attacker-controlled: one debug per batch, carrying the count). a
+            // member that fails to decode is a deterministic no-op: EXCLUDED
+            // from the ops and recorded Rejected after the block settles (it
+            // shares the block root-hash). the rest carry their identity
+            // parallel to `ops`, in member (= applied, = enqueue/FIFO) order,
+            // for building the drained records.
             let mut ops: Vec<host::BlockOp> = Vec::new();
             let mut op_meta: Vec<MemberMeta> = Vec::new();
             let mut decode_fail: Vec<(FrameId, String)> = Vec::new();
+            let mut seen: std::collections::HashSet<FrameId> =
+                std::collections::HashSet::with_capacity(members.len());
+            let mut repeated = 0usize;
             for member in &members {
                 let mid = frame_id(member);
+                let is_repeat = !seen.insert(mid);
+                if is_repeat {
+                    repeated += 1;
+                    continue;
+                }
                 match self.take_decoded(member) {
                     Ok(op) => {
                         op_meta.push(MemberMeta {
@@ -1765,6 +1901,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     }
                     Err(e) => decode_fail.push((mid, e.to_string())),
                 }
+            }
+            if repeated > 0 {
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    repeated,
+                    reason = "batch_member_repeated",
+                    "skipped members a proposer packed more than once into one batch"
+                );
             }
             // the observation barrier compares the watched root across the WHOLE
             // batch — only an applied member can move it (rejected members roll
@@ -1849,7 +1995,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     target: op_target,
                     payload: op_payload,
                 } = meta;
-                self.outstanding.remove(&mid);
+                self.release_custody(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
@@ -1888,7 +2034,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // share the block root-hash. custody ends — a decode-fail can never
             // apply, so it must not be carried at a cutover.
             for (mid, decode_reason) in decode_fail {
-                self.outstanding.remove(&mid);
+                self.release_custody(&mid);
                 self.drained.push(DrainedFrame {
                     id: mid,
                     height,
