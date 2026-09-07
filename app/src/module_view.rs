@@ -328,6 +328,11 @@ struct Guest {
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
+        // The faces the app loads (`font` in app.ice); a view names them and
+        // the runtime resolves the name only through this registry.
+        for family in ["Geist", "Geist Mono"] {
+            ui_lang_runtime::view_tree::register_font_family(family);
+        }
         let mut config = Config::new();
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
