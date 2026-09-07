@@ -239,8 +239,11 @@ component.wasm`; the network verifies the bytes by hash.
 
 Each deployment is a canonical Borsh `ModuleArtifact`: component bytes followed
 by an optional mapper (`Vec<u8>`, `Option<Vec<u8>>`). Its SHA-256 covers both.
-The CLI packages the raw files, stages this unit on the blob plane, and proposes
-that hash to governance:
+`ducktape module pack component.wasm --out module.artifact` packages the files
+and prints this hash offline; `--index index.wasm` includes a mapper. Agents
+commit the artifact and request `modules.update` through their final response
+(see [dogfood](../../dogfood.md)). The operator CLI packages and stages the same
+unit on the blob plane, then proposes that hash to governance:
 
 ```
 ducktape module register pages pages.component.wasm --index pages.index.wasm

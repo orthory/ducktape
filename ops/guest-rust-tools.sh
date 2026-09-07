@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ROOTFS_SETUP hook: install a guest-local Rust compiler, wasm-tools and the
 # ordinary native linker/build utilities. No host home or build cache crosses.
-# Usage: ROOTFS_SETUP=ops/guest-rust-tools.sh ops/build-guest-rootfs.sh <rust> <wasm-tools>
+# The image builder supplies the repository's toolchain pins by default on Linux.
 set -euo pipefail
 RUST_CHANNEL="${1:?supply the Rust channel from rust-toolchain.toml}"
 WASM_TOOLS_VERSION="${2:?supply the wasm-tools version}"

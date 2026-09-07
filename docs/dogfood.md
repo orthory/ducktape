@@ -315,21 +315,10 @@ to the program. The hash covers the canonical `ModuleArtifact`, including its
 length prefixes and optional mapper, rather than the component file alone:
 
 ```sh
-python3 - hello.component.wasm hello.module <<'PYHASH'
-import hashlib, pathlib, struct, sys
-component = pathlib.Path(sys.argv[1]).read_bytes()
-artifact = struct.pack("<I", len(component)) + component
-if len(sys.argv) == 4:
-    mapper = pathlib.Path(sys.argv[3]).read_bytes()
-    artifact += b"\x01" + struct.pack("<I", len(mapper)) + mapper
-else:
-    artifact += b"\x00"
-pathlib.Path(sys.argv[2]).write_bytes(artifact)
-print(hashlib.sha256(artifact).hexdigest())
-PYHASH
+ducktape module pack hello.component.wasm --out hello.module
 ```
 
-Pass a mapper path after `hello.module` to include it. An artifact without a
+Pass `--index <mapper.wasm>` to include a mapper. An artifact without a
 mapper removes the target's existing mapper when it activates. Activation is
 at the governance execute height plus `after`, with readiness required from every
 validator.
@@ -361,46 +350,53 @@ proposal ids, committed votes and registry status; the bridge keeps no private
 workflow checkpoint. Clock values in its query are hints from local committed
 status. Every target still validates messages against its execution context.
 
-To build Rust inside the Linux guest, prepare an image with the optional setup
-hook. This requires Bubblewrap with user namespaces, in addition to the base
-image builder's tools. Setup runs inside the extracted guest root with a private
-disk-backed scratch directory. It receives no host home, credentials or caches.
+The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
+the wasm32 target, native build utilities and the componentizer from
+`wasm-tools.version`. Build it at the default location with:
 
 ```sh
-ROOTFS_SETUP=ops/guest-rust-tools.sh ops/build-guest-rootfs.sh 1.96.1 1.253.0
+ops/build-guest-rootfs.sh
 ```
 
-The arguments pin Rust and wasm-tools. A different `ROOTFS_SETUP` script can
-install another build environment without changing the node executor. The
-default image remains minimal. Writable run filesystems provide 8 GiB of sparse
-capacity: output can exceed input size, and only written blocks consume host
-disk. The read-only input image retains its measured size plus metadata margin.
+Linux setup requires Bubblewrap with user namespaces, in addition to the base
+image builder's tools. It runs inside the extracted guest root with private,
+disk-backed scratch and receives no host home, credentials or caches.
+`ROOTFS_SETUP=/path/to/setup.sh` replaces the setup and receives command-line
+arguments; `ROOTFS_SETUP=` builds only the base image. macOS builds the base
+image without this Linux setup hook. Repositories must vendor dependencies for
+offline builds: the run's VM can reach only its host service tunnels.
 
-The opt-in live test uses the installed Claude CLI and host broker credential.
-Set `DUCKTAPE_GUEST_DIR` if the prepared image is outside the default guest
-directory. Keep `TMPDIR` short and disk-backed because the VM uses Unix sockets.
+Writable run filesystems provide 8 GiB of sparse capacity. Only written blocks
+consume host disk. The read-only input image retains its measured size plus
+metadata margin. Headless Claude invocations allow shell, file and Ducktape MCP
+tools without interactive approval; the VM and committed grants define access.
+
+The live repair test uses the standard Claude capability, installed CLI, host
+broker credential and default guest location. Set `DUCKTAPE_GUEST_DIR` only when
+using an image elsewhere. Keep `TMPDIR` short and disk-backed for Unix sockets.
+The live test is opt-in because it spends provider budget:
 
 ```sh
 cargo test -p node-bin --test chat_module_upgrade_e2e \
-  a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle \
+  a_blind_agent_repairs_and_deploys_from_symptoms \
   -- --ignored --nocapture
 ```
 
-This is a guided, single-validator integration test using `hello-wasm`, whose
-source identifies it as the reference module and includes test operations. The
-repository supplies the expected increment of one, vendored dependencies, an
-offline build script, artifact packaging and deployment instructions. The
-injected fault changes one arithmetic constant. The agent receives the repair
-issue through chat and uses the production provider invocation to edit source,
-build inside Firecracker and request deployment.
+The agent receives an incident report describing the observed count after a
+click, faulty counter source, its wire interface and vendored dependencies.
+The source comes from `hello-wasm` with unrelated conformance operations and
+fixture labels removed. No repair recipe, build script, expected patch, clean
+history or repaired artifact enters its checkout. Standard MCP instructions
+explain the available build tools and deployment API to every run.
 
-The host harness provisions the network, registers the faulty module, opens
-the issue and posts the mention. After activation it independently rebuilds
-the delivered source, checks preserved state and corrected increments, restarts
-the node and checks again. Those recovery checks are host assertions; the
-agent's run ends with its deployment request. Clean source history and the
-repaired artifact are withheld, while the required behavior and build procedure
-are supplied. Transcript checks establish absence of a host-only canary and
-evidence path, not absence of task guidance or awareness of a test. Evidence is
-retained under `target/self-heal/evidence/`; the provider trace is owner-readable
-only.
+The host harness provisions a single-validator network and a model with
+`chat.post` and `modules.update`, registers the faulty module, opens the issue
+and posts the mention. The test node advertises two cores and 4 GiB of memory.
+After activation the host independently rebuilds the delivered source, checks
+preserved state and corrected increments, restarts the node and checks again.
+Those recovery checks are host assertions; the agent's run ends with its
+deployment request. This tests blind repair of one arithmetic fault, rather
+than general autonomous incident detection or agent verification after deployment.
+Evidence is retained under `target/self-heal/evidence/`; the provider trace is
+written as events arrive and is owner-readable only. Canary and path assertions
+check those specific leaks; they do not establish what the model inferred.

@@ -1,8 +1,7 @@
-//! Guided live integration using the reference counter. The guest receives
-//! faulty source, its expected behavior, an offline build recipe and deployment
-//! instructions. The host owns fault injection, setup and recovery assertions.
-//! No clean source revision or repaired artifact is supplied. The transcript
-//! checks cover the host-only canary and evidence path, not absence of hints.
+//! Blind live counter repair from an incident report and faulty source. The
+//! guest gets the standard provider and product tools, with vendored dependencies
+//! but no repair recipe, correct revision, build script or expected patch.
+//! Fault injection and post-activation assertions belong to the host harness.
 
 use super::*;
 use std::sync::{Arc, Mutex};
@@ -11,13 +10,20 @@ struct OutputCapture {
     runtime: tokio::runtime::Runtime,
     task: tokio::task::JoinHandle<()>,
     lines: Arc<Mutex<Vec<String>>>,
-    file: std::path::PathBuf,
     result: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl OutputCapture {
     fn start(cluster: &Cluster, dispatch: &str, evidence: &Path) -> Self {
         use futures::{SinkExt as _, StreamExt as _};
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(evidence.join("provider-output.jsonl"))
+            .unwrap();
         let config: toml::Value =
             toml::from_str(&std::fs::read_to_string(cluster.config_file(0)).unwrap()).unwrap();
         let storage = Path::new(config["storage_dir"].as_str().unwrap());
@@ -53,6 +59,8 @@ impl OutputCapture {
                 let Some(line) = value["item"]["line"].as_str() else {
                     continue;
                 };
+                writeln!(file, "{line}").unwrap();
+                file.flush().unwrap();
                 captured.lock().unwrap().push(line.to_string());
                 let terminal = serde_json::from_str::<serde_json::Value>(line)
                     .ok()
@@ -67,7 +75,6 @@ impl OutputCapture {
             runtime,
             task,
             lines,
-            file: evidence.join("provider-output.jsonl"),
             result,
         }
     }
@@ -86,24 +93,13 @@ impl OutputCapture {
 
 impl Drop for OutputCapture {
     fn drop(&mut self) {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
         self.task.abort();
         let _ = self.runtime.block_on(async { (&mut self.task).await });
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&self.file)
-        {
-            let _ = file.write_all(self.text().as_bytes());
-        }
     }
 }
 
 const LIVE_MODEL: &str = "maintainer";
-const LIVE_CAPABILITY: &str = "maintenance";
+const LIVE_CAPABILITY: &str = "claude";
 const LIVE_REPO: &str = "counter-service";
 const REPAIR: Duration = Duration::from_secs(1800);
 
@@ -143,6 +139,13 @@ fn source_fixture(seed: &Path, wrong_step: u64) {
         .unwrap()
         .replace("../../module-sdk/wit", "wit")
         .replace("wrapping_add(1)", &format!("wrapping_add({wrong_step})"));
+    // Keep the counter implementation; omit unrelated host conformance probes
+    // and fixture labels from the repository the model investigates.
+    let start = source.find("wit_bindgen::generate!").unwrap();
+    let probes = source.find("            b\"output-cap\"").unwrap();
+    let other = source.find("            other =>").unwrap();
+    let source = format!("{}{}", &source[start..probes], &source[other..])
+        .replace("        // env is available (proves the import); this module doesn't branch on it.\n        let _env = host::get_env();\n", "");
     std::fs::write(seed.join("src/lib.rs"), source).unwrap();
     let mut vendor = Command::new("cargo");
     vendor
@@ -150,48 +153,35 @@ fn source_fixture(seed: &Path, wrong_step: u64) {
         .args(["vendor", "--locked", "vendor"]);
     std::fs::write(seed.join(".cargo/config.toml"), run(vendor)).unwrap();
     std::fs::write(seed.join(".gitignore"), "/target/\n/hello.component.wasm\n").unwrap();
-    std::fs::write(seed.join("build.sh"), BUILD).unwrap();
-    std::fs::write(seed.join("README.md"), CONTRACT).unwrap();
+    std::fs::write(seed.join("README.md"), REPOSITORY).unwrap();
 }
 
-const BUILD: &str = r#"#!/bin/sh
-set -eu
-export CARGO_BUILD_JOBS=2
-export RUSTFLAGS="--remap-path-prefix=$PWD=."
-cargo build --locked --offline --release --target wasm32-unknown-unknown
-wasm-tools component new target/wasm32-unknown-unknown/release/hello_wasm.wasm -o hello.component.wasm
-python3 - <<'PY'
-import hashlib, pathlib, struct
-component = pathlib.Path('hello.component.wasm').read_bytes()
-artifact = struct.pack('<I', len(component)) + component + b'\x00'
-pathlib.Path('hello.module').write_bytes(artifact)
-print(hashlib.sha256(artifact).hexdigest())
-PY
-"#;
+const REPOSITORY: &str = r#"# Counter service
 
-const CONTRACT: &str = r#"# Counter service
-
-The `hello` module is a durable unsigned 64-bit counter. `inc` adds one,
-wrapping at the u64 boundary; `reset` sets zero. Its query returns eight
-little-endian bytes. Existing state must survive code deployment and restart.
-
-Run `sh build.sh` to build offline from Cargo.lock and vendor/. The guest has
-Rust, the wasm32-unknown-unknown standard library, wasm-tools, and native build
-utilities. The build writes hello.module and prints its canonical SHA-256.
-Commit the source change and hello.module together. The run's final response
-contract describes how to request module deployment. Its artifact hash covers
-hello.module, not the raw component. Deployment changes an existing registered
-module; activation lead 50 is supported by this network.
-
-The node's read-only /v1/status and JSON /v1/query are available at
-DUCKTAPE_NODE. Query modules with {"target":"modules","query":"module_status"}
-to inspect deployed code. The counter's binary query is not a JSON query.
+The `hello` module stores a durable unsigned 64-bit count. It accepts `inc`
+and `reset` byte payloads. Queries return the count as eight little-endian bytes.
 "#;
 
 fn build(seed: &Path) {
-    let mut command = Command::new("sh");
-    command.current_dir(seed).arg("build.sh");
-    run(command);
+    let mut cargo = Command::new("cargo");
+    cargo.current_dir(seed).args([
+        "build",
+        "--locked",
+        "--offline",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+    ]);
+    run(cargo);
+    let mut componentize = Command::new("wasm-tools");
+    componentize.current_dir(seed).args([
+        "component",
+        "new",
+        "target/wasm32-unknown-unknown/release/hello_wasm.wasm",
+        "-o",
+        "hello.component.wasm",
+    ]);
+    run(componentize);
 }
 
 fn recent(cluster: &Cluster) -> Vec<runs::RunRecord> {
@@ -206,7 +196,7 @@ fn recent(cluster: &Cluster) -> Vec<runs::RunRecord> {
 
 #[test]
 #[ignore = "real Claude in Firecracker: requires login, a Rust guest image, network and model budget"]
-fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
+fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     assert!(
         common::unsandboxable_host().is_none(),
         "working microVM sandbox"
@@ -234,25 +224,29 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
     .unwrap();
     source_fixture(&seed, wrong_step);
     build(&seed);
-    let faulty_artifact = std::fs::read(seed.join("hello.module")).unwrap();
+    let faulty_component = fixtures.join("faulty.component.wasm");
+    std::fs::copy(seed.join("hello.component.wasm"), &faulty_component).unwrap();
+    let faulty_artifact =
+        module_artifact::ModuleArtifact::component(std::fs::read(&faulty_component).unwrap())
+            .encode();
     let faulty_hash = sha256_hex(&seed.join("hello.component.wasm").to_string_lossy());
     // No clean version or correction history is pushed. The only commit the
     // model starts from already contains the regression.
     git_ok(&seed, &["init"]);
     git_ok(&seed, &["add", "."]);
-    git_ok(&seed, &["commit", "-m", "Counter service"]);
+    git_ok(
+        &seed,
+        &[
+            "-c",
+            "user.name=Counter Service",
+            "-c",
+            "user.email=counter@local.invalid",
+            "commit",
+            "-m",
+            "Counter service",
+        ],
+    );
     let source_before = std::fs::read(seed.join("src/lib.rs")).unwrap();
-
-    let specs = fixtures.join("specs");
-    std::fs::create_dir(&specs).unwrap();
-    let standard = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/services/provider/specs/claude.toml"),
-    )
-    .unwrap();
-    let base = standard.split("\n[[variants]]").next().unwrap();
-    let spec = base.replace("tag = \"claude\"", &format!("tag = \"{LIVE_CAPABILITY}\""));
-    std::fs::write(specs.join("maintenance.toml"), spec).unwrap();
 
     let mut cluster = Cluster::new(&[1], &[1]);
     cluster.wireguard = true;
@@ -266,16 +260,10 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
             line.replace("cores = 0", "cores = 2")
                 .replace("mem_gb = 0", "mem_gb = 4")
         }));
-    cluster.env[0] = vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            specs.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_AGENT_RUNS_ROOT".into(),
-            fixtures.join("runs").display().to_string(),
-        ),
-    ];
+    cluster.env[0] = vec![(
+        "DUCKTAPE_AGENT_RUNS_ROOT".into(),
+        fixtures.join("runs").display().to_string(),
+    )];
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", FINALIZE);
     cluster.wait_compute_marker(0, "compute daemon serving", ACTIVATE);
@@ -284,7 +272,7 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
         "module",
         "register",
         "hello",
-        seed.join("hello.component.wasm").to_str().unwrap(),
+        faulty_component.to_str().unwrap(),
         "--after",
         AFTER,
         "--config",
@@ -336,7 +324,7 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
     );
     cluster.submit(0, "forge", &forge::encode_msg(&forge::ForgeMsg::OpenIssue {
         repo: LIVE_REPO.into(), title: "Counter behavior regression".into(),
-        body: "The deployed counter is inconsistent with its repository contract. Investigate, repair it, and deploy the corrected module while preserving its current state.".into(),
+        body: format!("An application sent one `inc` to the `hello` module from a zero count and read back {wrong_step}. The displayed count jumps when users click once. Please investigate and deploy a fix without losing the accumulated count."),
     }));
     let channel = cluster.await_committed(0, "maintenance issue", FINALIZE, || {
         let bytes = cluster.query(
@@ -445,12 +433,13 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
     );
     let artifact = std::fs::read(delivered.join(&deployment.request.update.artifact)).unwrap();
     assert_ne!(artifact, faulty_artifact);
-    // Use the fixture's trusted build recipe, not an agent-edited verifier.
-    // Independent clean compilation ties the deployed bytes to submitted source.
-    std::fs::write(delivered.join("build.sh"), BUILD).unwrap();
+    // The host rebuild command is not present in the agent's checkout.
     build(&delivered);
     assert_eq!(
-        std::fs::read(delivered.join("hello.module")).unwrap(),
+        module_artifact::ModuleArtifact::component(
+            std::fs::read(delivered.join("hello.component.wasm")).unwrap(),
+        )
+        .encode(),
         artifact,
         "deployed bytes must reproduce from the agent's committed source"
     );
@@ -488,7 +477,9 @@ fn a_live_agent_repairs_and_deploys_from_source_without_the_host_oracle() {
         serde_json::json!({
             "deployment": deployment, "run": record, "source_rebuilt": true,
             "counter_before": wrong_step, "counter_after_restart": wrong_step + 4,
-            "host_oracle_absent": true,
+            "host_oracle_absent": true, "scenario": "blind_counter_repair",
+            "provider": LIVE_CAPABILITY,
+            "agent_inputs": ["incident_report", "faulty_source", "vendored_dependencies", "standard_product_instructions"],
         })
         .to_string(),
     )
