@@ -126,13 +126,23 @@ fn caller() -> commonware_cryptography::ed25519::PrivateKey {
 /// salted against `local_node()`'s [`NODE_KEY`], the node these requests are
 /// always aimed at in this file.
 fn signed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    signed_by(&caller(), method, uri, body)
+}
+
+/// [`signed`], but with an explicit signer — for a test that needs to tell two
+/// different acting keys apart (e.g. a pin's owner vs. anyone else).
+fn signed_by(
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
     let bytes = serde_json::to_vec(&body).unwrap();
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
-    for (name, value) in
-        noded::signed_req::request_headers(&caller(), method, uri, &NODE_KEY, &bytes)
+    for (name, value) in noded::signed_req::request_headers(signer, method, uri, &NODE_KEY, &bytes)
     {
         req = req.header(name, value);
     }
@@ -218,7 +228,7 @@ async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
         ("POST", "/v1/files/stage"),
         ("POST", "/v1/files/commit"),
         ("POST", "/v1/files/pin"),
-        ("DELETE", "/v1/files/pin/keep"),
+        ("POST", "/v1/files/unpin"),
         ("POST", "/v1/files/watch"),
         ("PUT", "/v1/files/object/shared/a.txt"),
         ("DELETE", "/v1/files/object/shared/a.txt"),
@@ -1949,7 +1959,7 @@ async fn the_old_voice_ws_route_is_gone() {
 
 use std::collections::BTreeMap;
 
-use duckfs_core::{DiffEntry, DiffKind, FilesQuery, FilesReply, RefsInfo};
+use duckfs_core::{DiffEntry, DiffKind, FilesMsg, FilesQuery, FilesReply, RefsInfo};
 
 /// a scripted files actor: decodes each `FilesQuery` and answers the matching
 /// canned `FilesReply`, or fails a submit with `submit_err` (the 400-envelope
@@ -2012,6 +2022,142 @@ fn get(uri: &str) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .unwrap()
+}
+
+/// a scripted files actor with REAL pin ownership: decodes `FilesMsg::Pin`/
+/// `Unpin` off the submit payload and enforces the ONE rule `Fs::unpin_apply`
+/// carries (only the creator, keyed on the verified signer, may release a
+/// pin) — the piece [`spawn_files_actor`]'s canned replies don't need to
+/// model, and the one #1865 turns on: the name has to survive the wire
+/// (client encode -> signed JSON body -> axum decode -> module msg decode)
+/// byte-for-byte for the owner check to key on the right entry at all.
+fn spawn_pin_actor(
+    mut cmds: futures::channel::mpsc::Receiver<NodeCommand>,
+    pins: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
+) {
+    tokio::spawn(async move {
+        while let Some(cmd) = cmds.next().await {
+            match cmd {
+                NodeCommand::Query { target, req, reply } => {
+                    assert_eq!(target, "files");
+                    let FilesQuery::Refs {} =
+                        duckfs_core::decode_query(&req).expect("files query decodes")
+                    else {
+                        panic!("this actor only answers Refs");
+                    };
+                    let names = pins.lock().unwrap();
+                    let bytes = duckfs_core::encode_reply(&FilesReply::Refs(RefsInfo {
+                        head: None,
+                        pins: names
+                            .keys()
+                            .map(|name| (name.clone(), "ab".repeat(32)))
+                            .collect(),
+                        window_len: 0,
+                    }));
+                    let _ = reply.send(Ok(bytes));
+                }
+                NodeCommand::Submit {
+                    target,
+                    payload,
+                    origin,
+                    reply,
+                } => {
+                    assert_eq!(target, "files");
+                    let msg = duckfs_core::decode_msg(&payload).expect("files msg decodes");
+                    let result = match msg {
+                        FilesMsg::Pin { name, .. } => {
+                            pins.lock().unwrap().insert(name, origin);
+                            Ok(())
+                        }
+                        FilesMsg::Unpin { name } => {
+                            let mut names = pins.lock().unwrap();
+                            match names.get(&name) {
+                                None => Err("files: pin not found".to_string()),
+                                Some(owner) if *owner == origin => {
+                                    names.remove(&name);
+                                    Ok(())
+                                }
+                                Some(_) => Err("files: only the pin owner may unpin".to_string()),
+                            }
+                        }
+                        other => panic!("unexpected files msg: {other:?}"),
+                    };
+                    let _ = reply.send(result.map(|()| BlockSummary {
+                        height: 9,
+                        root_hash: "ab".repeat(32),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// the regression the wire-shape change exists for (#1865): every legal pin
+/// name — including `.`/`..`, which `url` collapses as dot-segments, and a
+/// slash, which splits a path — survives `POST /v1/files/unpin`'s signed JSON
+/// body unmangled, and the module's owner gate keys on that exact name: a
+/// different signer's unpin is refused verbatim, the pin survives the refusal,
+/// and the real owner's unpin (same name, same shape) removes it.
+#[tokio::test]
+async fn unpin_over_http_takes_every_legal_pin_name_and_is_owner_gated() {
+    for name in [".", "..", "a/b", "café-🦆"] {
+        let (handle, cmd_rx, _events) = local_node();
+        let pins = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        spawn_pin_actor(cmd_rx, pins.clone());
+        let app = noded::router(handle);
+
+        let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(101);
+        let other = commonware_cryptography::ed25519::PrivateKey::from_seed(102);
+
+        let pin_body = serde_json::json!({ "snapshot": "ab".repeat(32), "name": name });
+        let response = app
+            .clone()
+            .oneshot(signed_by(&owner, "POST", "/v1/files/pin", pin_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "pin {name:?} failed");
+
+        // a different signer's unpin reaches the module intact and is refused
+        // by name, not garbled by a route the wire never touches anymore.
+        let unpin_body = serde_json::json!({ "name": name });
+        let response = app
+            .clone()
+            .oneshot(signed_by(
+                &other,
+                "POST",
+                "/v1/files/unpin",
+                unpin_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-owner's unpin {name:?} must be refused"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "files: only the pin owner may unpin");
+
+        let refs = body_json(app.clone().oneshot(get("/v1/files/refs")).await.unwrap()).await;
+        assert!(
+            refs["pins"].get(name).is_some(),
+            "pin {name:?} must survive a refused unpin"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(signed_by(&owner, "POST", "/v1/files/unpin", unpin_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "owner unpin {name:?} failed");
+
+        let refs = body_json(app.oneshot(get("/v1/files/refs")).await.unwrap()).await;
+        assert!(
+            refs["pins"].get(name).is_none(),
+            "pin {name:?} must be gone once the owner unpins it"
+        );
+    }
 }
 
 #[tokio::test]
