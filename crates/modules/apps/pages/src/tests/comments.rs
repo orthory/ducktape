@@ -66,7 +66,10 @@ fn exact_comment_anchor_rebases_with_target_text() {
         .await;
         let moved = query_thread(&p, "t1").await.unwrap();
         assert_eq!(moved.thread.target, "b2");
-        assert_eq!(moved.thread.anchor, Some(RelativeAnchor { start: 0, end: 2 }));
+        assert_eq!(
+            moved.thread.anchor,
+            Some(RelativeAnchor { start: 0, end: 2 })
+        );
         // the per-target index re-homed with it.
         assert_eq!(target_thread_count(&p, "b1").await, 0);
         assert_eq!(target_thread_count(&p, "b2").await, 1);
@@ -358,10 +361,7 @@ fn as_agent_refines_a_module_origin_into_an_agent_author() {
             agent_id: "bot".into(),
         };
         assert_eq!(view.thread.opener, agent, "the opener is the agent");
-        assert_eq!(
-            view.comments[0].author, agent,
-            "the comment author too"
-        );
+        assert_eq!(view.comments[0].author, agent, "the comment author too");
     });
 }
 
@@ -570,12 +570,15 @@ fn comment_resolve_toggles_and_records_resolver() {
                 thread_id: "t1".into(),
                 resolved: true,
             },
-            user("bob"),
+            user("alice"),
         )
         .await;
         let v = query_thread(&p, "t1").await.unwrap();
         assert!(v.thread.resolved);
-        assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
+        assert_eq!(
+            v.thread.resolved_by,
+            Some(AuthorRef::User(b"alice".to_vec()))
+        );
         apply_commit_as(
             &mut p,
             &PageMsg::ResolveThread {
@@ -599,6 +602,100 @@ fn comment_resolve_toggles_and_records_resolver() {
             "thread not found",
         )
         .await;
+    });
+}
+
+// #1869: `ResolveThread` had no authority check at all — anyone could
+// resolve or re-open anyone's thread and be recorded as the resolver. The
+// rule is the same as `MoveCommentThread`: the thread's opener, or anyone
+// `may_edit` admits on the page owning the thread's target block.
+#[test]
+fn resolve_thread_requires_opener_or_page_editor() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        // p1's blocks are seeded under the System origin (seed_page), so
+        // alice (the opener) is the only principal admitted here — a plain
+        // stranger has neither the opener nor the page-author identity.
+        seed_page(&mut p, "p1").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+
+        let resolve_t1 = PageMsg::ResolveThread {
+            thread_id: "t1".into(),
+            resolved: true,
+        };
+        apply_err_as(
+            &mut p,
+            &resolve_t1,
+            user("mallory"),
+            "not the comment author",
+        )
+        .await;
+        assert!(!query_thread(&p, "t1").await.unwrap().thread.resolved);
+
+        apply_commit_as(&mut p, &resolve_t1, user("alice")).await;
+        assert!(query_thread(&p, "t1").await.unwrap().thread.resolved);
+
+        // a page actually owned by a real user: its editor may resolve a
+        // thread they never opened, same as they could move/edit its blocks.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "p2".into(),
+                title: "p2 title".into(),
+            },
+            user("carol"),
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::InsertBlock {
+                parent: "p2".into(),
+                after: None,
+                block: para("c1", "c1"),
+            },
+            user("carol"),
+        )
+        .await;
+        apply_commit_as(&mut p, &add("t2", "m2", "c1", "a"), user("alice")).await;
+
+        let resolve_t2 = PageMsg::ResolveThread {
+            thread_id: "t2".into(),
+            resolved: true,
+        };
+        apply_err_as(
+            &mut p,
+            &resolve_t2,
+            user("mallory"),
+            "not the comment author",
+        )
+        .await;
+
+        apply_commit_as(&mut p, &resolve_t2, user("carol")).await;
+        let v2 = query_thread(&p, "t2").await.unwrap();
+        assert!(v2.thread.resolved);
+        assert_eq!(
+            v2.thread.resolved_by,
+            Some(AuthorRef::User(b"carol".to_vec()))
+        );
+
+        // unresolve follows the same rule: the stranger is still refused,
+        // the editor still succeeds.
+        let unresolve_t2 = PageMsg::ResolveThread {
+            thread_id: "t2".into(),
+            resolved: false,
+        };
+        apply_err_as(
+            &mut p,
+            &unresolve_t2,
+            user("mallory"),
+            "not the comment author",
+        )
+        .await;
+        apply_commit_as(&mut p, &unresolve_t2, user("carol")).await;
+        assert_eq!(
+            query_thread(&p, "t2").await.unwrap().thread.resolved_by,
+            None
+        );
     });
 }
 
@@ -627,7 +724,6 @@ fn comment_caps_and_reserved_ids_reject() {
         // (`index::tests::threads_for_targets_rejects_over_cap_target_lists`).
     });
 }
-
 
 // comments ride the same qmdb as blocks (reserved NUL-prefixed keys), so a
 // block edit and a comment op never collide, and both compose into root.
