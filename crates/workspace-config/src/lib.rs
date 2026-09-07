@@ -187,14 +187,27 @@ pub fn validate_chain_id_shape(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// a beat of zero is not a cadence: every consensus timer is a multiple of it,
-/// so the whole simplex clock collapses to a hot spin. checked at every
-/// boundary a descriptor enters through, exactly like [`validate_module_id`].
+/// the floor a beat must clear: the idle heartbeat (`pump_heartbeat` in
+/// `bin/node/src/validator/run/drain.rs`) only ever fires from the drain
+/// pump's own tick (`DRAIN_TICK` in `bin/node/src/constants.rs`), so a beat
+/// under this many ms cannot land as the one idle block per interval that
+/// `Cadence::idle_hold` (`crates/kernel/consensus/src/lib.rs`) requires — it
+/// would land as a nullify + finalize instead. `bin/node/src/constants.rs`
+/// carries a const assertion that `DRAIN_TICK` agrees with this value.
+pub const MIN_BLOCK_TIME_MS: u64 = 100;
+
+/// a beat under the drain-tick floor is not a cadence the idle heartbeat can
+/// keep: every consensus timer is a multiple of it, so an unpaceable beat
+/// either hot-spins (at zero) or breaks `idle_hold` (below the floor).
+/// checked at every boundary a descriptor enters through, exactly like
+/// [`validate_module_id`].
 pub fn validate_block_time_ms(ms: u64) -> Result<(), String> {
-    match ms {
-        0 => Err("block_time_ms must be at least 1ms".to_string()),
-        _ => Ok(()),
+    if ms < MIN_BLOCK_TIME_MS {
+        return Err(format!(
+            "block_time_ms must be at least {MIN_BLOCK_TIME_MS}ms (the node's idle drain tick)"
+        ));
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1826,6 +1839,27 @@ mod tests {
         );
         let err = NetworkDescriptor::from_toml(&text).unwrap_err();
         assert!(err.contains("block_time_ms"), "{err}");
+    }
+
+    /// the floor is the drain tick, not zero: a beat the idle heartbeat can't
+    /// keep is refused just as loudly as a zero beat, and it names the floor.
+    #[test]
+    fn a_beat_under_the_drain_tick_is_refused() {
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 99\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&text).unwrap_err();
+        assert!(err.contains("block_time_ms"), "{err}");
+        assert!(err.contains("100"), "{err}");
+
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 100\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        NetworkDescriptor::from_toml(&text).expect("the floor itself is accepted");
     }
 
     #[test]
