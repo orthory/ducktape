@@ -1186,6 +1186,7 @@ impl RunsModule {
             target: jobs.into(),
             payload: super::jobs_encode_msg(&super::JobsMsg::Comment {
                 job_id: job_id.into(),
+                created_at_revision: job.created_at_revision,
                 comment_id,
                 text,
             }),

@@ -90,7 +90,9 @@ other writes within its grants. A destination never supplies the author.
 
 The job board stores bounded, immutable comments with their authenticated actor
 and commit height, and exposes them through its point read and index. Comments
-do not claim, finalize or reopen a job. Runs forwards only job claims and
+do not claim, finalize or reopen a job. Each comment binds the job creation
+revision, so delayed program calls cannot write into a replacement job, even
+when an ID is reused at the same height. Runs forwards only job claims and
 finalization as lifecycle operations; comments are proposals the program must
 execute like every other conversational write.
 

@@ -172,6 +172,8 @@ pub struct Job {
     pub claim: Option<Claim>,
     pub result: Option<JobResult>,
     pub comments: Vec<JobComment>,
+    /// Creation revision survives ID reuse, including replacement in one block.
+    pub created_at_revision: u64,
     pub created_at_height: u64,
     pub updated_at_height: u64,
 }
@@ -184,6 +186,8 @@ pub enum JobsMsg {
     /// Add to the job discussion without changing its execution status.
     Comment {
         job_id: String,
+        /// The source revision that created the job instance being answered.
+        created_at_revision: u64,
         comment_id: String,
         text: String,
     },

@@ -225,6 +225,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
             3,
             ext(&bob),
             op_job(&JobsMsg::Comment {
+                created_at_revision: 1,
                 job_id: "build".into(),
                 comment_id: "progress".into(),
                 text: "Build underway".into(),

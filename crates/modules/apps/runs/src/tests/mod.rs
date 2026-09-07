@@ -304,6 +304,7 @@ impl CaptureCtx {
                 }),
                 result: None,
                 comments: Vec::new(),
+                created_at_revision: 1,
                 created_at_height: height,
                 updated_at_height: height,
             },

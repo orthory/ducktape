@@ -378,6 +378,7 @@ fn fold_job(op: &OpRow, read: &impl StateRead, msg: JobsMsg) -> Result<Writes, F
             job_id,
             comment_id,
             text,
+            ..
         } => {
             let Some(mut row) = load(&job_id)? else {
                 return Ok(out);
@@ -784,6 +785,7 @@ mod tests {
             &mut map,
             2,
             &JobsMsg::Comment {
+                created_at_revision: 1,
                 job_id: "j".into(),
                 comment_id: "c".into(),
                 text: "Working".into(),

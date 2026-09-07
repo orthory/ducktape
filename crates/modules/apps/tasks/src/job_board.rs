@@ -312,6 +312,7 @@ async fn submit(
         )));
     }
     let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
+    let (_, created_at_revision) = crate::next_revision(staged, "job", &job_id).await?;
     stage_job(
         staged,
         &Job {
@@ -324,6 +325,7 @@ async fn submit(
             claim: None,
             result: None,
             comments: Vec::new(),
+            created_at_revision,
             created_at_height: height,
             updated_at_height: height,
         },
@@ -370,6 +372,7 @@ async fn claim(
 async fn comment(
     staged: &mut StagedStore,
     job_id: String,
+    created_at_revision: u64,
     comment_id: String,
     text: String,
     actor: &Party,
@@ -383,6 +386,12 @@ async fn comment(
         ));
     }
     let mut job = require(staged, &job_id).await?;
+    let same_instance = job.created_at_revision == created_at_revision;
+    if !same_instance {
+        return Err(Error::Module(
+            "job was replaced before the comment could be applied".into(),
+        ));
+    }
     let full = job.comments.len() >= MAX_JOB_COMMENTS;
     if full {
         return Err(Error::Module("job discussion is full".into()));
@@ -576,9 +585,21 @@ pub(crate) async fn execute(
     match msg {
         JobsMsg::Comment {
             job_id,
+            created_at_revision,
             comment_id,
             text,
-        } => comment(staged, job_id, comment_id, text, actor, height).await,
+        } => {
+            comment(
+                staged,
+                job_id,
+                created_at_revision,
+                comment_id,
+                text,
+                actor,
+                height,
+            )
+            .await
+        }
         JobsMsg::Submit { job_id, kind, spec } => {
             let workers = load_workers(staged).await?;
             let event = submit(staged, job_id, kind, spec, actor, height).await?;
