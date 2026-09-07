@@ -938,7 +938,17 @@ impl RunsModule {
         let resolved = match destination {
             Some(destination) => serde_json::from_value::<ReplyDestination>(destination.clone())
                 .map_err(|error| format!("invalid reply destination: {error}"))?,
-            None => entry.reply_destination()?,
+            None => {
+                if let Some(job_id) = &entry.job_id {
+                    let original_claim = self
+                        .job_claimed_by_run(ctx, job_id, entry.job_claim_height)
+                        .await?;
+                    if !original_claim {
+                        return Err("reply source no longer has the original job claim".into());
+                    }
+                }
+                entry.reply_destination()?
+            }
         };
         let agent = self
             .agent_for_run(ctx, entry)

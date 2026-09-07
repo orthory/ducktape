@@ -1471,3 +1471,42 @@ fn reply_destination_validation_stays_in_the_module() {
         );
     }
 }
+
+#[test]
+fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_job() {
+    let (m, registry, run) = with_open_session(&[crate::ACTION_JOBS_COMMENT], &[]);
+    let mut entry = m.pending_entry(&dispatch_id_for(&run)).unwrap().clone();
+    entry.job_id = Some("job-1".into());
+    entry.job_claim_height = 3;
+    for (claim_height, destination, accepted) in [
+        (3, None, true),
+        (4, None, false),
+        (
+            4,
+            Some(
+                crate::ReplyDestination::Job {
+                    job_id: "job-1".into(),
+                }
+                .into(),
+            ),
+            true,
+        ),
+    ] {
+        let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+            .with_claimed_job("job-1", claim_height);
+        let response = AgentResponse {
+            reply_blocks: Vec::new(),
+            actions: vec![AgentAction::Reply {
+                text: "progress".into(),
+                destination,
+            }],
+            commit_message: None,
+        };
+        let result = block_on(m.validate_response(&ctx, &run, &entry, Lane::Settle, response));
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        if let Err(reason) = result {
+            assert!(reason.contains("original job claim"), "{reason}");
+        }
+        assert!(ctx.job_msgs().is_empty(), "validation must not emit");
+    }
+}
