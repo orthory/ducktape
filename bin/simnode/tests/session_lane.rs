@@ -104,11 +104,18 @@ fn claim_and_open(sim: &Sim, saga_id: &str, run_id: &str) {
     );
 }
 
-/// one mid-run chat post, authored by `origin`.
-fn post_action(run_id: &str) -> Value {
+/// one mid-run chat post under the caller's `request_id`, authored by
+/// `origin`. Every distinct id is new work; a replay of one answers with the
+/// receipt it already has and spends nothing.
+fn post_action(run_id: &str, request_id: &str) -> Value {
     json!({ "agent_action": {
         "run_id": run_id,
-        "action": { "post_message": { "channel_id": "room", "text": "progress", "thread": null } },
+        "request_id": request_id,
+        "action": {
+            "operation": "chat.post_message",
+            "target": { "channel_id": "room" },
+            "input": { "content": [{ "type": "text", "text": "progress" }] },
+        },
     }})
 }
 
@@ -127,8 +134,8 @@ fn a_session_spends_its_action_budget_to_the_exact_boundary() {
 
     // spend the whole grant — each applied action mints its own chat post
     // (`agent/{run}/post/s{n}`, unique per counter) and advances the counter.
-    for _ in 0..BUDGET {
-        sim.submit_ok("runs", post_action(&run_id), Some(SESSION));
+    for n in 0..BUDGET {
+        sim.submit_ok("runs", post_action(&run_id, &format!("p{n}")), Some(SESSION));
     }
     let sessions = sim.query("runs", json!("agent_sessions"));
     assert_eq!(
@@ -137,7 +144,7 @@ fn a_session_spends_its_action_budget_to_the_exact_boundary() {
     );
 
     // one past the boundary: refused, and the counter stays pinned at the cap.
-    let error = sim.submit_rejected("runs", post_action(&run_id), Some(SESSION));
+    let error = sim.submit_rejected("runs", post_action(&run_id, "over"), Some(SESSION));
     assert!(
         error.contains(&format!("has spent its budget of {BUDGET} actions")),
         "the budget rung refuses with its exact string: {error}"
@@ -174,7 +181,7 @@ fn a_different_key_cannot_replace_the_same_attempts_session() {
     );
 
     // the original key still stands and still acts.
-    sim.submit_ok("runs", post_action(&run_id), Some(SESSION));
+    sim.submit_ok("runs", post_action(&run_id, "first"), Some(SESSION));
     let sessions = sim.query("runs", json!("agent_sessions"));
     assert_eq!(
         sessions["agent_sessions"][0]["session_key"],
@@ -198,7 +205,7 @@ fn only_the_bound_session_key_may_act_on_the_run() {
 
     // a stranger's 32-byte key: the session IS open, so this passes the
     // has-a-session gate and fails at the byte-equality ACL.
-    let error = sim.submit_rejected("runs", post_action(&run_id), Some(WRONG));
+    let error = sim.submit_rejected("runs", post_action(&run_id, "wrong-key"), Some(WRONG));
     assert!(
         error.contains(&format!(
             "only the bound session key may act for run {}",
@@ -208,7 +215,7 @@ fn only_the_bound_session_key_may_act_on_the_run() {
     );
 
     // even the lease-holder node — which opened the session — may not act as it.
-    let error = sim.submit_rejected("runs", post_action(&run_id), Some(NODE));
+    let error = sim.submit_rejected("runs", post_action(&run_id, "node-key"), Some(NODE));
     assert!(
         error.contains("only the bound session key may act"),
         "the assignee's own key does not pass the ACL: {error}"
