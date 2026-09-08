@@ -647,7 +647,7 @@ component ShellScreen(surface:str, setup_open:bool, identity_options:[str], iden
                   ShellNoCredential #no-credential register_hint=register_hint
                 if empty(entries) && !chat_busy && !empty(credential)
                   ShellWelcome #welcome provider_initial=provider_initial task_blurb=task_blurb
-                keyed entry in entries by=entry.id
+                keyed entry in entries by=entry.id #entries
                   with
                     w=fill
                     gap=20.0
@@ -714,7 +714,7 @@ component ShellScreen(surface:str, setup_open:bool, identity_options:[str], iden
                             text chat_detail size=10.5 @text-meta
                         if !empty(saga_id)
                           button "Stop watching" @ghost_action -> emit(shell_chat_detach)
-                      keyed row in activity by=row.id w=fill gap=8.0
+                      keyed row in activity by=row.id #activity w=fill gap=8.0
                         lazy row as settled
                           ShellActivityRow row=settled
                   if chat_busy
