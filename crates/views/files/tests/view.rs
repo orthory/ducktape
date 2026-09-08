@@ -4,8 +4,8 @@
 
 use files_view::host::{FilesProps, FsEntry, Name, Path, Save};
 use files_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, texts, type_into};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{find, has_text, item, keys, press, texts, type_into};
+use ui_lang_guest::wire::{Frame, Node};
 
 fn entry(key: i64, path: &str, kind: &str, size: i64) -> FsEntry {
     FsEntry {
@@ -60,6 +60,18 @@ fn shown(props: &FilesProps) -> (u64, Frame) {
     (subscription, frame)
 }
 
+/// What the write bar's name field reads now.
+fn name_field(frame: &Frame) -> String {
+    let key = keys(frame)
+        .into_iter()
+        .find(|key| key.ends_with("/fs-new"))
+        .expect("the name field");
+    match find(frame, &key) {
+        Some(Node::Input { value, .. }) => value.clone(),
+        other => panic!("not an input: {other:?}"),
+    }
+}
+
 fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -105,24 +117,31 @@ fn a_committed_write_consumes_the_name_it_read() {
             name: "reports".into()
         }
     );
-    // the write landed: the name goes, so the next press asks for nothing
+    assert_eq!(
+        name_field(&frame),
+        "  reports  ",
+        "the draft stays until a write lands"
+    );
+    // the write landed: the name goes …
     let written = FilesProps {
         writes: 1,
         ..facts()
     };
     let frame = tick_native(vec![item(subscription, &encoded(&written))]);
-    let frame = tick_native(press(&frame, "+ File"));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    // … and a refused directory keeps the field but takes the button away
-    let frame = tick_native(type_into(&frame, "new name…", "notes"));
+    assert_eq!(name_field(&frame), "");
+    // … and the same report pushed again consumes nothing more
+    let typed = tick_native(type_into(&frame, "new name…", "notes"));
+    assert_eq!(name_field(&typed), "notes");
+    let frame = tick_native(vec![item(subscription, &encoded(&written))]);
+    assert_eq!(name_field(&frame), "notes");
+    // a refused directory says so under the bar and keeps the draft
     let refused = FilesProps {
         write_refusal: "roots are not writable".into(),
-        ..written.clone()
+        ..written
     };
     let frame = tick_native(vec![item(subscription, &encoded(&refused))]);
     assert!(has_text(&frame, "roots are not writable"));
-    let frame = tick_native(press(&frame, "+ File"));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+    assert_eq!(name_field(&frame), "notes");
 }
 
 #[test]

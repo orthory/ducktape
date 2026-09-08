@@ -1462,15 +1462,20 @@ mod tests {
         found.expect("an input with that placeholder")
     }
 
-    /// The message index the button labelled `name` would send.
+    /// The message index the button labelled `name` — by its `label=`, or
+    /// by the text it shows — would send.
     fn button_message(guest: &Guest, name: &str) -> u32 {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut message = None;
         root.for_each_mut(&mut |node| {
             if let wire::Node::Button {
-                label, on_press, ..
+                label,
+                content,
+                on_press,
+                ..
             } = node
-                && label.as_deref() == Some(name)
+                && (label.as_deref() == Some(name)
+                    || matches!(content, wire::ButtonContent::Label(text) if text == name))
             {
                 message = *on_press;
             }
