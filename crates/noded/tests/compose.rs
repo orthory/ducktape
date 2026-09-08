@@ -709,7 +709,10 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
 }
 
 fn ice_view() -> Vec<u8> {
-    std::fs::read(fixtures().join("ice-view.component.wasm")).unwrap()
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ice-view.component.wasm"),
+    )
+    .unwrap()
 }
 
 fn view_deployment(component: Vec<u8>) -> module_artifact::ModuleArtifact {
