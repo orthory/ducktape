@@ -107,14 +107,21 @@ ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' a
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
+ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
 
 # The build dir is keyed by rev too: `cargo install --git` reuses whatever a
 # shared target dir already holds for the same crate name and version, so a
 # bump used to install the PREVIOUS rev's binary under the new rev's path
 # (`cargo ice bundle` then refused flags the new rev has).
-$(ICE_BIN):
+# An existing binary can predate the isolated build dir. Only reuse an install
+# completed by this recipe; --force also replaces Cargo's stale registration.
+.PHONY: ice-tool
+ice-tool:
+	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
+	rm -f "$(ICE_INSTALL_STAMP)" && \
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
-		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
+	touch "$(ICE_INSTALL_STAMP)"
 
 # wasm-tools at the version in wasm-tools.version, installed the same way
 # cargo-ice is: under target, keyed by version, so `make views` and
@@ -137,13 +144,13 @@ $(WASM_TOOLS_BIN):
 ## wire nobody tested.
 VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
 
-views: $(ICE_BIN) $(WASM_TOOLS_BIN)
+views: ice-tool $(WASM_TOOLS_BIN)
 	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
 	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
 
 ## rebuild the committed view sources in two isolated roots and compare bytes
-views-repro-check: $(ICE_BIN) $(WASM_TOOLS_BIN)
+views-repro-check: ice-tool $(WASM_TOOLS_BIN)
 	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
@@ -165,7 +172,7 @@ ifeq ($(UNAME_S),Darwin)
 ##                          before the upload — Apple rejects an ad-hoc
 ##                          signature.
 ## The release recipe is app/README.md § "Release build".
-app: $(ICE_BIN) views
+app: ice-tool views
 	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## `make app-release` for a build that leaves this machine: refuses unless a
