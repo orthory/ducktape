@@ -434,7 +434,7 @@ extern crate::backend
   // a channel id is a user-chosen string, so two networks' `#general` are two
   // rooms — the park store this replaced had to be emptied by hand on every
   // network switch to keep one from handing its words to the other.
-  pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool) -> SubmitVerdict
+  pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool, scope:str, current:str) -> SubmitVerdict
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str

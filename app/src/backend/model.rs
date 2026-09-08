@@ -442,14 +442,26 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
 /// it came from. One discriminant, one `match`, each arm ending in its own
 /// task — a boolean would have to be read twice, and the second read is
 /// where a `return if` swallows the words.
+///
+/// `scope` is the box the body was written in and `current` the box the
+/// screen would post from now: a submit queued before the reader moved —
+/// another room, another item, another network — is refused, and the arm
+/// hands it back to the box it came from rather than posting it here.
 pub fn submit_verdict(
     busy: bool,
     connected: bool,
     channel: String,
     refusal: String,
     seated: bool,
+    scope: String,
+    current: String,
 ) -> crate::SubmitVerdict {
-    let refused = busy || !connected || channel.is_empty() || !refusal.is_empty() || !seated;
+    let refused = busy
+        || !connected
+        || channel.is_empty()
+        || !refusal.is_empty()
+        || !seated
+        || scope != current;
     if refused {
         crate::SubmitVerdict::Refused
     } else {

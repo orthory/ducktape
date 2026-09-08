@@ -240,6 +240,7 @@ enum ForgeIntent
   blob
   open_link
   copy
+  composer
 
 // What a `governance` module view asks of the app: the two writes the
 // Approvals screen makes, routed to the handlers that sign them.

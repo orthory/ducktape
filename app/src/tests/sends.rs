@@ -70,6 +70,28 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     );
 }
 
+/// THE ROOM CHECK, RE-READ AT DELIVERY. A submit rides one async hop before
+/// `composer_submitted` takes it, and the reader can change rooms — or
+/// networks — in between; the scope it was written in rides the intent, so
+/// a body for a room no longer on screen is refused and restored into THAT
+/// room's box, never posted into the one she moved to.
+#[test]
+fn a_submit_for_a_room_the_reader_has_left_goes_back_to_that_room() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "general".into();
+    let left = backend::composer_scope("http://node", "ops");
+    let task = app.__update(__DucktapeMessage::ChatViewEvent(composer_intent(
+        &left, "message", "for ops",
+    )));
+    pump(&mut app, task);
+    assert!(app.messages.is_empty(), "never posted into general");
+    assert_eq!(composer_stash(&left), "for ops");
+    assert!(composer_stash(&composer_scope(&app)).is_empty());
+}
+
 #[test]
 fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     let (mut app, _) = Ducktape::__boot();
