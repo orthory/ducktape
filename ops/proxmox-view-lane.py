@@ -13,6 +13,7 @@ import ipaddress
 import tarfile
 import tempfile
 import uuid
+from urllib.parse import unquote
 import re
 import shlex
 import subprocess
@@ -299,7 +300,12 @@ def execute(args):
 
     def config(node_id):
         text = remote(args.host, "pct", "config", node_id, "--current", "1")
-        return dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+        values = dict(line.split(": ", 1) for line in text.splitlines() if ": " in line)
+        # pct percent-encodes the PVE description, whose stored form ends
+        # with one newline. Decode only this presentation, then compare exactly.
+        if "description" in values:
+            values["description"] = unquote(values["description"]).removesuffix("\n")
+        return values
 
     preflight(record, config)
     # Check every inner marker before the first mutation, too. A copied PVE

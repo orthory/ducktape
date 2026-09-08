@@ -45,6 +45,26 @@ class LaneGuardTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lane.validate_record(bad)
 
+    def test_pct_encoded_description_keeps_exact_owner_check(self):
+        record = {"owner": "ducktape-view-lane-test", "host": "root@zk", "nodes": [
+            {"id": i, "name": f"dt-view-{i}"} for i in [801, 802, 803]
+        ]}
+        def remote(host, *command):
+            if command[:2] == ("pct", "config"):
+                return f"hostname: dt-view-{command[2]}\ndescription: {record['owner']}%0A\n"
+            if "cat" in command:
+                return record["owner"] + "\n"
+            self.fail(f"unexpected command: {command}")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lane.json"
+            path.write_text(json.dumps(record))
+            with patch("sys.argv", ["lane", "--record", str(path), "check"]), patch.object(lane, "remote", remote), patch("sys.stdout", io.StringIO()) as output:
+                try:
+                    lane.main()
+                except ValueError as error:
+                    self.fail(f"PVE's encoded trailing newline must preserve the exact owner: {error}")
+                self.assertIn("all three ownership checks passed", output.getvalue())
+
     def test_reset_checks_every_inner_marker_before_stopping_any_node(self):
         record = {"owner": "ducktape-view-lane-test", "host": "root@zk", "nodes": [
             {"id": i, "name": f"dt-view-{i}"} for i in [801, 802, 803]
