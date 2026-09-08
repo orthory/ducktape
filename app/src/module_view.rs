@@ -2593,7 +2593,15 @@ impl Guest {
                 let checked = Instant::now();
                 let active = runtime.block_on(still_active(client, module, hash));
                 timing.check = checked.elapsed();
-                if !active? {
+                let active = match active {
+                    Ok(active) => active,
+                    Err(reason) => {
+                        logged(Some(&hash), "Failed", &reason);
+                        timing.log(module, Some(&hash), started, "Failed");
+                        return Err(reason);
+                    }
+                };
+                if !active {
                     let reason = "the active code moved while the view was prepared";
                     logged(Some(&hash), "Failed", reason);
                     timing.log(module, Some(&hash), started, "Failed");
@@ -2626,46 +2634,58 @@ impl Guest {
                 timing.path = "swap";
             }
             let compiled = Instant::now();
-            let component = Self::compile(&component, &shown)?;
+            let component = Self::compile(&component, &shown);
             timing.compile = compiled.elapsed();
+            let component = component?;
             let seated = Instant::now();
-            let mut fresh = Self::instantiate(module, &component, &shown)?;
-            fresh.deployed(hash, assets);
-            match against {
-                // a view drawn carries its state over
-                Some((_, ticks)) if ticks > 0 => {
-                    let snapshot = {
-                        let mut locked = mounted.lock().expect("module view lock");
-                        let Slot::Ready(old) = &mut locked.slot else {
-                            return Err("the view left while its replacement was prepared".into());
+            let prepared = (|| -> Result<Self, String> {
+                let mut fresh = Self::instantiate(module, &component, &shown)?;
+                fresh.deployed(hash, assets);
+                match against {
+                    // a view drawn carries its state over
+                    Some((_, ticks)) if ticks > 0 => {
+                        let snapshot = {
+                            let mut locked = mounted.lock().expect("module view lock");
+                            let Slot::Ready(old) = &mut locked.slot else {
+                                return Err(
+                                    "the view left while its replacement was prepared".into()
+                                );
+                            };
+                            if !old.settled() {
+                                return Err(
+                                    "the view has pending work; its replacement waits".into()
+                                );
+                            }
+                            old.snapshot()?
                         };
-                        if !old.settled() {
-                            return Err("the view has pending work; its replacement waits".into());
-                        }
-                        old.snapshot()?
-                    };
-                    wire::Snapshot::decode(&snapshot)?;
-                    fresh.restore(&snapshot, &shown)?;
-                    timing.init = seated.elapsed();
-                    let framed = Instant::now();
-                    fresh.first_frame(&shown)?;
-                    timing.first_frame = Some(framed.elapsed());
+                        wire::Snapshot::decode(&snapshot)?;
+                        fresh.restore(&snapshot, &shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    // one mounted but never ticked has no state worth carrying;
+                    // its replacement still proves its first tree before it
+                    // takes the slot
+                    Some(_) => {
+                        fresh.init(&shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    None => {
+                        fresh.init(&shown)?;
+                    }
                 }
-                // one mounted but never ticked has no state worth carrying;
-                // its replacement still proves its first tree before it
-                // takes the slot
-                Some(_) => {
-                    fresh.init(&shown)?;
-                    timing.init = seated.elapsed();
-                    let framed = Instant::now();
-                    fresh.first_frame(&shown)?;
-                    timing.first_frame = Some(framed.elapsed());
-                }
-                None => {
-                    fresh.init(&shown)?;
-                    timing.init = seated.elapsed();
-                }
-            }
+                Ok(fresh)
+            })();
+            // Include failed instantiate/restore/init work as well as success.
+            timing.init = seated
+                .elapsed()
+                .saturating_sub(timing.first_frame.unwrap_or_default());
+            let fresh = prepared?;
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
             let checked = Instant::now();
@@ -5034,9 +5054,7 @@ pub(crate) mod tests {
     async fn every_load_reports_the_time_of_each_of_its_stages() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
+        let staged = staged("governance").expect("build the governance guest before this test");
         let component = std::fs::read(staged).expect("the staged view");
         let (a, b) = (
             deployment(&component, "a.svg"),
