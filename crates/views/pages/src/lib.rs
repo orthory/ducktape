@@ -4,6 +4,7 @@
 //! the slot this view leaves for it; every act — a pick, a search, a comment,
 //! a delete — leaves as an intent the app signs.
 
+pub mod editor;
 pub mod host;
 
 ui_lang::include_app!("src/ui/app.ice");
