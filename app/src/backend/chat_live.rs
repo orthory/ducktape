@@ -163,19 +163,14 @@ pub fn chat_live_agents(rpc: String) -> iced::futures::stream::BoxStream<'static
                 // A job-backed run has no anchor in any room (`PendingRun`
                 // leaves `channel_id` empty for one), so there is nowhere in
                 // chat to draw it.
-                .filter(|record| {
-                    !record["channel_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .is_empty()
-                })
+                .filter(|record| !record["channel_id"].as_str().unwrap_or_default().is_empty())
                 .collect();
             // ONE ROSTER READ PER NEW AGENT, not one per poll: a run's agent
             // cannot be renamed mid-run, and a quiet node must not pay a query
             // every two seconds to learn nothing.
-            let unnamed = anchored
-                .iter()
-                .any(|record| !labels.contains_key(record["agent_id"].as_str().unwrap_or_default()));
+            let unnamed = anchored.iter().any(|record| {
+                !labels.contains_key(record["agent_id"].as_str().unwrap_or_default())
+            });
             if unnamed {
                 labels.extend(agent_labels(&client).await);
                 // AND ASKED ONLY ONCE. A run whose agent the roster does not
@@ -185,7 +180,9 @@ pub fn chat_live_agents(rpc: String) -> iced::futures::stream::BoxStream<'static
                 // every poll for a name that is not coming.
                 for record in &anchored {
                     let id = record["agent_id"].as_str().unwrap_or_default();
-                    labels.entry(id.to_string()).or_insert_with(|| id.to_string());
+                    labels
+                        .entry(id.to_string())
+                        .or_insert_with(|| id.to_string());
                 }
             }
             let mut seen = Vec::new();

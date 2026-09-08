@@ -4750,7 +4750,8 @@ pub(crate) mod tests {
             "the newest anchor is the one that must survive"
         );
         assert!(
-            kept.windows(2).all(|pair| pair[0].anchor_seq < pair[1].anchor_seq),
+            kept.windows(2)
+                .all(|pair| pair[0].anchor_seq < pair[1].anchor_seq),
             "the kept rows are handed back in anchor order"
         );
     }
