@@ -236,11 +236,10 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
-        app.chat_search_draft = draft.into();
-        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
-        // nothing.
+        // A DRAFT IS NOT A QUERY: the draft is the view's own, and typing
+        // alone runs nothing and captures nothing.
         assert!(app.chat_search_query.is_empty());
-        let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+        let _ = app.__update(__DucktapeMessage::SearchChatSubmit(draft.into()));
         assert_eq!(app.chat_search_phase, SearchPhase::Searching);
         assert_eq!(
             app.chat_search_query, "zzz",
@@ -253,19 +252,17 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         app
     };
 
-    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY, and one more character
-    // walks the draft away from it with no handler run.
-    let mut empty = answered("  zzz  ", Vec::new());
+    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY — the view retires it
+    // the moment the draft walks away from `search_query`, with no handler
+    // run.
+    let empty = answered("  zzz  ", Vec::new());
     assert!(empty.chat_search_hits.is_empty());
-    assert_eq!(empty.chat_search_draft.trim(), empty.chat_search_query);
-    empty.chat_search_draft = "zzzq".into();
-    assert_ne!(empty.chat_search_draft.trim(), empty.chat_search_query);
+    assert_eq!(empty.chat_search_query, "zzz");
 
     // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
     // keystroke, and the float's gate says so on its own `!empty(search_hits)`
     // term.
-    let mut rows = answered("zzz", vec![stale_chat_hit()]);
-    rows.chat_search_draft = "zzzq".into();
+    let rows = answered("zzz", vec![stale_chat_hit()]);
     assert_eq!(rows.chat_search_hits.len(), 1);
 
     // A FAILED search never ran, so nothing may stand for it.
@@ -296,7 +293,7 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
     // THE GATE. The float stands while the search is out, while hits are in
     // hand, or while the box still holds the string the answer speaks for —
     // and for no other reason, so a zero-hit answer cannot outlive its query.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         chat.contains(
             "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
@@ -329,7 +326,7 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
             "search_answer_stands(page_search_query, page_search_draft, page_searching)",
         ),
         (
-            inlined(include_str!("../ui/screens/chat.ice")),
+            inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice")),
             "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
         ),
         (
@@ -1048,8 +1045,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
-    app.chat_search_draft = "ledger".into();
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     assert_eq!(app.chat_search_phase, SearchPhase::Searching);
 
     let _ = app.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
@@ -1065,7 +1061,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     assert_eq!(app.error, "rpc unreachable");
 
     // And the empty result IS still reachable — "done" with no hits is the miss.
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
         backend::ChatSearchData { hits: Vec::new() },
     ));
@@ -1086,7 +1082,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
 /// answer that still stands for the box means the box is not empty.
 #[test]
 fn the_clear_search_button_survives_a_zero_hit_result() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
         "the clear × must open on the float's discriminant or on a live field"

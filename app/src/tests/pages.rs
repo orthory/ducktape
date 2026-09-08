@@ -27,7 +27,6 @@ fn background_refresh_preserves_editing_state() {
         "rpc",
         "password",
         "channel_draft",
-        "chat_search_draft",
         "page_draft",
         "block_draft",
         "page_search_draft",
@@ -38,12 +37,6 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    for scoped in ["channel_name_draft", "member_key_draft"] {
-        assert!(refresh.contains(&format!(
-            "{scoped} = retain_for_endpoint({scoped}, active_channel, \
-keep_str(next.chat_loaded, next.active_channel, active_channel))"
-        )));
-    }
     assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
     // The evicted inline edit is rescued to the composer of the room it was
     // in, not to an app-wide plate (ducktape-ui#698). The DESTINATION is the
@@ -51,9 +44,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     // here — its own assignment is further down the handler — so the rescue
     // cannot surface over the room the resync is carrying her to.
     assert!(refresh.contains(
-        "slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, \
-message_edit_draft, \"\"), selected_message_seq > 0 || message_action != \
-MessageAction.editing) at composer_scope(connected_rpc, active_channel)"
+        "composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), \
+keep_str(message_action == MessageAction.editing, message_edit_draft, \"\"), \
+selected_message_seq > 0 || message_action != MessageAction.editing)"
     ));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
     assert_no_polling(&lifecycle);

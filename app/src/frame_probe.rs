@@ -1021,25 +1021,20 @@ pub(crate) fn headless_renderer() -> iced::Renderer {
         .expect("a headless tiny-skia renderer")
 }
 
-/// The stream composer's instance scope, read off a rendered frame — the
-/// composers are component instances now (ducktape-ui#697), so a probe that
-/// types has to name the one it is typing into.
+/// The stream composer's scope — the composers are host surfaces now, keyed
+/// by the room, so a probe that types names the document it types into.
 fn composer_scope(app: &Ducktape) -> String {
-    app.__ice_test_scopes_chat_composer()
-        .into_iter()
-        .find(|scope| scope.contains("/composer("))
-        .expect("the stream composer materialized")
+    backend::composer_scope(&app.connected_rpc, &app.active_channel)
 }
 
-fn keystroke(scope: &str) -> __DucktapeMessage {
-    Ducktape::__ice_test_message_chat_composer_composer_event(
-        scope.to_owned(),
-        super::editor::ComposerEvent::Apply(super::editor::RichAction::Edit(
-            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
-        )),
-        false,
-        crate::ComposerKind::Message,
-    )
+/// One character into the composer's document, as the painted surface
+/// applies it: no app message rides a keystroke any more, only the rebuild.
+fn keystroke(scope: &str) {
+    use crate::composer_surface::testing::{Interaction, interact};
+    let event = super::editor::ComposerEvent::Apply(super::editor::RichAction::Edit(
+        iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
+    ));
+    let _ = interact(scope, "message", false, false, Interaction::Editor(event));
 }
 
 fn probe_posted_update(seq: i64) -> backend::LiveUpdate {
@@ -1128,7 +1123,7 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
     for _ in 0..SLOPE_FRAMES {
         cache = keystrokes
             .sample(|| {
-                let _ = app.__update(keystroke(&composer));
+                keystroke(&composer);
                 UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
             })
             .into_cache();
@@ -2368,7 +2363,7 @@ fn probe() {
         // truth. `no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer`
         // in `tests.rs` is what keeps it honest; the ceiling cannot see it.
         let ui = keystroke_frame.sample(|| {
-            let _ = app.__update(keystroke(&composer));
+            keystroke(&composer);
             UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
         });
         cache = ui.into_cache();

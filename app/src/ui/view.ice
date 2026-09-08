@@ -191,107 +191,12 @@ view
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
+        // Chat is a MODULE-OWNED VIEW: the facts go in as props — the mutation
+        // lock as a flag, the enums by name — and every act comes back as an
+        // intent the handler signs. The drafts are the view's; the composers
+        // are host surfaces the view leaves slots for (module_view.rs).
         chat:
-          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
-            with
-              endpoint=connected_rpc
-              network_name
-              network_chain_id
-              status
-              block_height
-              search_phase=chat_search_phase
-              search_query=chat_search_query
-              search_hits=chat_search_hits
-              rooms
-              dm_rows
-              channel_create_open
-              connected
-              loading
-              mutation_phase
-              active_channel
-              active_dm_peer
-              active_dm
-              active_channel_name
-              active_channel_archived
-              active_channel_members_only
-              channel_members
-              post_refusal
-              huddle_joined
-              huddle_channel
-              huddle_channel_name
-              huddle_joined_at
-              huddle_now
-              call_muted
-              messages
-              has_older_history
-              history_view
-              at_live_tail=chat_at_tail
-              history_loading
-              unread_boundary
-              unread_marker_seq
-              selected_message_seq
-              selected_message_rev
-              message_action
-              channel_settings_open
-              active_thread_seq
-              thread_target_seq
-              thread_messages
-              thread_selected_seq
-              thread_selected_rev
-              thread_message_action
-              thread_has_more
-              thread_next_reply_seq
-              thread_loading
-              copy_anchor_seq
-              copy_head_seq
-              copy_surface
-            events
-              search_chat_submit -> search_chat_submit
-              clear_chat_search -> clear_chat_search
-              open_chat_search_hit -> open_chat_search_hit _ _ _
-              toggle_channel_create -> toggle_channel_create
-              choose_channel -> choose_channel _
-              choose_dm -> choose_dm _
-              toggle_channel_settings -> toggle_channel_settings
-              show_huddle -> show_huddle
-              leave_huddle_here -> leave_huddle_here
-              huddle_go_channel -> huddle_go_channel
-              join_huddle_submit -> join_huddle_submit
-              load_more_history -> load_more_history
-              chat_scrolled -> chat_scrolled _ _ _ _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
-              copy_message_link -> copy_message_link _
-              add_reaction_at -> add_reaction_at _ _
-              remove_reaction_at -> remove_reaction_at _ _
-              open_thread_for -> open_thread_for _
-              open_message_actions -> open_message_actions _ _ _
-              open_message_reactions -> open_message_reactions _ _ _
-              begin_message_edit -> begin_message_edit _ _ _
-              arm_message_delete -> arm_message_delete _ _ _
-              clear_message_selection -> clear_message_selection
-              press_message -> press_message _ _
-              clear_copy_range -> clear_copy_range
-              copy_selected_messages -> copy_selected_messages
-              add_reaction_submit -> add_reaction_submit _
-              edit_message_submit -> edit_message_submit
-              delete_message_submit -> delete_message_submit
-              composer_submitted -> composer_submitted _ _ _
-              rename_channel_submit -> rename_channel_submit
-              archive_channel_submit -> archive_channel_submit
-              unarchive_channel_submit -> unarchive_channel_submit
-              add_channel_member_submit -> add_channel_member_submit
-              remove_channel_member_submit -> remove_channel_member_submit _
-              close_thread -> close_thread
-              open_thread_message_actions -> open_thread_message_actions _ _ _
-              open_thread_message_reactions -> open_thread_message_reactions _ _ _
-              begin_thread_message_edit -> begin_thread_message_edit _ _ _
-              arm_thread_message_delete -> arm_thread_message_delete _ _ _
-              clear_thread_message_selection -> clear_thread_message_selection
-              edit_thread_message_submit -> edit_thread_message_submit
-              delete_thread_message_submit -> delete_thread_message_submit
-              load_more_thread -> load_more_thread
-
+          extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial) #chat -> chat_view_event _
         shell:
           ShellScreen draft<->shell_chat_draft #shell
             with

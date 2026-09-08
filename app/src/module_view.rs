@@ -166,6 +166,20 @@ pub fn event_flag(event: &ModuleViewEvent, field: &str) -> bool {
         .is_some_and(|detail| detail.get(field).and_then(serde_json::Value::as_bool) == Some(true))
 }
 
+/// The integer under `field` in an intent's JSON detail; 0 when absent.
+pub fn event_int(event: &ModuleViewEvent, field: &str) -> i64 {
+    detail(event)
+        .and_then(|detail| detail.get(field).and_then(serde_json::Value::as_i64))
+        .unwrap_or_default()
+}
+
+/// The number under `field` in an intent's JSON detail; 0 when absent.
+pub fn event_num(event: &ModuleViewEvent, field: &str) -> f64 {
+    detail(event)
+        .and_then(|detail| detail.get(field).and_then(serde_json::Value::as_f64))
+        .unwrap_or_default()
+}
+
 fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
     serde_json::from_str(&event.detail).ok()
 }
@@ -449,6 +463,290 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
     }
 }
 
+// ---------- the chat seat ----------
+
+/// The chat view's props, as one document — a struct rather than a `json!`
+/// literal because the macro recurses once per field and this screen has
+/// more than the compiler's default limit.
+#[derive(serde::Serialize)]
+struct ChatProps<'a> {
+    dark: bool,
+    endpoint: &'a str,
+    network_name: &'a str,
+    network_chain_id: &'a str,
+    status: &'a str,
+    block_height: i64,
+    search_phase: &'static str,
+    search_query: &'a str,
+    search_hits: &'a [crate::backend::ChatSearchHit],
+    rooms: &'a [crate::backend::ChatSidebarRow],
+    dm_rows: &'a [crate::backend::DmSidebarRow],
+    channel_create_open: bool,
+    connected: bool,
+    loading: bool,
+    busy: bool,
+    active_channel: &'a str,
+    active_dm_peer: &'a str,
+    active_dm: &'a crate::backend::DmPeer,
+    active_channel_name: &'a str,
+    active_channel_archived: bool,
+    active_channel_members_only: bool,
+    channel_members: &'a [crate::backend::ChatMember],
+    post_refusal: &'a str,
+    huddle_joined: bool,
+    huddle_channel: &'a str,
+    huddle_channel_name: &'a str,
+    huddle_joined_at: i64,
+    huddle_now: i64,
+    call_muted: bool,
+    messages: &'a [crate::backend::ChatMessage],
+    has_older_history: bool,
+    history_view: bool,
+    at_live_tail: bool,
+    history_loading: bool,
+    unread_boundary: i64,
+    unread_marker_seq: i64,
+    selected_message_seq: i64,
+    selected_message_rev: i64,
+    message_action: &'static str,
+    channel_settings_open: bool,
+    active_thread_seq: i64,
+    thread_target_seq: i64,
+    thread_messages: &'a [crate::backend::ChatMessage],
+    thread_selected_seq: i64,
+    thread_selected_rev: i64,
+    thread_message_action: &'static str,
+    thread_has_more: bool,
+    thread_next_reply_seq: i64,
+    thread_loading: bool,
+    copy_anchor_seq: i64,
+    copy_head_seq: i64,
+    copy_surface: &'static str,
+    sent_serial: i64,
+}
+
+/// The Chat tab: the room list, the stream, the rail and the drawer as the
+/// app holds them, drawn by the `chat` view. Its intents come back one per
+/// act ([`chat_intent`]), carrying what the reader chose or typed; the two
+/// composers are host surfaces (`crate::composer_surface`), whose submit
+/// comes back as `composer`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn chat_view(
+    dark: bool,
+    endpoint: &str,
+    network_name: &str,
+    network_chain_id: &str,
+    status: &str,
+    block_height: i64,
+    search_phase: crate::SearchPhase,
+    search_query: &str,
+    search_hits: &[crate::backend::ChatSearchHit],
+    rooms: &[crate::backend::ChatSidebarRow],
+    dm_rows: &[crate::backend::DmSidebarRow],
+    channel_create_open: bool,
+    connected: bool,
+    loading: bool,
+    mutation_phase: crate::MutationPhase,
+    active_channel: &str,
+    active_dm_peer: &str,
+    active_dm: &crate::backend::DmPeer,
+    active_channel_name: &str,
+    active_channel_archived: bool,
+    active_channel_members_only: bool,
+    channel_members: &[crate::backend::ChatMember],
+    post_refusal: &str,
+    huddle_joined: bool,
+    huddle_channel: &str,
+    huddle_channel_name: &str,
+    huddle_joined_at: i64,
+    huddle_now: i64,
+    call_muted: bool,
+    messages: &[crate::backend::ChatMessage],
+    has_older_history: bool,
+    history_view: bool,
+    at_live_tail: bool,
+    history_loading: bool,
+    unread_boundary: i64,
+    unread_marker_seq: i64,
+    selected_message_seq: i64,
+    selected_message_rev: i64,
+    message_action: crate::MessageAction,
+    channel_settings_open: bool,
+    active_thread_seq: i64,
+    thread_target_seq: i64,
+    thread_messages: &[crate::backend::ChatMessage],
+    thread_selected_seq: i64,
+    thread_selected_rev: i64,
+    thread_message_action: crate::MessageAction,
+    thread_has_more: bool,
+    thread_next_reply_seq: i64,
+    thread_loading: bool,
+    copy_anchor_seq: i64,
+    copy_head_seq: i64,
+    copy_surface: crate::CopySurface,
+    sent_serial: i64,
+) -> Element<'static, ModuleViewEvent> {
+    let props = ChatProps {
+        dark,
+        endpoint,
+        network_name,
+        network_chain_id,
+        status,
+        block_height,
+        search_phase: search_phase_name(search_phase),
+        search_query,
+        search_hits,
+        rooms,
+        dm_rows,
+        channel_create_open,
+        connected,
+        loading,
+        busy: mutation_phase != crate::MutationPhase::Idle,
+        active_channel,
+        active_dm_peer,
+        active_dm,
+        active_channel_name,
+        active_channel_archived,
+        active_channel_members_only,
+        channel_members,
+        post_refusal,
+        huddle_joined,
+        huddle_channel,
+        huddle_channel_name,
+        huddle_joined_at,
+        huddle_now,
+        call_muted,
+        messages,
+        has_older_history,
+        history_view,
+        at_live_tail,
+        history_loading,
+        unread_boundary,
+        unread_marker_seq,
+        selected_message_seq,
+        selected_message_rev,
+        message_action: message_action_name(message_action),
+        channel_settings_open,
+        active_thread_seq,
+        thread_target_seq,
+        thread_messages,
+        thread_selected_seq,
+        thread_selected_rev,
+        thread_message_action: message_action_name(thread_message_action),
+        thread_has_more,
+        thread_next_reply_seq,
+        thread_loading,
+        copy_anchor_seq,
+        copy_head_seq,
+        copy_surface: copy_surface_name(copy_surface),
+        sent_serial,
+    };
+    module_view("chat", serde_json::to_vec(&props).expect("props encode"))
+}
+
+fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
+    match phase {
+        crate::SearchPhase::Idle => "idle",
+        crate::SearchPhase::Searching => "searching",
+        crate::SearchPhase::Done => "done",
+    }
+}
+
+fn message_action_name(action: crate::MessageAction) -> &'static str {
+    match action {
+        crate::MessageAction::Toolbar => "toolbar",
+        crate::MessageAction::More => "more",
+        crate::MessageAction::Reactions => "reactions",
+        crate::MessageAction::Editing => "editing",
+        crate::MessageAction::Delete => "delete",
+    }
+}
+
+fn copy_surface_name(surface: crate::CopySurface) -> &'static str {
+    match surface {
+        crate::CopySurface::Nowhere => "nowhere",
+        crate::CopySurface::Timeline => "timeline",
+        crate::CopySurface::Thread => "thread",
+    }
+}
+
+pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
+    use crate::ChatIntent as Intent;
+    match event.kind.as_str() {
+        "search" => Intent::Search,
+        "clear_search" => Intent::ClearSearch,
+        "open_hit" => Intent::OpenHit,
+        "toggle_create" => Intent::ToggleCreate,
+        "choose_channel" => Intent::ChooseChannel,
+        "choose_dm" => Intent::ChooseDm,
+        "toggle_settings" => Intent::ToggleSettings,
+        "show_huddle" => Intent::ShowHuddle,
+        "leave_huddle" => Intent::LeaveHuddle,
+        "join_huddle" => Intent::JoinHuddle,
+        "load_history" => Intent::LoadHistory,
+        "scrolled" => Intent::Scrolled,
+        "open_link" => Intent::OpenLink,
+        "copy" => Intent::Copy,
+        "copy_link" => Intent::CopyLink,
+        "add_reaction" => Intent::AddReaction,
+        "remove_reaction" => Intent::RemoveReaction,
+        "open_thread" => Intent::OpenThread,
+        "message_actions" => Intent::MessageActions,
+        "message_reactions" => Intent::MessageReactions,
+        "begin_edit" => Intent::BeginEdit,
+        "arm_delete" => Intent::ArmDelete,
+        "press" => Intent::Press,
+        "clear_range" => Intent::ClearRange,
+        "copy_range" => Intent::CopyRange,
+        "reaction_submit" => Intent::ReactionSubmit,
+        "edit" => Intent::Edit,
+        "delete" => Intent::Delete,
+        "rename" => Intent::Rename,
+        "archive" => Intent::Archive,
+        "unarchive" => Intent::Unarchive,
+        "add_member" => Intent::AddMember,
+        "remove_member" => Intent::RemoveMember,
+        "close_thread" => Intent::CloseThread,
+        "thread_actions" => Intent::ThreadActions,
+        "thread_reactions" => Intent::ThreadReactions,
+        "thread_begin_edit" => Intent::ThreadBeginEdit,
+        "thread_arm_delete" => Intent::ThreadArmDelete,
+        "thread_clear_selection" => Intent::ThreadClearSelection,
+        "thread_edit" => Intent::ThreadEdit,
+        "thread_delete" => Intent::ThreadDelete,
+        "load_thread" => Intent::LoadThread,
+        "composer" => Intent::Composer,
+        _ => Intent::ClearSelection,
+    }
+}
+
+/// The surface a `press` intent names; a name the view has no surface for
+/// is nowhere, which draws no range.
+pub fn chat_event_surface(event: &ModuleViewEvent) -> crate::CopySurface {
+    match event_text(event, "surface").as_str() {
+        "timeline" => crate::CopySurface::Timeline,
+        "thread" => crate::CopySurface::Thread,
+        _ => crate::CopySurface::Nowhere,
+    }
+}
+
+/// Which composer a `composer` intent came from.
+pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
+    match event_text(event, "kind").as_str() {
+        "reply" => crate::ComposerKind::Reply,
+        _ => crate::ComposerKind::Message,
+    }
+}
+
+/// A refused or failed body, handed back to the composer it was written in.
+pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
+    crate::composer_surface::unsent(scope, text, committed);
+    true
+}
+
 /// The native log ring behind the node view's slot: the timeline the app
 /// last drew the tab with, and what the reader did in it since the app
 /// last drained. One per process, like the view it belongs to.
@@ -489,6 +787,9 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
+    if module == "chat" {
+        surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
+    }
     surfaces
 }
 
@@ -523,6 +824,53 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+        ],
+        // `composer` is deliberately NOT here: a send crosses only from the
+        // host's own composer surface (`deliver`), never as a guest request.
+        "chat" => &[
+            "search",
+            "clear_search",
+            "open_hit",
+            "toggle_create",
+            "choose_channel",
+            "choose_dm",
+            "toggle_settings",
+            "show_huddle",
+            "leave_huddle",
+            "join_huddle",
+            "load_history",
+            "scrolled",
+            "open_link",
+            "copy",
+            "copy_link",
+            "add_reaction",
+            "remove_reaction",
+            "open_thread",
+            "message_actions",
+            "message_reactions",
+            "begin_edit",
+            "arm_delete",
+            "clear_selection",
+            "press",
+            "clear_range",
+            "copy_range",
+            "reaction_submit",
+            "edit",
+            "delete",
+            "rename",
+            "archive",
+            "unarchive",
+            "add_member",
+            "remove_member",
+            "close_thread",
+            "thread_actions",
+            "thread_reactions",
+            "thread_begin_edit",
+            "thread_arm_delete",
+            "thread_clear_selection",
+            "thread_edit",
+            "thread_delete",
+            "load_thread",
         ],
         _ => &[],
     }
@@ -821,11 +1169,15 @@ impl Guest {
     /// host surface's event is the app's, not the guest's: it was queued
     /// where the surface keeps it, and the app is told to drain it.
     fn deliver(&mut self, output: Output) {
-        if let Output::Surface { .. } = output {
-            self.intents.push(ModuleViewEvent {
-                kind: "log_timeline".into(),
-                detail: String::new(),
-            });
+        if let Output::Surface { value, .. } = output {
+            match self.module {
+                "node" => self.intents.push(ModuleViewEvent {
+                    kind: "log_timeline".into(),
+                    detail: String::new(),
+                }),
+                "chat" => self.intents.extend(crate::composer_surface::intent(&value)),
+                _ => {}
+            }
             return;
         }
         self.inputs.apply(output, &mut self.pending);

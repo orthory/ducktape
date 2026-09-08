@@ -262,6 +262,54 @@ enum SettingsIntent
   dark
   notifications
 
+// what the Chat view asks of the app: one variant per act the screen offers,
+// each carrying only what the reader chose or typed — the drafts are the view's
+enum ChatIntent
+  search
+  clear_search
+  open_hit
+  toggle_create
+  choose_channel
+  choose_dm
+  toggle_settings
+  show_huddle
+  leave_huddle
+  join_huddle
+  load_history
+  scrolled
+  open_link
+  copy
+  copy_link
+  add_reaction
+  remove_reaction
+  open_thread
+  message_actions
+  message_reactions
+  begin_edit
+  arm_delete
+  clear_selection
+  press
+  clear_range
+  copy_range
+  reaction_submit
+  edit
+  delete
+  rename
+  archive
+  unarchive
+  add_member
+  remove_member
+  close_thread
+  thread_actions
+  thread_reactions
+  thread_begin_edit
+  thread_arm_delete
+  thread_clear_selection
+  thread_edit
+  thread_delete
+  load_thread
+  composer
+
 enum MutationPhase
   idle
   recovering

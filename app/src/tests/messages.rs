@@ -367,7 +367,7 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
 /// mid-sentence, once per page, for as long as she keeps reading upwards.
 #[test]
 fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     // Only the rows the viewport can see are laid out, which is what lets the
     // timeline hold a whole channel without paying a text layout per row — and
     // `by=message.view_key` is what makes per-row state and per-row MEASUREMENT
@@ -399,9 +399,11 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // rows the reader is dragging over and leave every cached row behind it
     // untinted. Everything else about the key is unchanged: the range is three
     // scalars, not a list, so a cached row still reads nothing expensive.
-    assert!(timeline.1.contains(
-        "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
-    ));
+    assert!(
+        timeline.1.contains(
+            "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+        )
+    );
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -426,8 +428,11 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
 /// template that meets it.
 #[test]
 fn the_message_line_is_one_rich_text_paragraph() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
-    let rich_line = components
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
+    let rich_body = inlined(include_str!("../ui/components/richbody.ice"));
+    let rich_line = rich_body
         .split_once("component RichLine")
         .expect("the message line component")
         .1;
@@ -489,7 +494,9 @@ fn the_message_line_is_one_rich_text_paragraph() {
 /// has. The thread root drew a header and still never carried it at all.
 #[test]
 fn the_edited_marker_reaches_every_row_it_annotates() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     let marker = "text \"· edited\" size=11.0 wrap=none font=code_medium @text-muted";
     assert_eq!(
         components.matches(marker).count(),
@@ -541,9 +548,7 @@ fn message_actions_require_explicit_intent() {
 /// window fold runs — so a test never hand-writes the reader's label.
 fn seat_reader(byte: u8) -> String {
     let key = vec![byte; 32];
-    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(
-        key.clone(),
-    )));
+    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(key.clone())));
     backend::author_display(
         &format!("user:{}", backend::hex_encode(&key)),
         &backend::names(),

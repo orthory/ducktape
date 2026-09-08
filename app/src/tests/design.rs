@@ -24,7 +24,9 @@ fn full_view_fits_the_default_test_stack() {
 
 #[test]
 fn message_action_toolbar_stays_compact_and_accessible() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     let toolbar = components
         .split_once("component MessageCard")
         .unwrap()
@@ -38,7 +40,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // and it is the ANCHOR CONTRACT: while the ♡/⋯ card this row opened is
     // up, the toolbar it hangs off stays, however far the pointer went.
     assert!(toolbar.contains("hover tint=row_hover r=9.0 open=menu_open"));
-    let stream = inlined(include_str!("../ui/screens/chat.ice"));
+    let stream = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(stream.contains("MessageCard message selected=true menu_open=true"));
     assert!(toolbar.contains("if !message.deleted && !message.pending"));
     assert!(!toolbar.contains("&& hovered"));
@@ -91,7 +93,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         "button label=\"Open thread\" p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
     ));
 
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat.contains(
         "overlay when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)"
     ));
@@ -248,8 +250,8 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/state/derived.ice"),
         include_str!("../ui/theme.ice"),
         include_str!("../ui/view.ice"),
-        include_str!("../ui/components/chat.ice"),
-        include_str!("../ui/components/dm.ice"),
+        include_str!("../../../crates/views/chat/src/ui/components.ice"),
+        include_str!("../../../crates/views/chat/src/ui/dm.ice"),
         include_str!("../ui/components/files.ice"),
         include_str!("../ui/components/forge.ice"),
         include_str!("../ui/components/huddle.ice"),
@@ -411,19 +413,14 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(settings.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
     // Both chat composers wear the SAME plate — and now they wear the same
-    // SOURCE: one `ChatComposer` mounted twice (ducktape-ui#697), so the
-    // chrome cannot drift between the stream and the rail by editing one.
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
+    // SOURCE: the one `chat_composer` host surface (`composer_surface.rs`)
+    // seated twice by the view, so the chrome cannot drift between the
+    // stream and the rail by editing one.
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert_eq!(
-        chat_components
-            .matches("box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true")
-            .count(),
-        1
-    );
-    assert_eq!(
-        SCREENS.matches("ChatComposer #").count(),
+        chat_screen.matches("extern chat_composer(").count(),
         2,
-        "the stream and the rail are the two mounts of that one plate"
+        "the stream and the rail are the two seats of that one plate"
     );
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
@@ -446,7 +443,9 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
     // Both chat composers share ONE call now — they are one component — and
     // the forge note keeps its own compact geometry on the screen.
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
+    let chat_components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     assert_eq!(chat_components.matches(", 44.0, 150.0, 10.0) #").count(), 1);
     assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
     assert!(chat_components.contains("button \"Send\" disabled="));
@@ -468,7 +467,7 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
 
     let components = inlined(concat!(
         include_str!("../ui/components/shell.ice"),
-        include_str!("../ui/components/chat.ice"),
+        include_str!("../../../crates/views/chat/src/ui/components.ice"),
         include_str!("../ui/components/pages.ice"),
     ));
     // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
@@ -630,8 +629,10 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
 
     let view = inlined(include_str!("../ui/view.ice"));
     let shell = inlined(include_str!("../ui/components/shell.ice"));
-    let chat = inlined(include_str!("../ui/components/chat.ice"));
-    let chat_screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let pages = inlined(include_str!("../ui/components/pages.ice"));
     let kit = inlined(include_str!("../ui/components/kit.ice"));
     let forge = inlined(include_str!("../ui/components/forge.ice"));
@@ -694,7 +695,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // icon.ice is swept so the deleted `IconAction` ramp component itself
     // cannot quietly return.
     assert_icon_controls_inherit_ink("chat.ice", &chat);
-    assert_icon_controls_inherit_ink("screens/chat.ice", &chat_screen);
+    assert_icon_controls_inherit_ink("chat/src/ui/chat.ice", &chat_screen);
     assert_icon_controls_inherit_ink(
         "components/icon.ice",
         &inlined(include_str!("../ui/components/icon.ice")),
@@ -854,9 +855,14 @@ fn ice_sources_hold_to_the_design_system() {
         ("view.ice", inlined(include_str!("../ui/view.ice"))),
         (
             "chat.ice",
-            inlined(include_str!("../ui/components/chat.ice")),
+            inlined(include_str!(
+                "../../../crates/views/chat/src/ui/components.ice"
+            )),
         ),
-        ("dm.ice", inlined(include_str!("../ui/components/dm.ice"))),
+        (
+            "dm.ice",
+            inlined(include_str!("../../../crates/views/chat/src/ui/dm.ice")),
+        ),
         (
             "files.ice",
             inlined(include_str!("../ui/components/files.ice")),
@@ -1091,7 +1097,9 @@ fn every_status_fill_carries_a_readable_foreground_in_both_themes() {
 /// this one only has to say what these three chips wear.
 #[test]
 fn no_chip_inside_a_message_row_deflates_onto_the_row() {
-    let chat = inlined(include_str!("../ui/components/chat.ice"));
+    let chat = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     for (chip, states) in [
         (
             "reacted",
@@ -1201,8 +1209,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         ($($path:literal),* $(,)?) => { [$(($path, include_str!(concat!("../", $path)))),*] };
     }
     let sources = ice_sources![
-        "ui/components/chat.ice",
-        "ui/components/dm.ice",
         "ui/components/files.ice",
         "ui/components/forge.ice",
         "ui/components/huddle.ice",
@@ -1212,8 +1218,8 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/overlay.ice",
         "ui/components/pages.ice",
         "ui/components/patterns.ice",
+        "ui/components/richbody.ice",
         "ui/components/shell.ice",
-        "ui/screens/chat.ice",
         "ui/screens/forge.ice",
         // The Approvals, Members, Agents and Node screens ship as
         // module-owned views; their sources are held to the same conventions
@@ -1229,6 +1235,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/settings/src/ui/app.ice",
         "../../crates/views/settings/src/ui/settings.ice",
         "../../crates/views/settings/src/ui/kit.ice",
+        "../../crates/views/chat/src/ui/app.ice",
+        "../../crates/views/chat/src/ui/chat.ice",
+        "../../crates/views/chat/src/ui/components.ice",
+        "../../crates/views/chat/src/ui/dm.ice",
+        "../../crates/views/chat/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
         "ui/screens/shell.ice",
@@ -1264,8 +1275,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     assert_eq!(
         carriers,
         [
-            "ui/components/chat.ice",
-            "ui/components/dm.ice",
             "ui/components/files.ice",
             "ui/components/forge.ice",
             "ui/components/onboarding.ice",
@@ -1274,6 +1283,8 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/screens/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
             "../../crates/views/explorer/src/ui/app.ice",
+            "../../crates/views/chat/src/ui/components.ice",
+            "../../crates/views/chat/src/ui/dm.ice",
             "ui/screens/shell.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
@@ -1288,16 +1299,19 @@ fn every_current_row_marker_rests_on_one_selection_token() {
 /// screenshot nobody takes.
 #[test]
 fn the_chat_surface_holds_to_its_measured_geometry() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
-    let dm = inlined(include_str!("../ui/components/dm.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    let dm = inlined(include_str!("../../../crates/views/chat/src/ui/dm.ice"));
 
     // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
     // window and ~320 maximized — past every readability bound there is.
     assert!(
         components.contains("col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5")
     );
-    assert!(components.contains("col w=fill gap=5.0\n    for block in blocks"));
+    let rich_body = inlined(include_str!("../ui/components/richbody.ice"));
+    assert!(rich_body.contains("col w=fill gap=5.0\n    for block in blocks"));
 
     // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
     // 14px spacer). The spacer sits OUTSIDE the hover capsule, so the gap
@@ -1398,9 +1412,9 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // 1. WORKSPACE-SHAPED — channels, DMs, members, repos, pages,
         //    validators, peers. Length tracks how big the workspace is, not
         //    how long the chain has run, and it moves on a delta, not a scroll.
-        ("screens/chat.ice", "for room in rooms"),
-        ("screens/chat.ice", "for dm in dm_rows"),
-        ("screens/chat.ice", "for member in channel_members"),
+        ("chat/src/ui/chat.ice", "for room in rooms"),
+        ("chat/src/ui/chat.ice", "for dm in dm_rows"),
+        ("chat/src/ui/chat.ice", "for member in channel_members"),
         ("screens/pages.ice", "for page in pages"),
         ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
         ("screens/forge.ice", "for repo in repos"),
@@ -1423,8 +1437,11 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         //    own `lazy`, so they are built once per row change, not per frame.
         // `RichBody` is the one markdown renderer: a chat row, a forge body
         // and a review comment each hand it ONE body's blocks.
-        ("components/chat.ice", "for block in blocks"),
-        ("components/chat.ice", "for reaction in message.reactions"),
+        ("components/richbody.ice", "for block in blocks"),
+        (
+            "chat/src/ui/components.ice",
+            "for reaction in message.reactions",
+        ),
         // One review's inline comments, bounded by the review that holds them.
         ("components/forge.ice", "for comment in review.comments"),
         (
@@ -1441,7 +1458,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
-        ("screens/chat.ice", "for hit in search_hits"),
+        ("chat/src/ui/chat.ice", "for hit in search_hits"),
         ("screens/pages.ice", "for hit in page_search_hits"),
         ("screens/pages.ice", "for comment_row in block_comment_rows"),
         (

@@ -171,15 +171,18 @@ fn the_composers_are_out_of_reach_of_every_handler() {
         );
     }
 
-    const SCREEN: &str = include_str!("../ui/screens/chat.ice");
+    const SCREEN: &str = include_str!("../../../crates/views/chat/src/ui/chat.ice");
     for (mount, key) in [
-        ("ChatComposer #composer(", "composer_scope(endpoint,"),
-        ("ChatComposer #reply_composer(", "thread_scope(endpoint,"),
+        ("#composer", "extern chat_composer(composer_scope(endpoint,"),
+        (
+            "#reply_composer",
+            "extern chat_composer(thread_scope(endpoint,",
+        ),
     ] {
         let line = SCREEN
             .lines()
-            .map(str::trim_start)
-            .find(|line| line.starts_with(mount))
+            .map(str::trim)
+            .find(|line| line.ends_with(mount))
             .unwrap_or_else(|| panic!("`{mount}` is mounted"));
         assert!(
             line.contains(key),
@@ -322,7 +325,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 /// header above it printed one — two readings of one room, on screen together.
 #[test]
 fn the_dm_header_takes_the_slack_the_channel_title_would() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(screen.contains(
         "if !empty(active_dm.name)\n                    box w=fill clip=true\n                      DmHeader peer=active_dm"
     ));
@@ -368,14 +371,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
     // user-chosen string, so both networks can hold a `#general` — the key
     // carries the ENDPOINT for exactly that reason (ducktape-ui#697), and the
     // assertions below drive both halves of the promise.
-    let node_a_composer = composer_scope(&mut app);
-    type_into(
-        &mut app,
-        &node_a_composer,
-        ComposerKind::Message,
-        "node a draft",
-    );
-    assert_eq!(composer_text(&app, &node_a_composer), "node a draft");
+    let node_a_composer = composer_scope(&app);
+    type_into(&node_a_composer, "node a draft");
+    assert_eq!(composer_text(&node_a_composer), "node a draft");
 
     let _ = app.__update(__DucktapeMessage::ConsoleOpened(iced::window::Id::unique()));
 
@@ -394,18 +392,18 @@ fn opening_a_network_clears_the_previous_networks_state() {
     // instance — and node A's words are still under node A's key, which is
     // the half a `message_drafts = []` clear used to get wrong by throwing
     // them away instead.
-    let node_b_composer = composer_scope(&mut app);
+    let node_b_composer = composer_scope(&app);
     assert_ne!(
         node_b_composer, node_a_composer,
         "the endpoint is in the key, so #general on node B is not #general on \
          node A"
     );
     assert!(
-        composer_text(&app, &node_b_composer).is_empty(),
+        composer_text(&node_b_composer).is_empty(),
         "a draft typed on node A is not node B's to hand back"
     );
     assert_eq!(
-        composer_text(&app, &node_a_composer),
+        composer_text(&node_a_composer),
         "node a draft",
         "and it is still node A's, waiting where it was typed"
     );
@@ -464,13 +462,13 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_messages = vec![message(7, "the root", false)];
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "half a reply");
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "half a reply");
 
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(app.channel_settings_open, "the drawer opened");
     assert_eq!(
-        composer_text(&app, &rail),
+        composer_text(&rail),
         "half a reply",
         "the drawer does not discard a reply in progress"
     );
@@ -484,7 +482,7 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     // Closing it gives the rail back exactly as it was.
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(!app.channel_settings_open);
-    assert_eq!(composer_text(&app, &rail), "half a reply");
+    assert_eq!(composer_text(&rail), "half a reply");
     assert_eq!(app.active_thread_seq, 7);
 
     // The screen is what hides the rail while the drawer is up — the handler
@@ -1011,7 +1009,9 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
 fn unread_indicators_are_wired_client_local_only() {
     // Sidebar badge: ChannelButton takes an `unread` flag and paints the
     // brand treatment + dot when set.
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     assert!(components.contains(
         "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)"
     ));
@@ -1027,7 +1027,7 @@ fn unread_indicators_are_wired_client_local_only() {
         "if unread\n                box w=fill clip=true\n                  text channel.name size=13.0 wrap=none font=display @text-fg"
     ));
 
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     // The prepared row owns the scalar. No list-taking extern runs in either
     // sidebar loop.
     assert!(screen.contains(

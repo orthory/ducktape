@@ -26,11 +26,11 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use iced::futures::stream::BoxStream;
+use iced::futures::{SinkExt as _, StreamExt as _};
 use media_service::call_wire;
 use media_service::call_wire::CapturedFrame;
 use media_service::voice::FRAME_SAMPLES;
-use iced::futures::stream::BoxStream;
-use iced::futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -250,8 +250,9 @@ fn ws_url(rpc: &str, channel_id: &str, token: &str) -> String {
 /// the registered workspace whose endpoint is `rpc`. A node with no local
 /// workspace cannot be called into — the hub refuses every socket without it.
 fn workspace_secret(rpc: &str) -> Result<String, String> {
-    let (_, workspace) = crate::backend::workspace_at(rpc)
-        .ok_or_else(|| "this node has no local workspace, so its call hub cannot admit this device".to_string())?;
+    let (_, workspace) = crate::backend::workspace_at(rpc).ok_or_else(|| {
+        "this node has no local workspace, so its call hub cannot admit this device".to_string()
+    })?;
     crate::backend::read_link_token(&workspace)
 }
 

@@ -77,15 +77,13 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     // screen draws the rail under `!channel_settings_open`, so a capture with
     // the drawer open would find nothing to name.
     app.active_thread_seq = 7;
-    let rail = reply_composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "thread reply");
+    let rail = reply_composer_scope(&app);
+    type_into(&rail, "thread reply");
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
     app.message_action = MessageAction::Editing;
     app.message_edit_draft = "message edit".into();
     app.channel_settings_open = true;
-    app.channel_name_draft = "channel rename".into();
-    app.member_key_draft = "member".into();
     app.thread_generation = 4;
     app.thread_target_seq = 9;
     app.thread_messages = vec![message(7, "old thread", false)];
@@ -108,8 +106,6 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
     assert!(!app.channel_settings_open);
-    assert!(app.channel_name_draft.is_empty());
-    assert!(app.member_key_draft.is_empty());
     assert_eq!(app.active_thread_seq, 0);
     assert_eq!(app.thread_generation, 5);
     assert_eq!(app.thread_target_seq, 0);
@@ -120,7 +116,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     // The rail closed under her, and her words did NOT go with it: the reply
     // composer is that thread's own retained instance (ducktape-ui#697), so
     // it waits under its key for the rail to reopen there.
-    assert_eq!(composer_text(&app, &rail), "thread reply");
+    assert_eq!(composer_text(&rail), "thread reply");
     assert_eq!(app.active_page, "fallback-page");
 }
 
@@ -137,10 +133,10 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.thread_messages = vec![message(9, "thread root", false)];
     app.thread_next_reply_seq = 3;
     app.thread_has_more = true;
-    let rail = reply_composer_scope(&mut app);
-    let stream = composer_scope(&mut app);
-    type_into(&mut app, &rail, ComposerKind::Reply, "reply in progress");
-    type_into(&mut app, &stream, ComposerKind::Message, "next message");
+    let rail = reply_composer_scope(&app);
+    let stream = composer_scope(&app);
+    type_into(&rail, "reply in progress");
+    type_into(&stream, "next message");
     app.mutation_phase = MutationPhase::Channel;
 
     // an unrelated mutation's ack carries no snapshot — nothing to stomp
@@ -156,8 +152,8 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     assert_eq!(app.thread_messages.len(), 1);
     assert_eq!(app.thread_next_reply_seq, 3);
     assert!(app.thread_has_more);
-    assert_eq!(composer_text(&app, &rail), "reply in progress");
-    assert_eq!(composer_text(&app, &stream), "next message");
+    assert_eq!(composer_text(&rail), "reply in progress");
+    assert_eq!(composer_text(&stream), "next message");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
@@ -413,7 +409,7 @@ fn history_windows_offer_a_jump_back_to_latest() {
     // The way back is a float over the timeline's bottom edge now, not a
     // button inside an amber band at the top of the column — and it is shown
     // for a reader who simply scrolled up, not only for a history window.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat.contains("if !empty(messages) && (history_view || !at_live_tail)"));
     assert!(chat.contains("button \"↓  Jump to latest\""));
     assert!(chat.contains("-> emit(choose_channel, active_channel)"));

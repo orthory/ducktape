@@ -133,7 +133,7 @@ pub struct LiveThreadData {
     pub messages: Vec<ChatMessage>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,

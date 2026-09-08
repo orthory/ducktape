@@ -92,8 +92,6 @@ on reconnect
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -141,8 +139,8 @@ on reconnect
   page_refusal = ""
   block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
-  // The DRAFT survives, like `chat_search_draft` above — a typed-but-never-
-  // submitted query produced nothing this reset needs to discard, and this
+  // The DRAFT survives — it is the chat view's own now, and a typed-but-never-
+  // submitted query produced nothing this reset needs to discard; this
   // handler's doctrine is that typed drafts live through a reconnect. The
   // ANSWER does not: hits, flag and query go together, and the emptied query
   // is what keeps the zero-hit plate from reading the emptied list as a
@@ -449,13 +447,11 @@ on live_resynced(next)
   // that room (ducktape-ui#698). The plate is instance state now, so the
   // rescue has to say WHICH plate; a publication sits mid-handler, so the
   // guards below it still run.
-  slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing) at composer_scope(connected_rpc, active_channel)
+  composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing)
   selected_message_rev = message_seq_after_failure(selected_message_rev, MutationPhase.message_edit, selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, MutationPhase.message_edit, selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, MutationPhase.message_edit, selected_message_seq <= 0)
   channel_settings_open = channel_settings_open && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
-  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   // The line below zeroes the seq when the root was deleted or the room

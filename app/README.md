@@ -22,9 +22,9 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer and Settings tabs are not
-native: each is an Ice application under `crates/views` (`governance`,
-`members`, `agents`, `node`, `explorer`, `settings`) compiled
+The Approvals, Members, Agents, Node, Explorer, Settings and Chat tabs are
+not native: each is an Ice application under `crates/views` (`governance`,
+`members`, `agents`, `node`, `explorer`, `settings`, `chat`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -49,8 +49,13 @@ the Explorer's workspace search is run by the app on the view's behalf. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
-tells the view which drafts it consumed. The
-views workspace pins the same `ducktape-ui` rev as this crate; `make views`
+tells the view which drafts it consumed. A view whose screen needs a widget
+the tree wire does not carry leaves that widget to the host too: the Chat
+view declares `chat_composer` as a host surface per room and per thread,
+and the app paints its rich composer there (`src/composer_surface.rs`),
+keeps every box's words for the life of the process, and hears a submit as
+the view's `composer` intent — the words themselves never cross the wire.
+The views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 
 ## Release build (macOS: signed and notarized)

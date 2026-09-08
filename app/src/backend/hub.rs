@@ -1082,14 +1082,8 @@ mod tests {
     fn tray_open_reconnects_the_console_only_when_untracked_and_connected() {
         use crate::TrayOpen;
 
-        assert!(matches!(
-            tray_open_action(false, false),
-            TrayOpen::Launch
-        ));
-        assert!(matches!(
-            tray_open_action(true, false),
-            TrayOpen::Console
-        ));
+        assert!(matches!(tray_open_action(false, false), TrayOpen::Launch));
+        assert!(matches!(tray_open_action(true, false), TrayOpen::Console));
         assert!(matches!(tray_open_action(true, true), TrayOpen::Raise));
         assert!(matches!(tray_open_action(false, true), TrayOpen::Raise));
     }

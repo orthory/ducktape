@@ -2,10 +2,11 @@ ui_lang::include_app!("src/ui/app.ice");
 
 mod backend;
 mod call;
-mod video;
+mod composer_surface;
 mod editor;
 mod module_view;
 mod pages;
+mod video;
 
 fn main() -> iced::Result {
     install_log();

@@ -344,6 +344,10 @@ pub async fn duck_echo_i64(value: i64) -> Result<i64, AppError> {
     Ok(value)
 }
 
+pub async fn duck_echo_f64(value: f64) -> Result<f64, AppError> {
+    Ok(value)
+}
+
 /// Which second step a forge deep link still owes once its repo is open.
 pub fn forge_focus_kind(number: i64, path: String) -> crate::ForgeFocus {
     let item = number > 0;
