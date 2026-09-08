@@ -157,3 +157,54 @@ fn project(props: &mut Value, arrays: &[&str], source_fields: &[&str], preview: 
     props["display_shortened"] = shortened.into();
     props["display_unavailable"] = unavailable.into();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn source_and_route_identity_survive_display_clipping() {
+        let source = "한글".repeat(12_000);
+        let input = json!({"preview_text": source, "preview_truncated": false,
+            "preview_path": "/shared/source", "entries": [{"key": 17, "path": "/shared/entry", "name": "entry"}],
+            "directories": [], "history": [], "diff": []});
+        let result: Value = serde_json::from_slice(&files(input)).unwrap();
+        assert_eq!(result["preview_text"], source);
+        assert_eq!(result["preview_truncated"], false);
+        assert_eq!(result["preview_path"], "/shared/source");
+        assert_eq!(result["entries"][0]["key"], 17);
+        assert_eq!(result["entries"][0]["path"], "/shared/entry");
+        assert_eq!(result["preview_display_clipped"], true);
+        assert!(result["preview_display_text"].as_str().unwrap().len() < source.len());
+    }
+
+    #[test]
+    fn counted_omissions_keep_the_newest_contiguous_tail() {
+        let rows: Vec<_> = (0..100)
+            .map(|n| json!({"id": n, "body": "note".repeat(700)}))
+            .collect();
+        let result: Value =
+            serde_json::from_slice(&forge(json!({"discussion": rows, "file_text": ""}))).unwrap();
+        let kept = result["discussion"].as_array().unwrap();
+        assert_eq!(kept.last().unwrap()["id"], 99);
+        let first = kept.first().unwrap()["id"].as_i64().unwrap();
+        assert_eq!(result["display_omitted"], first);
+        assert!(first > 0);
+        assert_eq!(result["discussion_clipped"], true);
+        for (offset, row) in kept.iter().enumerate() {
+            assert_eq!(row["id"], first + offset as i64);
+        }
+    }
+
+    #[test]
+    fn oversized_identity_gets_an_explicit_unavailable_view_not_a_changed_path() {
+        let path = "/".repeat(20_000);
+        let result: Value =
+            serde_json::from_slice(&files(json!({"path": path, "preview_text": "original"})))
+                .unwrap();
+        assert_eq!(result["path"], path);
+        assert_eq!(result["preview_text"], "original");
+        assert_eq!(result["display_unavailable"], true);
+    }
+}
