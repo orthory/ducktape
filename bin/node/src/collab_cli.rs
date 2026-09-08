@@ -128,8 +128,17 @@ pub(crate) struct SendArgs {
     /// the same credential. Read the last one back with the `send_state` query.
     #[arg(long, value_name = "N")]
     seq: u64,
-    /// delivery deadline, in seconds from now. Scaled into the network's own
-    /// `consensus_time` unit before it is submitted — never a laptop clock.
+    /// how long this message stays deliverable, as a seconds INTENT converted
+    /// into the network's own `consensus_time` unit — never a laptop clock.
+    ///
+    /// The two lanes measure in different things, so the conversion is exact on
+    /// one and nominal on the other: a `millis` network counts milliseconds, so
+    /// the deadline is these seconds exactly; a `height` network counts BLOCKS,
+    /// so it is this many blocks, which is these seconds only while the chain
+    /// heartbeats at one block a second. A slower chain makes the wall-clock
+    /// window longer, a faster one shorter. Use `collab send --help` on the
+    /// network you are addressing and read `/v1/status`'s `consensus_time_unit`
+    /// if the distinction matters to you.
     #[arg(long, value_name = "SECONDS", default_value_t = 86_400)]
     ttl_secs: u64,
     /// the message body, after `--`
@@ -267,13 +276,28 @@ fn submit(
 /// create it. Never mints: `send` and `ack` act AS an existing binding, and
 /// minting one here would sign with a key no committed `Bind` has authorized —
 /// producing an op the module refuses, from a CLI that looked like it worked.
+/// The network a workspace belongs to, off its own `network.toml`.
+///
+/// A scoped key is fenced by this (`collab_keys`' header says why: a submit
+/// frame carries no chain id, so one key shared across two networks would make
+/// a send replayable between them). Read from the workspace rather than from
+/// `/v1/status` on purpose — it is the same answer, but it needs no node
+/// running, so `collab key` still prints on a stopped node, and a proxy
+/// standing in for one cannot change which key gets signed with.
+fn chain_id(workspace: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let path = workspace.join("network.toml");
+    Ok(crate::config::NetworkDescriptor::load(&path)?.chain_id)
+}
+
 fn scoped_key(
     ctx: &VerbCtx,
     conversation: &str,
     participant: &str,
 ) -> Result<commonware_cryptography::ed25519::PrivateKey, Box<dyn std::error::Error>> {
     let workspace = ctx.addr.workspace()?;
+    let network = chain_id(&workspace)?;
     let binding = crate::collab_keys::BindingRef {
+        network: &network,
         conversation,
         participant,
     };
@@ -295,7 +319,9 @@ fn scoped_key(
 fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> CollabResult {
     let base = ctx.http_base()?;
     let workspace = ctx.addr.workspace()?;
+    let network = chain_id(&workspace)?;
     let binding = crate::collab_keys::BindingRef {
+        network: &network,
         conversation: &args.conversation,
         participant: &args.participant,
     };
@@ -369,30 +395,64 @@ fn cmd_ack(args: AckArgs, ctx: &VerbCtx) -> CollabResult {
 /// its own, because a default would have to guess the unit. So the sender reads
 /// the unit off the node and scales into it — never a laptop's wall clock, which
 /// two nodes would disagree about.
+///
+/// The unit is REQUIRED, not defaulted. `NodeStatus::consensus_time_unit` is an
+/// ordinary field, so every node serving `/v1/status` emits it; a response
+/// without one is a reshaped or proxied status, not an older node. Defaulting
+/// there would pick a unit for a network that did not say which it counts in,
+/// and picking wrong is the whole bug this reads to avoid — a 24 h intent
+/// becomes 86 seconds if a millis lane is read as height.
 fn deadline(base: &str, ttl_secs: u64) -> Result<u64, Box<dyn std::error::Error>> {
     let status =
         crate::node_http::get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
     let now = status["consensus_time"]
         .as_u64()
         .ok_or_else(|| "node status carries no consensus_time".to_string())?;
-    let unit: noded::ConsensusTimeUnit = status
+    let named_unit = status
         .get("consensus_time_unit")
         .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| format!("node status consensus_time_unit: {error}"))?
-        .unwrap_or_default();
-    Ok(now + ttl_units(ttl_secs, unit))
+        .ok_or_else(|| "node status names no consensus_time_unit".to_string())?;
+    let unit: noded::ConsensusTimeUnit = serde_json::from_value(named_unit)
+        .map_err(|error| format!("node status consensus_time_unit: {error}"))?;
+    absolute_deadline(now, ttl_secs, unit)
 }
 
-/// Seconds into one network's `consensus_time` units. Pure, so the two shapes
-/// are testable without a node to dial.
+/// `now` plus the scaled TTL, as an absolute deadline — or a refusal.
 ///
-/// A `Height` unit is one block and a validator network heartbeats about once a
-/// second, so seconds map one-to-one; `Millis` is a millisecond epoch clock.
+/// Split out of [`deadline`] so the arithmetic is testable against a REAL
+/// nonzero clock reading without a node to dial. Scaling alone saturating is
+/// not enough: `u64::MAX` seconds scales to a saturated TTL that still
+/// overflows when added to any `now > 0`, which in release wraps into a
+/// deadline in the PAST — a message that expires the moment it lands, from a
+/// CLI that printed a height and looked like it worked. Refuse instead, and
+/// name the TTL as the thing to change.
+fn absolute_deadline(
+    now: u64,
+    ttl_secs: u64,
+    unit: noded::ConsensusTimeUnit,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let ttl = ttl_units(ttl_secs, unit);
+    now.checked_add(ttl).ok_or_else(|| {
+        format!(
+            "--ttl-secs {ttl_secs} is {ttl} {unit:?} units, past the end of the clock \
+             from {now} — pick a shorter deadline"
+        )
+        .into()
+    })
+}
+
+/// A seconds intent in one network's `consensus_time` units. Pure, so both
+/// lanes are testable without a node to dial.
+///
+/// `Millis` is a millisecond epoch clock, so the conversion is exact. `Height`
+/// counts BLOCKS: this returns that many blocks, which is that many seconds
+/// only while the chain heartbeats at one block a second. It is a nominal
+/// mapping, not a promise about wall-clock time — the flag's help says so.
+///
 /// The scaling saturates rather than wrapping: an absurd `--ttl-secs` must
-/// become a deadline the module refuses as too far out, never one that wraps
-/// past zero into the past.
+/// become a deadline that is refused, never one that wraps past zero into the
+/// past. Saturating here only bounds the SCALE; [`absolute_deadline`] is what
+/// refuses the sum.
 fn ttl_units(ttl_secs: u64, unit: noded::ConsensusTimeUnit) -> u64 {
     match unit {
         noded::ConsensusTimeUnit::Height => ttl_secs,
@@ -438,7 +498,9 @@ impl From<AckState> for collaboration::DeliveryState {
 /// binding would name one nothing holds.
 fn cmd_key(args: KeyArgs, ctx: &VerbCtx) -> CollabResult {
     let workspace = ctx.addr.workspace()?;
+    let network = chain_id(&workspace)?;
     let binding = crate::collab_keys::BindingRef {
+        network: &network,
         conversation: &args.conversation,
         participant: &args.participant,
     };
@@ -585,15 +647,47 @@ mod tests {
         );
     }
 
-    /// An absurd TTL must become a deadline the module refuses as too far out,
-    /// never one that wraps past zero into the past — which the module would
-    /// accept as "already expired" or, worse, admit.
+    /// A whole deadline against a REAL clock reading, which is what gets
+    /// submitted — a scaled TTL alone proves nothing about the sum.
     #[test]
-    fn an_absurd_ttl_saturates_rather_than_wrapping_into_the_past() {
-        let enormous = ttl_units(u64::MAX, noded::ConsensusTimeUnit::Millis);
-        assert_eq!(enormous, u64::MAX, "it must saturate, not wrap");
-        assert!(enormous > 0);
+    fn a_deadline_is_the_networks_clock_plus_the_scaled_ttl() {
+        let height_lane = absolute_deadline(40_000, 86_400, noded::ConsensusTimeUnit::Height)
+            .expect("an ordinary deadline");
+        assert_eq!(height_lane, 40_000 + 86_400);
+
+        // the sim lane's clock is a millisecond epoch miles past any height,
+        // so this is the reading that catches a unit mix-up.
+        let sim_now = 1_757_000_000_000;
+        let millis_lane =
+            absolute_deadline(sim_now, 86_400, noded::ConsensusTimeUnit::Millis).expect("ditto");
+        assert_eq!(millis_lane, sim_now + 86_400_000);
     }
+
+    /// An absurd TTL must be REFUSED, never wrapped past the end of the clock
+    /// into the past — which the module would read as already expired, from a
+    /// CLI that printed a height and looked like it had worked.
+    ///
+    /// Scaling saturating is not enough: `u64::MAX` saturates to a TTL that
+    /// still overflows when added to any nonzero clock. Nonzero `now` is the
+    /// whole point of the case.
+    #[test]
+    fn an_absurd_ttl_is_refused_rather_than_wrapping_into_the_past() {
+        assert_eq!(
+            ttl_units(u64::MAX, noded::ConsensusTimeUnit::Millis),
+            u64::MAX,
+            "the scale must saturate, not wrap"
+        );
+        for unit in [
+            noded::ConsensusTimeUnit::Height,
+            noded::ConsensusTimeUnit::Millis,
+        ] {
+            let refusal = absolute_deadline(40_000, u64::MAX, unit)
+                .expect_err("an unrepresentable deadline must refuse");
+            let names_the_flag = refusal.to_string().contains("--ttl-secs");
+            assert!(names_the_flag, "the refusal must name the knob: {refusal}");
+        }
+    }
+
 
     /// `send` and `ack` act AS an existing binding. Minting a key here would
     /// sign with one no committed `Bind` has authorized — an op the module
@@ -603,6 +697,7 @@ mod tests {
     fn sending_without_a_binding_refuses_and_never_mints_a_key() {
         let workspace = tempfile::TempDir::new().expect("temp workspace");
         let binding = crate::collab_keys::BindingRef {
+            network: "ducktape#a1b2c3d4",
             conversation: "c1",
             participant: "p1",
         };
@@ -626,6 +721,7 @@ mod tests {
     fn an_attach_authorizes_a_scoped_key_that_is_not_the_owner_key() {
         let workspace = tempfile::TempDir::new().expect("temp workspace");
         let binding = crate::collab_keys::BindingRef {
+            network: "ducktape#a1b2c3d4",
             conversation: "c1",
             participant: "p1",
         };

@@ -26,13 +26,33 @@
 //! committed on-chain in the binding, so re-minting it at boot would silently
 //! revoke every attachment on this host.
 //!
+//! ## a key is scoped to one NETWORK as well as one binding
+//!
+//! `chain_id` is part of the binding's identity here, not decoration. One
+//! workspace can be pointed at a second network, and conversation and
+//! participant ids are module-defined strings that carry no network in them —
+//! so `("standup", "alice")` on network A and on network B are the same two
+//! strings. Without the chain id they would name one key file.
+//!
+//! That matters because a submit frame is NOT chain-bound: `user_frame` signs
+//! `signer ‖ seq ‖ target ‖ payload` and nothing else, so a frame minted for
+//! one network verifies byte-identically on another. Sharing one key across
+//! both would make a `Send` or `Acknowledge` signed for A replayable as the
+//! same binding's op on B. Fencing the KEY is what stops it: B's binding
+//! commits a different public key, so A's frame is signed by a key B's module
+//! does not recognise, and B refuses it.
+//!
+//! The fence is the workspace's own `network.toml` (`chain_id`, which that
+//! file's own doc calls the namespace) — immutable per network and readable
+//! with no node running.
+//!
 //! ## the filename is a digest
 //!
 //! A conversation id and a participant id are module-defined strings; core puts
 //! no charset on them. Rather than constrain core's id space or hand-roll an
-//! escaping rule, the file is named by `sha256(conversation ‖ 0x1f ‖ participant)`
-//! — no id can walk out of the directory, and nothing here has to be listed by
-//! name.
+//! escaping rule, the file is named by
+//! `sha256(chain_id ‖ 0x1f ‖ conversation ‖ 0x1f ‖ participant)` — no id can
+//! walk out of the directory, and nothing here has to be listed by name.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -43,18 +63,25 @@ use sha2::Digest as _;
 /// must never be offered as one.
 const DIR: &str = "collab-keys";
 
-/// One binding's identity, as the two ids that name it on-chain.
+/// One binding's identity: the network it lives on, and the two ids that name
+/// it there on-chain.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BindingRef<'a> {
+    /// the workspace's `network.toml` `chain_id`. Two networks never share a
+    /// scoped key — see this module's header.
+    pub(crate) network: &'a str,
     pub(crate) conversation: &'a str,
     pub(crate) participant: &'a str,
 }
 
 impl BindingRef<'_> {
-    /// the digest that names this binding's key file. `0x1f` separated so
-    /// `("ab", "c")` and `("a", "bc")` cannot collide.
+    /// the digest that names this binding's key file. `0x1f` separated so no
+    /// shift of a boundary between the three parts can collide — `("ab", "c")`
+    /// with `("a", "bc")`, or a chain id ending in a conversation id's prefix.
     fn file_name(&self) -> String {
         let mut hasher = sha2::Sha256::new();
+        hasher.update(self.network.as_bytes());
+        hasher.update([0x1f]);
         hasher.update(self.conversation.as_bytes());
         hasher.update([0x1f]);
         hasher.update(self.participant.as_bytes());
@@ -174,8 +201,19 @@ mod tests {
         tempfile::TempDir::new().expect("temp workspace")
     }
 
+    const NET: &str = "ducktape#a1b2c3d4";
+
     fn binding<'a>(conversation: &'a str, participant: &'a str) -> BindingRef<'a> {
+        on_network(NET, conversation, participant)
+    }
+
+    fn on_network<'a>(
+        network: &'a str,
+        conversation: &'a str,
+        participant: &'a str,
+    ) -> BindingRef<'a> {
         BindingRef {
+            network,
             conversation,
             participant,
         }
@@ -205,13 +243,42 @@ mod tests {
         assert_ne!(public_hex(&a), public_hex(&other_participant));
     }
 
-    /// The id pair is separated before hashing, so a shift of the boundary
-    /// between the two ids cannot name the same file.
+    /// The parts are separated before hashing, so a shift of any boundary
+    /// between them cannot name the same file.
     #[test]
-    fn the_id_pair_cannot_collide_by_shifting_its_boundary() {
+    fn the_id_parts_cannot_collide_by_shifting_a_boundary() {
         assert_ne!(
             binding("ab", "c").file_name(),
             binding("a", "bc").file_name()
+        );
+        assert_ne!(
+            on_network("net", "a", "p").file_name(),
+            on_network("ne", "ta", "p").file_name()
+        );
+    }
+
+    /// One workspace pointed at a second network must not reuse the first
+    /// network's scoped key for the same two ids.
+    ///
+    /// A submit frame is not chain-bound (`user_frame` signs signer, seq,
+    /// target and payload — no chain id), so one shared key would make a `Send`
+    /// or `Acknowledge` minted for one network replayable as the same binding's
+    /// op on the other. Distinct keys are what refuse it: the second network's
+    /// binding commits a different public key.
+    #[test]
+    fn the_same_binding_on_another_network_gets_another_key() {
+        let dir = workspace();
+        let here = ensure(dir.path(), on_network("ducktape#aaaa1111", "standup", "alice"))
+            .expect("mints");
+        let elsewhere = ensure(
+            dir.path(),
+            on_network("ducktape#bbbb2222", "standup", "alice"),
+        )
+        .expect("mints");
+        assert_ne!(
+            public_hex(&here),
+            public_hex(&elsewhere),
+            "one workspace, two networks, two keys"
         );
     }
 
