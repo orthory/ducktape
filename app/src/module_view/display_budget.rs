@@ -66,6 +66,14 @@ fn shorten_record(value: &mut Value) -> bool {
 /// The production Forge encoder. The landing note and newest discussion get
 /// first claim around the item body, then the other lists. Omitted rows are counted.
 pub(super) fn forge(mut props: Value) -> Vec<u8> {
+    props["has_staged_comments"] = props["staged_comments"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+        .into();
+    props["has_merge_conflicts"] = props["merge_conflicts"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+        .into();
     let arrays = [
         "linked_note",
         "forge_item_blocks",
@@ -132,11 +140,17 @@ fn project(props: &mut Value, arrays: &[&str], source_fields: &[&str], preview: 
             rows.reverse();
         }
         let mut kept = Vec::new();
+        // An item body must leave a share for the newest discussion below it.
+        let mut section_left = if key == "forge_item_blocks" {
+            left / 2
+        } else {
+            left
+        };
         let mut exhausted = false;
         for mut row in rows {
             let cut = shorten_record(&mut row);
             let cost = charge(&row);
-            if exhausted || cost > left {
+            if exhausted || cost > section_left {
                 omitted = omitted.saturating_add(1);
                 exhausted = true;
                 if newest {
@@ -144,6 +158,7 @@ fn project(props: &mut Value, arrays: &[&str], source_fields: &[&str], preview: 
                 }
             } else {
                 left -= cost;
+                section_left -= cost;
                 shortened |= cut;
                 kept.push(row);
             }

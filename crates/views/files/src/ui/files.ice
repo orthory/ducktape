@@ -228,7 +228,7 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
               // THIS path there is nothing to read — the node is down, or the
               // rows still describe the directory you just left — and the main
               // pane already says so.
-              if connected && listed && empty(directories)
+              if connected && listed && empty(directories) && display_omitted == 0
                 box
                   with
                     w=fill
@@ -302,7 +302,7 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
                       active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle
-                  if empty(diff)
+                  if empty(diff) && display_omitted == 0
                     text "No differences." size=12.5 @text-caption
                   for entry in diff
                     row
@@ -331,7 +331,7 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
                   // failed. Same trade as the "No differences." arm above.
                   if !empty(history)
                     GroupLabel label="SNAPSHOTS"
-                  if empty(history)
+                  if empty(history) && display_omitted == 0
                     text "No snapshots yet." size=12.5 @text-caption
                   for snapshot in history
                     box

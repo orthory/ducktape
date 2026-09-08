@@ -1250,17 +1250,16 @@ pub fn chat_view(
 /// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
 /// newest messages come last — a busy room's hot window (256 rows) drew its
 /// newest messages blank. The rest of the frame (rooms, names, times, the
-/// rail) lives in the headroom. The forge discussion and the file preview
-/// are held to the same budget.
-const FRAME_TEXT_BUDGET: usize = 48 << 10;
+/// rail) lives in the headroom.
+const TIMELINE_TEXT_BUDGET: usize = 48 << 10;
 
 /// The facts encoded for the view, the timelines held to
-/// [`FRAME_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
+/// [`TIMELINE_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
 /// first, and a clipped stream says so through `has_older_history` (the
 /// thread through `thread_has_more`, its root always kept) so the view still
 /// offers what was left behind as history.
 fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
-    let (stream, stream_clipped) = newest_within(props.messages, FRAME_TEXT_BUDGET);
+    let (stream, stream_clipped) = newest_within(props.messages, TIMELINE_TEXT_BUDGET);
     let stream_spent: usize = stream.iter().map(text_bytes).sum();
     props.messages = stream;
     props.has_older_history |= stream_clipped;
@@ -1273,7 +1272,7 @@ fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
     );
     let (replies, thread_clipped) = newest_within(
         &thread[root..],
-        FRAME_TEXT_BUDGET
+        TIMELINE_TEXT_BUDGET
             .saturating_sub(stream_spent + thread[..root].iter().map(text_bytes).sum::<usize>()),
     );
     if thread_clipped {
@@ -4274,8 +4273,8 @@ pub(crate) mod tests {
           "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
           "forge_item_merge_oid": "", "forge_item_source_oid": "",
           "forge_item_approvals": 0, "forge_item_change_requests": 0,
-          "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-          "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+          "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+          "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
           "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
           "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
           "tree_entries": [], "tree_born": false, "tree_truncated": false,
@@ -4469,12 +4468,17 @@ pub(crate) mod tests {
         facts["open_repo"] = "core".into();
         facts["forge_item_number"] = 7.into();
         facts["item_phase"] = "ready".into();
-        facts["forge_item_kind"] = "pull".into();
+        facts["forge_item_kind"] = "pr".into();
+        facts["forge_item_state"] = "open".into();
+        facts["forge_item_source_oid"] = "source-oid".into();
         facts["forge_item_body"] = "body".repeat(16_000).into();
-        facts["forge_item_blocks"] = serde_json::to_value(crate::backend::paragraph_blocks(
-            &"rich body ".repeat(6_000),
-        ))
-        .unwrap();
+        facts["forge_item_blocks"] =
+            serde_json::to_value(crate::backend::paragraph_blocks(&format!(
+                "**{}**\n\n{}",
+                "rich body ".repeat(3_000),
+                "plain body ".repeat(3_000)
+            )))
+            .unwrap();
         facts["discussion"] = (1..=40)
             .map(|n| {
                 let body = format!("latest-{n} {}", "한글".repeat(400));
@@ -4493,15 +4497,37 @@ pub(crate) mod tests {
             "new".repeat(10_000)
         )))
         .unwrap();
-        facts["staged_comments"] = (0..64).map(|n| serde_json::json!({"anchor": format!("a{n}"), "path": "main", "line": "1", "side": "new", "body": "comment".repeat(2_000)})).collect::<Vec<_>>().into();
+        facts["staged_comments"] = (0..64).map(|n| serde_json::json!({"anchor": format!("a{n}{}", "x".repeat(12_000)), "path": "main", "line": "1", "side": "new", "body": "comment".repeat(2_000)})).collect::<Vec<_>>().into();
+        facts["merge_conflicts"] = vec!["conflict-path".repeat(8_000)].into();
         let bytes = display_budget::forge(facts);
         let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             projected["discussion"].as_array().unwrap().last().unwrap()["seq"],
             40
         );
-        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert_eq!(projected["has_staged_comments"], true);
         assert_display_projection_survives_wire("forge", &bytes, "latest-40");
+        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert!(projected["staged_comments"].as_array().unwrap().is_empty());
+        assert!(projected["merge_conflicts"].as_array().unwrap().is_empty());
+        let path = staged("forge").expect("actual forge wasm");
+        let mut guest = Guest::load_from("forge", &path).unwrap();
+        guest.redraw(&None);
+        let props = Some(bytes);
+        guest.redraw(&props);
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text.starts_with("Merge conflicts —"))
+        );
+        guest.deliver(Output::Activate(button_message(&guest, "Submit review")));
+        guest.redraw(&props);
+        assert!(
+            guest
+                .intents
+                .iter()
+                .any(|event| event.kind == "review_submit")
+        );
     }
 
     /// A busy room's whole hot window through the real wire: the newest
@@ -4717,7 +4743,7 @@ pub(crate) mod tests {
         assert!(newest_within(&stream, 250).1);
         assert_eq!(newest_within(&stream, 300), (&stream[..], false));
 
-        let big = FRAME_TEXT_BUDGET / 2;
+        let big = TIMELINE_TEXT_BUDGET / 2;
         let root = crate::backend::ChatMessage {
             thread_seq: 0,
             ..row(10, 10)
@@ -5163,8 +5189,8 @@ pub(crate) mod tests {
               "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
               "forge_item_merge_oid": "", "forge_item_source_oid": "",
               "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+              "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
               "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
               "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
               "tree_entries": [], "tree_born": false, "tree_truncated": false,
