@@ -6,7 +6,7 @@
 //! polls the deployments once a second (`deployments_checked`, what a block
 //! tip spawns). On every `view_source` transition that names a hash —
 //! Ready, Swapped, Missing, Failed — it writes the line to
-//! `<out>/view_source.log` and a PNG of the Approvals tab to
+//! `<out>/view_source.log` and a PNG of that module's tab to
 //! `<out>/<n>-<module>-<state>-<hash8>.png`. The steps themselves (activate
 //! A, then B, then an asset-only B′, then a removal) are somebody else's to
 //! drive; this runs until it is killed, or `DUCKTAPE_CANARY_STEPS` captures.
@@ -39,9 +39,9 @@ use iced::advanced::{clipboard, mouse, renderer};
 use iced::{Color, Event, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
-use crate::module_view::canary::{mount_module_owned, seated_hash, tap, texts};
+use crate::module_view::canary::{drawn, mount_module_owned, seated_hash, tap, texts};
 
-/// The Approvals tab as captured: a console-sized tab, one pixel per point.
+/// A tab as captured: console-sized, one pixel per point.
 const TAB: Size = Size::new(900.0, 600.0);
 /// How often the deployments are checked — a block interval, near enough.
 const POLL: Duration = Duration::from_secs(1);
@@ -139,7 +139,7 @@ fn run(node: &str, out: &Path, steps: usize, markers: bool) -> usize {
                     step.state,
                     &step.hash[..8]
                 );
-                let seal = capture(&mut renderer, &out.join(&name));
+                let seal = capture(&mut renderer, &step.module, &out.join(&name));
                 let shown = shown(&step.module);
                 std::fs::write(out.join(name.replace(".png", ".txt")), shown.join("\n"))
                     .expect("the texts file");
@@ -182,9 +182,8 @@ fn shown(module: &str) -> Vec<String> {
 /// The canary views' promise, held against this transition: an A (Ready)
 /// shows no marker, a B (Swapped) moves the hash and shows its module's
 /// marker, a B′ (a Swapped after a Swapped) changes the governance seal, a
-/// removal (Missing) shows nothing. The Approvals tab is the one drawn
-/// here; another module's marker is read only where its tab has a tree and
-/// is past "Not connected" — this read-only client never connects the
+/// removal (Missing) shows nothing. A module's marker is read only where
+/// its tab has a tree and is past "Not connected" — this read-only client never connects the
 /// Files tab to a workspace, and its marker sits behind that.
 fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
     let module = &step.module;
@@ -243,19 +242,25 @@ fn seated(step: &Transition) {
     );
 }
 
-/// The Approvals tab drawn to `path`: three frames, so the view's own
+/// `module`'s tab drawn to `path`: three frames, so the view's own
 /// requests are routed and its tree rebuilt, then the pixels — of which the
 /// seal's corner comes back, for the next capture to be held against.
-fn capture(renderer: &mut iced::Renderer, path: &Path) -> Vec<u8> {
+fn capture(renderer: &mut iced::Renderer, module: &str, path: &Path) -> Vec<u8> {
     let mut cache = user_interface::Cache::default();
     let mut clipboard = clipboard::Null;
+    let owned = crate::backend::view_source::MODULE_OWNED
+        .into_iter()
+        .find(|owned| *owned == module)
+        .expect("a module this app owns");
     for _ in 0..3 {
-        let mut ui = UserInterface::build(
-            crate::module_view::governance_view(false, true, false, true, "", &[]),
-            TAB,
-            cache,
-            renderer,
-        );
+        // the Approvals tab under the props the seal is judged on; every
+        // other module's tree as it stands, a read-only client's
+        let element = if module == "governance" {
+            crate::module_view::governance_view(false, true, false, true, "", &[])
+        } else {
+            drawn(owned)
+        };
+        let mut ui = UserInterface::build(element, TAB, cache, renderer);
         let mut messages = Vec::new();
         ui.update(
             &[Event::Window(iced::window::Event::RedrawRequested(
@@ -283,6 +288,76 @@ fn capture(renderer: &mut iced::Renderer, path: &Path) -> Vec<u8> {
     image::imageops::crop_imm(&tab, 0, 0, SEAL.0, SEAL.1)
         .to_image()
         .into_raw()
+}
+
+/// A capture names its module: the chat tab and the Approvals tab, seated
+/// from one node, are not the same picture.
+#[test]
+fn a_capture_draws_the_module_it_names() {
+    use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+    let views = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/views");
+    let (governance, chat) = (
+        views.join("governance_view.wasm"),
+        views.join("chat_view.wasm"),
+    );
+    if !governance.is_file() || !chat.is_file() {
+        eprintln!(
+            "skipped: no staged views under {} — run `make views`",
+            views.display()
+        );
+        return;
+    }
+    let governance = artifact(
+        &std::fs::read(governance).unwrap(),
+        vec![7],
+        seal("#d00000"),
+    );
+    // codes of their own: a seat left at the transition test's A would
+    // swallow that test's first transition
+    let chat = artifact(&std::fs::read(chat).unwrap(), vec![8], seal("#d00000"));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _turn = runtime.block_on(crate::module_view::canary::connection_turn());
+    let node = FakeDeployment::serving("governance", &governance);
+    node.artifacts.lock().unwrap().push(chat.clone());
+    *node.status.lock().unwrap() = serde_json::json!({"module_status": {"modules": [
+        {"module_id": "governance", "active_code_hash": governance.hash(), "pending": null,
+         "history": [{"height": 7, "code_hash": governance.hash()}]},
+        {"module_id": "chat", "active_code_hash": chat.hash(), "pending": null,
+         "history": [{"height": 7, "code_hash": chat.hash()}]},
+    ]}});
+    let client = runtime.block_on(fake_node(node));
+    mount_module_owned();
+    // the loads the connection starts, each joined: the seats are in
+    for load in crate::module_view::connected(&client) {
+        load.join().expect("a view load");
+    }
+    for (module, artifact) in [("governance", &governance), ("chat", &chat)] {
+        assert_eq!(
+            seated_hash(module),
+            Some(artifact.hash()),
+            "{module} seated"
+        );
+    }
+
+    let out = std::env::temp_dir().join(format!("ducktape-canary-tabs-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let mut renderer = crate::frame_probe::headless_renderer();
+    capture(&mut renderer, "governance", &out.join("governance.png"));
+    capture(&mut renderer, "chat", &out.join("chat.png"));
+    assert_ne!(
+        std::fs::read(out.join("governance.png")).unwrap(),
+        std::fs::read(out.join("chat.png")).unwrap(),
+        "the chat capture is the Approvals tab"
+    );
+    assert!(
+        texts("chat").iter().any(|text| text.contains("CHANNELS")),
+        "{:?}",
+        texts("chat")
+    );
 }
 
 #[test]
