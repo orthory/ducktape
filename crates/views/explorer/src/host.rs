@@ -143,6 +143,16 @@ pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {
 }
 
 /// `h 84,912`; a height the node has not reported reads `h —`.
+/// The list's landmark for a digest: its first twelve hex chars and an
+/// ellipsis. The whole value stays in the props for the detail and the copy.
+pub fn short(digest: &str) -> String {
+    let mut short: String = digest.chars().take(12).collect();
+    if digest.chars().count() > 12 {
+        short.push('\u{2026}');
+    }
+    short
+}
+
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();

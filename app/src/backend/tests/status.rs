@@ -100,8 +100,11 @@ fn explorer_ops_keep_the_full_hash_and_pretty_print_json_payloads() {
         data.ops[0].payload, "plain prose, not a document",
         "a non-JSON payload stays verbatim"
     );
-    // the list's landmark stays the short form
-    assert_eq!(data.blocks[0].hash.chars().count(), 13);
+    // the block hash, the commit and the proposer cross WHOLE: the guest
+    // abbreviates its list and copies the full value
+    assert_eq!(data.blocks[0].hash, "aa".repeat(32));
+    assert_eq!(data.blocks[0].commit, "bb".repeat(32));
+    assert_eq!(data.ops[0].proposer, "cc".repeat(32));
 }
 
 #[test]

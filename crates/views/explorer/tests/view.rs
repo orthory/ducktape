@@ -154,3 +154,39 @@ fn an_ops_hash_leaves_as_a_copy() {
         }
     );
 }
+
+/// A block's hash is a landmark in the list and a key in the detail: twelve
+/// hex chars on the row, the whole value beside a copy once the block is
+/// open — and the copy carries every character.
+#[test]
+fn a_block_hash_reads_short_in_the_list_and_whole_with_a_copy_in_the_detail() {
+    let hash = "9f3e".repeat(16);
+    let commit = "c0ffee11".repeat(8);
+    let props = ExplorerProps {
+        blocks: vec![ExplorerBlock {
+            height: 84_912,
+            hash: hash.clone(),
+            commit: commit.clone(),
+            op_count: 1,
+        }],
+        ..ledger()
+    };
+    let (_, frame) = shown(&props);
+    assert!(has_text(&frame, "9f3e9f3e9f3e…"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, &hash), "the list abbreviates");
+    let frame = tick_native(press(&frame, "Inspect block"));
+    assert!(has_text(&frame, &hash), "{:?}", texts(&frame));
+    assert!(has_text(&frame, &commit), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Copy block hash"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(intent.kind, "explorer.copy");
+    assert_eq!(
+        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        Copy {
+            text: hash,
+            label: "Block hash copied".into()
+        }
+    );
+}

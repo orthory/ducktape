@@ -30,6 +30,7 @@ extern crate::host
   pure icon(name:&str) -> bytes
   pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
   pure height_label(height:i64) -> str
+  pure short(digest:&str) -> str
   pure plural(count:i64, one:&str, many:&str) -> str
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
 
@@ -427,6 +428,36 @@ view
                       w=fill
                       h=fill
                     col w=fill gap=6.0
+                      // THE BLOCK'S OWN KEYS, WHOLE. The list abbreviates
+                      // the hash to a landmark; this is the one place the
+                      // reader gets every character, and a click copies it.
+                      for block in blocks
+                        if block.height == selected
+                          box
+                            with
+                              w=fill
+                              p=8.0
+                              bg=surface
+                              border=fg/10
+                              border-w=1.0
+                              r=9.0
+                            col w=fill gap=3.0
+                              DigestRow
+                                with
+                                  name="block"
+                                  digest=block.hash
+                                  copied="Block hash copied"
+                                  action="Copy block hash"
+                                events
+                                  copy_to_clipboard -> copy_to_clipboard _ _
+                              DigestRow
+                                with
+                                  name="commit"
+                                  digest=block.commit
+                                  copied="Commit hash copied"
+                                  action="Copy commit hash"
+                                events
+                                  copy_to_clipboard -> copy_to_clipboard _ _
                       for op in explorer_ops_at(ops, selected)
                         box
                           with
@@ -513,12 +544,20 @@ view
                                   wrap=none
                                   font=code_medium
                                   @text-muted
-                              text op.proposer
+                              button -> copy_to_clipboard(op.proposer, "Proposer copied")
                                 with
-                                  size=12.0
-                                  wrap=none
-                                  font=code
-                                  @text-muted
+                                  label="Copy proposer"
+                                  p=2.0
+                                  @ghost_action
+                                text op.proposer
+                                  with
+                                    size=12.0
+                                    wrap=word-or-glyph
+                                    font=code
+                                    @text-muted
+                                active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
+                                hovered bg=row_hover text=fg
+                                pressed bg=accent
                             // `chat(+0m/+0e)` sat here naked. `dispatch` is the
                             // word this screen's own "Select a block" plate
                             // already uses for it ("Its operations and dispatch
@@ -554,6 +593,37 @@ view
                                 wrap=word-or-glyph
                                 font=code
                                 @text-fg
+
+// A labelled digest, whole, in the code face; clicking it copies every
+// character. `word-or-glyph` wraps a 64-char hash instead of clipping it.
+component DigestRow(name:str, digest:str, copied:str, action:str)
+  emits
+    copy_to_clipboard(str, str)
+  row #root
+    with
+      w=fill
+      gap=8.0
+      align=center
+    text name
+      with
+        size=11.0
+        wrap=none
+        font=code_medium
+        @text-muted
+    button -> emit(copy_to_clipboard, digest, copied)
+      with
+        label=action
+        p=2.0
+        @ghost_action
+      text digest
+        with
+          size=12.0
+          wrap=word-or-glyph
+          font=code
+          @text-muted
+      active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
+      hovered bg=row_hover text=fg
+      pressed bg=accent
 
 component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
   emits
@@ -598,7 +668,9 @@ component ExplorerBlockFace(block:ExplorerBlock)
         wrap=none
         font=code
         @text-fg
-    text block.hash
+    // the landmark, not the key: the whole hash sits in the detail beside
+    // a copy once the block is open
+    text short(block.hash)
       with
         w=fill
         size=12.0

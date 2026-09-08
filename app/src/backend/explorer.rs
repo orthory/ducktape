@@ -78,22 +78,23 @@ pub(crate) fn explorer_window(generation: i64, rows: &[serde_json::Value]) -> Ex
         if row_ops.is_empty() {
             continue;
         }
+        // WHOLE, as the node prints them (bare lowercase hex): the guest
+        // abbreviates its list to a landmark and shows and copies the full
+        // value in the detail. A digest shortened here is a key the reader
+        // cannot use anywhere.
         blocks.push(ExplorerBlock {
             height,
-            hash: short_digest(row["hash"].as_str().unwrap_or_default()),
-            commit: short_digest(row["commit_hash"].as_str().unwrap_or_default()),
+            hash: row["hash"].as_str().unwrap_or_default().to_string(),
+            commit: row["commit_hash"].as_str().unwrap_or_default().to_string(),
             op_count: count_i64(row_ops.len()),
         });
         for op in row_ops {
             ops.push(ExplorerOp {
                 height,
-                proposer: short_digest(op["proposer"].as_str().unwrap_or_default()),
+                proposer: op["proposer"].as_str().unwrap_or_default().to_string(),
                 target: op["target"].as_str().unwrap_or_default().to_string(),
                 disposition: op["disposition"].as_str().unwrap_or_default().to_string(),
-                // FULL, not `short_digest`: this hash is the `GET
-                // /v1/files/blob/{op_hash}` key, so a shortened render is a
-                // key the reader cannot use. The card shows and copies it
-                // whole; the list's landmarks stay short.
+                // the `GET /v1/files/blob/{op_hash}` key
                 op_hash: op["op_hash"].as_str().unwrap_or_default().to_string(),
                 payload: explorer_payload(&op["payload"]),
                 trace: explorer_trace(op["operations"].as_array()),
@@ -109,7 +110,8 @@ pub(crate) fn explorer_window(generation: i64, rows: &[serde_json::Value]) -> Ex
     }
 }
 
-/// First 12 hex chars of a digest — the explorer's display form.
+/// First 12 hex chars of a digest — the display form where a screen has no
+/// detail to show the whole value in.
 pub(crate) fn short_digest(digest: &str) -> String {
     let mut short: String = digest.chars().take(12).collect();
     if digest.chars().count() > 12 {
