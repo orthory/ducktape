@@ -741,10 +741,11 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 /// Exemptions are named with their reason, never left implicit.
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
-    /// Settings owns connection repair and Node owns the daemon diagnostics;
-    /// both remain useful while the node is down instead of claiming the
-    /// network's module contents are empty.
-    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
+    /// Settings owns connection repair and remains useful while the node is
+    /// down instead of claiming the network's module contents are empty. (Node,
+    /// which owns the daemon diagnostics, is a module-owned view now and is
+    /// not in this inventory.)
+    const EXEMPT: [&str; 1] = ["SettingsScreen"];
 
     let mut screens: Vec<&str> = SCREENS
         .lines()
@@ -761,7 +762,6 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
             "ExplorerScreen",
             "FilesScreen",
             "ForgeScreen",
-            "NodeScreen",
             "PagesScreen",
             "SettingsScreen",
             "ShellScreen",
@@ -808,7 +808,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// rows)` is already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
-    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
+    const EXEMPT: [&str; 1] = ["SettingsScreen"];
 
     for source in [
         include_str!("../ui/screens/storage.ice"),

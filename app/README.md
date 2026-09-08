@@ -22,8 +22,8 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members and Agents tabs are not native: each is an Ice
-application under `crates/views` (`governance`, `members`, `agents`) compiled
+The Approvals, Members, Agents and Node tabs are not native: each is an Ice
+application under `crates/views` (`governance`, `members`, `agents`, `node`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -38,7 +38,11 @@ A view is a pure function of the props the app pushes it (`<module>.props`,
 one JSON item per change) and speaks back only in intents (`governance.vote`,
 `members.propose`, …) that the tab's handler signs and submits exactly as the
 native screen did; a view with nothing to write, like Agents, declares none. The guest sees no key, no endpoint and no clock, and a view
-that traps shows why in its place instead of taking the window with it. The
+that traps shows why in its place instead of taking the window with it. A
+view may leave a slot for something only the host can draw: the Node view's
+Activity tab declares `node_log_timeline` as a host surface, and the app
+paints its own retained log ring there (`surfaces_of` in `module_view.rs`),
+queuing what the reader does in it for the handler to drain. The
 views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 

@@ -249,18 +249,6 @@ component AgentAvatar(initials:str, plate:f64, ink:f64)
         ink
         ring=""
 
-// The status dot that precedes a machine reading.
-component Dot(plate:f64)
-  box #root
-    with
-      w=plate
-      h=plate
-      bg=success_dot
-      r=(plate / 2.0)
-    space w=1.0 h=1.0
-
-// A dashed empty plate — what a screen shows when its list is legitimately
-// empty, as opposed to not loaded yet.
 component EmptyPlate(message:str)
   box #root
     with

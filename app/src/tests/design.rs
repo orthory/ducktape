@@ -255,12 +255,10 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/components/huddle.ice"),
         include_str!("../ui/components/icon.ice"),
         include_str!("../ui/components/kit.ice"),
-        include_str!("../ui/components/node.ice"),
         include_str!("../ui/components/onboarding.ice"),
         include_str!("../ui/components/overlay.ice"),
         include_str!("../ui/components/pages.ice"),
         include_str!("../ui/components/patterns.ice"),
-        include_str!("../ui/components/roster.ice"),
         include_str!("../ui/components/shell.ice"),
         include_str!("../ui/handlers/lifecycle.ice"),
         include_str!("../ui/handlers/chat.ice"),
@@ -870,10 +868,6 @@ fn ice_sources_hold_to_the_design_system() {
         ),
         ("kit.ice", inlined(include_str!("../ui/components/kit.ice"))),
         (
-            "node.ice",
-            inlined(include_str!("../ui/components/node.ice")),
-        ),
-        (
             "onboarding.ice",
             inlined(include_str!("../ui/components/onboarding.ice")),
         ),
@@ -888,10 +882,6 @@ fn ice_sources_hold_to_the_design_system() {
         (
             "patterns.ice",
             inlined(include_str!("../ui/components/patterns.ice")),
-        ),
-        (
-            "roster.ice",
-            inlined(include_str!("../ui/components/roster.ice")),
         ),
         (
             "shell.ice",
@@ -1211,21 +1201,22 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/huddle.ice",
         "ui/components/icon.ice",
         "ui/components/kit.ice",
-        "ui/components/node.ice",
         "ui/components/onboarding.ice",
         "ui/components/overlay.ice",
         "ui/components/pages.ice",
         "ui/components/patterns.ice",
-        "ui/components/roster.ice",
         "ui/components/shell.ice",
         "ui/screens/chat.ice",
         "ui/screens/forge.ice",
-        // The Approvals, Members and Agents screens ship as module-owned
-        // views; their sources are held to the same conventions as the
-        // native ones.
+        // The Approvals, Members, Agents and Node screens ship as
+        // module-owned views; their sources are held to the same conventions
+        // as the native ones.
         "../../crates/views/governance/src/ui/app.ice",
         "../../crates/views/members/src/ui/app.ice",
         "../../crates/views/agents/src/ui/app.ice",
+        "../../crates/views/node/src/ui/app.ice",
+        "../../crates/views/node/src/ui/node.ice",
+        "../../crates/views/node/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
         "ui/screens/settings.ice",
@@ -1266,11 +1257,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/dm.ice",
             "ui/components/files.ice",
             "ui/components/forge.ice",
-            "ui/components/node.ice",
             "ui/components/onboarding.ice",
             "ui/components/pages.ice",
             "ui/components/shell.ice",
             "ui/screens/forge.ice",
+            "../../crates/views/node/src/ui/node.ice",
             "ui/screens/shell.ice",
             "ui/screens/storage.ice",
         ],
@@ -1404,9 +1395,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/forge.ice", "for repo in repos"),
         ("screens/forge.ice", "for entry in tree_entries"),
         ("screens/forge.ice", "for review in forge_item_reviews"),
-        ("screens/node.ice", "for peer in node_peers"),
         ("components/huddle.ice", "for tile in rows"),
-        ("components/node.ice", "for entry in rows"),
         ("components/onboarding.ice", "for row in networks"),
         // The keystore's wallets: how many identities this DEVICE holds, and
         // it only moves when one is minted, imported, or removed by hand.

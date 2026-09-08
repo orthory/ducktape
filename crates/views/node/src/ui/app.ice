@@ -1,12 +1,174 @@
-// NODE — the operator surface for this daemon: coherent status, standing,
-// peers, logs and the code registry. It is a rail destination, not a Settings
-// appendix; Settings links here for readers who start from workspace details.
-//
-// The live `block_height` register is deliberately NOT read here. It is the
-// titlebar's liveness reading and carries no checkpoint. This screen's head and
-// checkpoint come from one `NodeFacts` document so they can never describe two
-// different instants.
-component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], status:str, loading:bool, node_tab:NodeTab, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
+// NODE, as a module-owned view: the operator surface for this daemon —
+// coherent status, standing, peers, logs and the code registry — drawn from
+// the one facts document the desktop app pushes. The screen body is the
+// app's own (screens/node.ice before the port), with the two StatCard grids
+// as rows; the live log ring is a host surface in the Activity slot.
+app NodeView
+  title "Node"
+  palette active_palette
+  id "dev.ducktape.view.node"
+  text-size 13.5
+
+use "../../../../../app/src/ui/theme.ice"
+use "../../../../../app/src/ui/ducktape-ui/recipes.ice"
+use "log-timeline.ice"
+use "../../../../../app/src/ui/components/icon.ice"
+use "node.ice"
+use "kit.ice"
+
+enum NodeTab
+  overview
+  permissions
+  activity
+  modules
+
+extern crate::host
+  HostError(message:str)
+  PeerRow(key:str, role:str, live:bool)
+  ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
+  NodeProps(node_key:str, node_data_dir:str, tier:str, admin:bool, status:str, loading:bool, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], wall_now:i64, connected:bool, dark:bool)
+  stream props() -> NodeProps ! HostError
+  pure copy(text:&str, label:&str) -> bool
+  pure show_tab(tab:NodeTab) -> bool
+  pure log_filter(filter:&str) -> bool
+  pure icon(name:&str) -> bytes
+  pure connection_degraded(status:&str) -> bool
+  pure reading_pair(left:&str, right:&str) -> str
+  pure count_label(count:i64) -> str
+  pure keep_str(loaded:bool, next:&str, current:&str) -> str
+  pure initial_of(name:&str) -> str
+  pure height_label_short(height:i64) -> str
+  pure relative_time(unix_seconds:i64, wall_now:i64) -> str
+  // The live log ring: the host draws its own retained timeline here.
+  component node_log_timeline() -> unit
+
+state
+  active_palette:palette[AppTheme] = AppTheme.app
+  node_key = ""
+  node_data_dir = ""
+  tier = ""
+  admin = false
+  status = ""
+  loading = false
+  node_tab:NodeTab = NodeTab.overview
+  module_rows:[ModuleRow] = []
+  node_height:i64 = -1
+  node_checkpoint:i64 = -1
+  node_last_finalized:i64 = -1
+  node_reachable_label = "—"
+  node_quorum_label = "—"
+  node_version = ""
+  node_root_hash = ""
+  sync_line = ""
+  node_phase_since:i64 = -1
+  node_sync_retries:i64 = 0
+  node_sync_failures:i64 = 0
+  node_sync_last_error = ""
+  node_peers:[PeerRow] = []
+  node_log_filter = ""
+  wall_now:i64 = 0
+  connected = false
+  host_error = ""
+  // a write's acknowledgement — `host::notify` returns nothing to bind
+  sent = false
+
+on mount
+  stream every props() -> props_changed _ | props_failed _
+
+on props_changed(next)
+  node_key = next.node_key
+  node_data_dir = next.node_data_dir
+  tier = next.tier
+  admin = next.admin
+  status = next.status
+  loading = next.loading
+  module_rows = next.module_rows
+  node_height = next.node_height
+  node_checkpoint = next.node_checkpoint
+  node_last_finalized = next.node_last_finalized
+  node_reachable_label = next.node_reachable_label
+  node_quorum_label = next.node_quorum_label
+  node_version = next.node_version
+  node_root_hash = next.node_root_hash
+  sync_line = next.sync_line
+  node_phase_since = next.node_phase_since
+  node_sync_retries = next.node_sync_retries
+  node_sync_failures = next.node_sync_failures
+  node_sync_last_error = next.node_sync_last_error
+  node_peers = next.node_peers
+  wall_now = next.wall_now
+  connected = next.connected
+  active_palette = AppTheme.app
+  return if !next.dark
+  active_palette = AppTheme.app_dark
+
+on props_failed(error)
+  host_error = error.message
+
+on select_node_tab(next)
+  node_tab = next
+  sent = show_tab(next)
+
+on open_node_modules
+  node_tab = NodeTab.modules
+  sent = show_tab(NodeTab.modules)
+
+on node_log_filter_changed(next)
+  node_log_filter = next
+  sent = log_filter(next)
+
+on copy_to_clipboard(text, label)
+  sent = copy(text, label)
+
+view
+  box #root
+    with
+      w=fill
+      h=fill
+      bg=bg
+    col w=fill h=fill
+      if !connected
+        col
+          with
+            w=fill
+            h=fill
+            align=center
+          space h=fill
+          text "Not connected" size=13.0 @text-muted
+          space h=fill
+      if connected
+        NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
+          with
+            node_key
+            node_data_dir
+            tier
+            admin
+            status
+            loading
+            node_tab
+            module_rows
+            node_height
+            node_checkpoint
+            node_last_finalized
+            node_reachable_label
+            node_quorum_label
+            node_version
+            node_root_hash
+            sync_line
+            node_phase_since
+            node_sync_retries
+            node_sync_failures
+            node_sync_last_error
+            node_peers
+          events
+            select_node_tab -> select_node_tab _
+            open_node_modules -> open_node_modules
+            node_log_filter_changed -> node_log_filter_changed _
+            copy_to_clipboard -> copy_to_clipboard _ _
+          activity_log:
+            extern node_log_timeline() #node-log-timeline
+
+component NodeScreen(node_key:str, node_data_dir:str, tier:str, admin:bool, status:str, loading:bool, node_tab:NodeTab, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
   emits
     select_node_tab(NodeTab)
     open_node_modules()
@@ -102,8 +264,8 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
             ModulesPanel rows=module_rows
           NodeTab.permissions
             col w=fill gap=18.0
-              NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
-              PermissionMatrix tier=member_tier(members_rows)
+              NodeAccessCard tier=tier admin=admin
+              PermissionMatrix tier=tier
           NodeTab.activity
             LogTimeline.Frame
               with
@@ -160,7 +322,7 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                     label="LAST FINALIZED"
                     value=relative_time(node_last_finalized, wall_now)
                     note=""
-              if members_is_admin(members_rows)
+              if admin
                 grid min-cell=170.0 gap=10.0
                   StatCard
                     with

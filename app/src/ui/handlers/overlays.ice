@@ -122,13 +122,13 @@ on global_key_pressed(event)
 // The multi-pane screens (chat, pages, files, forge, the explorer) are absent
 // on purpose: they show two or three scrolls side by side and nothing here can
 // say which one the reader means. Giving them a keyboard scroll is a focus
-// design, not a bug fix, and guessing a pane would move the wrong one.
+// design, not a bug fix, and guessing a pane would move the wrong one. The
+// module-owned views (Node among them) are absent because their scrolls are
+// the guest's, not this tree's.
 on content_scroll_key(event)
   let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu))
   return if content_scroll == 0.0
-  parallel
-    task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll window=window_target(console_win)
+  task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
 
 on palette_changed(next)
   invalidate lane=palette_search

@@ -290,13 +290,10 @@ extern crate::backend
   pure initials_of(name:&str) -> str
   NodeLogLine(cursor:str, line:str)
   NodeLogTimelineState()
-  NodeLogTimelineEvent()
   sync node_log_timeline_state() -> NodeLogTimelineState
   sync node_log_timeline_reset() -> NodeLogTimelineState
   pure node_log_timeline_push(state:NodeLogTimelineState, line:NodeLogLine) -> NodeLogTimelineState
   pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
-  pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
-  component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
   NodeFacts(public_key:str, version:str, root_hash:str, chain_id:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str) -> NodeFacts ! AppError
   pure optional_number(value:i64?) -> str

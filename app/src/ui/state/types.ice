@@ -227,6 +227,14 @@ enum RosterIntent
   agent_status
   propose
 
+// what the Node view asks of the app: a clipboard write, the tab it is on,
+// the log filter, or the native log ring reporting what the reader did
+enum NodeIntent
+  copy
+  tab
+  log_filter
+  log_timeline
+
 enum MutationPhase
   idle
   recovering

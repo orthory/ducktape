@@ -221,7 +221,8 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
 #[test]
 fn node_operations_are_a_first_class_screen() {
     let settings = include_str!("../ui/screens/settings.ice");
-    let node = include_str!("../ui/screens/node.ice");
+    // the Node screen ships as a module-owned view; its source is the guest's
+    let node = include_str!("../../../crates/views/node/src/ui/app.ice");
     assert!(settings.contains("component SettingsScreen("));
     assert!(node.contains("component NodeScreen("));
     assert!(settings.contains("emit(select_shell_tab, ShellTab.node)"));
@@ -241,7 +242,7 @@ fn node_operations_are_a_first_class_screen() {
     let shell = include_str!("../ui/components/shell.ice");
     assert!(shell.contains("ShellTab.node\n                  slot node"));
     let view = include_str!("../ui/view.ice");
-    assert!(view.contains("node:\n          NodeScreen"));
+    assert!(view.contains("node:\n          extern node_view("));
     assert!(view.contains("settings:\n          SettingsScreen"));
 }
 
