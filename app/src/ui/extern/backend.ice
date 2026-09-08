@@ -235,6 +235,7 @@ extern crate::backend
   pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
+  duck_echo_f64(value:f64) -> f64 ! AppError
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:&[FsEntry]) -> [FsEntry]

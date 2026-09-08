@@ -22,9 +22,9 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer, Settings, Files, Pages,
-Forge and Shell tabs are not native: each is an Ice application under `crates/views`
-(`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `files`,
+The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
+Pages, Forge and Shell tabs are not native: each is an Ice application under `crates/views`
+(`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`,
 `pages`, `forge`, `shell`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
@@ -67,8 +67,14 @@ code reader, each painted by the app from the arguments the view passes,
 and the reader's links come back to the view's own handler. What cannot
 cross the wire stays native beside the view: Forge's discussion note
 composer edits an editor the app holds, so the app docks it under the view
-while an item is open. The
-views workspace pins the same `ducktape-ui` rev as this crate; `make views`
+while an item is open.
+A view whose screen needs a widget
+the tree wire does not carry leaves that widget to the host too: the Chat
+view declares `chat_composer` as a host surface per room and per thread,
+and the app paints its rich composer there (`src/composer_surface.rs`),
+keeps every box's words for the life of the process, and hears a submit as
+the view's `composer` intent — the words themselves never cross the wire.
+The views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 
 ## Release build (macOS: signed and notarized)

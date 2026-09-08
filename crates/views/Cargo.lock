@@ -527,6 +527,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "chat-view"
+version = "0.1.0"
+dependencies = [
+ "design",
+ "iced",
+ "serde",
+ "serde_json",
+ "ui-lang",
+ "ui-lang-build",
+ "ui-lang-guest",
+ "ui-lang-runtime",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -430,8 +430,6 @@ on console_opened(id)
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   channel_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
@@ -451,7 +449,6 @@ on console_opened(id)
   invalidate lane=live_thread
   thread_loading = false
   pending_channel = ""
-  chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
