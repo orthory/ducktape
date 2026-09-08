@@ -483,6 +483,21 @@ pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String
     format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
 }
 
+/// The room a composer scope belongs to: a thread scope shorn of the
+/// `#<seq>` tail [`thread_scope`] appends, a room scope as it is. A room
+/// whose channel id itself ends in `#<digits>` is looked up under its own
+/// scope first, so the shearing only ever reaches a thread.
+pub fn room_scope(scope: &str) -> String {
+    let Some((room, seq)) = scope.rsplit_once('#') else {
+        return scope.to_owned();
+    };
+    let seq_is_thread = !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit());
+    if seq_is_thread {
+        return room.to_owned();
+    }
+    scope.to_owned()
+}
+
 /// The clicked page's title, from the index the sidebar is already drawn from
 /// — the header has to move with the click, not with the round trip. Falls
 /// back to the current title while the id is not in the list yet.

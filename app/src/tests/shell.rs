@@ -571,15 +571,19 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
         generation: in_flight,
         agents: vec![backend::AgentRow {
             id: "agent-1".into(),
-            name: "Quackbot".into(),
-            initials: "QU".into(),
+            name: "ChiefDuck".into(),
+            initials: "CH".into(),
             capability: "mock-llm-1".into(),
             status: "active".into(),
             owner_handle: String::new(),
+            controller: String::new(),
             live: true,
-            skill_count: 0,
-            cap_count: 0,
+            allowed_actions: Vec::new(),
+            caps: backend::AgentCaps::default(),
+            skills: Vec::new(),
         }],
+        capabilities: Vec::new(),
+        actions: Vec::new(),
     }));
     assert!(
         backend::any_agent_active(&app.agents_rows),

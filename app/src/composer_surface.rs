@@ -20,6 +20,13 @@
 //! afresh inside every `Widget` method, over a lock held for that call
 //! alone. The `Tree` state is the built composer's own, so focus and caret
 //! carry over between calls as they would for a widget built once.
+//!
+//! THE MENTION MENU. An `@word` under the caret opens a list of the handles
+//! it prefixes, above the editor inside the plate; the arrows walk it, Enter
+//! or Tab (or a click) completes the word, Escape closes it for that word.
+//! The handles are exactly the send's: [`MentionCandidates`] over the name
+//! directory and the room's roster, which the app hands each room through
+//! [`roster`] as it reads it — so a row offered is a mention that resolves.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,14 +39,39 @@ use iced::{Border, Color, Element, Event, Font, Length, Rectangle, Size, Vector,
 use ui_lang_runtime::view_tree::Surface;
 use ui_lang_wire::SurfaceValue as Value;
 
-use crate::editor::{ComposerEvent, apply_composer_event, composer_toggle_mark, rich_composer};
+use crate::backend::{ChatMember, MentionCandidates, names, room_scope};
+use crate::editor::{
+    ComposerEvent, MentionQuery, MenuKey, apply_composer_event, complete_mention,
+    composer_toggle_mark, mention_matches, mention_query, rich_composer,
+};
 
-/// One composer's state: its words, and the unsent body its last failed
-/// send handed back (ducktape-ui#698).
+/// One composer's state: its words, the unsent body its last failed send
+/// handed back (ducktape-ui#698), and where the reader is in the mention
+/// menu over the word under the caret.
 #[derive(Default)]
 struct Document {
     content: Content,
     failed: String,
+    menu: MenuState,
+}
+
+/// The reader's position in the mention menu for ONE typed word: which row
+/// is highlighted, and whether Escape closed the menu for it. Typing a
+/// different word starts over — the menu is derived from the words, and
+/// this is the only thing about it that is not.
+#[derive(Default)]
+struct MenuState {
+    partial: String,
+    selected: usize,
+    dismissed: bool,
+}
+
+/// The mention menu as drawn: the word it completes, the handles it offers
+/// and the highlighted one.
+struct Menu {
+    query: MentionQuery,
+    matches: Vec<String>,
+    selected: usize,
 }
 
 type Shared = Arc<Mutex<Document>>;
@@ -58,6 +90,36 @@ thread_local! {
 
 fn document(scope: &str) -> Shared {
     DOCUMENTS.with_borrow_mut(|documents| documents.entry(scope.to_owned()).or_default().clone())
+}
+
+thread_local! {
+    // EACH ROOM'S EXPLICIT ROSTER, as the app last read it, under the room's
+    // composer scope. A thread's composer reads its room's. Never evicted, for
+    // the same reason the documents are not: a room the reader visited is a
+    // room she may write in again, and its roster is still its roster.
+    static ROSTERS: RefCell<HashMap<String, Vec<ChatMember>>> = RefCell::default();
+}
+
+/// The app's hand-off: the roster of the room under `scope`, for the
+/// composers over it. Called wherever the app learns a room's members.
+pub fn roster(scope: &str, members: &[ChatMember]) {
+    ROSTERS.with_borrow_mut(|rosters| {
+        rosters.insert(scope.to_owned(), members.to_vec());
+    });
+}
+
+/// Who an `@` in this composer may complete to: the send's own rule over the
+/// name directory and the room's roster — under the scope itself (a room), else
+/// under the room a thread scope names.
+fn candidates(scope: &str) -> MentionCandidates {
+    let members = ROSTERS.with_borrow(|rosters| {
+        rosters
+            .get(scope)
+            .or_else(|| rosters.get(&room_scope(scope)))
+            .cloned()
+            .unwrap_or_default()
+    });
+    MentionCandidates::new(&names(), &members)
 }
 
 fn lock(document: &Shared) -> MutexGuard<'_, Document> {
@@ -141,12 +203,14 @@ pub fn intent(value: &Value) -> Option<crate::module_view::ModuleViewEvent> {
 }
 
 /// What the reader did in the composer: an editor event (a keystroke, a
-/// paste, a click, a chord, the Send button's synthetic Submit), a mark
-/// from the toolbar, or the banner's two buttons.
+/// paste, a click, a chord, the Send button's synthetic Submit, a key the
+/// mention menu claimed), a mark from the toolbar, a click on a mention
+/// menu row, or the banner's two buttons.
 #[derive(Clone, Debug)]
 pub(crate) enum Interaction {
     Editor(ComposerEvent),
     Mark(&'static str),
+    Pick(String),
     Restore,
     Dismiss,
 }
@@ -163,10 +227,73 @@ struct Composer {
 }
 
 impl Composer {
+    /// The mention menu over the word under the caret, if one is showing:
+    /// the word is a mention in progress, the reader has not closed the menu
+    /// for it, and at least one handle prefixes it. The highlighted row is
+    /// the reader's for the word she is typing and the first row for a new
+    /// one.
+    fn menu(&self, document: &Document) -> Option<Menu> {
+        let query = mention_query(&document.content)?;
+        let same_word = document.menu.partial == query.partial;
+        if same_word && document.menu.dismissed {
+            return None;
+        }
+        let matches = mention_matches(&candidates(&self.scope).handles(), &query.partial);
+        if matches.is_empty() {
+            return None;
+        }
+        let selected = if same_word {
+            document.menu.selected.min(matches.len() - 1)
+        } else {
+            0
+        };
+        Some(Menu {
+            query,
+            matches,
+            selected,
+        })
+    }
+
     /// One interaction applied to the document; a submit that goes through
     /// is the value published to the guest tree.
     fn apply(&self, document: &mut Document, interaction: Interaction) -> Option<Value> {
         match interaction {
+            Interaction::Editor(ComposerEvent::Menu(key)) => {
+                let menu = self.menu(document)?;
+                let rows = menu.matches.len();
+                let step = |from: usize, by: usize| (from + by) % rows;
+                document.menu = match key {
+                    MenuKey::Up => MenuState {
+                        partial: menu.query.partial,
+                        selected: step(menu.selected, rows - 1),
+                        dismissed: false,
+                    },
+                    MenuKey::Down => MenuState {
+                        partial: menu.query.partial,
+                        selected: step(menu.selected, 1),
+                        dismissed: false,
+                    },
+                    MenuKey::Dismiss => MenuState {
+                        partial: menu.query.partial,
+                        selected: 0,
+                        dismissed: true,
+                    },
+                    MenuKey::Pick => {
+                        let content = std::mem::take(&mut document.content);
+                        document.content =
+                            complete_mention(content, &menu.query, &menu.matches[menu.selected]);
+                        MenuState::default()
+                    }
+                };
+                None
+            }
+            Interaction::Pick(handle) => {
+                let menu = self.menu(document)?;
+                let content = std::mem::take(&mut document.content);
+                document.content = complete_mention(content, &menu.query, &handle);
+                document.menu = MenuState::default();
+                None
+            }
             Interaction::Editor(ComposerEvent::Submit) => {
                 if self.blocked {
                     return None;
@@ -286,15 +413,25 @@ impl Composer {
             })
             .into()
         };
+        let menu = if self.blocked {
+            None
+        } else {
+            self.menu(document)
+        };
         let editor = rich_composer(
             &document.content,
             self.hint.clone(),
             self.blocked,
+            menu.is_some(),
             44.0,
             150.0,
             10.0,
         )
         .map(Interaction::Editor);
+        let suggestions: Element<'a, Interaction> = match menu {
+            None => widget::Space::new().into(),
+            Some(menu) => mention_menu(menu),
+        };
         let mark = |label: Element<'a, Interaction>, glyph: &'static str| {
             widget::button(widget::container(label).center(Length::Fill))
                 .width(26)
@@ -366,6 +503,7 @@ impl Composer {
         let tail = tail.push(send);
         let plate = widget::container(
             widget::column![
+                suggestions,
                 editor,
                 widget::container(tail.width(Length::Fill)).padding(iced::Padding {
                     top: 0.0,
@@ -395,6 +533,64 @@ impl Composer {
             .spacing(10)
             .width(Length::Fill)
             .into()
+    }
+}
+
+/// The mention menu's rows, one button per handle, the highlighted one on
+/// the accent wash: a click completes the word the way Enter does.
+fn mention_menu<'a>(menu: Menu) -> Element<'a, Interaction> {
+    let rows: Vec<Element<'a, Interaction>> = menu
+        .matches
+        .into_iter()
+        .enumerate()
+        .map(|(index, handle)| {
+            let highlighted = index == menu.selected;
+            let label = widget::text(format!("@{handle}")).size(12.5).font(Font {
+                family: iced::font::Family::Name("Geist Mono"),
+                ..Font::DEFAULT
+            });
+            widget::button(label)
+                .width(Length::Fill)
+                .padding([5, 10])
+                .style(move |theme, status| mention_row(theme, status, highlighted))
+                .on_press(Interaction::Pick(handle))
+                .into()
+        })
+        .collect();
+    widget::container(
+        widget::scrollable(widget::column(rows).width(Length::Fill)).height(Length::Shrink),
+    )
+    .max_height(168)
+    .width(Length::Fill)
+    .padding(iced::Padding {
+        top: 6.0,
+        right: 6.0,
+        bottom: 0.0,
+        left: 6.0,
+    })
+    .into()
+}
+
+fn mention_row(
+    theme: &iced::Theme,
+    status: widget::button::Status,
+    highlighted: bool,
+) -> widget::button::Style {
+    let tokens = crate::backend::app_tokens(theme);
+    let hovered = matches!(
+        status,
+        widget::button::Status::Hovered | widget::button::Status::Pressed
+    );
+    let background = if highlighted || hovered {
+        Some(tokens.palette.accent.into())
+    } else {
+        None
+    };
+    widget::button::Style {
+        background,
+        text_color: tokens.palette.foreground,
+        border: Border::default().rounded(6.0),
+        ..Default::default()
     }
 }
 
@@ -672,6 +868,26 @@ pub(crate) mod testing {
         lock(&document).content.text()
     }
 
+    /// The mention menu's rows over the scope's words, and the highlighted
+    /// one — as the painted composer would draw them for an unblocked box.
+    pub(crate) fn menu_rows(scope: &str) -> Option<(Vec<String>, usize)> {
+        let composer = Composer {
+            document: document(scope),
+            scope: scope.into(),
+            kind: "message".into(),
+            compact: false,
+            hint: String::new(),
+            blocked: false,
+            restore_blocked: false,
+            failed_note: String::new(),
+        };
+        let document = composer.document.clone();
+        let document = lock(&document);
+        composer
+            .menu(&document)
+            .map(|menu| (menu.matches, menu.selected))
+    }
+
     pub(crate) fn failed(scope: &str) -> String {
         let document = document(scope);
         lock(&document).failed.clone()
@@ -681,6 +897,64 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BoundAccount, NameDirectory};
+    use iced::widget::text_editor::{Action, Edit};
+    use std::collections::BTreeMap;
+
+    /// Type `text` into the scope's composer, one keystroke at a time, the
+    /// way the editor delivers them.
+    fn type_into(scope: &str, text: &str) {
+        for c in text.chars() {
+            testing::interact(
+                scope,
+                "message",
+                false,
+                false,
+                Interaction::Editor(ComposerEvent::Apply(crate::editor::RichAction::Edit(
+                    Action::Edit(Edit::Insert(c)),
+                ))),
+            );
+        }
+    }
+
+    fn menu_key(scope: &str, key: MenuKey) {
+        testing::interact(
+            scope,
+            "message",
+            false,
+            false,
+            Interaction::Editor(ComposerEvent::Menu(key)),
+        );
+    }
+
+    /// A directory naming two accounts, and a room whose roster adds a member
+    /// the directory does not know, whose handle is its key's — the handles a
+    /// send resolves.
+    fn seat_directory_and_roster(room: &str) -> crate::backend::SeededNames {
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "aa".repeat(32),
+            BoundAccount {
+                number: 5,
+                name: "ChiefDuck".into(),
+            },
+        );
+        accounts.insert(
+            "bb".repeat(32),
+            BoundAccount {
+                number: 6,
+                name: "chi-ops".into(),
+            },
+        );
+        roster(
+            room,
+            &[ChatMember {
+                key: "user:cafe0123".into(),
+                label: "cafe".into(),
+            }],
+        );
+        crate::backend::seed_names(NameDirectory::new(accounts))
+    }
 
     #[test]
     fn a_failed_send_stashes_into_the_box_it_came_from_and_a_committed_one_does_not() {
@@ -710,5 +984,128 @@ mod tests {
         assert_eq!(detail["body"], "hi");
         assert_eq!(detail["id"], "reply-1");
         assert!(intent(&Value::Unit).is_none());
+    }
+
+    /// THE MENU OFFERS WHAT THE SEND RESOLVES, AND ONLY WHILE A MENTION IS
+    /// BEING TYPED. The rows are the directory's handles and the room's keyed
+    /// members, prefix-matched to the word under the caret; a word that names
+    /// nobody, or a caret that has left the word, shows nothing.
+    #[test]
+    fn the_mention_menu_follows_the_word_under_the_caret() {
+        let room = "net\u{1f}mention-room";
+        let _names = seat_directory_and_roster(room);
+        type_into(room, "hello @");
+        assert_eq!(
+            testing::menu_rows(room),
+            Some((
+                vec!["cafe0123".into(), "chi-ops".into(), "chiefduck".into()],
+                0
+            ))
+        );
+        type_into(room, "CH");
+        assert_eq!(
+            testing::menu_rows(room),
+            Some((vec!["chi-ops".into(), "chiefduck".into()], 0))
+        );
+        type_into(room, "x");
+        assert_eq!(testing::menu_rows(room), None, "no handle starts with chx");
+        type_into(room, " and @c");
+        assert!(
+            testing::menu_rows(room).is_some(),
+            "a new word reopens the menu"
+        );
+        // a thread over the room reads the room's roster
+        let thread = format!("{room}#12");
+        type_into(&thread, "@ca");
+        assert_eq!(
+            testing::menu_rows(&thread),
+            Some((vec!["cafe0123".into()], 0))
+        );
+        // an `@` glued to a word is an address or a decoration, not a mention
+        type_into(room, " mail@ch");
+        assert_eq!(testing::menu_rows(room), None);
+    }
+
+    /// The arrows walk the rows and wrap; Enter completes the highlighted
+    /// handle in place and leaves the caret after a space; Escape closes the
+    /// menu for that word and typing on reopens it.
+    #[test]
+    fn the_menu_keys_walk_pick_and_dismiss() {
+        let room = "net\u{1f}mention-keys";
+        let _names = seat_directory_and_roster(room);
+        type_into(room, "@ch");
+        menu_key(room, MenuKey::Down);
+        assert_eq!(testing::menu_rows(room).map(|(_, at)| at), Some(1));
+        menu_key(room, MenuKey::Down);
+        assert_eq!(testing::menu_rows(room).map(|(_, at)| at), Some(0), "wraps");
+        menu_key(room, MenuKey::Up);
+        assert_eq!(testing::menu_rows(room).map(|(_, at)| at), Some(1));
+        menu_key(room, MenuKey::Pick);
+        assert_eq!(testing::text(room).trim_end(), "@chiefduck");
+        assert_eq!(
+            testing::menu_rows(room),
+            None,
+            "a completed word is not a query"
+        );
+        type_into(room, "and @c");
+        assert_eq!(testing::text(room).trim_end(), "@chiefduck and @c");
+
+        menu_key(room, MenuKey::Dismiss);
+        assert_eq!(
+            testing::menu_rows(room),
+            None,
+            "escape closes the menu for this word"
+        );
+        type_into(room, "h");
+        assert!(testing::menu_rows(room).is_some(), "typing on reopens it");
+
+        // a click on a row completes like Enter does
+        testing::interact(
+            room,
+            "message",
+            false,
+            false,
+            Interaction::Pick("chi-ops".into()),
+        );
+        assert_eq!(testing::text(room).trim_end(), "@chiefduck and @chi-ops");
+    }
+
+    /// The menu only ever completes the word under the caret: a completion
+    /// mid-line replaces exactly the typed `@partial`.
+    #[test]
+    fn a_completion_replaces_only_the_typed_word() {
+        let room = "net\u{1f}mention-midline";
+        let _names = seat_directory_and_roster(room);
+        type_into(room, "ping @chi please");
+        // put the caret right after "@chi"
+        for _ in 0.." please".len() {
+            testing::interact(
+                room,
+                "message",
+                false,
+                false,
+                Interaction::Editor(ComposerEvent::Apply(crate::editor::RichAction::Edit(
+                    Action::Move(iced::widget::text_editor::Motion::Left),
+                ))),
+            );
+        }
+        assert!(
+            testing::menu_rows(room).is_some(),
+            "the caret ends the word again"
+        );
+        menu_key(room, MenuKey::Pick);
+        assert_eq!(testing::text(room).trim_end(), "ping @chi-ops  please");
+    }
+
+    #[test]
+    fn a_room_scope_is_its_own_and_a_thread_scope_names_its_room() {
+        assert_eq!(room_scope("net\u{1f}general"), "net\u{1f}general");
+        assert_eq!(room_scope("net\u{1f}general#42"), "net\u{1f}general");
+        assert_eq!(
+            room_scope("net\u{1f}forge:playground:1#7"),
+            "net\u{1f}forge:playground:1"
+        );
+        // a `#` that is not a thread tail stays
+        assert_eq!(room_scope("net\u{1f}room#x"), "net\u{1f}room#x");
     }
 }
