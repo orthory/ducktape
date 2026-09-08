@@ -2020,10 +2020,12 @@ fn spawn_load(
                 if let Some(root) = &mut fresh.frame.root {
                     fresh.inputs.adopt(root);
                     fresh.pictures.adopt(root);
-                    root.for_each_mut(&mut |node| {
-                        if let wire::Node::Svg { bytes, .. } = node {
-                            *bytes = None;
+                    root.for_each_mut(&mut |node| match node {
+                        wire::Node::Svg { bytes, .. } => *bytes = None,
+                        wire::Node::Image { data, .. } | wire::Node::ImageViewer { data, .. } => {
+                            *data = None
                         }
+                        _ => {}
                     });
                 }
                 log_source(module, fresh.hash.as_ref(), "Swapped", generation, "");
@@ -2837,10 +2839,11 @@ impl Guest {
                             // The guest remembers its tree without the
                             // picture bytes; the tree its patches build on
                             // has to be that one.
-                            root.for_each_mut(&mut |node| {
-                                if let wire::Node::Svg { bytes, .. } = node {
-                                    *bytes = None;
-                                }
+                            root.for_each_mut(&mut |node| match node {
+                                wire::Node::Svg { bytes, .. } => *bytes = None,
+                                wire::Node::Image { data, .. }
+                                | wire::Node::ImageViewer { data, .. } => *data = None,
+                                _ => {}
                             });
                         }
                     }
