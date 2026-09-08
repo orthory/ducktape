@@ -142,10 +142,14 @@ pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {
         .collect()
 }
 
-/// A digest the way this screen prints one: `0x` and every character of it.
+/// A digest the way this screen PRINTS one: `0x` and every character of it.
 /// The prefix is what tells a reader the run of digits is hex rather than the
 /// decimal byte array the same value reads as elsewhere, and nothing is cut —
 /// a shortened digest is a key that opens nothing.
+///
+/// FOR THE EYE ONLY. The prefix is not part of the key: `GET
+/// /v1/files/blob/{op_hash}` and every CLI that takes a digest want the bare
+/// form, so a copy carries the prop this decorated, never this.
 ///
 /// VERBATIM WHEN IT IS NOT A DIGEST. `proposer` carries a hex key only for
 /// frame-authored ops; `project_root_op` labels the rest `system`,

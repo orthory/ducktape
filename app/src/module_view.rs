@@ -3740,7 +3740,8 @@ pub(crate) mod tests {
     /// hand-built prop — and the reader is the bundled wasm guest. Nothing
     /// between the two may cut a digest or leave one in decimal: the block
     /// hash on the list row, the commit hash and the op hash in the detail,
-    /// and the `new_oid` inside the payload all read `0x` and every character.
+    /// and the `new_oid` inside the payload all read `0x` and every character
+    /// — and the copy intent carries the bare key the blob route takes.
     #[test]
     fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
         let Some(staged) = staged("explorer") else {
@@ -3781,14 +3782,20 @@ pub(crate) mod tests {
         );
         guest.redraw(&props);
 
+        let whole = format!("0x{hash}");
         let listed = texts(&guest);
         assert!(
-            listed.iter().any(|text| text == &format!("0x{hash}")),
+            listed.contains(&whole),
             "the list row carries the whole block hash: {listed:?}"
         );
+        // and nothing on it is a cut-down version of that hash — the guard
+        // that fails the moment a landmark form comes back.
+        let abbreviated = listed
+            .iter()
+            .find(|text| text.starts_with("0x9f3e") && **text != whole);
         assert!(
-            !listed.iter().any(|text| text.contains('\u{2026}')),
-            "and elides nothing: {listed:?}"
+            abbreviated.is_none(),
+            "the list carries the whole hash, not {abbreviated:?}"
         );
 
         guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
@@ -3806,6 +3813,18 @@ pub(crate) mod tests {
                 .any(|text| text
                     .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
             "the payload's digest is hex too: {opened:?}"
+        );
+
+        // AND THE CLIPBOARD GETS THE KEY, not the reading of it: `0x` is for
+        // the eye, and `GET /v1/files/blob/{op_hash}` takes the bare digest.
+        guest.deliver(Output::Activate(button_message(&guest, "Copy op hash")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "copy".into(),
+                detail: format!(r#"{{"text":"{op_hash}","label":"Op hash copied"}}"#),
+            }]
         );
         assert!(guest.fault.is_none());
     }

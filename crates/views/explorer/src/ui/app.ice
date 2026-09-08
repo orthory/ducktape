@@ -447,7 +447,7 @@ view
                               DigestRow
                                 with
                                   name="block"
-                                  digest=hex(block.hash)
+                                  digest=block.hash
                                   copied="Block hash copied"
                                   action="Copy block hash"
                                 events
@@ -455,7 +455,7 @@ view
                               DigestRow
                                 with
                                   name="commit"
-                                  digest=hex(block.commit)
+                                  digest=block.commit
                                   copied="Commit hash copied"
                                   action="Copy commit hash"
                                 events
@@ -513,7 +513,7 @@ view
                             DigestRow
                               with
                                 name="hash"
-                                digest=hex(op.op_hash)
+                                digest=op.op_hash
                                 copied="Op hash copied"
                                 action="Copy op hash"
                               events
@@ -521,7 +521,7 @@ view
                             DigestRow
                               with
                                 name="by"
-                                digest=hex(op.proposer)
+                                digest=op.proposer
                                 copied="Proposer copied"
                                 action="Copy proposer"
                               events
@@ -562,10 +562,15 @@ view
                                 font=code
                                 @text-fg
 
-// A labelled digest, whole, in the code face; clicking it copies exactly what
-// it shows. `word-or-glyph` wraps a 66-char `0x…` hash instead of clipping it.
-// The caller passes the value through `hex` — the copy must carry the string
-// the reader is looking at, so the prefix cannot be added here.
+// A labelled digest, whole, in the code face. `word-or-glyph` wraps a 66-char
+// `0x…` hash instead of clipping it.
+//
+// THE PROP IS THE CANONICAL DIGEST — bare, exactly as the node published it —
+// and the `0x` is put on for the EYE only, at the one `text` below. The copy
+// carries the prop: `GET /v1/files/blob/{op_hash}` and every CLI that takes a
+// digest want the bare form, and a paste that has to be hand-trimmed first is
+// a copy button that does not work. The prefix is what tells a reader the run
+// of digits is hex; it is not part of the key.
 component DigestRow(name:str, digest:str, copied:str, action:str)
   emits
     copy_to_clipboard(str, str)
@@ -585,7 +590,7 @@ component DigestRow(name:str, digest:str, copied:str, action:str)
         label=action
         p=2.0
         @ghost_action
-      text digest
+      text hex(digest)
         with
           size=12.0
           wrap=word-or-glyph

@@ -137,10 +137,15 @@ fn a_search_leaves_as_an_intent_and_its_answer_comes_back_as_props() {
     assert_eq!(intent.kind, "explorer.clear");
 }
 
+/// THE EYE GETS `0x`, THE CLIPBOARD GETS THE KEY. An op hash is the
+/// `GET /v1/files/blob/{op_hash}` key and what every CLI that takes a digest
+/// wants, so the copy carries it bare and whole — a paste that has to be
+/// hand-trimmed first is a copy button that does not work.
 #[test]
-fn an_ops_hash_leaves_as_a_copy() {
+fn an_ops_hash_reads_prefixed_and_copies_bare() {
     let (_, frame) = shown(&ledger());
     let frame = tick_native(press(&frame, "Inspect block"));
+    assert!(has_text(&frame, "0xab12cd34"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "Copy op hash"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -149,8 +154,7 @@ fn an_ops_hash_leaves_as_a_copy() {
     assert_eq!(
         serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
         Copy {
-            // what the reader is looking at, prefix and all
-            text: "0xab12cd34".into(),
+            text: "ab12cd34".into(),
             label: "Op hash copied".into()
         }
     );
@@ -159,10 +163,10 @@ fn an_ops_hash_leaves_as_a_copy() {
 /// EVERY DIGEST, WHOLE AND `0x`-PREFIXED, IN BOTH PLACES IT APPEARS. The list
 /// row carries the block hash in full — not twelve chars and an ellipsis, which
 /// identifies a block to the eye and to nothing else — and the detail names it
-/// beside the commit hash with a copy on each. The copy carries exactly the
-/// string on screen.
+/// beside the commit hash with a copy on each. The copy carries the canonical
+/// bare digest, which is the form anything downstream can be handed.
 #[test]
-fn every_digest_reads_whole_and_hex_prefixed_and_copies_what_it_shows() {
+fn every_digest_reads_whole_and_hex_prefixed_and_copies_the_bare_key() {
     let hash = "9f3e".repeat(16);
     let commit = "c0ffee11".repeat(8);
     let props = ExplorerProps {
@@ -187,7 +191,7 @@ fn every_digest_reads_whole_and_hex_prefixed_and_copies_what_it_shows() {
         "the list carries the whole hash, not {abbreviated:?}"
     );
     let frame = tick_native(press(&frame, "Inspect block"));
-    for expected in [whole.clone(), format!("0x{commit}")] {
+    for expected in [whole, format!("0x{commit}")] {
         assert!(has_text(&frame, &expected), "{:?}", texts(&frame));
     }
     let frame = tick_native(press(&frame, "Copy block hash"));
@@ -198,7 +202,7 @@ fn every_digest_reads_whole_and_hex_prefixed_and_copies_what_it_shows() {
     assert_eq!(
         serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
         Copy {
-            text: whole,
+            text: hash,
             label: "Block hash copied".into()
         }
     );
