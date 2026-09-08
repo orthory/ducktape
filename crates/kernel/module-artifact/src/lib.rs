@@ -21,7 +21,7 @@ pub struct ModuleArtifact {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize)]
 pub struct ViewArtifact {
     pub component: Vec<u8>,
-    /// Logical relative paths, never archive entries or filesystem extraction targets.
+    /// Logical relative paths. No asset may also be another asset's directory.
     pub assets: BTreeMap<String, Vec<u8>>,
 }
 
@@ -117,6 +117,12 @@ fn take_view<'a>(bytes: &mut &'a [u8]) -> Result<ViewArtifactRef<'a>, String> {
         let out_of_order = previous.is_some_and(|previous| previous >= path);
         if out_of_order {
             return Err("module artifact asset paths are duplicated or out of order".into());
+        }
+        let file_ancestor = path
+            .match_indices('/')
+            .any(|(end, _)| assets.contains_key(&path[..end]));
+        if file_ancestor {
+            return Err("module artifact asset path has a file ancestor".into());
         }
         let payload = take_bytes(bytes)?;
         assets.insert(path, payload);
@@ -279,6 +285,31 @@ mod tests {
                 "accepted noncanonical key order {keys:?}"
             );
         }
+    }
+
+    #[test]
+    fn file_ancestor_collisions_are_refused() {
+        // The intervening key makes a previous-key-only prefix check insufficient.
+        let bytes = raw_view(
+            ["a", "a-b", "a/b"]
+                .into_iter()
+                .map(|key| (key.into(), vec![1]))
+                .collect(),
+        );
+        assert!(
+            ModuleArtifactRef::decode(&bytes).is_err(),
+            "file/ancestor collision accepted"
+        );
+        let siblings = raw_view(
+            ["a/b", "a/c", "ab"]
+                .into_iter()
+                .map(|key| (key.into(), vec![1]))
+                .collect(),
+        );
+        assert!(
+            ModuleArtifactRef::decode(&siblings).is_ok(),
+            "distinct sibling assets rejected"
+        );
     }
 
     #[test]
