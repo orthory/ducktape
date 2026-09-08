@@ -1024,6 +1024,17 @@ subscribe
   // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
   // gate is the budget: leaving the tab stops the encode at the source.
   run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _
+  // THE AGENT RUNS IN FLIGHT, for the NODE rather than for a room. Anchored to
+  // the connection and to nothing else: the subscription is keyed on
+  // `connected_rpc`, so reconnecting to another network tears the old reading
+  // down and starts the new node's, and a room switch is not a lifecycle event
+  // at all — `encode_chat_props` picks this room's rows out of the node's set
+  // on the way to the view.
+  //
+  // Gated on `connected` ALONE, not on the chat tab: a run she started and
+  // walked away from must still be running under its anchor when she comes
+  // back, and the poll is one bounded `runs` read every two seconds.
+  run chat_live_agents(connected_rpc) when connected -> live_agents_event _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick

@@ -44,7 +44,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  invalidate lane=live_agents
   // PARK HER UNSENT WORDS before the room identity moves. Both composers belong
   // to the room/thread being left; message windows are deliberately not kept.
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
@@ -57,7 +56,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the "did my click land?" void #1059 removed from the pickers, still live on
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
-  live_agents = []
   active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
@@ -122,9 +120,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_generation = chat_generation + 1
   // Reads the room back from state, like `choose_dm` does: `active_channel =
   // channel_id` above already moved the payload.
-  parallel
-    run replace lane=chat_load load_chat_hit(connected_rpc, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
-    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
+  run replace lane=chat_load load_chat_hit(connected_rpc, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
 
 // THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
 // true for the entire switch it starts — so the second click of a fast A→B→C
@@ -143,7 +139,6 @@ on choose_channel(id)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  invalidate lane=live_agents
   // PARK HER UNSENT WORDS while `active_channel` still names the room being
   // left. Message windows are deliberately not retained across navigation.
   active_dm_peer = ""
@@ -159,7 +154,6 @@ on choose_channel(id)
   // The switch is visible NOW: the clicked room takes the header and sidebar
   // highlight, then paints an empty loading state until its root window lands.
   active_channel = id
-  live_agents = []
   active_channel_name = next_channel.name
   // BOTH GATE FACTS RIDE THE CLICK. `post_refusal` is recomputed here, and
   // computing it from the room she LEFT is how a public channel came up
@@ -219,9 +213,7 @@ on choose_channel(id)
   //
   // One root-window read is the whole switch. Emptying `messages` above also
   // unmounts the old scroll state, so the arriving room starts at its tail.
-  parallel
-    run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
-    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
+  run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -233,7 +225,6 @@ on choose_dm(peer_key)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  invalidate lane=live_agents
   invalidate lane=chat_load
   // PARK HER UNSENT WORDS before moving to the DM. Message windows are not
   // retained; every room paints the same bounded, authoritative root window.
@@ -263,7 +254,6 @@ on choose_dm(peer_key)
   let next_channel = channel_switch_facts(channel_reads, channels, active_channel, dm_room, unread_boundary, active_channel_name)
   unread_boundary = next_channel.unread_boundary
   active_channel = dm_room
-  live_agents = []
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
@@ -312,9 +302,7 @@ on choose_dm(peer_key)
   // `open_dm`'s own "it already exists" early return would then treat as
   // finished forever. `chat_generation` drops the superseded REPLY instead.
   chat_generation = chat_generation + 1
-  parallel
-    run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
-    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
+  run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
 
 on create_channel_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(trim(channel_draft))
@@ -802,8 +790,18 @@ on channel_created(next)
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
+// EVERY PENDING RUN THIS NODE HOLDS, not this room's. Which of them reach the
+// screen is decided once, in `encode_chat_props`, against the room on screen
+// when the frame is built — so no handler that moves `active_channel` owes this
+// lane anything, and none of them can forget.
+//
+// THE NODE IS THE ONE THING THE FOLD STILL HAS TO ASK. A reading in flight when
+// she reconnects elsewhere names the node she left, and room ids are not unique
+// across networks: `general` on the node she left would otherwise have drawn
+// its runs under `general` on the node she is on. `live_agents_of` drops such a
+// reading whole.
 on live_agents_event(next)
-  live_agents = next.rows
+  live_agents = live_agents_of(next, connected_rpc)
 
 on live_cancel_acked(_ok)
   error = ""

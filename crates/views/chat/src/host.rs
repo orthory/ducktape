@@ -169,8 +169,9 @@ pub struct ChatProps {
     pub copy_head_seq: i64,
     pub copy_surface: String,
     pub sent_serial: i64,
-    /// The agent runs anchored in this room, live while they run; the
-    /// committed reply takes a row's place.
+    /// The agent runs anchored in THIS room, live while they run; the
+    /// committed reply takes a row's place. The host filters by room before
+    /// encoding, so a row here is always one of this room's.
     pub live_agents: Vec<LiveAgentRow>,
 }
 
@@ -181,18 +182,18 @@ pub struct LiveActivity {
     pub done: bool,
 }
 
-/// An agent run in flight under its anchor message.
+/// An agent run in flight under its anchor message. The host's row also names
+/// the room and the dispatch feeding it; neither is mirrored, because this
+/// screen draws one room and cannot act on a dispatch.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LiveAgentRow {
     pub anchor_seq: i64,
     pub thread_root: i64,
     pub run_id: String,
-    pub dispatch: String,
     pub agent: String,
     pub status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
-    pub elapsed_ms: i64,
 }
 
 /// One item of the facts subscription: the facts, or why not.
@@ -657,9 +658,10 @@ pub(crate) fn seq_in_copy_range(
     range_seqs(anchor, head).is_some_and(|(low, high)| seq >= low && seq <= high)
 }
 
-/// The stream and the runs live in it, as one value: the timeline memo
-/// hashes its one dependency, so the two lists that draw together cross
-/// the boundary together.
+/// The stream and the runs live in it, as one value: the timeline memo hashes
+/// its one dependency, so the two lists that draw together must cross the
+/// boundary together — a run's progress folded into `live_agents` alone would
+/// leave the memo's key unmoved and the card would never repaint.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct Timeline {
     pub messages: Vec<ChatMessage>,

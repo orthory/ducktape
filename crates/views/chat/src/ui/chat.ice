@@ -110,7 +110,12 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], un
                 press_message
       // THE RUN THIS MESSAGE ANCHORED, live under it while it runs; the
       // committed reply takes the row's place.
-      keyed live in live_agents by=live.anchor_seq
+      //
+      // A PLAIN `for`, NOT `keyed`. The card holds no state to follow, and
+      // this loop sits INSIDE the row loop — a `keyed live ... by=anchor_seq`
+      // here mints the same key once per message on screen, so a single run
+      // turned into one duplicate-keyed scope per visible row.
+      for live in live_agents
         if live.anchor_seq == message.seq
           LiveAgentCard live=live
             forward
@@ -1798,8 +1803,11 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             open_message_link
                             press_message
                       // THE RUN ANCHORED IN THIS THREAD, live at the foot of
-                      // the rail until its reply lands.
-                      keyed live in live_agents by=live.anchor_seq
+                      // the rail until its reply lands. A run summoned by the
+                      // root reads `anchor_seq`; one summoned by a reply reads
+                      // `thread_root`, because its answer posts into the same
+                      // thread the reply lives in.
+                      for live in live_agents
                         if live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
                           LiveAgentCard live=live
                             forward
