@@ -255,6 +255,22 @@ enum ShellIntent
   discard
   open_link
 
+// what the Files view asks of the app: one variant per act the browser
+// offers, from a navigation to a write
+enum FilesIntent
+  open_dir
+  open_file
+  open_parent
+  mkdir
+  new_file
+  arm_delete
+  disarm_delete
+  delete
+  save
+  show_diff
+  close_diff
+  open_link
+
 enum SettingsIntent
   tab
   reconnect

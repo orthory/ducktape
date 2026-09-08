@@ -15,6 +15,11 @@
 # proxies to a node-local server. The frameless /v1/submit lane stamps the
 # node's own validator key as the op origin. Its account controls the model
 # user; the separate demo wallet signs and owns the gateway routes.
+#
+# The model user (Quackbot) is a TEST agent: its provider is the guest shell
+# running a literal script, staged as a capability spec in this host's
+# capability dir, so the seeded @mention run completes on `make dev` with no
+# model credential at all.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -147,6 +152,57 @@ else
   log "minted the demo wallet (password: $DEMO_PASSWORD)"
 fi
 
+# ── 3c. the test provider spec ─────────────────────────────────
+# The seeded model user (step 5) names a capability tag, and its @mention run
+# completes only on a node whose compute service announces that tag. A real
+# coding agent needs a credential this seed does not have, so the demo's
+# provider is the guest shell running a literal script: it reads the prompt
+# envelope off stdin and replies from inside the microVM. The spec is host
+# config, resolved the way the compute daemon resolves it ($DUCKTAPE_CAPABILITY_DIR,
+# else <ducktape home>/capabilities), and the daemon probes `sh` in the
+# executors dir the guest image is derived from ($DUCKTAPE_EXECUTOR_DIR, else
+# <ducktape home>/executors). Staged BEFORE the compute grant below: the
+# grant is minted from the daemon's live hello, which offers only what
+# discovery found.
+CAP_DIR="${DUCKTAPE_CAPABILITY_DIR:-$DUCK/capabilities}"
+EXEC_DIR="${DUCKTAPE_EXECUTOR_DIR:-$DUCK/executors}"
+TEST_TAG="quack-test"
+mkdir -p "$CAP_DIR" || die "cannot create the capability dir $CAP_DIR"
+# An unquoted heredoc so $TEST_TAG names the tag ONCE; the executor script's
+# own `$` and `\` are escaped so they reach the file verbatim.
+cat >"$CAP_DIR/$TEST_TAG.toml" <<TOML || die "cannot write the $TEST_TAG spec"
+# Rewritten by \`make demo-seed\`: the demo's script-backed test provider.
+# Format: docs/records/specs/capability-spec.md.
+spec = 1
+
+[capability]
+tag = "$TEST_TAG"
+description = "demo test agent: the guest shell replying from inside a microVM, no model credential"
+
+[detect]
+bin = "sh"
+
+[invoke]
+# The whole executor. argv is literal (no host shell sees it); the prompt
+# envelope arrives on stdin, and plain stdout is the reply the runs module
+# posts as a paragraph in the mention's thread.
+args = ["-c", '''
+set -e
+bytes=\$(wc -c)
+printf "Quack! I am the demo test agent: a shell script that ran inside this node's microVM. I read %s bytes of run context.\\n" "\$bytes"
+''']
+prompt = "stdin"
+
+[output]
+format = "text"
+TOML
+if [ -x "$EXEC_DIR/sh" ]; then
+  log "staged the $TEST_TAG provider spec at $CAP_DIR/$TEST_TAG.toml"
+else
+  log "no guest shell at $EXEC_DIR/sh — Quackbot's runs stay pending until a"
+  log "  guest-compatible Linux sh is installed there (the guest image is derived from that dir)"
+fi
+
 # ── 4. start the node, wait for its http surface ───────────────
 log "starting node (http $DEV_LISTEN:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
@@ -239,6 +295,8 @@ submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # model user — the operator account controls a keyless programmable account.
 # The recipe is emitted by the current binary, never copied into this script.
+# Its capability is the test provider staged in step 3c, so the @mention below
+# is a run this host's own compute service executes.
 query(){ # query <module> <query-json>
   local body
   body=$(bun -e 'const [target,query]=process.argv.slice(1);process.stdout.write(JSON.stringify({target,query:JSON.parse(query)}))' "$1" "$2") || die "invalid query"
@@ -259,16 +317,13 @@ MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\
   if(matches.length!==1) throw new Error("expected exactly one Quackbot program account");
   process.stdout.write(String(matches[0].number));
 ') || die "cannot resolve the model account"
-submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"mock-llm-1\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"]}}}}"
+submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"$TEST_TAG\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"]}}}}"
 MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:"@quackbot can you follow up?",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT")
 submit chat "$MENTION"
 
 # jobs — a job on the board. the job board shares the "tasks" target under the
 # WorkMsg `{"job":{…}}` arm (there is no separate "jobs" module).
 submit tasks '{"job":{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome deck"}}}'
-
-# inbox — a starter notification for the demo author
-submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo network is ready."}}'
 
 # automations — a rule that files a task whenever someone says "deploy"
 submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel_id":null,"mention":null,"text_contains":"deploy"},"action":{"create_task":{"task_id_prefix":"deploy","title_template":"Follow up on a deploy mention"}}}}'
@@ -295,7 +350,7 @@ case "$gateway_status" in
     ;;
 esac
 
-log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
+log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, automations, files, gateway"
 
 # ── 6. stop the node (state is durable on disk) ────────────────
 kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null; trap - EXIT

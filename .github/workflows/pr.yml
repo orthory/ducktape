@@ -156,6 +156,18 @@ jobs:
       - run: rustup show
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
 
+  view-artifact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p ducktape-rpc --test blob
+      - run: cargo test --locked -p ducktape-app --test view_artifact
+
   # The module-owned views (crates/views) are their own workspace, so the
   # workspace gates above never see them: their wire tests and lints run
   # here, natively — the wasm bundle itself is `make views`, a build step.

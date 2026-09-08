@@ -704,7 +704,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 
     assert_eq!(
         screens,
-        ["ChatScreen", "FilesScreen", "ForgeScreen", "PagesScreen",],
+        ["ChatScreen", "ForgeScreen", "PagesScreen",],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
@@ -749,10 +749,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 fn a_disconnected_screen_stands_its_registers_down_too() {
     const EXEMPT: [&str; 0] = [];
 
-    for source in [
-        include_str!("../ui/screens/storage.ice"),
-        include_str!("../ui/screens/forge.ice"),
-    ] {
+    for source in [include_str!("../ui/screens/forge.ice")] {
         for chunk in source.split("\ncomponent ").skip(1) {
             let name = chunk.split('(').next().unwrap_or("").trim();
             if !name.ends_with("Screen") || EXEMPT.contains(&name) {
@@ -835,11 +832,11 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         })
         .collect();
     sites.sort_unstable();
-    // Approvals', Members', Agents' and Settings' subtitles are their module
-    // views' now, gated the same way in `crates/views/*` (Settings' members
-    // line is folded host-side, `members_summary` in `module_view.rs`).
-    let mut expected = ["fs_counts_summary(connected, listed, entries)"];
-    expected.sort_unstable();
+    // Approvals', Members', Agents', Settings' and Files' subtitles are their
+    // module views' now, gated the same way in `crates/views/*` (Settings'
+    // members line is folded host-side, `members_summary` in
+    // `module_view.rs`; Files' crumb tally in its guest's `host.rs`).
+    let expected: [&str; 0] = [];
 
     assert_eq!(
         sites, expected,
@@ -1008,28 +1005,16 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         backend::members_summary(app.connected, &app.members_rows),
         "1 human · 0 agents"
     );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "1 file · 0 dirs"
-    );
 
-    // The node goes down. Everything above was a reading; none of it is one now.
+    // The node goes down. Everything above was a reading; none of it is one
+    // now. (The Files tally went with its screen into the `files` module
+    // view, where its guest tests hold it to the same rule.)
     app.connected = false;
-    for (screen, meta) in [
-        (
-            "Members",
-            backend::members_summary(app.connected, &app.members_rows),
-        ),
-        (
-            "Files",
-            backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        ),
-    ] {
-        assert_eq!(
-            meta, "",
-            "{screen} printed `{meta}` off a node that answered nothing"
-        );
-    }
+    assert_eq!(
+        backend::members_summary(app.connected, &app.members_rows),
+        "",
+        "Members printed a count off a node that answered nothing"
+    );
 }
 
 /// A SEARCH THAT ERRORED IS NOT A SEARCH THAT FOUND NOTHING. `search_chat_submit`

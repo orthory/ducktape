@@ -26,7 +26,10 @@ commentary in the app, with run outcomes available through the query API.
   `ducktape agent install codex`, including the spec's declared companions.
   Discovery checks the sandbox's executor directory. Custom specs live under
   `DUCKTAPE_CAPABILITY_DIR` or `<ducktape home>/capabilities/`
-  (`docs/records/specs/capability-spec.md`).
+  (`docs/records/specs/capability-spec.md`); `make demo-seed` stages one
+  there, `quack-test.toml`, a script-backed test provider run by the guest
+  shell `sh` in the executor directory, and registers the demo's Quackbot
+  against it.
 - **Provider authentication on the executing service.** Codex uses
   `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
   `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.claude/.credentials.json`. Installing an

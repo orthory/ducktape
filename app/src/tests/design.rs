@@ -250,7 +250,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/view.ice"),
         include_str!("../ui/components/chat.ice"),
         include_str!("../ui/components/dm.ice"),
-        include_str!("../ui/components/files.ice"),
+        include_str!("../../../crates/views/files/src/ui/browser.ice"),
         include_str!("../ui/components/forge.ice"),
         include_str!("../ui/components/huddle.ice"),
         include_str!("../ui/components/icon.ice"),
@@ -677,9 +677,11 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         "fs_new_file_submit",
     ] {
         let kit_components = inlined(include_str!("../ui/components/kit.ice"));
+        let files_view = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
         let action = SCREENS
             .lines()
             .chain(kit_components.lines())
+            .chain(files_view.lines())
             .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
             .unwrap_or_else(|| panic!("missing action target {target}"));
         assert!(action.contains("@secondary_action"), "{action}");
@@ -701,11 +703,18 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     );
     // The three composer editors carried ad-hoc `focused border=ring` status
     // blocks; their focus ring now lives in the rich composer adapter
-    // (`editor::composer_style`), and the fs editor is the one authored
-    // `editor` ring left. Inputs inherit `@control`'s ring — see
-    // `control_focus_ring_survives_the_active_base`.
+    // (`editor::composer_style`), and the fs editor — the `files` module
+    // view's now — is the one authored `editor` ring left. Inputs inherit
+    // `@control`'s ring — see `control_focus_ring_survives_the_active_base`.
     assert_eq!(
         SCREENS
+            .matches("focused bg=muted_bg border=ring border-w=1.0")
+            .count(),
+        0
+    );
+    let files_view = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
+    assert_eq!(
+        files_view
             .matches("focused bg=muted_bg border=ring border-w=1.0")
             .count(),
         1
@@ -858,8 +867,10 @@ fn ice_sources_hold_to_the_design_system() {
         ),
         ("dm.ice", inlined(include_str!("../ui/components/dm.ice"))),
         (
-            "files.ice",
-            inlined(include_str!("../ui/components/files.ice")),
+            "files/browser.ice",
+            inlined(include_str!(
+                "../../../crates/views/files/src/ui/browser.ice"
+            )),
         ),
         (
             "forge.ice",
@@ -1203,7 +1214,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     let sources = ice_sources![
         "ui/components/chat.ice",
         "ui/components/dm.ice",
-        "ui/components/files.ice",
         "ui/components/forge.ice",
         "ui/components/huddle.ice",
         "ui/components/icon.ice",
@@ -1229,12 +1239,15 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/settings/src/ui/app.ice",
         "../../crates/views/settings/src/ui/settings.ice",
         "../../crates/views/settings/src/ui/kit.ice",
+        "../../crates/views/files/src/ui/app.ice",
+        "../../crates/views/files/src/ui/files.ice",
+        "../../crates/views/files/src/ui/browser.ice",
+        "../../crates/views/files/src/ui/kit.ice",
         "../../crates/views/shell/src/ui/app.ice",
         "../../crates/views/shell/src/ui/shell.ice",
         "../../crates/views/shell/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
-        "ui/screens/storage.ice",
         "ui/view.ice",
     ];
 
@@ -1268,7 +1281,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         [
             "ui/components/chat.ice",
             "ui/components/dm.ice",
-            "ui/components/files.ice",
             "ui/components/forge.ice",
             "ui/components/onboarding.ice",
             "ui/components/pages.ice",
@@ -1276,6 +1288,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/screens/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
             "../../crates/views/explorer/src/ui/app.ice",
+            "../../crates/views/files/src/ui/browser.ice",
             "../../crates/views/shell/src/ui/shell.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
