@@ -672,20 +672,15 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 
 /// The widget for one module's view, with `props` as the app has them now.
 /// The view is loaded on its own thread, and the tab shows what stage it is
-/// at until then. A load that failed is tried again once the app points at
-/// another node ([`connected`]); a view that loaded stays for the process
-/// (the swap-in-place on a new deployment is the next step, behind the
-/// `generation` this registry already keeps).
+/// at until then. A load still going or failed when the app points at
+/// another node is started over on that node ([`connected`]); a view that
+/// loaded stays for the process (the swap-in-place on a new deployment is
+/// the next step, behind the `generation` this registry already keeps).
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
     let (content, rev, generation) = {
         let mut locked = mounted.lock().expect("module view lock");
         locked.props = Some(props);
-        if matches!(locked.slot, Slot::Failed(_)) && locked.client_rev != client_rev() {
-            locked.slot = Slot::Loading;
-            locked.generation += 1;
-            spawn_load(module, &mounted, &mut locked);
-        }
         match &mut locked.slot {
             Slot::Loading => return notice("Loading the view…"),
             Slot::Failed(reason) => return notice(reason),
@@ -701,11 +696,26 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
 }
 
 /// The node the app is connected to, for the views that come from its
-/// deployments. Told by `backend::connect`; a change retries every module
-/// view that failed to load off the previous one.
-pub fn connected(client: &ducktape_rpc::Client) {
+/// deployments. Told by `backend::connect`; every module view still
+/// loading or failed off the previous node starts over on this one, under
+/// a new generation, so an answer the previous node is still composing
+/// lands nowhere. Returns the loads it started, for a test to wait on.
+pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
     *rpc_client().lock().expect("views rpc") = Some(client.clone());
     CLIENT_REV.fetch_add(1, Ordering::SeqCst);
+    let registry = registry().lock().expect("module views");
+    registry
+        .iter()
+        .filter_map(|(module, mounted)| {
+            let mut locked = mounted.lock().expect("module view lock");
+            if matches!(locked.slot, Slot::Ready(_)) {
+                return None;
+            }
+            locked.slot = Slot::Loading;
+            locked.generation += 1;
+            Some(spawn_load(module, mounted, &mut locked))
+        })
+        .collect()
 }
 
 static CLIENT_REV: AtomicU64 = AtomicU64::new(0);
@@ -737,8 +747,6 @@ struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
-    /// The [`client_rev`] the last load was asked under.
-    client_rev: u64,
 }
 
 enum Slot {
@@ -749,12 +757,13 @@ enum Slot {
 
 type Registry = Mutex<HashMap<&'static str, Arc<Mutex<Mounted>>>>;
 
-fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
+fn registry() -> &'static Registry {
     static MOUNTED: OnceLock<Registry> = OnceLock::new();
-    let mut registry = MOUNTED
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("module views");
+    MOUNTED.get_or_init(Mutex::default)
+}
+
+fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
+    let mut registry = registry().lock().expect("module views");
     registry
         .entry(module)
         .or_insert_with(|| {
@@ -762,7 +771,6 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 slot: Slot::Loading,
                 props: None,
                 generation: 0,
-                client_rev: 0,
             }));
             spawn_load(
                 module,
@@ -776,10 +784,15 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
 
 /// Loads the view on its own thread — a cold cranelift compile is a second
 /// or more; the window thread shows "Loading" instead of freezing for it —
-/// and installs it only if `mounted` still waits for this very load.
-fn spawn_load(module: &'static str, mounted: &Arc<Mutex<Mounted>>, locked: &mut Mounted) {
+/// and installs it only if `mounted` still waits for this very load AND the
+/// app is still on the node it was asked of: either moving drops the answer.
+fn spawn_load(
+    module: &'static str,
+    mounted: &Arc<Mutex<Mounted>>,
+    locked: &mut Mounted,
+) -> std::thread::JoinHandle<()> {
     let generation = locked.generation;
-    locked.client_rev = client_rev();
+    let asked_of = client_rev();
     let client = rpc_client().lock().expect("views rpc").clone();
     let loading = mounted.clone();
     std::thread::spawn(move || {
@@ -797,10 +810,10 @@ fn spawn_load(module: &'static str, mounted: &Arc<Mutex<Mounted>>, locked: &mut 
             }
         };
         let mut locked = loading.lock().expect("module view lock");
-        if locked.generation == generation {
+        if locked.generation == generation && client_rev() == asked_of {
             locked.slot = slot;
         }
-    });
+    })
 }
 
 /// Where the staged views are: `$DUCKTAPE_VIEWS_DIR`, else `views/` beside
@@ -2109,6 +2122,63 @@ mod tests {
             );
         }
         assert!(!crate::backend::view_source::module_owned("settings"));
+    }
+
+    /// A load still in flight when the app moves to another node lands
+    /// nowhere: the node it was asked of may answer late, and its view is
+    /// not the view of the node the app is on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_load_the_previous_node_answers_late_is_not_installed() {
+        use crate::backend::view_source::tests::node;
+        use module_artifact::{ModuleArtifact, ViewArtifact};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let deployment = |asset: &str| ModuleArtifact {
+            component: vec![1, 2, 3],
+            index: None,
+            view: Some(ViewArtifact {
+                component: component.clone(),
+                assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
+            }),
+        };
+        let status = |artifact: &ModuleArtifact| {
+            serde_json::json!({"module_status": {"modules": [
+                {"module_id": "forge", "active_code_hash": artifact.hash().to_vec(),
+                 "pending": null, "history": []}
+            ]}})
+        };
+        let (a, b) = (deployment("a.svg"), deployment("b.svg"));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let node_a = node(status(&a), Some(a), Some(hold.clone())).await;
+        let node_b = node(status(&b), Some(b), None).await;
+
+        // mounted with no node: fails fast, then A is asked and holds
+        let mounted = mounted("forge");
+        let asked_of_a = connected(&node_a);
+        // the app moves to B while A is still composing its answer
+        let asked_of_b = connected(&node_b);
+        for load in asked_of_b {
+            load.join().expect("the load on B");
+        }
+        hold.notify_one();
+        for load in asked_of_a {
+            load.join().expect("the load on A");
+        }
+        let locked = mounted.lock().expect("module view lock");
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("the view of B is not there");
+        };
+        assert!(
+            guest.assets.contains_key("b.svg"),
+            "{:?}",
+            guest.assets.keys()
+        );
+        assert!(
+            !guest.assets.contains_key("a.svg"),
+            "A's late answer landed"
+        );
     }
 
     #[test]

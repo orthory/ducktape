@@ -169,15 +169,20 @@ pub async fn resolve(client: &Client, module: &str) -> Result<ViewSource, Error>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use module_artifact::{ModuleArtifact, ViewArtifact};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     /// A node that answers `module_status` with `status` and serves
     /// `artifact` under every blob digest asked for — so a registry naming
-    /// a hash the bytes do not match is one test away.
-    async fn node(status: serde_json::Value, artifact: Option<ModuleArtifact>) -> Client {
+    /// a hash the bytes do not match is one test away. With `hold`, the
+    /// blob is served only once it is notified.
+    pub(crate) async fn node(
+        status: serde_json::Value,
+        artifact: Option<ModuleArtifact>,
+        hold: Option<Arc<tokio::sync::Notify>>,
+    ) -> Client {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -190,6 +195,9 @@ mod tests {
                 let (status_line, body) = if route == "/v1/query" {
                     ("200 OK", status.to_string().into_bytes())
                 } else if route.starts_with("/v1/files/blob/") {
+                    if let Some(hold) = &hold {
+                        hold.notified().await;
+                    }
                     match &artifact {
                         Some(artifact) => ("200 OK", artifact.encode()),
                         None => ("404 Not Found", Vec::new()),
@@ -231,7 +239,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_activated_deployment_with_a_view_is_ready() {
         let artifact = with_view();
-        let client = node(status_of(&artifact.hash()), Some(artifact.clone())).await;
+        let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
             resolve(&client, "files").await.unwrap(),
             ViewSource::Ready {
@@ -245,7 +253,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_verified_deployment_without_a_view_is_missing_not_a_fallback() {
         let artifact = ModuleArtifact::component(vec![1, 2, 3]);
-        let client = node(status_of(&artifact.hash()), Some(artifact.clone())).await;
+        let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
             resolve(&client, "files").await.unwrap(),
             ViewSource::Missing {
@@ -256,7 +264,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bytes_that_do_not_hash_to_the_active_code_fail() {
-        let client = node(status_of(&[7; 32]), Some(with_view())).await;
+        let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert!(matches!(
             resolve(&client, "files").await,
             Err(Error::Artifact(view_artifact::Error::HashMismatch))
@@ -265,7 +273,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_fetch_that_fails_is_an_error() {
-        let client = node(status_of(&[7; 32]), None).await;
+        let client = node(status_of(&[7; 32]), None, None).await;
         assert!(matches!(
             resolve(&client, "files").await,
             Err(Error::Artifact(view_artifact::Error::Transport(_)))
@@ -274,7 +282,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_admission_before_its_boundary_is_not_activated() {
-        let client = node(status_of(&[7; 32]), Some(with_view())).await;
+        let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert_eq!(
             resolve(&client, "chat").await.unwrap(),
             ViewSource::NotActivated
@@ -308,7 +316,7 @@ mod tests {
                 serde_json::json!({"module_status": {"modules": []}}),
             ),
         ] {
-            let client = node(status, Some(with_view())).await;
+            let client = node(status, Some(with_view()), None).await;
             assert!(
                 matches!(resolve(&client, "files").await, Err(Error::Status(_))),
                 "{case}"
