@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -701,8 +700,15 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
 /// a new generation, so an answer the previous node is still composing
 /// lands nowhere. Returns the loads it started, for a test to wait on.
 pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
-    *rpc_client().lock().expect("views rpc") = Some(client.clone());
-    CLIENT_REV.fetch_add(1, Ordering::SeqCst);
+    // the client and its revision move as one, and the lock is let go
+    // before any view is touched: a load installs under it (see
+    // `spawn_load`), and takes the view's own lock inside it.
+    let snapshot = {
+        let mut connection = connection().lock().expect("views rpc");
+        connection.rev += 1;
+        connection.client = Some(client.clone());
+        connection.clone()
+    };
     let registry = registry().lock().expect("module views");
     registry
         .iter()
@@ -713,20 +719,28 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
             }
             locked.slot = Slot::Loading;
             locked.generation += 1;
-            Some(spawn_load(module, mounted, &mut locked))
+            Some(spawn_load(
+                module,
+                mounted,
+                locked.generation,
+                snapshot.clone(),
+            ))
         })
         .collect()
 }
 
-static CLIENT_REV: AtomicU64 = AtomicU64::new(0);
-
-fn client_rev() -> u64 {
-    CLIENT_REV.load(Ordering::SeqCst)
+/// The node the module-owned views load from, and how many times the app
+/// has moved: a load is asked of one snapshot of this and installs only
+/// while it is still the one.
+#[derive(Clone, Default)]
+struct Connection {
+    client: Option<ducktape_rpc::Client>,
+    rev: u64,
 }
 
-fn rpc_client() -> &'static Mutex<Option<ducktape_rpc::Client>> {
-    static CLIENT: OnceLock<Mutex<Option<ducktape_rpc::Client>>> = OnceLock::new();
-    CLIENT.get_or_init(Mutex::default)
+fn connection() -> &'static Mutex<Connection> {
+    static CONNECTION: OnceLock<Mutex<Connection>> = OnceLock::new();
+    CONNECTION.get_or_init(Mutex::default)
 }
 
 /// What the tab shows while the view is not there to show itself.
@@ -767,16 +781,13 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
     registry
         .entry(module)
         .or_insert_with(|| {
+            let snapshot = connection().lock().expect("views rpc").clone();
             let mounted = Arc::new(Mutex::new(Mounted {
                 slot: Slot::Loading,
                 props: None,
                 generation: 0,
             }));
-            spawn_load(
-                module,
-                &mounted,
-                &mut mounted.lock().expect("module view lock"),
-            );
+            spawn_load(module, &mounted, 0, snapshot);
             mounted
         })
         .clone()
@@ -785,18 +796,17 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
 /// Loads the view on its own thread — a cold cranelift compile is a second
 /// or more; the window thread shows "Loading" instead of freezing for it —
 /// and installs it only if `mounted` still waits for this very load AND the
-/// app is still on the node it was asked of: either moving drops the answer.
+/// app is still on the node it was asked of, both checked under the
+/// connection lock so a move cannot slip between the check and the seat.
 fn spawn_load(
     module: &'static str,
     mounted: &Arc<Mutex<Mounted>>,
-    locked: &mut Mounted,
+    generation: u64,
+    asked_of: Connection,
 ) -> std::thread::JoinHandle<()> {
-    let generation = locked.generation;
-    let asked_of = client_rev();
-    let client = rpc_client().lock().expect("views rpc").clone();
     let loading = mounted.clone();
     std::thread::spawn(move || {
-        let slot = match Guest::load(module, client.as_ref(), generation) {
+        let slot = match Guest::load(module, asked_of.client.as_ref(), generation) {
             Ok(guest) => Slot::Ready(Box::new(guest)),
             Err(reason) => {
                 tracing::warn!(
@@ -809,8 +819,9 @@ fn spawn_load(
                 Slot::Failed(reason)
             }
         };
+        let connection = connection().lock().expect("views rpc");
         let mut locked = loading.lock().expect("module view lock");
-        if locked.generation == generation && client_rev() == asked_of {
+        if locked.generation == generation && connection.rev == asked_of.rev {
             locked.slot = slot;
         }
     })
