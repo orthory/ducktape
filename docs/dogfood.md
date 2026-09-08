@@ -356,8 +356,9 @@ workflow checkpoint. Clock values in its query are hints from local committed
 status. Every target still validates messages against its execution context.
 
 The standard Linux guest includes the Rust toolchain from `rust-toolchain.toml`,
-the wasm32 target, native build utilities and the componentizer from
-`wasm-tools.version`. Build it at the default location with:
+the wasm32 target, native build utilities and the `wasm-tools` CLI of the
+componentizer's release (the `wit-component` pin in
+`bin/guest-builder/Cargo.toml`). Build it at the default location with:
 
 ```sh
 ops/build-guest-rootfs.sh

@@ -173,15 +173,10 @@ fn build(seed: &Path) {
         "wasm32-unknown-unknown",
     ]);
     run(cargo);
-    let mut componentize = Command::new("wasm-tools");
-    componentize.current_dir(seed).args([
-        "component",
-        "new",
-        "target/wasm32-unknown-unknown/release/hello_wasm.wasm",
-        "-o",
-        "hello.component.wasm",
-    ]);
-    run(componentize);
+    let core =
+        std::fs::read(seed.join("target/wasm32-unknown-unknown/release/hello_wasm.wasm")).unwrap();
+    let component = guest_builder::componentize(&core).unwrap();
+    std::fs::write(seed.join("hello.component.wasm"), component).unwrap();
 }
 
 fn recent(cluster: &Cluster) -> Vec<runs::RunRecord> {

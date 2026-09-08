@@ -256,21 +256,32 @@ identity_published || die "node never published its identity — see $WSDIR/seed
 # operator does — `service run` discovers this host's providers, signals them,
 # and --enable grants from that live hello. It only needs to run long enough
 # for the grant to land, so it is stopped once services.toml appears.
-"$NODE_BIN" service run compute --enable --workspace "$WSDIR" >"$WSDIR/service.log" 2>&1 &
-SVC_PID=$!
-for _ in $(seq 1 50); do [ -f "$WSDIR/services.toml" ] && break; sleep 0.1; done
-kill "$SVC_PID" 2>/dev/null; wait "$SVC_PID" 2>/dev/null
-if [ -f "$WSDIR/services.toml" ]; then
-  log "compute granted — agent runs available"
-else
+grant_compute(){
+  "$NODE_BIN" service run compute --enable --workspace "$WSDIR" >"$WSDIR/service.log" 2>&1 &
+  local svc_pid=$!
+  for _ in $(seq 1 50); do [ -f "$WSDIR/services.toml" ] && break; sleep 0.1; done
+  kill "$svc_pid" 2>/dev/null; wait "$svc_pid" 2>/dev/null
+  if [ -f "$WSDIR/services.toml" ]; then
+    log "compute granted — agent runs available"
+    return
+  fi
   # The reason is in service.log and nowhere else; guessing at it ("no usable
-  # container runtime?") sends the reader hunting for the wrong thing — the
-  # usual cause is a node.toml with no live [sandbox] table, not a missing VMM.
+  # container runtime?") sends the reader hunting for the wrong thing.
   log "compute NOT granted:"
   tail -n 3 "$WSDIR/service.log" 2>/dev/null | sed 's/^/    /'
   log "  full log: $WSDIR/service.log"
   log "  the demo still runs, just without agent runs. Grant it later with:"
   log "  ducktape service run compute --workspace $WSDIR"
+}
+
+# A node.toml with no live [sandbox] table is a host that cannot isolate a run
+# (`node init` writes the table only where it can): the compute daemon dies at
+# boot on it, so there is no grant to mint and no log worth reading.
+has_sandbox_table(){ grep -q '^\[sandbox\]' "$WSDIR/node.toml"; }
+if has_sandbox_table; then
+  grant_compute
+else
+  log "no [sandbox] table in node.toml — this host cannot isolate a run, so compute is not granted; the demo still runs, just without agent runs"
 fi
 
 # ── 5. seed ops ────────────────────────────────────────────────

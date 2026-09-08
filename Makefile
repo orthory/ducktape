@@ -138,12 +138,13 @@ ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
 ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
 
-# The build dir is keyed by rev too: `cargo install --git` reuses whatever a
-# shared target dir already holds for the same crate name and version, so a
-# bump used to install the PREVIOUS rev's binary under the new rev's path
-# (`cargo ice bundle` then refused flags the new rev has).
-# An existing binary can predate the isolated build dir. Only reuse an install
-# completed by this recipe; --force also replaces Cargo's stale registration.
+# The build dir is keyed by rev too: cargo treats every checkout under its git
+# cache as immutable (no mtime check on its sources) and hashes a git package's
+# outputs without the revision, so a build dir shared across revs hands the
+# next rev the previous rev's binary as "fresh" — a cargo-ice that parses the
+# wrong language, filed under the right rev. An existing binary can predate the
+# isolated build dir. Only reuse an install completed by this recipe; --force
+# also replaces Cargo's stale registration.
 .PHONY: ice-tool
 ice-tool:
 	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
@@ -152,25 +153,30 @@ ice-tool:
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
 	touch "$(ICE_INSTALL_STAMP)"
 
-# wasm-tools at the version in wasm-tools.version, installed the same way
-# cargo-ice is: under target, keyed by version, so `make views` and
-# `make wasm-modules` need nothing on PATH and cannot pick up a global copy
-# at another version (component bytes depend on it).
-WASM_TOOLS_VERSION = $(shell cat wasm-tools.version)
+# The `wasm-tools` CLI the view bundler drives (cargo-ice shells out to it to
+# wrap each view as a component), installed the same way cargo-ice is: under
+# target, keyed by version, so `make views` needs nothing on PATH and cannot
+# pick up a global copy at another version. It is the componentizer's own
+# release — `wasm-tools 1.x.y` and the `wit-component 0.x.y` guest-builder
+# links ship together and write the same bytes — so the version is read off
+# guest-builder's manifest, the one place the componentizer is pinned, and no
+# second number exists to drift.
+WASM_TOOLS_VERSION = 1.$(shell sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' bin/guest-builder/Cargo.toml | head -n1)
 WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
 WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
 
 $(WASM_TOOLS_BIN):
-	CARGO_TARGET_DIR="$(CURDIR)/target/wasm-tools-build" $(CARGO) install wasm-tools \
-		--locked --version "$(WASM_TOOLS_VERSION)" --root "$(WASM_TOOLS_ROOT)"
+	CARGO_TARGET_DIR="$(WASM_TOOLS_ROOT)/build" $(CARGO) install wasm-tools \
+		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
 
 ## build every desktop view (crates/views) as an `ice:view` component
 ## and stage it under target/views, where a built desktop app loads it from
 ## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-## binary). Installs wasm-tools like `wasm-modules`. The views workspace pins the
-## same ducktape-ui rev as the app, and this refuses when they differ: a view
-## compiled by another language revision than the host that renders it is a
-## wire nobody tested.
+## binary). Installs the bundler's wasm-tools under target on first use and
+## puts it on the recipe's PATH, never the operator's. The views workspace pins
+## the same ducktape-ui rev as the app, and this refuses when they differ: a
+## view compiled by another language revision than the host that renders it is
+## a wire nobody tested.
 VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
 
 views: ice-tool $(WASM_TOOLS_BIN)
@@ -336,17 +342,17 @@ test: wasm-modules-check wasm-embed-check
 ## rebuild every wasm guest into its artifact and refresh EVERY committed copy
 ## in one sweep (the canonical artifact in the module's own directory, which
 ## the build stages into the founding set, + the kernel test fixtures), so the
-## copies can never drift apart. installs wasm-tools at the pinned version
-## under target on first use; the wasm32 target uses
-## rust-toolchain.toml. every guest is built ALONE, out of the platform
-## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
-## pushed first; each module's guest.lock records the revision and the
+## copies can never drift apart. the componentizer is the `wit-component` crate
+## guest-builder links (pinned in bin/guest-builder/Cargo.toml); the wasm32
+## target uses rust-toolchain.toml. every guest is built ALONE, out of the
+## platform repository at this checkout's HEAD (bin/guest-builder), so HEAD must
+## be pushed first; each module's guest.lock records the revision and the
 ## registry versions its artifact came from and seeds its next build, so a
-## crates.io publish never moves the bytes, and a revision that changes none
-## of what a module compiles leaves its bytes as they are. component bytes
-## ARE toolchain-dependent: a rebuild on a different rustc may legitimately
-## differ from the committed bytes — move the channel and the whole set
-## together. `wasm-modules-check` guards the copies' mutual consistency,
+## crates.io publish never moves the bytes, and a revision that changes none of
+## what a module compiles leaves its bytes as they are. component bytes ARE
+## toolchain-dependent: a rebuild on a different rustc may legitimately differ
+## from the committed bytes — move the channel and the whole set together.
+## `wasm-modules-check` guards the copies' mutual consistency,
 ## `wasm-rebuild-check` every artifact against a rebuild of its source, and
 ## `wasm-repro-check` that nothing builder-local reaches the bytes.
 #
@@ -388,10 +394,10 @@ INDEX_MODULES := \
 # the netstack-wasm scenario lane reads it from the crate directory.
 NETSTACK_GUEST := crates/networking/netstack-machine
 
-wasm-modules: $(WASM_TOOLS_BIN)
+wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
+	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
@@ -406,9 +412,9 @@ wasm-modules: $(WASM_TOOLS_BIN)
 	# committed lock, so $(LOCKED) applies same as everywhere else) — their
 	# components are kernel test fixtures, nothing the genesis hash pins.
 	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	"$(WASM_TOOLS_BIN)" component new \
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
-	  -o crates/guests/hello-wasm/component.wasm
+	  --out crates/guests/hello-wasm/component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
@@ -417,23 +423,23 @@ wasm-modules: $(WASM_TOOLS_BIN)
 	# nothing. Its component is committed beside the crate and pinned in the
 	# host fixtures, the hello shape.
 	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	"$(WASM_TOOLS_BIN)" component new \
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
-	  -o crates/guests/noop-wasm/component.wasm
+	  --out crates/guests/noop-wasm/component.wasm
 	cp crates/guests/noop-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	"$(WASM_TOOLS_BIN)" component new \
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
-	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
+	  --out crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
 	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	"$(WASM_TOOLS_BIN)" component new \
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
-	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
+	  --out crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
 	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	"$(WASM_TOOLS_BIN)" component new \
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- componentize \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
-	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
+	  --out crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (`node init` hashes the bundle into the
@@ -490,8 +496,8 @@ wasm-embed-check:
 	echo "wasm-embed-check: no non-test include of a .wasm"
 
 ## the reproducibility gate: one guest built twice, in two scratch directories,
-## must be byte-identical and carry no host path. Needs the wasm32 target,
-## wasm-tools and a pushed HEAD (which `wasm-modules-check` deliberately does
+## must be byte-identical and carry no host path. Needs the wasm32 target
+## and a pushed HEAD (which `wasm-modules-check` deliberately does
 ## not), so it stands apart from the pre-push `test` gate. See
 ## ops/wasm-repro-check.sh.
 wasm-repro-check:
@@ -505,7 +511,7 @@ REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 ## against each other, so an artifact could drift arbitrarily far from the
 ## source beside it and stay green. A `--out` build leaves the module
 ## directory (lock included) untouched, so the tree stays clean under the
-## check. Needs the wasm32 target, wasm-tools and a pushed HEAD, so like
+## check. Needs the wasm32 target and a pushed HEAD, so like
 ## `wasm-repro-check` it stands apart from the pre-push `test` gate.
 wasm-rebuild-check:
 	@mkdir -p "$(REBUILD_CHECK_DIR)"
