@@ -6,7 +6,7 @@
 //! polls the deployments once a second (`deployments_checked`, what a block
 //! tip spawns). On every `view_source` transition that names a hash —
 //! Ready, Swapped, Missing, Failed — it writes the line to
-//! `<out>/view_source.log` and a PNG of the Approvals tab to
+//! `<out>/view_source.log` and a PNG of that module's tab to
 //! `<out>/<n>-<module>-<state>-<hash8>.png`. The steps themselves (activate
 //! A, then B, then an asset-only B′, then a removal) are somebody else's to
 //! drive; this runs until it is killed, or `DUCKTAPE_CANARY_STEPS` captures.
@@ -41,7 +41,7 @@ use iced_test::runtime::user_interface::{self, UserInterface};
 
 use crate::module_view::canary::{drawn, mount_module_owned, seated_hash, tap, texts};
 
-/// The Approvals tab as captured: a console-sized tab, one pixel per point.
+/// A tab as captured: console-sized, one pixel per point.
 const TAB: Size = Size::new(900.0, 600.0);
 /// How often the deployments are checked — a block interval, near enough.
 const POLL: Duration = Duration::from_secs(1);
@@ -182,9 +182,8 @@ fn shown(module: &str) -> Vec<String> {
 /// The canary views' promise, held against this transition: an A (Ready)
 /// shows no marker, a B (Swapped) moves the hash and shows its module's
 /// marker, a B′ (a Swapped after a Swapped) changes the governance seal, a
-/// removal (Missing) shows nothing. The Approvals tab is the one drawn
-/// here; another module's marker is read only where its tab has a tree and
-/// is past "Not connected" — this read-only client never connects the
+/// removal (Missing) shows nothing. A module's marker is read only where
+/// its tab has a tree and is past "Not connected" — this read-only client never connects the
 /// Files tab to a workspace, and its marker sits behind that.
 fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
     let module = &step.module;
@@ -328,15 +327,18 @@ fn a_capture_draws_the_module_it_names() {
         {"module_id": "chat", "active_code_hash": chat.hash(), "pending": null,
          "history": [{"height": 7, "code_hash": chat.hash()}]},
     ]}});
-    let origin = runtime.block_on(fake_node(node)).origin().to_owned();
+    let client = runtime.block_on(fake_node(node));
     mount_module_owned();
-    drop(runtime.block_on(crate::backend::connect(origin, 0, 0)));
+    // the loads the connection starts, each joined: the seats are in
+    for load in crate::module_view::connected(&client) {
+        load.join().expect("a view load");
+    }
     for (module, artifact) in [("governance", &governance), ("chat", &chat)] {
-        let until = Instant::now() + SEAT;
-        while seated_hash(module) != Some(artifact.hash()) {
-            assert!(Instant::now() < until, "{module} never seated");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert_eq!(
+            seated_hash(module),
+            Some(artifact.hash()),
+            "{module} seated"
+        );
     }
 
     let out = std::env::temp_dir().join(format!("ducktape-canary-tabs-{}", std::process::id()));
