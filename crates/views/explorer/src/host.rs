@@ -142,17 +142,25 @@ pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {
         .collect()
 }
 
-/// `h 84,912`; a height the node has not reported reads `h —`.
-/// The list's landmark for a digest: its first twelve hex chars and an
-/// ellipsis. The whole value stays in the props for the detail and the copy.
-pub fn short(digest: &str) -> String {
-    let mut short: String = digest.chars().take(12).collect();
-    if digest.chars().count() > 12 {
-        short.push('\u{2026}');
+/// A digest the way this screen prints one: `0x` and every character of it.
+/// The prefix is what tells a reader the run of digits is hex rather than the
+/// decimal byte array the same value reads as elsewhere, and nothing is cut —
+/// a shortened digest is a key that opens nothing.
+///
+/// VERBATIM WHEN IT IS NOT A DIGEST. `proposer` carries a hex key only for
+/// frame-authored ops; `project_root_op` labels the rest `system`,
+/// `module:<id>` or `acct:<account>`, and a follower's boundary row carries an
+/// empty `hash`. `0xsystem` names nothing, so anything that is not bare hex
+/// passes through untouched.
+pub fn hex(digest: &str) -> String {
+    let is_hex = !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit());
+    if !is_hex {
+        return digest.to_string();
     }
-    short
+    format!("0x{digest}")
 }
 
+/// `h 84,912`; a height the node has not reported reads `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();

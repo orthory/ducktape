@@ -3734,6 +3734,82 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    /// EVERY DIGEST THE LEDGER PUBLISHES REACHES THE SCREEN WHOLE, IN HEX.
+    /// The rows are the node's own `GET /v1/blocks` shape, the props are what
+    /// `explorer_window` makes of them — the production conversion, not a
+    /// hand-built prop — and the reader is the bundled wasm guest. Nothing
+    /// between the two may cut a digest or leave one in decimal: the block
+    /// hash on the list row, the commit hash and the op hash in the detail,
+    /// and the `new_oid` inside the payload all read `0x` and every character.
+    #[test]
+    fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
+        let Some(staged) = staged("explorer") else {
+            return;
+        };
+        let hash = "9f3e".repeat(16);
+        let commit = "c0ffee11".repeat(8);
+        let op_hash = "dd".repeat(32);
+        let oid: Vec<u8> = (1..=20).collect();
+        let rows = vec![serde_json::json!({
+            "height": 84_912,
+            "hash": hash,
+            "commit_hash": commit,
+            "ops": [{
+                "proposer": "cc".repeat(32),
+                "target": "forge",
+                "disposition": "applied",
+                "op_hash": op_hash,
+                "payload": serde_json::to_string(&serde_json::json!({
+                    "push": { "new_oid": oid }
+                }))
+                .expect("payload encodes"),
+                "operations": []
+            }]
+        })];
+        let ledger = crate::backend::explorer_window(1, &rows);
+
+        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "connected": true, "loading": false, "dark": false,
+                "blocks": ledger.blocks, "ops": ledger.ops,
+                "head": 84_912, "sync_line": "live",
+                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+
+        let listed = texts(&guest);
+        assert!(
+            listed.iter().any(|text| text == &format!("0x{hash}")),
+            "the list row carries the whole block hash: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|text| text.contains('\u{2026}')),
+            "and elides nothing: {listed:?}"
+        );
+
+        guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
+        guest.redraw(&props);
+        let opened = texts(&guest);
+        for expected in [format!("0x{commit}"), format!("0x{op_hash}")] {
+            assert!(
+                opened.iter().any(|text| text == &expected),
+                "missing {expected:?} in {opened:?}"
+            );
+        }
+        assert!(
+            opened
+                .iter()
+                .any(|text| text
+                    .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
+            "the payload's digest is hex too: {opened:?}"
+        );
+        assert!(guest.fault.is_none());
+    }
+
     /// The bundled Settings view through the host: the facts, then a
     /// rename that leaves as an intent carrying the trimmed name — and the
     /// password crosses in as a flag only.

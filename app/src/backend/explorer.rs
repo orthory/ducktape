@@ -78,10 +78,10 @@ pub(crate) fn explorer_window(generation: i64, rows: &[serde_json::Value]) -> Ex
         if row_ops.is_empty() {
             continue;
         }
-        // WHOLE, as the node prints them (bare lowercase hex): the guest
-        // abbreviates its list to a landmark and shows and copies the full
-        // value in the detail. A digest shortened here is a key the reader
-        // cannot use anywhere.
+        // WHOLE, as the node prints them (bare lowercase hex). The view adds
+        // the `0x` and shows every character; a digest shortened HERE is one
+        // no screen can ever recover, and the byte identity the node published
+        // is what has to cross.
         blocks.push(ExplorerBlock {
             height,
             hash: row["hash"].as_str().unwrap_or_default().to_string(),
@@ -127,12 +127,69 @@ pub(crate) fn short_digest(digest: &str) -> String {
 fn explorer_payload(payload: &serde_json::Value) -> String {
     let Some(text) = payload.as_str() else {
         // already-structured JSON (no projection in between): print it readably.
-        return serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+        let mut parsed = payload.clone();
+        hex_byte_arrays(&mut parsed);
+        return serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| payload.to_string());
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) else {
         return text.to_string();
     };
+    hex_byte_arrays(&mut parsed);
     serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| text.to_string())
+}
+
+/// How many bytes an array has to carry before this reads it as a digest.
+/// Sixteen is the shortest width anything is ever called a digest at; what
+/// actually crosses this lane is wider — a git object id is 20, a sha256 and
+/// an ed25519 key are 32. Below it, an array of small numbers is far likelier
+/// to be a list of small numbers.
+const DIGEST_BYTES_MIN: usize = 16;
+
+/// Rewrite every digest-shaped byte array in a payload as `0x…` hex, in place.
+///
+/// A module message carries its digests as `Vec<u8>` — forge's `prev_oid` and
+/// `new_oid`, runs' `recipe_hash`, the registry's `code_hash` — and serde
+/// prints those as decimal arrays, so a payload card showed thirty-two lines
+/// of three-digit numbers where a hash belongs: not comparable with the block
+/// and op hashes beside it, and not pasteable at anything. The same value in
+/// the same notation as every other digest on the screen is the whole point.
+///
+/// THE SHAPE IS THE WHOLE TEST — every element a byte, at least
+/// [`DIGEST_BYTES_MIN`] of them — because the field NAMES are the modules',
+/// and this reads payloads from all of them. A genuine list of that many
+/// small numbers would render as hex too; nothing that reaches this lane
+/// produces one, and if something ever does, the module names its digest
+/// field rather than this growing a dictionary of the ones it knows.
+fn hex_byte_arrays(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            if let Some(bytes) = digest_bytes(items) {
+                *value = serde_json::Value::String(format!("0x{}", hex_encode(&bytes)));
+                return;
+            }
+            for item in items {
+                hex_byte_arrays(item);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (_, field) in fields {
+                hex_byte_arrays(field);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The bytes this array carries, when every element is one and there are
+/// enough of them to be a digest.
+fn digest_bytes(items: &[serde_json::Value]) -> Option<Vec<u8>> {
+    if items.len() < DIGEST_BYTES_MIN {
+        return None;
+    }
+    items
+        .iter()
+        .map(|item| u8::try_from(item.as_u64()?).ok())
+        .collect()
 }
 
 /// The dispatch trace summary: one hop per module the op reached, each naming

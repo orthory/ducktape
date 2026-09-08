@@ -149,17 +149,20 @@ fn an_ops_hash_leaves_as_a_copy() {
     assert_eq!(
         serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
         Copy {
-            text: "ab12cd34".into(),
+            // what the reader is looking at, prefix and all
+            text: "0xab12cd34".into(),
             label: "Op hash copied".into()
         }
     );
 }
 
-/// A block's hash is a landmark in the list and a key in the detail: twelve
-/// hex chars on the row, the whole value beside a copy once the block is
-/// open — and the copy carries every character.
+/// EVERY DIGEST, WHOLE AND `0x`-PREFIXED, IN BOTH PLACES IT APPEARS. The list
+/// row carries the block hash in full — not twelve chars and an ellipsis, which
+/// identifies a block to the eye and to nothing else — and the detail names it
+/// beside the commit hash with a copy on each. The copy carries exactly the
+/// string on screen.
 #[test]
-fn a_block_hash_reads_short_in_the_list_and_whole_with_a_copy_in_the_detail() {
+fn every_digest_reads_whole_and_hex_prefixed_and_copies_what_it_shows() {
     let hash = "9f3e".repeat(16);
     let commit = "c0ffee11".repeat(8);
     let props = ExplorerProps {
@@ -172,11 +175,21 @@ fn a_block_hash_reads_short_in_the_list_and_whole_with_a_copy_in_the_detail() {
         ..ledger()
     };
     let (_, frame) = shown(&props);
-    assert!(has_text(&frame, "9f3e9f3e9f3e…"), "{:?}", texts(&frame));
-    assert!(!has_text(&frame, &hash), "the list abbreviates");
+    let whole = format!("0x{hash}");
+    assert!(has_text(&frame, &whole), "{:?}", texts(&frame));
+    // and NOTHING on the list is a cut-down version of it — the guard that
+    // fails the moment a landmark form comes back.
+    let abbreviated = texts(&frame)
+        .into_iter()
+        .find(|text| text.starts_with("0x9f3e") && *text != whole);
+    assert!(
+        abbreviated.is_none(),
+        "the list carries the whole hash, not {abbreviated:?}"
+    );
     let frame = tick_native(press(&frame, "Inspect block"));
-    assert!(has_text(&frame, &hash), "{:?}", texts(&frame));
-    assert!(has_text(&frame, &commit), "{:?}", texts(&frame));
+    for expected in [whole.clone(), format!("0x{commit}")] {
+        assert!(has_text(&frame, &expected), "{:?}", texts(&frame));
+    }
     let frame = tick_native(press(&frame, "Copy block hash"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -185,8 +198,37 @@ fn a_block_hash_reads_short_in_the_list_and_whole_with_a_copy_in_the_detail() {
     assert_eq!(
         serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
         Copy {
-            text: hash,
+            text: whole,
             label: "Block hash copied".into()
+        }
+    );
+}
+
+/// `0x` MARKS HEX, SO IT GOES ON NOTHING ELSE. A proposer is a hex key only
+/// for a frame-authored op; `project_root_op` labels the rest `system`,
+/// `module:<id>` or `acct:<account>`, and `0xsystem` names nothing.
+#[test]
+fn a_proposer_that_is_not_a_key_keeps_its_label() {
+    let props = ExplorerProps {
+        ops: vec![ExplorerOp {
+            proposer: "system".into(),
+            ..ledger().ops[0].clone()
+        }],
+        ..ledger()
+    };
+    let (_, frame) = shown(&props);
+    let frame = tick_native(press(&frame, "Inspect block"));
+    assert!(has_text(&frame, "system"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "0xsystem"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Copy proposer"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(
+        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        Copy {
+            text: "system".into(),
+            label: "Proposer copied".into()
         }
     );
 }
