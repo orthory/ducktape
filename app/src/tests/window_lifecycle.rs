@@ -8,7 +8,7 @@
 //! scenario CAN see (the close unregisters, the menu reopens, the chord's
 //! arming) it does see; this file pins the rest.
 
-use super::ice_handlers;
+use super::{__DucktapeMessage, Ducktape, ShellTab, ice_handlers, inlined};
 
 const LIFECYCLE: &str = include_str!("../ui/handlers/lifecycle.ice");
 const CORE_STATE: &str = include_str!("../ui/state/core.ice");
@@ -208,4 +208,34 @@ fn the_command_chords_are_classified_in_one_extern() {
     ] {
         assert!(EXTERNS.contains(declared), "backend.ice lost `{declared}`");
     }
+}
+
+/// A FILE DROPPED ON THE WINDOW IS A FILES-TAB UPLOAD. The Files screen is a
+/// module-owned view, but the OS drop stays a WINDOW event the daemon hears
+/// (`window file-dropped -> fs_file_dropped _`): on the Files tab, connected,
+/// the handler takes the write lock the view reads as `loading` and starts
+/// the upload; on any other tab the drop is nobody's and changes nothing.
+#[test]
+fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
+    assert!(
+        LIFECYCLE.contains("window file-dropped -> fs_file_dropped _"),
+        "lifecycle.ice stopped routing the OS drop to the files handler"
+    );
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Pages;
+    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
+    assert!(!app.fs_loading, "a drop off the Files tab is nobody's");
+
+    app.shell_tab = ShellTab::Files;
+    let _ = app.__update(__DucktapeMessage::FsFileDropped("/tmp/notes.md".into()));
+    assert!(app.error.is_empty(), "{}", app.error);
+    assert!(
+        app.fs_loading,
+        "the drop takes the write lock the files view shows as `loading`"
+    );
+    assert!(
+        inlined(include_str!("../ui/view.ice")).contains("extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading,"),
+        "the files view stopped reading the lock as its `loading` prop"
+    );
 }
