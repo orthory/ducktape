@@ -68,7 +68,6 @@ extern crate::backend
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
-  component agent_terminal_surface(session:&AgentTerminalSession) -> unit
   component agent_markdown(source:str, dark:bool) -> str
   component forge_markdown(source:str, doc:str, dark:bool) -> str
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
@@ -82,15 +81,6 @@ extern crate::backend
   pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
   pure agent_host_node_choice(options:[str], current:str) -> str
   pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
-  pure agent_host_grant_note(host_node:&str, credential:&str) -> str
-  pure agent_run_line(identity:&str, host_node:&str) -> str
-  pure agent_provider_label(provider:&str) -> str
-  pure agent_provider_initial(provider:&str) -> str
-  pure agent_register_hint(provider:&str) -> str
-  pure agent_composer_hint(provider:&str) -> str
-  pure agent_task_blurb(host_node:&str) -> str
-  pure agent_terminal_note(provider:&str, credential:&str) -> str
-  pure agent_run_label(saga_id:&str) -> str
   pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
   pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
   pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]

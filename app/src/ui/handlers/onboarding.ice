@@ -405,14 +405,13 @@ on console_opened(id)
   shell_terminal_error = ""
   shell_chat_entries = []
   shell_chat_activity = []
-  shell_chat_draft = editor("")
+  shell_draft_cleared = shell_composer_clear()
   shell_chat_busy = false
   shell_chat_status = ""
   shell_chat_detail = ""
   shell_chat_live = ""
   shell_chat_saga = ""
   shell_detached_saga = ""
-  shell_steps_open = 0
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false

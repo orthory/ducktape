@@ -1229,9 +1229,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/settings/src/ui/app.ice",
         "../../crates/views/settings/src/ui/settings.ice",
         "../../crates/views/settings/src/ui/kit.ice",
+        "../../crates/views/shell/src/ui/app.ice",
+        "../../crates/views/shell/src/ui/shell.ice",
+        "../../crates/views/shell/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
-        "ui/screens/shell.ice",
         "ui/screens/storage.ice",
         "ui/view.ice",
     ];
@@ -1274,7 +1276,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/screens/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
             "../../crates/views/explorer/src/ui/app.ice",
-            "ui/screens/shell.ice",
+            "../../crates/views/shell/src/ui/shell.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
     );
@@ -1431,14 +1433,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "components/shell.ice",
             "for item in shell_nav(tab, approvals, agent_live)",
         ),
-        // One provider turn, hard-capped to MAX_ACTIVITY_ROWS in the backend.
-        (
-            "screens/shell.ice",
-            "keyed row in activity by=row.id #activity w=fill gap=8.0",
-        ),
-        // The same cap, kept with the turn it belongs to, and drawn only for
-        // the ONE entry whose fold is open (`steps_open == entry.id`).
-        ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
         ("screens/chat.ice", "for hit in search_hits"),

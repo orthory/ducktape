@@ -239,6 +239,22 @@ enum ExplorerIntent
 // what the Settings view asks of the app: one variant per act the screen
 // offers, each carrying only what the reader typed (a name, a key, a ticket,
 // the key password) — the drafts themselves are the view's
+// what the shell view asks of the app — `crate::module_view::shell_intent`
+enum ShellIntent
+  surface
+  setup
+  identity
+  host_node
+  refresh
+  terminal_start
+  terminal_stop
+  send
+  reset
+  detach
+  reopen
+  discard
+  open_link
+
 enum SettingsIntent
   tab
   reconnect

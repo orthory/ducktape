@@ -293,48 +293,7 @@ view
               load_more_thread -> load_more_thread
 
         shell:
-          ShellScreen draft<->shell_chat_draft #shell
-            with
-              surface=shell_surface
-              setup_open=shell_setup_open
-              identity_options=shell_identity_options
-              identity=shell_identity
-              provider=shell_provider
-              credential=shell_credential
-              host_node_options=shell_host_node_options
-              host_node=shell_host_node
-              credentials_loading=shell_credentials_loading
-              terminal=shell_terminal
-              terminal_running=shell_terminal_running
-              terminal_busy=shell_terminal_busy
-              terminal_title=shell_terminal_title
-              terminal_error=shell_terminal_error
-              entries=shell_chat_entries
-              activity=shell_chat_activity
-              chat_busy=shell_chat_busy
-              chat_status=shell_chat_status
-              chat_detail=shell_chat_detail
-              live=shell_chat_live
-              saga_id=shell_chat_saga
-              steps_open=shell_steps_open
-              detached_saga=shell_detached_saga
-              connected
-              dark
-            events
-              shell_surface_changed -> shell_surface_changed _
-              shell_setup_toggled -> shell_setup_toggled
-              shell_identity_changed -> shell_identity_changed _
-              shell_host_node_changed -> shell_host_node_changed _
-              shell_credentials_refresh -> shell_credentials_refresh
-              shell_terminal_start -> shell_terminal_start
-              shell_terminal_stop -> shell_terminal_stop
-              shell_composer_event -> shell_composer_event _
-              shell_chat_reset -> shell_chat_reset
-              shell_chat_detach -> shell_chat_detach
-              shell_chat_reopen -> shell_chat_reopen
-              shell_chat_discard -> shell_chat_discard
-              shell_chat_steps_toggled -> shell_chat_steps_toggled _
-              shell_open_link -> open_message_link _
+          extern shell_view(dark, connected, shell_surface, shell_setup_open, shell_identity_options, shell_identity, shell_provider, shell_credential, shell_host_node_options, shell_host_node, shell_credentials_loading, shell_terminal, shell_terminal_running, shell_terminal_busy, shell_terminal_title, shell_terminal_error, shell_chat_entries, shell_chat_activity, shell_chat_busy, shell_chat_status, shell_chat_detail, shell_chat_live, shell_chat_saga, shell_detached_saga) #shell -> shell_view_event _
 
         pages:
           PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages

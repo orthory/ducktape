@@ -704,13 +704,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 
     assert_eq!(
         screens,
-        [
-            "ChatScreen",
-            "FilesScreen",
-            "ForgeScreen",
-            "PagesScreen",
-            "ShellScreen",
-        ],
+        ["ChatScreen", "FilesScreen", "ForgeScreen", "PagesScreen",],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
