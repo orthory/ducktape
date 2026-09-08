@@ -228,7 +228,9 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
         "the browse launches from ForgeCodeBrowser, not the app plane"
     );
     let screen = include_str!("../ui/screens/forge.ice");
-    assert!(screen.contains("run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"));
+    assert!(screen.contains(
+        "run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"
+    ));
     assert!(screen.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
 
     let screen = include_str!("../ui/screens/forge.ice");
@@ -304,15 +306,9 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "-> choose_channel _",
         "-> open_chat_search_hit(_, link.seq, link.seq)",
     ] {
-        assert!(
-            open.contains(route),
-            "a kind routes onto existing navigation: {route}"
-        );
+        assert!(open.contains(route), "a kind routes onto existing navigation: {route}");
     }
-    assert!(
-        !open.contains("run replace"),
-        "the open plane owns no lane of its own"
-    );
+    assert!(!open.contains("run replace"), "the open plane owns no lane of its own");
 
     let forge = include_str!("../ui/handlers/forge.ice");
     let repo_loaded = forge
@@ -351,8 +347,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         focus_file.contains("tree_path = forge_parent(path)")
             && focus_file.contains("tree_rev = keep_str(!empty(rev), rev, tree_rev)")
-            && focus_file
-                .contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path)"),
+            && focus_file.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path)"),
         "a focused file first moves the tree to its directory, pinned to the link's rev"
     );
     assert!(
@@ -396,17 +391,8 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "the page is addressable and the landed note is drawn once, above the list"
     );
     for retiring in ["on forge_open_item(number)", "on forge_close_item"] {
-        let body = forge
-            .split_once(retiring)
-            .expect(retiring)
-            .1
-            .split_once("\non ")
-            .expect("ends")
-            .0;
-        assert!(
-            body.contains("forge_linked_note = none"),
-            "{retiring} retires the landed note"
-        );
+        let body = forge.split_once(retiring).expect(retiring).1.split_once("\non ").expect("ends").0;
+        assert!(body.contains("forge_linked_note = none"), "{retiring} retires the landed note");
     }
 }
 
@@ -477,9 +463,7 @@ fn the_forge_reader_draws_a_picture_through_the_viewer() {
         .split_once("\n  on ")
         .expect("the handler ends")
         .0;
-    let cleared = open_file
-        .find("file_picture = false")
-        .expect("the flag is cleared");
+    let cleared = open_file.find("file_picture = false").expect("the flag is cleared");
     let read = open_file.find("run replace lane=blob").expect("the read");
     assert!(cleared < read, "cleared before the read is issued");
 }
@@ -714,23 +698,15 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
             },
         )
     };
-    let _ = app.__update(tree(
-        "2222222222222222222222222222222222222222",
-        "src",
-        false,
-    ));
-    let state = app
-        .__ice_test_state_forge_code_browser(&scope)
-        .expect("instance");
+    let _ = app.__update(tree("2222222222222222222222222222222222222222", "src", false));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
     assert!(
         !state.tree_born,
         "a listing for a path the browse never asked for must not paint"
     );
 
     let _ = app.__update(tree("1111111111111111111111111111111111111111", "", true));
-    let state = app
-        .__ice_test_state_forge_code_browser(&scope)
-        .expect("instance");
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
     assert!(state.tree_born);
     assert!(state.tree_truncated);
     assert_eq!(
@@ -745,14 +721,8 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
         "core".into(),
         "src".into(),
     ));
-    let _ = app.__update(tree(
-        "2222222222222222222222222222222222222222",
-        "src",
-        false,
-    ));
-    let state = app
-        .__ice_test_state_forge_code_browser(&scope)
-        .expect("instance");
+    let _ = app.__update(tree("2222222222222222222222222222222222222222", "src", false));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
     assert!(
         state.tree_entries.is_empty() && !state.tree_truncated,
         "a tree from another revision must not paint"
@@ -819,14 +789,9 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
         "core".into(),
         "src".into(),
     ));
-    let state = app
-        .__ice_test_state_forge_code_browser(&scope)
-        .expect("instance");
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
     assert_eq!(state.tree_path, "src");
-    assert!(
-        state.tree_entries.is_empty(),
-        "navigation clears the listing it left"
-    );
+    assert!(state.tree_entries.is_empty(), "navigation clears the listing it left");
 }
 
 /// A BLOB ANSWERS FOR ONE FILE. The reader keeps a single in-flight path, and
@@ -912,10 +877,7 @@ fn the_file_reader_owns_its_cycle_inside_the_component() {
     assert!(head.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
     assert!(head.contains("run replace lane=blob forge_blob("));
     let gates = head.matches("forge_file_header(").count();
-    assert!(
-        gates >= 8,
-        "every preview arm gates on the header, found {gates}"
-    );
+    assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
     assert!(
         !handlers.contains("forge_blob(") && !handlers.contains("forge_tree("),
         "the app half of the browse is gone"
