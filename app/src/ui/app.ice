@@ -5,14 +5,14 @@ daemon Ducktape
   bg app_background
   fg app_text
   id "dev.ducktape.app"
-  font "../../../crates/design/assets/fonts/Geist[wght].ttf"
-  font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
+  font "../../../crates/views/support/design/assets/fonts/Geist[wght].ttf"
+  font "../../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf"
   // Not a type role: with no emoji face in the font system, cosmic-text
   // re-scans the whole database for EVERY emoji on EVERY fresh paragraph
   // (~3.7ms each, uncached on miss) — the chat row toolbar carries three,
   // which made every freshly mounted row ~11ms and a channel switch a
   // half-second layout freeze. A resolved fallback costs ~60us.
-  font "../../../crates/design/assets/fonts/NotoColorEmoji.ttf"
+  font "../../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf"
   text-size 13.5
   antialiasing true
   // The status item. A click raises THIS menu, never a window: the platform

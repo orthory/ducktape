@@ -2,6 +2,6 @@
 # component tokens live in `ducktape-ui`.
 [package]
 name = "design"
-edition.workspace = true
-version.workspace = true
+edition = "2024"
+version = "0.1.0"
 publish = false

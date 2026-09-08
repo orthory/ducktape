@@ -522,13 +522,13 @@ pub(crate) fn headless_renderer() -> iced::Renderer {
             .write()
             .expect("the shared font system lock");
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/Geist[wght].ttf"
+            "../../crates/views/support/design/assets/fonts/Geist[wght].ttf"
         )));
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/GeistMono[wght].ttf"
+            "../../crates/views/support/design/assets/fonts/GeistMono[wght].ttf"
         )));
         fonts.load_font(Cow::Borrowed(include_bytes!(
-            "../../crates/design/assets/fonts/NotoColorEmoji.ttf"
+            "../../crates/views/support/design/assets/fonts/NotoColorEmoji.ttf"
         )));
     });
     tokio::runtime::Builder::new_current_thread()
