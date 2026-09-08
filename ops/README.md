@@ -156,6 +156,35 @@ rendering. View replacement/removal still uses the existing `module update`
 ceremony, verified active artifact hashes on every node, and the actual app
 host's rendering/asset/removal checks.
 
+### Local three-process canary
+
+`proxmox-view-local.py` runs the same three-node configuration on loopback when
+remote access is unavailable. It is a local rehearsal, not a Proxmox result.
+It copies the binary and all staged modules into a new task-owned directory
+under `target`, records their SHA-256 values and the supplied exact source/UI
+revisions in `owner.json`, and allocates fresh loopback ports. The binary's
+version must match the source revision. Build the input files from the stated
+revisions; the supervisor cannot infer the compiler provenance of view bytes.
+
+```sh
+python3 ops/proxmox-view-local.py --binary "$NODE_BINARY" --modules "$MODULES" \
+  --revision "$SOURCE_REV" --ui-revision "$UI_REV" --seconds 7200
+```
+
+Keep this command in the foreground. It prints the record path and three HTTP
+URLs, then reports `ready` only after the module rosters agree and all three
+nodes demonstrate an advancing common committed root. `owner.json` records
+configs, ports and child PIDs for operator commands. Interrupting the supervisor
+or reaching the time limit stops only its own children and records their exit
+codes; it never scans for or kills other node processes. Each restart creates
+new network data. SSH forwarding and the Mac app remain separate operator
+steps; no socket binds to a public interface.
+
+The generated network uses a 500 ms idle block cadence. `--after 600` in a
+module ceremony means 600 committed blocks after governance executes it,
+nominally five idle minutes, not 600 seconds or a wall-clock guarantee. Allow
+additional time for voting, artifact fan-out and the client observations.
+
 ### Preparing the actual view ceremony
 
 After the aggregate UI pin and view/assets staging CLI are integrated, prepare
