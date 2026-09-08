@@ -449,6 +449,142 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
     }
 }
 
+// ---------- the pages seat ----------
+
+/// The Pages tab: the facts the app holds, drawn by the `pages` view. The
+/// document is NOT among them — it is the app's editor, stashed for the
+/// `page_document` surface the view leaves a slot for (`crate::pages::surface`)
+/// and painted there by the host. Its intents come back one per act
+/// (`pages_intent`); the drafts the view holds cross only with the act that
+/// reads them, and `seed_rev` moving tells the view to take `page_draft` /
+/// `block_comment_draft` back as its own (a recovered comment, a refused
+/// post or create handed back).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn pages_view(
+    dark: bool,
+    connected: bool,
+    loading: bool,
+    mutation_phase: crate::MutationPhase,
+    network_chain_id: &str,
+    pages: &[crate::backend::PageItem],
+    page_create_open: bool,
+    page_draft: &str,
+    block_comment_draft: &str,
+    seed_rev: i64,
+    active_page: &str,
+    active_page_title: &str,
+    active_page_parent: &str,
+    page_searching: bool,
+    page_search_hits: &[crate::backend::PageSearchHit],
+    page_search_query: &str,
+    page_delete_armed: bool,
+    autosave: crate::AutosaveStatus,
+    page_refusal: &str,
+    doc_tabs: &[String],
+    blocks: &[crate::backend::PageBlock],
+    commented_block_hits: &[String],
+    caret_comment_target: &str,
+    active_thread_anchor: &str,
+    orphaned_comment_drafts: &[String],
+    page_editor: &iced::widget::text_editor::Content,
+    block_comments_open: bool,
+    thread_total: i64,
+    threads: &[crate::backend::PageCommentThread],
+    comment_rows: &[crate::pages::PageCommentThreadRow],
+    threads_loading: bool,
+    threads_has_more: bool,
+    active_thread: &str,
+    comments: &[crate::backend::PageComment],
+    comments_loading: bool,
+    comments_has_more: bool,
+) -> Element<'static, ModuleViewEvent> {
+    crate::pages::surface::show(
+        page_editor,
+        dark,
+        loading || !connected,
+        blocks,
+        commented_block_hits,
+    );
+    let autosave = match autosave {
+        crate::AutosaveStatus::Idle => "idle",
+        crate::AutosaveStatus::Saving => "saving",
+        crate::AutosaveStatus::Saved => "saved",
+        crate::AutosaveStatus::Error => "error",
+    };
+    let subpages: Vec<serde_json::Value> = crate::backend::subpage_blocks(blocks)
+        .into_iter()
+        .map(|block| serde_json::json!({ "id": block.id, "title": block.text }))
+        .collect();
+    let props = serde_json::json!({
+        "dark": dark,
+        "connected": connected,
+        "loading": loading,
+        "busy": mutation_phase != crate::MutationPhase::Idle,
+        "page_link": crate::backend::duck_page_link(active_page.to_owned(), network_chain_id.to_owned()),
+        "pages": pages,
+        "page_create_open": page_create_open,
+        "active_page": active_page,
+        "active_page_title": active_page_title,
+        "active_page_parent": active_page_parent,
+        "page_searching": page_searching,
+        "page_search_hits": page_search_hits,
+        "page_search_query": page_search_query,
+        "page_delete_armed": page_delete_armed,
+        "autosave": autosave,
+        "page_refusal": page_refusal,
+        "doc_tabs": crate::backend::doc_tab_rows(doc_tabs, pages, active_page),
+        "subpages": subpages,
+        "orphaned_comment_drafts": orphaned_comment_drafts,
+        "block_comments_open": block_comments_open,
+        "thread_total": thread_total,
+        "comment_rows": comment_rows,
+        "threads_loading": threads_loading,
+        "threads_has_more": threads_has_more,
+        "active_thread": active_thread,
+        "thread_resolved": crate::backend::thread_is_resolved(threads, active_thread),
+        "active_thread_anchor": active_thread_anchor,
+        "comments": comments,
+        "comments_loading": comments_loading,
+        "comments_has_more": comments_has_more,
+        "compose_hint": crate::pages::comment_compose_hint(blocks, caret_comment_target, active_page),
+        "seed_rev": seed_rev,
+        "page_seed": page_draft,
+        "comment_seed": block_comment_draft,
+    });
+    module_view("pages", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
+    use crate::PagesIntent as Intent;
+    match event.kind.as_str() {
+        "toggle_create" => Intent::ToggleCreate,
+        "create" => Intent::Create,
+        "choose" => Intent::Choose,
+        "search" => Intent::Search,
+        "clear_search" => Intent::ClearSearch,
+        "arm_delete" => Intent::ArmDelete,
+        "disarm_delete" => Intent::DisarmDelete,
+        "delete" => Intent::Delete,
+        "close_tab" => Intent::CloseTab,
+        "open_hit" => Intent::OpenHit,
+        "use_draft" => Intent::UseDraft,
+        "discard_draft" => Intent::DiscardDraft,
+        "edited" => Intent::Edited,
+        "toggle_comments" => Intent::ToggleComments,
+        "close_comments" => Intent::CloseComments,
+        "open_thread" => Intent::OpenThread,
+        "resolve" => Intent::Resolve,
+        "more_threads" => Intent::MoreThreads,
+        "close_thread" => Intent::CloseThread,
+        "more_comments" => Intent::MoreComments,
+        "post" => Intent::Post,
+        _ => Intent::Copy,
+    }
+}
+
 // ---------- the files seat ----------
 
 /// The Files tab: one directory's listing, the preview open in it, the
@@ -611,7 +747,19 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
+    if module == "pages" {
+        surfaces.insert("page_document".into(), crate::pages::surface::provider());
+    }
     surfaces
+}
+
+/// The intent a host surface's event comes back as, by module: the node's
+/// log ring, the pages document.
+fn surface_intent(module: &str) -> &'static str {
+    match module {
+        "pages" => "edited",
+        _ => "log_timeline",
+    }
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -659,6 +807,29 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+        ],
+        "pages" => &[
+            "toggle_create",
+            "create",
+            "choose",
+            "search",
+            "clear_search",
+            "arm_delete",
+            "disarm_delete",
+            "delete",
+            "close_tab",
+            "open_hit",
+            "use_draft",
+            "discard_draft",
+            "toggle_comments",
+            "close_comments",
+            "open_thread",
+            "resolve",
+            "more_threads",
+            "close_thread",
+            "more_comments",
+            "post",
+            "copy",
         ],
         _ => &[],
     }
@@ -961,7 +1132,7 @@ impl Guest {
     fn deliver(&mut self, output: Output) {
         if let Output::Surface { handler: None, .. } = output {
             self.intents.push(ModuleViewEvent {
-                kind: "log_timeline".into(),
+                kind: surface_intent(self.module).into(),
                 detail: String::new(),
             });
             return;
@@ -1742,6 +1913,81 @@ mod tests {
             guest.intents,
             [ModuleViewEvent {
                 kind: "log_timeline".into(),
+                detail: String::new(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Pages view through the host: the sidebar and the header,
+    /// a pick that leaves as an intent carrying the rail's draft, and the
+    /// document slot the host paints — what the reader does in it comes back
+    /// as the `edited` intent rather than going to the guest.
+    #[test]
+    fn the_staged_pages_view_boots_takes_the_facts_and_leaves_the_document_to_the_host() {
+        let Some(staged) = staged("pages") else {
+            return;
+        };
+        let mut guest = Guest::load_from("pages", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("page_document"));
+        guest.redraw(&None);
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "loading": false, "busy": false,
+                "page_link": "duck://pages/alpha",
+                "pages": [
+                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
+                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
+                ],
+                "page_create_open": false, "active_page": "alpha",
+                "active_page_title": "Alpha", "active_page_parent": "",
+                "page_searching": false, "page_search_hits": [], "page_search_query": "",
+                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
+                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
+                "subpages": [], "orphaned_comment_drafts": [],
+                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
+                "threads_loading": false, "threads_has_more": false, "active_thread": "",
+                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
+                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
+                "seed_rev": 0, "page_seed": "", "comment_seed": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["Pages", "Alpha", "Beta", "✓ synced"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["page_document"]);
+
+        guest.deliver(Output::Activate(button_message(&guest, "Beta")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "choose".into(),
+                detail: r#"{"id":"beta","comment_draft":""}"#.into(),
+            }]
+        );
+
+        // what the reader does in the host's document never reaches the guest
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Unit,
+        });
+        assert!(guest.pending.is_empty());
+        assert_eq!(
+            guest.intents,
+            [ModuleViewEvent {
+                kind: "edited".into(),
                 detail: String::new(),
             }]
         );

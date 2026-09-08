@@ -100,7 +100,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 
     // THE ARM. The plate may not be keyed on a flag, and may not fire during
     // the round trip its own submit opened.
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     assert!(pages_screen.contains(
         "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
@@ -137,7 +137,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 /// opaque card UNDER the document it is supposed to cover.
 #[test]
 fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     // Both needles carry the SAME ten-space indent, and the indent is the
     // sibling pin: re-nesting the plate inside the document arm deepens its
     // indent and its needle stops matching, exactly as hoisting the document
@@ -325,7 +325,7 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
     // The three arms read it, so none of them can drift from the others.
     for (source, call) in [
         (
-            inlined(include_str!("../ui/screens/pages.ice")),
+            inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice")),
             "search_answer_stands(page_search_query, page_search_draft, page_searching)",
         ),
         (
@@ -690,8 +690,9 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
     /// Settings (which owns connection repair and stays useful with the node
-    /// down) and Node (which owns the daemon diagnostics) are module-owned
-    /// views now and not in this inventory; every native data screen answers.
+    /// down), Node (which owns the daemon diagnostics), Files and Pages are
+    /// module-owned views now and not in this inventory; every native data
+    /// screen answers.
     const EXEMPT: [&str; 0] = [];
 
     let mut screens: Vec<&str> = SCREENS
@@ -704,7 +705,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 
     assert_eq!(
         screens,
-        ["ChatScreen", "ForgeScreen", "PagesScreen", "ShellScreen",],
+        ["ChatScreen", "ForgeScreen", "ShellScreen"],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );

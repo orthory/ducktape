@@ -124,7 +124,7 @@ views: $(ICE_BIN)
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
 	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
 	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
-	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p files-view \
+	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p files-view -p pages-view \
 		--target wasm32-unknown-unknown --out target/views
 
 ifeq ($(UNAME_S),Darwin)
