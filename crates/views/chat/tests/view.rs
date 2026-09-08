@@ -264,6 +264,47 @@ fn live_run(anchor_seq: i64) -> LiveAgentRow {
     }
 }
 
+/// THE MEMO MUST SEE THE RUN MOVE. The stream's rows are drawn inside the
+/// timeline's `lazy`, and a `by` key list takes the lazied value OUT of the
+/// memo's hash — what keys it is the REVISION of the state the value reads. So
+/// the runs have to ride a state field the memo reads (`host::Timeline`): fold
+/// them into `live_agents` alone and the second reading below is a cache hit
+/// with the card still on its first status, for the whole run.
+///
+/// Only `live_agents` differs between the two readings here. That is the point.
+#[test]
+fn a_run_in_flight_repaints_as_it_works() {
+    on_a_deep_stack(|| {
+        let mut starting = live_run(2);
+        starting.status = "Starting".into();
+        starting.activity.clear();
+        let props = ChatProps {
+            live_agents: vec![starting],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&props);
+        assert!(has_text(&frame, "Starting"), "{:?}", texts(&frame));
+
+        let moved_on = ChatProps {
+            live_agents: vec![live_run(2)],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&moved_on))]);
+        for expected in ["Reading the repo", "Command: cargo test", "Reasoning"] {
+            assert!(
+                has_text(&frame, expected),
+                "the run's progress never reached the frame: missing {expected:?} in {:?}",
+                texts(&frame)
+            );
+        }
+        assert!(
+            !has_text(&frame, "Starting"),
+            "the memo served a stale card: {:?}",
+            texts(&frame)
+        );
+    });
+}
+
 #[test]
 fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
     on_a_deep_stack(|| {

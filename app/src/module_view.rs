@@ -1277,7 +1277,8 @@ fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
     // THE LIVE CARDS ARE SERVED FIRST. A run in flight is the most perishable
     // thing on the frame and the one the reader is waiting on, so it takes its
     // bytes before the scrollback it sits in does.
-    let timelines = TIMELINE_TEXT_BUDGET.saturating_sub(live.iter().map(live_text_bytes).sum());
+    let timelines =
+        TIMELINE_TEXT_BUDGET.saturating_sub(live.iter().map(live_text_bytes).sum::<usize>());
     props.live_agents = std::borrow::Cow::Owned(live);
     let (stream, stream_clipped) = newest_within(props.messages, timelines);
     let stream_spent: usize = stream.iter().map(text_bytes).sum();
