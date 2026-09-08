@@ -21,8 +21,9 @@
 //! reading committed state, the way compute already learns its placement, and
 //! the link's teardown cannot reach them. Nothing in this file touches
 //! `Sessions`, a `term:` topic, `TermInput` or `TermOutput`; pty bytes are raw
-//! and unstructured and are not a delivery channel. Pinned by
-//! `bin/node/tests/collab_cli_seam.rs`.
+//! and unstructured and are not a delivery channel. Pinned by this file's own
+//! `the_collab_plane_never_touches_the_pty_plane`, which fails the build if the
+//! two planes ever touch.
 //!
 //! ## reads are authenticated, and that is not free
 //!
