@@ -16,10 +16,12 @@
 # node's own validator key as the op origin. Its account controls the model
 # user; the separate demo wallet signs and owns the gateway routes.
 #
-# The model user (Quackbot) is a TEST agent: its provider is the guest shell
-# running a literal script, staged as a capability spec in this host's
-# capability dir, so the seeded @mention run completes on `make dev` with no
-# model credential at all.
+# The model user (Quackbot) is a TEST agent with the dogfood e2e runner's
+# shape: its provider is the guest shell running a literal script, staged as
+# a capability spec in this host's capability dir, and its grant carries forge
+# read and push on a seeded `playground` repo. The two seeded @mentions (one in
+# #general, one on a playground issue) complete on `make dev` with no model
+# credential at all: a chat reply, and a pull request opened from a microVM.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -183,12 +185,24 @@ description = "demo test agent: the guest shell replying from inside a microVM, 
 bin = "sh"
 
 [invoke]
-# The whole executor. argv is literal (no host shell sees it); the prompt
-# envelope arrives on stdin, and plain stdout is the reply the runs module
-# posts as a paragraph in the mention's thread.
+# The whole executor, doing what the dogfood e2e's script runner does so the
+# demo proves the same loop. argv is literal (no host shell sees it). The
+# prompt envelope arrives on stdin. \`ducktape mcp\` is on the run's PATH and
+# posts a live progress reply through the same tool a model uses. In a forge
+# checkout the script leaves a file for the host to commit and push (.git/HEAD
+# holds the bare pinned oid: the clone is detached by construction). Plain
+# stdout is the final reply the runs module posts in the mention's thread.
 args = ["-c", '''
 set -e
 bytes=\$(wc -c)
+printf '%s\\n' \\
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}' \\
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \\
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ducktape_action","arguments":{"operation":"reply","input":{"content":[{"type":"text","text":"Quack, on it: reading the run context."}]},"request_id":"progress"}}}' \\
+  | ducktape mcp > /dev/null
+if [ -f .git/HEAD ]; then
+  printf 'Quackbot was here, forked from %s.\\n' "\$(cat .git/HEAD)" > QUACKBOT.md
+fi
 printf "Quack! I am the demo test agent: a shell script that ran inside this node's microVM. I read %s bytes of run context.\\n" "\$bytes"
 ''']
 prompt = "stdin"
@@ -317,9 +331,41 @@ MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\
   if(matches.length!==1) throw new Error("expected exactly one Quackbot program account");
   process.stdout.write(String(matches[0].number));
 ') || die "cannot resolve the model account"
-submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"$TEST_TAG\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"]}}}}"
+# The grant has the dogfood e2e runner's shape: chat replies, plus forge read
+# and push on the playground repo seeded below and on the dogfood mirror
+# `make dev` pushes (`ops/dogfood-forge.sh`, repo `ducktape`).
+PLAYGROUND="playground"
+submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"$TEST_TAG\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"],\"caps\":{\"forge_read\":[\"ducktape\",\"$PLAYGROUND\"],\"forge_push\":[\"ducktape\",\"$PLAYGROUND\"]}}}}}"
 MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:"@quackbot can you follow up?",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT")
 submit chat "$MENTION"
+
+# forge — a playground repo, an issue on it, and a Quackbot mention in the
+# issue's discussion channel: the trigger the dogfood e2e drives. A push must
+# prove itself, so this one carries the operator credential (the node becomes
+# the repo's owner) through GIT_CONFIG_*, never an argv. The run itself waits
+# for `make dev`: the compute service clones the repo into a microVM, the
+# script writes QUACKBOT.md, the host commits and pushes agent/item-1, and the
+# PR sink opens the pull request onto dev.
+if command -v git >/dev/null; then
+  SEED_REPO="$(mktemp -d)"
+  ( cd "$SEED_REPO" \
+    && git -c init.defaultBranch=dev init -q \
+    && printf '# %s\n\nA scratch repository the demo seeds for Quackbot. Mention @quackbot on an issue here and it opens a pull request.\n' "$PLAYGROUND" > README.md \
+    && git add README.md \
+    && git -c user.name="Demo seed" -c user.email="seed@demo.duck" -c commit.gpgsign=false commit -q -m "seed the playground" \
+    && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $OPERATOR" \
+       git push -q "$URL/forge/$PLAYGROUND" HEAD:dev )
+  pushed=$?
+  rm -rf "$SEED_REPO"
+  [ "$pushed" -eq 0 ] || die "cannot push the $PLAYGROUND repo into the forge"
+  submit forge "{\"open_issue\":{\"repo\":\"$PLAYGROUND\",\"title\":\"Say hello from a microVM\",\"body\":\"Mention @quackbot here: it clones this repo inside a microVM, writes QUACKBOT.md, and opens a pull request.\"}}"
+  ISSUE_CHANNEL=$(query forge "{\"get_item\":{\"repo\":\"$PLAYGROUND\",\"number\":1}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).item?.channel_id ?? ""))')
+  [ -n "$ISSUE_CHANNEL" ] || die "the $PLAYGROUND issue has no discussion channel"
+  ISSUE_MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:process.argv[2],message_id:"i1",blocks:[{paragraph:[{text:"@quackbot say hello",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$ISSUE_CHANNEL")
+  submit chat "$ISSUE_MENTION"
+else
+  log "no host git — skipping the $PLAYGROUND forge repo and its Quackbot issue"
+fi
 
 # jobs — a job on the board. the job board shares the "tasks" target under the
 # WorkMsg `{"job":{…}}` arm (there is no separate "jobs" module).
@@ -350,7 +396,7 @@ case "$gateway_status" in
     ;;
 esac
 
-log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, automations, files, gateway"
+log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, forge, jobs, automations, files, gateway"
 
 # ── 6. stop the node (state is durable on disk) ────────────────
 kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null; trap - EXIT
