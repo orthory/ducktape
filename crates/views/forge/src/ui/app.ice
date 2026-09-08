@@ -33,7 +33,7 @@ extern crate::host
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   TreeEntry(name:str, path:str, kind:str)
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  ForgeProps(dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
+  ForgeProps(dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
   PropsItem(next:ForgeProps, error:str)
   subscription props() -> PropsItem
   pure open_repo(name:&str) -> bool
@@ -129,6 +129,7 @@ state
   comment_cap_reached = false
   discussion:[ChatMessage] = []
   linked_note:[ChatMessage] = []
+  discussion_clipped = false
   note_scope = ""
   note_blocked = true
   // the last landing the app reported: a count that moves once per deep
@@ -216,6 +217,7 @@ on props_arrived(item)
   comment_cap_reached = next.comment_cap_reached
   discussion = next.discussion
   linked_note = next.linked_note
+  discussion_clipped = next.discussion_clipped
   note_scope = next.note_scope
   note_blocked = next.note_blocked
   tree_path = next.tree_path
@@ -386,6 +388,7 @@ view
       comment_cap_reached
       discussion
       linked_note
+      discussion_clipped
       note_scope
       note_blocked
       tree_path

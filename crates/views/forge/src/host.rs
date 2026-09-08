@@ -164,6 +164,7 @@ pub struct ForgeProps {
     pub comment_cap_reached: bool,
     pub discussion: Vec<ChatMessage>,
     pub linked_note: Vec<ChatMessage>,
+    pub discussion_clipped: bool,
     pub landed_seq: i64,
     pub landed_tick: i64,
     pub tree_path: String,

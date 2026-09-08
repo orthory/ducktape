@@ -431,7 +431,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                           font=code
                           @text-meta
                       if preview_truncated
-                        text "first 64 KiB"
+                        text "first 48 KiB"
                           with
                             size=12.5
                             wrap=none

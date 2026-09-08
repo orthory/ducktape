@@ -520,6 +520,7 @@ struct ForgeProps<'a> {
     comment_cap_reached: bool,
     discussion: &'a [crate::backend::ChatMessage],
     linked_note: &'a [crate::backend::ChatMessage],
+    discussion_clipped: bool,
     landed_seq: i64,
     landed_tick: i64,
     tree_path: &'a str,
@@ -619,6 +620,12 @@ pub fn forge_view(
     note_scope: &str,
     note_blocked: bool,
 ) -> Element<'static, ModuleViewEvent> {
+    // the note a link landed on is what the reader came for: it stays; the
+    // discussion gets the rest of the frame's text, newest first
+    let (discussion, discussion_clipped) = newest_within(
+        discussion,
+        FRAME_TEXT_BUDGET.saturating_sub(linked_note.iter().map(text_bytes).sum()),
+    );
     let props = ForgeProps {
         dark,
         connected,
@@ -666,6 +673,7 @@ pub fn forge_view(
         comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
         discussion,
         linked_note: linked_note.as_slice(),
+        discussion_clipped,
         landed_seq,
         landed_tick,
         tree_path,
@@ -1216,20 +1224,21 @@ pub fn chat_view(
     module_view("chat", encode_chat_props(props))
 }
 
-/// Body bytes the two timelines may put on one frame together: the wire
+/// Text bytes a guest's big list or blob may put on one frame: the wire
 /// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
 /// newest messages come last — a busy room's hot window (256 rows) drew its
 /// newest messages blank. The rest of the frame (rooms, names, times, the
-/// rail) lives in the headroom.
-const TIMELINE_TEXT_BUDGET: usize = 48 << 10;
+/// rail) lives in the headroom. The forge discussion and the file preview
+/// are held to the same budget.
+const FRAME_TEXT_BUDGET: usize = 48 << 10;
 
 /// The facts encoded for the view, the timelines held to
-/// [`TIMELINE_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
+/// [`FRAME_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
 /// first, and a clipped stream says so through `has_older_history` (the
 /// thread through `thread_has_more`, its root always kept) so the view still
 /// offers what was left behind as history.
 fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
-    let (stream, stream_clipped) = newest_within(props.messages, TIMELINE_TEXT_BUDGET);
+    let (stream, stream_clipped) = newest_within(props.messages, FRAME_TEXT_BUDGET);
     let stream_spent: usize = stream.iter().map(text_bytes).sum();
     props.messages = stream;
     props.has_older_history |= stream_clipped;
@@ -1242,7 +1251,7 @@ fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
     );
     let (replies, thread_clipped) = newest_within(
         &thread[root..],
-        TIMELINE_TEXT_BUDGET
+        FRAME_TEXT_BUDGET
             .saturating_sub(stream_spent + thread[..root].iter().map(text_bytes).sum::<usize>()),
     );
     if thread_clipped {
@@ -1271,6 +1280,19 @@ fn newest_within(
         start -= 1;
     }
     (&messages[start..], start > 0)
+}
+
+/// The head of `text` that fits `budget`, cut on a char boundary, and
+/// whether anything was cut.
+fn head_within(text: &str, budget: usize) -> (&str, bool) {
+    if text.len() <= budget {
+        return (text, false);
+    }
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
 }
 
 fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
@@ -1408,6 +1430,9 @@ pub fn files_view(
     write_refusal: &str,
     writes: i64,
 ) -> Element<'static, ModuleViewEvent> {
+    // a 64 KiB read is the whole frame's text: the head that leaves room
+    // for the listing, told as truncated like a read past the end
+    let (preview_text, preview_clipped) = head_within(preview_text, FRAME_TEXT_BUDGET);
     let props = serde_json::json!({
         "path": path,
         "listed": listed,
@@ -1421,7 +1446,7 @@ pub fn files_view(
         "diff_from": diff_from,
         "diff": diff,
         "history": history,
-        "preview_truncated": preview_truncated,
+        "preview_truncated": preview_truncated || preview_clipped,
         "preview_binary": preview_binary,
         "preview_picture": preview_picture,
         "preview_width": preview_width,
@@ -4210,7 +4235,7 @@ pub(crate) mod tests {
           "forge_item_approvals": 0, "forge_item_change_requests": 0,
           "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
           "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-          "comment_cap_reached": false, "discussion": [], "linked_note": [],
+          "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false,
           "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
           "tree_entries": [], "tree_born": false, "tree_truncated": false,
           "tree_phase": "loading", "file_path": "", "file_text": "",
@@ -4376,6 +4401,119 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    /// The forge discussion has the chat stream's shape: 40 notes of 2 KB
+    /// are past the frame's text budget, and the newest note — drawn last —
+    /// must still read; the landing note above the list stays whole.
+    #[test]
+    fn the_newest_discussion_note_still_reads_through_the_wire() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        const ROWS: i64 = 40;
+        let notes: Vec<_> = (1..=ROWS)
+            .map(|seq| {
+                let body = format!("n{seq} {}", "x".repeat(2_000));
+                crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(seq)
+                }
+            })
+            .collect();
+        let landing = crate::backend::ChatMessage {
+            body: "the note a link landed on".into(),
+            ..first_light_at(1_000)
+        };
+        // what forge_view sends: the landing note whole, the discussion held
+        // to the rest of the budget
+        let (kept, clipped) = newest_within(
+            &notes,
+            FRAME_TEXT_BUDGET.saturating_sub(text_bytes(&landing)),
+        );
+        assert!(clipped);
+        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
+        facts["open_repo"] = "core".into();
+        facts["forge_item_number"] = 7.into();
+        facts["discussion"] = serde_json::to_value(kept).unwrap();
+        facts["linked_note"] = serde_json::to_value([&landing]).unwrap();
+        facts["discussion_clipped"] = clipped.into();
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let newest = format!("n{ROWS} ");
+        assert!(
+            shown.iter().any(|text| text.starts_with(&newest)),
+            "the newest note is blank (fault {:?}): last texts {:?}",
+            guest.fault,
+            shown
+                .iter()
+                .rev()
+                .take(6)
+                .map(|text| &text[..text.len().min(24)])
+                .collect::<Vec<_>>()
+        );
+        assert!(shown.iter().any(|text| text == "the note a link landed on"));
+        assert!(
+            shown
+                .iter()
+                .any(|text| text == "Older comments are not shown.")
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// A 60 KB file preview: the reader either sees all of it or is told
+    /// it is cut — never a silently shortened text.
+    #[test]
+    fn a_long_file_preview_says_where_it_is_cut() {
+        let Some(staged) = staged("files") else {
+            return;
+        };
+        let text = format!("{}END-MARK", "y".repeat(60_000));
+        let (head, clipped) = head_within(&text, FRAME_TEXT_BUDGET);
+        assert!(clipped);
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        facts["preview_text"] = head.into();
+        facts["preview_truncated"] = clipped.into();
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let mut guest = Guest::load_from("files", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let whole = shown.iter().any(|text| text.ends_with("END-MARK"));
+        let told = shown.iter().any(|text| text == "first 48 KiB");
+        assert!(
+            whole || told,
+            "the preview is cut without a word (fault {:?}): {} texts, longest {}",
+            guest.fault,
+            shown.len(),
+            shown.iter().map(String::len).max().unwrap_or(0)
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// `head_within` never cuts inside a char; the discussion budget keeps
+    /// the landing note whole and the newest notes.
+    #[test]
+    fn the_text_head_and_the_discussion_split_hold_their_budgets() {
+        assert_eq!(head_within("abc", 3), ("abc", false));
+        // "한" is 3 bytes: a 4-byte budget cuts before the second char
+        assert_eq!(head_within("한글", 4), ("한", true));
+        assert_eq!(head_within("한글", 6), ("한글", false));
+        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
+            author: String::new(),
+            meta: String::new(),
+            body: "x".repeat(bytes),
+            ..first_light_at(seq)
+        };
+        let landing = row(9, 100);
+        let notes = [row(1, 100), row(2, 100), row(3, 100)];
+        let (kept, clipped) = newest_within(&notes, 300usize.saturating_sub(text_bytes(&landing)));
+        assert_eq!(kept.iter().map(|m| m.seq).collect::<Vec<_>>(), [2, 3]);
+        assert!(clipped);
+    }
+
     fn first_light_at(seq: i64) -> crate::backend::ChatMessage {
         crate::backend::ChatMessage {
             id: format!("m{seq}"),
@@ -4401,7 +4539,7 @@ pub(crate) mod tests {
         assert!(newest_within(&stream, 250).1);
         assert_eq!(newest_within(&stream, 300), (&stream[..], false));
 
-        let big = TIMELINE_TEXT_BUDGET / 2;
+        let big = FRAME_TEXT_BUDGET / 2;
         let root = crate::backend::ChatMessage {
             thread_seq: 0,
             ..row(10, 10)
@@ -4849,7 +4987,7 @@ pub(crate) mod tests {
               "forge_item_approvals": 0, "forge_item_change_requests": 0,
               "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
               "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false,
               "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
               "tree_entries": [], "tree_born": false, "tree_truncated": false,
               "tree_phase": "loading", "file_path": "", "file_text": "",
