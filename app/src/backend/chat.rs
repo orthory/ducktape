@@ -289,21 +289,29 @@ pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
 /// The call fan-out set: every roster peer's node key, self excluded — the
 /// shape `CallClientControl::Recipients` wants.
 ///
-/// Excludes by BOTH `is_you` (this device's own roster row) AND `self_node`
-/// (this device's node key, whichever roster row carries it): a member's
-/// `node_proof` only proves that member's user holds the node key it names,
-/// never that the name is unique — a stale or replayed roster row can still
-/// carry another user's `user` field alongside THIS node's key, and fanning
-/// media to your own node is a loopback echo regardless of whose row it rides
-/// in on.
+/// Excludes by NODE, never by `is_you`: `is_you` answers by ACCOUNT (own key,
+/// or any key bound to the same account), so two devices of one account in
+/// the same huddle both answer it true, and a filter on `is_you` alone drops
+/// BOTH rows — the devices go mutually dark instead of each excluding only
+/// itself. `self_node` is THIS device's own node key; a roster row's
+/// `node_proof` only proves that row's user holds the node key it names,
+/// never that the name is unique, so any row naming this node — including a
+/// stale or replayed one riding another user's `user` field — is a loopback
+/// echo and never a recipient, regardless of whose row it rides in on. Only
+/// when this device's own node key is unknown (no status read yet) is there
+/// nothing to compare against, so `is_you` is the fallback then: it cannot
+/// tell two of the reader's devices apart, but it is still the best guess
+/// available for a lone-device roster.
 pub fn huddle_recipient_nodes(
     roster: Vec<HuddleParticipant>,
     self_node: Option<&str>,
 ) -> Vec<String> {
     roster
         .into_iter()
-        .filter(|participant| !participant.is_you)
-        .filter(|participant| Some(participant.node.as_str()) != self_node)
+        .filter(|participant| match self_node {
+            Some(node) => participant.node != node,
+            None => !participant.is_you,
+        })
         .map(|participant| participant.node)
         .collect()
 }

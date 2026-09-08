@@ -329,3 +329,103 @@ impl Network {
         run.run_id.clone()
     }
 }
+
+// ---- catalog envelopes ---------------------------------------------------------
+// the operations tests submit, built the way an agent builds them: an
+// operation name, an optional target, an input — never a typed variant.
+
+pub fn envelope(operation: &str, target: Option<serde_json::Value>, input: serde_json::Value) -> runs::ActionEnvelope {
+    runs::ActionEnvelope::new(operation, target, input)
+}
+
+pub fn text_content(text: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({"content": [{"type": "text", "text": text.into()}]})
+}
+
+pub fn reply(text: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(runs::OP_REPLY, None, text_content(text))
+}
+
+pub fn post_message(channel_id: impl Into<String>, text: impl Into<String>, thread: Option<u64>) -> runs::ActionEnvelope {
+    let mut target = serde_json::json!({"channel_id": channel_id.into()});
+    if let Some(root) = thread {
+        target["thread"] = root.into();
+    }
+    envelope(runs::ACTION_CHAT_POST_MESSAGE, Some(target), text_content(text))
+}
+
+pub fn page_comment(target: impl Into<String>, text: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_PAGES_COMMENT,
+        Some(serde_json::json!({"target": target.into()})),
+        text_content(text),
+    )
+}
+
+pub fn page_thread_comment(thread_id: impl Into<String>, text: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_PAGES_COMMENT,
+        Some(serde_json::json!({"thread_id": thread_id.into()})),
+        text_content(text),
+    )
+}
+
+pub fn set_page_checked(block_id: impl Into<String>, checked: bool) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_PAGES_SET_CHECKED,
+        Some(serde_json::json!({"block_id": block_id.into()})),
+        serde_json::json!({"checked": checked}),
+    )
+}
+
+pub fn job_comment(job_id: impl Into<String>, text: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_JOBS_COMMENT,
+        Some(serde_json::json!({"job_id": job_id.into()})),
+        text_content(text),
+    )
+}
+
+pub fn create_task(task_id: impl Into<String>, title: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_TASKS_CREATE,
+        None,
+        serde_json::json!({"task_id": task_id.into(), "title": title.into()}),
+    )
+}
+
+pub fn update_task_status(task_id: impl Into<String>, status: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_TASKS_UPDATE_STATUS,
+        Some(serde_json::json!({"task_id": task_id.into()})),
+        serde_json::json!({"status": status.into()}),
+    )
+}
+
+pub fn duckfs_write_text(path: impl Into<String>, text: impl Into<String>, base_snapshot: Option<String>) -> runs::ActionEnvelope {
+    let mut input = serde_json::json!({"text": text.into()});
+    if let Some(base) = base_snapshot {
+        input["base_snapshot"] = base.into();
+    }
+    envelope(
+        runs::ACTION_DUCKFS_WRITE_TEXT,
+        Some(serde_json::json!({"path": path.into()})),
+        input,
+    )
+}
+
+pub fn update_module(spec: runs::ModuleUpdateSpec) -> runs::ActionEnvelope {
+    envelope(
+        runs::ACTION_MODULES_UPDATE,
+        None,
+        serde_json::to_value(spec).expect("module update specs serialize"),
+    )
+}
+
+pub fn agent_call(agent_id: impl Into<String>, instruction: impl Into<String>) -> runs::ActionEnvelope {
+    envelope(
+        runs::OP_AGENT_CALL,
+        Some(serde_json::json!({"agent_id": agent_id.into()})),
+        serde_json::json!({"instruction": instruction.into()}),
+    )
+}

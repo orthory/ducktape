@@ -1140,14 +1140,14 @@ fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
 /// the model's strict-output prose (a bare AgentResponse JSON), wrapped in
 /// the host-assembled runner result the oracle now ALWAYS delivers (the
 /// marker-less flat tolerance is gone — flag day).
-fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+fn response(reply: &[&str], actions: Vec<ActionEnvelope>) -> Vec<u8> {
     let prose = String::from_utf8(response_json(reply, actions)).expect("utf-8");
     runner_wrapper(&prose, serde_json::json!({}))
 }
 
 /// the bare AgentResponse wire JSON — the PROSE inside [`response`], and the
 /// expected-value shape assertions compare against.
-fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+fn response_json(reply: &[&str], actions: Vec<ActionEnvelope>) -> Vec<u8> {
     crate::encode_response(&AgentResponse {
         reply_blocks: reply
             .iter()
@@ -1195,6 +1195,98 @@ fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaVi
         created_at: 0,
         updated_at: 0,
     }
+}
+
+// ---- catalog envelopes ---------------------------------------------------------
+// the operations tests submit, built the way an agent builds them: an
+// operation name, an optional target, an input — never a typed variant.
+
+fn envelope(operation: &str, target: Option<serde_json::Value>, input: serde_json::Value) -> ActionEnvelope {
+    ActionEnvelope::new(operation, target, input)
+}
+
+fn text_content(text: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({"content": [{"type": "text", "text": text.into()}]})
+}
+
+fn reply(text: impl Into<String>) -> ActionEnvelope {
+    envelope(crate::OP_REPLY, None, text_content(text))
+}
+
+fn post_message(channel_id: impl Into<String>, text: impl Into<String>, thread: Option<u64>) -> ActionEnvelope {
+    let mut target = serde_json::json!({"channel_id": channel_id.into()});
+    if let Some(root) = thread {
+        target["thread"] = root.into();
+    }
+    envelope(ACTION_CHAT_POST_MESSAGE, Some(target), text_content(text))
+}
+
+fn page_comment(target: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_PAGES_COMMENT,
+        Some(serde_json::json!({"target": target.into()})),
+        text_content(text),
+    )
+}
+
+fn page_thread_comment(thread_id: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_PAGES_COMMENT,
+        Some(serde_json::json!({"thread_id": thread_id.into()})),
+        text_content(text),
+    )
+}
+
+fn set_page_checked(block_id: impl Into<String>, checked: bool) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_PAGES_SET_CHECKED,
+        Some(serde_json::json!({"block_id": block_id.into()})),
+        serde_json::json!({"checked": checked}),
+    )
+}
+
+fn job_comment(job_id: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_JOBS_COMMENT,
+        Some(serde_json::json!({"job_id": job_id.into()})),
+        text_content(text),
+    )
+}
+
+fn create_task(task_id: impl Into<String>, title: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        ACTION_TASKS_CREATE,
+        None,
+        serde_json::json!({"task_id": task_id.into(), "title": title.into()}),
+    )
+}
+
+fn update_task_status(task_id: impl Into<String>, status: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        ACTION_TASKS_UPDATE_STATUS,
+        Some(serde_json::json!({"task_id": task_id.into()})),
+        serde_json::json!({"status": status.into()}),
+    )
+}
+
+fn duckfs_write_text(path: impl Into<String>, text: impl Into<String>, base_snapshot: Option<String>) -> ActionEnvelope {
+    let mut input = serde_json::json!({"text": text.into()});
+    if let Some(base) = base_snapshot {
+        input["base_snapshot"] = base.into();
+    }
+    envelope(
+        crate::ACTION_DUCKFS_WRITE_TEXT,
+        Some(serde_json::json!({"path": path.into()})),
+        input,
+    )
+}
+
+fn agent_call(agent_id: impl Into<String>, instruction: impl Into<String>) -> ActionEnvelope {
+    envelope(
+        crate::OP_AGENT_CALL,
+        Some(serde_json::json!({"agent_id": agent_id.into()})),
+        serde_json::json!({"instruction": instruction.into()}),
+    )
 }
 
 mod composition;

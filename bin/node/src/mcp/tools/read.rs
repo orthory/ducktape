@@ -1,5 +1,5 @@
 //! the read plane: everything an agent could previously only be TOLD, it can
-//! now ask for.
+//! ask for.
 //!
 //! before this plane existed a run saw exactly what the composer pre-injected
 //! into its envelope — the anchored conversation, and a forge item's context if
@@ -7,6 +7,14 @@
 //! it was told to comment on, or open the sibling issue that explains the one it
 //! is working. every one of those had to be foreseen in consensus, at compose
 //! time, by code that could not know what the agent would want.
+//!
+//! the plane is four tools. `ducktape_whoami` answers who this run is.
+//! `ducktape_actions` lists the catalog: the write operations the runs module
+//! owns, straight from consensus, beside the read operations this binary
+//! serves. `ducktape_query` runs one read operation by name with the same
+//! `operation`/`target`/`input` envelope a write takes, and `ducktape_receipt`
+//! reads a write's committed receipt back. reads cross no consensus op, so
+//! their table lives here; writes are the module's, so their table does not.
 //!
 //! queries are built from each module's OWN `*Query` enum rather than
 //! hand-written json, so a wire change in `chat` or `forge` breaks this file at
@@ -50,157 +58,229 @@ pub(super) fn tools() -> Vec<Tool> {
             description: "Who you are in Ducktape: your run id, agent id, display name, owner, the \
                           actions you are allowed to take, your resource caps, your workspace \
                           directory, and where your skills are mounted. Call this first if you \
-                          are unsure what you are permitted to do — every write tool is gated on \
-                          the actions listed here.",
+                          are unsure what you are permitted to do — every write is gated on the \
+                          actions listed here.",
             schema: || schema(&[]),
             handler: whoami,
         },
         Tool {
-            name: "ducktape_agents",
-            description: "List registered agents with their status, owner, allowed actions, \
-                          resource caps, and curated skills.",
-            schema: bounded_list_schema,
-            handler: agents_list,
+            name: "ducktape_actions",
+            description: "The operation catalog. Each write operation comes from the runs module \
+                          with its target and input schemas, the receipt result it reports, the \
+                          grant it requires and the lanes it admits (live via ducktape_action, \
+                          final via your final response). Each read operation is one \
+                          ducktape_query can run, with its target and input schemas. Pass filter \
+                          to keep only names starting with it (e.g. \"pages.\").",
+            schema: || schema(&[("filter", "string", false, "A name prefix to narrow the catalog.")]),
+            handler: actions,
         },
         Tool {
-            name: "ducktape_runs",
-            description: "List in-flight run correlations and this node's recent terminal run \
-                          observations. Recent runs are a bounded derived cache and can be empty \
-                          after a snapshot join; replies are recorded at their source destination. \
-                          Live agent sessions and session keys are deliberately not exposed.",
-            schema: bounded_list_schema,
-            handler: runs_list,
+            name: "ducktape_query",
+            description: "Run one read operation from the catalog: operation names it, target \
+                          selects the resource it reads (omit when the operation takes none), \
+                          input carries its options. Reads of forge repos require the repo in \
+                          your forge_read caps; reads of duckfs require the path under your \
+                          duckfs_read caps; everything else is ungated.",
+            schema: query_schema,
+            handler: query,
         },
         Tool {
-            name: "ducktape_chat_channels",
-            description: "List every chat channel, with its id and name.",
-            schema: || schema(&[]),
-            handler: chat_channels,
-        },
-        Tool {
-            name: "ducktape_chat_messages",
-            description: "Read the most recent top-level messages of a chat channel, oldest \
-                          first. Each root carries its thread summary. Use this to catch up on a \
-                          conversation you were not anchored in.",
-            schema: || {
-                schema(&[
-                    ("channel_id", "string", true, "The channel to read."),
-                    (
-                        "limit",
-                        "integer",
-                        false,
-                        "How many of the newest roots to return (default 50, max 200).",
-                    ),
-                ])
-            },
-            handler: chat_messages,
-        },
-        Tool {
-            name: "ducktape_tasks",
-            description: "Read one bounded page of tasks — id, title and status (open, \
-                          in_progress, done) — in ascending id order. Pass the last id you saw \
-                          as after to continue.",
-            schema: tasks_list_schema,
-            handler: tasks_list,
-        },
-        Tool {
-            name: "ducktape_job",
-            description: "Read a job's specification, execution status, result and bounded discussion, including each comment's authenticated author.",
-            schema: || schema(&[("job_id", "string", true, "The job to read.")]),
-            handler: job_get,
-        },
-        Tool {
-            name: "ducktape_pages",
-            description: "Read one bounded page of page ids and titles. Pass next_after as after \
-                          to continue.",
-            schema: page_list_schema,
-            handler: pages_list,
-        },
-        Tool {
-            name: "ducktape_page",
-            description: "Read one bounded document-order block page. Pass next_after as after \
-                          to continue. Block ids here are what ducktape_page_comment and \
-                          ducktape_page_check take.",
-            schema: page_get_schema,
-            handler: page_get,
-        },
-        Tool {
-            name: "ducktape_forge_repos",
-            description: "List the forge repos and their current heads.",
-            schema: || schema(&[]),
-            handler: forge_repos,
-        },
-        Tool {
-            name: "ducktape_forge_items",
-            description: "List a forge repo's issues and pull requests. Requires the repo to be \
-                          in your forge_read caps.",
-            schema: || schema(&[("repo", "string", true, "The forge repo.")]),
-            handler: forge_items,
-        },
-        Tool {
-            name: "ducktape_forge_item",
-            description: "Read one forge issue or pull request in full — body, branches, \
-                          reviews, and the id of its discussion channel (readable with \
-                          ducktape_chat_messages). Requires the repo to be in your forge_read \
-                          caps.",
-            schema: || {
-                schema(&[
-                    ("repo", "string", true, "The forge repo."),
-                    ("number", "integer", true, "The issue or PR number."),
-                ])
-            },
-            handler: forge_item,
-        },
-        Tool {
-            name: "ducktape_forge_pr_diff",
-            description: "Read a pull request's exact committed source and target OIDs plus a \
-                          bounded unified patch and full diff statistics. The patch is capped at \
-                          48 KiB and reports truncation; inputs beyond 256 changed files or 8 MiB \
-                          of aggregate blobs fail instead of returning partial statistics. Fails \
-                          if the item is not a PR or the pinned git objects are unavailable \
-                          locally. Requires the repo to be in your forge_read caps.",
-            schema: || {
-                schema(&[
-                    ("repo", "string", true, "The forge repo."),
-                    ("number", "integer", true, "The pull request number."),
-                ])
-            },
-            handler: forge_pr_diff,
-        },
-        Tool {
-            name: "ducktape_files_ls",
-            description: "List a directory in the Ducktape filesystem (duckfs). This is the \
-                          shared, replicated filesystem — NOT your local workspace, which you \
-                          read with ordinary file tools. Requires the path to be under your \
-                          duckfs_read caps.",
-            schema: || schema(&[("path", "string", true, "The duckfs directory path.")]),
-            handler: files_ls,
-        },
-        Tool {
-            name: "ducktape_files_read",
-            description: "Read a file from the Ducktape filesystem (duckfs) as text. Requires \
-                          the path to be under your duckfs_read caps.",
-            schema: || schema(&[("path", "string", true, "The duckfs file path.")]),
-            handler: files_read,
-        },
-        Tool {
-            name: "ducktape_files_grep",
-            description: "Search the Ducktape filesystem (duckfs) for matching lines under a \
-                          path prefix. Requires the prefix to be under your duckfs_read caps.",
-            schema: || {
-                schema(&[
-                    ("pattern", "string", true, "The pattern to search for."),
-                    (
-                        "prefix",
-                        "string",
-                        true,
-                        "The duckfs path prefix to search under.",
-                    ),
-                ])
-            },
-            handler: files_grep,
+            name: "ducktape_receipt",
+            description: "Read the committed receipt of one write by the receipt_id \
+                          ducktape_action returned: its operation, result, target, payload and \
+                          status (awaiting the program, claimed, completed with the target's \
+                          outcome, or rejected with the reason).",
+            schema: || schema(&[("id", "string", true, "The receipt_id ducktape_action returned.")]),
+            handler: receipt,
         },
     ]
+}
+
+/// one read operation: its catalog entry and the handler behind it. `target`
+/// is `None` for an operation that reads no particular resource.
+pub(super) struct ReadOperation {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub target: Option<Value>,
+    pub input: Value,
+    pub handler: fn(&Run, &Value, &Value) -> Result<Value>,
+}
+
+impl ReadOperation {
+    fn view(&self) -> Value {
+        json!({
+            "kind": "read",
+            "name": self.name,
+            "description": self.description,
+            "target": self.target,
+            "input": self.input,
+        })
+    }
+}
+
+fn closed(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+fn no_input() -> Value {
+    closed(json!({}), &[])
+}
+
+pub(super) fn read_operations() -> Vec<ReadOperation> {
+    vec![
+        ReadOperation {
+            name: "agents.list",
+            description: "List registered agents with their status, owner, allowed actions, resource caps, and curated skills.",
+            target: None,
+            input: bounded_list_schema(),
+            handler: agents_list,
+        },
+        ReadOperation {
+            name: "runs.list",
+            description: "List in-flight run correlations and this node's recent terminal run observations. Recent runs are a bounded derived cache and can be empty after a snapshot join. Live agent sessions and session keys are deliberately not exposed.",
+            target: None,
+            input: bounded_list_schema(),
+            handler: runs_list,
+        },
+        ReadOperation {
+            name: "chat.channels",
+            description: "List every chat channel, with its id and name.",
+            target: None,
+            input: no_input(),
+            handler: chat_channels,
+        },
+        ReadOperation {
+            name: "chat.messages",
+            description: "Read the most recent top-level messages of a chat channel, oldest first. Each root carries its thread summary.",
+            target: Some(closed(json!({"channel_id": {"type": "string"}}), &["channel_id"])),
+            input: closed(
+                json!({"limit": {"type": "integer", "description": "How many of the newest roots to return (default 50, max 200)."}}),
+                &[],
+            ),
+            handler: chat_messages,
+        },
+        ReadOperation {
+            name: "tasks.list",
+            description: "Read one bounded page of tasks — id, title and status (open, in_progress, done) — in ascending id order. Pass the last id you saw as after to continue.",
+            target: None,
+            input: tasks_list_schema(),
+            handler: tasks_list,
+        },
+        ReadOperation {
+            name: "jobs.get",
+            description: "Read a job's specification, execution status, result and bounded discussion, including each comment's authenticated author.",
+            target: Some(closed(json!({"job_id": {"type": "string"}}), &["job_id"])),
+            input: no_input(),
+            handler: job_get,
+        },
+        ReadOperation {
+            name: "pages.list",
+            description: "Read one bounded page of page ids and titles. Pass next_after as after to continue.",
+            target: None,
+            input: page_cursor_schema(),
+            handler: pages_list,
+        },
+        ReadOperation {
+            name: "pages.get",
+            description: "Read one bounded document-order block page. Pass next_after as after to continue. Block ids here are what pages.comment and pages.set_checked target.",
+            target: Some(closed(json!({"page_id": {"type": "string"}}), &["page_id"])),
+            input: page_cursor_schema(),
+            handler: page_get,
+        },
+        ReadOperation {
+            name: "forge.repos",
+            description: "List the forge repos and their current heads.",
+            target: None,
+            input: no_input(),
+            handler: forge_repos,
+        },
+        ReadOperation {
+            name: "forge.items",
+            description: "List a forge repo's issues and pull requests. Requires the repo in your forge_read caps.",
+            target: Some(closed(json!({"repo": {"type": "string"}}), &["repo"])),
+            input: no_input(),
+            handler: forge_items,
+        },
+        ReadOperation {
+            name: "forge.item",
+            description: "Read one forge issue or pull request in full — body, branches, reviews, and the id of its discussion channel (readable with chat.messages). Requires the repo in your forge_read caps.",
+            target: Some(closed(
+                json!({"repo": {"type": "string"}, "number": {"type": "integer"}}),
+                &["repo", "number"],
+            )),
+            input: no_input(),
+            handler: forge_item,
+        },
+        ReadOperation {
+            name: "forge.pr_diff",
+            description: "Read a pull request's exact committed source and target OIDs plus a bounded unified patch and full diff statistics. The patch is capped at 48 KiB and reports truncation; inputs beyond 256 changed files or 8 MiB of aggregate blobs fail instead of returning partial statistics. Fails if the item is not a PR or the pinned git objects are unavailable locally. Requires the repo in your forge_read caps.",
+            target: Some(closed(
+                json!({"repo": {"type": "string"}, "number": {"type": "integer"}}),
+                &["repo", "number"],
+            )),
+            input: no_input(),
+            handler: forge_pr_diff,
+        },
+        ReadOperation {
+            name: "files.ls",
+            description: "List a directory in the Ducktape filesystem (duckfs). This is the shared, replicated filesystem — NOT your local workspace, which you read with ordinary file tools. Requires the path under your duckfs_read caps.",
+            target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
+            input: no_input(),
+            handler: files_ls,
+        },
+        ReadOperation {
+            name: "files.read",
+            description: "Read a file from the Ducktape filesystem (duckfs) as text. Requires the path under your duckfs_read caps.",
+            target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
+            input: no_input(),
+            handler: files_read,
+        },
+        ReadOperation {
+            name: "files.grep",
+            description: "Search the Ducktape filesystem (duckfs) for matching lines under a path prefix. Requires the prefix under your duckfs_read caps.",
+            target: Some(closed(json!({"prefix": {"type": "string"}}), &["prefix"])),
+            input: closed(json!({"pattern": {"type": "string"}}), &["pattern"]),
+            handler: files_grep,
+        },
+        ReadOperation {
+            name: "agent.calls",
+            description: "List this run's agent.call edges: each pending call and every delivered, failed or cancelled result.",
+            target: None,
+            input: no_input(),
+            handler: agent_calls,
+        },
+    ]
+}
+
+fn find_read(name: &str) -> Option<ReadOperation> {
+    read_operations().into_iter().find(|op| op.name == name)
+}
+
+fn query_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "description": "A read operation name from ducktape_actions.",
+            },
+            "target": {
+                "type": "object",
+                "description": "The resource to read, per the operation's target schema. Omit for operations that take none.",
+            },
+            "input": {
+                "type": "object",
+                "description": "The operation's options, per its input schema. Omit when it has none.",
+            },
+        },
+        "required": ["operation"],
+        "additionalProperties": false,
+    })
 }
 
 /// the agent's own committed record, plus the host facts it cannot read off the
@@ -223,8 +303,90 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
     }))
 }
 
-fn agents_list(run: &Run, args: &Value) -> Result<Value> {
-    let limit = list_limit(args)?;
+/// the write catalog as consensus holds it, beside the read table this binary
+/// serves. the writes are fetched per call: a module swap that adds an
+/// operation shows up here without a tool-binary update.
+fn actions(run: &Run, args: &Value) -> Result<Value> {
+    let filter = match args.get("filter") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(filter)) => Some(filter.clone()),
+        Some(_) => {
+            return Err(NodeError::Rejected(
+                "this tool needs a string \"filter\" argument when one is given".into(),
+            ));
+        }
+    };
+    let reply = run.node.query(
+        TARGET_RUNS,
+        encode(&RunsQuery::Catalog {
+            filter: filter.clone(),
+        })?,
+    )?;
+    let mut operations: Vec<Value> = reply_array(&reply, "catalog")?
+        .into_iter()
+        .map(|mut view| {
+            view["kind"] = json!("write");
+            view
+        })
+        .collect();
+    let keep = |name: &str| filter.as_deref().is_none_or(|prefix| name.starts_with(prefix));
+    operations.extend(
+        read_operations()
+            .iter()
+            .filter(|op| keep(op.name))
+            .map(ReadOperation::view),
+    );
+    Ok(json!({"operations": operations}))
+}
+
+/// one read operation by name. the envelope is checked for shape only — an
+/// object target where the operation takes one, none where it takes none —
+/// and each handler reads its own fields by name so a refusal names them.
+fn query(run: &Run, args: &Value) -> Result<Value> {
+    let name = arg_str(args, "operation")?;
+    let Some(operation) = find_read(&name) else {
+        return Err(NodeError::Rejected(format!(
+            "{name:?} is not a read operation; ducktape_actions lists them"
+        )));
+    };
+    let target = match (args.get("target"), operation.target.is_some()) {
+        (None | Some(Value::Null), false) => Value::Null,
+        (None | Some(Value::Null), true) => {
+            return Err(NodeError::Rejected(format!("{name} requires a target")));
+        }
+        (Some(_), false) => {
+            return Err(NodeError::Rejected(format!("{name} takes no target")));
+        }
+        (Some(target @ Value::Object(_)), true) => target.clone(),
+        (Some(_), true) => {
+            return Err(NodeError::Rejected(format!(
+                "{name} needs an object \"target\" argument"
+            )));
+        }
+    };
+    let input = match args.get("input") {
+        None | Some(Value::Null) => json!({}),
+        Some(input @ Value::Object(_)) => input.clone(),
+        Some(_) => {
+            return Err(NodeError::Rejected(format!(
+                "{name} needs an object \"input\" argument"
+            )));
+        }
+    };
+    (operation.handler)(run, &target, &input)
+}
+
+fn receipt(run: &Run, args: &Value) -> Result<Value> {
+    run.node.query(
+        TARGET_RUNS,
+        encode(&RunsQuery::ActionRequest {
+            request_id: arg_str(args, "id")?,
+        })?,
+    )
+}
+
+fn agents_list(run: &Run, _target: &Value, input: &Value) -> Result<Value> {
+    let limit = list_limit(input)?;
     let reply = run.node.query(
         TARGET_MODEL,
         encode(&runs::RunsQuery::Model {
@@ -247,8 +409,8 @@ fn agents_list(run: &Run, args: &Value) -> Result<Value> {
     }))
 }
 
-fn runs_list(run: &Run, args: &Value) -> Result<Value> {
-    let limit = list_limit(args)?;
+fn runs_list(run: &Run, _target: &Value, input: &Value) -> Result<Value> {
+    let limit = list_limit(input)?;
     let pending = run
         .node
         .query(TARGET_RUNS, encode(&RunsQuery::PendingRuns)?)?;
@@ -269,87 +431,91 @@ fn runs_list(run: &Run, args: &Value) -> Result<Value> {
     }))
 }
 
-fn chat_channels(run: &Run, _args: &Value) -> Result<Value> {
+fn chat_channels(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
     run.node.view(TARGET_CHAT, json!({"channels": {}}))
 }
 
-fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
-    let limit = opt_u64(args, "limit")
+fn chat_messages(run: &Run, target: &Value, input: &Value) -> Result<Value> {
+    let limit = opt_u64(input, "limit")
         .unwrap_or(DEFAULT_READ_LIMIT)
         .min(MAX_READ_LIMIT);
     let query = json!({"roots": {
-        "channel_id": arg_str(args, "channel_id")?,
+        "channel_id": arg_str(target, "channel_id")?,
         "limit": limit,
     }});
     run.node.view(TARGET_CHAT, query)
 }
 
-fn tasks_list(run: &Run, args: &Value) -> Result<Value> {
+fn tasks_list(run: &Run, _target: &Value, input: &Value) -> Result<Value> {
     // the board's page bound is its own (`tasks::MAX_LIST_LIMIT`, 256) and it
     // clamps whatever arrives; the pages cursor/limit parsing carries the same
     // shape and the same 1..=256 range, so it is reused verbatim.
     let query = WorkQuery::Task(TaskQuery::List {
-        limit: u64::from(page_limit(args)?),
-        after: page_cursor(args)?,
+        limit: u64::from(page_limit(input)?),
+        after: page_cursor(input)?,
     });
     run.node.query(TARGET_TASKS, encode(&query)?)
 }
 
-fn job_get(run: &Run, args: &Value) -> Result<Value> {
+fn job_get(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let query = WorkQuery::Job(JobsQuery::Get {
-        job_id: arg_str(args, "job_id")?,
+        job_id: arg_str(target, "job_id")?,
     });
     run.node.query(TARGET_TASKS, encode(&query)?)
 }
 
-fn pages_list(run: &Run, args: &Value) -> Result<Value> {
+fn pages_list(run: &Run, _target: &Value, input: &Value) -> Result<Value> {
     run.node.view(
         TARGET_PAGES,
-        json!({"list_pages": {"after": page_cursor(args)?, "limit": page_limit(args)?}}),
+        json!({"list_pages": {"after": page_cursor(input)?, "limit": page_limit(input)?}}),
     )
 }
 
-fn page_get(run: &Run, args: &Value) -> Result<Value> {
+fn page_get(run: &Run, target: &Value, input: &Value) -> Result<Value> {
     let query = PageQuery::GetPage {
-        page_id: arg_str(args, "page_id")?,
-        after: page_cursor(args)?,
-        limit: page_limit(args)?,
+        page_id: arg_str(target, "page_id")?,
+        after: page_cursor(input)?,
+        limit: page_limit(input)?,
     };
     run.node.query(TARGET_PAGES, encode(&query)?)
 }
 
-fn forge_repos(run: &Run, _args: &Value) -> Result<Value> {
+fn forge_repos(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
     run.node
         .query(TARGET_FORGE, encode(&ForgeQuery::ListRepos)?)
 }
 
-fn forge_items(run: &Run, args: &Value) -> Result<Value> {
-    let repo = arg_str(args, "repo")?;
+fn forge_items(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+    let repo = arg_str(target, "repo")?;
     gate_forge_read(run, &repo)?;
     let query = ForgeQuery::ListItems { repo };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
 
-fn forge_item(run: &Run, args: &Value) -> Result<Value> {
-    let repo = arg_str(args, "repo")?;
-    let number = opt_u64(args, "number")
-        .ok_or_else(|| NodeError::Rejected("this tool needs an integer \"number\"".into()))?;
+fn forge_item(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+    let repo = arg_str(target, "repo")?;
+    let number = item_number(target)?;
     gate_forge_read(run, &repo)?;
     let query = ForgeQuery::GetItem { repo, number };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
 
-fn forge_pr_diff(run: &Run, args: &Value) -> Result<Value> {
-    let repo = arg_str(args, "repo")?;
-    let number = opt_u64(args, "number")
-        .ok_or_else(|| NodeError::Rejected("this tool needs an integer \"number\"".into()))?;
+fn forge_pr_diff(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+    let repo = arg_str(target, "repo")?;
+    let number = item_number(target)?;
     gate_forge_read(run, &repo)?;
     let query = ForgeQuery::PrDiff { repo, number };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
 
-fn files_ls(run: &Run, args: &Value) -> Result<Value> {
-    let path = arg_str(args, "path")?;
+fn item_number(target: &Value) -> Result<u64> {
+    opt_u64(target, "number").ok_or_else(|| {
+        NodeError::Rejected("this operation needs an integer \"number\" in its target".into())
+    })
+}
+
+fn files_ls(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+    let path = arg_str(target, "path")?;
     gate_duckfs_read(run, &path)?;
     run.node.files("ls", &[("path", path)])
 }
@@ -357,8 +523,8 @@ fn files_ls(run: &Run, args: &Value) -> Result<Value> {
 /// duckfs reads come back base64 in `b64`. an agent wants TEXT — hand it the
 /// decoded body and say plainly when the bytes are not text, rather than
 /// handing a model a base64 blob to decode in its head.
-fn files_read(run: &Run, args: &Value) -> Result<Value> {
-    let path = arg_str(args, "path")?;
+fn files_read(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
+    let path = arg_str(target, "path")?;
     gate_duckfs_read(run, &path)?;
     let reply = run.node.files("read", &[("path", path.clone())])?;
     let Some(b64) = reply.get("b64").and_then(Value::as_str) else {
@@ -374,14 +540,14 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
             "eof": reply.get("eof").cloned().unwrap_or(Value::Null),
         })),
         Err(e) => Err(NodeError::Rejected(format!(
-            "{path:?} is not utf-8 text ({} bytes); this tool reads text files only",
+            "{path:?} is not utf-8 text ({} bytes); this operation reads text files only",
             e.into_bytes().len()
         ))),
     }
 }
 
 /// duckfs grep's own prefix rule is a raw string prefix (`/shared/team` also
-/// matches `/shared/team-secrets/...`), but the cap this tool gates on is
+/// matches `/shared/team-secrets/...`), but the cap this operation gates on is
 /// segment-boundary (see `ModelRecord::permits`'s doc on `DuckfsRead`). Passing
 /// the gate on `prefix` does not make every hit `grep` returns covered by the
 /// cap, so each hit's own path is re-checked against the SAME predicate before
@@ -402,9 +568,9 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 /// gate in front of the raw route any more: a sandboxed run's node tunnel is a
 /// cap-checked read lane (`provider-host`'s `read_lane`) that filters the same
 /// replies, and the lane and this tool plane must decide identically.
-fn files_grep(run: &Run, args: &Value) -> Result<Value> {
-    let prefix = arg_str(args, "prefix")?;
-    let pattern = arg_str(args, "pattern")?;
+fn files_grep(run: &Run, target: &Value, input: &Value) -> Result<Value> {
+    let prefix = arg_str(target, "prefix")?;
+    let pattern = arg_str(input, "pattern")?;
     let record = run.record()?;
     run.permits(&record, &CapRequest::DuckfsRead(&prefix))?;
     let mut reply = run
@@ -413,6 +579,18 @@ fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
     duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
     Ok(reply)
+}
+
+fn agent_calls(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
+    let run_id = run.run_id().ok_or_else(|| {
+        NodeError::Rejected("this server is not bound to a run, so it has no agent calls".into())
+    })?;
+    run.node.query(
+        TARGET_RUNS,
+        encode(&RunsQuery::Delegations {
+            caller_run_id: run_id.into(),
+        })?,
+    )
 }
 
 fn gate_forge_read(run: &Run, repo: &str) -> Result<()> {
@@ -437,10 +615,6 @@ fn bounded_list_schema() -> Value {
     value["properties"]["limit"]["default"] = json!(DEFAULT_READ_LIMIT);
     value["additionalProperties"] = Value::Bool(false);
     value
-}
-
-fn page_list_schema() -> Value {
-    page_read_schema(&[])
 }
 
 /// the task board's page args. same shape and same 1..=256 bound as the pages
@@ -468,13 +642,8 @@ fn tasks_list_schema() -> Value {
     value
 }
 
-fn page_get_schema() -> Value {
-    page_read_schema(&[("page_id", "string", true, "The page to read.")])
-}
-
-fn page_read_schema(required: &[(&str, &str, bool, &str)]) -> Value {
-    let mut props = required.to_vec();
-    props.extend([
+fn page_cursor_schema() -> Value {
+    let mut value = schema(&[
         (
             "after",
             "string",
@@ -488,7 +657,6 @@ fn page_read_schema(required: &[(&str, &str, bool, &str)]) -> Value {
             "Records to return (default and maximum 256).",
         ),
     ]);
-    let mut value = schema(&props);
     value["properties"]["limit"]["minimum"] = json!(1);
     value["properties"]["limit"]["maximum"] = json!(pages::MAX_PAGE_QUERY_LIMIT);
     value["properties"]["limit"]["default"] = json!(pages::MAX_PAGE_QUERY_LIMIT);
@@ -501,7 +669,7 @@ fn page_cursor(args: &Value) -> Result<Option<String>> {
         None => Ok(None),
         Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
         Some(_) => Err(NodeError::Rejected(
-            "this tool needs a string \"after\" argument".into(),
+            "this operation needs a string \"after\" argument".into(),
         )),
     }
 }
@@ -511,11 +679,11 @@ fn page_limit(args: &Value) -> Result<u16> {
         return Ok(pages::MAX_PAGE_QUERY_LIMIT);
     };
     let limit = value.as_u64().ok_or_else(|| {
-        NodeError::Rejected("this tool needs an integer \"limit\" argument".into())
+        NodeError::Rejected("this operation needs an integer \"limit\" argument".into())
     })?;
     if !(1..=u64::from(pages::MAX_PAGE_QUERY_LIMIT)).contains(&limit) {
         return Err(NodeError::Rejected(format!(
-            "this tool needs \"limit\" between 1 and {}",
+            "this operation needs \"limit\" between 1 and {}",
             pages::MAX_PAGE_QUERY_LIMIT
         )));
     }
@@ -525,21 +693,21 @@ fn page_limit(args: &Value) -> Result<u16> {
 fn list_limit(args: &Value) -> Result<usize> {
     let object = args
         .as_object()
-        .ok_or_else(|| NodeError::Rejected("this tool needs an object argument".into()))?;
+        .ok_or_else(|| NodeError::Rejected("this operation needs an object input".into()))?;
     if object.keys().any(|key| key != "limit") {
         return Err(NodeError::Rejected(
-            "this tool accepts only an optional integer \"limit\" argument".into(),
+            "this operation accepts only an optional integer \"limit\" argument".into(),
         ));
     }
     let limit = match object.get("limit") {
         None => DEFAULT_READ_LIMIT,
         Some(value) => value.as_u64().ok_or_else(|| {
-            NodeError::Rejected("this tool needs an integer \"limit\" argument".into())
+            NodeError::Rejected("this operation needs an integer \"limit\" argument".into())
         })?,
     };
     if !(1..=MAX_READ_LIMIT).contains(&limit) {
         return Err(NodeError::Rejected(format!(
-            "this tool needs \"limit\" between 1 and {MAX_READ_LIMIT}"
+            "this operation needs \"limit\" between 1 and {MAX_READ_LIMIT}"
         )));
     }
     Ok(limit as usize)
@@ -593,6 +761,13 @@ mod tests {
             json!("recent_runs")
         );
         assert_eq!(
+            encode(&RunsQuery::Catalog {
+                filter: Some("pages.".into())
+            })
+            .unwrap(),
+            json!({"catalog": {"filter": "pages."}})
+        );
+        assert_eq!(
             encode(&ForgeQuery::PrDiff {
                 repo: "app".into(),
                 number: 8,
@@ -620,6 +795,60 @@ mod tests {
             .unwrap(),
             json!({"get_item": {"repo": "app", "number": 7}})
         );
+    }
+
+    #[test]
+    fn read_operations_are_uniquely_named_and_disjoint_from_the_write_catalog() {
+        let ops = read_operations();
+        let mut names: Vec<&str> = ops.iter().map(|op| op.name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "read operation names must be unique");
+        for op in &ops {
+            assert!(!op.description.is_empty(), "{} has no description", op.name);
+            assert_eq!(op.input["type"], "object", "{} input is not an object", op.name);
+            if let Some(target) = &op.target {
+                assert_eq!(target["type"], "object", "{} target is not an object", op.name);
+            }
+            assert!(
+                runs::catalog(None).iter().all(|write| write.name != op.name),
+                "{} collides with a write operation",
+                op.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_query_envelope_is_checked_for_shape_before_any_handler_runs() {
+        let run = Run::from_env();
+        for (args, needle) in [
+            (json!({}), "operation"),
+            (json!({"operation": "nope"}), "not a read operation"),
+            (json!({"operation": "jobs.get"}), "requires a target"),
+            (
+                json!({"operation": "chat.channels", "target": {"x": 1}}),
+                "takes no target",
+            ),
+            (
+                json!({"operation": "jobs.get", "target": "job-1"}),
+                "object \"target\"",
+            ),
+            (
+                json!({"operation": "tasks.list", "input": []}),
+                "object \"input\"",
+            ),
+            (
+                json!({"operation": "jobs.get", "target": {}}),
+                "job_id",
+            ),
+        ] {
+            let error = query(&run, &args).unwrap_err();
+            assert!(
+                matches!(&error, NodeError::Rejected(m) if m.contains(needle)),
+                "{args} -> {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -661,21 +890,20 @@ mod tests {
     }
 
     #[test]
-    fn pages_schemas_expose_the_bounded_cursor() {
-        for name in ["ducktape_pages", "ducktape_page"] {
-            let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
-            let schema = (tool.schema)();
-            assert_eq!(schema["properties"]["after"]["type"], "string");
+    fn pages_operations_expose_the_bounded_cursor() {
+        for name in ["pages.list", "pages.get"] {
+            let op = find_read(name).unwrap();
+            assert_eq!(op.input["properties"]["after"]["type"], "string");
             assert_eq!(
-                schema["properties"]["limit"]["maximum"],
+                op.input["properties"]["limit"]["maximum"],
                 pages::MAX_PAGE_QUERY_LIMIT
             );
-            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(op.input["additionalProperties"], false);
         }
     }
 
     #[test]
-    fn agent_and_run_schemas_are_exactly_bounded() {
+    fn agent_and_run_inputs_are_exactly_bounded() {
         let expected = json!({
             "type": "object",
             "properties": {
@@ -690,9 +918,10 @@ mod tests {
             "required": [],
             "additionalProperties": false,
         });
-        for name in ["ducktape_agents", "ducktape_runs"] {
-            let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
-            assert_eq!((tool.schema)(), expected, "{name}");
+        for name in ["agents.list", "runs.list"] {
+            let op = find_read(name).unwrap();
+            assert_eq!(op.target, None, "{name}");
+            assert_eq!(op.input, expected, "{name}");
         }
     }
 
@@ -708,14 +937,17 @@ mod tests {
             json!({"limit": 0}),
             json!({"limit": 201}),
         ];
-        for args in bad {
-            for handler in [agents_list as fn(&Run, &Value) -> Result<Value>, runs_list] {
+        for input in bad {
+            for handler in [
+                agents_list as fn(&Run, &Value, &Value) -> Result<Value>,
+                runs_list,
+            ] {
                 assert!(
                     matches!(
-                        handler(&Run::from_env(), &args),
+                        handler(&Run::from_env(), &Value::Null, &input),
                         Err(NodeError::Rejected(_))
                     ),
-                    "accepted {args}"
+                    "accepted {input}"
                 );
             }
         }
@@ -764,8 +996,8 @@ mod tests {
         }
     }
 
-    /// #1663: grep's own matcher is a raw string prefix (`/shared/team` also
-    /// matches `/shared/team-secrets/...`), but the cap it is gated on is
+    /// grep's own matcher is a raw string prefix (`/shared/team` also matches
+    /// `/shared/team-secrets/...`), but the cap it is gated on is
     /// segment-boundary. A hit from a sibling path that only shares a textual
     /// prefix with the capped one must be dropped before the reply reaches the
     /// agent, while a hit truly under the cap must survive.
@@ -789,7 +1021,7 @@ mod tests {
         assert_eq!(paths, vec!["/shared/team/notes.txt"]);
     }
 
-    /// #1755: a `next` cursor naming a path outside the cap (the sibling tree
+    /// a `next` cursor naming a path outside the cap (the sibling tree
     /// `/shared/team-secrets/...`, reached because duckfs' grep walk prefixes
     /// on a raw string) must never reach the agent — it is replaced with the
     /// last retained hit's own path so the agent can still resume inside its

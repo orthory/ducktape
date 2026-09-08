@@ -20,8 +20,8 @@ use files::Files;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use pages::Pages;
 use runs::{
-    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentResponse,
-    ReplyBlock, ResourceCaps, SkillRef, encode_response,
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ActionEnvelope,
+    AgentResponse, ReplyBlock, ResourceCaps, SkillRef, encode_response,
 };
 use runs::{
     RunsModule, RunsMsg, RunsQuery, RunsReply, decode_reply as runs_decode_reply, dispatch_id_for,
@@ -359,6 +359,40 @@ fn wrap_runner(prose: Vec<u8>) -> Vec<u8> {
     .expect("wrapper serializes")
 }
 
+// ---- catalog envelopes ---------------------------------------------------------
+
+fn text_content(text: &str) -> serde_json::Value {
+    serde_json::json!({"content": [{"type": "text", "text": text}]})
+}
+
+fn reply(text: &str) -> ActionEnvelope {
+    ActionEnvelope::new(runs::OP_REPLY, None, text_content(text))
+}
+
+fn create_task(task_id: &str, title: &str) -> ActionEnvelope {
+    ActionEnvelope::new(
+        ACTION_TASKS_CREATE,
+        None,
+        serde_json::json!({"task_id": task_id, "title": title}),
+    )
+}
+
+fn update_task_status(task_id: &str, status: &str) -> ActionEnvelope {
+    ActionEnvelope::new(
+        runs::ACTION_TASKS_UPDATE_STATUS,
+        Some(serde_json::json!({"task_id": task_id})),
+        serde_json::json!({"status": status}),
+    )
+}
+
+fn set_page_checked(block_id: &str, checked: bool) -> ActionEnvelope {
+    ActionEnvelope::new(
+        runs::ACTION_PAGES_SET_CHECKED,
+        Some(serde_json::json!({"block_id": block_id})),
+        serde_json::json!({"checked": checked}),
+    )
+}
+
 /// the model's RAW text: a strict AgentResponse JSON the in-consensus
 /// normalization accepts as-is — one reply paragraph + one task action.
 fn canned_response(run_id: &str) -> Vec<u8> {
@@ -368,10 +402,7 @@ fn canned_response(run_id: &str) -> Vec<u8> {
             text: format!("quack: handling {run_id}"),
             lang: None,
         }],
-        actions: vec![AgentAction::CreateTask {
-            task_id: "task-1".into(),
-            title: "follow up on the mention".into(),
-        }],
+        actions: vec![create_task("task-1", "follow up on the mention")],
         commit_message: None,
     })
 }
@@ -654,16 +685,14 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                 Origin::External(SESSION_KEY.to_vec()),
                 runs_op(&RunsMsg::AgentAction {
                     run_id: run.clone(),
-                    action: AgentAction::SetPageChecked {
-                        block: "inline-todo".into(),
-                        checked: true,
-                    },
+                    request_id: "tick".into(),
+                    action: set_page_checked("inline-todo", true),
                 }),
             )
             .await;
             pair.drain().await;
             assert!(matches!(
-                pair.action(&runs::action_request_id(run, 0)).await.status,
+                pair.action(&runs::action_request_id(run, "tick")).await.status,
                 runs::ActionStatus::Completed {
                     outcome: dispatch::CallOutcomeSummary::Rejected { .. },
                     ..
@@ -673,10 +702,8 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                 Origin::External(SESSION_KEY.to_vec()),
                 runs_op(&RunsMsg::AgentAction {
                     run_id: run.clone(),
-                    action: AgentAction::Reply {
-                        text: "Review underway.".into(),
-                        destination: None,
-                    },
+                    request_id: "underway".into(),
+                    action: reply("Review underway."),
                 }),
             )
             .await;
@@ -1153,10 +1180,8 @@ fn rejections_match_and_leave_no_trace() {
                 alice(),
                 runs_op(&RunsMsg::AgentAction {
                     run_id: "nope".into(),
-                    action: AgentAction::CreateTask {
-                        task_id: "t".into(),
-                        title: "t".into(),
-                    },
+                    request_id: "t".into(),
+                    action: create_task("t", "t"),
                 }),
                 "run is not in flight",
             ),
@@ -1226,10 +1251,8 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
         let action = |id: &str| {
             runs_op(&RunsMsg::AgentAction {
                 run_id: run.clone(),
-                action: AgentAction::CreateTask {
-                    task_id: id.into(),
-                    title: id.into(),
-                },
+                request_id: id.into(),
+                action: create_task(id, id),
             })
         };
         let outcomes = pair
@@ -1249,9 +1272,9 @@ fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts(
         );
         pair.drain().await;
         assert_eq!(task_ids(&pair.wasm).await, vec!["first", "second"]);
-        for slot in 0..2 {
+        for id in ["first", "second"] {
             assert!(matches!(
-                pair.action(&runs::action_request_id(&run, slot))
+                pair.action(&runs::action_request_id(&run, id))
                     .await
                     .status,
                 runs::ActionStatus::Completed {
@@ -1354,10 +1377,8 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         .await;
         let post = runs_op(&RunsMsg::AgentAction {
             run_id: run.clone(),
-            action: AgentAction::Reply {
-                text: "working".into(),
-                destination: None,
-            },
+            request_id: "working".into(),
+            action: reply("working"),
         });
         pair.rejected(
             Origin::External(WORKER_NODE.to_vec()),
@@ -1369,10 +1390,8 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run.clone(),
-                action: AgentAction::UpdateTaskStatus {
-                    task_id: "task-1".into(),
-                    status: "done".into(),
-                },
+                request_id: "status".into(),
+                action: update_task_status("task-1", "done"),
             }),
             "not allowed to tasks.update_status",
         )
@@ -1381,11 +1400,11 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             .await;
         assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 1);
         assert!(matches!(
-            pair.action(&runs::action_request_id(&run, 0)).await.status,
+            pair.action(&runs::action_request_id(&run, "working")).await.status,
             runs::ActionStatus::AwaitingProgram
         ));
         pair.drain().await;
-        let receipt = pair.action(&runs::action_request_id(&run, 0)).await;
+        let receipt = pair.action(&runs::action_request_id(&run, "working")).await;
         assert!(matches!(
             receipt.status,
             runs::ActionStatus::Completed {
@@ -1399,15 +1418,20 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         assert_eq!(message.head.author, Party::Account(2));
         assert_eq!(message.head.origin, Origin::Program(2));
         assert_eq!(message.head.thread, Some(1));
-        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 0)).await;
+        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, "working")).await;
         // An admitted action cannot borrow the next attempt's lease, even
-        // when the same node wins it. Completed receipts remain reportable.
+        // when the same node wins it. Completed receipts remain reportable,
+        // and the rejected proposal keeps its request_id: the retry under the
+        // new lease is new work with a new key.
         let reply_action = runs_op(&RunsMsg::AgentAction {
             run_id: run.clone(),
-            action: AgentAction::Reply {
-                text: "next update".into(),
-                destination: None,
-            },
+            request_id: "next".into(),
+            action: reply("next update"),
+        });
+        let retry_action = runs_op(&RunsMsg::AgentAction {
+            run_id: run.clone(),
+            request_id: "next-retry".into(),
+            action: reply("next update"),
         });
         pair.submit(Origin::External(SESSION_KEY.to_vec()), reply_action.clone())
             .await;
@@ -1453,11 +1477,11 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         .await;
         assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 2);
         assert_eq!(agent_sessions(&pair.wasm).await[0].lease.attempt, 1);
-        pair.submit(Origin::External(vec![0x77; 32]), reply_action)
+        pair.submit(Origin::External(vec![0x77; 32]), retry_action)
             .await;
         pair.drain().await;
         assert!(matches!(
-            pair.action(&runs::action_request_id(&run, 1)).await.status,
+            pair.action(&runs::action_request_id(&run, "next")).await.status,
             runs::ActionStatus::Rejected { .. }
         ));
         assert!(
@@ -1470,7 +1494,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             .unwrap();
         assert_eq!(retried.head.author, Party::Account(2));
         assert_eq!(retried.head.thread, Some(1));
-        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 2)).await;
+        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, "next-retry")).await;
         pair.settle(&run, canned_response(&run)).await;
         let reply = chat_message(&pair.wasm, &reply_message_id(&run))
             .await
@@ -1487,10 +1511,8 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run,
-                action: AgentAction::CreateTask {
-                    task_id: "late".into(),
-                    title: "late".into(),
-                },
+                request_id: "late".into(),
+                action: create_task("late", "late"),
             }),
             "run is not in flight",
         )
@@ -1547,10 +1569,8 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run.clone(),
-                action: AgentAction::Reply {
-                    text: "Job underway.".into(),
-                    destination: None,
-                },
+                request_id: "underway".into(),
+                action: reply("Job underway."),
             }),
         )
         .await;
@@ -1561,10 +1581,7 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
                 text: "Job complete.".into(),
                 lang: None,
             }],
-            actions: vec![AgentAction::CreateTask {
-                task_id: "job-task".into(),
-                title: "complete job".into(),
-            }],
+            actions: vec![create_task("job-task", "complete job")],
             commit_message: None,
         });
         pair.settle(&run, response).await;

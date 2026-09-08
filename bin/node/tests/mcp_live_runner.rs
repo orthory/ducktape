@@ -62,7 +62,8 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     );
 
     let prompt = "Use the ducktape MCP tools. First call ducktape_whoami. Then call \
-                  ducktape_task_create with the title: live-proof. Then reply with the word \
+                  ducktape_action with operation tasks.create, input {\"title\": \
+                  \"live-proof\"} and request_id live-proof. Then reply with the word \
                   DONE and nothing else.";
     // This harness dispatches no run, so it supplies an unavailable scoped
     // endpoint. The runner must surface the refusal and never fall back.

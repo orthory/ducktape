@@ -10,6 +10,14 @@ pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
 mod interface;
 pub use interface::*;
 
+// the module-owned action catalog: the envelope the host carries, the typed
+// operations it decodes to, and the views discovery answers.
+mod catalog;
+pub use catalog::{
+    ActionEnvelope, ContentPart, Grant, LaneKind, OP_AGENT_CALL, OP_REPLY, OperationView,
+    catalog, content_blocks, operation_view, validate_request_id,
+};
+
 // dispatch payload composition: the structured run envelope.
 mod envelope;
 
@@ -208,6 +216,23 @@ impl Lane {
         match self {
             Lane::Settle | Lane::DelegatedSettle => index.to_string(),
             Lane::Session(actions) => format!("s{actions}"),
+        }
+    }
+
+    /// the catalog lane this path admits operations for: the settle paths
+    /// carry the run's final response, the session lane its live actions.
+    fn kind(self) -> LaneKind {
+        match self {
+            Lane::Settle | Lane::DelegatedSettle => LaneKind::Final,
+            Lane::Session(_) => LaneKind::Live,
+        }
+    }
+
+    /// the lane's catalog name, as the strict-lane diagnostics print it.
+    fn kind_name(self) -> &'static str {
+        match self.kind() {
+            LaneKind::Final => "final",
+            LaneKind::Live => "live",
         }
     }
 }
@@ -498,6 +523,10 @@ pub struct RunsModule {
     pending_pr_links: BTreeMap<String, u64>,
     /// Authenticated result-action refusals become visible only at commit.
     pending_action_rejections: BTreeSet<String>,
+    /// The receipt facts of every effect prepared in the current execute,
+    /// keyed by its message digest, so the proposal staged for that message
+    /// records which operation produced it. Transient: never committed state.
+    prepared_receipts: RefCell<BTreeMap<[u8; 32], action_requests::ReceiptMeta>>,
 }
 
 impl RunsModule {
@@ -572,7 +601,27 @@ impl RunsModule {
             pending_history: Vec::new(),
             pending_pr_links: BTreeMap::new(),
             pending_action_rejections: BTreeSet::new(),
+            prepared_receipts: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// Emit one prepared effect and remember its receipt facts for the
+    /// proposal that will be staged for its exact message.
+    fn emit_prepared(&self, ctx: &mut dyn Ctx, prepared: action_requests::Prepared) {
+        self.prepared_receipts.borrow_mut().insert(
+            action_requests::message_digest(&prepared.message),
+            prepared.receipt,
+        );
+        ctx.emit_msg(prepared.message);
+    }
+
+    /// The receipt facts recorded for `message`, or an effect label naming its
+    /// target for a message no preparer annotated.
+    fn take_prepared_receipt(&self, message: &Msg) -> action_requests::ReceiptMeta {
+        self.prepared_receipts
+            .borrow_mut()
+            .remove(&action_requests::message_digest(message))
+            .unwrap_or_else(|| action_requests::ReceiptMeta::effect(message.target.clone()))
     }
 
     /// wire the forge module as the PR/merge sink target (O2), after

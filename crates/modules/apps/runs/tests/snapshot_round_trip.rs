@@ -13,7 +13,7 @@ async fn source() -> (Vec<u8>, StateRoot, Network) {
     let mut network = Network::new().await;
     let run = network.provision().await;
     network.submit(session(), msg("runs", &runs::RunsMsg::AgentAction {
-        run_id: run, action: runs::AgentAction::CreateTask { task_id: "pending".into(), title: "persisted request".into() },
+        run_id: run, request_id: "pending".into(), action: create_task("pending", "persisted request"),
     })).await;
     let (snapshot, _) = network.host.capture_current_snapshot(network.height, host::CapturePayloads::All, || std::time::Duration::ZERO);
     let runs = snapshot.module("runs").unwrap();

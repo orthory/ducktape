@@ -52,16 +52,16 @@ const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktap
 /// its caps do not cover.
 pub use runs::SKILL_LIBRARY_PREFIX;
 
-/// the tier-2 pointer. named tools with their real parameter names, because a
-/// model that has to guess the call will guess wrong: `ducktape_files_ls` takes
-/// `path`, `ducktape_files_grep` takes `pattern` + `prefix`, and
-/// `ducktape_files_read` takes `path` (`bin/node/src/mcp/tools/read.rs`).
+/// the tier-2 pointer. named read operations with their real envelope shapes,
+/// because a model that has to guess the call will guess wrong: `files.ls`
+/// targets a `path`, `files.grep` targets a `prefix` and takes a `pattern`, and
+/// `files.read` targets a `path` (`bin/node/src/mcp/tools/read.rs`).
 ///
-/// `ducktape_files_ls` is named FIRST, and it was the missing one: the library
-/// has no index file, so listing the directory is the only way to see every
-/// skill it holds — an agent told only to grep can find a skill it can already
-/// describe and nothing else.
-const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, list the library with the `ducktape_files_ls` tool (`path`: `/shared/skills/`) to see every skill it holds, or search it with `ducktape_files_grep` (`prefix`: `/shared/skills/`, `pattern`: what you are looking for) — then read the skill you want in full with `ducktape_files_read` (`path`: `/shared/skills/<name>/SKILL.md`). Reading one is cheap; guessing at a task the library already answers is not.";
+/// `files.ls` is named FIRST, and it was the missing one: the library has no
+/// index file, so listing the directory is the only way to see every skill it
+/// holds — an agent told only to grep can find a skill it can already describe
+/// and nothing else.
+const SKILL_LIBRARY_SECTION: &str = "## The shared skill library\nBeyond the skills above, Ducktape carries a shared library of skills in duckfs under `/shared/skills/`, one directory per skill: `/shared/skills/<name>/SKILL.md`, whose YAML frontmatter carries a one-line `description`. It is NOT loaded into this context and costs you nothing until you read it. When your own skills do not cover the task in front of you, list the library with `ducktape_query` (`operation`: `files.ls`, `target`: `{\"path\": \"/shared/skills/\"}`) to see every skill it holds, or search it (`operation`: `files.grep`, `target`: `{\"prefix\": \"/shared/skills/\"}`, `input`: `{\"pattern\": what you are looking for}`) — then read the skill you want in full (`operation`: `files.read`, `target`: `{\"path\": \"/shared/skills/<name>/SKILL.md\"}`). Reading one is cheap; guessing at a task the library already answers is not.";
 
 /// hard cap on the TOTAL bytes of inlined `always` bodies — the persona's
 /// context budget. over it the run FAILS: truncating a persona would hand the
@@ -117,7 +117,7 @@ pub struct SkillDoc {
 /// paragraph and nothing else: an agent WITHOUT the grant is never told about a
 /// door the MCP tool plane would refuse to open for it. the alternative — always
 /// advertising it — is a document that lies to the model, which then burns a turn
-/// on a refused `ducktape_files_grep` and has no way to know why.
+/// on a refused `files.grep` query and has no way to know why.
 ///
 /// `Err` = a bound was blown: the caller fails the run. checked HERE, in the
 /// pure layer, so both node binaries reach the same verdict from the same
@@ -273,7 +273,7 @@ mod tests {
             );
             assert!(!doc.contains("## The shared skill library"), "got {doc}");
             assert!(!doc.contains(SKILL_LIBRARY_PREFIX), "got {doc}");
-            assert!(!doc.contains("ducktape_files_grep"), "got {doc}");
+            assert!(!doc.contains("files.grep"), "got {doc}");
         }
         // the curated skills are untouched by the grant — curation is not a cap.
         let doc =
@@ -330,8 +330,8 @@ mod tests {
             assert_eq!(doc.matches("## The shared skill library").count(), 1);
             assert!(doc.contains(SKILL_LIBRARY_PREFIX), "got {doc}");
             assert!(doc.contains("/shared/skills/<name>/SKILL.md"), "got {doc}");
-            assert!(doc.contains("ducktape_files_grep"), "got {doc}");
-            assert!(doc.contains("ducktape_files_read"), "got {doc}");
+            assert!(doc.contains("files.grep"), "got {doc}");
+            assert!(doc.contains("files.read"), "got {doc}");
             // the whole point of the tier: it is a POINTER, not a payload.
             assert!(
                 doc.contains("costs you nothing until you read it"),

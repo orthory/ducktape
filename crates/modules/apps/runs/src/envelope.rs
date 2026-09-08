@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// [`crate::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the model configuration. With modules.update, a final-response action may be {"update_module":{"module_id":"hello","artifact":"hello.module","code_hash":"<lowercase SHA-256>","after":50}}. The artifact path is relative to your forge checkout; Ducktape binds them to the host-pushed output commit. The file contains the prebuilt canonical ModuleArtifact (component and optional mapper); code_hash is SHA-256 of that file. This action requires a changed forge output and cannot run as a live session tool. The program queues it and each validator stages the pinned artifact and votes; query runs ModuleUpdate for activation. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Each action is a catalog envelope {"operation":"<name>","target":{...},"input":{...}} — the same shape the live ducktape_action tool takes, without request_id. ducktape_actions lists every operation with its target and input schema, the grant it needs and the lanes it admits; use only operations your model configuration allows. A reply to the run's source is {"operation":"reply","input":{"content":[{"type":"text","text":"..."}]}}; an explicit destination names its target, e.g. {"operation":"tasks.create","input":{"title":"..."}} or {"operation":"chat.post_message","target":{"channel_id":"general","thread":12},"input":{"content":[{"type":"text","text":"..."}]}}. modules.update is final-response only: {"operation":"modules.update","input":{"module_id":"hello","artifact":"hello.module","code_hash":"<lowercase SHA-256>","after":50}}. The artifact path is relative to your forge checkout; Ducktape binds it to the host-pushed output commit. The file contains the prebuilt canonical ModuleArtifact (component and optional mapper); code_hash is SHA-256 of that file. It requires a changed forge output; the program queues it and each validator stages the pinned artifact and votes; query runs ModuleUpdate for activation. agent.call is live only: call peers through ducktape_action mid-run and read their results with ducktape_query. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -348,7 +348,7 @@ pub(crate) fn render_job_payload(
         agent,
         run_id,
         format!(
-            "Job {job_id} — replies are delivered to this job discussion; use ducktape_reply for live updates.\n\nJob spec:\n{spec}"
+            "Job {job_id} — replies are delivered to this job discussion; use ducktape_action with operation reply for live updates.\n\nJob spec:\n{spec}"
         ),
         portable,
     )
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(
             v["conversation"],
-            "Job job-1 — replies are delivered to this job discussion; use ducktape_reply for live updates.\n\nJob spec:\nsummarize this work item"
+            "Job job-1 — replies are delivered to this job discussion; use ducktape_action with operation reply for live updates.\n\nJob spec:\nsummarize this work item"
         );
     }
 

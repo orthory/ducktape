@@ -15,10 +15,7 @@ fn responses_beyond_the_agents_grants_fail_the_run() {
             &run_id,
             Ok(response(
                 &["look what i did"],
-                vec![AgentAction::CreateTask {
-                    task_id: "t1".into(),
-                    title: "sneaky".into(),
-                }],
+                vec![create_task("t1", "sneaky")],
             )),
         ),
     )
@@ -100,10 +97,7 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
             &run_id,
             Ok(response(
                 &["ok"],
-                vec![AgentAction::CreateTask {
-                    task_id: "t1".into(),
-                    title: "x".into(),
-                }],
+                vec![create_task("t1", "x")],
             )),
         ),
     )
@@ -158,11 +152,7 @@ fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
             &run_id,
             Ok(response(
                 &["ok"],
-                vec![AgentAction::DuckfsWriteText {
-                    path: "/shared/agents/qa-fixer/self-improvement/SKILL.md".into(),
-                    text: "lesson".into(),
-                    base_snapshot: None,
-                }],
+                vec![duckfs_write_text("/shared/agents/qa-fixer/self-improvement/SKILL.md", "lesson", None)],
             )),
         ),
     )
@@ -228,11 +218,7 @@ fn duckfs_write_text_with_a_stale_base_degrades_without_failing_the_run() {
             &run_id,
             Ok(response(
                 &["ok"],
-                vec![AgentAction::DuckfsWriteText {
-                    path: path.into(),
-                    text: "lesson".into(),
-                    base_snapshot: None,
-                }],
+                vec![duckfs_write_text(path, "lesson", None)],
             )),
         ),
     )
@@ -358,11 +344,7 @@ fn a_reply_and_a_post_message_into_one_near_full_thread_refuse_the_overflow() {
             &run_id,
             Ok(response(
                 &["done"],
-                vec![AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "and one more".into(),
-                    thread: Some(1),
-                }],
+                vec![post_message("general", "and one more", Some(1))],
             )),
         ),
     )
@@ -398,11 +380,7 @@ fn two_post_messages_into_one_near_full_thread_refuse_the_second() {
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
     let mut nearly_full = transcript(2);
     nearly_full[0].head.reply_count = MAX_THREAD_REPLIES as u64 - 1;
-    let post = |text: &str| AgentAction::PostMessage {
-        channel_id: "general".into(),
-        text: text.into(),
-        thread: Some(1),
-    };
+    let post = |text: &str| post_message("general", text, Some(1));
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -555,11 +533,7 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
     // own. chat admits a module/agent author everywhere, so the requester's
     // standing in the TARGET channel is the only thing between an agent and
     // every members-only channel on the network.
-    let post = |channel: &str| AgentAction::PostMessage {
-        channel_id: channel.into(),
-        text: "hello".into(),
-        thread: None,
-    };
+    let post = |channel: &str| post_message(channel, "hello", None);
     // the run's requester is the engaging poster, user(1).
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
     let board = |member: u8| {

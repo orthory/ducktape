@@ -84,7 +84,7 @@ async fn awaiting_pr(
 async fn awaiting_pr_with_actions(
     directory: &Directory,
     program: agent::Program,
-    actions: Vec<runs::AgentAction>,
+    actions: Vec<runs::ActionEnvelope>,
 ) -> (Network, runs::PendingRun) {
     let mut network = Network::new().await;
     network.host.register(Box::new(
@@ -236,10 +236,8 @@ async fn awaiting_pr_with_actions(
                 "runs",
                 &runs::RunsMsg::AgentAction {
                     run_id: run.run_id.clone(),
-                    action: runs::AgentAction::Reply {
-                        text: "Working on this issue".into(),
-                        destination: None,
-                    },
+                    request_id: "progress".into(),
+                    action: reply("Working on this issue"),
                 },
             ),
         )
@@ -247,7 +245,7 @@ async fn awaiting_pr_with_actions(
     network.drain().await;
     assert!(matches!(
         network
-            .action(&runs::action_request_id(&run.run_id, 0))
+            .action(&runs::action_request_id(&run.run_id, "progress"))
             .await
             .status,
         runs::ActionStatus::Completed {
@@ -369,8 +367,8 @@ async fn next_update(network: &Network) -> Option<runs::ModuleUpdateView> {
     update
 }
 
-fn replacement_action() -> runs::AgentAction {
-    runs::AgentAction::UpdateModule(runs::ModuleUpdateSpec {
+fn replacement_action() -> runs::ActionEnvelope {
+    update_module(runs::ModuleUpdateSpec {
         module_id: "hello".into(),
         artifact: "hello.module".into(),
         code_hash: "ab".repeat(32),

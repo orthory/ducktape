@@ -15,10 +15,8 @@ fn mention_and_interactive_action_use_the_actual_program_account() {
                     "runs",
                     &runs::RunsMsg::AgentAction {
                         run_id: run_id.clone(),
-                        action: runs::AgentAction::CreateTask {
-                            task_id: "made-by-program".into(),
-                            title: "Actual committed tool write".into(),
-                        },
+                        request_id: "made-by-program".into(),
+                        action: create_task("made-by-program", "Actual committed tool write"),
                     },
                 ),
             )
@@ -27,7 +25,7 @@ fn mention_and_interactive_action_use_the_actual_program_account() {
             network.task("made-by-program").await.is_none(),
             "session admission does not impersonate the user"
         );
-        let id = runs::action_request_id(&run_id, 0);
+        let id = runs::action_request_id(&run_id, "made-by-program");
         assert!(matches!(
             network.action(&id).await.status,
             runs::ActionStatus::AwaitingProgram
@@ -93,10 +91,8 @@ fn revoking_a_program_rejects_its_waiting_tool_request_without_a_write() {
                     "runs",
                     &runs::RunsMsg::AgentAction {
                         run_id: run_id.clone(),
-                        action: runs::AgentAction::CreateTask {
-                            task_id: "revoked".into(),
-                            title: "Must not land".into(),
-                        },
+                        request_id: "revoked".into(),
+                        action: create_task("revoked", "Must not land"),
                     },
                 ),
             )
@@ -111,7 +107,7 @@ fn revoking_a_program_rejects_its_waiting_tool_request_without_a_write() {
             )
             .await;
         network.drain().await;
-        let request = network.action(&runs::action_request_id(&run_id, 0)).await;
+        let request = network.action(&runs::action_request_id(&run_id, "revoked")).await;
         assert!(
             matches!(request.status, runs::ActionStatus::Rejected { .. }),
             "{request:?}"
@@ -128,15 +124,13 @@ async fn propose_task(network: &mut Network, run_id: &str, task_id: &str) -> Str
                 "runs",
                 &runs::RunsMsg::AgentAction {
                     run_id: run_id.into(),
-                    action: runs::AgentAction::CreateTask {
-                        task_id: task_id.into(),
-                        title: "A tool write".into(),
-                    },
+                    request_id: task_id.into(),
+                    action: create_task(task_id, "A tool write"),
                 },
             ),
         )
         .await;
-    runs::action_request_id(run_id, 0)
+    runs::action_request_id(run_id, task_id)
 }
 
 #[test]
@@ -588,10 +582,8 @@ fn a_same_node_retry_fences_queued_work_and_gives_new_actions_distinct_ids() {
                     "runs",
                     &runs::RunsMsg::AgentAction {
                         run_id: run.clone(),
-                        action: runs::AgentAction::CreateTask {
-                            task_id: "new-attempt".into(),
-                            title: "The current attempt".into(),
-                        },
+                        request_id: "new-attempt".into(),
+                        action: create_task("new-attempt", "The current attempt"),
                     },
                 ),
             )
@@ -603,7 +595,7 @@ fn a_same_node_retry_fences_queued_work_and_gives_new_actions_distinct_ids() {
             "{old:?}"
         );
         assert!(network.task("old-attempt").await.is_none());
-        let fresh = network.action(&runs::action_request_id(&run, 1)).await;
+        let fresh = network.action(&runs::action_request_id(&run, "new-attempt")).await;
         assert!(
             matches!(
                 fresh.status,

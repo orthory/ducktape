@@ -565,8 +565,8 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         "a library-granted agent is told the library is there: {prompt}"
     );
     assert!(
-        prompt.contains("ducktape_files_grep") && prompt.contains(runs::SKILL_LIBRARY_PREFIX),
-        "…and told, by name, the tool and prefix that open it: {prompt}"
+        prompt.contains("files.grep") && prompt.contains(runs::SKILL_LIBRARY_PREFIX),
+        "…and told, by name, the operation and prefix that open it: {prompt}"
     );
 
     // the artifact is COMMITTED duckfs state, readable on a node that never

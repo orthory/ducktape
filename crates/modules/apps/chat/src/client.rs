@@ -242,6 +242,16 @@ impl<'a> ChatReader<'a> {
         self.key
             .is_some_and(|key| self.names.owns_handle(handle, key))
     }
+
+    /// This reader's own signing key, exactly — narrower than [`Self::is_me`]:
+    /// two devices of one account both answer `is_me` true for a handle
+    /// either of them owns, but only the row naming THIS key answers here.
+    /// Reaction ownership hangs on this: "reacted by me" means this key
+    /// pressed it, not that some other device sharing the account did.
+    fn is_this_key(&self, handle: &str) -> bool {
+        self.key
+            .is_some_and(|key| handle == index::party_handle(&Party::Key(key.to_vec())))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -703,7 +713,9 @@ fn reaction_delta(
     reader: ChatReader<'_>,
 ) -> ChatDelta {
     let reactor = index::party_handle(actor);
-    let by_me = reader.is_me(&reactor);
+    // Reaction ownership is per-KEY, not per-account: `is_me` would light up
+    // "reacted by me" on every device of the account that pressed it.
+    let by_me = reader.is_this_key(&reactor);
     ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
@@ -1310,10 +1322,11 @@ pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
     .seed_render_rev()
 }
 
-/// True when the reader's rendered handle (`user:{hex}`) is among a reaction's
-/// reactors.
+/// True when the reader's OWN signing key (`user:{hex}`, never the account)
+/// is among a reaction's reactors — a phone's reaction must not light up
+/// "reacted by me" on the laptop just because both keys share an account.
 fn reacted_by_reader(reactors: &[String], reader: ChatReader<'_>) -> bool {
-    reactors.iter().any(|reactor| reader.is_me(reactor))
+    reactors.iter().any(|reactor| reader.is_this_key(reactor))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it
@@ -2495,15 +2508,18 @@ mod tests {
             short_label(&hex_encode(&[0xef; 32]))
         );
 
-        // `by me` hangs on the reader's ACCOUNT, never on a name: the key
-        // itself, or another key the same account holds.
+        // `by me` hangs on the reader's KEY, never the account: a reactor
+        // entry recorded as the account (`acct:1` — what the module writes
+        // when any of the account's keys reacts) is not "by me" on a device
+        // holding a DIFFERENT key of that same account, and a raw handle
+        // naming another key never matches either way.
         let reader = ChatReader::new(Some(&me), &names);
         assert!(reacted_by_reader(std::slice::from_ref(&mine), reader));
         assert!(!reacted_by_reader(
             std::slice::from_ref(&my_passkey),
             reader
         ));
-        assert!(reacted_by_reader(&["acct:1".into()], reader));
+        assert!(!reacted_by_reader(&["acct:1".into()], reader));
         assert!(!reacted_by_reader(std::slice::from_ref(&theirs), reader));
         assert!(!reacted_by_reader(&[mine], ChatReader::nobody()));
         // Two keys the directory does not know are two people.
@@ -2943,6 +2959,48 @@ mod tests {
             ChatReader::new(Some(&someone_else), &names)
         ));
         assert!(!reacted_by_reader(&reactors, ChatReader::nobody()));
+    }
+
+    /// Two devices, one account: a phone's reaction must not read as "reacted
+    /// by me" on the laptop, and tapping it there must not think it has
+    /// anything of its own to remove.
+    #[test]
+    fn reacted_by_me_means_this_key_not_this_account() {
+        let laptop = [0xaau8; 32];
+        let phone = [0xadu8; 32];
+        let names = NameDirectory::new(BTreeMap::from([
+            (
+                hex_encode(&laptop),
+                BoundAccount {
+                    number: 1,
+                    name: "me".into(),
+                },
+            ),
+            (
+                hex_encode(&phone),
+                BoundAccount {
+                    number: 1,
+                    name: "me".into(),
+                },
+            ),
+        ]));
+        let reader = ChatReader::new(Some(&laptop), &names);
+
+        // The module records a reaction by ACCOUNT once the reacting key is
+        // bound — `acct:1` regardless of which of the account's keys pressed
+        // it (see `Authority::participant`) — so this is what the phone's
+        // reaction looks like on the wire.
+        let phone_reacted = vec!["acct:1".to_string()];
+        assert!(
+            !reacted_by_reader(&phone_reacted, reader),
+            "the phone's reaction is not the laptop's to un-react"
+        );
+
+        let laptop_reacted = vec![format!("user:{}", hex_encode(&laptop))];
+        assert!(
+            reacted_by_reader(&laptop_reacted, reader),
+            "this device's own key is always its own reaction"
+        );
     }
 
     #[test]
