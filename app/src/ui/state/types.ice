@@ -421,3 +421,9 @@ enum MutationPhase
   onboarding
   page
   page_delete
+
+// Whether a closed window owns the authentication being abandoned.
+enum CeremonyRetirement
+  keep
+  welcome
+  account

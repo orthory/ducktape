@@ -595,19 +595,25 @@ const PHONE_CEREMONY_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// the auth host's relay as the callback, and poll the relay. A phone cannot
 /// reach a loopback listener, so a printed loopback URL would never answer.
 fn ceremony(auth: &AuthCtx, request: &Request) -> Result<Outcome, Box<dyn std::error::Error>> {
-    if !auth.browser {
-        return phone_ceremony(auth, request);
-    }
-    let listener = authpage::Listener::bind()?;
-    let url = authpage::request_url(&auth.page, request, &listener.callback_url());
-    if !authpage::open_browser(&url) {
-        eprintln!("no browser opener on this machine — open this yourself:\n    {url}");
-    }
-    eprintln!("waiting for the browser…");
-    Ok(listener.wait()?)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            if !auth.browser {
+                return phone_ceremony(auth, request).await;
+            }
+            let listener = authpage::Listener::bind().await?;
+            let url = authpage::request_url(&auth.page, request, &listener.callback_url());
+            let opened = authpage::open_browser(&url);
+            if !opened {
+                eprintln!("no browser opener on this machine — open this yourself:\n    {url}");
+            }
+            eprintln!("waiting for the browser…");
+            Ok(listener.wait().await?)
+        })
 }
 
-fn phone_ceremony(
+async fn phone_ceremony(
     auth: &AuthCtx,
     request: &Request,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
@@ -617,12 +623,14 @@ fn phone_ceremony(
         "scan this with your phone (or open the URL there):\n\n{}\n    {url}\n",
         authpage::terminal_qr(&url)?
     );
-    let outcome = relay.wait_reporting(PHONE_CEREMONY_TIMEOUT, |left| {
-        eprint!(
-            "\rwaiting for the phone… {} left ",
-            authpage::countdown(left)
-        );
-    });
+    let outcome = relay
+        .wait_reporting(PHONE_CEREMONY_TIMEOUT, |left| {
+            eprint!(
+                "\rwaiting for the phone… {} left ",
+                authpage::countdown(left)
+            );
+        })
+        .await;
     eprintln!();
     Ok(outcome?)
 }
@@ -1060,7 +1068,7 @@ mod tests {
     fn a_phone_ceremony_relays_and_never_binds_a_loopback_listener() {
         let source = include_str!("account_cli.rs");
         let phone = source
-            .split("\nfn phone_ceremony(")
+            .split("\nasync fn phone_ceremony(")
             .nth(1)
             .expect("the phone ceremony")
             .split("\n}\n")
@@ -1076,9 +1084,42 @@ mod tests {
             .split("\n}\n")
             .next()
             .unwrap();
-        assert!(
-            browser.contains("if !auth.browser {\n        return phone_ceremony(auth, request);")
-        );
+        let compact: String = browser.split_whitespace().collect();
+        assert!(compact.contains("if!auth.browser{returnphone_ceremony(auth,request).await;"));
+    }
+
+    #[test]
+    fn the_synchronous_cli_drives_the_async_phone_ceremony() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.starts_with("GET /r/"), "{request}");
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                let headers_complete = line == "\r\n";
+                if headers_complete {
+                    break;
+                }
+            }
+            let body = r#"{"op":"get","error":"cancelled","message":"phone cancelled"}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let auth = AuthCtx { page, browser: false };
+        let result = ceremony(&auth, &Request::Get { challenge: [7; 32] });
+        assert!(result.unwrap_err().to_string().contains("phone cancelled"));
+        server.join().unwrap();
     }
 
     fn add_key_ticket(

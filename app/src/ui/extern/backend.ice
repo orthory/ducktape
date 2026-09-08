@@ -163,6 +163,7 @@ extern crate::backend
   // Whether the close that just unregistered a slot ends the process: true
   // only off macOS, where no status item exists to live in, once no window
   // is left.
+  pure ceremony_retirement(welcome_closed:bool, account_closed:bool) -> CeremonyRetirement
   pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
   // "Open Ducktape" as a discriminant. Nothing tracked no longer means "never
   // connected": a connected network reopens the CONSOLE (reconnecting from

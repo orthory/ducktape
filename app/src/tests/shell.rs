@@ -2106,7 +2106,7 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
             .unwrap();
         assert!(
             handler.contains(&format!(
-                "run every {backend}(connected_rpc, password, network_chain_id"
+                "run replace lane=account_desktop_ceremony {backend}(connected_rpc, password, network_chain_id"
             )),
             "{signal} runs {backend} on the connected chain"
         );

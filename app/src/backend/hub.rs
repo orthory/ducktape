@@ -1,5 +1,16 @@
 use super::*;
 
+pub fn ceremony_retirement(
+    welcome_closed: bool,
+    account_closed: bool,
+) -> crate::CeremonyRetirement {
+    match (welcome_closed, account_closed) {
+        (true, _) => crate::CeremonyRetirement::Welcome,
+        (false, true) => crate::CeremonyRetirement::Account,
+        (false, false) => crate::CeremonyRetirement::Keep,
+    }
+}
+
 /// One row of the launch window's network list. `id` is the row's stable
 /// device-local key: the chain id for a materialized network (the same id the
 /// CLI registry lists), the canonical endpoint for a saved remote. `chain_id`

@@ -74,6 +74,10 @@ on account_ceremony_stepped(next)
 // with it — a ticket left on screen after its device joined is a stale blob
 // that looks like a secret.
 on account_changed(_result)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   account_busy = false
   account_ticket = ""
   settings_drafts_cleared = settings_drafts_cleared + 1
@@ -82,6 +86,10 @@ on account_changed(_result)
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 
 on account_op_failed(cause)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   account_busy = false
   error = cause.message
 

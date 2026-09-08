@@ -634,6 +634,14 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                             h=28.0
                             p=5.0
                             @secondary_action
+                      CeremonyPlate #account-login-ceremony
+                        with
+                          phase=account_ceremony_phase
+                          qr=account_ceremony_qr
+                          detail=account_ceremony_detail
+                          left=account_ceremony_left
+                        forward
+                          account_ceremony_cancel
                     // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. With the key
                     // in no account, `load_account` returns zeros for every field,
                     // and the card printed `0 keys` one line under "· validator
