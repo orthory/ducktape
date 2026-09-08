@@ -140,11 +140,11 @@ ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
 
 # The build dir is keyed by rev too: cargo treats every checkout under its git
 # cache as immutable (no mtime check on its sources) and hashes a git package's
-# outputs without the revision, so a build dir shared across revs handed a bump
-# the PREVIOUS rev's binary under the new rev's path (`cargo ice bundle` then
-# refused flags the new rev has). An existing binary can predate the isolated
-# build dir. Only reuse an install completed by this recipe; --force also
-# replaces Cargo's stale registration.
+# outputs without the revision, so a build dir shared across revs hands the
+# next rev the previous rev's binary as "fresh" — a cargo-ice that parses the
+# wrong language, filed under the right rev. An existing binary can predate the
+# isolated build dir. Only reuse an install completed by this recipe; --force
+# also replaces Cargo's stale registration.
 .PHONY: ice-tool
 ice-tool:
 	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
