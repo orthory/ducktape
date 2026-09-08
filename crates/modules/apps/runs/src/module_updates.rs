@@ -1,5 +1,7 @@
 //! Programs queue immutable forge deployments; module policy drives node work.
 use super::*;
+use crate::action_requests::Prepared;
+use crate::catalog::Operation;
 use crate::facets::{RunnerResult, WireSink};
 
 const HEAD: &str = "module_updates/head";
@@ -93,10 +95,10 @@ impl RunsModule {
         run_id: &str,
         entry: &PendingState,
         result: &RunnerResult,
-        actions: &[AgentAction],
+        operations: &[Operation],
     ) {
-        for (index, action) in actions.iter().enumerate() {
-            let AgentAction::UpdateModule(update) = action else {
+        for (index, operation) in operations.iter().enumerate() {
+            let Operation::ModulesUpdate(update) = operation else {
                 continue;
             };
             let WireSink::Pr {
@@ -122,19 +124,27 @@ impl RunsModule {
                 );
                 continue;
             };
-            ctx.emit_msg(Msg {
-                target: self.id.clone(),
-                payload: encode_msg(&RunsMsg::RequestModuleUpdate {
-                    request_id: format!("{}/{index}", dispatch_id_for(run_id)),
-                    run_id: run_id.into(),
-                    source: ModuleUpdateSource {
-                        repo: repo.clone(),
-                        branch: source_branch.clone(),
-                        commit: commit.clone(),
-                    },
-                    update: update.clone(),
+            let prepared = Prepared::new(
+                Msg {
+                    target: self.id.clone(),
+                    payload: encode_msg(&RunsMsg::RequestModuleUpdate {
+                        request_id: format!("{}/{index}", dispatch_id_for(run_id)),
+                        run_id: run_id.into(),
+                        source: ModuleUpdateSource {
+                            repo: repo.clone(),
+                            branch: source_branch.clone(),
+                            commit: commit.clone(),
+                        },
+                        update: update.clone(),
+                    }),
+                },
+                operation.name(),
+                serde_json::json!({
+                    "module_id": update.module_id,
+                    "code_hash": update.code_hash,
                 }),
-            });
+            );
+            self.emit_prepared(ctx, prepared);
         }
     }
 

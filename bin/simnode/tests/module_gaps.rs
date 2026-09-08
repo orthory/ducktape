@@ -679,7 +679,12 @@ fn an_out_of_acl_agent_action_is_refused_at_the_module_layer() {
         "runs",
         serde_json::json!({ "agent_action": {
             "run_id": run_id,
-            "action": { "post_message": { "channel_id": "room", "text": "progress update" } },
+            "request_id": "progress",
+            "action": {
+                "operation": "chat.post_message",
+                "target": { "channel_id": "room" },
+                "input": { "content": [{ "type": "text", "text": "progress update" }] },
+            },
         }}),
         Some(&"s".repeat(32)),
     );

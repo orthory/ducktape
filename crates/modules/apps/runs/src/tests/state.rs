@@ -54,10 +54,8 @@ fn model_run_session_and_request_state_round_trip() {
         &mut act,
         &admin(&RunsMsg::AgentAction {
             run_id,
-            action: AgentAction::CreateTask {
-                task_id: "persisted".into(),
-                title: "a task".into(),
-            },
+            request_id: "persisted".into(),
+            action: create_task("persisted", "a task"),
         }),
     )
     .unwrap();

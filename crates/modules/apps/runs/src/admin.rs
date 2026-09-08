@@ -289,21 +289,17 @@ impl RunsModule {
                 self.open_agent_session(ctx, run_id, attempt, session_key)
                     .await
             }
-            RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
+            RunsMsg::AgentAction {
+                run_id,
+                request_id,
+                action,
+            } => self.agent_action(ctx, run_id, request_id, action).await,
             RunsMsg::ExecuteDelegation {
                 run_id,
                 request_id,
                 request,
             } => {
                 self.execute_delegation(ctx, run_id, request_id, request, budget)
-                    .await
-            }
-            RunsMsg::DelegateRun {
-                run_id,
-                request_id,
-                request,
-            } => {
-                self.delegate_run(ctx, run_id, request_id, request, budget)
                     .await
             }
         }

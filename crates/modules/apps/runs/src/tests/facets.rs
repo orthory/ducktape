@@ -66,10 +66,7 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
     // action is applied (the effects-facet fallback).
     let response_text = String::from_utf8(response_json(
         &["on it"],
-        vec![AgentAction::CreateTask {
-            task_id: "from_prose".into(),
-            title: "prose".into(),
-        }],
+        vec![create_task("from_prose", "prose")],
     ))
     .unwrap();
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
@@ -587,10 +584,7 @@ fn job_finalize_is_a_delivery_receipt_with_output_ref() {
     // lifts effects; a job run with no action would fail validation).
     let prose = String::from_utf8(response_json(
         &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
+        vec![create_task("t1", "todo")],
     ))
     .unwrap();
     let mut ctx = CaptureCtx::new()
@@ -647,10 +641,7 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
     let run_id = job_run_id_for("job-1", "duck", 3);
     let response = crate::encode_response(&AgentResponse {
         reply_blocks: Vec::new(),
-        actions: vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
+        actions: vec![create_task("t1", "todo")],
         commit_message: Some("x".repeat(JOB_FINALIZE_PAYLOAD_BYTES * 2)),
     });
     let response = String::from_utf8(response).unwrap();
@@ -712,10 +703,7 @@ fn job_finalize_output_ref_carries_forge_coordinates() {
     // the prose carries the action (job runs with no action fail validation).
     let prose = String::from_utf8(response_json(
         &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "todo".into(),
-        }],
+        vec![create_task("t1", "todo")],
     ))
     .unwrap();
     let mut ctx = CaptureCtx::new()

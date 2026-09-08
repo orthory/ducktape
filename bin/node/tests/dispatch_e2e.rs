@@ -572,16 +572,19 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
             .find(|c| c["id"] == "dispatch" && c["head_seq"].as_u64() >= Some(4))
             .map(|_| ())
     });
-    cluster.await_committed(0, "the message page view to fold", FINALIZE, || {
+    // a source reply lands in the mention's thread, never as a timeline root,
+    // so the thread view is where the read model shows it.
+    cluster.await_committed(0, "the reply thread view to fold", FINALIZE, || {
         let (status, body) = cluster.http(
             0,
             "POST",
             "/v1/index/chat/view",
-            Some(&serde_json::json!({"roots": {"channel_id": "dispatch", "limit": 16}})),
+            Some(&serde_json::json!({"thread": {"channel_id": "dispatch", "root_seq": 1}})),
         );
         (status == 200).then_some(())?;
-        let rows = body["roots"]["roots"].as_array()?;
-        rows.iter()
+        let replies = body["thread"]["replies"].as_array()?;
+        replies
+            .iter()
             .find(|r| r["message_id"] == runs::reply_message_id(&run_text))
             .map(|_| ())
     });

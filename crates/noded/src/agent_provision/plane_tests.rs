@@ -144,6 +144,8 @@ fn spawn_session_actor(
                                     account: 2,
                                     generation: 0,
                                     run_id: consensus_run_id(),
+                                    operation: "tasks.create".into(),
+                                    result: serde_json::Value::Null,
                                     target: "tasks".into(),
                                     payload: serde_json::Value::Null,
                                     status: runs::ActionStatus::Completed {
@@ -459,7 +461,8 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         &"cd".repeat(32),
         &serde_json::json!({"message":{"agent_action":{
             "run_id": consensus_run_id(),
-            "action":{"create_task":{"task_id":"task-0", "title":"no"}},
+            "request_id": "task-0",
+            "action":{"operation":"tasks.create","input":{"task_id":"task-0", "title":"no"}},
         }}}),
     )
     .await;
@@ -470,7 +473,8 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
         action_token,
         &serde_json::json!({"message":{"agent_action":{
             "run_id": "another-run",
-            "action":{"create_task":{"task_id":"task-0", "title":"no"}},
+            "request_id": "task-0",
+            "action":{"operation":"tasks.create","input":{"task_id":"task-0", "title":"no"}},
         }}}),
     )
     .await;
@@ -489,15 +493,17 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     assert_eq!(out_of_scope, 403);
     assert!(actions.lock().unwrap().is_empty());
 
-    let action = runs::AgentAction::CreateTask {
-        task_id: "task-1".into(),
-        title: "scoped".into(),
-    };
+    let action = runs::ActionEnvelope::new(
+        runs::ACTION_TASKS_CREATE,
+        None,
+        serde_json::json!({"task_id": "task-1", "title": "scoped"}),
+    );
     let accepted = post_action(
         action_url,
         action_token,
         &serde_json::json!({"message":{"agent_action":{
             "run_id": consensus_run_id(),
+            "request_id": "task-1",
             "action": action,
         }}}),
     )
@@ -642,6 +648,8 @@ fn spawn_receipt_actor(
                                 account: 2,
                                 generation: 0,
                                 run_id: consensus_run_id(),
+                                operation: "tasks.create".into(),
+                                result: serde_json::Value::Null,
                                 target: "tasks".into(),
                                 payload: serde_json::Value::Null,
                                 status: stored.lock().unwrap().clone(),
@@ -662,7 +670,8 @@ fn request_tool_action(session: &super::session::RunSession) -> tokio::task::Joi
     let token = session.action_token.clone();
     tokio::spawn(async move {
         post_action(&url, &token, &serde_json::json!({"message":{"agent_action":{
-            "run_id":consensus_run_id(), "action":{"create_task":{"task_id":"committed", "title":"wait for target"}}
+            "run_id":consensus_run_id(), "request_id":"committed",
+            "action":{"operation":"tasks.create","input":{"task_id":"committed", "title":"wait for target"}}
         }}})).await
     })
 }

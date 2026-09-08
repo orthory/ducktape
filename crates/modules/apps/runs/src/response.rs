@@ -8,17 +8,29 @@ use files::paths::canonical as canonical_duckfs_path;
 use super::facets::{
     WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of,
 };
+use super::action_requests::Prepared;
+use super::catalog::Operation;
 use super::{
-    AgentAction, AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx,
-    DelegationResult, DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error,
-    FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, ModelRecord, Msg, Origin,
-    PendingState, ReplyBlock, ReplyDestination, ResultEvent, RunOrigin, RunsModule, TaskMsg,
-    TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
-    dispatch_encode_msg, dispatch_id_for, files_decode_reply, files_encode_msg, files_encode_query,
-    reply_message_id, tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
+    AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult,
+    DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error, FilesChange, FilesContent,
+    FilesMsg, FilesQuery, FilesReply, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
+    MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_REPLY_BLOCKS_BYTES,
+    MAX_THREAD_REPLIES, ModelRecord, Msg, Origin, PendingState, ReplyBlock, ReplyDestination,
+    ResultEvent, RunOrigin, RunsModule, TaskMsg, TaskQuery, TaskReply, TaskStatus,
+    chat_decode_reply, chat_encode_msg, chat_encode_query, content_blocks, dispatch_encode_msg,
+    dispatch_id_for, files_decode_reply, files_encode_msg, files_encode_query, reply_message_id,
+    tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
+
+/// A response whose every envelope decoded against the catalog and passed the
+/// strict lane: the response as delivered (the finalize payload embeds it) and
+/// the typed operations the emitters work on.
+#[derive(Debug)]
+pub(super) struct Validated {
+    pub response: AgentResponse,
+    pub operations: Vec<Operation>,
+}
 
 struct ChatPost<'a> {
     channel_id: &'a str,
@@ -27,8 +39,11 @@ struct ChatPost<'a> {
     message_id: String,
 }
 
+/// The countable destinations one response has already reserved, so a probe
+/// that reads committed state also counts what this same delivery block will
+/// stage before it. Shared across the pages and conversational lanes.
 #[derive(Default)]
-struct ReplyPosts {
+pub(super) struct ReplyPosts {
     staged: BTreeMap<(String, u64), u64>,
     standing: BTreeMap<String, bool>,
     page_threads: BTreeMap<String, (String, usize)>,
@@ -43,7 +58,7 @@ struct ReplyPosts {
 
 /// the reply-block kinds normalization keeps — the closed vocabulary the
 /// strict-output instruction names.
-const REPLY_KIND_PARAGRAPH: &str = "paragraph";
+pub(crate) const REPLY_KIND_PARAGRAPH: &str = "paragraph";
 const REPLY_KIND_HEADING: &str = "heading";
 pub(crate) const REPLY_KIND_CODE: &str = "code";
 
@@ -227,7 +242,7 @@ pub(super) fn canonical_origin(origin: &Origin) -> Result<RunOrigin, Error> {
     }
 }
 
-/// the wire name of a task status an [`AgentAction::UpdateTaskStatus`] carries.
+/// the wire name of a task status a `tasks.update_status` operation carries.
 fn task_status(name: &str) -> Option<TaskStatus> {
     match name {
         "open" => Some(TaskStatus::Open),
@@ -240,6 +255,49 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 /// whether the registry granted this agent an action name.
 pub(super) fn allows(agent: &ModelRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
+}
+
+/// the admission half of an `agent.call`: the caller's cap, the callee is not
+/// itself, and the bounded instruction. `execute_delegation` re-checks these
+/// under the program origin with the live registry; refusing here answers the
+/// submitter instead of burning a program call to be told the same thing.
+fn validate_agent_call(
+    caller: &ModelRecord,
+    entry: &PendingState,
+    agent_id: &str,
+    instruction: &str,
+    skills: &[String],
+) -> Result<(), String> {
+    if caller.caps.subagent_budget == 0 {
+        return Err(format!(
+            "agent {} has no subagent budget (caps.subagent_budget)",
+            caller.agent_id
+        ));
+    }
+    if agent_id == entry.agent_id {
+        return Err("an agent cannot call itself".into());
+    }
+    if agent_id.is_empty() {
+        return Err("agent.call requires a callee agent_id".into());
+    }
+    let bounded_instruction =
+        !instruction.trim().is_empty() && instruction.len() <= MAX_DELEGATION_INSTRUCTION_BYTES;
+    if !bounded_instruction {
+        return Err(format!(
+            "instruction must be non-empty and at most {MAX_DELEGATION_INSTRUCTION_BYTES} bytes"
+        ));
+    }
+    let request = crate::DelegationRequest {
+        agent_id: agent_id.into(),
+        instruction: instruction.into(),
+        skills: skills.to_vec(),
+    };
+    if sdk::wire::encode(&request).len() > MAX_DELEGATIONS_BYTES {
+        return Err(format!(
+            "agent call exceeds the {MAX_DELEGATIONS_BYTES}-byte request cap"
+        ));
+    }
+    Ok(())
 }
 
 impl RunsModule {
@@ -380,27 +438,38 @@ impl RunsModule {
                 .await;
         }
         let response = agent_response_from_text(&result.response_text);
-        let response = match self
+        let Validated {
+            response,
+            operations,
+        } = match self
             .validate_response(&*ctx, run_id, entry, Lane::DelegatedSettle, response)
             .await
         {
-            Ok(response) => response,
+            Ok(validated) => validated,
             Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
         };
-        let reply_blocks = response.reply_blocks.clone();
-        self.emit_pages_effects(ctx, run_id, entry, Lane::DelegatedSettle, &response.actions)
+        let reply_blocks = response.reply_blocks;
+        let mut posts = ReplyPosts::default();
+        self.emit_pages_effects(
+            ctx,
+            run_id,
+            entry,
+            Lane::DelegatedSettle,
+            &operations,
+            &mut posts,
+        )
+        .await;
+        self.emit_duckfs_effects(ctx, run_id, entry, &operations)
             .await;
-        self.emit_duckfs_effects(ctx, run_id, entry, &response.actions)
-            .await;
+        // a callee's reply blocks return to its caller, never to the chat.
         self.emit_response(
             ctx,
             run_id,
             entry,
             Lane::DelegatedSettle,
-            AgentResponse {
-                reply_blocks: Vec::new(),
-                ..response
-            },
+            &[],
+            &operations,
+            &mut posts,
         )
         .await;
         let output_ref = output_ref_of(&result.workspace_receipt);
@@ -544,11 +613,14 @@ impl RunsModule {
                 .await;
         }
         let response = agent_response_from_text(&result.response_text);
-        let response = match self
+        let Validated {
+            response,
+            operations,
+        } = match self
             .validate_response(&*ctx, run_id, entry, Lane::Settle, response)
             .await
         {
-            Ok(r) => r,
+            Ok(validated) => validated,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
         // build the faceted finalize payload — and render the message facet
@@ -564,13 +636,22 @@ impl RunsModule {
         // pages action degrades to a breadcrumb, the run still delivers. the
         // duckfs write lane is the same shape: a stale per-path base degrades
         // alone, it never costs the response its reply or its other actions.
-        self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &response.actions)
+        let mut posts = ReplyPosts::default();
+        self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &operations, &mut posts)
             .await;
-        self.emit_duckfs_effects(ctx, run_id, entry, &response.actions)
+        self.emit_duckfs_effects(ctx, run_id, entry, &operations)
             .await;
-        self.emit_module_updates(ctx, run_id, entry, &result, &response.actions);
-        self.emit_response(ctx, run_id, entry, Lane::Settle, response)
-            .await;
+        self.emit_module_updates(ctx, run_id, entry, &result, &operations);
+        self.emit_response(
+            ctx,
+            run_id,
+            entry,
+            Lane::Settle,
+            &response.reply_blocks,
+            &operations,
+            &mut posts,
+        )
+        .await;
         // the binding is the sink COMMITTED at dispatch (#1835), never the
         // executing node's echo: an echo that disagrees is a lease-holder
         // trying to redirect the run's output after the fact, so it is
@@ -647,7 +728,7 @@ impl RunsModule {
         entry: &PendingState,
         lane: Lane,
         response: AgentResponse,
-    ) -> Result<AgentResponse, String> {
+    ) -> Result<Validated, String> {
         let agent = self
             .agent_for_run(ctx, entry)
             .await?
@@ -671,6 +752,22 @@ impl RunsModule {
             return Err(format!(
                 "actions are {actions_bytes} bytes; the cap is {MAX_ACTIONS_BYTES}"
             ));
+        }
+        // every envelope decodes against the catalog before any probe runs: an
+        // operation this module does not know, a target or input outside its
+        // schema, or an operation the lane does not admit fails the response
+        // by name.
+        let mut operations = Vec::with_capacity(response.actions.len());
+        for envelope in &response.actions {
+            let operation = Operation::decode(envelope)?;
+            if !operation.admits(lane.kind()) {
+                return Err(format!(
+                    "{} is not available in the {} lane",
+                    operation.name(),
+                    lane.kind_name()
+                ));
+            }
+            operations.push(operation);
         }
 
         // the thread posts THIS response has already staged, per (channel,
@@ -709,67 +806,93 @@ impl RunsModule {
             }
         }
 
-        // the strict all-or-nothing lane covers the CHAT-POST and TASK verbs.
-        // the pages actions and the duckfs write are deliberately NOT validated
-        // here: they gate and validate at apply (`emit_pages_effects`,
-        // `emit_duckfs_effects`), where a bad one degrades ALONE with a
-        // breadcrumb instead of failing the whole run — a stale write base is a
-        // fact about a shared, concurrently-written filesystem, not a defect in
-        // this response, so it must never cost the response its reply.
+        // the strict all-or-nothing lane covers the conversational, task,
+        // module-update and agent-call operations. the pages operations and the
+        // duckfs write are deliberately NOT validated here: they gate and
+        // validate at apply (`emit_pages_effects`, `emit_duckfs_effects`), where
+        // a bad one degrades ALONE with a breadcrumb instead of failing the
+        // whole run — a stale write base is a fact about a shared, concurrently
+        // written filesystem, not a defect in this response, so it must never
+        // cost the response its reply.
         //
         // the tasks arms probe BY ID (`task_exists`), so a response carrying no
-        // task action never touches the tasks module at all.
-        let mut created: BTreeSet<&str> = BTreeSet::new();
-        for (index, action) in response.actions.iter().enumerate() {
-            if super::pages_effects::is_pages_action(action) || is_duckfs_action(action) {
+        // task operation never touches the tasks module at all.
+        let mut created: BTreeSet<String> = BTreeSet::new();
+        for (index, operation) in operations.iter().enumerate() {
+            if operation.is_pages() || operation.is_duckfs() {
                 continue;
             }
-            let missing_grant = action
-                .vocabulary_name()
+            let missing_grant = operation
+                .fixed_grant()
                 .filter(|name| !allows(&agent, name));
             if let Some(name) = missing_grant {
                 return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
             }
-            match action {
-                AgentAction::UpdateModule(update) => {
-                    if !matches!(lane, Lane::Settle) {
-                        return Err("modules.update requires the final response and its committed forge output".into());
+            let slot = lane.slot(index);
+            match operation {
+                Operation::ModulesUpdate(update) => {
+                    // only the run's own final response binds a forge output a
+                    // module update can pin; a callee's result returns to its
+                    // caller and stages no update.
+                    if matches!(lane, Lane::DelegatedSettle) {
+                        return Err(
+                            "modules.update requires the run's own final response and its committed forge output"
+                                .into(),
+                        );
                     }
-                    update.validate()?;
+                    update.validate()?
                 }
-                AgentAction::Reply { text, destination } => {
+                Operation::Reply { content } => {
                     self.reply_msg(
                         ctx,
                         run_id,
                         entry,
-                        &lane.slot(index),
-                        &[paragraph_block(text.clone())],
-                        destination.as_ref(),
+                        &slot,
+                        &content_blocks(content),
+                        None,
                         &mut posts,
                     )
                     .await?;
                 }
-                AgentAction::PostMessage {
+                Operation::JobsComment { job_id, content } => {
+                    self.reply_msg(
+                        ctx,
+                        run_id,
+                        entry,
+                        &slot,
+                        &content_blocks(content),
+                        Some(ReplyDestination::Job {
+                            job_id: job_id.clone(),
+                        }),
+                        &mut posts,
+                    )
+                    .await?;
+                }
+                Operation::ChatPost {
                     channel_id,
-                    text,
                     thread,
+                    content,
                 } => {
+                    let text = to_page_comment_text(&content_blocks(content));
                     self.probe_chat_action(
                         ctx,
                         entry,
                         ChatPost {
                             channel_id,
-                            text,
+                            text: &text,
                             thread: *thread,
-                            message_id: post_message_id(run_id, &lane.slot(index)),
+                            message_id: post_message_id(run_id, &slot),
                         },
                         &mut posts,
                     )
                     .await?;
                 }
-                AgentAction::CreateTask { task_id, title } => {
-                    if task_id.is_empty() || title.is_empty() {
-                        return Err("task actions require a non-empty task_id and title".into());
+                Operation::TasksCreate { task_id, title } => {
+                    let task_id = task_id
+                        .clone()
+                        .unwrap_or_else(|| task_id_for(run_id, &slot));
+                    if title.is_empty() {
+                        return Err("tasks.create requires a non-empty title".into());
                     }
                     // tasks' OWN admission rule for an id, applied with tasks'
                     // OWN call so the two can never drift: at most
@@ -777,34 +900,41 @@ impl RunsModule {
                     // model-authored id is bounded only by MAX_ACTIONS_BYTES,
                     // so without this an id tasks REJECTS at apply aborts the
                     // whole settle op instead of failing the run.
-                    sdk::validate_id("task_id", task_id, tasks::MAX_TASK_ID)
+                    sdk::validate_id("task_id", &task_id, tasks::MAX_TASK_ID)
                         .map_err(|e| e.to_string())?;
                     // duplicates — committed or earlier in this very
                     // response — would make tasks reject the follow-up.
-                    let on_board = self.task_exists(ctx, task_id).await?;
-                    if on_board || !created.insert(task_id) {
+                    let on_board = self.task_exists(ctx, &task_id).await?;
+                    if on_board || !created.insert(task_id.clone()) {
                         return Err(format!("task already exists: {task_id}"));
                     }
                 }
-                AgentAction::UpdateTaskStatus { task_id, status } => {
+                Operation::TasksUpdateStatus { task_id, status } => {
                     if task_status(status).is_none() {
                         return Err(format!("unknown task status: {status}"));
                     }
-                    let staged_here = created.contains(task_id.as_str());
+                    let staged_here = created.contains(task_id);
                     if !staged_here && !self.task_exists(ctx, task_id).await? {
                         return Err(format!("unknown task: {task_id}"));
                     }
                 }
-                AgentAction::DuckfsWriteText { .. } => {
-                    unreachable!("duckfs actions are skipped above")
-                }
-                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
-                    unreachable!("pages actions are skipped above")
+                Operation::AgentCall {
+                    agent_id,
+                    instruction,
+                    skills,
+                } => validate_agent_call(&agent, entry, agent_id, instruction, skills)?,
+                Operation::PagesComment { .. }
+                | Operation::PagesSetChecked { .. }
+                | Operation::DuckfsWriteText { .. } => {
+                    unreachable!("degrade-lane operations are skipped above")
                 }
             }
         }
 
-        Ok(response)
+        Ok(Validated {
+            response,
+            operations,
+        })
     }
 
     async fn probe_chat_action(
@@ -919,25 +1049,28 @@ impl RunsModule {
         Ok(())
     }
 
-    /// Resolve and validate one conversational write. The session, final and
-    /// failure paths all use this route; only the program executes its result.
+    /// Resolve and validate one conversational write. `None` resolves the
+    /// destination from the run's committed source (the `reply` operation, the
+    /// run's own reply and its failure reply); `Some` is an explicit
+    /// operation's destination. The session, final and failure paths all use
+    /// this route; only the program executes its result.
     #[allow(
         clippy::too_many_arguments,
         reason = "source, deterministic slot and batch reservations are independent inputs"
     )]
-    async fn reply_msg(
+    pub(super) async fn reply_msg(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
         slot: &str,
         blocks: &[ReplyBlock],
-        destination: Option<&serde_json::Value>,
+        destination: Option<ReplyDestination>,
         posts: &mut ReplyPosts,
-    ) -> Result<Msg, String> {
+    ) -> Result<Prepared, String> {
+        let explicit = destination.is_some();
         let resolved = match destination {
-            Some(destination) => serde_json::from_value::<ReplyDestination>(destination.clone())
-                .map_err(|error| format!("invalid reply destination: {error}"))?,
+            Some(destination) => destination,
             None => {
                 if let Some(job_id) = &entry.job_id {
                     let original_claim = self
@@ -954,9 +1087,11 @@ impl RunsModule {
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        let action = match (&resolved, destination) {
-            (ReplyDestination::Chat { .. }, None) => crate::ACTION_CHAT_POST,
-            _ => resolved.required_action(),
+        let source_chat_reply = matches!(resolved, ReplyDestination::Chat { .. }) && !explicit;
+        let action = if source_chat_reply {
+            crate::ACTION_CHAT_POST
+        } else {
+            resolved.required_action()
         };
         let permitted = allows(&agent, action);
         if !permitted {
@@ -978,6 +1113,16 @@ impl RunsModule {
                 bytes.len()
             ));
         }
+        // the receipt names the operation the caller invoked: a source reply is
+        // `reply` and reports where it landed; an explicit destination is its
+        // own operation and reports that operation's coordinates.
+        let operation = if explicit {
+            resolved.required_action()
+        } else {
+            crate::OP_REPLY
+        };
+        let destination_json = serde_json::to_value(&resolved).expect("destinations serialize");
+        let source_result = |id: &str| serde_json::json!({"destination": destination_json, "id": id});
         match resolved {
             ReplyDestination::Chat { channel_id, thread } => {
                 let message_id = match slot {
@@ -996,41 +1141,70 @@ impl RunsModule {
                     posts,
                 )
                 .await?;
-                Ok(Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id,
-                        message_id,
-                        blocks: to_chat_blocks(blocks),
-                        thread,
-                    }),
-                })
+                let result = if explicit {
+                    serde_json::json!({"channel_id": channel_id, "thread": thread, "message_id": message_id})
+                } else {
+                    source_result(&message_id)
+                };
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.chat.clone(),
+                        payload: chat_encode_msg(&ChatMsg::PostMessage {
+                            channel_id,
+                            message_id,
+                            blocks: to_chat_blocks(blocks),
+                            thread,
+                        }),
+                    },
+                    operation,
+                    result,
+                ))
             }
             ReplyDestination::Page { target } => {
-                let thread_slot = match destination {
-                    None => "reply",
-                    Some(_) => slot,
-                };
+                // a source reply lands in the run's ONE shared thread on the
+                // mentioned block; an explicit comment opens a thread per slot.
+                let thread_slot = if explicit { slot } else { "reply" };
                 let thread_id = super::pages_effects::page_thread_id(run_id, thread_slot);
-                self.page_reply_msg(
-                    ctx,
-                    &agent,
-                    run_id,
-                    slot,
-                    &thread_id,
-                    Some(&target),
-                    text,
-                    posts,
-                )
-                .await
+                let (message, target, comment_id) = self
+                    .page_reply_msg(
+                        ctx,
+                        &agent,
+                        run_id,
+                        slot,
+                        &thread_id,
+                        Some(&target),
+                        text,
+                        posts,
+                    )
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
             }
             ReplyDestination::PageThread { thread_id } => {
-                self.page_reply_msg(ctx, &agent, run_id, slot, &thread_id, None, text, posts)
-                    .await
+                let (message, target, comment_id) = self
+                    .page_reply_msg(ctx, &agent, run_id, slot, &thread_id, None, text, posts)
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
             }
             ReplyDestination::Job { job_id } => {
-                self.job_reply_msg(ctx, &job_id, run_id, slot, text, posts)
-                    .await
+                let (message, comment_id) = self
+                    .job_reply_msg(ctx, &job_id, run_id, slot, text, posts)
+                    .await?;
+                let result = if explicit {
+                    serde_json::json!({"job_id": job_id, "comment_id": comment_id})
+                } else {
+                    source_result(&comment_id)
+                };
+                Ok(Prepared::new(message, operation, result))
             }
         }
     }
@@ -1049,7 +1223,7 @@ impl RunsModule {
         new_target: Option<&str>,
         text: String,
         posts: &mut ReplyPosts,
-    ) -> Result<Msg, String> {
+    ) -> Result<(Msg, String, String), String> {
         let pages = self
             .pages
             .as_deref()
@@ -1138,17 +1312,18 @@ impl RunsModule {
         posts
             .page_threads
             .insert(thread_id.into(), (target.clone(), count + 1));
-        Ok(Msg {
+        let message = Msg {
             target: pages.into(),
             payload: pages::encode_msg(&pages::PageMsg::AddComment {
                 thread_id: thread_id.into(),
-                comment_id,
-                target,
+                comment_id: comment_id.clone(),
+                target: target.clone(),
                 text,
                 anchor: None,
                 mentions: Vec::new(),
             }),
-        })
+        };
+        Ok((message, target, comment_id))
     }
 
     async fn job_reply_msg(
@@ -1159,7 +1334,7 @@ impl RunsModule {
         slot: &str,
         text: String,
         posts: &mut ReplyPosts,
-    ) -> Result<Msg, String> {
+    ) -> Result<(Msg, String), String> {
         let jobs = self
             .jobs
             .as_deref()
@@ -1193,15 +1368,16 @@ impl RunsModule {
             return Err("job discussion is full".into());
         }
         *staged += 1;
-        Ok(Msg {
+        let message = Msg {
             target: jobs.into(),
             payload: super::jobs_encode_msg(&super::JobsMsg::Comment {
                 job_id: job_id.into(),
                 created_at_revision: job.created_at_revision,
-                comment_id,
+                comment_id: comment_id.clone(),
                 text,
             }),
-        })
+        };
+        Ok((message, comment_id))
     }
 
     /// Both the model user and an explicit external requester must retain
@@ -1325,26 +1501,26 @@ impl RunsModule {
         Ok(())
     }
 
-    /// ONE duckfs.write_text action as an emit-ready follow-up, or the reason
-    /// it must not be emitted — the same shape as `pages_action_msg`: gate
-    /// order grant -> shape/cap/permission -> the per-path base probe. `Err`
-    /// degrades to a breadcrumb on the settle path and returns to the
-    /// submitter on the session lane; same verdict, two failure policies.
+    /// ONE duckfs.write_text operation as an emit-ready follow-up, or the
+    /// reason it must not be emitted: gate order grant -> shape/cap/permission
+    /// -> the per-path base probe. `Err` degrades to a breadcrumb on the settle
+    /// path and returns to the submitter on the session lane; same verdict,
+    /// two failure policies.
     pub(super) async fn duckfs_write_msg(
         &self,
         ctx: &dyn Ctx,
         agent: &ModelRecord,
-        action: &AgentAction,
-    ) -> Result<Msg, String> {
-        let AgentAction::DuckfsWriteText {
+        operation: &Operation,
+    ) -> Result<Prepared, String> {
+        let Operation::DuckfsWriteText {
             path,
             text,
             base_snapshot,
-        } = action
+        } = operation
         else {
-            unreachable!("only the duckfs action reaches this lane");
+            unreachable!("only the duckfs operation reaches this lane");
         };
-        let name = action.vocabulary_name().expect("concrete write action");
+        let name = operation.name();
         if !allows(agent, name) {
             return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
         }
@@ -1355,21 +1531,25 @@ impl RunsModule {
             .ok_or_else(|| "no files module is configured".to_string())?;
         self.probe_duckfs_write_base(ctx, files, path, base_snapshot)
             .await?;
-        Ok(Msg {
-            target: files.clone(),
-            payload: files_encode_msg(&FilesMsg::Commit {
-                base_snapshot: base_snapshot.clone(),
-                message: "agent duckfs.write_text".into(),
-                changes: vec![FilesChange::Put {
-                    path: path.clone(),
-                    exec: false,
-                    meta: BTreeMap::new(),
-                    content: FilesContent::Inline {
-                        b64: STANDARD.encode(text.as_bytes()),
-                    },
-                }],
-            }),
-        })
+        Ok(Prepared::new(
+            Msg {
+                target: files.clone(),
+                payload: files_encode_msg(&FilesMsg::Commit {
+                    base_snapshot: base_snapshot.clone(),
+                    message: "agent duckfs.write_text".into(),
+                    changes: vec![FilesChange::Put {
+                        path: path.clone(),
+                        exec: false,
+                        meta: BTreeMap::new(),
+                        content: FilesContent::Inline {
+                            b64: STANDARD.encode(text.as_bytes()),
+                        },
+                    }],
+                }),
+            },
+            name,
+            serde_json::json!({"path": path, "base_snapshot": base_snapshot}),
+        ))
     }
 
     /// apply the duckfs.write_text actions of a validated response — its own
@@ -1383,9 +1563,9 @@ impl RunsModule {
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
-        actions: &[AgentAction],
+        operations: &[Operation],
     ) {
-        if !actions.iter().any(is_duckfs_action) {
+        if !operations.iter().any(Operation::is_duckfs) {
             return;
         }
         let skip = |what: &str| format!("run {run_id} duckfs.write_text action skipped: {what}");
@@ -1396,12 +1576,12 @@ impl RunsModule {
                 return;
             }
         };
-        for (index, action) in actions.iter().enumerate() {
-            if !is_duckfs_action(action) {
+        for (index, operation) in operations.iter().enumerate() {
+            if !operation.is_duckfs() {
                 continue;
             }
-            match self.duckfs_write_msg(&*ctx, &agent, action).await {
-                Ok(msg) => ctx.emit_msg(msg),
+            match self.duckfs_write_msg(&*ctx, &agent, operation).await {
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(
                     ctx,
                     format!("run {run_id} duckfs.write_text action {index} skipped: {why}"),
@@ -1425,7 +1605,7 @@ impl RunsModule {
         reason: &str,
     ) {
         match self.failure_reply(&*ctx, run_id, entry, reason).await {
-            Ok(msg) => ctx.emit_msg(msg),
+            Ok(prepared) => self.emit_prepared(ctx, prepared),
             Err(why) => self.note(ctx, format!("run {run_id} failure not surfaced: {why}")),
         }
     }
@@ -1437,7 +1617,7 @@ impl RunsModule {
         run_id: &str,
         entry: &PendingState,
         reason: &str,
-    ) -> Result<Msg, String> {
+    ) -> Result<Prepared, String> {
         let agent = self
             .agent_for_run(ctx, entry)
             .await?
@@ -1490,99 +1670,158 @@ impl RunsModule {
         }
     }
 
-    /// Prepare validated chat, page and task intents. The result/session
-    /// boundary records them for the account's program to execute.
+    /// Prepare validated chat, job and task intents. The result/session
+    /// boundary records them for the account's program to execute. `posts` is
+    /// shared with the pages lane so every countable destination this response
+    /// touches is counted once across both. An operation this lane cannot
+    /// prepare degrades alone to a breadcrumb; the run keeps every other
+    /// effect.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reply blocks, operations, lane slot and shared reservations are independent inputs"
+    )]
     pub(super) async fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
         lane: Lane,
-        response: AgentResponse,
+        reply_blocks: &[ReplyBlock],
+        operations: &[Operation],
+        posts: &mut ReplyPosts,
     ) {
-        let mut posts = ReplyPosts::default();
-        if !response.reply_blocks.is_empty() {
+        if !reply_blocks.is_empty() {
             match self
-                .reply_msg(
-                    &*ctx,
-                    run_id,
-                    entry,
-                    "reply",
-                    &response.reply_blocks,
-                    None,
-                    &mut posts,
-                )
+                .reply_msg(&*ctx, run_id, entry, "reply", reply_blocks, None, posts)
                 .await
             {
-                Ok(msg) => ctx.emit_msg(msg),
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(ctx, format!("run {run_id} reply skipped: {why}")),
             }
         }
-        for (index, action) in response.actions.into_iter().enumerate() {
-            let msg = match action {
-                AgentAction::UpdateModule(_) => continue,
-                AgentAction::Reply { text, destination } => {
-                    match self
-                        .reply_msg(
-                            &*ctx,
-                            run_id,
-                            entry,
-                            &lane.slot(index),
-                            &[paragraph_block(text)],
-                            destination.as_ref(),
-                            &mut posts,
-                        )
-                        .await
-                    {
-                        Ok(msg) => msg,
-                        Err(why) => {
-                            self.note(ctx, format!("run {run_id} reply skipped: {why}"));
-                            continue;
-                        }
-                    }
-                }
-                AgentAction::PostMessage {
-                    channel_id,
-                    text,
-                    thread,
-                } => Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id,
-                        message_id: post_message_id(run_id, &lane.slot(index)),
-                        blocks: vec![Block::paragraph(text)],
-                        thread,
+        for (index, operation) in operations.iter().enumerate() {
+            if !operation.is_conversational() {
+                continue;
+            }
+            match self
+                .conversational_msg(&*ctx, run_id, entry, &lane.slot(index), operation, posts)
+                .await
+            {
+                Ok(prepared) => self.emit_prepared(ctx, prepared),
+                Err(why) => self.note(
+                    ctx,
+                    format!("run {run_id} {} action {index} skipped: {why}", operation.name()),
+                ),
+            }
+        }
+    }
+
+    /// One conversational operation (a reply, a chat post, a job comment, a
+    /// task create or status update) as an emit-ready follow-up, or the reason
+    /// it cannot be prepared. The settle path degrades an `Err` to a
+    /// breadcrumb; the session lane returns it to the submitter.
+    pub(super) async fn conversational_msg(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        slot: &str,
+        operation: &Operation,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        match operation {
+            Operation::Reply { content } => {
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    slot,
+                    &content_blocks(content),
+                    None,
+                    posts,
+                )
+                .await
+            }
+            Operation::JobsComment { job_id, content } => {
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    slot,
+                    &content_blocks(content),
+                    Some(ReplyDestination::Job {
+                        job_id: job_id.clone(),
                     }),
-                },
-                AgentAction::CreateTask { task_id, title } => Msg {
-                    target: self.task_target(),
-                    // runs' own task creation stays owned by this module's
-                    // id ("runs"), unchanged — see #1740's scope note: the
-                    // requester identity plumbing would ripple through every
-                    // caller of `emit_response`'s test expectations, so it is
-                    // left alone here (only automations' rule-owner
-                    // attribution was in scope).
-                    payload: tasks_encode_msg(&TaskMsg::CreateTask {
-                        task_id,
-                        title,
-                        owner: None,
+                    posts,
+                )
+                .await
+            }
+            Operation::ChatPost {
+                channel_id,
+                thread,
+                content,
+            } => {
+                let message_id = post_message_id(run_id, slot);
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.chat.clone(),
+                        payload: chat_encode_msg(&ChatMsg::PostMessage {
+                            channel_id: channel_id.clone(),
+                            message_id: message_id.clone(),
+                            blocks: to_chat_blocks(&content_blocks(content)),
+                            thread: *thread,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "channel_id": channel_id,
+                        "thread": thread,
+                        "message_id": message_id,
                     }),
-                },
-                AgentAction::UpdateTaskStatus { task_id, status } => Msg {
-                    target: self.task_target(),
-                    payload: tasks_encode_msg(&TaskMsg::UpdateStatus {
-                        task_id,
-                        status: task_status(&status).expect("status was validated"),
-                    }),
-                },
-                // duckfs and pages actions were already applied by
-                // `emit_duckfs_effects` / `emit_pages_effects` (their own
-                // lanes: probes, cap gate, per-action degrade).
-                AgentAction::DuckfsWriteText { .. }
-                | AgentAction::AddPageComment { .. }
-                | AgentAction::SetPageChecked { .. } => continue,
-            };
-            ctx.emit_msg(msg);
+                ))
+            }
+            Operation::TasksCreate { task_id, title } => {
+                let task_id = task_id
+                    .clone()
+                    .unwrap_or_else(|| task_id_for(run_id, slot));
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.task_target(),
+                        // runs' own task creation stays owned by this module's
+                        // id ("runs"): the program call supplies the
+                        // authenticated account actor.
+                        payload: tasks_encode_msg(&TaskMsg::CreateTask {
+                            task_id: task_id.clone(),
+                            title: title.clone(),
+                            owner: None,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({"task_id": task_id}),
+                ))
+            }
+            Operation::TasksUpdateStatus { task_id, status } => {
+                let status_value = task_status(status)
+                    .ok_or_else(|| format!("unknown task status: {status}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target: self.task_target(),
+                        payload: tasks_encode_msg(&TaskMsg::UpdateStatus {
+                            task_id: task_id.clone(),
+                            status: status_value,
+                        }),
+                    },
+                    operation.name(),
+                    serde_json::json!({"task_id": task_id, "status": status}),
+                ))
+            }
+            Operation::PagesComment { .. }
+            | Operation::PagesSetChecked { .. }
+            | Operation::DuckfsWriteText { .. }
+            | Operation::ModulesUpdate(_)
+            | Operation::AgentCall { .. } => {
+                unreachable!("only conversational operations reach this lane")
+            }
         }
     }
 
@@ -1593,11 +1832,11 @@ impl RunsModule {
     }
 }
 
-/// whether an action belongs to the duckfs-write lane (and is therefore
-/// skipped by the strict task-action validator and the generic emitter) — the
-/// peer of `pages_effects::is_pages_action`.
-pub(super) fn is_duckfs_action(action: &AgentAction) -> bool {
-    matches!(action, AgentAction::DuckfsWriteText { .. })
+/// the task id `tasks.create` mints when the caller supplies none: derived
+/// from the run and the action's lane slot like every other agent-minted id,
+/// so every replaying validator derives the same one.
+pub(super) fn task_id_for(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/task/{slot}", dispatch_id_for(run_id))
 }
 
 fn validate_duckfs_text_write(agent: &ModelRecord, path: &str, text: &str) -> Result<(), String> {

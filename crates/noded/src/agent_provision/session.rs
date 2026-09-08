@@ -18,9 +18,10 @@
 //! caps }`; opening the session requires no additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
-//! accepts `AgentAction` and `DelegateRun` for exactly this run, signs them, and
-//! dies with the provisioned workspace. A shell can therefore exercise the
-//! committed agent grant but can never recover a general-purpose frame signer.
+//! accepts `RunsMsg::AgentAction` for exactly this run, signs it, waits for the
+//! committed receipt, and dies with the provisioned workspace. A shell can
+//! therefore exercise the committed agent grant but can never recover a
+//! general-purpose frame signer.
 //!
 //! A refused bind fails provisioning. An agent run never starts with a
 //! silently disabled write plane.
@@ -184,9 +185,7 @@ async fn run_action(
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
     let names_bound_run = match &request.message {
-        runs::RunsMsg::AgentAction { run_id, .. } | runs::RunsMsg::DelegateRun { run_id, .. } => {
-            run_id == &state.run_id
-        }
+        runs::RunsMsg::AgentAction { run_id, .. } => run_id == &state.run_id,
         _ => false,
     };
     if !names_bound_run {
@@ -195,9 +194,8 @@ async fn run_action(
             "message is outside this run's action scope",
         );
     }
-    let result = submit_action(&state, request.message).await;
-    match result {
-        Ok(()) => action_response(StatusCode::OK, "ok"),
+    match submit_action(&state, request.message).await {
+        Ok(receipt) => action_json(StatusCode::OK, receipt),
         Err(error) => action_response(StatusCode::BAD_REQUEST, &error),
     }
 }
@@ -241,26 +239,13 @@ async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
     Err("action receipt event stream closed before subscription".into())
 }
 
-async fn next_action_request(node: &NodeLink, run_id: &str) -> Result<String, String> {
-    let bytes = node
-        .query(
-            RUNS_MODULE,
-            &runs::encode_query(&runs::RunsQuery::AgentSessions),
-        )
-        .await?;
-    let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes)? else {
-        return Err("unexpected run session reply".into());
-    };
-    let Some(session) = sessions.iter().find(|session| session.run_id == run_id) else {
-        return Err("run session has closed".into());
-    };
-    Ok(runs::action_request_id(run_id, session.actions))
-}
-
+/// The committed outcome of one proposal: `None` while the program has not
+/// finished it, the receipt when the target applied it, its reason when it
+/// was refused anywhere along the way.
 async fn action_result(
     node: &NodeLink,
     request_id: &str,
-) -> Result<Option<Result<(), String>>, String> {
+) -> Result<Option<Result<runs::ActionRequestView, String>>, String> {
     let bytes = node
         .query(
             RUNS_MODULE,
@@ -275,12 +260,12 @@ async fn action_result(
     let Some(request) = request else {
         return Ok(None);
     };
-    match request.status {
+    match &request.status {
         runs::ActionStatus::AwaitingProgram | runs::ActionStatus::Claimed { .. } => Ok(None),
-        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason))),
+        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason.clone()))),
         runs::ActionStatus::Completed { outcome, .. } => match outcome {
-            dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(()))),
-            dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason))),
+            dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(request))),
+            dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason.clone()))),
             dispatch::CallOutcomeSummary::Refused(reason) => {
                 Ok(Some(Err(format!("program action refused: {reason:?}"))))
             }
@@ -295,7 +280,7 @@ async fn await_action_result(
     node: &NodeLink,
     request_id: &str,
     mut events: ActionEvents,
-) -> Result<(), String> {
+) -> Result<runs::ActionRequestView, String> {
     if let Some(result) = action_result(node, request_id).await? {
         return result;
     }
@@ -326,24 +311,25 @@ async fn await_action_result(
     Err("node disconnected before the program action completed".into())
 }
 
-async fn submit_action(state: &ActionState, message: runs::RunsMsg) -> Result<(), String> {
-    // Serialize both admission and completion so the next session slot cannot
-    // overtake an action whose actual target write is still pending.
-    let mut next_seq = state.seq.lock().await;
-    let pending = match &message {
-        runs::RunsMsg::AgentAction { run_id, .. } => {
-            let events = action_events(&state.node).await?;
-            let request_id = next_action_request(&state.node, run_id).await?;
-            Some((request_id, events))
-        }
-        runs::RunsMsg::DelegateRun {
-            run_id, request_id, ..
-        } => {
-            let events = action_events(&state.node).await?;
-            Some((runs::delegation_action_id(run_id, request_id), events))
-        }
-        _ => return Err("message is outside the run action scope".into()),
+/// Sign and submit one action, then wait for its committed receipt. The
+/// receipt id is derived from the run and the caller's request_id exactly as
+/// runs derives it, so a replayed request_id resolves to the same receipt; the
+/// response names it `receipt_id` beside the receipt itself.
+async fn submit_action(
+    state: &ActionState,
+    message: runs::RunsMsg,
+) -> Result<serde_json::Value, String> {
+    let runs::RunsMsg::AgentAction {
+        run_id, request_id, ..
+    } = &message
+    else {
+        return Err("message is outside the run action scope".into());
     };
+    let receipt_id = runs::action_request_id(run_id, request_id);
+    // Serialize admission and completion so a later action cannot overtake one
+    // whose actual target write is still pending.
+    let mut next_seq = state.seq.lock().await;
+    let events = action_events(&state.node).await?;
     let msg = sdk::Msg {
         target: RUNS_MODULE.into(),
         payload: runs::encode_msg(&message),
@@ -353,10 +339,16 @@ async fn submit_action(state: &ActionState, message: runs::RunsMsg) -> Result<()
         .checked_add(1)
         .ok_or_else(|| "action signer sequence exhausted".to_string())?;
     state.node.submit_frame(frame).await?;
-    match pending {
-        Some((request_id, events)) => await_action_result(&state.node, &request_id, events).await,
-        None => Ok(()),
-    }
+    let receipt = await_action_result(&state.node, &receipt_id, events).await?;
+    Ok(serde_json::json!({"receipt_id": receipt_id, "receipt": receipt}))
+}
+
+fn action_json(status: StatusCode, value: serde_json::Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(value.to_string()))
+        .expect("static scoped action response")
 }
 
 fn action_response(status: StatusCode, message: &str) -> Response<Body> {
