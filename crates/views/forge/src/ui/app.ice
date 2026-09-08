@@ -361,7 +361,9 @@ view
     if !display_unavailable
       col w=fill h=fill
         if display_omitted > 0
-          text "{display_omitted} rows are not shown." size=12.5
+          row gap=4.0
+            text display_omitted #display-omitted size=12.5
+            text "rows are not shown." size=12.5
         if display_shortened
           text "Some content is shortened for display." size=12.5
         ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge

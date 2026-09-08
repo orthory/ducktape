@@ -4422,15 +4422,24 @@ pub(crate) mod tests {
         let frame: wire::Frame = wire::decode(&bytes).expect("wire frame");
         assert!(frame.root.is_some(), "resync emits a full tree");
         let mut observed = frame.root.clone().unwrap();
+        let supplied: serde_json::Value = serde_json::from_slice(props).unwrap();
+        let omitted = supplied["display_omitted"].as_i64().unwrap();
+        let omitted_text = omitted.to_string();
+        let mut omitted_seen = omitted == 0;
         let mut expected_seen = false;
         observed.for_each_mut(&mut |node| {
-            if let wire::Node::Text { content, .. } = node {
+            if let wire::Node::Text { key, content, .. } = node {
                 expected_seen |= content.starts_with(expected);
+                omitted_seen |= key.ends_with("/display-omitted") && *content == omitted_text;
             }
         });
         assert!(
             expected_seen,
             "{module}: expected actual projected content {expected:?}"
+        );
+        assert!(
+            omitted_seen,
+            "{module}: omitted row count is not rendered as a number"
         );
         let mut sanitized = frame.clone();
         wire::sanitize(&mut sanitized);
@@ -4628,6 +4637,7 @@ pub(crate) mod tests {
         let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
         facts["open_repo"] = "core".into();
         facts["forge_item_number"] = 7.into();
+        facts["item_phase"] = "ready".into();
         facts["discussion"] = serde_json::to_value(&notes).unwrap();
         facts["linked_note"] = serde_json::to_value([&landing]).unwrap();
         let props = Some(display_budget::forge(facts));
