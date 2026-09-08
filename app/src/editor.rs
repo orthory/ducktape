@@ -86,14 +86,6 @@ pub enum ComposerEvent {
     Mark(String),
 }
 
-pub fn composer_submit_event() -> ComposerEvent {
-    ComposerEvent::Submit
-}
-
-pub fn composer_submits(event: ComposerEvent) -> bool {
-    matches!(event, ComposerEvent::Submit)
-}
-
 /// Put the caret at `cursor`. iced 0.14's `Content::move_to` sets the caret
 /// and touches the selection only when the cursor CARRIES one, so the plain
 /// press after a drag left the old anchor standing — and the widget's next

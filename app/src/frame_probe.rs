@@ -1050,6 +1050,7 @@ fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
         crate::ComposerKind::Message,
         "confirmation probe".into(),
         backend::fresh_operation_id("message".into()),
+        backend::composer_scope(&app.connected_rpc, &app.active_channel),
     ));
     assert_eq!(app.messages.len(), backend::CHAT_HOT_WINDOW_LIMIT);
     let pending = app.messages.last().expect("the optimistic row");

@@ -541,6 +541,8 @@ struct ForgeProps<'a> {
     file_phase: &'static str,
     drafts_cleared: i64,
     drafts_scope: &'a str,
+    note_scope: &'a str,
+    note_blocked: bool,
 }
 
 /// The Forge tab: the register the app holds, the repo and item it has
@@ -615,6 +617,8 @@ pub fn forge_view(
     file_phase: crate::ForgeFilePhase,
     drafts_cleared: i64,
     drafts_scope: &str,
+    note_scope: &str,
+    note_blocked: bool,
 ) -> Element<'static, ModuleViewEvent> {
     let props = ForgeProps {
         dark,
@@ -692,6 +696,8 @@ pub fn forge_view(
         },
         drafts_cleared,
         drafts_scope,
+        note_scope,
+        note_blocked,
     };
     module_view("forge", serde_json::to_vec(&props).expect("props encode"))
 }
@@ -730,6 +736,7 @@ pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
         "tree" => Intent::Tree,
         "blob" => Intent::Blob,
         "open_link" => Intent::OpenLink,
+        "composer" => Intent::Composer,
         _ => Intent::Copy,
     }
 }
@@ -1453,6 +1460,9 @@ fn surfaces_of(module: &str) -> Surfaces {
         surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
     }
     if module == "forge" {
+        // the discussion note is the chat composer over its own scope, the
+        // item's channel — same document rule, same `composer` intent
+        surfaces.insert("forge_composer".into(), crate::composer_surface::provider());
         surfaces.insert(
             "picture".into(),
             Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
@@ -1645,6 +1655,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "blob",
             "open_link",
             "copy",
+            "composer",
         ],
         "files" => &[
             "open_dir",
@@ -2184,7 +2195,7 @@ impl Guest {
             // unrouted surfaces only say that something happened
             if self.module == "shell" {
                 self.intents.extend(crate::shell_composer::intent(&value));
-            } else if self.module == "chat" {
+            } else if self.module == "chat" || self.module == "forge" {
                 self.intents.extend(crate::composer_surface::intent(&value));
             } else {
                 self.intents.push(ModuleViewEvent {
@@ -3204,6 +3215,10 @@ mod tests {
             value: wire::SurfaceValue::Record {
                 name: "composer".into(),
                 fields: vec![
+                    (
+                        "scope".into(),
+                        wire::SurfaceValue::Str("testnet\u{1f}channel-b".into()),
+                    ),
                     ("kind".into(), wire::SurfaceValue::Str("message".into())),
                     ("body".into(), wire::SurfaceValue::Str("hello".into())),
                     ("id".into(), wire::SurfaceValue::Str("message-1".into())),
@@ -3585,7 +3600,8 @@ mod tests {
               "tree_phase": "loading", "file_path": "", "file_text": "",
               "file_binary": false, "file_truncated": false, "file_picture": false,
               "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
-              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
+              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
+              "note_scope": "", "note_blocked": true
             }"#
             .to_vec(),
         );
@@ -3606,12 +3622,95 @@ mod tests {
                 detail: r#"{"name":"core"}"#.into(),
             }]
         );
-        for surface in ["picture", "forge_markdown", "forge_code"] {
+        for surface in ["picture", "forge_markdown", "forge_code", "forge_composer"] {
             assert!(
                 surfaces_of("forge").contains_key(surface),
                 "the host paints the {surface} slot the view leaves"
             );
         }
+        assert!(guest.fault.is_none());
+    }
+
+    /// With an item open the Forge view leaves the note composer to the
+    /// host: a note typed in the host's composer and sent leaves as the
+    /// `composer` intent with its body, and the typing itself never
+    /// reaches the guest.
+    #[test]
+    fn the_staged_forge_view_hears_a_note_typed_in_the_hosts_composer() {
+        use crate::composer_surface::testing::{Interaction, interact};
+        use crate::editor::{ComposerEvent, RichAction};
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            br#"{
+              "dark": false, "connected": true, "org": "duckhouse", "about": "",
+              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+              "connected_rpc": "http://127.0.0.1:1",
+              "repos": [{"name": "core", "head": "main"}],
+              "list_phase": "ready", "open_repo": "core", "repo_menu": false,
+              "repo_phase": "ready", "branches": ["main"], "tab": "issues", "items": [],
+              "forge_item_number": 7, "item_phase": "ready", "forge_item_kind": "issue",
+              "forge_item_title": "Bound every list", "forge_item_state": "open",
+              "forge_item_author": "duck", "forge_item_branches": "", "forge_item_body": "",
+              "forge_item_blocks": [], "forge_item_files_changed": 0, "forge_item_additions": 0,
+              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
+              "forge_item_merge_oid": "", "forge_item_source_oid": "",
+              "forge_item_approvals": 0, "forge_item_change_requests": 0,
+              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
+              "tree_entries": [], "tree_born": false, "tree_truncated": false,
+              "tree_phase": "loading", "file_path": "", "file_text": "",
+              "file_binary": false, "file_truncated": false, "file_picture": false,
+              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
+              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
+              "note_scope": "forge:core:7", "note_blocked": false
+            }"#
+            .to_vec(),
+        );
+        guest.redraw(&props);
+        assert!(
+            surface_names(&guest).contains(&"forge_composer".to_owned()),
+            "the open item leaves the note composer slot: {:?}",
+            surface_names(&guest)
+        );
+
+        // typed in the host's composer, on the item's own document
+        let scope = "forge:core:7";
+        for glyph in ['h', 'i'] {
+            let typed = interact(
+                scope,
+                "note",
+                false,
+                false,
+                Interaction::Editor(ComposerEvent::Apply(RichAction::Edit(
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Insert(glyph),
+                    ),
+                ))),
+            );
+            assert!(typed.is_none(), "an edit stays in the host");
+        }
+        let sent = interact(
+            scope,
+            "note",
+            false,
+            false,
+            Interaction::Editor(ComposerEvent::Submit),
+        )
+        .expect("a send publishes");
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: sent,
+        });
+        assert!(guest.pending.is_empty(), "the words never reach the guest");
+        assert_eq!(guest.intents.len(), 1);
+        assert_eq!(guest.intents[0].kind, "composer");
+        assert!(guest.intents[0].detail.contains(r#""body":"hi""#));
         assert!(guest.fault.is_none());
     }
 
