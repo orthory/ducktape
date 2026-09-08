@@ -260,6 +260,12 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
             line.replace("cores = 0", "cores = 2")
                 .replace("mem_gb = 0", "mem_gb = 4")
         }));
+    // the real agent CLI: the box's own installed executors, under the
+    // built-in specs (no operator spec dir).
+    cluster.sandbox[0] = Some(common::SandboxStage {
+        capabilities: None,
+        executors: Some(common::installed_executor_dir()),
+    });
     cluster.env[0] = vec![(
         "DUCKTAPE_AGENT_RUNS_ROOT".into(),
         fixtures.join("runs").display().to_string(),

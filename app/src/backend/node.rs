@@ -27,14 +27,11 @@ pub async fn load_settings_facts(
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
     async {
-        // the launch window's `user_key_state` reading, on the same file: one
+        // the launch window's key-state reading, on the same file: one
         // classifier, so Settings and the wallet list cannot disagree about it.
-        let (key_path, key_state) = match user_key_path() {
+        let (key_path, key_state) = match session_key_path(&rpc) {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
-            Ok(path) => {
-                let state = keystore::userkey::key_file_state(&path);
-                (path.display().to_string(), state.as_str().to_string())
-            }
+            Ok(path) => (path.display().to_string(), key_state_of(&path)),
         };
         let tabs = load_doc_tabs(rpc.clone()).await;
         let data_dir = workspace_at(&rpc)
@@ -1361,15 +1358,6 @@ pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
 /// Test seam: Ice reads extern structs but cannot construct one.
 pub fn account_data_none(generation: i64) -> AccountData {
     AccountData::none(generation)
-}
-
-/// A network pick's gate: no password means a read-only session with no key
-/// to probe an account for — the console opens outright.
-pub fn pick_gate(password: &str) -> crate::PickGate {
-    match password.is_empty() {
-        true => crate::PickGate::ReadOnly,
-        false => crate::PickGate::Probe,
-    }
 }
 
 /// The probe's answer as the discriminant the launch window branches on.

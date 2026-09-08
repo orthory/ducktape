@@ -537,13 +537,14 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
     Ok(mirror)
 }
 
-/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root IS the root
-/// the user key resolves through, [`ducktape_home::root`].
+/// `<app cache>/forge-remote/<endpoint-slug>/<repo>` — a rebuildable mirror,
+/// so it lives in the app's cache directory ([`super::app_dirs::cache_dir`]),
+/// never under the ducktape home.
 fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
     if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
         return Err(format!("invalid forge repo name {repo:?}"));
     }
-    let root = ducktape_home::root()?;
+    let root = super::app_dirs::cache_dir()?;
     let slug: String = endpoint
         .chars()
         .map(|character| match character.is_ascii_alphanumeric() {

@@ -1,18 +1,17 @@
 //! THE ducktape home resolution: `$DUCKTAPE_HOME` when set to a non-empty
 //! value, else `$HOME/.ducktape`.
 //!
-//! One function in a zero-dependency leaf because the alternative was four
-//! copies of it, and four copies of a one-line rule is how it drifts — two of
-//! them honoured a set-but-empty override while the other two did not, so a
-//! run with `DUCKTAPE_HOME=` exported put the node's workspaces under
-//! `$HOME/.ducktape` and the signing key under `./keys`.
+//! One function in a zero-dependency leaf, so every reader resolves the same
+//! root and a set-but-empty override reads as unset everywhere. The home
+//! holds one directory per workspace and nothing else; what a workspace holds
+//! is `workspace-config`'s to say.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// everything this operator keeps on disk: `$DUCKTAPE_HOME` when the override
-/// is set to a non-empty value (tests, portable setups, huddle lanes), else
-/// `~/.ducktape`.
+/// the directory this operator's workspaces live in: `$DUCKTAPE_HOME` when
+/// the override is set to a non-empty value (tests, portable setups, huddle
+/// lanes), else `~/.ducktape`.
 ///
 /// set-but-empty is unset. That is how the shell readers beside this one spell
 /// it (`${DUCKTAPE_HOME:-$HOME/.ducktape}`), and honouring an empty value here

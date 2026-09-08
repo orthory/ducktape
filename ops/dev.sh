@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # make dev — the desktop-app dev loop against a fresh "demo" localnet.
 #
-# Offers this host's setup as two prompts up front (which agent CLIs this node
-# lends to runs, and on macOS the sandbox prerequisites), then founds the
-# "demo" network anew (ops/demo-seed.sh: it stops and clears whatever a
-# previous lap left, then seeds from the founding set THIS build staged),
-# starts its node, starts the three local agent services, initializes its
-# forge with ducktape's own repository (ops/dogfood-forge.sh), then runs the
-# desktop app in the foreground.
+# On macOS, offers the sandbox prerequisites as a prompt up front; then founds
+# the "demo" network anew (ops/demo-seed.sh: it stops and clears whatever a
+# previous lap left, then seeds from the founding set THIS build staged and
+# builds the workspace's guest images), offers the agent CLIs this network
+# lends to runs as a checklist, starts its node, starts the three local agent
+# services, initializes its forge with ducktape's own repository
+# (ops/dogfood-forge.sh), then runs the desktop app in the foreground.
 #
 # The demo network is disposable: every lap founds it from the modules, index
-# guests and views the build just staged, so nothing from an earlier lap — a
-# genesis without today's views, a service bound to a workspace that no longer
-# exists — survives into the next. Ctrl-C quits the app and leaves the node
+# guests and views the build just staged, and installs its guest and agent
+# CLIs into the fresh workspace, so nothing from an earlier lap — a genesis
+# without today's views, a service bound to a workspace that no longer
+# exists, a CLI at last month's pin — survives into the next. Every file the
+# network owns lives under its workspace. Ctrl-C quits the app and leaves the node
 # and services up for app-only relaunches (`cargo run -p ducktape-app`); the
 # next `make dev` replaces them. `make dev-clear` stops that background
 # runtime without deleting state; `make demo-clear` removes the workspace
@@ -22,7 +24,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${DEMO_WORKSPACE_ID:-demo}"
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
+WSDIR="$DUCK/$ID"
 
 log(){ printf '\033[36m[dev]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -39,11 +41,6 @@ if [ -z "$NODE_BIN" ]; then
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
-# What this host's guest image can lend to runs. A checklist, because it is the
-# operator's call: each entry is a vendor download this machine does not have,
-# shown with its url and expected hash, and checking none is a complete answer.
-"$NODE_BIN" agent install || log "agent CLI setup skipped — runs will refuse the providers that are missing"
-
 # macOS: offer the sandbox prerequisites as an install prompt, once, up front —
 # instead of the node's boot probe refusing them one at a time later. Declining
 # (or an unfixable machine) is not fatal: the dev loop still runs, provider
@@ -57,6 +54,12 @@ fi
 # env-read knobs; this script has no listener config of its own to widen — it
 # inherits whichever values are already in the caller's environment.
 bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
+
+# What this network's guest lends to runs: the agent CLIs, installed into the
+# fresh workspace's executors dir. A checklist, because it is the operator's
+# call: each entry is a vendor download at its pin, shown with its url and
+# expected hash, and checking none is a complete answer.
+"$NODE_BIN" agent install -n "$ID" || log "agent CLI setup skipped — runs will refuse the providers that are missing"
 
 # The compute plane's readiness, said now and where the operator is looking:
 # `node sandbox` measures the [sandbox] table `node init` just wrote against

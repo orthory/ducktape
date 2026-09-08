@@ -64,11 +64,12 @@ enum HubStep
   live
   account
 
-// A network pick's gate: a read-only session (no password, no key) opens the
-// console outright; a signing session probes the account first.
-enum PickGate
+// The door a picked network's keystore opens: its rows unlock, an empty
+// keystore mints the device key, no keystore at all (a remote) is read-only.
+enum WalletDoor
+  wallets
+  password
   read_only
-  probe
 
 // Open-or-raise for a window whose open state means "put it in front of me",
 // nothing more — the huddle's call window. The status item's own "Open" row
@@ -324,7 +325,6 @@ enum SettingsIntent
   login
   copy
   clear_tabs
-  forget
   light
   dark
   notifications
@@ -414,7 +414,6 @@ enum MutationPhase
   channel_rename
   channel_unarchive
   comment_resolve
-  forget_workspace
   huddle
   message_delete
   message_edit

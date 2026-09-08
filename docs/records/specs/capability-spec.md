@@ -93,12 +93,10 @@ Specs load in two passes:
    (globbed by `build.rs`, sorted by file name). These parse through the
    exact same code path as operator files and serve as the reference
    examples.
-2. **Operator directory** — every `*.toml` in:
-   - `$DUCKTAPE_CAPABILITY_DIR` if set. Pointing this at a missing directory
-     is a **hard error** (you asked for a dir that isn't there);
-   - otherwise `<ducktape home>/capabilities` (`$DUCKTAPE_HOME` when set,
-     else `~/.ducktape`), only if it exists (absent default simply means "no
-     operator specs").
+2. **Workspace directory** — every `*.toml` in `<workspace>/capabilities`
+   (`workspace_config::capability_dir`), only if it exists (an absent
+   directory simply means "no operator specs"). Per workspace: two networks
+   on one host offer two spec sets.
 
 **Override rule:** an operator spec whose `tag` matches a built-in **replaces
 it wholesale** — there is no field-level merging; the spec file is the unit of
@@ -399,7 +397,6 @@ model actually supports, so the codex side is not a rectangle), and `claude`
 
 | Variable | Effect |
 |---|---|
-| `DUCKTAPE_CAPABILITY_DIR` | operator spec directory (explicit; missing dir = boot error) |
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
 

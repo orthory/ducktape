@@ -36,12 +36,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
 ## Sandbox (microVM) hosts
 
-- `build-guest-rootfs.sh` — builds the shared kernel and rootfs for Firecracker
-  (Linux) or vz (macOS). Linux installs the pinned Rust and wasm-tools through
-  `guest-rust-tools.sh` by default; `ROOTFS_SETUP` selects a custom setup.
+- `build-guest-rootfs.sh` — builds one workspace's kernel and rootfs
+  (`OUT=<workspace>/guest`) for Firecracker (Linux) or vz (macOS). Linux
+  installs the pinned Rust and wasm-tools through `guest-rust-tools.sh` by
+  default; `ROOTFS_SETUP` selects a custom setup.
 - `macos-preflight.sh` — checks a macOS host for everything the vz backend
   needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
-  target, the entitled `bin/duck-vz-shim` on PATH, the guest kernel + rootfs)
+  target, the entitled `bin/duck-vz-shim` on PATH)
   and reports release-signing readiness — the Developer ID identities in the
   keychain and the `ICE_NOTARY_*` variables — informationally, since a local
   build needs neither. `--prompt` (what `make dev` passes) offers to run the
@@ -60,9 +61,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `agent-system` — a compact operator CLI over a running node's module surface
   (raw query/submit, agent list/pause/resume); takes the node from
   `DUCKTAPE_NODE` (the same variable the `ducktape` CLI, the app, and every run
-  read), else `<ducktape home>/agent-system-url`, else the active workspace in
-  `<ducktape home>/registry.json` — the home being `$DUCKTAPE_HOME` when set,
-  else `~/.ducktape`. It talks to a loopback node only, so a
+  read), else the url `use` remembered (`$XDG_STATE_HOME/ducktape/agent-system-url`,
+  `~/.local/state` by default), else the one workspace under the ducktape home
+  — `$DUCKTAPE_HOME` when set, else `~/.ducktape`. It talks to a loopback node only, so a
   `DUCKTAPE_NODE` pointing at a remote one is refused by name rather than
   silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.

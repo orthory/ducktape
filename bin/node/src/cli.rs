@@ -59,9 +59,10 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
         key: args.key,
     };
     let base = ctx.http_base()?;
-    let node_key = crate::node_http::pinned_node_key(&base, args.trust_node)?;
+    let key_path = ctx.key_path()?;
+    let node_key = crate::node_http::pinned_node_key(&key_path, &base, args.trust_node)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
+    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)?;
 
     const PATH: &str = "/v1/log-filter";
     let body = args.filter.into_bytes();
@@ -213,16 +214,14 @@ fn dispatch_join(cmd: JoinCmd) -> CommandResult {
     }
 }
 
-/// `list` — enumerate the workspace registry, one `chain-id<TAB>config-path`
-/// line per registered network on stdout. an empty registry prints a friendly
-/// notice on stderr and exits 0 (nothing registered is not an error).
+/// `list` — enumerate the workspaces under the ducktape home, one
+/// `chain-id<TAB>config-path` line per network on stdout. an empty home
+/// prints a friendly notice on stderr and exits 0 (no workspace yet is not
+/// an error).
 fn cmd_list() -> CommandResult {
     let workspaces = config::list_workspaces()?;
     if workspaces.is_empty() {
-        eprintln!(
-            "no workspaces registered under {}",
-            config::workspaces_root()?.display()
-        );
+        eprintln!("no workspaces under {}", config::ducktape_home()?.display());
         return Ok(());
     }
     for (chain_id, config_path) in workspaces {
@@ -483,8 +482,8 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// `ducktape service enable compute`, so detection can stay eager: it makes the
 /// interactive terminal plane work out of the box and leaves the compute plane
 /// dark until someone consents to it.
-fn detect_platform_sandbox() -> Option<config::SandboxToml> {
-    let (table, found) = config::detect_platform_sandbox()?;
+fn detect_platform_sandbox(workspace: &std::path::Path) -> Option<config::SandboxToml> {
+    let (table, found) = config::detect_platform_sandbox(workspace)?;
     eprintln!(
         "compute plane: {} found at {} — writing a live [sandbox] table \
          (announce stays off; delete the table for a consensus-only node)",
@@ -506,8 +505,8 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
 /// RPC, gateway, WireGuard), which is the one place those ports are written
 /// down — and prints every key, so the file itself documents what to change.
-/// without `--dir` the workspace lands in the registry
-/// (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>` finds it.
+/// without `--dir` the workspace lands under the ducktape home
+/// (`~/.ducktape/<chain-id>/`), where `-n <chain-id>` finds it.
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
     let explicit_dir = args.dir.is_some();
@@ -586,7 +585,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // resurrected. Turning the compute plane ON is `ducktape service enable
     // compute`, never an init flag.
     if fresh_workspace {
-        plumbing.sandbox = detect_platform_sandbox();
+        plumbing.sandbox = detect_platform_sandbox(&dir);
     }
 
     // write the genesis the node boots from: the SAME bytes just hashed, and
@@ -1101,8 +1100,10 @@ pub(super) fn gov_signer(
     let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     let http_base = config::http_base_in(workspace)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let key =
-        crate::userkey_cli::load_user_signer(&keystore::wallet::active_user_key()?, &mut stdin)?;
+    let key = crate::userkey_cli::load_user_signer(
+        &keystore::wallet::active_user_key(workspace)?,
+        &mut stdin,
+    )?;
     let number = account_of_key(rpc_addr, key.public_key().as_ref())?.ok_or(
         "shares govern this network and the active user key belongs to no Identity account — \
          `ducktape account create` first",

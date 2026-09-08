@@ -133,26 +133,30 @@ pub(crate) fn node_public_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error:
 ///   ([`crate::cli_args::workspace_for_base`]): its `node.toml` already names
 ///   the key, read locally with no network round trip — nothing an answer on
 ///   `base` says can change it.
-/// - anything else: trust-on-first-use, pinned in the wallet dir
+/// - anything else: trust-on-first-use, pinned beside the signing key
 ///   ([`crate::known_nodes`]). The first answer this CLI ever sees for `base`
 ///   is trusted and remembered; every answer after that must match it, or the
 ///   request is refused (reason: `node_key_mismatch`) unless the caller passed
 ///   `trust_node` to re-pin.
+///
+/// `key_path` is the user key about to sign: its pins live in its directory,
+/// so the identity that trusts a url and the identity that signs against it
+/// are one and the same file's neighbours.
 pub(crate) fn pinned_node_key(
+    key_path: &std::path::Path,
     base: &str,
     trust_node: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    Ok(pinned_node_key_in(
-        &keystore::wallet::duck_root()?,
-        base,
-        trust_node,
-    )?)
+    let keys = key_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", key_path.display()))?;
+    Ok(pinned_node_key_in(keys, base, trust_node)?)
 }
 
-/// [`pinned_node_key`] over an explicit wallet dir — split out so a test can
+/// [`pinned_node_key`] over an explicit keys dir — split out so a test can
 /// drive it against a temp dir instead of the operator's real keystore.
 fn pinned_node_key_in(
-    duck: &std::path::Path,
+    keys: &std::path::Path,
     base: &str,
     trust_node: bool,
 ) -> Result<Vec<u8>, String> {
@@ -161,14 +165,14 @@ fn pinned_node_key_in(
         return Ok(resolved.signer.public_key().as_ref().to_vec());
     }
     let reported = node_public_key(base).map_err(|error| error.to_string())?;
-    match crate::known_nodes::pinned(duck, base)? {
+    match crate::known_nodes::pinned(keys, base)? {
         None => {
-            crate::known_nodes::trust(duck, base, &reported)?;
+            crate::known_nodes::trust(keys, base, &reported)?;
             Ok(reported)
         }
         Some(pinned) if pinned == reported => Ok(pinned),
         Some(_) if trust_node => {
-            crate::known_nodes::trust(duck, base, &reported)?;
+            crate::known_nodes::trust(keys, base, &reported)?;
             Ok(reported)
         }
         Some(_) => Err(format!(

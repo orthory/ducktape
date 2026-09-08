@@ -248,6 +248,8 @@ preset ui_launch
     hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
+    rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
     // Ice reads extern structs but cannot construct one, so the rows come
     // from the same `wallet_info` constructor the backend hands the list.
     hub_wallets = [wallet_info("alice", "aabbccddeeff00112233", "encrypted", false), wallet_info("demo", "eeff0011", "encrypted", true)]
@@ -274,7 +276,6 @@ test launch_wallets_contract
         wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
-        hidden=0
         name=""
         invite=""
         steps=provision_steps
@@ -305,12 +306,10 @@ test launch_wallets_contract
         restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
-        forget_network_submit -> forget_network_submit _ _
+        forget_network_submit -> forget_network_submit _
         connect_remote_submit -> connect_remote_submit _
-        restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
@@ -332,6 +331,7 @@ test wallet_list_contract
       with
         wallets=hub_wallets
         selected=hub_wallet_selected
+        network="demo"
         busy=false
         error=""
       events
@@ -339,6 +339,7 @@ test wallet_list_contract
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
         go_restore -> go_restore
+        go_networks -> go_networks
   target list = #wallets/root
   target demo_pw = #wallets/root/wallet-row("demo")/root/wallet-password
   target alice_row = #wallets/root/wallet-row("alice")/root/wallet-pick
@@ -365,17 +366,19 @@ test wallet_list_contract
 // A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
 // A failed `wallet list` yields an empty list, which is the password step —
 // so this screen, not just the wallet list, has to carry `login_skip`, or
-// someone who HAS wallets is trapped on a mint screen by a missing binary.
-// The mint itself is NOT dispatched: `password_submit` seals a real key.
+// someone who HAS wallets is trapped on a mint screen by an unreadable
+// keystore. The mint itself is NOT dispatched: `password_submit` seals a
+// real key. Skipping opens the console (a window task — not asserted here).
 test password_screen_read_only_escape_contract
   preset ui_launch
   viewport 480 680
   mount
-    PasswordScreen #pw busy=false error="the keystore listing is unreadable"
+    PasswordScreen #pw network="demo" busy=false error="the keystore listing is unreadable"
       events
         password_submit -> password_submit _
         go_restore -> go_restore
         login_skip -> login_skip
+        go_networks -> go_networks
   target screen = #pw/root
   target skip = #pw/root/password-skip
   target field = #pw/root/device-password
@@ -383,10 +386,23 @@ test password_screen_read_only_escape_contract
   expect exists field
   expect exists go
   expect text "the keystore listing is unreadable" within screen
-  // read-only signs as NOBODY: the label must not keep naming a wallet.
-  click skip
+  expect exists skip
+
+// A NETWORK PICK OPENS THE DOOR ITS KEYSTORE NAMES — the launch window's
+// load-bearing branch. Rows land on the wallet list with the active row
+// picked; an empty keystore lands on the password step, carrying the
+// listing's error. No keystore at all (a remote) opens the console — a
+// window task, not dispatched here.
+test a_network_pick_opens_the_door_its_keystore_names
+  preset ui_pick_probe
+  dispatch wallets_loaded(wallet_list([wallet_info("alice", "aabbccddeeff00112233", "encrypted", false), wallet_info("demo", "eeff0011", "encrypted", true)], "", true))
+  expect hub_step == HubStep.wallets
+  expect hub_wallet_selected == "demo"
+  expect mutation_phase == MutationPhase.idle
+  dispatch wallets_loaded(wallet_list([], "the keystore listing is unreadable", true))
+  expect hub_step == HubStep.password
   expect hub_wallet_selected == ""
-  expect hub_step == HubStep.networks
+  expect onboarding_error == "the keystore listing is unreadable"
 
 // THE PHRASE SCREEN, on a FIXED mnemonic. `phrase_rows_of` is mounted rather
 // than `phrase_rows` on purpose: the live one reads the phrase a real mint is
@@ -454,7 +470,6 @@ test launch_networks_empty_contract
         wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
-        hidden=0
         name=""
         invite=""
         steps=provision_steps
@@ -485,12 +500,10 @@ test launch_networks_empty_contract
         restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
-        forget_network_submit -> forget_network_submit _ _
+        forget_network_submit -> forget_network_submit _
         connect_remote_submit -> connect_remote_submit _
-        restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
@@ -668,7 +681,6 @@ test palette_overlay_contract
   expect palette_draft == "duck"
   key escape
   expect !palette_open
-
 
 // AND THE BACKDROP TAKES THE POINTER. #804's other half: the palette used to be
 // a `box bg=scrim`, which tints the console and captures nothing — the rail and

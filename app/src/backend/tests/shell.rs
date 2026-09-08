@@ -919,7 +919,7 @@ checkpoint_blocks = 32
     .unwrap();
 
     assert_eq!(
-        registered_workspaces_in(root.path()),
+        workspaces_in(root.path()),
         vec![("mynet#a1b2c3d4".to_string(), dir.clone())]
     );
     assert_eq!(workspace_identity(&dir), Some(short_label(&founder)));

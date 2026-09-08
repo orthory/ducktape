@@ -34,7 +34,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
-use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
+use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
@@ -196,17 +196,11 @@ impl PortableProvider {
         }
     }
 
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (
-                "DUCKTAPE_EXECUTOR_DIR".into(),
-                self.executors.display().to_string(),
-            ),
-        ]
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
 }
 
@@ -214,24 +208,6 @@ impl PortableProvider {
 // fuller base than the harness default. Every node now boots the same shared
 // guest rootfs, so what a run can execute is decided when that image is built
 // (ops/build-guest-rootfs.sh), not per suite.
-
-/// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
-fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let empty = root.join(name).join("specs");
-    std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let executors = root.join(name).join("executors");
-    std::fs::create_dir_all(&executors).expect("empty executor dir");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            executors.display().to_string(),
-        ),
-    ]
-}
 
 fn boot(cluster: &mut Cluster) {
     cluster.spawn(0);
@@ -425,17 +401,18 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // announces the granted tags INTERSECTED with what it discovers, so the
     // hermetic nodes 0/2 still announce nothing.
     cluster.compute_grant = Some(vec![provider.tag.clone()]);
-    cluster.env[0] = [
-        hermetic_env(fixtures.path(), "node0"),
-        vec![runs_root_env.clone()],
-    ]
-    .concat();
+    // an EMPTY stage keeps nodes 0 and 2 out of provider discovery (see
+    // dispatch_e2e).
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(provider.sandbox());
+    cluster.sandbox[2] = Some(SandboxStage::default());
+    cluster.env[0] = vec![runs_root_env.clone()];
     // node 1's compute daemon prints the `run dir materialized` marker at
     // debug under `ducktape::agent` (RUST_LOG appends to the daemon's info
     // floor, it never replaces it), and `materialized_dirs` below reads it.
     let agent_debug = ("RUST_LOG".to_string(), "ducktape::agent=debug".to_string());
-    cluster.env[1] = [provider.env(), vec![runs_root_env.clone(), agent_debug]].concat();
-    cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
+    cluster.env[1] = vec![runs_root_env.clone(), agent_debug];
+    cluster.env[2] = vec![runs_root_env];
     boot(&mut cluster);
 
     // node 1 is the tag's ONLY provider, so every lease lands there.

@@ -17,19 +17,24 @@ soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 
 ## Where the workspace lives
 
-Everything the node keeps on disk sits under **`DUCKTAPE_HOME`**
-(`crates/workspace-config/src/lib.rs`, `ducktape_home`): `$DUCKTAPE_HOME`
-when set, else `~/.ducktape`. The units set
-`DUCKTAPE_HOME=/var/lib/ducktape` (a systemd `StateDirectory`, owned by the
-`ducktape` user), so under them the layout is:
+Everything a network keeps on disk sits in its workspace under
+**`DUCKTAPE_HOME`** (`crates/workspace-config/src/lib.rs`, `ducktape_home`):
+`$DUCKTAPE_HOME` when set, else `~/.ducktape`. The home holds one directory
+per network and nothing else — two networks on one host share no file. The
+units set `DUCKTAPE_HOME=/var/lib/ducktape` (a systemd `StateDirectory`,
+owned by the `ducktape` user), so under them the layout is:
 
 ```
 /var/lib/ducktape/
-  workspaces/<chain-id>/     one dir per network (`ducktape node list`)
+  <chain-id>/                one dir per network (`ducktape node list`)
     node.toml                the operator file: listeners, storage_dir, [sandbox]
     network.toml             the network descriptor (validators, reach hints, the genesis pin)
     genesis                  the network's wasm (every component + index guest), pinned by network.toml
     identity.key             THIS NODE'S seat key, 0600 — back it up (see backup-and-keys.md)
+    keys/                    this network's user wallets + `active` pointer (`ducktape wallet new <name> -n <chain-id>`)
+    guest/                   the kernel + rootfs its runs boot (`OUT=<workspace>/guest ops/build-guest-rootfs.sh`)
+    executors/               the pinned agent CLIs its runs exec (`ducktape agent install -n <chain-id>`)
+    capabilities/            operator capability specs, `*.toml`
     wireguard.key            the tunnel keypair (regenerable)
     services.toml            service grants (`ducktape service enable`)
     coord.cap                the coordinator admission capability, when issued
@@ -37,9 +42,8 @@ when set, else `~/.ducktape`. The units set
     daemon.log               `node run`'s tee (append-only)
     <kind>.log               `service run <kind>`'s tee (append-only)
     storage/                 consensus state, blobs, mesh-state.json, airlock-creds/
-  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): what `node init` composes a genesis from
-  executors/                 pinned agent CLIs (`ducktape agent install`)
-  keys/                      user wallets + `active` pointer (only if you run wallet verbs as this user)
+/usr/local/lib/ducktape/
+  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): program data the unit's DUCKTAPE_MODULES_DIR names, what `node init` composes a genesis from
 ```
 
 ### What grows, and what nothing prunes
@@ -88,9 +92,10 @@ sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
 # 3. The founding set: what `node init --modules` composes the genesis from,
 #    and where the unit's DUCKTAPE_MODULES_DIR has the netstack guest read.
-sudo install -d -o ducktape -g ducktape /var/lib/ducktape/modules
-sudo cp ~/.cargo/bin/modules/*.wasm /var/lib/ducktape/modules/
-sudo chown -R ducktape:ducktape /var/lib/ducktape/modules
+#    Program data beside the binary's prefix, never under the home.
+sudo install -d -m 0755 /usr/local/lib/ducktape/modules
+sudo cp ~/.cargo/bin/modules/*.wasm /usr/local/lib/ducktape/modules/
+sudo chmod -R a+rX /usr/local/lib/ducktape/modules
 
 # 4. Units and log rotation.
 sudo cp ops/node/ducktape-node@.service ops/node/ducktape-service@.service /etc/systemd/system/
@@ -101,7 +106,7 @@ sudo systemctl daemon-reload
 #    the unit will look for them. A member (an identity the founder admitted
 #    before genesis) joins with the founder's `<workspace>/genesis`; a
 #    resident fetches it off the mesh at first boot.
-dt node init --name mynet --modules /var/lib/ducktape/modules   # founder
+dt node init --name mynet --modules /usr/local/lib/ducktape/modules   # founder
 dt node join '<invite blob>'                                    # ...or a resident
 dt node join '<invite blob>' --genesis /path/to/founders/genesis # ...or a member
 dt node list                              # the chain id the instance names
@@ -109,6 +114,10 @@ dt node list                              # the chain id the instance names
 
 `node init`/`node join` probe the host and write the `[sandbox]` table when
 `/dev/kvm` opens; a host that gained KVM later runs `dt node sandbox` once.
+The table names HOW a run is isolated, never where its images are: those are
+the workspace's own, built by `OUT=/var/lib/ducktape/<chain-id>/guest
+ops/build-guest-rootfs.sh` (as the service user, or chowned to it), and
+`dt node sandbox` names the exact invocation for a workspace missing them.
 Firecracker, `mke2fs` AND `debugfs` must be on the service's `PATH`
 — `/usr/local/bin`, `/usr/sbin` and `/sbin` are searched
 (`crates/services/sandbox/src/host_tools.rs`); the compute/agent daemon
@@ -166,8 +175,8 @@ workspace. They never disagree about what was recorded.
 
 ```sh
 journalctl -fu ducktape-node@mynet
-tail -f /var/lib/ducktape/workspaces/<chain-id>/daemon.log
-tail -f /var/lib/ducktape/workspaces/<chain-id>/compute.log
+tail -f /var/lib/ducktape/<chain-id>/daemon.log
+tail -f /var/lib/ducktape/<chain-id>/compute.log
 
 # turn one plane up on the LIVE node — never restart to look at a wedged state.
 # the route mutates the process, so it takes a credential: the verb signs with
@@ -175,7 +184,7 @@ tail -f /var/lib/ducktape/workspaces/<chain-id>/compute.log
 # credential does (an uncredentialed curl is refused 401).
 ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>
 curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug' \
-  -H "x-ducktape-admin-token: $(cat /var/lib/ducktape/workspaces/<chain-id>/admin.token)"
+  -H "x-ducktape-admin-token: $(cat /var/lib/ducktape/<chain-id>/admin.token)"
 ```
 
 The tee files are opened append-only once and never reopened, which is why
@@ -183,7 +192,7 @@ the logrotate drop-in uses `copytruncate` (weekly, or at 256 MB, eight kept).
 
 A wedged node (no more progress, no crash) can dump every async task it is
 parked on: `kill -USR1 $(systemctl show -p MainPID --value ducktape-node@mynet)`
-writes `/var/lib/ducktape/workspaces/<chain-id>/tasks.txt` (overwritten each
+writes `/var/lib/ducktape/<chain-id>/tasks.txt` (overwritten each
 time) and logs one `task_dump_written` line to `daemon.log`. Linux
 x86_64/aarch64 only; elsewhere the signal does nothing.
 

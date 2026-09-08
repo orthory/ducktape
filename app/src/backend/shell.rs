@@ -138,60 +138,25 @@ pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
     }
 }
 
-/// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
-/// only writer). Read per call, not cached: the launch window switches
-/// networks in-process, so no registry reading may outlive a boot.
-fn demo_registry() -> Option<serde_json::Value> {
-    let path = ducktape_home()?.join("registry.json");
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
-fn registry_active_entry() -> Option<serde_json::Value> {
-    let registry = demo_registry()?;
-    let active = registry.get("active")?.as_str()?;
-    registry
-        .get("workspaces")?
-        .as_array()?
-        .iter()
-        .find(|workspace| workspace.get("id").and_then(|id| id.as_str()) == Some(active))
-        .cloned()
-}
-
-/// The registry's `active` workspace id — the launch list's preselection
-/// hint on a demo-seeded machine.
-pub(crate) fn registry_active_workspace() -> Option<String> {
-    demo_registry()?.get("active")?.as_str().map(str::to_string)
-}
-
-/// The active workspace's http endpoint, from the same registry the titlebar
-/// name comes from. This is what makes a bare `make dev` connect: with no
-/// `DUCKTAPE_NODE` and an empty endpoint field the app fell back to a
-/// hardcoded port while the seeded node listened wherever `node init` picked
-/// its ports — so every first boot opened on "Could not connect" over a
-/// perfectly healthy node the registry knew the address of.
-pub(crate) fn registered_endpoint() -> Option<String> {
-    let workspace = registry_active_entry()?;
-    let http = workspace.get("ports")?.get("http")?.as_u64()?;
-    Some(format!("http://127.0.0.1:{http}"))
-}
-
-/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key
-/// uses, because it IS that resolution: [`ducktape_home::root`].
+/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the directory that holds every
+/// workspace on this device and nothing else: [`ducktape_home::root`], the
+/// same resolution the node lists its workspaces through.
 pub(crate) fn ducktape_home() -> Option<PathBuf> {
     ducktape_home::root().ok()
 }
 
-/// Every registered workspace as `(chain id, directory)` — the CLI's own
-/// registry walk (`workspace_config::list_workspaces`), so membership and the
-/// id agree with what `node init`/`node join` wrote and what `-n` resolves.
-pub(crate) fn registered_workspaces() -> Vec<(String, PathBuf)> {
-    let Ok(root) = workspace_config::workspaces_root() else {
+/// Every workspace under the ducktape home as `(chain id, directory)` — the
+/// CLI's own directory walk (`workspace_config::list_workspaces`), read per
+/// call, so membership and the id agree with what `node init`/`node join`
+/// wrote and what `-n` resolves.
+pub(crate) fn workspaces() -> Vec<(String, PathBuf)> {
+    let Some(root) = ducktape_home() else {
         return Vec::new();
     };
-    registered_workspaces_in(&root)
+    workspaces_in(&root)
 }
 
-pub(crate) fn registered_workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
     workspace_config::list_workspaces_in(root)
         .unwrap_or_default()
         .into_iter()
@@ -205,26 +170,24 @@ pub(crate) fn workspace_endpoint(dir: &Path) -> Option<String> {
     workspace_config::http_base_in(dir).ok()
 }
 
-/// The registered workspace this app is pointed at, matched on the endpoint it
-/// is actually connected to.
-pub(crate) fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
-    let endpoint = canonical_endpoint(rpc.to_string());
-    registered_workspaces()
-        .into_iter()
-        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
+/// The endpoint an EMPTY `rpc` means: the one workspace under the home, when
+/// the home holds exactly one — the rung the CLI's `-n` falls to as well.
+/// Two workspaces are a pick the launch window makes, never a default.
+pub(crate) fn lone_workspace_endpoint() -> Option<String> {
+    let listed = workspaces();
+    let [(_, dir)] = listed.as_slice() else {
+        return None;
+    };
+    workspace_endpoint(dir)
 }
 
-/// Workspaces this device has been told to forget — device-local, never wire
-/// state. The directories stay on disk; the console simply stops offering them.
-pub(crate) fn forgotten_workspaces() -> Vec<String> {
-    read_prefs()["forgotten_workspaces"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|id| id.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+/// The workspace on this device that serves an endpoint, matched on the
+/// endpoint the app is actually connected to. `None` is a remote.
+pub(crate) fn workspace_at(rpc: &str) -> Option<(String, PathBuf)> {
+    let endpoint = canonical_endpoint(rpc.to_string());
+    workspaces()
+        .into_iter()
+        .find(|(_, dir)| workspace_endpoint(dir).as_deref() == Some(endpoint.as_str()))
 }
 
 /// What a join hands back: the network's id, where it materialized, and the
@@ -303,7 +266,7 @@ fn workspace_rpc(selector: &str) -> Result<String, String> {
     let matches_selector = |chain_id: &str, dir: &Path| {
         chain_id == selector || dir.file_name().is_some_and(|name| name == selector)
     };
-    registered_workspaces()
+    workspaces()
         .into_iter()
         .find(|(chain_id, dir)| matches_selector(chain_id, dir))
         .and_then(|(_, dir)| workspace_endpoint(&dir))
@@ -337,7 +300,7 @@ pub fn provision_progress(
         step: usize,
         attempts: u32,
     }
-    let found = registered_workspaces()
+    let found = workspaces()
         .into_iter()
         .find(|(chain_id, dir)| *chain_id == workspace || dir.display().to_string() == workspace);
     let (chain_id, dir) = match found {
@@ -363,7 +326,7 @@ pub fn provision_progress(
                     Some((
                         registered_step(
                             1,
-                            &format!("Workspace registered · {home}"),
+                            &format!("Workspace on disk · {home}"),
                             state.dir.is_some(),
                         ),
                         state,
@@ -472,34 +435,13 @@ pub(crate) fn workspace_identity(dir: &Path) -> Option<String> {
     Some(short_label(key))
 }
 
-/// Forget this workspace on THIS DEVICE: it stops being offered by the shell
-/// and its view prefs are dropped. The directory, the identity and the chain
-/// are untouched — this is not a leave-the-network op.
-pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
-    let Some((chain_id, _)) = workspace_at(&rpc) else {
-        return Err(app_error(
-            "this endpoint is not one of this device's registered workspaces".into(),
-        ));
-    };
-    let mut prefs = read_prefs();
-    let mut forgotten = forgotten_workspaces();
-    if !forgotten.contains(&chain_id) {
-        forgotten.push(chain_id);
-    }
-    prefs["forgotten_workspaces"] = serde_json::json!(forgotten);
-    if let Some(tabs) = prefs["doc_tabs"].as_object_mut() {
-        tabs.remove(&canonical_endpoint(rpc));
-    }
-    Ok(write_prefs(&prefs))
-}
-
 /// The titlebar's network label: the NAME PART of the connected node's chain
 /// id (`name#hash`), the one fact every member of a network shares. Until the
 /// node has said which chain it serves, the endpoint's host stands in, and
 /// with no endpoint the product name does.
 ///
-/// Nothing device-local feeds this: the CLI registry only knows the
-/// workspaces this machine created, and an account name is one person's,
+/// Nothing device-local feeds this: the ducktape home only knows the
+/// workspaces this machine holds, and an account name is one person's,
 /// not the network's.
 pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
     let chain_id = chain_id.as_ref().trim();

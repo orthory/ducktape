@@ -53,9 +53,9 @@ fn install_log() {
     let filter = EnvFilter::builder()
         .parse(format!("info,{env}"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let file = backend::duck_home()
+    let file = backend::app_log_path()
         .ok()
-        .and_then(|home| node::log_file::open_rotating(&home.join("app.log")).ok());
+        .and_then(|path| node::log_file::open_rotating(&path).ok());
     let file_layer = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)

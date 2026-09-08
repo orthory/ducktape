@@ -154,7 +154,6 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         | crate::MutationPhase::ChannelRename
         | crate::MutationPhase::ChannelUnarchive
         | crate::MutationPhase::CommentResolve
-        | crate::MutationPhase::ForgetWorkspace
         | crate::MutationPhase::Huddle
         | crate::MutationPhase::Onboarding
         | crate::MutationPhase::Page
@@ -841,7 +840,7 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     let configured = if input.trim().is_empty() {
         std::env::var("DUCKTAPE_NODE")
             .ok()
-            .or_else(registered_endpoint)
+            .or_else(super::shell::lone_workspace_endpoint)
             .unwrap_or_else(|| DEFAULT_RPC.to_string())
     } else {
         input.trim().to_string()
@@ -888,7 +887,7 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
 /// [`rpc_client`], which is where this runs, holding its cache lock. The
 /// bug that shape produced was not a slow test but a dead process.
 fn operator_token_for(origin: &str) -> Option<String> {
-    let (_, workspace) = super::shell::registered_workspaces()
+    let (_, workspace) = super::shell::workspaces()
         .into_iter()
         .find(|(_, dir)| super::shell::workspace_endpoint(dir).as_deref() == Some(origin))?;
     let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;

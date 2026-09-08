@@ -287,7 +287,7 @@ fn service_network_shape(
     raw: &NodeToml,
     descriptor: &NetworkDescriptor,
 ) -> Result<ServiceConfig, String> {
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(base, raw.sandbox.as_ref())?;
     Ok(ServiceConfig {
         workspace: base.to_path_buf(),
         storage_dir: base.join(&raw.storage_dir),
@@ -301,7 +301,7 @@ fn service_network_shape(
 /// THE dev-shape derivation of the same six facts, on the same terms.
 fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
     let storage_dir = dev_storage_dir(raw)?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(&storage_dir, raw.sandbox.as_ref())?;
     Ok(ServiceConfig {
         // the dev shape has no config directory; its per-process state dir
         // stands in as the workspace.
@@ -344,11 +344,13 @@ fn gate_on_compute_grant(
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
 /// (no table) = consensus-only node, no backend and no capacity;
-/// `"firecracker"` (Linux) or `"vz"` (macOS) → the microVM backend with the
-/// probed host totals, per-key overrides winning; any other runtime —
-/// "podman", "tart" and "direct" included, there is no container backend and
-/// no bare spawn — is a loud config error naming the audited adapters.
+/// `"firecracker"` (Linux) or `"vz"` (macOS) → the microVM backend over the
+/// WORKSPACE's guest images and executors, with the probed host totals,
+/// per-key overrides winning; any other runtime — "podman", "tart" and
+/// "direct" included, there is no container backend and no bare spawn — is a
+/// loud config error naming the audited adapters.
 fn resolve_sandbox(
+    workspace: &Path,
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
     let Some(sandbox) = sandbox else {
@@ -389,23 +391,15 @@ fn resolve_sandbox(
             ));
         }
     };
-    // The guest images are the whole backend: one kernel and one read-only
-    // rootfs, shared by every run on this node. Both are resolved to absolute
-    // paths here so a relative one in node.toml fails at config time rather
-    // than at the first boot, where it would read as "the guest never dialled
-    // back".
-    let kernel = absolute_runtime_path(&sandbox.kernel)?;
-    let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
-    // The agent CLIs are NOT a table key: they are per-machine, installed by
-    // `ducktape agent install`, and every node on this host lends the same set.
-    let executors = workspace_config::executor_dir()?;
+    // The guest images and the agent CLIs are the workspace's own files, never
+    // table keys: `<workspace>/guest/{vmlinux,rootfs.ext4}` and
+    // `<workspace>/executors/`. Two networks on one host boot two guests out of
+    // two directories, and a workspace copied whole carries its sandbox along.
+    // `workspace` is already absolute (the config's directory, or the dev
+    // shape's state dir), so a guest that never dials back cannot be a
+    // relative path resolved against the wrong cwd.
     Ok((
-        Some(SandboxBackend::MicroVm {
-            vmm,
-            kernel,
-            rootfs,
-            executors,
-        }),
+        Some(workspace_config::sandbox_backend(workspace, vmm)),
         probed()?,
     ))
 }
@@ -1485,7 +1479,7 @@ mod tests {
             dir.join("storage").to_str().expect("utf8 path"),
             fake_bundle(&dir)
         );
-        let sandbox = sandbox_table("firecracker", "/var/lib/ducktape/guest", 0, 0);
+        let sandbox = sandbox_table("firecracker", 0, 0);
 
         // a sandbox table alone announces NOTHING: it says how a run would be
         // isolated, never that the user consented to run any.
@@ -1535,11 +1529,8 @@ mod tests {
 
     /// one `[sandbox]` line-set for the dev-seed harness shape, appended
     /// LAST (everything after a toml table header belongs to the table).
-    fn sandbox_table(runtime: &str, guest_dir: &str, cores: u64, mem_gb: u64) -> String {
-        format!(
-            "[sandbox]\nruntime = \"{runtime}\"\nkernel = \"{guest_dir}/vmlinux\"\n\
-             rootfs = \"{guest_dir}/rootfs.ext4\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
-        )
+    fn sandbox_table(runtime: &str, cores: u64, mem_gb: u64) -> String {
+        format!("[sandbox]\nruntime = \"{runtime}\"\ncores = {cores}\nmem_gb = {mem_gb}\n")
     }
 
     #[test]
@@ -1568,24 +1559,25 @@ mod tests {
         .expect("write");
         resolve(&dir.join("node.toml")).expect_err("flat sandbox key refused");
 
-        // firecracker ⇒ the two guest images + probed capacity (0 = probe).
+        // firecracker ⇒ the workspace's two guest images and its executors
+        // directory + probed capacity (0 = probe). The table names no path:
+        // the images and the agent CLIs are the workspace's own files.
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}{}", sandbox_table("firecracker", "/srv/guest", 0, 0)),
+            format!("{base}{}", sandbox_table("firecracker", 0, 0)),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve firecracker");
+        let workspace = resolved.service.workspace.clone();
         assert!(
             matches!(
                 &resolved.service.sandbox,
                 Some(SandboxBackend::MicroVm { vmm: Vmm::Firecracker, kernel, rootfs, executors })
-                    if kernel == Path::new("/srv/guest/vmlinux")
-                        && rootfs == Path::new("/srv/guest/rootfs.ext4")
-                        // the agent CLIs are per-machine, so the table never
-                        // names them and this is the operator's own directory.
-                        && executors == &workspace_config::executor_dir().expect("executor dir")
+                    if kernel == &workspace_config::guest_kernel(&workspace)
+                        && rootfs == &workspace_config::guest_rootfs(&workspace)
+                        && executors == &workspace_config::executor_dir(&workspace)
             ),
-            "firecracker backend with the configured images: {:?}",
+            "firecracker backend over the workspace's images: {:?}",
             resolved.service.sandbox
         );
 
@@ -1595,7 +1587,7 @@ mod tests {
         // one.
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}{}", sandbox_table("vz", "/srv/guest", 0, 0)),
+            format!("{base}{}", sandbox_table("vz", 0, 0)),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve vz");
@@ -1603,9 +1595,9 @@ mod tests {
             matches!(
                 &resolved.service.sandbox,
                 Some(SandboxBackend::MicroVm { vmm: Vmm::Vz, kernel, .. })
-                    if kernel == Path::new("/srv/guest/vmlinux")
+                    if kernel == &workspace_config::guest_kernel(&workspace)
             ),
-            "vz backend with the configured images: {:?}",
+            "vz backend over the workspace's images: {:?}",
             resolved.service.sandbox
         );
         assert!(
@@ -1619,25 +1611,13 @@ mod tests {
             "a compute node announces its probed capacity"
         );
 
-        // an override wins over the probe; a custom guest directory is honored.
+        // an override wins over the probe.
         std::fs::write(
             dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("firecracker", "/opt/other", 99, 128)
-            ),
+            format!("{base}{}", sandbox_table("firecracker", 99, 128)),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
-        assert!(
-            matches!(
-                &resolved.service.sandbox,
-                Some(SandboxBackend::MicroVm { kernel, .. })
-                    if kernel == Path::new("/opt/other/vmlinux")
-            ),
-            "custom guest dir honored: {:?}",
-            resolved.service.sandbox
-        );
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
 
@@ -1649,7 +1629,7 @@ mod tests {
         for runtime in ["tart", "podman", "gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
-                format!("{base}{}", sandbox_table(runtime, "/g", 0, 0)),
+                format!("{base}{}", sandbox_table(runtime, 0, 0)),
             )
             .expect("write");
             let err = resolve(&dir.join("node.toml")).expect_err("unknown runtime refused");

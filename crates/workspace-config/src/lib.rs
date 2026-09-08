@@ -50,33 +50,42 @@ pub use invite::*;
 pub use join::*;
 pub use node_toml::*;
 
-/// where `ops/build-guest-rootfs.sh` writes the kernel and rootfs by default —
-/// the paths `[sandbox]` generation puts in a fresh table and in the commented
-/// example: `$DUCKTAPE_HOME/guest`, else `~/.ducktape/guest`.
+/// the guest artifacts a workspace's runs boot: `<workspace>/guest`, holding
+/// the `vmlinux` and `rootfs.ext4` that `ops/build-guest-rootfs.sh` writes
+/// there (`OUT=<workspace>/guest`).
 ///
-/// Under the operator's home, beside `workspaces/`, because that is the only
-/// place BOTH platforms can write without root: the guest build is rootless
-/// start to finish ("a node that needs root to build its guest is a node that
-/// runs as root"), and macOS has no `/var/lib` an operator would ever use.
-/// One value, so the builder, the preflight and the written table cannot
-/// disagree about where the images are.
-pub fn default_guest_dir() -> Result<PathBuf, String> {
-    Ok(ducktape_home()?.join("guest"))
+/// Per workspace, never per host: two networks on one machine boot two
+/// guests, and rebuilding one cannot change what the other runs. The
+/// `[sandbox]` table names no path for the same reason — a config copied
+/// between workspaces would otherwise point at images that are not there.
+pub fn guest_dir(workspace: &Path) -> PathBuf {
+    workspace.join("guest")
 }
 
-/// where `ducktape agent install` puts the agent CLIs this host can lend to a
-/// run: `$DUCKTAPE_EXECUTOR_DIR`, else `<ducktape_home>/executors`.
-///
-/// NOT a `[sandbox]` key, unlike the kernel and rootfs paths beside it. Those
-/// name build outputs a node may legitimately be pointed at; this names the one
-/// place an operator installs into, and a per-node override would be a second
-/// answer to "which CLIs does this machine have" — the question the whole
-/// executors design exists to have exactly one answer to.
-pub fn executor_dir() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    Ok(ducktape_home()?.join("executors"))
+/// the guest kernel every run of this workspace boots.
+pub fn guest_kernel(workspace: &Path) -> PathBuf {
+    guest_dir(workspace).join("vmlinux")
+}
+
+/// the guest root filesystem every run of this workspace attaches read-only.
+pub fn guest_rootfs(workspace: &Path) -> PathBuf {
+    guest_dir(workspace).join("rootfs.ext4")
+}
+
+/// where `ducktape agent install` puts the agent CLIs a workspace's guest
+/// lends to a run: `<workspace>/executors`. The node derives the guest's
+/// read-only image from this directory (`sandbox_host::executor_image`), so
+/// what the directory holds is exactly what a run can exec.
+pub fn executor_dir(workspace: &Path) -> PathBuf {
+    workspace.join("executors")
+}
+
+/// the operator capability specs a workspace's compute daemon offers: every
+/// `*.toml` under `<workspace>/capabilities`
+/// (`docs/records/specs/capability-spec.md`). An absent directory is a node
+/// with no operator specs, not an error.
+pub fn capability_dir(workspace: &Path) -> PathBuf {
+    workspace.join("capabilities")
 }
 
 /// where the FOUNDING SET is read from — the directory of
@@ -1056,50 +1065,46 @@ pub fn sync_source_candidates<A>(
 }
 
 // ============================================================================
-// the workspace registry — the desktop app materializes one directory per
-// network under `~/.ducktape/workspaces/<id>/` (node.toml + network.toml +
-// identity.key). `--network <chain id>` resolves through it, so the CLI can
-// address a node by the name humans actually know.
+// the ducktape home — one directory per network, `~/.ducktape/<id>/`, and
+// nothing else. A workspace is a network's WHOLE node home: node.toml,
+// network.toml, identity.key, keys/, guest/, executors/, capabilities/ and
+// storage/ all live inside it, so two networks on one machine share no file.
+// The home is the list: `--network <chain id>` resolves by scanning it, so
+// the CLI can address a node by the name humans actually know.
 // ============================================================================
 
-/// everything this operator's node keeps on disk — [`ducktape_home::root`],
-/// re-exported under the name this crate's callers already use. The rule and
-/// its test live in that zero-dependency leaf, because the keystore, the
-/// desktop app and `provider-host` resolve the same root and must not disagree
-/// about it.
+/// the ducktape home — [`ducktape_home::root`], re-exported under the name
+/// this crate's callers already use. The rule and its test live in that
+/// zero-dependency leaf, because the desktop app resolves the same root and
+/// must not disagree about it.
 pub fn ducktape_home() -> Result<PathBuf, String> {
     ducktape_home::root()
 }
 
-/// the registry root: `<ducktape_home>/workspaces`.
-pub fn workspaces_root() -> Result<PathBuf, String> {
-    Ok(ducktape_home()?.join("workspaces"))
-}
-
-/// the registry directory a chain-id's workspace materializes into:
-/// `<workspaces_root>/<chain-id>`. path separators in the id (a `--name` is
-/// arbitrary text) are made inert — the registry resolves by descriptor
+/// the directory a chain-id's workspace materializes into by default:
+/// `<ducktape_home>/<chain-id>`. path separators in the id (a `--name` is
+/// arbitrary text) are made inert — workspaces resolve by descriptor
 /// content, so the directory name is display-only.
 pub fn default_workspace_dir(chain_id: &str) -> Result<PathBuf, String> {
     let name = chain_id.replace(std::path::MAIN_SEPARATOR, "-");
     if !is_workspace_dir_name(&name) {
         return Err(format!(
-            "chain id {chain_id:?} is not a workspace directory name — the registry holds one \
-             directory per network, so an id that resolves to the registry root or its parent \
-             would scatter identity.key and network.toml over the ducktape home instead; pass \
-             --dir to choose a destination"
+            "chain id {chain_id:?} is not a workspace directory name — the ducktape home holds \
+             one directory per network, so an id that resolves to the home itself or its \
+             parent would scatter identity.key and network.toml over it instead; pass --dir \
+             to choose a destination"
         ));
     }
-    Ok(workspaces_root()?.join(name))
+    Ok(ducktape_home()?.join(name))
 }
 
-/// does this name address a directory INSIDE the registry, and only that one?
-/// a chain-id reaches here straight out of an untrusted invite (`unpack_invite`
-/// asks only for UTF-8 under 255 bytes), and `""`, `"."` and `".."` all join
-/// to the registry root or its parent — a workspace written there is invisible
-/// to `list_workspaces`/`find_workspace_config`, which scan subdirectories, so
-/// `-n <chain-id>` could never address it again. one real path component, and
-/// nothing else.
+/// does this name address a directory INSIDE the ducktape home, and only that
+/// one? a chain-id reaches here straight out of an untrusted invite
+/// (`unpack_invite` asks only for UTF-8 under 255 bytes), and `""`, `"."` and
+/// `".."` all join to the home itself or its parent — a workspace written
+/// there is invisible to `list_workspaces`/`find_workspace_config`, which scan
+/// subdirectories, so `-n <chain-id>` could never address it again. one real
+/// path component, and nothing else.
 fn is_workspace_dir_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
     let single = matches!(components.next(), Some(std::path::Component::Normal(_)));
@@ -1107,17 +1112,16 @@ fn is_workspace_dir_name(name: &str) -> bool {
 }
 
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
-/// registry for descriptors whose chain-id matches `needle` — exact first,
-/// else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`). ambiguity
-/// and absence are loud errors that name what WAS found.
+/// ducktape home for descriptors whose chain-id matches `needle` — exact
+/// first, else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`).
+/// ambiguity and absence are loud errors that name what WAS found.
 pub fn find_workspace_config(needle: &str) -> Result<PathBuf, String> {
-    find_workspace_config_in(&workspaces_root()?, needle)
+    find_workspace_config_in(&ducktape_home()?, needle)
 }
 
 fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String> {
-    let entries = std::fs::read_dir(root).map_err(|e| {
-        format!("no workspace registry at {root:?} ({e}) — pass --config <node.toml>")
-    })?;
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("no workspaces under {root:?} ({e}) — pass --config <node.toml>"))?;
     let mut matches: Vec<(String, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.path();
@@ -1164,16 +1168,16 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
     }
 }
 
-/// resolve a `--network <chain id>` needle through the registry to the
+/// resolve a `--network <chain id>` needle through the ducktape home to the
 /// workspace directory (the node.toml's parent — what the `gateway` family
 /// addresses) and, when the workspace exposes one, the node's HTTP base URL
 /// (what the `fs`/`user` families dial). the base rewrites a wildcard bind to
 /// loopback so a local CLI actually reaches it; it is `None` when the node.toml
 /// carries no `http_listen` (no node-API surface to dial) — the callers that
 /// need a URL turn that into a loud error, the ones that need only the
-/// directory ignore it. ONE shared resolver so no family re-walks the registry.
+/// directory ignore it. ONE shared resolver so no family re-walks the home.
 pub fn resolve_network(needle: &str) -> Result<(PathBuf, Option<String>), String> {
-    resolve_network_in(&workspaces_root()?, needle)
+    resolve_network_in(&ducktape_home()?, needle)
 }
 
 fn resolve_network_in(root: &Path, needle: &str) -> Result<(PathBuf, Option<String>), String> {
@@ -1218,19 +1222,19 @@ pub fn http_base_of(http_listen: &str) -> String {
     format!("http://{loopback}:{port}")
 }
 
-/// enumerate the workspace registry: `(chain_id, node.toml path)` per
-/// registered network, sorted by chain_id. an ABSENT registry root is an empty
-/// list, not an error — nothing has been registered yet. one unreadable
+/// enumerate the workspaces under the ducktape home: `(chain_id, node.toml
+/// path)` per network, sorted by chain_id. an ABSENT home is an empty list,
+/// not an error — no network has been founded or joined yet. one unreadable
 /// descriptor is skipped, never fatal (same tolerance as `find_workspace_config`).
 pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
-    list_workspaces_in(&workspaces_root()?)
+    list_workspaces_in(&ducktape_home()?)
 }
 
 pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("read workspace registry {root:?}: {e}")),
+        Err(e) => return Err(format!("read {root:?}: {e}")),
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
@@ -1601,7 +1605,7 @@ mod tests {
     #[test]
     fn a_traversal_chain_id_never_becomes_a_workspace_directory() {
         // straight out of an untrusted invite: each of these joins to the
-        // registry root or its parent instead of a per-network directory.
+        // ducktape home itself or its parent instead of a per-network directory.
         for hostile in ["", ".", ".."] {
             let err = default_workspace_dir(hostile)
                 .expect_err("a traversal chain id has no default workspace");

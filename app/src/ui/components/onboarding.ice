@@ -1,8 +1,11 @@
 // THE LAUNCH WINDOW'S COLUMN. `hub_step` is the single discriminant:
-// (password | wallets) -> [restore] -> networks -> [join -> provisioning ->
-// live] -> [account]. The console never renders here — it lives in its own
-// window, opened on a network pick (once the device key has an account there,
-// or the user goes on without one).
+// networks -> (password | wallets) -> [restore] -> [account], with [join ->
+// provisioning -> live] off the network list. The network comes first
+// because a wallet is an identity ON a network, kept in that network's
+// workspace: the wallet screens show the PICKED network's keystore. The
+// console never renders here — it lives in its own window, opened once a key
+// is unlocked there (and has an account, or the user goes on without one), or
+// straight off a read-only pick.
 //
 // THERE IS NO CREATE-NETWORK ROUTE. Founding a network is an operator act on
 // the node (`ducktape node init`). This app attaches to a node somebody
@@ -13,7 +16,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
@@ -32,12 +35,10 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
     restore_submit(str, str)
     pick_network(str)
     open_network_submit
-    forget_network_submit(str, str)
+    forget_network_submit(str)
     connect_remote_submit(str)
-    restore_hidden_submit
     go_join
     go_networks
-    go_wallets
     join_network_submit
     copy_onboarding_invite
     enter_console
@@ -87,6 +88,7 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
                 with
                   wallets
                   selected=wallet_selected
+                  network
                   busy
                   error
                 forward
@@ -94,12 +96,14 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
                   unlock_submit
                   login_skip
                   go_restore
+                  go_networks
             HubStep.password
-              PasswordScreen #password busy=busy error=error
+              PasswordScreen #password network=network busy=busy error=error
                 forward
                   password_submit
                   go_restore
                   login_skip
+                  go_networks
             // The two ceremony steps read the phrase the backend is holding
             // rather than any app state — the words are never a reading this
             // process keeps, and both screens are gone the moment it lets go.
@@ -132,18 +136,14 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
                 with
                   networks
                   selected
-                  hidden
                   busy
                   error
-                  active_wallet=wallet_selected
                 forward
                   pick_network
                   open_network_submit
                   forget_network_submit
                   connect_remote_submit
-                  restore_hidden_submit
                   go_join
-                  go_wallets
             HubStep.provisioning
               ProvisioningScreen
                 with
@@ -239,19 +239,24 @@ component HubBrand(title:str, caption:str)
             align-x=center
             @text-caption
 
-// WALLETS. Returning device: the keystore's named identities, one row each.
+// WALLETS. The picked network's keystore: its named identities, one row each.
 // The selected row is the one that opens — its password field is right there,
 // so choosing an identity and unlocking it is one gesture, not two screens.
 // Reads never need a wallet, so the quiet way past a forgotten password stays
-// one click.
-component WalletsScreen(wallets:[WalletInfo], selected:str, busy:bool, error:str)
+// one click, and the network list is one click back.
+component WalletsScreen(wallets:[WalletInfo], selected:str, network:str, busy:bool, error:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
     login_skip
     go_restore
+    go_networks
   col #root w=428.0 gap=0.0
-    HubBrand title="Choose a wallet" caption="Unlock an identity to sign what you do."
+    BackToNetworks
+      forward
+        go_networks
+    space w=fill h=16.0
+    HubBrand title="Choose a wallet" caption=wallet_caption(network)
     box w=fill pt=22.0
       scroll
         with
@@ -451,25 +456,30 @@ component WalletRow(row:WalletInfo, selected:bool, busy:bool)
         hovered bg=subtle text=fg
         pressed bg=rail_hover text=fg
 
-// PASSWORD. First run: one password, and the device key is minted under it.
-// The mint's 24 words are shown on the next step and confirmed on the one
-// after — they are the ONLY backup this key has once the disk holding it is
-// gone. The authoritative password floor lives in Rust
-// (`password_problem` mirrors the CLI's 8-char minimum); the button stays
-// dead until the pair is acceptable.
-component PasswordScreen(busy:bool, error:str)
+// PASSWORD. A network with no wallet yet: one password, and the device key
+// for that network is minted under it into its keystore. The mint's 24 words
+// are shown on the next step and confirmed on the one after — they are the
+// ONLY backup this key has once the disk holding it is gone. The
+// authoritative password floor lives in Rust (`password_problem` mirrors the
+// CLI's 8-char minimum); the button stays dead until the pair is acceptable.
+component PasswordScreen(network:str, busy:bool, error:str)
   emits
     password_submit(str)
     go_restore
     login_skip
+    go_networks
   state
     pw = ""
     pw2 = ""
   col #root w=428.0 gap=0.0
+    BackToNetworks
+      forward
+        go_networks
+    space w=fill h=16.0
     HubBrand
       with
-        title="Welcome to ducktape"
-        caption="Set a password for this device. It encrypts the key on this disk — the next screen shows the 24 words that are the only way to get that key back."
+        title="Your key on this network"
+        caption=password_caption(network)
     box w=fill pt=26.0
       text "PASSWORD"
         with
@@ -600,13 +610,39 @@ component PasswordScreen(busy:bool, error:str)
             @text-icon_idle
     OnboardingError message=error
 
+// The one row back to the network list, above the wallet screens: the pick
+// is what put them on screen.
+component BackToNetworks()
+  emits
+    go_networks
+  col #root w=fill gap=0.0
+    button -> emit(go_networks)
+      with
+        label="Back"
+        @ghost_action
+        @px-0px
+        @py-0px
+        @rounded-6px
+      row gap=8.0 align=center
+        text "‹"
+          with
+            size=14.0
+            wrap=none
+            @text-meta
+        text "NETWORKS"
+          with
+            size=11.0
+            wrap=none
+            font=code_medium
+            @text-meta
+
 // THE PHRASE, SHOWN EXACTLY ONCE. The mint picked 24 words and no key file
 // exists yet — the confirm on the next screen is what seals it — and this is
 // the only screen in the app that will ever draw them: there is no copy
 // button (a phrase in the clipboard is a phrase in every paste target), no
 // skip, and no re-show. Off the app, someone who still HAS the key file and
 // its password can read them back with
-// `ducktape user key reveal --key $DUCKTAPE_HOME/keys/<name>.key` — which
+// `ducktape user key reveal --key <workspace>/keys/<name>.key` — which
 // is exactly the case this screen exists for the loss of. The rows are
 // paired 1↔13 … 12↔24 in Rust because Ice cannot index a list, and because
 // twelve rows fit this window and twenty-four do not.
@@ -1097,17 +1133,17 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
     OnboardingError message=error
 
 // NETWORKS. The launch window's home: every network this device knows —
-// workspaces on disk and saved remote endpoints — most recently used first.
-// An empty list is the old welcome screen wearing its real name.
-component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:bool, error:str, active_wallet:str)
+// workspaces under the ducktape home and saved remote endpoints — most
+// recently used first. An empty list is the old welcome screen wearing its
+// real name. Opening a row is what loads its wallets: the identity comes
+// after the network, because it lives in the network's workspace.
+component NetworksScreen(networks:[HubNetwork], selected:str, busy:bool, error:str)
   emits
     pick_network(str)
     open_network_submit
-    forget_network_submit(str, str)
+    forget_network_submit(str)
     go_join
-    go_wallets
     connect_remote_submit(str)
-    restore_hidden_submit
   state
     remote = ""
   col #root w=428.0 gap=0.0
@@ -1177,37 +1213,12 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
             font=display
             @text-primary
         box w=fill pt=6.0
-          text "Local workspaces on this device and saved remote endpoints."
+          text "Local workspaces on this device and saved remote endpoints. Opening one asks for its wallet."
             with
               w=fill
               size=13.0
               line-h=1.5
               @text-caption
-        // Which identity the next console signs as, and the one click back to
-        // the wallet list. A network pick that silently signs as whoever was
-        // active last is the thing this line exists to stop.
-        box w=fill pt=12.0
-          row
-            with
-              w=fill
-              gap=9.0
-              align=center
-            text active_wallet_label(active_wallet)
-              with
-                w=fill
-                size=11.0
-                wrap=none
-                font=code_medium
-                @text-meta
-            button "Switch wallet" #switch-wallet -> emit(go_wallets)
-              with
-                disabled=busy
-                h=24.0
-                p=4.0
-                @ghost_action
-              active bg=transparent text=muted r=7.0
-              hovered bg=fg/9 text=fg
-              pressed bg=fg/14
         box w=fill pt=16.0
           scroll
             with
@@ -1285,34 +1296,16 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
             @control
           active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
           disabled value=hint
-    // Forgetting is not a one-way door: every hidden local network comes
-    // back with one click. Lives OUTSIDE the empty/non-empty branch —
-    // forgetting the ONLY network empties the list, and that is exactly
-    // when the door must stay visible.
-    if hidden > 0
-      box w=fill pt=10.0
-        col
-          with
-            w=fill
-            gap=0.0
-            align=center
-          button "Restore hidden networks" #restore-hidden -> emit(restore_hidden_submit)
-            with
-              disabled=busy
-              h=24.0
-              p=4.0
-              @ghost_action
-            active bg=transparent text=muted r=7.0
-            hovered bg=fg/9 text=fg
-            pressed bg=fg/14
     OnboardingError message=error
 
 // One network row: the liveness dot, the name, where it lives, and — while
-// selected — the honest state line and the forget control.
+// selected — the honest state line, and for a saved remote the forget
+// control. A local network is a directory under the ducktape home, which
+// this app does not delete, so it has nothing to forget.
 component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
   emits
     pick_network(str)
-    forget_network_submit(str, str)
+    forget_network_submit(str)
   col #root w=fill gap=0.0
     if selected
       col w=fill gap=0.0
@@ -1379,20 +1372,21 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
           active bg=selected_row text=fg border=primary border-w=1.5 r=11.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
-        box
-          with
-            w=fill
-            pt=4.0
-            align-x=end
-          button "Forget" -> emit(forget_network_submit, row.id, row.kind)
+        if row.kind == "remote"
+          box
             with
-              disabled=busy
-              h=22.0
-              p=4.0
-              @ghost_action
-            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-            hovered bg=danger_bg text=fg
-            pressed bg=danger_bg text=fg
+              w=fill
+              pt=4.0
+              align-x=end
+            button "Forget" -> emit(forget_network_submit, row.id)
+              with
+                disabled=busy
+                h=22.0
+                p=4.0
+                @ghost_action
+              active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+              hovered bg=danger_bg text=fg
+              pressed bg=danger_bg text=fg
     if !selected
       button -> emit(pick_network, row.id)
         with
@@ -1675,25 +1669,9 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
     copy_onboarding_invite
     enter_console
   col #root w=428.0 gap=0.0
-    button -> emit(go_networks)
-      with
-        label="Back"
-        @ghost_action
-        @px-0px
-        @py-0px
-        @rounded-6px
-      row gap=8.0 align=center
-        text "‹"
-          with
-            size=14.0
-            wrap=none
-            @text-meta
-        text "NETWORKS"
-          with
-            size=11.0
-            wrap=none
-            font=code_medium
-            @text-meta
+    BackToNetworks
+      forward
+        go_networks
     box w=fill pt=16.0
       row
         with
@@ -1938,25 +1916,9 @@ component JoinScreen(busy:bool, error:str, invite_empty:bool)
     go_networks
     join_network_submit
   col #root w=428.0 gap=0.0
-    button -> emit(go_networks)
-      with
-        label="Back"
-        @ghost_action
-        @px-0px
-        @py-0px
-        @rounded-6px
-      row gap=8.0 align=center
-        text "‹"
-          with
-            size=14.0
-            wrap=none
-            @text-meta
-        text "NETWORKS"
-          with
-            size=11.0
-            wrap=none
-            font=code_medium
-            @text-meta
+    BackToNetworks
+      forward
+        go_networks
     box w=fill pt=16.0
       text "Join a network"
         with

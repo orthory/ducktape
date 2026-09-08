@@ -120,6 +120,7 @@ async fn run(
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
     let providers = provider_host::discover(
         &node_key,
+        &workspace_config::capability_dir(&service.workspace),
         Some(output_sink(line_tx)),
         // cloned: `discover` consumes the backend, and the teardown below needs
         // the same socket to sweep this instance's containers through.

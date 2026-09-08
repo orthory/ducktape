@@ -8,7 +8,8 @@ state
   hub_step:HubStep = HubStep.loading
   hub_networks:[HubNetwork] = []
   hub_selected = ""
-  hub_hidden:i64 = 0
+  // THE PICKED NETWORK'S wallets — its workspace's keystore, loaded on the
+  // pick and empty until one is made; a wallet is an identity on one network.
   hub_wallets:[WalletInfo] = []
   hub_wallet_selected = ""
   onboarding_name = ""

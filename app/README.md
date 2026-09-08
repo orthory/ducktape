@@ -9,17 +9,22 @@ make views                  # the tabs: wasm views staged under target/views
 cargo run -p ducktape-app
 ```
 
-The RPC endpoint stays editable in the app and wins whenever it is set; left
-empty it resolves `DUCKTAPE_NODE`, else the active workspace's http port from
-the CLI registry (`<ducktape home>/registry.json`), else
+The launch window lists the workspaces under the ducktape home (one
+directory per network, `$DUCKTAPE_HOME` when set, else `~/.ducktape`) and the
+remote endpoints it has saved; picking one opens that workspace's keystore.
+An RPC endpoint typed in wins whenever it is set; left empty it resolves
+`DUCKTAPE_NODE`, else the one workspace under the home, else
 `http://127.0.0.1:8844`. Chat + Pages hydrate over HTTP after the resumable
 `module:chat` and `module:pages` WebSocket topics are active, then rehydrate on
 committed changes. Writes sign with the encrypted key at `DUCKTAPE_USER_KEY`,
-else the keystore's active wallet (`<ducktape home>/keys/<name>.key`); no
-active wallet is a refusal, not a guess — pick one in the launch window.
-`<ducktape home>` is `$DUCKTAPE_HOME` when set, else `~/.ducktape`. Set
-`DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app binary nor on
-`PATH`.
+else the picked workspace's active wallet (`<workspace>/keys/<name>.key`); no
+active wallet is a refusal, not a guess — unlock one in the launch window.
+The app's own state — its preferences, its log, its forge mirrors — lives in
+the platform's application directories (`~/.config`, `~/.local/state` and
+`~/.cache` on Linux, `~/Library/Application Support`, `~/Library/Logs` and
+`~/Library/Caches` on macOS; an `XDG_*` variable wins on either), never under
+the home. Set `DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app
+binary nor on `PATH`.
 
 ## Module-owned views
 

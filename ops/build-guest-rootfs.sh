@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Build the shared guest artifacts every run's microVM boots from: the kernel
-# and one read-only ext4 rootfs.
+# Build one workspace's guest artifacts, which every run of that network's
+# microVM boots from: the kernel and one read-only ext4 rootfs.
 #
-#   ops/build-guest-rootfs.sh                 # -> ~/.ducktape/guest
-#   OUT=~/guest ops/build-guest-rootfs.sh     # anywhere writable
-#   ROOTFS_SETUP=/path/to/setup.sh ops/build-guest-rootfs.sh [setup arguments]
+#   OUT=<workspace>/guest ops/build-guest-rootfs.sh
+#   ROOTFS_SETUP=/path/to/setup.sh OUT=… ops/build-guest-rootfs.sh [setup arguments]
 #     Linux installs the repository's pinned Rust and wasm-tools by default
 #     (requires Bubblewrap). ROOTFS_SETUP replaces that setup; an empty value
 #     builds only the base image. Arguments are passed to a custom hook.
 #
-# The default is where `node init` writes a fresh [sandbox] table
-# (workspace-config's `default_guest_dir`) — build here and the node already
-# points at it. Under the operator's home because this build is rootless.
+# OUT is required and is a WORKSPACE's guest directory: a guest is per
+# workspace (two networks on one box share no image), and the workspace's
+# [sandbox] table names no path because `<workspace>/guest` is where its node
+# looks. `ducktape node sandbox` prints the exact invocation for a workspace.
+# Rootless, so it builds under the operator's own directories.
 #
 # ROOTLESS on purpose, start to finish. `unsquashfs -no-xattrs` extracts the
 # base without needing privileges and `mke2fs -d` builds the image without ever
@@ -19,7 +20,7 @@
 # root.
 #
 # NO AGENT CLI GOES IN, and that is the point: this image is a base, not an
-# install target. The CLIs a node lends live in `~/.ducktape/executors`
+# install target. The CLIs a node lends live in `<workspace>/executors`
 # (`ducktape agent install`) and the node derives its own read-only image from
 # that directory, mounted at /opt/duck/bin per run. Baking them in here instead
 # made this 500 MB build the unit of installation and gave "which CLIs does
@@ -36,11 +37,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${OUT:-${DUCKTAPE_HOME:-$HOME/.ducktape}/guest}"
-# Beside the output, never under /tmp: the extracted base is ~1 GB and /tmp on
-# this class of host is both memory-backed and periodically reaped — a reaped
-# cache silently turns every rebuild into a fresh 250 MB download.
-WORK="${WORK:-$OUT/.build}"
+OUT="${OUT:?set OUT=<workspace>/guest — a guest is built per workspace}"
+# The download and extraction cache, under the repository's target dir: not
+# under the workspace, which is disposable (a `make dev` lap founds a fresh
+# one, and re-fetching 250 MB per lap is not a rebuild), and never under /tmp,
+# which on this class of host is both memory-backed and periodically reaped.
+WORK="${WORK:-$HERE/target/guest-build}"
 
 if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   ROOTFS_SETUP="$HERE/ops/guest-rust-tools.sh"
@@ -213,8 +215,6 @@ RUNTIME=firecracker
 
 say "rootfs: $(du -h "$IMG" | cut -f1) -> $IMG"
 echo
-echo "Point the node at these with:"
+echo "A node whose workspace holds these under guest/ boots them under:"
 echo "  [sandbox]"
 echo "  runtime = \"$RUNTIME\""
-echo "  kernel  = \"$OUT/vmlinux\""
-echo "  rootfs  = \"$IMG\""

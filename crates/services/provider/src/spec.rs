@@ -36,8 +36,8 @@
 //! a spec is EXECUTING CODE by proxy. specs are operator-trusted configuration
 //! — the same trust class as a shell profile or systemd unit. they load from
 //! exactly two places, both local and operator-controlled: the specs embedded
-//! in this crate at compile time, and `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `<ducktape home>/capabilities`, so `$DUCKTAPE_HOME` moves it). specs are
+//! in this crate at compile time, and the workspace's own `capabilities/`
+//! directory, handed to `discover` by the daemon serving it. specs are
 //! NEVER fetched from the network, and nothing consensus-side may ever read
 //! one (host-local files are non-deterministic input; the consensus capability
 //! module sees only the announced TAGS, never the specs behind them).

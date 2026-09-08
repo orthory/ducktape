@@ -5,10 +5,10 @@
 # /v1/admin/shutdown first, then a sweep that admits only `ducktape node run`
 # and `ducktape service run` processes whose command line names the workspace
 # dir — a recycled pid, or an editor open on a log in here, must never be
-# taken down), deletes <ducktape home>/workspaces/<id>, and
-# drops the entry from <ducktape home>/registry.json, handing "active" to
-# another workspace when the demo held it. Other workspaces are untouched.
-# The home is $DUCKTAPE_HOME when set, else ~/.ducktape.
+# taken down), then deletes <ducktape home>/<id> — the whole network: its
+# config, keystore, guest images, executors and state. Other workspaces under
+# the home are untouched. The home is $DUCKTAPE_HOME when set, else
+# ~/.ducktape.
 #
 # If `make demo-app` is still running it keeps serving its loopback port — it's
 # a plain foreground process you own; Ctrl-C it yourself. The route it served
@@ -17,14 +17,13 @@ set -uo pipefail
 
 ID="${DEMO_WORKSPACE_ID:-demo}"
 # this script kills by path match and rm -rfs the workspace dir — refuse an id
-# that could walk WSDIR out of the workspaces root (e.g. "../..").
+# that could walk WSDIR out of the home (e.g. "../..").
 case "$ID" in ""|*/*|*..*|.*) printf '\033[31m[demo-clear] unsafe workspace id: %s\033[0m\n' "$ID" >&2; exit 1;; esac
 # the SAME root demo-seed wrote into. Hardcoding $HOME here made the
 # documented inverse of `make demo-seed` report "no demo workspace" and
 # aim its rm -rf at a root the seed never touched.
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
-REG="$DUCK/registry.json"
+WSDIR="$DUCK/$ID"
 
 log(){ printf '\033[36m[demo-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-clear] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -34,7 +33,15 @@ die(){ printf '\033[31m[demo-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 # sentence would truncate at an escaped quote, which is fine for a log line.
 json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 
-command -v bun >/dev/null || die "bun is required"
+# The loopback of a node.toml `http_listen`'s address family, port kept: the
+# bind is a wildcard by default, which no client can dial as written.
+loopback_base(){
+  local port="${1##*:}" host="${1%:*}"
+  case "$host" in
+    \[*) printf '[::1]:%s' "$port" ;;
+    *) printf '127.0.0.1:%s' "$port" ;;
+  esac
+}
 
 # pids of LIVE ducktape processes serving THIS workspace: the node
 # (`ducktape node run`) and the service daemons (`ducktape service run`) whose
@@ -64,33 +71,19 @@ managed_pids(){
 }
 
 # ── 1. anything to clear? ──────────────────────────────────────
-IN_REGISTRY="$(bun - "$REG" "$ID" 2>/dev/null <<'JS'
-import { existsSync, readFileSync } from "node:fs";
-const [path, id] = process.argv.slice(2);
-if (!existsSync(path)) process.exit(0);
-try {
-  const registry = JSON.parse(readFileSync(path, "utf8"));
-  const listed = (registry.workspaces ?? []).some((item) => item.id === id);
-  if (listed || registry.active === id) console.log("yes");
-} catch {}
-JS
-)"
-if [ ! -d "$WSDIR" ] && [ -z "$IN_REGISTRY" ]; then
-  log "nothing to clear — no '$ID' workspace on disk or in the registry"
+if [ ! -d "$WSDIR" ]; then
+  log "nothing to clear — no '$ID' workspace under $DUCK"
   exit 0
 fi
 
 # ── 2. stop the workspace's node, graceful first ───────────────
-HTTP_PORT="$(bun - "$REG" "$ID" 2>/dev/null <<'JS'
-import { readFileSync } from "node:fs";
-const [path, id] = process.argv.slice(2);
-try {
-  const port = JSON.parse(readFileSync(path, "utf8")).workspaces
-    ?.find((item) => item.id === id)?.ports?.http;
-  if (Number.isInteger(port) && port > 0) console.log(port);
-} catch {}
-JS
-)"
+# the node's app endpoint, from the workspace's own config — the one place it
+# is written.
+LISTEN=""
+if [ -f "$WSDIR/node.toml" ]; then
+  LISTEN="$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
+    "$WSDIR/node.toml" | head -1 | tr -d '[:space:]')"
+fi
 # SAY SO on every path that does not gracefully stop the node. Falling silently
 # through to the SIGTERM sweep looks EXACTLY like a graceful stop that worked,
 # and hides which of these happened: no token on disk (DUCKTAPE_ADMIN=off mints
@@ -100,8 +93,8 @@ JS
 # user key's password and is more than this script should carry.
 # The sweep below still stops the node either way; these lines are why it took a
 # signal to do it.
-if [ -z "$HTTP_PORT" ]; then
-  log "no http port in the registry for '$ID' — using the pid sweep"
+if [ -z "$LISTEN" ]; then
+  log "no http endpoint in $WSDIR/node.toml — using the pid sweep"
 elif [ ! -r "$WSDIR/admin.token" ]; then
   log "no readable $WSDIR/admin.token — using the pid sweep"
 else
@@ -113,7 +106,7 @@ else
   # refusal in that body (`{"error":…,"reason":…}`, crates/noded/src/admin.rs).
   # Print that token verbatim: a reason invented here greps to nothing.
   RESPONSE="$(curl -s -m 2 -w '\n%{http_code}' \
-    -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" \
+    -X POST "http://$(loopback_base "$LISTEN")/v1/admin/shutdown" \
     -H "x-ducktape-admin-token: $(cat "$WSDIR/admin.token")" 2>/dev/null)"
   CODE="${RESPONSE##*$'\n'}"
   # BOTH fields the node sent: `reason` is the greppable token and `error` is
@@ -149,29 +142,13 @@ fi
 [ -z "$(managed_pids)" ] || die "a '$ID' node or service is still running and could not be stopped — stop it manually, then re-run"
 
 # ── 3. delete the workspace dir ────────────────────────────────
-if [ -d "$WSDIR" ]; then
-  # A plain rm is enough now. This used to need a `podman unshare` pass to
-  # unmount a container storage overlay left under the workspace; a run's
-  # storage is a microVM's own block device, so there is nothing under here
-  # mounted in another user namespace.
-  rm -rf "$WSDIR" 2>/dev/null
-  [ ! -d "$WSDIR" ] || die "could not delete $WSDIR — stop its services and remove the remaining files"
-  log "deleted $WSDIR"
-fi
-
-# ── 4. drop it from the registry (other workspaces untouched) ──
-if [ -n "$IN_REGISTRY" ]; then
-  NEXT="$(bun - "$REG" "$ID" <<'JS'
-import { readFileSync, writeFileSync } from "node:fs";
-const [path, id] = process.argv.slice(2);
-const registry = JSON.parse(readFileSync(path, "utf8"));
-registry.workspaces = (registry.workspaces ?? []).filter((item) => item.id !== id);
-if (registry.active === id) registry.active = registry.workspaces[0]?.id ?? null;
-writeFileSync(path, JSON.stringify(registry, null, 2));
-console.log(registry.active ?? "none");
-JS
-)" || die "registry update failed — $REG"
-  log "removed '$ID' from the registry (active workspace: $NEXT)"
-fi
+# A plain rm is enough. This used to need a `podman unshare` pass to unmount
+# a container storage overlay left under the workspace; a run's storage is a
+# microVM's own block device, so there is nothing under here mounted in
+# another user namespace. The directory IS the network's whole footprint on
+# this box: nothing outside it lists or names the workspace.
+rm -rf "$WSDIR" 2>/dev/null
+[ ! -d "$WSDIR" ] || die "could not delete $WSDIR — stop its services and remove the remaining files"
+log "deleted $WSDIR"
 
 printf '\033[32m[demo-clear] done.\033[0m\n'

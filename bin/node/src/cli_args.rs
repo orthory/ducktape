@@ -24,7 +24,7 @@ pub enum NodeCmd {
 pub enum OpCmd {
     /// generate or reuse a node identity (prints its pubkey)
     Key(KeyArgs),
-    /// found a new network (default dir: ~/.ducktape/workspaces/<chain-id>)
+    /// found a new network (default dir: ~/.ducktape/<chain-id>)
     Init(InitArgs),
     /// mint a single-use bearer invite blob
     Invite(InviteArgs),
@@ -236,6 +236,79 @@ impl Selector {
 /// Deliberately a different question from [`Selector`], which resolves a
 /// workspace's node.toml PATH for the daemon that IS the node.
 ///
+/// which WORKSPACE a verb reads or edits — the directory itself, for the verb
+/// families whose subject is a file in it (a service grant, a gateway route,
+/// the keystore) rather than a node to dial. An explicit `--workspace` wins,
+/// else `-n/--network` names one under the ducktape home, else the lone
+/// workspace on the box.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WorkspaceArgs {
+    /// this node's config file (`ducktape node run --config`'s twin)
+    #[arg(long, value_name = "FILE", global = true)]
+    pub(crate) config: Option<PathBuf>,
+    /// explicit workspace dir (wins over -n)
+    #[arg(long, value_name = "DIR", global = true)]
+    pub(crate) workspace: Option<PathBuf>,
+    /// a workspace's chain id (`ducktape node list`)
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
+    pub(crate) network: Option<String>,
+}
+
+impl WorkspaceArgs {
+    /// the node config this workspace's node is described by.
+    ///
+    /// `--config` exists because a workspace dir does not always CONTAIN its
+    /// config: the dev shape's workspace is its `storage_dir`, named BY a
+    /// config that lives elsewhere. `ducktape node run --config` has always
+    /// taken the file directly; a daemon serving that node needs the same.
+    pub(crate) fn config_file(&self) -> Result<PathBuf, String> {
+        match &self.config {
+            Some(file) => Ok(file.clone()),
+            None => Ok(self.dir()?.join("node.toml")),
+        }
+    }
+
+    /// the workspace directory — the config's own answer, so the CLI and the
+    /// node can never disagree about which directory a file lives in.
+    pub(crate) fn dir(&self) -> Result<PathBuf, String> {
+        if let Some(file) = &self.config {
+            // the keyless read: every verb on this group answers "which
+            // workspace?" without ever opening the node's identity.
+            return Ok(config::resolve_service(file)?.workspace);
+        }
+        if let Some(dir) = &self.workspace {
+            return Ok(dir.clone());
+        }
+        if let Some(needle) = &self.network {
+            let (dir, _http) = config::resolve_network(needle)?;
+            return Ok(dir);
+        }
+        // the bottom rung `node run` and `node status` already stand on: with
+        // exactly one workspace on the box there is nothing to disambiguate,
+        // and demanding a selector here made `service list` the only read verb
+        // on the box that refused to answer a machine with one network on it.
+        let mut workspaces = config::list_workspaces()?;
+        match workspaces.len() {
+            // `list_workspaces` yields the node.toml PATH, not the directory —
+            // these verbs want the workspace that CONTAINS it.
+            1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
+            0 => Err(
+                "no workspace: found one with `ducktape node init --name <name>` \
+                      or `ducktape node join <invite>`"
+                    .into(),
+            ),
+            _ => Err(format!(
+                "several workspaces exist — pick one with -n:\n{}",
+                workspaces
+                    .iter()
+                    .map(|(chain_id, _)| format!("  {chain_id}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+        }
+    }
+}
+
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
 /// family's host targeting — which PEER runs the work, a raw 64-hex node key —
 /// is `--host-node`, because it is a different type of input.

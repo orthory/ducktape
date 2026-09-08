@@ -111,17 +111,18 @@ pub struct NodeToml {
 /// compute node; inside it every key is required. there is deliberately no
 /// bare/"direct" runtime — a provider run never executes directly on the
 /// host, so the only selectable adapters are the audited in-tree ones.
+///
+/// It names no path. The guest kernel and rootfs every run boots are the
+/// workspace's own (`<workspace>/guest/`, `crate::guest_dir`), shared
+/// read-only across that workspace's concurrent runs, and the agent CLIs a
+/// run may exec are `<workspace>/executors/` — so a table copied between
+/// workspaces or machines points at nothing that is not there.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxToml {
     /// the isolation adapter: `"firecracker"` (Linux) or `"vz"` (macOS) — one
     /// microVM per run either way.
     pub runtime: String,
-    /// the guest kernel every run boots. Shared, read-only, immutable.
-    pub kernel: std::path::PathBuf,
-    /// the guest root filesystem image. Shared across every concurrent run and
-    /// attached READ-ONLY, so one buyer's run cannot corrupt another's guest.
-    pub rootfs: std::path::PathBuf,
     /// announced capacity; `0` = probe the host.
     pub cores: u64,
     /// announced capacity in GiB; `0` = probe the host.
@@ -470,18 +471,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             );
             keyline(
                 &mut s,
-                "kernel",
-                format_args!("\"{}\"", sb.kernel.display()),
-                "the guest kernel every run boots",
-            );
-            keyline(
-                &mut s,
-                "rootfs",
-                format_args!("\"{}\"", sb.rootfs.display()),
-                "the shared read-only guest root filesystem",
-            );
-            keyline(
-                &mut s,
                 "cores",
                 format_args!("{}", sb.cores),
                 "announced capacity; 0 = probe the host",
@@ -494,20 +483,18 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             );
         }
         None => {
-            // the commented-out template names THIS OS's adapter AND this
-            // operator's guest dir, so uncommenting it on the machine `node
-            // init` ran on is enough.
+            // the commented-out template names THIS OS's adapter, so
+            // uncommenting it on the machine `node init` ran on is enough; the
+            // images it boots are this workspace's own guest/ directory.
             let runtime = sandbox_host::Vmm::platform_default().config_token();
-            let guest = super::default_guest_dir()?.display().to_string();
             let _ = writeln!(
                 s,
                 "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
                  # runtime: \"{runtime}\" — one microVM per run; runs never execute\n\
-                 # bare on the host. Build the two images with ops/build-guest-rootfs.sh.\n\
+                 # bare on the host. The two images it boots live in this workspace's\n\
+                 # guest/ directory: OUT=<workspace>/guest ops/build-guest-rootfs.sh\n\
                  #[sandbox]\n\
                  #runtime = \"{runtime}\"\n\
-                 #kernel = \"{guest}/vmlinux\"\n\
-                 #rootfs = \"{guest}/rootfs.ext4\"\n\
                  #cores = 0\n\
                  #mem_gb = 0"
             );
@@ -670,8 +657,7 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
-            + "\n[sandbox]\nruntime = \"firecracker\"\nkernel = \"/g/vmlinux\"\n\
-               rootfs = \"/g/rootfs.ext4\"\ncores = 4\nmem_gb = 0\n";
+            + "\n[sandbox]\nruntime = \"firecracker\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
         let p = merged_plumbing(&dir, &PlumbingOverrides::default()).expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");

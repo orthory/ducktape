@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
-use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
+use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use runs::{ACTION_CHAT_POST, ModelMsg, ResourceCaps};
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
 
@@ -123,17 +123,11 @@ impl DogfoodProvider {
         serde_json::to_string(&["-c", &script]).expect("provider argv")
     }
 
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (
-                "DUCKTAPE_EXECUTOR_DIR".into(),
-                self.executors.display().to_string(),
-            ),
-        ]
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
 }
 
@@ -153,24 +147,6 @@ fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
         .split_once('|')
         .unwrap_or_else(|| panic!("{HEAD_FILE} at {commit} is `pwd|HEAD`, got {line:?}"));
     (cwd.to_string(), head.to_string())
-}
-
-/// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
-fn hermetic_env(root: &Path, name: &str) -> Vec<(String, String)> {
-    let empty = root.join(name).join("specs");
-    std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let executors = root.join(name).join("executors");
-    std::fs::create_dir_all(&executors).expect("empty executor dir");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            executors.display().to_string(),
-        ),
-    ]
 }
 
 fn boot(cluster: &mut Cluster) {
@@ -482,13 +458,14 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     // any (the grant); the compute daemon needs both and refuses to boot without
     // the table. Appended LAST — nothing may follow a toml table header.
     cluster.extra_toml.extend(sandbox_toml());
-    cluster.env[0] = [
-        hermetic_env(fixtures.path(), "node0"),
-        vec![runs_root_env.clone()],
-    ]
-    .concat();
-    cluster.env[1] = [provider.env(), vec![runs_root_env.clone()]].concat();
-    cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
+    // an EMPTY stage keeps nodes 0 and 2 out of provider discovery (see
+    // dispatch_e2e).
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(provider.sandbox());
+    cluster.sandbox[2] = Some(SandboxStage::default());
+    cluster.env[0] = vec![runs_root_env.clone()];
+    cluster.env[1] = vec![runs_root_env.clone()];
+    cluster.env[2] = vec![runs_root_env];
     boot(&mut cluster);
 
     // node 1 is the tag's ONLY provider, so every lease lands there.

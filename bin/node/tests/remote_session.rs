@@ -30,7 +30,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, create_account, hex, sandbox_toml, skip_unless_sandboxed, submit_frame};
+use common::{
+    Cluster, SandboxStage, create_account, hex, sandbox_toml, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use gateway::{
@@ -100,7 +102,7 @@ fn signed_set_credential(
 
 /// An operator capability dir whose sole provider, `echo`, runs a bare `cat` on
 /// the pty — a scripted child that echoes stdin, no real provider or credential
-/// needed. Its private executor directory carries the actual Linux binary
+/// needed. Its private executor directory carries the guest's own `cat`,
 /// mounted at `/opt/duck/bin/cat` in the host's session microVM.
 fn echo_fixture() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("echo provider tempdir");
@@ -108,15 +110,7 @@ fn echo_fixture() -> tempfile::TempDir {
     let executors = dir.path().join("executors");
     std::fs::create_dir_all(&specs).expect("echo spec directory");
     std::fs::create_dir_all(&executors).expect("echo executor directory");
-    let source = workspace_config::executor_dir()
-        .expect("the configured guest-compatible executor directory")
-        .join("cat");
-    std::fs::copy(&source, executors.join("cat")).unwrap_or_else(|error| {
-        panic!(
-            "install a guest-compatible Linux cat in {} before running remote_session: {error}",
-            source.display()
-        )
-    });
+    common::guest_binary("/usr/bin/cat", &executors.join("cat"));
     std::fs::write(
         specs.join("echo.toml"),
         // An empty interactive argv launches the installed cat bare; it copies
@@ -247,31 +241,17 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // the host's sole provider is the scripted `cat`; keep the dir alive for the
     // node's whole lifetime.
     let fixture = echo_fixture();
-    let empty = fixture.path().join("empty");
-    std::fs::create_dir_all(&empty).expect("empty guest provider directory");
 
     // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run
     // a terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
     cluster.extra_toml = sandbox_toml();
-    cluster.env[0] = vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        ("DUCKTAPE_EXECUTOR_DIR".into(), empty.display().to_string()),
-    ];
-    cluster.env[1] = vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            fixture.path().join("specs").display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            fixture.path().join("executors").display().to_string(),
-        ),
-    ];
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(SandboxStage {
+        capabilities: Some(fixture.path().join("specs")),
+        executors: Some(fixture.path().join("executors")),
+    });
     for index in 0..2 {
         cluster.spawn(index);
     }

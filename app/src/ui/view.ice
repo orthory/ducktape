@@ -18,7 +18,6 @@ view
           wallet_selected=hub_wallet_selected
           networks=hub_networks
           selected=hub_selected
-          hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
           steps=provision_steps
@@ -49,14 +48,12 @@ view
           restore_submit -> restore_submit _ _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
-          forget_network_submit -> forget_network_submit _ _
+          forget_network_submit -> forget_network_submit _
           go_join -> go_join
           go_networks -> go_networks
-          go_wallets -> go_wallets
           join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
-          restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
         restore_phrase:
           input "" #restore-words <-> restore_words

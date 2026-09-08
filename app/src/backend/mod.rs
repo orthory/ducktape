@@ -386,6 +386,7 @@ impl Default for LiveUpdate {
 }
 
 mod agent;
+mod app_dirs;
 mod bell;
 mod chat;
 mod document;
@@ -409,6 +410,7 @@ mod view_artifact;
 pub mod view_source;
 
 pub use agent::*;
+pub use app_dirs::app_log_path;
 pub use bell::*;
 pub use chat::*;
 pub use document::*;

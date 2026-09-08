@@ -9,9 +9,6 @@ version.workspace = true
 # which replicates WHO provides what; this crate is the machine-local half
 # that actually provides it.
 [dependencies]
-# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
-# zero-dependency leaf so every reader of that root agrees about it.
-ducktape-home = { workspace = true }
 async-trait = { workspace = true }
 # the run's node read lane (src/read_lane.rs): a loopback proxy in front of the
 # node's http listener, bound to one run — same server/client pair the run's
