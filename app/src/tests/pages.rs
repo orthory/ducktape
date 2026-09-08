@@ -521,8 +521,8 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
 /// the block it is about the moment the block sits on the right half.
 #[test]
 fn block_comments_dock_a_rail_beside_the_document() {
-    // the pages screen is its own file now, so the slot slicing is gone.
-    let pages = inlined(include_str!("../ui/screens/pages.ice"));
+    // the pages screen is the `pages` view's now (crates/views/pages).
+    let pages = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     // the rail is a sibling of the document, separated by the same 1px rule
     // every other docked column uses — never an overlay layer.
     let rail = pages
@@ -538,7 +538,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     );
     assert!(!pages.contains("close_block_comments backdrop=transparent"));
     assert!(pages.contains("-> emit(close_block_comments)"));
-    assert!(pages.contains("#page-comment(scope_key(connected_rpc, active_page))"));
+    assert!(pages.contains("#page-comment(active_page)"));
     assert!(!pages.contains("button \"Save\""));
     assert!(!pages.contains("Saving"));
 
@@ -546,7 +546,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     // a per-block menu — the rail was always page-scoped.
     assert!(pages.contains("button label=\"Comments\""));
     assert!(pages.contains("-> emit(toggle_block_comments)"));
-    let components = inlined(include_str!("../ui/components/pages.ice"));
+    let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     assert!(!components.contains("component BlockActionsMenu"));
 
     let handlers = inlined(include_str!("../ui/handlers/pages.ice"));
@@ -561,16 +561,19 @@ fn block_comments_dock_a_rail_beside_the_document() {
     ));
     // Opening a thread rides the thread's OWN anchor — a block-anchored
     // thread opened with the page id is refused by the node.
-    assert!(handlers.contains("on open_block_comment_thread(id, target)"));
+    assert!(handlers.contains("on open_block_comment_thread(event)"));
+    assert!(handlers.contains("let target = event_text(event, \"target\")"));
     // The document wears its comment story: washes from the load, resolve
     // available from the open thread. The editor is handed the BLOCKS and the
     // raw hit list rather than a precomputed line set, because the chip in the
     // margin spells how many threads sit on the line and the count is the
     // repetition in `commented_block_hits` — a precomputed `[i64]` of lines
     // has already thrown it away.
-    assert!(pages.contains(
-        "page_document(page_editor, dark, (loading || !connected), blocks, commented_block_hits)"
-    ));
+    // The editor is the app's, painted by the host into the view's slot
+    // (`crate::pages::surface`) with the blocks and the raw hit list.
+    assert!(pages.contains("extern page_document() #document"));
+    let view = inlined(include_str!("../ui/view.ice"));
+    assert!(view.contains(", blocks, commented_block_hits, caret_comment_target,"));
     assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
 }
 

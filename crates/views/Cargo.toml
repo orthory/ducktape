@@ -10,7 +10,7 @@
 # revision than the host that renders it.
 [workspace]
 resolver = "2"
-members = ["governance", "members", "agents", "node", "explorer", "settings", "files", "shell"]
+members = ["governance", "members", "agents", "node", "explorer", "settings", "files", "pages", "shell"]
 
 [workspace.dependencies]
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "ddc566776b72389ee8ae87abf9d80122a9e695fd" }

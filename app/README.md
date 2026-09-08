@@ -22,10 +22,10 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer, Settings, Files and Shell
-tabs are not native: each is an Ice application under `crates/views`
+The Approvals, Members, Agents, Node, Explorer, Settings, Files, Pages and
+Shell tabs are not native: each is an Ice application under `crates/views`
 (`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `files`,
-`shell`) compiled
+`pages`, `shell`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -50,7 +50,13 @@ the Explorer's workspace search is run by the app on the view's behalf. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
-tells the view which drafts it consumed. The Shell view goes further: its
+tells the view which drafts it consumed. A view may also leave the host a
+whole editor: the Pages document is the app's own `page_document` (its
+buffer, history and save tick never cross), painted into the view's slot
+from what the tab was last drawn with (`pages/surface.rs`); the view's page,
+search and comment drafts leave with the act that reads them, and the app
+hands one back only by moving `seed_rev`.
+The Shell view goes further: its
 composer, its terminal and its answer Markdown are host surfaces, so a task's
 words never cross the wire — the host's composer raises the `send` intent
 itself. The

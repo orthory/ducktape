@@ -22,6 +22,8 @@
 pub mod history;
 pub mod markdown;
 pub mod menu;
+pub mod surface;
+pub use surface::page_document_take;
 pub mod sync;
 
 use std::collections::BTreeMap;
@@ -81,7 +83,7 @@ pub fn comment_anchor_label(
 /// One thread-list row with its document anchor already resolved. The Ice
 /// view reads the scalar; it never clones and searches the whole block list
 /// once per thread.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageCommentThreadRow {
     pub thread: crate::backend::PageCommentThread,
     pub anchor: String,

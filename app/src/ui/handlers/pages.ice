@@ -1,3 +1,111 @@
+// THE PAGES VIEW'S ACTS, one arm per intent (`PagesIntent`). The screen
+// lives in the `pages` view now (crates/views/pages); every handler below
+// this one is reached from here by a `flow` so its body stays where it was.
+// A draft crosses only with the act that reads it: the arm writes it into
+// the app-side field the handler always read, then routes. The three acts
+// that abandon the rail's comment (a pick, a hit, the rail's toggle/close)
+// carry it so the handler can keep it as a recovered draft.
+on pages_view_event(event)
+  match pages_intent(event)
+    PagesIntent.toggle_create
+      page_create_open = !page_create_open
+    PagesIntent.create
+      page_draft = event_text(event, "title")
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> create_page_submit()
+    PagesIntent.choose
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done event_text(event, "id")
+        done -> choose_page _
+    PagesIntent.search
+      page_search_draft = event_text(event, "query")
+      flow
+        from done true
+        done -> search_pages_submit()
+    PagesIntent.clear_search
+      flow
+        from done true
+        done -> clear_page_search()
+    PagesIntent.arm_delete
+      flow
+        from done true
+        done -> arm_page_delete()
+    PagesIntent.disarm_delete
+      flow
+        from done true
+        done -> disarm_page_delete()
+    PagesIntent.delete
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> delete_page_submit()
+    PagesIntent.close_tab
+      flow
+        from done event_text(event, "id")
+        done -> close_doc_tab _
+    // The same echo the chat plane uses to reach this two-arg handler: a
+    // flow route takes one `_`, a run route takes the literal.
+    PagesIntent.open_hit
+      block_comment_draft = event_text(event, "comment_draft")
+      run every duck_echo_str(event_text(event, "page_id")) -> open_page_search_hit(_, "") | external_url_failed _
+    PagesIntent.use_draft
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done event_text(event, "draft")
+        done -> use_orphaned_comment_draft _
+    PagesIntent.discard_draft
+      flow
+        from done event_text(event, "draft")
+        done -> discard_orphaned_comment_draft _
+    // The host-painted document queued one event per intent; take it and
+    // run the document's one edit route on it.
+    PagesIntent.edited
+      flow
+        from done page_document_take()
+        done -> page_edited _
+    PagesIntent.toggle_comments
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> toggle_block_comments()
+    PagesIntent.close_comments
+      block_comment_draft = event_text(event, "comment_draft")
+      flow
+        from done true
+        done -> close_block_comments()
+    PagesIntent.open_thread
+      flow
+        from done event
+        done -> open_block_comment_thread _
+    PagesIntent.resolve
+      flow
+        from done event_flag(event, "resolved")
+        done -> resolve_thread_submit _
+    PagesIntent.more_threads
+      flow
+        from done true
+        done -> load_more_block_threads()
+    PagesIntent.close_thread
+      flow
+        from done true
+        done -> close_block_comment_thread()
+    PagesIntent.more_comments
+      flow
+        from done true
+        done -> load_more_block_comments()
+    PagesIntent.post
+      block_comment_draft = event_text(event, "text")
+      flow
+        from done true
+        done -> post_block_comment_submit()
+    PagesIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
+
 on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
   page_searching = true
@@ -143,8 +251,6 @@ on create_page_submit
 
 on toggle_page_create
   page_create_open = !page_create_open
-  return if !page_create_open
-  task widget focus #workspace-tabs/content/pages/new-page window=window_target(console_win)
 
 on arm_page_delete
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
@@ -164,6 +270,7 @@ on delete_page_submit
 on use_orphaned_comment_draft(draft)
   return if loading || mutation_phase != MutationPhase.idle || !empty(trim(block_comment_draft))
   block_comment_draft = draft
+  pages_seed_rev = pages_seed_rev + 1
   block_comments_open = true
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
 
@@ -268,7 +375,9 @@ on block_threads_failed(cause)
   block_comment_threads_loading = false
   error = cause.message
 
-on open_block_comment_thread(id, target)
+on open_block_comment_thread(event)
+  let id = event_text(event, "id")
+  let target = event_text(event, "target")
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(id)
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = id
@@ -374,6 +483,7 @@ on block_comment_posted(next)
 
 on block_comment_post_failed(cause)
   block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
+  pages_seed_rev = pages_seed_rev + 1
   pending_block_comment = ""
   mutation_phase = mutation_failure_phase(cause.committed)
   block_thread_comments_loading = false
