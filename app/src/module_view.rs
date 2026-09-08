@@ -1720,7 +1720,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 /// the next step, behind the `generation` this registry already keeps).
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
-    let (content, rev, generation, preferred) = {
+    let (content, rev, generation) = {
         let mut locked = mounted.lock().expect("module view lock");
         locked.props = Some(props);
         let generation = locked.generation;
@@ -1728,14 +1728,13 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
             Slot::Loading => return notice("Loading the view…"),
             Slot::Empty => return notice("This module ships no view."),
             Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation, guest.preferred),
+            Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation),
         }
     };
     Element::new(ModuleView {
         mounted,
         generation,
         rev,
-        preferred,
         content,
     })
 }
@@ -1776,13 +1775,8 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
                 Slot::Ready(_) => {}
                 _ => locked.slot = Slot::Loading,
             }
-            locked.generation += 1;
-            Some(spawn_load(
-                module,
-                mounted,
-                locked.generation,
-                snapshot.clone(),
-            ))
+            let generation = locked.start(None);
+            Some(spawn_load(module, mounted, generation, snapshot.clone()))
         })
         .collect()
 }
@@ -1833,16 +1827,16 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
             let active = hashes.get(*module).copied().flatten();
-            if matches!(locked.slot, Slot::Loading) || active == locked.hash {
+            // a load already after this deployment — or after whatever is
+            // active, as a reconnect's is — lands or fails on its own;
+            // starting over on every block would never let it land
+            let waited_for =
+                locked.in_flight && locked.wanted.is_none_or(|wanted| Some(wanted) == active);
+            if waited_for || active == locked.hash {
                 return None;
             }
-            locked.generation += 1;
-            Some(spawn_load(
-                module,
-                mounted,
-                locked.generation,
-                asked_of.clone(),
-            ))
+            let generation = locked.start(active);
+            Some(spawn_load(module, mounted, generation, asked_of.clone()))
         })
         .collect()
 }
@@ -1883,6 +1877,22 @@ struct Mounted {
     /// slot of a deployment without one, or the one that failed to load —
     /// so a block moves it only when the active code moved.
     hash: Option<[u8; 32]>,
+    /// A load is on its way for `generation`, and the deployment it is
+    /// after when a block named one: a block that names it again waits
+    /// for it instead of starting over.
+    in_flight: bool,
+    wanted: Option<[u8; 32]>,
+}
+
+impl Mounted {
+    /// Opens the next generation for a load after `wanted` (None: whatever
+    /// the node holds active), and names it.
+    fn start(&mut self, wanted: Option<[u8; 32]>) -> u64 {
+        self.generation += 1;
+        self.in_flight = true;
+        self.wanted = wanted;
+        self.generation
+    }
 }
 
 enum Slot {
@@ -1911,6 +1921,8 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 props: None,
                 generation: 0,
                 hash: None,
+                in_flight: true,
+                wanted: None,
             }));
             spawn_load(module, &mounted, 0, snapshot);
             mounted
@@ -1934,7 +1946,11 @@ fn spawn_load(
         let loaded = Guest::load(module, asked_of.client.as_ref(), generation, &loading);
         let connection = connection().lock().expect("views rpc");
         let mut locked = loading.lock().expect("module view lock");
-        if locked.generation != generation || connection.rev != asked_of.rev {
+        if locked.generation != generation {
+            return;
+        }
+        locked.in_flight = false;
+        if connection.rev != asked_of.rev {
             return;
         }
         let Mounted { slot, hash, .. } = &mut *locked;
@@ -2027,6 +2043,19 @@ enum Loaded {
     Empty([u8; 32]),
 }
 
+/// Whether `hash` is still the module's active code, asked of the node
+/// right before a load's result is taken as the deployment's word.
+async fn still_active(
+    client: &ducktape_rpc::Client,
+    module: &str,
+    hash: [u8; 32],
+) -> Result<bool, String> {
+    crate::backend::view_source::active_hash(client, module)
+        .await
+        .map(|active| active == Some(hash))
+        .map_err(|error| error.to_string())
+}
+
 /// One `view_source` line per outcome, with the same fields every time —
 /// the canary greps them.
 fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u64, reason: &str) {
@@ -2116,8 +2145,6 @@ struct Guest {
     snapshot: TypedFunc<(), (Result<Vec<u8>, String>,)>,
     restore: Restore,
     init: TypedFunc<(bool,), ()>,
-    /// The size the view's manifest asks for, when it asks.
-    preferred: Option<[f32; 2]>,
 }
 
 /// The asset at `path` in a deployment's map: the canonical relative path,
@@ -2129,16 +2156,9 @@ fn artifact_asset<'a>(
     assets.get(path).map(Vec::as_slice)
 }
 
-/// The limits a view is laid out in: its manifest's preferred size when it
-/// names one, else the tab's.
-fn view_limits(limits: &layout::Limits, preferred: Option<[f32; 2]>) -> layout::Limits {
-    match preferred {
-        Some([width, height]) => limits
-            .width(Length::Fixed(width))
-            .height(Length::Fixed(height)),
-        None => *limits,
-    }
-}
+/// How many distinct missing asset paths a deployment's view is told
+/// about: past this a guest asking a new path every frame is one line.
+const MAX_MISSING_ASSETS: usize = 32;
 
 fn hex_short(hash: &[u8; 32]) -> String {
     hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
@@ -2228,6 +2248,13 @@ impl Guest {
                 return Err(format!("the {module} module is not activated yet"));
             }
             ViewSource::Missing { hash } => {
+                // a removal answered late, after the code moved on, is not
+                // the current deployment's word
+                if !runtime.block_on(still_active(client, module, hash))? {
+                    let reason = "the active code moved while the view was prepared";
+                    logged(Some(&hash), "Failed", reason);
+                    return Err(reason.to_owned());
+                }
                 logged(Some(&hash), "Missing", "");
                 return Ok(Loaded::Empty(hash));
             }
@@ -2239,43 +2266,42 @@ impl Guest {
         };
         let shown = format!("{module} view @ {}", hex_short(&hash));
         let outcome = (|| -> Result<Loaded, String> {
-            // the view drawn, if the deployment is a new one for it; one
-            // mounted but never ticked has no state worth carrying over
-            let drawn = {
+            // the instance in the slot, if the deployment is a new one for
+            // it: the replacement is seated only against that very
+            // instance at that very tick count
+            let against = {
                 let locked = mounted.lock().expect("module view lock");
                 match &locked.slot {
                     Slot::Ready(old) if old.hash == Some(hash) => return Ok(Loaded::Unchanged),
-                    Slot::Ready(old) => old.ticks > 0,
-                    _ => false,
+                    Slot::Ready(old) => Some((old.alive.clone(), old.ticks)),
+                    _ => None,
                 }
             };
             let mut fresh = Self::instantiate(module, &component, &shown)?;
             fresh.deployed(hash, assets);
-            let against = if drawn {
-                let (snapshot, alive, ticks) = {
-                    let mut locked = mounted.lock().expect("module view lock");
-                    let Slot::Ready(old) = &mut locked.slot else {
-                        return Err("the view left while its replacement was prepared".into());
+            match against {
+                // a view drawn carries its state over
+                Some((_, ticks)) if ticks > 0 => {
+                    let snapshot = {
+                        let mut locked = mounted.lock().expect("module view lock");
+                        let Slot::Ready(old) = &mut locked.slot else {
+                            return Err("the view left while its replacement was prepared".into());
+                        };
+                        if !old.settled() {
+                            return Err("the view has pending work; its replacement waits".into());
+                        }
+                        old.snapshot()?
                     };
-                    if !old.settled() {
-                        return Err("the view has pending work; its replacement waits".into());
-                    }
-                    (old.snapshot()?, old.alive.clone(), old.ticks)
-                };
-                wire::Snapshot::decode(&snapshot)?;
-                fresh.restore(&snapshot, &shown)?;
-                fresh.first_frame(&shown)?;
-                Some((alive, ticks))
-            } else {
-                fresh.init(&shown)?;
-                None
-            };
+                    wire::Snapshot::decode(&snapshot)?;
+                    fresh.restore(&snapshot, &shown)?;
+                    fresh.first_frame(&shown)?;
+                }
+                // one mounted but never ticked has no state worth carrying
+                _ => fresh.init(&shown)?,
+            }
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
-            let active = runtime
-                .block_on(view_source::active_hash(client, module))
-                .map_err(|error| error.to_string())?;
-            if active != Some(hash) {
+            if !runtime.block_on(still_active(client, module, hash))? {
                 return Err("the active code moved while the view was prepared".into());
             }
             Ok(match against {
@@ -2303,6 +2329,9 @@ impl Guest {
         self.hash = Some(hash);
         self.assets = assets.clone();
         let module = self.module;
+        // the paths said to be missing, once each — up to a budget, past
+        // which one line says the guest keeps asking and nothing more is
+        // kept or logged
         let missing: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
         let lookup = move |args: &[wire::SurfaceValue]| -> Option<Vec<u8>> {
             let path = match args.first() {
@@ -2310,16 +2339,24 @@ impl Guest {
                 _ => String::new(),
             };
             let found = artifact_asset(&assets, &path).map(<[u8]>::to_vec);
-            if found.is_none() && missing.lock().expect("missing assets").insert(path.clone()) {
-                tracing::info!(
-                    target: "ducktape::app",
-                    module,
-                    hash = %crate::backend::hex_encode(&hash),
-                    state = "Ready",
-                    path,
-                    reason = "asset_missing",
-                    "view_source"
-                );
+            if found.is_none() {
+                let mut missing = missing.lock().expect("missing assets");
+                let (path, reason) = match missing.len() {
+                    n if n < MAX_MISSING_ASSETS => (path, "asset_missing"),
+                    MAX_MISSING_ASSETS => (String::new(), "asset_missing_budget"),
+                    _ => return None,
+                };
+                if missing.insert(path.clone()) {
+                    tracing::info!(
+                        target: "ducktape::app",
+                        module,
+                        hash = %crate::backend::hex_encode(&hash),
+                        state = "Ready",
+                        path,
+                        reason,
+                        "view_source"
+                    );
+                }
             }
             found
         };
@@ -2436,7 +2473,8 @@ impl Guest {
                 "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
             ));
         }
-        let manifest = ui_lang_wire::manifest::read_manifest(bytes)
+        // its preferred size is for placing a new window; the tab embeds
+        ui_lang_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
         let engine = engine();
         let component =
@@ -2517,7 +2555,6 @@ impl Guest {
             snapshot,
             restore,
             init,
-            preferred: manifest.preferred_size.map(|size| size.dimensions()),
         })
     }
 
@@ -2802,8 +2839,6 @@ fn first_line(error: &wasmtime::Error) -> String {
 /// re-rendered in place.
 struct ModuleView {
     mounted: Arc<Mutex<Mounted>>,
-    /// The size the view's manifest asks for, when it asks.
-    preferred: Option<[f32; 2]>,
     /// The load `content` was rendered under: what the reader does in a
     /// tree of an earlier one is not handed to the view of a later one.
     generation: u64,
@@ -2843,9 +2878,7 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.content
-            .as_widget_mut()
-            .layout(tree, renderer, &view_limits(limits, self.preferred))
+        self.content.as_widget_mut().layout(tree, renderer, limits)
     }
 
     fn operate(
@@ -3403,28 +3436,7 @@ mod tests {
             "{:?}",
             texts(&guest)
         );
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "dark": false, "connected": true, "loading": false, "busy": false,
-                "page_link": "duck://pages/alpha",
-                "pages": [
-                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
-                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
-                ],
-                "page_create_open": false, "active_page": "alpha",
-                "active_page_title": "Alpha", "active_page_parent": "",
-                "page_searching": false, "page_search_hits": [], "page_search_query": "",
-                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
-                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
-                "subpages": [], "orphaned_comment_drafts": [],
-                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
-                "threads_loading": false, "threads_has_more": false, "active_thread": "",
-                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
-                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
-                "seed_rev": 0, "page_seed": "", "comment_seed": ""
-            }))
-            .expect("props encode"),
-        );
+        let props = pages_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["Pages", "Alpha", "Beta", "✓ synced"] {
@@ -3473,98 +3485,7 @@ mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         assert!(guest.surfaces.contains_key("chat_composer"));
         guest.redraw(&None);
-        let general = crate::backend::ChatChannel {
-            id: "channel-a".into(),
-            name: "general".into(),
-            ..Default::default()
-        };
-        let ops = crate::backend::ChatChannel {
-            id: "channel-b".into(),
-            name: "ops".into(),
-            ..Default::default()
-        };
-        let rooms = [
-            crate::backend::ChatSidebarRow {
-                channel: general,
-                unread: false,
-            },
-            crate::backend::ChatSidebarRow {
-                channel: ops,
-                unread: true,
-            },
-        ];
-        let messages = [crate::backend::ChatMessage {
-            id: "m1".into(),
-            view_key: 1,
-            seq: 1,
-            author: "mallard".into(),
-            meta: "h 84,912".into(),
-            body: "first light".into(),
-            blocks: crate::backend::paragraph_blocks("first light"),
-            show_author: true,
-            initial: "M".into(),
-            avatar_kind: "human".into(),
-            height: 84_912,
-            time: 84_912,
-            rev: 1,
-            ..Default::default()
-        }];
-        let props = ChatProps {
-            dark: false,
-            endpoint: "http://127.0.0.1:1",
-            network_name: "testnet",
-            network_chain_id: "testnet#abcd",
-            status: "Live",
-            block_height: 84_912,
-            search_phase: "idle",
-            search_query: "",
-            search_hits: &[],
-            rooms: &rooms,
-            dm_rows: &[],
-            channel_create_open: false,
-            connected: true,
-            loading: false,
-            busy: false,
-            active_channel: "channel-a",
-            active_dm_peer: "",
-            active_dm: &crate::backend::DmPeer::default(),
-            active_channel_name: "general",
-            active_channel_archived: false,
-            active_channel_members_only: false,
-            channel_members: &[],
-            post_refusal: "",
-            huddle_joined: false,
-            huddle_channel: "",
-            huddle_channel_name: "",
-            huddle_joined_at: 0,
-            huddle_now: 0,
-            call_muted: false,
-            messages: &messages,
-            has_older_history: false,
-            history_view: false,
-            at_live_tail: true,
-            history_loading: false,
-            unread_boundary: 0,
-            unread_marker_seq: 0,
-            selected_message_seq: 0,
-            selected_message_rev: 0,
-            message_action: "toolbar",
-            channel_settings_open: false,
-            active_thread_seq: 0,
-            thread_target_seq: 0,
-            thread_messages: &[],
-            thread_selected_seq: 0,
-            thread_selected_rev: 0,
-            thread_message_action: "toolbar",
-            thread_has_more: false,
-            thread_next_reply_seq: 0,
-            thread_loading: false,
-            copy_anchor_seq: 0,
-            copy_head_seq: 0,
-            copy_surface: "nowhere",
-            sent_serial: 0,
-        };
-        let props = Some(serde_json::to_vec(&props).expect("props encode"));
+        let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["testnet", "general", "ops", "first light"] {
@@ -3713,27 +3634,7 @@ mod tests {
         };
         let mut guest = Guest::load_from("files", &staged).expect("the view loads");
         guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "path": "/shared", "listed": true,
-                "entries": [
-                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
-                    {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
-                ],
-                "directories": [
-                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
-                ],
-                "connected": true, "loading": false,
-                "preview_path": "/shared/README.md",
-                "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
-                "delete_target": "", "diff_from": "", "diff": [], "history": [],
-                "preview_truncated": false, "preview_binary": false, "preview_picture": false,
-                "preview_width": 0, "preview_height": 0,
-                "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
-                "dark": false, "write_refusal": "", "writes": 0
-            }))
-            .expect("props encode"),
-        );
+        let props = files_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "1 KB"] {
@@ -3809,6 +3710,8 @@ mod tests {
                 props: None,
                 generation: 0,
                 hash: None,
+                in_flight: true,
+                wanted: None,
             }));
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
@@ -3957,33 +3860,7 @@ mod tests {
         guest.redraw(&None);
         // the whole register as the app encodes it — a literal, since the
         // document is past `json!`'s recursion limit
-        let props = Some(
-            br#"{
-              "dark": false, "connected": true, "org": "duckhouse", "about": "",
-              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
-              "connected_rpc": "http://127.0.0.1:1",
-              "repos": [{"name": "core", "head": "main"}],
-              "list_phase": "ready", "open_repo": "", "repo_menu": false,
-              "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
-              "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
-              "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
-              "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
-              "forge_item_files_changed": 0, "forge_item_additions": 0,
-              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
-              "forge_item_merge_oid": "", "forge_item_source_oid": "",
-              "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-              "comment_cap_reached": false, "discussion": [], "linked_note": [],
-              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
-              "tree_entries": [], "tree_born": false, "tree_truncated": false,
-              "tree_phase": "loading", "file_path": "", "file_text": "",
-              "file_binary": false, "file_truncated": false, "file_picture": false,
-              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
-              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
-            }"#
-            .to_vec(),
-        );
+        let props = forge_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["duckhouse", "core"] {
@@ -4057,9 +3934,233 @@ mod tests {
         mounted(module)
     }
 
+    /// One open proposal, as the host pushes the register.
+    fn register() -> Option<Vec<u8>> {
+        Some(
+            serde_json::to_vec(&serde_json::json!({
+                "rows": [{
+                    "id": "prop-1", "action": "add_validator", "detail": "node-7",
+                    "proposer": "robin", "status": "open", "deadline": 4200,
+                    "approvals": 1, "rejections": 0, "rule": "threshold",
+                    "required_yes": 2, "electorate": 4, "open": true, "settled_height": 0
+                }],
+                "voting": "", "admin": true, "connected": true, "answered": true, "dark": false
+            }))
+            .expect("props encode"),
+        )
+    }
+
+    /// Holds the node's next blob answer until released.
+    fn hold_blob(
+        node: &crate::backend::view_source::tests::FakeDeployment,
+    ) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *node.hold.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
+    /// Holds the node's next status answer until released.
+    fn hold_status(
+        node: &crate::backend::view_source::tests::FakeDeployment,
+    ) -> Arc<tokio::sync::Notify> {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *node.hold_status.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
     fn join_all(loads: Vec<std::thread::JoinHandle<()>>) {
         for load in loads {
             load.join().expect("the load");
+        }
+    }
+
+    fn files_facts() -> Option<Vec<u8>> {
+        let props = Some(
+        serde_json::to_vec(&serde_json::json!({
+            "path": "/shared", "listed": true,
+            "entries": [
+                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
+                {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
+            ],
+            "directories": [
+                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
+            ],
+            "connected": true, "loading": false,
+            "preview_path": "/shared/README.md",
+            "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
+            "delete_target": "", "diff_from": "", "diff": [], "history": [],
+            "preview_truncated": false, "preview_binary": false, "preview_picture": false,
+            "preview_width": 0, "preview_height": 0,
+            "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "dark": false, "write_refusal": "", "writes": 0
+        }))
+        .expect("props encode"),
+    );
+        props
+    }
+
+    fn pages_facts() -> Option<Vec<u8>> {
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "loading": false, "busy": false,
+                "page_link": "duck://pages/alpha",
+                "pages": [
+                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
+                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
+                ],
+                "page_create_open": false, "active_page": "alpha",
+                "active_page_title": "Alpha", "active_page_parent": "",
+                "page_searching": false, "page_search_hits": [], "page_search_query": "",
+                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
+                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
+                "subpages": [], "orphaned_comment_drafts": [],
+                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
+                "threads_loading": false, "threads_has_more": false, "active_thread": "",
+                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
+                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
+                "seed_rev": 0, "page_seed": "", "comment_seed": ""
+            }))
+            .expect("props encode"),
+        );
+        props
+    }
+
+    fn forge_facts() -> Option<Vec<u8>> {
+        let props = Some(
+            br#"{
+          "dark": false, "connected": true, "org": "duckhouse", "about": "",
+          "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+          "connected_rpc": "http://127.0.0.1:1",
+          "repos": [{"name": "core", "head": "main"}],
+          "list_phase": "ready", "open_repo": "", "repo_menu": false,
+          "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
+          "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
+          "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
+          "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
+          "forge_item_files_changed": 0, "forge_item_additions": 0,
+          "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
+          "forge_item_merge_oid": "", "forge_item_source_oid": "",
+          "forge_item_approvals": 0, "forge_item_change_requests": 0,
+          "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
+          "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+          "comment_cap_reached": false, "discussion": [], "linked_note": [],
+          "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
+          "tree_entries": [], "tree_born": false, "tree_truncated": false,
+          "tree_phase": "loading", "file_path": "", "file_text": "",
+          "file_binary": false, "file_truncated": false, "file_picture": false,
+          "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
+          "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
+        }"#
+            .to_vec(),
+        );
+        props
+    }
+
+    fn chat_facts() -> Option<Vec<u8>> {
+        let general = crate::backend::ChatChannel {
+            id: "channel-a".into(),
+            name: "general".into(),
+            ..Default::default()
+        };
+        let ops = crate::backend::ChatChannel {
+            id: "channel-b".into(),
+            name: "ops".into(),
+            ..Default::default()
+        };
+        let rooms = [
+            crate::backend::ChatSidebarRow {
+                channel: general,
+                unread: false,
+            },
+            crate::backend::ChatSidebarRow {
+                channel: ops,
+                unread: true,
+            },
+        ];
+        let messages = [crate::backend::ChatMessage {
+            id: "m1".into(),
+            view_key: 1,
+            seq: 1,
+            author: "mallard".into(),
+            meta: "h 84,912".into(),
+            body: "first light".into(),
+            blocks: crate::backend::paragraph_blocks("first light"),
+            show_author: true,
+            initial: "M".into(),
+            avatar_kind: "human".into(),
+            height: 84_912,
+            time: 84_912,
+            rev: 1,
+            ..Default::default()
+        }];
+        let props = ChatProps {
+            dark: false,
+            endpoint: "http://127.0.0.1:1",
+            network_name: "testnet",
+            network_chain_id: "testnet#abcd",
+            status: "Live",
+            block_height: 84_912,
+            search_phase: "idle",
+            search_query: "",
+            search_hits: &[],
+            rooms: &rooms,
+            dm_rows: &[],
+            channel_create_open: false,
+            connected: true,
+            loading: false,
+            busy: false,
+            active_channel: "channel-a",
+            active_dm_peer: "",
+            active_dm: &crate::backend::DmPeer::default(),
+            active_channel_name: "general",
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            channel_members: &[],
+            post_refusal: "",
+            huddle_joined: false,
+            huddle_channel: "",
+            huddle_channel_name: "",
+            huddle_joined_at: 0,
+            huddle_now: 0,
+            call_muted: false,
+            messages: &messages,
+            has_older_history: false,
+            history_view: false,
+            at_live_tail: true,
+            history_loading: false,
+            unread_boundary: 0,
+            unread_marker_seq: 0,
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            message_action: "toolbar",
+            channel_settings_open: false,
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: &[],
+            thread_selected_seq: 0,
+            thread_selected_rev: 0,
+            thread_message_action: "toolbar",
+            thread_has_more: false,
+            thread_next_reply_seq: 0,
+            thread_loading: false,
+            copy_anchor_seq: 0,
+            copy_head_seq: 0,
+            copy_surface: "nowhere",
+            sent_serial: 0,
+        };
+        let props = Some(serde_json::to_vec(&props).expect("props encode"));
+        props
+    }
+
+    /// The facts a module's host pushes, and one word of them the tree
+    /// shows — what a swap must carry from A into B's first tree.
+    fn facts(module: &str) -> (Option<Vec<u8>>, &'static str) {
+        match module {
+            "governance" => (register(), "prop-1"),
+            "files" => (files_facts(), "README.md"),
+            "pages" => (pages_facts(), "Alpha"),
+            "chat" => (chat_facts(), "first light"),
+            _ => (forge_facts(), "core"),
         }
     }
 
@@ -4079,6 +4180,7 @@ mod tests {
             let Some(staged) = staged(module) else {
                 continue;
             };
+            let (props, shown) = facts(module);
             let component = std::fs::read(staged).expect("the staged view");
             let (a, b) = (
                 deployment(&component, "a.svg"),
@@ -4096,10 +4198,16 @@ mod tests {
                 let Slot::Ready(guest) = &mut locked.slot else {
                     panic!("{module}: the view of A");
                 };
-                // the view draws, answers its own props request, and settles
-                assert!((0..4).any(|_| !guest.redraw(&None)), "{module}");
+                // the view draws, takes facts that are not its initial
+                // state, and settles
+                assert!((0..4).any(|_| !guest.redraw(&props)), "{module}");
                 assert!(guest.settled(), "{module} fault: {:?}", guest.fault);
                 assert!(guest.props_subscription.is_some(), "{module}");
+                assert!(
+                    texts(guest).iter().any(|text| text == shown),
+                    "{module}: {shown:?} not shown in {:?}",
+                    texts(guest)
+                );
                 (generation, guest.frame_rev)
             };
 
@@ -4124,6 +4232,12 @@ mod tests {
                 assert!(
                     guest.staged && guest.props_subscription.is_none(),
                     "{module}"
+                );
+                // B's first tree is A's state, before any facts reach it
+                assert!(
+                    texts(guest).iter().any(|text| text == shown),
+                    "{module}: the facts did not carry over: {:?}",
+                    texts(guest)
                 );
                 let ticks = guest.ticks;
                 // the first redraw routes the staged requests without another
@@ -4175,7 +4289,6 @@ mod tests {
         let hold = Arc::new(tokio::sync::Notify::new());
         *node.hold.lock().unwrap() = Some(hold.clone());
         let loads = deployments_checked().await;
-        assert_eq!(loads.len(), 1);
         node.deploy("chat", &c);
         hold.notify_one();
         join_all(loads);
@@ -4214,6 +4327,141 @@ mod tests {
         assert_eq!(locked.hash, Some(removed.hash()));
     }
 
+    /// Blocks keep landing while a deployment's bytes are slow: the load
+    /// after it is left to land, not started over as stale every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_deployment_is_not_restarted_by_every_block() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("forge", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = mounted("forge");
+        join_all(connected(&client));
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+
+        let before = mounted.lock().unwrap().generation;
+        node.deploy("forge", &b);
+        let hold = hold_blob(&node);
+        let mut loads = deployments_checked().await;
+        node.held.notified().await;
+        let generation = mounted.lock().unwrap().generation;
+        assert_eq!(generation, before + 1);
+        // three more blocks while B's bytes are held: the status still
+        // answers, and none of them starts this view over (the views of
+        // earlier tests, unknown to this node, get their own loads)
+        for _ in 0..3 {
+            loads.extend(deployments_checked().await);
+            let locked = mounted.lock().unwrap();
+            assert_eq!((locked.generation, locked.in_flight), (generation, true));
+        }
+        hold.notify_one();
+        join_all(loads);
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
+        let locked = mounted.lock().unwrap();
+        assert_eq!((locked.generation, locked.in_flight), (generation, false));
+    }
+
+    /// A removal answered late — the code moved on to C while the
+    /// verified "no view" for B was on its way — does not empty the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_that_moves_while_it_is_verified_is_not_installed() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, c) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "c.svg"),
+        );
+        let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
+        let node = FakeDeployment::serving("pages", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = mounted("pages");
+        join_all(connected(&client));
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+
+        node.deploy("pages", &removed);
+        let hold = hold_blob(&node);
+        let loads = deployments_checked().await;
+        node.deploy("pages", &c);
+        hold.notify_one();
+        join_all(loads);
+        assert_eq!(slot_assets(&mounted), ["a.svg"], "A is still drawn");
+        assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["c.svg"]);
+    }
+
+    /// A view mounted but not yet ticked names its instance too: a tick
+    /// that reaches it while a fresh candidate is prepared refuses the
+    /// candidate, and the next block's replacement carries the tick's
+    /// state over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_ticked_while_its_fresh_candidate_is_prepared_keeps_its_state() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("files", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = mounted("files");
+        join_all(connected(&client));
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+
+        node.deploy("files", &b);
+        // the candidate reads the instance after its bytes arrive, and is
+        // seated after the node confirms the code did not move: hold the
+        // bytes to get past the first, the confirmation to sit between
+        let blob = hold_blob(&node);
+        let loads = deployments_checked().await;
+        node.held.notified().await;
+        let status = hold_status(&node);
+        blob.notify_one();
+        node.held.notified().await;
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("the view of A");
+            };
+            assert_eq!(guest.ticks, 0);
+            assert!((0..4).any(|_| !guest.redraw(&None)));
+        }
+        status.notify_one();
+        join_all(loads);
+        let ticks = {
+            let locked = mounted.lock().unwrap();
+            assert_eq!(locked.hash, Some(a.hash()), "the candidate was refused");
+            let Slot::Ready(guest) = &locked.slot else {
+                panic!("the view of A");
+            };
+            guest.ticks
+        };
+        assert!(ticks > 0);
+        join_all(deployments_checked().await);
+        let locked = mounted.lock().unwrap();
+        assert_eq!(locked.hash, Some(b.hash()));
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("the view of B");
+        };
+        assert!(guest.staged, "restored from A, not booted fresh");
+    }
+
     /// An artifact asset is found by its canonical relative path, exactly.
     #[test]
     fn an_artifact_asset_is_an_exact_path_lookup() {
@@ -4233,14 +4481,11 @@ mod tests {
         }
     }
 
-    /// A manifest's preferred size sizes the view; without one the tab does.
+    /// A staged view carries a manifest the host reads; a component without
+    /// one is no view. The manifest's preferred size is for placing a new
+    /// window, which the embedded tab never does: it keeps the tab's limits.
     #[test]
-    fn a_manifests_preferred_size_sizes_the_view() {
-        let tab = layout::Limits::new(Size::ZERO, Size::new(1200.0, 800.0));
-        assert_eq!(view_limits(&tab, None).max(), Size::new(1200.0, 800.0));
-        let sized = view_limits(&tab, Some([320.0, 200.0]));
-        assert_eq!(sized.max(), Size::new(320.0, 200.0));
-        assert_eq!(sized.min(), Size::new(320.0, 200.0));
+    fn a_view_carries_a_readable_manifest() {
         if let Some(staged) = staged("governance") {
             let bytes = std::fs::read(staged).expect("the staged view");
             let manifest = ui_lang_wire::manifest::read_manifest(&bytes).expect("a manifest");
