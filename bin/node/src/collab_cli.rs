@@ -88,6 +88,20 @@ pub(crate) struct KeyArgs {
     existing_only: bool,
 }
 
+/// The JSON is the MODULE's own query enum, passed through verbatim — this CLI
+/// is a transport. Spelling core's shape as a Rust type here would be a second
+/// copy of it to drift; an example in the help is not.
+///
+/// `collaboration` takes one envelope, and the caller it acts as comes from the
+/// signature, never from the payload:
+///
+/// ```text
+/// ducktape collab query --target collaboration \
+///   '{"read":{"participant_id":"p1","read":{"events":{"conversation_id":"c1","from_seq":0,"limit":50}}}}'
+/// ```
+///
+/// `via` names the conversation whose binding authorizes the read when you are
+/// signing with that binding's scoped service key rather than the owner key.
 #[derive(Debug, clap::Args)]
 pub(crate) struct QueryArgs {
     /// the module to ask (e.g. `collaboration`)
