@@ -22,7 +22,6 @@ use "rows.ice"
 use "kit.ice"
 
 extern crate::host
-  HostError(message:str)
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   DocTab(id:str, title:str, active:bool)
   Subpage(id:str, title:str)
@@ -31,7 +30,8 @@ extern crate::host
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
   PagesProps(dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
-  stream props() -> PagesProps ! HostError
+  PropsItem(next:PagesProps, error:str)
+  subscription props() -> PropsItem
   // the app's editor, painted into this slot by the host
   component page_document() -> unit
   pure toggle_create() -> bool
@@ -104,10 +104,16 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// The facts are the host's: one subscription, one item per change. A
+// subscription, not a mount task, so a replacement restored from this
+// view's state asks for the facts again on its own.
+subscribe
+  props() -> props_arrived _
 
-on props_changed(next)
+on props_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   connected = next.connected
   loading = next.loading
   busy = next.busy
@@ -148,9 +154,6 @@ on props_changed(next)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
-
-on props_failed(error)
-  host_error = error.message
 
 on toggle_page_create
   sent = toggle_create()

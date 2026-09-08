@@ -3050,7 +3050,7 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn event(kind: &str, detail: &str) -> ModuleViewEvent {
@@ -3462,28 +3462,7 @@ mod tests {
             "{:?}",
             texts(&guest)
         );
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "dark": false, "connected": true, "loading": false, "busy": false,
-                "page_link": "duck://pages/alpha",
-                "pages": [
-                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
-                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
-                ],
-                "page_create_open": false, "active_page": "alpha",
-                "active_page_title": "Alpha", "active_page_parent": "",
-                "page_searching": false, "page_search_hits": [], "page_search_query": "",
-                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
-                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
-                "subpages": [], "orphaned_comment_drafts": [],
-                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
-                "threads_loading": false, "threads_has_more": false, "active_thread": "",
-                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
-                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
-                "seed_rev": 0, "page_seed": "", "comment_seed": ""
-            }))
-            .expect("props encode"),
-        );
+        let props = pages_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["Pages", "Alpha", "Beta", "✓ synced"] {
@@ -3532,98 +3511,7 @@ mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         assert!(guest.surfaces.contains_key("chat_composer"));
         guest.redraw(&None);
-        let general = crate::backend::ChatChannel {
-            id: "channel-a".into(),
-            name: "general".into(),
-            ..Default::default()
-        };
-        let ops = crate::backend::ChatChannel {
-            id: "channel-b".into(),
-            name: "ops".into(),
-            ..Default::default()
-        };
-        let rooms = [
-            crate::backend::ChatSidebarRow {
-                channel: general,
-                unread: false,
-            },
-            crate::backend::ChatSidebarRow {
-                channel: ops,
-                unread: true,
-            },
-        ];
-        let messages = [crate::backend::ChatMessage {
-            id: "m1".into(),
-            view_key: 1,
-            seq: 1,
-            author: "mallard".into(),
-            meta: "h 84,912".into(),
-            body: "first light".into(),
-            blocks: crate::backend::paragraph_blocks("first light"),
-            show_author: true,
-            initial: "M".into(),
-            avatar_kind: "human".into(),
-            height: 84_912,
-            time: 84_912,
-            rev: 1,
-            ..Default::default()
-        }];
-        let props = ChatProps {
-            dark: false,
-            endpoint: "http://127.0.0.1:1",
-            network_name: "testnet",
-            network_chain_id: "testnet#abcd",
-            status: "Live",
-            block_height: 84_912,
-            search_phase: "idle",
-            search_query: "",
-            search_hits: &[],
-            rooms: &rooms,
-            dm_rows: &[],
-            channel_create_open: false,
-            connected: true,
-            loading: false,
-            busy: false,
-            active_channel: "channel-a",
-            active_dm_peer: "",
-            active_dm: &crate::backend::DmPeer::default(),
-            active_channel_name: "general",
-            active_channel_archived: false,
-            active_channel_members_only: false,
-            channel_members: &[],
-            post_refusal: "",
-            huddle_joined: false,
-            huddle_channel: "",
-            huddle_channel_name: "",
-            huddle_joined_at: 0,
-            huddle_now: 0,
-            call_muted: false,
-            messages: &messages,
-            has_older_history: false,
-            history_view: false,
-            at_live_tail: true,
-            history_loading: false,
-            unread_boundary: 0,
-            unread_marker_seq: 0,
-            selected_message_seq: 0,
-            selected_message_rev: 0,
-            message_action: "toolbar",
-            channel_settings_open: false,
-            active_thread_seq: 0,
-            thread_target_seq: 0,
-            thread_messages: &[],
-            thread_selected_seq: 0,
-            thread_selected_rev: 0,
-            thread_message_action: "toolbar",
-            thread_has_more: false,
-            thread_next_reply_seq: 0,
-            thread_loading: false,
-            copy_anchor_seq: 0,
-            copy_head_seq: 0,
-            copy_surface: "nowhere",
-            sent_serial: 0,
-        };
-        let props = Some(serde_json::to_vec(&props).expect("props encode"));
+        let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["testnet", "general", "ops", "first light"] {
@@ -3776,27 +3664,7 @@ mod tests {
         };
         let mut guest = Guest::load_from("files", &staged).expect("the view loads");
         guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "path": "/shared", "listed": true,
-                "entries": [
-                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
-                    {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
-                ],
-                "directories": [
-                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
-                ],
-                "connected": true, "loading": false,
-                "preview_path": "/shared/README.md",
-                "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
-                "delete_target": "", "diff_from": "", "diff": [], "history": [],
-                "preview_truncated": false, "preview_binary": false, "preview_picture": false,
-                "preview_width": 0, "preview_height": 0,
-                "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
-                "dark": false, "write_refusal": "", "writes": 0
-            }))
-            .expect("props encode"),
-        );
+        let props = files_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "1 KB"] {
@@ -4022,34 +3890,7 @@ mod tests {
         guest.redraw(&None);
         // the whole register as the app encodes it — a literal, since the
         // document is past `json!`'s recursion limit
-        let props = Some(
-            br#"{
-              "dark": false, "connected": true, "org": "duckhouse", "about": "",
-              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
-              "connected_rpc": "http://127.0.0.1:1",
-              "repos": [{"name": "core", "head": "main"}],
-              "list_phase": "ready", "open_repo": "", "repo_menu": false,
-              "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
-              "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
-              "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
-              "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
-              "forge_item_files_changed": 0, "forge_item_additions": 0,
-              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
-              "forge_item_merge_oid": "", "forge_item_source_oid": "",
-              "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-              "comment_cap_reached": false, "discussion": [], "linked_note": [],
-              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
-              "tree_entries": [], "tree_born": false, "tree_truncated": false,
-              "tree_phase": "loading", "file_path": "", "file_text": "",
-              "file_binary": false, "file_truncated": false, "file_picture": false,
-              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
-              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
-              "note_scope": "", "note_blocked": true
-            }"#
-            .to_vec(),
-        );
+        let props = forge_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["duckhouse", "core"] {
@@ -4107,13 +3948,22 @@ mod tests {
     }
 
     /// The connection is one per process: the tests that move it take
-    /// turns, so one's node is not another's.
-    async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    /// turns, so one's node is not another's — including the round trip
+    /// over a real node in `backend::tests::wire`, whose connect reloads
+    /// every seat here from a node that runs none of these modules.
+    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         TURN.get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await
+    }
+
+    /// The seat of `module` as no test has touched it: the registry is one
+    /// per process, and every deployment test leaves its module drawn.
+    fn fresh(module: &'static str) -> Arc<Mutex<Mounted>> {
+        registry().lock().expect("module views").remove(module);
+        mounted(module)
     }
 
     /// Set by a test: the next candidate's first frame traps.
@@ -4160,89 +4010,294 @@ mod tests {
         }
     }
 
+    fn files_facts() -> Option<Vec<u8>> {
+        Some(
+        serde_json::to_vec(&serde_json::json!({
+            "path": "/shared", "listed": true,
+            "entries": [
+                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
+                {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
+            ],
+            "directories": [
+                {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
+            ],
+            "connected": true, "loading": false,
+            "preview_path": "/shared/README.md",
+            "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
+            "delete_target": "", "diff_from": "", "diff": [], "history": [],
+            "preview_truncated": false, "preview_binary": false, "preview_picture": false,
+            "preview_width": 0, "preview_height": 0,
+            "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "dark": false, "write_refusal": "", "writes": 0
+        }))
+        .expect("props encode"),
+    )
+    }
+
+    fn pages_facts() -> Option<Vec<u8>> {
+        Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "loading": false, "busy": false,
+                "page_link": "duck://pages/alpha",
+                "pages": [
+                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
+                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
+                ],
+                "page_create_open": false, "active_page": "alpha",
+                "active_page_title": "Alpha", "active_page_parent": "",
+                "page_searching": false, "page_search_hits": [], "page_search_query": "",
+                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
+                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
+                "subpages": [], "orphaned_comment_drafts": [],
+                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
+                "threads_loading": false, "threads_has_more": false, "active_thread": "",
+                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
+                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
+                "seed_rev": 0, "page_seed": "", "comment_seed": ""
+            }))
+            .expect("props encode"),
+        )
+    }
+
+    fn forge_facts() -> Option<Vec<u8>> {
+        Some(
+            br#"{
+          "dark": false, "connected": true, "org": "duckhouse", "about": "",
+          "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+          "connected_rpc": "http://127.0.0.1:1",
+          "repos": [{"name": "core", "head": "main"}],
+          "list_phase": "ready", "open_repo": "", "repo_menu": false,
+          "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
+          "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
+          "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
+          "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
+          "forge_item_files_changed": 0, "forge_item_additions": 0,
+          "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
+          "forge_item_merge_oid": "", "forge_item_source_oid": "",
+          "forge_item_approvals": 0, "forge_item_change_requests": 0,
+          "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
+          "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+          "comment_cap_reached": false, "discussion": [], "linked_note": [],
+          "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
+          "tree_entries": [], "tree_born": false, "tree_truncated": false,
+          "tree_phase": "loading", "file_path": "", "file_text": "",
+          "file_binary": false, "file_truncated": false, "file_picture": false,
+          "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
+          "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
+          "note_scope": "", "note_blocked": true
+        }"#
+            .to_vec(),
+        )
+    }
+
+    fn chat_facts() -> Option<Vec<u8>> {
+        let general = crate::backend::ChatChannel {
+            id: "channel-a".into(),
+            name: "general".into(),
+            ..Default::default()
+        };
+        let ops = crate::backend::ChatChannel {
+            id: "channel-b".into(),
+            name: "ops".into(),
+            ..Default::default()
+        };
+        let rooms = [
+            crate::backend::ChatSidebarRow {
+                channel: general,
+                unread: false,
+            },
+            crate::backend::ChatSidebarRow {
+                channel: ops,
+                unread: true,
+            },
+        ];
+        let messages = [crate::backend::ChatMessage {
+            id: "m1".into(),
+            view_key: 1,
+            seq: 1,
+            author: "mallard".into(),
+            meta: "h 84,912".into(),
+            body: "first light".into(),
+            blocks: crate::backend::paragraph_blocks("first light"),
+            show_author: true,
+            initial: "M".into(),
+            avatar_kind: "human".into(),
+            height: 84_912,
+            time: 84_912,
+            rev: 1,
+            ..Default::default()
+        }];
+        let props = ChatProps {
+            dark: false,
+            endpoint: "http://127.0.0.1:1",
+            network_name: "testnet",
+            network_chain_id: "testnet#abcd",
+            status: "Live",
+            block_height: 84_912,
+            search_phase: "idle",
+            search_query: "",
+            search_hits: &[],
+            rooms: &rooms,
+            dm_rows: &[],
+            channel_create_open: false,
+            connected: true,
+            loading: false,
+            busy: false,
+            active_channel: "channel-a",
+            active_dm_peer: "",
+            active_dm: &crate::backend::DmPeer::default(),
+            active_channel_name: "general",
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            channel_members: &[],
+            post_refusal: "",
+            huddle_joined: false,
+            huddle_channel: "",
+            huddle_channel_name: "",
+            huddle_joined_at: 0,
+            huddle_now: 0,
+            call_muted: false,
+            messages: &messages,
+            has_older_history: false,
+            history_view: false,
+            at_live_tail: true,
+            history_loading: false,
+            unread_boundary: 0,
+            unread_marker_seq: 0,
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            message_action: "toolbar",
+            channel_settings_open: false,
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: &[],
+            thread_selected_seq: 0,
+            thread_selected_rev: 0,
+            thread_message_action: "toolbar",
+            thread_has_more: false,
+            thread_next_reply_seq: 0,
+            thread_loading: false,
+            copy_anchor_seq: 0,
+            copy_head_seq: 0,
+            copy_surface: "nowhere",
+            sent_serial: 0,
+        };
+        Some(serde_json::to_vec(&props).expect("props encode"))
+    }
+
+    /// The facts a module's host pushes, and one word of them the tree
+    /// shows — what a swap must carry from A into B's first tree.
+    fn facts(module: &str) -> (Option<Vec<u8>>, &'static str) {
+        match module {
+            "governance" => (register(), "prop-1"),
+            "files" => (files_facts(), "README.md"),
+            "pages" => (pages_facts(), "Alpha"),
+            "chat" => (chat_facts(), "first light"),
+            _ => (forge_facts(), "core"),
+        }
+    }
+
     /// A new deployment of a module whose view is drawn replaces the
     /// instance in place: restored from the drawn view's snapshot, under a
     /// new generation (so the old tree's messages route nowhere), with the
     /// new deployment's assets, and its first redraw routes the restored
     /// view's requests — the props subscription among them — without
-    /// another tick.
+    /// another tick. Every module-owned view, from its own staged wasm:
+    /// a view whose props ride a mount task instead of a subscription can
+    /// never be snapshotted while that task is live, and never asks again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_deployment_swaps_the_view_in_place() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
-        let component = std::fs::read(staged).expect("the staged view");
-        let (a, b) = (
-            deployment(&component, "a.svg"),
-            deployment(&component, "b.svg"),
-        );
-        let node = FakeDeployment::serving("governance", &a);
-        let client = fake_node(node.clone()).await;
-
-        let mounted = mounted("governance");
-        join_all(connected(&client));
-        assert_eq!(slot_assets(&mounted), ["a.svg"]);
-        let (generation, frame_rev) = {
-            let mut locked = mounted.lock().expect("module view lock");
-            let generation = locked.generation;
-            let Slot::Ready(guest) = &mut locked.slot else {
-                panic!("the view of A");
+        for module in ["governance", "files", "pages", "chat", "forge"] {
+            let Some(staged) = staged(module) else {
+                continue;
             };
-            // the view draws, takes a register that is not its initial
-            // state, and settles
-            assert!((0..4).any(|_| !guest.redraw(&register())));
-            assert!(guest.settled(), "fault: {:?}", guest.fault);
-            assert!(guest.props_subscription.is_some());
-            assert!(texts(guest).iter().any(|text| text == "prop-1"));
-            (generation, guest.frame_rev)
-        };
+            let (props, shown) = facts(module);
+            let component = std::fs::read(staged).expect("the staged view");
+            let (a, b) = (
+                deployment(&component, "a.svg"),
+                deployment(&component, "b.svg"),
+            );
+            let node = FakeDeployment::serving(module, &a);
+            let client = fake_node(node.clone()).await;
 
-        // a block activates B: the check finds the hash moved
-        node.deploy("governance", &b);
-        join_all(deployments_checked().await);
-        assert_eq!(slot_assets(&mounted), ["b.svg"]);
-        let generation = {
-            let mut locked = mounted.lock().expect("module view lock");
-            assert_eq!(locked.hash, Some(b.hash()));
-            assert!(
-                locked.generation > generation,
-                "the old tree's messages are refused"
-            );
-            let Slot::Ready(guest) = &mut locked.slot else {
-                panic!("the view of B");
+            let mounted = fresh(module);
+            join_all(connected(&client));
+            assert_eq!(slot_assets(&mounted), ["a.svg"], "{module}");
+            let (generation, frame_rev) = {
+                let mut locked = mounted.lock().expect("module view lock");
+                let generation = locked.generation;
+                let Slot::Ready(guest) = &mut locked.slot else {
+                    panic!("{module}: the view of A");
+                };
+                // the view draws, takes facts that are not its initial
+                // state, and settles
+                assert!((0..4).any(|_| !guest.redraw(&props)), "{module}");
+                assert!(guest.settled(), "{module} fault: {:?}", guest.fault);
+                assert!(guest.props_subscription.is_some(), "{module}");
+                assert!(
+                    texts(guest).iter().any(|text| text == shown),
+                    "{module}: {shown:?} not shown in {:?}",
+                    texts(guest)
+                );
+                (generation, guest.frame_rev)
             };
-            assert!(
-                guest.frame_rev > frame_rev,
-                "the widget rebuilds for the new tree"
-            );
-            assert!(guest.staged && guest.props_subscription.is_none());
-            // B's first tree is A's state, before any register reaches it
-            assert!(
-                texts(guest).iter().any(|text| text == "prop-1"),
-                "the register did not carry over: {:?}",
-                texts(guest)
-            );
-            let ticks = guest.ticks;
-            // the first redraw routes the staged requests without another
-            // tick, and the view is quiet after it
-            assert!(!guest.redraw(&None));
-            assert_eq!(guest.ticks, ticks);
-            assert!(
-                guest.props_subscription.is_some(),
-                "the restored view asked for its props again"
-            );
-            assert!(guest.fault.is_none());
-            locked.generation
-        };
-        // and the same deployment again is nothing to do
-        join_all(deployments_checked().await);
-        let locked = mounted.lock().expect("module view lock");
-        assert_eq!(
-            (locked.generation, locked.hash),
-            (generation, Some(b.hash()))
-        );
+
+            // a block activates B: the check finds the hash moved
+            node.deploy(module, &b);
+            join_all(deployments_checked().await);
+            assert_eq!(slot_assets(&mounted), ["b.svg"], "{module}: B installed");
+            let generation = {
+                let mut locked = mounted.lock().expect("module view lock");
+                assert_eq!(locked.hash, Some(b.hash()), "{module}");
+                assert!(
+                    locked.generation > generation,
+                    "{module}: the old tree's messages are refused"
+                );
+                let Slot::Ready(guest) = &mut locked.slot else {
+                    panic!("{module}: the view of B");
+                };
+                assert!(
+                    guest.frame_rev > frame_rev,
+                    "{module}: the widget rebuilds for the new tree"
+                );
+                assert!(
+                    guest.staged && guest.props_subscription.is_none(),
+                    "{module}"
+                );
+                // B's first tree is A's state, before any facts reach it
+                assert!(
+                    texts(guest).iter().any(|text| text == shown),
+                    "{module}: the facts did not carry over: {:?}",
+                    texts(guest)
+                );
+                let ticks = guest.ticks;
+                // the first redraw routes the staged requests without another
+                // tick, and the view is quiet after it
+                assert!(!guest.redraw(&None), "{module}");
+                assert_eq!(guest.ticks, ticks, "{module}");
+                assert!(
+                    guest.props_subscription.is_some(),
+                    "{module}: the restored view asked for its props again"
+                );
+                assert!(guest.fault.is_none(), "{module}: {:?}", guest.fault);
+                locked.generation
+            };
+            // and the same deployment again is nothing to do
+            join_all(deployments_checked().await);
+            {
+                let locked = mounted.lock().expect("module view lock");
+                assert_eq!(
+                    (locked.generation, locked.hash),
+                    (generation, Some(b.hash())),
+                    "{module}"
+                );
+            }
+            // the seat is given back: the next module's node, and the
+            // other deployment tests, know nothing of this one
+            registry().lock().expect("module views").remove(module);
+        }
     }
 
     /// A deployment that moves while its view is prepared is not installed:
@@ -4263,7 +4318,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("forge");
+        let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4296,7 +4351,7 @@ mod tests {
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("forge");
+        let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         node.deploy("forge", &removed);
@@ -4326,7 +4381,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("forge");
+        let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4369,7 +4424,7 @@ mod tests {
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("governance");
+        let mounted = fresh("governance");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4404,10 +4459,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("governance");
-        // whatever an earlier test left drawn: this one starts from a view
-        // booted fresh, never ticked
-        mounted.lock().unwrap().slot = Slot::Empty;
+        let mounted = fresh("governance");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4465,10 +4517,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("forge");
-        // whatever an earlier test left drawn: this one starts from a view
-        // booted fresh, never ticked, so the init branch is the one exercised
-        mounted.lock().unwrap().slot = Slot::Empty;
+        let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         {
