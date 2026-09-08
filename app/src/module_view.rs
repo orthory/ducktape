@@ -1743,7 +1743,11 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
         let generation = locked.generation;
         match &mut locked.slot {
             Slot::Loading => return notice("Loading the view…"),
-            Slot::Empty => return notice("This module ships no view."),
+            Slot::Empty => {
+                return notice(&format!(
+                    "This network has no {module} view yet. An admin activates a {module} deployment that ships one."
+                ));
+            }
             Slot::Failed(reason) => return notice(reason),
             Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation),
         }
