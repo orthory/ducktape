@@ -1,9 +1,12 @@
 //! Module-owned views. A screen that ships as an `ice:view` component — an
 //! Ice application compiled for the `tree` target (`crates/views`) — is
-//! loaded FROM A FILE beside the binary (`make views` stages
-//! `target/views/<module>_view.wasm`; `DUCKTAPE_VIEWS_DIR` overrides), ticked
-//! inside a fuel and time budget, and drawn with the runtime's tree renderer
-//! as one widget in the tab that used to hold the native screen.
+//! loaded either from the deployed artifact of the module it belongs to
+//! (`backend::view_source`: the registry's ACTIVE code hash, fetched and
+//! verified, never a desktop substitute) or, for the desktop's own views,
+//! FROM A FILE beside the binary (`make views` stages
+//! `target/views/<module>_view.wasm`; `DUCKTAPE_VIEWS_DIR` overrides); it is
+//! ticked inside a fuel and time budget, and drawn with the runtime's tree
+//! renderer as one widget in the tab that used to hold the native screen.
 //!
 //! The boundary is the screen component's own contract. Its props go in as
 //! JSON, one item per change, on the guest's `<module>.props` subscription;
@@ -1720,24 +1723,83 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 // ---------- mounting ----------
 
 /// The widget for one module's view, with `props` as the app has them now.
-/// The view is loaded once per process, on its own thread, and the tab
-/// shows what stage it is at until then.
+/// The view is loaded on its own thread, and the tab shows what stage it is
+/// at until then. A load still going or failed when the app points at
+/// another node is started over on that node ([`connected`]); a view that
+/// loaded stays for the process (the swap-in-place on a new deployment is
+/// the next step, behind the `generation` this registry already keeps).
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
-    let (content, rev) = {
+    let (content, rev, generation) = {
         let mut locked = mounted.lock().expect("module view lock");
         locked.props = Some(props);
         match &mut locked.slot {
             Slot::Loading => return notice("Loading the view…"),
             Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (guest.render(), guest.frame_rev),
+            Slot::Ready(guest) => (guest.render(), guest.frame_rev, locked.generation),
         }
     };
     Element::new(ModuleView {
         mounted,
+        generation,
         rev,
         content,
     })
+}
+
+/// The node the app is connected to, for the views that come from its
+/// deployments. Told by `backend::connect`; every module view still
+/// loading or failed off the previous node starts over on this one, under
+/// a new generation, so an answer the previous node is still composing
+/// lands nowhere. Returns the loads it started, for a test to wait on.
+pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
+    // THE REGISTRY LOCK FIRST: a connection change and the restart of the
+    // views under it are one step. Two callers — `backend::connect` runs on
+    // the executor's threads, and two connects can overlap — otherwise
+    // interleave into loads asked of one node under the other's revision,
+    // every one of which dies at install, and the views stay "Loading".
+    let registry = registry().lock().expect("module views");
+    // the client and its revision move as one, and their lock is let go
+    // before any view is touched: a load installs under it (see
+    // `spawn_load`), and takes the view's own lock inside it. Lock order,
+    // everywhere: registry, then connection, then a view.
+    let snapshot = {
+        let mut connection = connection().lock().expect("views rpc");
+        connection.rev += 1;
+        connection.client = Some(client.clone());
+        connection.clone()
+    };
+    registry
+        .iter()
+        .filter_map(|(module, mounted)| {
+            let mut locked = mounted.lock().expect("module view lock");
+            if matches!(locked.slot, Slot::Ready(_)) {
+                return None;
+            }
+            locked.slot = Slot::Loading;
+            locked.generation += 1;
+            Some(spawn_load(
+                module,
+                mounted,
+                locked.generation,
+                snapshot.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// The node the module-owned views load from, and how many times the app
+/// has moved: a load is asked of one snapshot of this and installs only
+/// while it is still the one.
+#[derive(Clone, Default)]
+struct Connection {
+    client: Option<ducktape_rpc::Client>,
+    rev: u64,
+}
+
+fn connection() -> &'static Mutex<Connection> {
+    static CONNECTION: OnceLock<Mutex<Connection>> = OnceLock::new();
+    CONNECTION.get_or_init(Mutex::default)
 }
 
 /// What the tab shows while the view is not there to show itself.
@@ -1752,9 +1814,12 @@ fn notice(text: &str) -> Element<'static, ModuleViewEvent> {
 /// One module's view for the life of the process: the instance once it is
 /// there, and the props the app last handed it, which it takes on its next
 /// redraw whether the instance was ready when they arrived or not.
+/// `generation` moves with every load asked for; a load answering for an
+/// earlier one is dropped, and so is what the reader did in a tree of one.
 struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
+    generation: u64,
 }
 
 enum Slot {
@@ -1765,41 +1830,60 @@ enum Slot {
 
 type Registry = Mutex<HashMap<&'static str, Arc<Mutex<Mounted>>>>;
 
-fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
+fn registry() -> &'static Registry {
     static MOUNTED: OnceLock<Registry> = OnceLock::new();
-    let mut registry = MOUNTED
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("module views");
+    MOUNTED.get_or_init(Mutex::default)
+}
+
+fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
+    let mut registry = registry().lock().expect("module views");
     registry
         .entry(module)
         .or_insert_with(|| {
+            let snapshot = connection().lock().expect("views rpc").clone();
             let mounted = Arc::new(Mutex::new(Mounted {
                 slot: Slot::Loading,
                 props: None,
+                generation: 0,
             }));
-            // A cold cranelift compile is a second or more; the window
-            // thread shows "Loading" instead of freezing for it.
-            let loading = mounted.clone();
-            std::thread::spawn(move || {
-                let slot = match Guest::load(module) {
-                    Ok(guest) => Slot::Ready(Box::new(guest)),
-                    Err(reason) => {
-                        tracing::warn!(
-                            target: "ducktape::app",
-                            module,
-                            reason = "module_view_unloadable",
-                            error = %reason,
-                            "module view not loaded"
-                        );
-                        Slot::Failed(reason)
-                    }
-                };
-                loading.lock().expect("module view lock").slot = slot;
-            });
+            spawn_load(module, &mounted, 0, snapshot);
             mounted
         })
         .clone()
+}
+
+/// Loads the view on its own thread — a cold cranelift compile is a second
+/// or more; the window thread shows "Loading" instead of freezing for it —
+/// and installs it only if `mounted` still waits for this very load AND the
+/// app is still on the node it was asked of, both checked under the
+/// connection lock so a move cannot slip between the check and the seat.
+fn spawn_load(
+    module: &'static str,
+    mounted: &Arc<Mutex<Mounted>>,
+    generation: u64,
+    asked_of: Connection,
+) -> std::thread::JoinHandle<()> {
+    let loading = mounted.clone();
+    std::thread::spawn(move || {
+        let slot = match Guest::load(module, asked_of.client.as_ref(), generation) {
+            Ok(guest) => Slot::Ready(Box::new(guest)),
+            Err(reason) => {
+                tracing::warn!(
+                    target: "ducktape::app",
+                    module,
+                    reason = "module_view_unloadable",
+                    error = %reason,
+                    "module view not loaded"
+                );
+                Slot::Failed(reason)
+            }
+        };
+        let connection = connection().lock().expect("views rpc");
+        let mut locked = loading.lock().expect("module view lock");
+        if locked.generation == generation && connection.rev == asked_of.rev {
+            locked.slot = slot;
+        }
+    })
 }
 
 /// Where the staged views are: `$DUCKTAPE_VIEWS_DIR`, else `views/` beside
@@ -1859,6 +1943,15 @@ struct Guest {
     intents: Vec<ModuleViewEvent>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
+    /// The assets the deployment shipped beside this view, for the host
+    /// surfaces that paint them by canonical relative path; swapped with the
+    /// instance as one unit. Empty for a staged desktop view.
+    #[allow(dead_code, reason = "the artifact surfaces are the next step")]
+    assets: Arc<crate::backend::view_source::Assets>,
+}
+
+fn hex_short(hash: &[u8; 32]) -> String {
+    hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn engine() -> &'static Engine {
@@ -1895,9 +1988,78 @@ fn arm(store: &mut Store<HostState>) {
 }
 
 impl Guest {
-    fn load(module: &'static str) -> Result<Self, String> {
-        let path = views_dir()?.join(format!("{module}_view.wasm"));
-        Self::load_from(module, &path)
+    /// A module-owned view comes from the module's active deployment on the
+    /// connected node — nothing else, so with no node there is nothing to
+    /// load yet, and no staged file is ever opened for it; the desktop's own
+    /// views come from the staged file. Every outcome for a module-owned view
+    /// is one `view_source` log line with stable fields.
+    fn load(
+        module: &'static str,
+        client: Option<&ducktape_rpc::Client>,
+        generation: u64,
+    ) -> Result<Self, String> {
+        use crate::backend::view_source::{self, ViewSource};
+        if !view_source::module_owned(module) {
+            let path = views_dir()?.join(format!("{module}_view.wasm"));
+            return Self::load_from(module, &path);
+        }
+        let logged = |hash: Option<&[u8; 32]>, state: &str, reason: &str| {
+            tracing::info!(
+                target: "ducktape::app",
+                module,
+                hash = %hash.map_or_else(|| "-".to_owned(), |hash| crate::backend::hex_encode(hash)),
+                state,
+                gen = generation,
+                reason = %if reason.is_empty() { "-" } else { reason },
+                "view_source"
+            );
+        };
+        let source = client
+            .ok_or_else(|| "not connected to a node yet".to_owned())
+            .and_then(|client| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(view_source::resolve(client, module))
+                    .map_err(|error| error.to_string())
+            });
+        let source = match source {
+            Ok(source) => source,
+            Err(reason) => {
+                logged(None, "Failed", &reason);
+                return Err(reason);
+            }
+        };
+        match source {
+            ViewSource::NotActivated => {
+                logged(None, "NotActivated", "");
+                Err(format!("the {module} module is not activated yet"))
+            }
+            ViewSource::Missing { hash } => {
+                logged(Some(&hash), "Missing", "");
+                Err(format!("the {module} module's deployment ships no view"))
+            }
+            ViewSource::Ready {
+                hash,
+                component,
+                assets,
+            } => {
+                let shown = format!("{module} view @ {}", hex_short(&hash));
+                match Self::from_bytes(module, &component, &shown) {
+                    Ok(mut guest) => {
+                        guest.assets = assets;
+                        logged(Some(&hash), "Ready", "");
+                        Ok(guest)
+                    }
+                    Err(reason) => {
+                        logged(Some(&hash), "Failed", &reason);
+                        Err(reason)
+                    }
+                }
+            }
+        }
     }
 
     fn load_from(module: &'static str, path: &std::path::Path) -> Result<Self, String> {
@@ -1909,9 +2071,19 @@ impl Guest {
             ));
         }
         let bytes = std::fs::read(path).map_err(|error| format!("{shown}: {error}"))?;
+        Self::from_bytes(module, &bytes, &shown)
+    }
+
+    /// The component instantiated and mounted; `shown` names it in errors.
+    fn from_bytes(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
+        if bytes.len() as u64 > MAX_MODULE_BYTES {
+            return Err(format!(
+                "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
+            ));
+        }
         let engine = engine();
         let component =
-            Component::new(engine, &bytes).map_err(|error| format!("{shown}: {error}"))?;
+            Component::new(engine, bytes).map_err(|error| format!("{shown}: {error}"))?;
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
         // instances — the app, the stub adapters `cargo ice bundle` gave it,
@@ -1982,6 +2154,7 @@ impl Guest {
             props_sent: None,
             intents: Vec::new(),
             fault: None,
+            assets: Arc::default(),
         })
     }
 
@@ -2260,6 +2433,9 @@ fn first_line(error: &wasmtime::Error) -> String {
 /// re-rendered in place.
 struct ModuleView {
     mounted: Arc<Mutex<Mounted>>,
+    /// The load `content` was rendered under: what the reader does in a
+    /// tree of an earlier one is not handed to the view of a later one.
+    generation: u64,
     /// The frame `content` was rendered from.
     rev: u64,
     content: Element<'static, Output, iced::Theme, iced::Renderer>,
@@ -2348,7 +2524,12 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             shell.input_method_mut().merge(local.input_method());
         }
         let mut mounted = self.mounted.lock().expect("module view lock");
-        let Mounted { slot, props } = &mut *mounted;
+        let Mounted {
+            slot,
+            props,
+            generation,
+            ..
+        } = &mut *mounted;
         let guest = match slot {
             Slot::Ready(guest) => guest,
             Slot::Loading => {
@@ -2358,6 +2539,14 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
                 return;
             }
             Slot::Failed(_) => return,
+        };
+        let outputs = if *generation == self.generation {
+            outputs
+        } else {
+            // a tree of an earlier load: its messages index nothing here
+            self.generation = *generation;
+            self.rev = 0;
+            Vec::new()
         };
         if !outputs.is_empty() {
             for output in outputs {
@@ -3220,6 +3409,87 @@ mod tests {
             }]
         );
         assert!(guest.fault.is_none());
+    }
+
+    /// A module-owned view has one source, the module's deployment on the
+    /// connected node: with no node it is not there yet, and the staged file
+    /// a desktop view would take is never opened for it.
+    #[test]
+    fn a_module_owned_view_never_comes_from_the_staged_file() {
+        // a staged file for every one of them, where `views_dir` would look
+        let staged = tempfile::tempdir().expect("a staging dir");
+        for module in crate::backend::view_source::MODULE_OWNED {
+            std::fs::write(staged.path().join(format!("{module}_view.wasm")), b"\0asm")
+                .expect("staged");
+        }
+        // SAFETY: the one test that sets this variable; `views_dir` reads it
+        // only for a desktop view, which no test loads through `Guest::load`.
+        unsafe { std::env::set_var("DUCKTAPE_VIEWS_DIR", staged.path()) };
+        for module in crate::backend::view_source::MODULE_OWNED {
+            assert_eq!(
+                Guest::load(module, None, 0).err().as_deref(),
+                Some("not connected to a node yet"),
+                "{module}"
+            );
+        }
+        assert!(!crate::backend::view_source::module_owned("settings"));
+    }
+
+    /// A load still in flight when the app moves to another node lands
+    /// nowhere: the node it was asked of may answer late, and its view is
+    /// not the view of the node the app is on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_load_the_previous_node_answers_late_is_not_installed() {
+        use crate::backend::view_source::tests::node;
+        use module_artifact::{ModuleArtifact, ViewArtifact};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let deployment = |asset: &str| ModuleArtifact {
+            component: vec![1, 2, 3],
+            index: None,
+            view: Some(ViewArtifact {
+                component: component.clone(),
+                assets: [(asset.to_owned(), b"<svg/>".to_vec())].into(),
+            }),
+        };
+        let status = |artifact: &ModuleArtifact| {
+            serde_json::json!({"module_status": {"modules": [
+                {"module_id": "forge", "active_code_hash": artifact.hash().to_vec(),
+                 "pending": null, "history": []}
+            ]}})
+        };
+        let (a, b) = (deployment("a.svg"), deployment("b.svg"));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let node_a = node(status(&a), Some(a), Some(hold.clone())).await;
+        let node_b = node(status(&b), Some(b), None).await;
+
+        // mounted with no node: fails fast, then A is asked and holds
+        let mounted = mounted("forge");
+        let asked_of_a = connected(&node_a);
+        // the app moves to B while A is still composing its answer
+        let asked_of_b = connected(&node_b);
+        for load in asked_of_b {
+            load.join().expect("the load on B");
+        }
+        hold.notify_one();
+        for load in asked_of_a {
+            load.join().expect("the load on A");
+        }
+        let locked = mounted.lock().expect("module view lock");
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("the view of B is not there");
+        };
+        assert!(
+            guest.assets.contains_key("b.svg"),
+            "{:?}",
+            guest.assets.keys()
+        );
+        assert!(
+            !guest.assets.contains_key("a.svg"),
+            "A's late answer landed"
+        );
     }
 
     /// The bundled Shell view through the host: the facts, the welcome
