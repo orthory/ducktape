@@ -67,7 +67,11 @@ pub fn read_module_artifact(dir: &Path, id: &str) -> Result<ModuleArtifact, Stri
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("read {}: {error}", index_path.display())),
     };
-    Ok(ModuleArtifact { component, index })
+    Ok(ModuleArtifact {
+        component,
+        index,
+        view: None,
+    })
 }
 
 /// `<dir>/netstack.component.wasm` — the netstack guest in a founding set.
@@ -115,6 +119,7 @@ impl Genesis {
                 Artifact {
                     id: artifact.id,
                     bytes: ModuleArtifact {
+                        view: None,
                         component: artifact.bytes,
                         index,
                     }
@@ -453,6 +458,7 @@ mod tests {
             vec![Artifact {
                 id: "weather".into(),
                 bytes: ModuleArtifact {
+                    view: None,
                     component: b"W".to_vec(),
                     index: Some(b"mapper".to_vec())
                 }
@@ -552,6 +558,7 @@ mod tests {
             modules: vec![Artifact {
                 id: "pages".into(),
                 bytes: ModuleArtifact {
+                    view: None,
                     component: vec![1, 2, 3],
                     index: Some(vec![9]),
                 }
