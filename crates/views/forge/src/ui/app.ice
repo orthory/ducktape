@@ -23,7 +23,6 @@ use "components.ice"
 use "forge.ice"
 
 extern crate::host
-  HostError(message:str)
   ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
@@ -35,7 +34,8 @@ extern crate::host
   TreeEntry(name:str, path:str, kind:str)
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
   ForgeProps(dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str)
-  stream props() -> ForgeProps ! HostError
+  PropsItem(next:ForgeProps, error:str)
+  subscription props() -> PropsItem
   pure open_repo(name:&str) -> bool
   pure close_repo() -> bool
   pure toggle_repo_menu() -> bool
@@ -159,10 +159,16 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// The facts are the host's: one subscription, one item per change. A
+// subscription, not a mount task, so a replacement restored from this
+// view's state asks for the facts again on its own.
+subscribe
+  props() -> props_arrived _
 
-on props_changed(next)
+on props_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   connected = next.connected
   dark = next.dark
   org = next.org
@@ -252,9 +258,6 @@ on props_changed(next)
       flow
         from done landed_seq_of(fresh_landing, next.landed_seq)
         done -> land_note _
-
-on props_failed(error)
-  host_error = error.message
 
 on land_note(seq)
   return if seq <= 0

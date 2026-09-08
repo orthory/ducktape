@@ -1,14 +1,9 @@
 //! The facts the host pushes, the readings folded off them, and the writes
 //! that leave as intents — one per act the forge screen offers.
 
-use iced::futures::{Stream, StreamExt};
+use iced::futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use ui_lang_guest::host;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HostError {
-    pub message: String,
-}
 
 /// One repository card: its name and the head the last push landed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -191,12 +186,31 @@ pub struct ForgeProps {
     pub drafts_scope: String,
 }
 
-/// The facts now, and again on every change the host sees.
-pub fn props() -> impl Stream<Item = Result<ForgeProps, HostError>> + Send + 'static {
-    host::subscribe("forge.props", &[]).map(|answer| {
-        let bytes = answer.map_err(|message| HostError { message })?;
-        serde_json::from_slice(&bytes).map_err(|error| HostError {
-            message: error.to_string(),
+/// One item of the facts subscription: the facts, or why not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PropsItem {
+    pub next: ForgeProps,
+    pub error: String,
+}
+
+/// The facts now, and again on every change the host sees — a
+/// subscription, so a view restored from a snapshot asks again on its own.
+pub fn props() -> iced::Subscription<PropsItem> {
+    iced::Subscription::run(|| {
+        host::subscribe("forge.props", &[]).map(|answer| {
+            let read = answer.and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+            });
+            match read {
+                Ok(next) => PropsItem {
+                    next,
+                    error: String::new(),
+                },
+                Err(error) => PropsItem {
+                    next: ForgeProps::default(),
+                    error,
+                },
+            }
         })
     })
 }

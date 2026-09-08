@@ -4050,6 +4050,13 @@ mod tests {
             .await
     }
 
+    /// The seat of `module` as no test has touched it: the registry is one
+    /// per process, and every deployment test leaves its module drawn.
+    fn fresh(module: &'static str) -> Arc<Mutex<Mounted>> {
+        registry().lock().expect("module views").remove(module);
+        mounted(module)
+    }
+
     fn join_all(loads: Vec<std::thread::JoinHandle<()>>) {
         for load in loads {
             load.join().expect("the load");
@@ -4061,76 +4068,84 @@ mod tests {
     /// new generation (so the old tree's messages route nowhere), with the
     /// new deployment's assets, and its first redraw routes the restored
     /// view's requests — the props subscription among them — without
-    /// another tick.
+    /// another tick. Every module-owned view, from its own staged wasm:
+    /// a view whose props ride a mount task instead of a subscription can
+    /// never be snapshotted while that task is live, and never asks again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_deployment_swaps_the_view_in_place() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
-        let component = std::fs::read(staged).expect("the staged view");
-        let (a, b) = (
-            deployment(&component, "a.svg"),
-            deployment(&component, "b.svg"),
-        );
-        let node = FakeDeployment::serving("governance", &a);
-        let client = fake_node(node.clone()).await;
-
-        let mounted = mounted("governance");
-        join_all(connected(&client));
-        assert_eq!(slot_assets(&mounted), ["a.svg"]);
-        let (generation, frame_rev) = {
-            let mut locked = mounted.lock().expect("module view lock");
-            let generation = locked.generation;
-            let Slot::Ready(guest) = &mut locked.slot else {
-                panic!("the view of A");
+        for module in ["governance", "files", "pages", "chat", "forge"] {
+            let Some(staged) = staged(module) else {
+                continue;
             };
-            // the view draws, answers its own props request, and settles
-            assert!((0..4).any(|_| !guest.redraw(&None)));
-            assert!(guest.settled(), "fault: {:?}", guest.fault);
-            assert!(guest.props_subscription.is_some());
-            (generation, guest.frame_rev)
-        };
+            let component = std::fs::read(staged).expect("the staged view");
+            let (a, b) = (
+                deployment(&component, "a.svg"),
+                deployment(&component, "b.svg"),
+            );
+            let node = FakeDeployment::serving(module, &a);
+            let client = fake_node(node.clone()).await;
 
-        // a block activates B: the check finds the hash moved
-        node.deploy("governance", &b);
-        join_all(deployments_checked().await);
-        assert_eq!(slot_assets(&mounted), ["b.svg"]);
-        let generation = {
-            let mut locked = mounted.lock().expect("module view lock");
-            assert_eq!(locked.hash, Some(b.hash()));
-            assert!(
-                locked.generation > generation,
-                "the old tree's messages are refused"
-            );
-            let Slot::Ready(guest) = &mut locked.slot else {
-                panic!("the view of B");
+            let mounted = fresh(module);
+            join_all(connected(&client));
+            assert_eq!(slot_assets(&mounted), ["a.svg"], "{module}");
+            let (generation, frame_rev) = {
+                let mut locked = mounted.lock().expect("module view lock");
+                let generation = locked.generation;
+                let Slot::Ready(guest) = &mut locked.slot else {
+                    panic!("{module}: the view of A");
+                };
+                // the view draws, answers its own props request, and settles
+                assert!((0..4).any(|_| !guest.redraw(&None)), "{module}");
+                assert!(guest.settled(), "{module} fault: {:?}", guest.fault);
+                assert!(guest.props_subscription.is_some(), "{module}");
+                (generation, guest.frame_rev)
             };
-            assert!(
-                guest.frame_rev > frame_rev,
-                "the widget rebuilds for the new tree"
+
+            // a block activates B: the check finds the hash moved
+            node.deploy(module, &b);
+            join_all(deployments_checked().await);
+            assert_eq!(slot_assets(&mounted), ["b.svg"], "{module}: B installed");
+            let generation = {
+                let mut locked = mounted.lock().expect("module view lock");
+                assert_eq!(locked.hash, Some(b.hash()), "{module}");
+                assert!(
+                    locked.generation > generation,
+                    "{module}: the old tree's messages are refused"
+                );
+                let Slot::Ready(guest) = &mut locked.slot else {
+                    panic!("{module}: the view of B");
+                };
+                assert!(
+                    guest.frame_rev > frame_rev,
+                    "{module}: the widget rebuilds for the new tree"
+                );
+                assert!(
+                    guest.staged && guest.props_subscription.is_none(),
+                    "{module}"
+                );
+                let ticks = guest.ticks;
+                // the first redraw routes the staged requests without another
+                // tick, and the view is quiet after it
+                assert!(!guest.redraw(&None), "{module}");
+                assert_eq!(guest.ticks, ticks, "{module}");
+                assert!(
+                    guest.props_subscription.is_some(),
+                    "{module}: the restored view asked for its props again"
+                );
+                assert!(guest.fault.is_none(), "{module}: {:?}", guest.fault);
+                locked.generation
+            };
+            // and the same deployment again is nothing to do
+            join_all(deployments_checked().await);
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(
+                (locked.generation, locked.hash),
+                (generation, Some(b.hash())),
+                "{module}"
             );
-            assert!(guest.staged && guest.props_subscription.is_none());
-            let ticks = guest.ticks;
-            // the first redraw routes the staged requests without another
-            // tick, and the view is quiet after it
-            assert!(!guest.redraw(&None));
-            assert_eq!(guest.ticks, ticks);
-            assert!(
-                guest.props_subscription.is_some(),
-                "the restored view asked for its props again"
-            );
-            assert!(guest.fault.is_none());
-            locked.generation
-        };
-        // and the same deployment again is nothing to do
-        join_all(deployments_checked().await);
-        let locked = mounted.lock().expect("module view lock");
-        assert_eq!(
-            (locked.generation, locked.hash),
-            (generation, Some(b.hash()))
-        );
+        }
     }
 
     /// A deployment that moves while its view is prepared is not installed:
@@ -4151,7 +4166,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("chat", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("chat");
+        let mounted = fresh("chat");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4185,7 +4200,7 @@ mod tests {
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
         let node = FakeDeployment::serving("files", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("files");
+        let mounted = fresh("files");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         node.deploy("files", &removed);
