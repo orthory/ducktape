@@ -24,9 +24,11 @@ fn full_view_fits_the_default_test_stack() {
 
 #[test]
 fn message_action_toolbar_stays_compact_and_accessible() {
+    // The chat rows, and the rich body they share with the forge.
     let components = inlined(include_str!(
         "../../../crates/views/chat/src/ui/components.ice"
-    ));
+    )) + "\n"
+        + &inlined(include_str!("../ui/components/richbody.ice"));
     let toolbar = components
         .split_once("component MessageCard")
         .unwrap()
@@ -168,11 +170,13 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // dismisses it (see `reactions_run_outside_the_mutation_lock`).
     assert!(!picker.contains("mutation_phase"));
 
-    let handlers = inlined(include_str!("../ui/handlers/chat.ice"));
+    // The focus moves are the view's own: its handlers seat the caret on
+    // the control the act opened, under the view's `#chat` mount.
+    let handlers = inlined(include_str!("../../../crates/views/chat/src/ui/app.ice"));
     for focus in [
-        "#workspace-tabs/content/chat/message-action-focus",
-        "#workspace-tabs/content/chat/message-reaction-focus",
-        "#workspace-tabs/content/chat/message-delete-focus",
+        "#chat/message-action-focus",
+        "#chat/message-reaction-focus",
+        "#chat/message-delete-focus",
     ] {
         assert!(handlers.contains(focus));
     }
@@ -192,7 +196,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("\non ")
         .unwrap()
         .0;
-    assert!(activate.contains("task widget focus #workspace-tabs/content/chat/message-edit"));
+    assert!(activate.contains("task widget focus #chat/message-edit"));
 }
 
 #[test]
@@ -389,7 +393,8 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
     ));
-    assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    assert!(chat_screen.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
 
     // THE WAY BACK TO NOW IS A FLOAT, NOT A BAND. There is no amber "Viewing
@@ -398,10 +403,10 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // me back to now" as far from now as the pane allows. The pill is a stack
     // layer at the timeline's bottom edge, shown when the reader is away from
     // the tail — a history window OR her own scroll.
-    assert!(!SCREENS.contains("text \"Viewing history\""));
-    assert!(SCREENS.contains("if !empty(messages) && (history_view || !at_live_tail)"));
-    assert!(SCREENS.contains("button \"↓  Jump to latest\""));
-    assert!(SCREENS.contains("emit(choose_channel, active_channel)"));
+    assert!(!chat_screen.contains("text \"Viewing history\""));
+    assert!(chat_screen.contains("if !empty(messages) && (history_view || !at_live_tail)"));
+    assert!(chat_screen.contains("button \"↓  Jump to latest\""));
+    assert!(chat_screen.contains("emit(choose_channel, active_channel)"));
 
     // The endpoint field is GONE from Settings — the launch window's picker
     // owns which network; Settings keeps only Reconnect / Switch network.
@@ -411,12 +416,11 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!settings.contains("#rpc"));
     assert!(settings.contains("emit(switch_network)"));
     assert!(settings.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
-    assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
+    assert!(chat_screen.contains("if active_thread_seq > 0 && !channel_settings_open"));
     // Both chat composers wear the SAME plate — and now they wear the same
     // SOURCE: the one `chat_composer` host surface (`composer_surface.rs`)
     // seated twice by the view, so the chrome cannot drift between the
     // stream and the rail by editing one.
-    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert_eq!(
         chat_screen.matches("extern chat_composer(").count(),
         2,
@@ -441,21 +445,27 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
     // The composer geometry moved into the `rich_composer` extern args
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
-    // Both chat composers share ONE call now — they are one component — and
-    // the forge note keeps its own compact geometry on the screen.
-    let chat_components = inlined(include_str!(
-        "../../../crates/views/chat/src/ui/components.ice"
-    ));
-    assert_eq!(chat_components.matches(", 44.0, 150.0, 10.0) #").count(), 1);
+    // Both chat composers share ONE call now — the `chat_composer` host
+    // surface — and the forge note keeps its own compact geometry on the
+    // screen.
+    let chat_composer = include_str!("../composer_surface.rs");
+    assert_eq!(
+        chat_composer
+            .matches("44.0,\n            150.0,\n            10.0,")
+            .count(),
+        1
+    );
     assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
-    assert!(chat_components.contains("button \"Send\" disabled="));
-    assert!(chat_components.contains(
-        "h=29.0 @primary_action @px-12px @py-7px -> composer_event(composer_submit_event(), blocked, kind)"
-    ));
+    assert!(chat_composer.contains("widget::text(\"Send\")"));
+    assert!(chat_composer.contains(".height(if self.compact { 28 } else { 29 })"));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         SCREENS
             .matches("box w=fill h=fill align-x=center align-y=center")
             .count()
+            + chat_screen
+                .matches("box w=fill h=fill align-x=center align-y=center")
+                .count()
             >= 10
     );
     for line in SCREENS
@@ -473,9 +483,10 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
     // centered row. Chat and pages both draw it, from their screens — the
     // components carry the pane bodies, never a second header shape.
-    let pane_headers: Vec<_> = SCREENS
+    let screens = format!("{}\n{chat_screen}", *SCREENS);
+    let pane_headers: Vec<_> = screens
         .lines()
-        .zip(SCREENS.lines().skip(1))
+        .zip(screens.lines().skip(1))
         .filter(|(plate, _)| {
             let plate = plate.trim_start();
             plate == "box w=fill h=50.0 pl=18.0 pr=18.0"
@@ -647,7 +658,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert!(!SCREENS.contains("font=code @text-brand"));
     assert!(!chat.contains("bg=brand/10 border=brand/22"));
     assert!(!chat.contains("bg=brand/9 border=brand/20"));
-    assert!(SCREENS.contains("Badge.Outline label=\"Members only\""));
+    assert!(chat_screen.contains("Badge.Outline label=\"Members only\""));
     // a tracker row's kind is carried by the PLATE behind the glyph, not by
     // a second badge next to the state — one `match item.kind`, two plates.
     assert!(forge.contains(
@@ -680,6 +691,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         let kit_components = inlined(include_str!("../ui/components/kit.ice"));
         let action = SCREENS
             .lines()
+            .chain(chat_screen.lines())
             .chain(kit_components.lines())
             .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
             .unwrap_or_else(|| panic!("missing action target {target}"));
@@ -725,7 +737,10 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert_eq!(
         SCREENS
             .matches("focused bg=transparent border=transparent value=transparent border-w=0.0")
-            .count(),
+            .count()
+            + chat_screen
+                .matches("focused bg=transparent border=transparent value=transparent border-w=0.0")
+                .count(),
         6
     );
 
@@ -753,7 +768,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         assert!(kit.contains(mapping), "{mapping}");
     }
     assert!(SCREENS.contains("bg=danger_bg border=danger_line"));
-    assert!(SCREENS.contains("bg=danger_dot"));
+    assert!(chat_screen.contains("bg=danger_dot"));
     assert!(SCREENS.contains("bg=success_dot"));
     // the semantic status plate is the kit's, so every screen that reports
     // a good outcome paints the same three tokens.
@@ -1301,7 +1316,8 @@ fn every_current_row_marker_rests_on_one_selection_token() {
 fn the_chat_surface_holds_to_its_measured_geometry() {
     let components = inlined(include_str!(
         "../../../crates/views/chat/src/ui/components.ice"
-    ));
+    )) + "\n"
+        + &inlined(include_str!("../ui/components/richbody.ice"));
     let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let dm = inlined(include_str!("../../../crates/views/chat/src/ui/dm.ice"));
 
@@ -1310,8 +1326,7 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
     assert!(
         components.contains("col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5")
     );
-    let rich_body = inlined(include_str!("../ui/components/richbody.ice"));
-    assert!(rich_body.contains("col w=fill gap=5.0\n    for block in blocks"));
+    assert!(components.contains("col w=fill gap=5.0\n    for block in blocks"));
 
     // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
     // 14px spacer). The spacer sits OUTSIDE the hover capsule, so the gap
@@ -1370,11 +1385,14 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
     // A FAILED SEND WEARS GateNote's REVERSIBLE-DANGER PLATE, not a muted
     // sentence quieter than the archived-channel notice above it. It lives
-    // with the composer it offers the words back to (ducktape-ui#697), which
-    // is why there is one of it instead of a stream copy and a rail copy.
-    assert!(components.contains(
-        "box w=fill px=13.0 py=11.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=9.0"
-    ));
+    // with the composer it offers the words back to (ducktape-ui#697) — the
+    // `chat_composer` host surface — which is why there is one of it instead
+    // of a stream copy and a rail copy.
+    let composer = include_str!("../composer_surface.rs");
+    assert!(composer.contains(".padding([11, 13])"));
+    assert!(composer.contains("background: Some(tokens.palette.destructive_background.into())"));
+    assert!(composer.contains("color: tokens.palette.destructive_line,"));
+    assert!(composer.contains("radius: 9.0.into(),"));
 
     // THE DM ROW CARRIES THE SAME PREPARED UNREAD MARK AS A CHANNEL ROW.
     assert!(screen.contains("unread=dm.unread"));
@@ -1412,9 +1430,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // 1. WORKSPACE-SHAPED — channels, DMs, members, repos, pages,
         //    validators, peers. Length tracks how big the workspace is, not
         //    how long the chain has run, and it moves on a delta, not a scroll.
-        ("chat/src/ui/chat.ice", "for room in rooms"),
-        ("chat/src/ui/chat.ice", "for dm in dm_rows"),
-        ("chat/src/ui/chat.ice", "for member in channel_members"),
         ("screens/pages.ice", "for page in pages"),
         ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
         ("screens/forge.ice", "for repo in repos"),
@@ -1438,10 +1453,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // `RichBody` is the one markdown renderer: a chat row, a forge body
         // and a review comment each hand it ONE body's blocks.
         ("components/richbody.ice", "for block in blocks"),
-        (
-            "chat/src/ui/components.ice",
-            "for reaction in message.reactions",
-        ),
         // One review's inline comments, bounded by the review that holds them.
         ("components/forge.ice", "for comment in review.comments"),
         (
@@ -1458,7 +1469,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
-        ("chat/src/ui/chat.ice", "for hit in search_hits"),
         ("screens/pages.ice", "for hit in page_search_hits"),
         ("screens/pages.ice", "for comment_row in block_comment_rows"),
         (

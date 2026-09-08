@@ -1615,7 +1615,13 @@ mod tests {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert!(intents_of("agents").is_empty());
-        assert!(intents_of("chat").is_empty());
+        let chat = intents_of("chat");
+        assert_eq!(chat.len(), 43);
+        assert!(chat.contains(&"choose_channel"));
+        assert!(
+            !chat.contains(&"composer"),
+            "a submit reaches the app only through the composer surface it was typed in"
+        );
     }
 
     /// A roster intent is read field by field off its JSON; a missing or

@@ -243,13 +243,13 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
             })
             .collect()
     };
-    // The mount's `blocked=` and the arm's `let refused =`, in mount order.
+    // The seat's `blocked` argument — the fifth of `chat_composer(scope,
+    // kind, compact, hint, blocked, …)` — and the arm's verdict, in seat order.
     let shown: Vec<Vec<String>> = SCREEN
         .lines()
         .map(str::trim)
-        .filter_map(|line| line.strip_prefix("blocked=("))
-        .filter_map(|line| line.strip_suffix(')'))
-        .map(terms)
+        .filter_map(|line| line.strip_prefix("extern chat_composer("))
+        .map(|arguments| terms(split_top(arguments)[4]))
         .collect();
     // The re-read is a VERDICT now, computed once from the same four inputs
     // the mount's gate wears — so the lint reads its arguments rather than a
@@ -517,6 +517,10 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
+        // Each reason is its own network: the composer documents are keyed
+        // by endpoint and room and outlive an app, so two fixtures on one
+        // thread must not share a plate.
+        app.connected_rpc = format!("http://{reason}");
         app.active_channel = "general".into();
         app.active_channel_archived = archived;
         app.active_channel_members_only = members_only;

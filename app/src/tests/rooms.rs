@@ -487,8 +487,9 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
 
     // The screen is what hides the rail while the drawer is up — the handler
     // never needed to.
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
-        SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"),
+        screen.contains("if active_thread_seq > 0 && !channel_settings_open"),
         "the rail is drawn under the drawer's own gate"
     );
     let chat = inlined(include_str!("../ui/handlers/chat.ice"));

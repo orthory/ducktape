@@ -428,9 +428,6 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
 /// template that meets it.
 #[test]
 fn the_message_line_is_one_rich_text_paragraph() {
-    let components = inlined(include_str!(
-        "../../../crates/views/chat/src/ui/components.ice"
-    ));
     let rich_body = inlined(include_str!("../ui/components/richbody.ice"));
     let rich_line = rich_body
         .split_once("component RichLine")
@@ -447,7 +444,7 @@ fn the_message_line_is_one_rich_text_paragraph() {
     ));
     assert!(rich_line.contains("for span in block.spans"));
     // The prose scale is the BODY's to set: a chat row reads at 13.5.
-    assert!(components.contains("RichBody blocks=message.blocks size=13.5"));
+    assert!(rich_body.contains("RichBody blocks=message.blocks size=13.5"));
     assert!(
         !rich_line.contains("flex") && !rich_line.contains("button"),
         "a token widget beside the paragraph is the #1071 workaround back"

@@ -1033,7 +1033,8 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         );
     }
 
-    let chat = component(SCREENS.as_str(), "ChatScreen");
+    let chat_screen = include_str!("../../../crates/views/chat/src/ui/chat.ice");
+    let chat = component(chat_screen, "ChatScreen");
     let chat_state = local_state(chat);
     for field in [
         "message_action_focus = \"\"",

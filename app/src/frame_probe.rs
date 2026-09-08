@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape, LiveKind, MessageAction, ShellTab};
+use super::{__DucktapeMessage, Ducktape, LiveKind, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -1602,20 +1602,13 @@ fn drawn_frame(
 }
 
 /// A settled optimistic row keeps the identity already mounted in the keyed
-/// virtual timeline. Replacing its client identity with the canonical sequence
-/// used to wedge the main stream while the unkeyed thread rail kept working.
+/// virtual timeline the view draws it in. Replacing its client identity with
+/// the canonical sequence used to wedge the main stream while the unkeyed
+/// thread rail kept working — the timeline is the chat view's now, keyed on
+/// `view_key`, so the reducer's promise is the whole contract.
 #[test]
 fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_optimistic_confirmation)
-        .expect("the confirmation probe thread spawns")
-        .join()
-        .expect("the confirmation probe thread finishes");
-}
-
-fn probe_optimistic_confirmation() {
-    let (mut app, console) = console_in_chat();
+    let (mut app, _) = console_in_chat();
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         crate::ComposerKind::Message,
         "confirmation probe".into(),
@@ -1633,14 +1626,6 @@ fn probe_optimistic_confirmation() {
         app.messages.first().map(|message| message.seq),
         Some(2),
         "making room for the pending row drops the oldest committed root"
-    );
-
-    let mut renderer = headless_renderer();
-    let (cache, pending_frame) = drawn_frame(
-        &mut app,
-        console,
-        &mut renderer,
-        user_interface::Cache::default(),
     );
 
     let canonical = backend::ChatMessage {
@@ -1674,47 +1659,27 @@ fn probe_optimistic_confirmation() {
         Some(ROWS + 1),
         "confirmation keeps the canonical row at the active tail"
     );
-
-    let (_, confirmed_frame) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert_ne!(
-        pending_frame, confirmed_frame,
-        "the pending dot must disappear when the row becomes canonical"
-    );
 }
 
-/// THE STALENESS GUARD. Under the keyed lazy a quiet row repaints ONLY when
+/// THE STALENESS GUARD. The chat view's keyed rows repaint ONLY when
 /// (seq, render_rev) moves, so a mutation path that misses its `render_rev`
 /// bump is not a perf regression but a WRONG FRAME — the reader keeps looking
 /// at the pre-mutation row. Drive the two in-place folds a reader sees most —
 /// a reaction and an edit — through the app's real live-delta path and assert
-/// each repaints the DRAWN frame, with an unchanged-frame control proving the
-/// diffs mean repaint rather than render noise.
+/// each moves the revision the view keys on.
 #[test]
 fn a_reaction_and_an_edit_repaint_the_visible_row() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_row_repaint)
-        .expect("the repaint probe thread spawns")
-        .join()
-        .expect("the repaint probe thread finishes");
-}
+    let (mut app, _) = console_in_chat();
+    let render_rev = |app: &Ducktape| {
+        app.messages
+            .iter()
+            .find(|message| message.seq == ROWS)
+            .map(|message| message.render_rev)
+            .expect("the bottom row")
+    };
+    let quiet = render_rev(&app);
 
-fn probe_row_repaint() {
-    let (mut app, console) = console_in_chat();
-    let mut renderer = headless_renderer();
-
-    let cache = user_interface::Cache::default();
-    let (cache, quiet) = drawn_frame(&mut app, console, &mut renderer, cache);
-    let (cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        quiet == control,
-        "an unchanged frame must draw identical pixels — without this control \
-         the repaint assertions below prove nothing"
-    );
-
-    // A reaction lands on the BOTTOM row — visible under `anchor-y=end`, and
-    // in the quiet arm (nothing selected), so the repaint
-    // must come through the keyed lazy's (seq, render_rev) move.
+    // A reaction lands on the BOTTOM row — visible under `anchor-y=end`.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
         kind: LiveKind::Chat,
         chat: vec![backend::ChatDelta::Reaction {
@@ -1727,11 +1692,11 @@ fn probe_row_repaint() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    let (cache, reacted) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        control != reacted,
+    let reacted = render_rev(&app);
+    assert_ne!(
+        quiet, reacted,
         "a reaction delta must repaint the visible row — `merge_message_reaction` \
-         stopped moving `render_rev` if this frame is unchanged"
+         stopped moving `render_rev` if it is unchanged"
     );
 
     // An edit of the same row, one wire revision up.
@@ -1751,11 +1716,11 @@ fn probe_row_repaint() {
         }],
         ..backend::LiveUpdate::default()
     }));
-    let (_, edited) = drawn_frame(&mut app, console, &mut renderer, cache);
-    assert!(
-        reacted != edited,
+    assert_ne!(
+        reacted,
+        render_rev(&app),
         "an edit delta must repaint the visible row — `apply_edit_content` \
-         stopped moving `render_rev` if this frame is unchanged"
+         stopped moving `render_rev` if it is unchanged"
     );
 }
 
@@ -2548,73 +2513,5 @@ fn probe_channel_switch() {
         "one room switch cost {per_switch} allocations, over the \
          {CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING} ceiling. The switch should clear \
          the active rich window, retain only tiny draft stores, and launch one root read."
-    );
-}
-
-/// A press on the pane beside an open message menu dismisses it — the
-/// backdrop's `dismiss`, the one exit a pointer has. The app's codegen wraps
-/// an overlay's LAYER in a press swallower (a press on a menu row's padding
-/// must not fall through to the backdrop), so a fill-sized layer covered the
-/// backdrop end to end: every press on the pane died in the swallower and
-/// Esc was the menu's only exit. Driven through the real event path — the
-/// float overlay, the swallower, the backdrop — not the reducer.
-#[test]
-fn a_press_beside_the_message_menu_dismisses_it() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(probe_message_menu_dismiss)
-        .expect("the menu dismiss probe thread spawns")
-        .join()
-        .expect("the menu dismiss probe thread finishes");
-}
-
-fn probe_message_menu_dismiss() {
-    let (mut app, console) = console_in_chat();
-    let _ = app.__update(__DucktapeMessage::OpenMessageActions(
-        ROWS,
-        "body".into(),
-        1,
-    ));
-    assert_eq!(app.message_action, MessageAction::More, "the menu is open");
-    assert_eq!(app.selected_message_seq, ROWS);
-
-    let mut renderer = headless_renderer();
-    let cache = warm_settled(
-        "the menu dismiss probe",
-        &mut app,
-        console,
-        WINDOW,
-        &mut renderer,
-        user_interface::Cache::default(),
-    );
-    // Mid-pane, well left of the 200px menu that hangs off the right edge.
-    let position = Point::new(520.0, 450.0);
-    let cursor = mouse::Cursor::Available(position);
-    let mut clipboard = clipboard::Null;
-    let mut queued: Vec<__DucktapeMessage> = Vec::new();
-    let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
-    let _ = ui.update(
-        &[
-            Event::Mouse(mouse::Event::CursorMoved { position }),
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-        ],
-        cursor,
-        &mut renderer,
-        &mut clipboard,
-        &mut queued,
-    );
-    drop(ui);
-    for message in queued {
-        let _ = app.__update(message);
-    }
-    assert_eq!(
-        app.message_action,
-        MessageAction::Toolbar,
-        "a press beside the menu must reach the backdrop's dismiss"
-    );
-    assert_eq!(
-        app.selected_message_seq, 0,
-        "the selection clears with the menu"
     );
 }

@@ -223,7 +223,7 @@ fn thread_messages_mirror_the_main_action_system() {
     }
     // Thread edit/delete target the thread selection, never the main one.
     let edit = handlers
-        .split_once("on edit_thread_message_submit\n")
+        .split_once("on edit_thread_message_submit(text)\n")
         .unwrap()
         .1
         .split_once("\non ")

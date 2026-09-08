@@ -687,8 +687,9 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
     /// Settings (which owns connection repair and stays useful with the node
-    /// down) and Node (which owns the daemon diagnostics) are module-owned
-    /// views now and not in this inventory; every native data screen answers.
+    /// down), Node (which owns the daemon diagnostics) and Chat (which answers
+    /// on its own, in `crates/views/chat`) are module-owned views now and not
+    /// in this inventory; every native data screen answers.
     const EXEMPT: [&str; 0] = [];
 
     let mut screens: Vec<&str> = SCREENS
@@ -701,13 +702,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 
     assert_eq!(
         screens,
-        [
-            "ChatScreen",
-            "FilesScreen",
-            "ForgeScreen",
-            "PagesScreen",
-            "ShellScreen",
-        ],
+        ["FilesScreen", "ForgeScreen", "PagesScreen", "ShellScreen",],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
