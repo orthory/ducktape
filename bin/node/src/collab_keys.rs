@@ -268,8 +268,11 @@ mod tests {
     #[test]
     fn the_same_binding_on_another_network_gets_another_key() {
         let dir = workspace();
-        let here = ensure(dir.path(), on_network("ducktape#aaaa1111", "standup", "alice"))
-            .expect("mints");
+        let here = ensure(
+            dir.path(),
+            on_network("ducktape#aaaa1111", "standup", "alice"),
+        )
+        .expect("mints");
         let elsewhere = ensure(
             dir.path(),
             on_network("ducktape#bbbb2222", "standup", "alice"),

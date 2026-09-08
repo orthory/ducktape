@@ -266,7 +266,8 @@ fn submit(
     signer: &commonware_cryptography::ed25519::PrivateKey,
     msg: &collaboration::CollaborationMsg,
 ) -> CollabResult {
-    let frame = crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(msg));
+    let frame =
+        crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(msg));
     let height = crate::node_http::submit_frame(base, &frame)?;
     println!("{height}");
     Ok(())
@@ -582,7 +583,10 @@ mod tests {
         let CollabCmd::Key(args) = parsed.cmd else {
             panic!("key parses to the key verb");
         };
-        assert_eq!((args.conversation.as_str(), args.participant.as_str()), ("c1", "p1"));
+        assert_eq!(
+            (args.conversation.as_str(), args.participant.as_str()),
+            ("c1", "p1")
+        );
         assert!(
             !args.existing_only,
             "minting is the default: attaching is the common case"
@@ -663,6 +667,66 @@ mod tests {
         assert_eq!(millis_lane, sim_now + 86_400_000);
     }
 
+    /// Serve ONE canned `/v1/status` body on loopback and answer its base url —
+    /// this binary's own fake-node idiom (`account_cli`'s ceremony test).
+    fn status_once(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("one request");
+            let mut reader = BufReader::new(&socket);
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("request line");
+            assert!(request.starts_with("GET /v1/status"), "{request}");
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).expect("header"), 0);
+                let headers_complete = line == "\r\n";
+                if headers_complete {
+                    break;
+                }
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("respond");
+        });
+        (base, server)
+    }
+
+    /// The unit is REQUIRED. `consensus_time_unit` is an ordinary field every
+    /// node emits, so a status without one is a reshaped or proxied response —
+    /// and guessing picks a unit for a network that never said which it counts
+    /// in. Guessing wrong turns a 24 h intent into 86 seconds.
+    ///
+    /// This is the mutation guard for that decision: restoring the old
+    /// `unwrap_or_default()` makes the second half pass a deadline back.
+    #[test]
+    fn a_status_that_names_no_time_unit_is_refused_rather_than_guessed() {
+        let (base, server) =
+            status_once(r#"{"consensus_time":40000,"consensus_time_unit":"millis"}"#);
+        let named = deadline(&base, 3_600).expect("a status naming its unit answers a deadline");
+        assert_eq!(
+            named,
+            40_000 + 3_600_000,
+            "the named unit must be the one used"
+        );
+        server.join().expect("server");
+
+        let (base, server) = status_once(r#"{"consensus_time":40000}"#);
+        let refusal = deadline(&base, 3_600).expect_err("an unnamed unit must refuse");
+        assert!(
+            refusal.to_string().contains("consensus_time_unit"),
+            "the refusal must name the missing field: {refusal}"
+        );
+        server.join().expect("server");
+    }
+
     /// An absurd TTL must be REFUSED, never wrapped past the end of the clock
     /// into the past — which the module would read as already expired, from a
     /// CLI that printed a height and looked like it had worked.
@@ -687,7 +751,6 @@ mod tests {
             assert!(names_the_flag, "the refusal must name the knob: {refusal}");
         }
     }
-
 
     /// `send` and `ack` act AS an existing binding. Minting a key here would
     /// sign with one no committed `Bind` has authorized — an op the module
@@ -773,9 +836,6 @@ mod tests {
             &mut std::io::Cursor::new(Vec::new()),
         )
         .expect_err("invalid json cannot reach the node");
-        assert!(
-            refused.to_string().contains("not valid json"),
-            "{refused}"
-        );
+        assert!(refused.to_string().contains("not valid json"), "{refused}");
     }
 }
