@@ -131,21 +131,44 @@ pub fn members_view(
     module_view("members", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The Agents tab: the registry as the app has it, drawn by the `agents`
-/// view. Nothing comes back — the register is read-only there.
+/// The Agents tab: the register as the app has it, drawn by the `agents`
+/// view — every record whole, the capability tags the network announces,
+/// the action vocabulary, and the signing account (`account`, its decimal
+/// number) so the view offers the editor to a record's controller. Its
+/// intents come back as `status` (`agent_id`, `paused`), `save` and
+/// `register` (both the whole draft record as JSON, `AgentDraft`). Every
+/// committed write bumps `committed`, which tells the view its drafts were
+/// consumed.
+#[allow(clippy::too_many_arguments)]
 pub fn agents_view(
     dark: bool,
     connected: bool,
     answered: bool,
+    account: &str,
+    committed: i64,
     rows: &[crate::backend::AgentRow],
+    capabilities: &[String],
+    actions: &[String],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "rows": rows,
+        "capabilities": capabilities,
+        "actions": actions,
+        "account": account,
+        "committed": committed,
         "connected": connected,
         "answered": answered,
         "dark": dark,
     });
     module_view("agents", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
+    match event.kind.as_str() {
+        "save" => crate::AgentsIntent::Save,
+        "register" => crate::AgentsIntent::Register,
+        _ => crate::AgentsIntent::Status,
+    }
 }
 
 pub fn roster_intent(event: &ModuleViewEvent) -> crate::RosterIntent {
@@ -1316,6 +1339,13 @@ pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
     true
 }
 
+/// The room's explicit roster, as the app just read it, handed to the
+/// composers over that room (and its threads) for their mention menu.
+pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember]) -> bool {
+    crate::composer_surface::roster(scope, members);
+    true
+}
+
 // ---------- the files seat ----------
 
 /// The Files tab: one directory's listing, the preview open in it, the
@@ -1574,7 +1604,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         "governance" => &["vote", "execute"],
         "members" => &["copy", "agent_status", "propose"],
-        "agents" => &[],
+        "agents" => &["status", "save", "register"],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
         // `send` is deliberately NOT here: a send crosses only from the
@@ -3162,7 +3192,7 @@ pub(crate) mod tests {
     fn only_declared_intents_are_routed() {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
-        assert!(intents_of("agents").is_empty());
+        assert_eq!(intents_of("agents"), ["status", "save", "register"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(chat.contains(&"choose_channel"));
@@ -3401,7 +3431,7 @@ pub(crate) mod tests {
     }
 
     /// The bundled Agents view through the host: offline plate, then the
-    /// register, and nothing ever leaves it.
+    /// register; nothing leaves it until a reader edits a record.
     #[test]
     fn the_staged_agents_view_boots_and_takes_the_register() {
         let Some(staged) = staged("agents") else {
@@ -3419,8 +3449,21 @@ pub(crate) mod tests {
                 "rows": [{
                     "id": "reviewer-bot", "name": "Reviewer Bot", "initials": "RB",
                     "capability": "review", "status": "paused", "owner_handle": "eddy",
-                    "live": false, "skill_count": 3, "cap_count": 2
+                    "controller": "7", "live": false,
+                    "allowed_actions": ["chat.post"],
+                    "caps": {
+                        "forge_read": ["ducktape"], "forge_push": [], "duckfs_read": [],
+                        "duckfs_write": [], "tools": [], "secrets": [], "pages_write": ["*"],
+                        "subagent_budget": 0
+                    },
+                    "skills": [
+                        {"name": "review", "source_prefix": "/shared/skills/review", "source_snapshot": "", "always": true},
+                        {"name": "style", "source_prefix": "/shared/skills/style", "source_snapshot": "", "always": false},
+                        {"name": "tests", "source_prefix": "/shared/skills/tests", "source_snapshot": "", "always": false}
+                    ]
                 }],
+                "capabilities": ["claude", "review"], "actions": ["chat.post", "tasks.create"],
+                "account": "", "committed": 0,
                 "connected": true, "answered": true, "dark": false
             }))
             .expect("props encode"),

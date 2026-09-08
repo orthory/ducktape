@@ -85,12 +85,39 @@ pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
     NameDirectory::from_accounts(accounts)
 }
 
-/// A test's directory, seated the way a roster read seats it.
+/// A test's directory, seated the way a roster read seats it, for as long as
+/// the guard lives. The directory is one per process, so tests that seat one
+/// take turns on it, and a guard dropped leaves it empty for the next.
 #[cfg(test)]
-pub(crate) fn seed_names(directory: NameDirectory) {
-    *NAME_DIRECTORY
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+pub(crate) fn seed_names(directory: NameDirectory) -> SeededNames {
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let seeded = SeededNames { _turn: turn };
+    seeded.seat(directory);
+    seeded
+}
+
+/// A test's turn on the process-wide directory.
+#[cfg(test)]
+pub(crate) struct SeededNames {
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl SeededNames {
+    /// Replace the seated directory, the turn kept.
+    pub(crate) fn seat(&self, directory: NameDirectory) {
+        *NAME_DIRECTORY
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+    }
+}
+
+#[cfg(test)]
+impl Drop for SeededNames {
+    fn drop(&mut self) {
+        self.seat(NameDirectory::empty());
+    }
 }
 
 /// Whether the account or exact key represented by `me` holds a seat.

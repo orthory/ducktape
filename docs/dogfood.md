@@ -26,12 +26,12 @@ commentary in the app, with run outcomes available through the query API.
   install claude -n <chain-id>` or `ducktape agent install codex -n
   <chain-id>`, including the spec's declared companions. Discovery checks the
   workspace's executor directory (`<workspace>/executors`). Custom specs live
-  under `<workspace>/capabilities/` (`docs/records/specs/capability-spec.md`);
-  `make demo-seed` stages one there, `quack-test.toml`, a script-backed test
-  provider run by the guest shell `sh` it lifts out of the guest rootfs it
-  builds into `<workspace>/guest`, and registers the demo's Quackbot against
-  it with forge read and push on the seeded `playground` repo and on
-  `ducktape`.
+  under `<workspace>/capabilities/` (`docs/records/specs/capability-spec.md`).
+  `make demo-seed` registers the demo's ChiefDuck on the built-in `claude`
+  spec with the full action vocabulary, forge read and push on the seeded
+  `playground` repo and on `ducktape`, every page, and its persona
+  (`ops/chiefduck/SKILL.md`) as an always-loaded skill; `make dev` then
+  installs the claude CLI into the workspace so its runs execute.
 - **Provider authentication on the executing service.** Codex uses
   `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
   `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.claude/.credentials.json`. Installing an

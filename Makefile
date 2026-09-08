@@ -68,12 +68,13 @@ dev-clear:
 	@bash ops/dev-clear.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
-## messages, a tasks board, pages, a registered TEST agent with the dogfood
-## e2e runner's shape (a script-backed provider staged as a capability spec,
-## forge read+push on a seeded `playground` repo with an issue mentioning it —
-## once `make dev` starts the compute service it replies in chat and opens a
-## pull request from a microVM, no model credential needed), jobs, an
-## automation rule — plus TWO gateway web-app routes: a
+## messages, a tasks board, pages, the registered ChiefDuck agent (the
+## network's maintainer on the `claude` capability: the full action grant,
+## forge read+push on `ducktape` and on a seeded `playground` repo with an
+## issue mentioning it, its persona as an always-loaded skill — once `make
+## dev` installs the claude CLI and starts the compute service it replies in
+## chat and opens a pull request from a microVM), jobs, an automation rule —
+## plus TWO gateway web-app routes: a
 ## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Stops and
 ## replaces any previous "demo" workspace under ~/.ducktape (demo-clear), and
 ## builds the workspace's own guest images and shell executor. Builds ducktape
