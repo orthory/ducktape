@@ -2124,6 +2124,27 @@ pub(crate) mod canary {
             .expect("module view lock")
             .hash
     }
+
+    /// Every text in the view's tree, or none where no tree is drawn yet.
+    pub(crate) fn texts(module: &'static str) -> Vec<String> {
+        let mut texts = Vec::new();
+        let root = match &super::mounted(module)
+            .lock()
+            .expect("module view lock")
+            .slot
+        {
+            super::Slot::Ready(guest) => guest.frame.root.clone(),
+            _ => None,
+        };
+        if let Some(mut root) = root {
+            root.for_each_mut(&mut |node| {
+                if let super::wire::Node::Text { content, .. } = node {
+                    texts.push(content.clone());
+                }
+            });
+        }
+        texts
+    }
 }
 
 /// Where the staged views are: `$DUCKTAPE_VIEWS_DIR`, else `views/` beside

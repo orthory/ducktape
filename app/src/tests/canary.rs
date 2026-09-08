@@ -10,6 +10,10 @@
 //! `<out>/<n>-<module>-<state>-<hash8>.png`. The steps themselves (activate
 //! A, then B, then an asset-only B′, then a removal) are somebody else's to
 //! drive; this runs until it is killed, or `DUCKTAPE_CANARY_STEPS` captures.
+//! Beside each PNG, `<n>-….txt` holds every text in the transitioned view's
+//! tree, and the live run asserts what the canary views promise: the B
+//! views carry a visible marker (`CANARY B`, `· B`) the A views do not, and
+//! B′ changes the governance seal's colour and nothing else.
 //!
 //! Against a real node, from a fresh home, with the six desktop views staged
 //! where `DUCKTAPE_VIEWS_DIR` points:
@@ -17,7 +21,7 @@
 //! ```text
 //! DUCKTAPE_HOME=$(mktemp -d) DUCKTAPE_VIEWS_DIR=target/views \
 //! DUCKTAPE_NODE=http://127.0.0.1:<http port> DUCKTAPE_CANARY_OUT=target/canary \
-//! DUCKTAPE_CANARY_STEPS=4 \
+//! DUCKTAPE_CANARY_STEPS=8 DUCKTAPE_CANARY_MARKERS=1 \
 //! cargo test -p ducktape-app -- --ignored --nocapture canary_follows_a_live_node
 //! ```
 //!
@@ -35,7 +39,7 @@ use iced::advanced::{clipboard, mouse, renderer};
 use iced::{Color, Event, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
-use crate::module_view::canary::{mount_module_owned, seated_hash, tap};
+use crate::module_view::canary::{mount_module_owned, seated_hash, tap, texts};
 
 /// The Approvals tab as captured: a console-sized tab, one pixel per point.
 const TAB: Size = Size::new(900.0, 600.0);
@@ -44,6 +48,25 @@ const POLL: Duration = Duration::from_secs(1);
 /// How long a logged Ready waits for its seat before the capture is taken
 /// anyway (the line is logged before the seat, the seat is microseconds).
 const SEAT: Duration = Duration::from_secs(5);
+/// The corner of the Approvals tab the seal is drawn in.
+const SEAL: (u32, u32) = (64, 64);
+
+/// The text a module's canary B view shows that its A view does not.
+fn marker(module: &str) -> &'static str {
+    match module {
+        "files" => "+ Folder · B",
+        "pages" => "Pages · B",
+        "chat" => "CHANNELS · B",
+        _ => "CANARY B",
+    }
+}
+
+/// What a capture left behind, for the next one of the same module to be
+/// judged against.
+struct Seen {
+    state: String,
+    seal: Vec<u8>,
+}
 
 struct Transition {
     module: String,
@@ -70,8 +93,10 @@ fn required(name: &str) -> String {
 }
 
 /// Seats the views from `node` and follows its deployments, writing into
-/// `out`; returns after `steps` captures (0: only when killed).
-fn run(node: &str, out: &Path, steps: usize) -> usize {
+/// `out`; returns after `steps` captures (0: only when killed). With
+/// `markers`, every transition is also judged against what the canary
+/// views promise (see the module doc) — and a broken promise is a panic.
+fn run(node: &str, out: &Path, steps: usize, markers: bool) -> usize {
     use std::io::Write as _;
     std::fs::create_dir_all(out).expect("the output directory");
     let mut log = std::fs::File::create(out.join("view_source.log")).expect("the log file");
@@ -94,6 +119,7 @@ fn run(node: &str, out: &Path, steps: usize) -> usize {
     let mut renderer = crate::frame_probe::headless_renderer();
     let mut captures = 0;
     let mut polled = Instant::now();
+    let mut seen: std::collections::HashMap<String, Seen> = std::collections::HashMap::new();
     loop {
         match lines.recv_timeout(Duration::from_millis(200)) {
             Ok(line) => {
@@ -112,8 +138,22 @@ fn run(node: &str, out: &Path, steps: usize) -> usize {
                     step.state,
                     &step.hash[..8]
                 );
-                capture(&mut renderer, &out.join(&name));
-                eprintln!("canary: {name}");
+                let seal = capture(&mut renderer, &out.join(&name));
+                let shown = shown(&step.module);
+                std::fs::write(out.join(name.replace(".png", ".txt")), shown.join("\n"))
+                    .expect("the texts file");
+                let marked = shown.iter().any(|text| text.contains(marker(&step.module)));
+                eprintln!("canary: {name} marker={marked} texts={}", shown.len());
+                if markers {
+                    judge(&step, marked, &shown, &seal, seen.get(&step.module));
+                }
+                seen.insert(
+                    step.module.clone(),
+                    Seen {
+                        state: step.state.clone(),
+                        seal,
+                    },
+                );
                 if steps > 0 && captures >= steps {
                     return captures;
                 }
@@ -125,6 +165,46 @@ fn run(node: &str, out: &Path, steps: usize) -> usize {
             drop(runtime.block_on(crate::module_view::deployments_checked()));
             polled = Instant::now();
         }
+    }
+}
+
+/// The texts of `module`'s tree, or none for a module this app does not own.
+fn shown(module: &str) -> Vec<String> {
+    crate::backend::view_source::MODULE_OWNED
+        .into_iter()
+        .find(|owned| *owned == module)
+        .map(texts)
+        .unwrap_or_default()
+}
+
+/// The canary views' promise, held against this transition: an A (Ready)
+/// shows no marker, a B (Swapped) shows its module's, a B′ (a Swapped after
+/// a Swapped) changes the governance seal, a removal (Missing) shows nothing.
+fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
+    let module = &step.module;
+    match step.state.as_str() {
+        "Ready" => assert!(
+            !marked,
+            "{module} shows the B marker before any swap: {shown:?}"
+        ),
+        "Swapped" => {
+            assert!(
+                marked,
+                "{module} swapped without its marker {:?}: {shown:?}",
+                marker(module)
+            );
+            if module == "governance" && before.is_some_and(|before| before.state == "Swapped") {
+                assert!(
+                    before.is_some_and(|before| before.seal != seal),
+                    "the governance seal did not change between B and B′"
+                );
+            }
+        }
+        "Missing" => assert!(
+            shown.is_empty(),
+            "{module} removed but still drawn: {shown:?}"
+        ),
+        _ => {}
     }
 }
 
@@ -153,8 +233,9 @@ fn seated(step: &Transition) {
 }
 
 /// The Approvals tab drawn to `path`: three frames, so the view's own
-/// requests are routed and its tree rebuilt, then the pixels.
-fn capture(renderer: &mut iced::Renderer, path: &Path) {
+/// requests are routed and its tree rebuilt, then the pixels — of which the
+/// seal's corner comes back, for the next capture to be held against.
+fn capture(renderer: &mut iced::Renderer, path: &Path) -> Vec<u8> {
     let mut cache = user_interface::Cache::default();
     let mut clipboard = clipboard::Null;
     for _ in 0..3 {
@@ -186,10 +267,11 @@ fn capture(renderer: &mut iced::Renderer, path: &Path) {
     }
     let (width, height) = (TAB.width as u32, TAB.height as u32);
     let rgba = renderer.screenshot(Size::new(width, height), 1.0, Color::WHITE);
-    image::RgbaImage::from_raw(width, height, rgba)
-        .expect("a full RGBA buffer")
-        .save(path)
-        .expect("the PNG");
+    let tab = image::RgbaImage::from_raw(width, height, rgba).expect("a full RGBA buffer");
+    tab.save(path).expect("the PNG");
+    image::imageops::crop_imm(&tab, 0, 0, SEAL.0, SEAL.1)
+        .to_image()
+        .into_raw()
 }
 
 #[test]
@@ -203,9 +285,12 @@ fn canary_follows_a_live_node() {
         .ok()
         .and_then(|steps| steps.parse().ok())
         .unwrap_or(0);
+    // the canary views' promise is held only when asked: a rehearsal
+    // network may seat anything
+    let markers = std::env::var_os("DUCKTAPE_CANARY_MARKERS").is_some();
     let captures = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || run(&node, &out, steps))
+        .spawn(move || run(&node, &out, steps, markers))
         .expect("the canary thread")
         .join()
         .expect("the canary finishes");
@@ -275,7 +360,7 @@ fn the_canary_captures_every_transition_of_a_deployment() {
         let out = out.clone();
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
-            .spawn(move || run(&origin, &out, 4))
+            .spawn(move || run(&origin, &out, 4, false))
             .unwrap()
     };
     // each step once the runner has captured the one before
@@ -308,6 +393,11 @@ fn the_canary_captures_every_transition_of_a_deployment() {
             format!("4-governance-Missing-{}.png", hash8(&removed)),
         ]
     );
+    // the texts beside each PNG: the tab's, then nothing once removed
+    let shown =
+        |name: &str| std::fs::read_to_string(out.join(name.replace(".png", ".txt"))).unwrap();
+    assert!(shown(&expected[1]).contains("Approvals"));
+    assert!(shown(&expected[3]).is_empty(), "{}", shown(&expected[3]));
     let log = std::fs::read_to_string(out.join("view_source.log")).unwrap();
     for (state, artifact) in [
         (a_state, &a),
