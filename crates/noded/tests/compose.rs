@@ -707,3 +707,321 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
         })
     });
 }
+
+fn ice_view() -> Vec<u8> {
+    std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ice-view.component.wasm"),
+    )
+    .unwrap()
+}
+
+fn view_deployment(component: Vec<u8>) -> module_artifact::ModuleArtifact {
+    module_artifact::ModuleArtifact {
+        view: Some(module_artifact::ViewArtifact {
+            component,
+            assets: Default::default(),
+        }),
+        ..module_artifact::ModuleArtifact::component(
+            std::fs::read(fixtures().join("pages.component.wasm")).unwrap(),
+        )
+    }
+}
+
+#[test]
+fn deployment_readiness_rejects_invalid_view_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    let mut view = ice_view();
+    let marker = b"ice.manifest.v1";
+    // The guest retains the text in data as well as its custom section.
+    // Corrupt every copy so the actual metadata, not just data, is invalid.
+    let offsets: Vec<_> = view
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == marker).then_some(offset))
+        .collect();
+    assert!(!offsets.is_empty());
+    for offset in offsets {
+        view[offset] = b'x';
+    }
+    assert!(ui_lang_wire::manifest::read_manifest(&view).is_none());
+    let error =
+        noded::compose::validate_deployment("pages", &view_deployment(view).encode(), &index)
+            .expect_err("invalid view manifest must refuse readiness");
+    assert!(error.contains("view manifest"), "{error}");
+}
+
+#[test]
+fn deployment_readiness_rejects_invalid_view_abi() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    // A valid component and strict manifest, but init has the wrong type.
+    let mut view = wat::parse_str(
+        r#"(component
+        (core module $m (func (export "init") unreachable))
+        (core instance $i (instantiate $m))
+        (func (export "init") (canon lift (core func $i "init"))))"#,
+    )
+    .unwrap();
+    append_manifest(&mut view);
+    let error =
+        noded::compose::validate_deployment("pages", &view_deployment(view).encode(), &index)
+            .expect_err("wrong view export type must refuse readiness");
+    assert!(
+        error.contains("view ABI") && error.contains("init"),
+        "{error}"
+    );
+}
+
+fn append_manifest(view: &mut Vec<u8>) {
+    let name = b"ice.manifest";
+    let text = b"ice.manifest.v1\nTest\n\n\nnone";
+    view.extend_from_slice(&[0, (1 + name.len() + text.len()) as u8, name.len() as u8]);
+    view.extend_from_slice(name);
+    view.extend_from_slice(text);
+}
+
+#[test]
+fn deployment_readiness_accepts_actual_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    noded::compose::validate_deployment("pages", &view_deployment(ice_view()).encode(), &index)
+        .unwrap();
+}
+
+#[test]
+fn deployment_readiness_does_not_instantiate_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = indexer::IndexStore::open_bare(dir.path(), &["pages"]).unwrap();
+    // Every function traps, including the core start. A valid ABI must pass
+    // readiness, but ANY component instantiation must fail before init.
+    let mut view = wat::parse_str(r#"(component
+        (core module $m
+            (memory (export "memory") 1)
+            (func $start unreachable)
+            (start $start)
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) unreachable)
+            (func (export "init") (param i32) unreachable)
+            (func (export "tick") (param i32 i32) (result i32) unreachable)
+            (func (export "snapshot") (result i32) unreachable)
+            (func (export "restore") (param i32 i32 i32) (result i32) unreachable))
+        (core instance $i (instantiate $m))
+        (func (export "init") (param "macos" bool)
+            (canon lift (core func $i "init")))
+        (func (export "tick") (param "events" (list u8)) (result (list u8))
+            (canon lift (core func $i "tick") (memory $i "memory") (realloc (func $i "realloc"))))
+        (func (export "snapshot") (result (result (list u8) (error string)))
+            (canon lift (core func $i "snapshot") (memory $i "memory") (realloc (func $i "realloc"))))
+        (func (export "restore") (param "state" (list u8)) (param "macos" bool)
+            (result (result (error string)))
+            (canon lift (core func $i "restore") (memory $i "memory") (realloc (func $i "realloc")))))"#).unwrap();
+    append_manifest(&mut view);
+    noded::compose::validate_deployment("pages", &view_deployment(view.clone()).encode(), &index)
+        .expect("static view readiness must not execute the trapping start");
+    // Prove the fixture's trap is reached on real instantiation; a passing
+    // readiness assertion alone would not establish this counterexample.
+    let engine = wasmtime::Engine::default();
+    let component = wasmtime::component::Component::from_binary(&engine, &view).unwrap();
+    let linker = wasmtime::component::Linker::<()>::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let error = linker.instantiate(&mut store, &component).unwrap_err();
+    assert!(format!("{error:#}").contains("unreachable"), "{error:#}");
+}
+
+async fn assert_deployment(
+    host: &host::Host,
+    source: &ArtifactSource,
+    hash: [u8; 32],
+    expected: &module_artifact::ModuleArtifact,
+) {
+    assert_eq!(host.module_code_hash("pages").unwrap(), hash);
+    let bytes = noded::compose::fetch_code(source, "pages", &hash)
+        .await
+        .unwrap();
+    assert_eq!(
+        module_artifact::ModuleArtifact::decode(&bytes).unwrap(),
+        *expected
+    );
+}
+
+#[test]
+fn wasm_registry_activates_view_assets_and_reopens_after_view_removal() {
+    use commonware_cryptography::Signer as _;
+    use module_artifact::ModuleArtifact;
+    use sdk::Origin;
+    run(|context, dir| {
+        Box::pin(async move {
+            let member = commonware_cryptography::ed25519::PrivateKey::from_seed(1)
+                .public_key()
+                .as_ref()
+                .to_vec();
+            let mut source = ArtifactSource(Default::default());
+            let mut codes = std::collections::BTreeMap::new();
+            for id in ["modules", "valset", "identity", "attribution"] {
+                let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
+                codes.insert(id.to_string(), source.add(ModuleArtifact::component(bytes)));
+            }
+            let mut first = view_deployment(ice_view());
+            first.index = Some(
+                std::fs::read(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../modules/apps/pages/index.wasm"),
+                )
+                .unwrap(),
+            );
+            first.view.as_mut().unwrap().assets.insert(
+                "images/proof.svg".into(),
+                b"<svg xmlns='http://www.w3.org/2000/svg'><title>first</title></svg>".to_vec(),
+            );
+            let mut changed_view = first.clone();
+            changed_view
+                .view
+                .as_mut()
+                .unwrap()
+                .component
+                .extend_from_slice(&[0, 6, 5, b'p', b'r', b'o', b'o', b'f']);
+            let mut changed_asset = changed_view.clone();
+            changed_asset.view.as_mut().unwrap().assets.insert(
+                "images/proof.svg".into(),
+                b"<svg xmlns='http://www.w3.org/2000/svg'><title>second</title></svg>".to_vec(),
+            );
+            let removed = ModuleArtifact {
+                view: None,
+                ..changed_asset.clone()
+            };
+            let deployments = [first, changed_view, changed_asset, removed];
+            let hashes = deployments
+                .each_ref()
+                .map(|artifact| source.add(artifact.clone()));
+            assert_eq!(
+                hashes
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                4,
+                "view changes, asset changes, and view removal each change the deployment hash"
+            );
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let mut host = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: std::slice::from_ref(&member),
+                    bundle: &codes,
+                },
+            )
+            .await
+            .unwrap();
+            host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &BINDINGS)));
+            let index =
+                indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
+            for deployment in &deployments {
+                noded::compose::validate_deployment("pages", &deployment.encode(), &index).unwrap();
+                assert_eq!(deployment.component, deployments[0].component);
+                assert_eq!(deployment.index, deployments[0].index);
+            }
+            registry_op(
+                &mut host,
+                1,
+                Origin::System,
+                modules::ModulesMsg::ScheduleRegister {
+                    name: "deploy-pages".into(),
+                    module_id: "pages".into(),
+                    activation_height: 10,
+                    code_hash: hashes[0].to_vec(),
+                },
+            )
+            .await;
+            ready(&mut host, 2, &member, "pages", hashes[0]).await;
+            host.realize_module_swaps(9, &source).await.unwrap();
+            assert!(host.module_root("pages").is_none());
+            host.realize_module_swaps(10, &source).await.unwrap();
+            registry_op(&mut host, 10, Origin::System, modules::ModulesMsg::Advance).await;
+            assert_deployment(&host, &source, hashes[0], &deployments[0]).await;
+            noded::converge_host_modules(&index, &host).unwrap();
+            let out = host
+                .submit_at(
+                    host::BlockContext {
+                        height: 11,
+                        consensus_time: 11,
+                        origin: Origin::External(member.clone()),
+                    },
+                    sdk::Msg {
+                        target: "pages".into(),
+                        payload: br#"{"create_page":{"page_id":"first","title":"First"}}"#.to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            noded::projection::apply_block_to_index(&index, 11, 11, None, &out.dispatches, &host);
+            index.wait_folds_drained().unwrap();
+            let state = host.module_root("pages").unwrap();
+            let query = br#"{"list_pages":{}}"#;
+            let indexed_page = index.view("pages", query).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&indexed_page).unwrap();
+            assert_eq!(parsed["pages"]["pages"].as_array().unwrap().len(), 1);
+            for (next, at) in [(1, 20), (2, 30), (3, 40)] {
+                schedule_swap(&mut host, at - 8, "pages", hashes[next], at).await;
+                ready(&mut host, at - 7, &member, "pages", hashes[next]).await;
+                host.realize_module_swaps(at - 1, &source).await.unwrap();
+                assert_deployment(&host, &source, hashes[next - 1], &deployments[next - 1]).await;
+                let before = host.root_hash();
+                host.realize_module_swaps(at, &source).await.unwrap();
+                assert_deployment(&host, &source, hashes[next], &deployments[next]).await;
+                assert_eq!(
+                    host.module_root("pages").unwrap(),
+                    state,
+                    "view swaps preserve consensus state"
+                );
+                assert_ne!(
+                    host.root_hash(),
+                    before,
+                    "global root authenticates the view deployment"
+                );
+                registry_op(&mut host, at, Origin::System, modules::ModulesMsg::Advance).await;
+                noded::converge_host_modules(&index, &host).unwrap();
+                index.wait_folds_drained().unwrap();
+                assert_eq!(
+                    index.view("pages", query).unwrap(),
+                    indexed_page,
+                    "view removal preserves the mapper"
+                );
+            }
+            let status = host.module_status().await.unwrap().unwrap();
+            let pages = status
+                .iter()
+                .find(|entry| entry.module_id == "pages")
+                .unwrap();
+            for (height, selected) in [(19, 0), (20, 1), (29, 1), (30, 2), (39, 2), (40, 3)] {
+                assert_eq!(modules::code_at(pages, height).unwrap(), hashes[selected]);
+            }
+            codes.insert("pages".into(), hashes[3]);
+            let root = host.root_hash();
+            drop(host);
+            let mut snapshots =
+                |_: &str, _: Backing| -> SnapshotFut<'_> { Box::pin(async { Ok(None) }) };
+            let reopened = compose(
+                &source,
+                &mut stores,
+                &substrates,
+                &BINDINGS,
+                Boot::Reopen {
+                    height: 40,
+                    codes: &codes,
+                    snapshots: &mut snapshots,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.root_hash(), root);
+            assert_eq!(reopened.module_root("pages").unwrap(), state);
+            assert_deployment(&reopened, &source, hashes[3], &deployments[3]).await;
+            noded::converge_host_modules(&index, &reopened).unwrap();
+            index.wait_folds_drained().unwrap();
+            assert_eq!(index.view("pages", query).unwrap(), indexed_page);
+        })
+    });
+}

@@ -1053,7 +1053,10 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         assert!(chat.contains(handler), "ChatScreen owns `{handler}`");
     }
 
-    let files = component(SCREENS.as_str(), "FilesScreen");
+    // The Files screen is the `files` module view's now; the history fold
+    // stays the screen's own there.
+    let files_view = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
+    let files = component(files_view.as_str(), "FilesScreen");
     assert!(local_state(files).contains(&"history_open = false"));
     assert!(files.contains("on fs_toggle_history"));
 
@@ -1461,10 +1464,6 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         app.fs_listed_path, app.fs_path,
         "the listing answered for it"
     );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "0 files · 1 dir"
-    );
 
     // Navigate. The crumb moves at once; the rows have not.
     let _ = app.__update(__DucktapeMessage::FsOpenDir("/shared/reports".into()));
@@ -1481,21 +1480,12 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "`listed` is false for the whole of the navigation, and every reading \
          of `entries` on the screen is gated on it"
     );
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, false, &app.fs_entries),
-        "",
-        "no tally for a directory nobody has answered for"
-    );
 
     // The answer lands and the two agree again. The directory is empty, so the
     // tally stays silent — the pane's own plate says "Empty directory" in
     // words, and a subtitle of nothing but zeros repeats it in digits.
     let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
     assert_eq!(app.fs_listed_path, app.fs_path);
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        ""
-    );
 
     // A same-path refresh — what a write kicks off — must NOT blank the pane:
     // the rows on hand still describe the path in the crumb.
@@ -1505,14 +1495,10 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         vec![entry("/shared/reports/q3.md", "file")],
     ));
     assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
-    assert_eq!(
-        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
-        "1 file · 0 dirs",
-        "and it speaks again as soon as there is something to count"
-    );
 
-    // And the screen actually gates on it, at every reading of the rows.
-    let storage = inlined(include_str!("../ui/screens/storage.ice"));
+    // And the screen — the `files` module view's — actually gates on it, at
+    // every reading of the rows, the crumb's tally included.
+    let storage = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
     let files = storage
         .split_once("component FilesScreen(")
         .expect("the screen")
@@ -1535,7 +1521,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     }
     let view = inlined(include_str!("../ui/view.ice"));
     assert!(
-        view.contains("listed=(fs_listed_path == fs_path)"),
+        view.contains("extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, "),
         "the mount has to compute it"
     );
 }
@@ -1550,7 +1536,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
 /// body before the read lands, instead of showing A's text under B's path.
 #[test]
 fn the_files_preview_reads_text_through_the_forge_reader() {
-    let storage = inlined(include_str!("../ui/screens/storage.ice"));
+    let storage = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
     let files = storage
         .split_once("component FilesScreen(")
         .expect("the screen")
@@ -1588,19 +1574,17 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
     );
 
     let view = inlined(include_str!("../ui/view.ice"));
-    let mount = view
-        .split_once("FilesScreen new_name<->fs_new_name")
-        .expect("the mount")
-        .1
-        .split_once("\n        members:")
-        .expect("the mount ends")
-        .0;
     assert!(
-        mount.contains("dark\n"),
-        "the mount hands the screen the appearance"
+        view.contains("extern files_view(dark, connected, "),
+        "the mount hands the view the appearance"
     );
+    let handlers = include_str!("../ui/handlers/files.ice");
+    let open_link = handlers
+        .split_once("\n    FilesIntent.open_link\n")
+        .expect("the link intent")
+        .1;
     assert!(
-        mount.contains("open_message_link -> open_message_link _"),
+        open_link.contains("done -> open_message_link _"),
         "markdown links route through the shell's link seam"
     );
 

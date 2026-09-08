@@ -40,7 +40,6 @@ const PAGE_ROWS: usize = 128;
 const THREAD_ROWS: i64 = backend::THREAD_HOT_WINDOW_LIMIT as i64;
 const HUDDLE_ROWS: usize = 32;
 const LONG_LIST_ROWS: usize = 2_048;
-const FILE_ROWS: usize = 256;
 const DISCUSSION_ROWS: usize = 256;
 /// Settled agent answers on the shell transcript, each carrying one fenced
 /// code block — the syntect surface repeated per row.
@@ -141,29 +140,6 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_huddle,
         allocation_ceiling: 6_000,
     },
-    // Re-derived at ducktape-ui af77d53e (#668). Baseline 62,167: dev-side
-    // drift unrelated to that pin had already moved it 60,437 -> 61,019, and
-    // #668's per-row reconciliation identity adds ~3 allocations per
-    // lazy-free component row (384 rows here, +1,148) — the honest price of
-    // rows that park per-row instead of sharing one scope. The controls
-    // flipped order at this pin: removing the directory-row virtualization
-    // is now the smallest at 63,729; restoring the selected-entry scan
-    // reaches 73,453 (the per-rebuild list clone grew with the rows).
-    // Re-derived 2026-08-23 at af41cc28: 46,036 with the mount's
-    // `fs_directories(fs_entries)` and the screen's `fs_counts_summary`,
-    // `explorer_ops_at`, `markdown_path` borrowing their arguments; 51,569
-    // with them cloning — `fs_directories` alone copied every entry into the
-    // call per frame — and that clone is the control this ceiling gates.
-    // The two structural controls fell inside the noise floor at this pin
-    // and no longer gate on allocations: removing the directory-row
-    // virtualization lands at 47,478 and restoring the selected-entry scan
-    // at 46,553 (it moves layout time, 3.5 ms -> 3.9 ms, not the count).
-    ScreenProbe {
-        label: "files build+layout",
-        size: WINDOW,
-        fixture: console_in_files,
-        allocation_ceiling: 50_000,
-    },
     // Every settled answer is an `agent_markdown` extern — a markdown parse
     // plus a syntect pass over its fenced block. 6,902 measured 2026-08-23
     // with the answer rows behind the keyed (body, provider, status, dark)
@@ -176,15 +152,6 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         size: WINDOW,
         fixture: console_in_shell_answers,
         allocation_ceiling: 9_000,
-    },
-    // The Files preview reading a Markdown document of the same twenty
-    // fenced blocks through the same extern: 3,189 behind its
-    // (preview_text, preview_path, dark) lazy vs 195,246 without.
-    ScreenProbe {
-        label: "files markdown build+layout",
-        size: WINDOW,
-        fixture: console_in_files_markdown,
-        allocation_ceiling: 5_000,
     },
 ];
 
@@ -575,52 +542,6 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
     (app, huddle)
 }
 
-fn probe_fs_entry(index: usize) -> backend::FsEntry {
-    let kind = if index.is_multiple_of(2) {
-        "dir"
-    } else {
-        "file"
-    };
-    backend::FsEntry {
-        key: index as i64,
-        path: format!("/shared/entry-{index:04}"),
-        name: format!("entry-{index:04}"),
-        kind: kind.into(),
-        size: index as i64,
-        object: format!("object-{index:04}"),
-    }
-}
-
-fn console_in_files() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Files);
-    let entries: Vec<_> = (0..FILE_ROWS).map(probe_fs_entry).collect();
-    let selected = entries
-        .last()
-        .expect("the fixture is non-empty")
-        .path
-        .clone();
-    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
-        generation: app.fs_generation,
-        path: "/shared".into(),
-        entries,
-    }));
-    let _ = app.__update(__DucktapeMessage::FsOpenFile(selected.clone()));
-    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
-        generation: app.fs_generation,
-        path: selected.clone(),
-        text: "selected file preview".into(),
-        truncated: false,
-        binary: false,
-        picture: false,
-        width: 0,
-        height: 0,
-    }));
-    assert_eq!(app.fs_entries.len(), FILE_ROWS);
-    assert_eq!(app.fs_preview_path, selected);
-    assert_eq!(app.fs_preview_entry.path, app.fs_preview_path);
-    (app, console)
-}
-
 /// One settled answer: a heading, a paragraph, and a fenced Rust block the
 /// markdown extern hands to syntect.
 fn probe_answer_body(index: usize) -> String {
@@ -663,37 +584,6 @@ fn console_in_shell_answers() -> (Ducktape, iced::window::Id) {
     }
     app.shell_chat_entries = entries;
     assert_eq!(app.shell_chat_entries.len(), ANSWER_ROWS * 2);
-    (app, console)
-}
-
-/// The Files preview open on a Markdown document carrying every probe answer.
-fn console_in_files_markdown() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Files);
-    let path = "/shared/README.md";
-    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
-        generation: app.fs_generation,
-        path: "/shared".into(),
-        entries: vec![backend::FsEntry {
-            key: 0,
-            path: path.into(),
-            name: "README.md".into(),
-            kind: "file".into(),
-            size: 0,
-            object: "object-readme".into(),
-        }],
-    }));
-    let _ = app.__update(__DucktapeMessage::FsOpenFile(path.into()));
-    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
-        generation: app.fs_generation,
-        path: path.into(),
-        text: (0..ANSWER_ROWS).map(probe_answer_body).collect(),
-        truncated: false,
-        binary: false,
-        picture: false,
-        width: 0,
-        height: 0,
-    }));
-    assert_eq!(app.fs_preview_path, path);
     (app, console)
 }
 
@@ -1194,7 +1084,7 @@ fn probe_large_screens() {
     eprintln!(
         "large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows, \
          {LONG_LIST_ROWS} source/diff rows, {DISCUSSION_ROWS} discussion rows, \
-         {FILE_ROWS} file rows, {ANSWER_ROWS} answer rows"
+         {ANSWER_ROWS} answer rows"
     );
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();

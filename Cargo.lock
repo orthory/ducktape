@@ -3374,6 +3374,7 @@ dependencies = [
  "jpeg-encoder",
  "keystore",
  "media-service",
+ "module-artifact",
  "node",
  "nokhwa",
  "objc2 0.5.2",
@@ -3389,6 +3390,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "simnode",
  "tempfile",
  "tokio",
@@ -3399,7 +3401,7 @@ dependencies = [
  "ui-lang-build",
  "ui-lang-components",
  "ui-lang-runtime",
- "ui-lang-wire",
+ "ui-lang-wire 0.1.0 (git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ddc566776b72389ee8ae87abf9d80122a9e695fd)",
  "usvg",
  "wasmtime",
  "workspace-config",
@@ -6547,8 +6549,11 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "ui-lang-wire 0.1.0 (git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=677e154590aa39e436e2d1aab6453c1435134f66)",
  "valset",
  "wasm-host",
+ "wasmtime",
+ "wat",
  "workspace-config",
 ]
 
@@ -10643,7 +10648,7 @@ dependencies = [
  "stacker",
  "tray-icon",
  "ui-lang-template",
- "ui-lang-wire",
+ "ui-lang-wire 0.1.0 (git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ddc566776b72389ee8ae87abf9d80122a9e695fd)",
  "unicode-segmentation",
  "zbus",
  "zeroize",
@@ -10656,6 +10661,16 @@ source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ddc566776b723
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ui-lang-wire"
+version = "0.1.0"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=677e154590aa39e436e2d1aab6453c1435134f66#677e154590aa39e436e2d1aab6453c1435134f66"
+dependencies = [
+ "bincode",
+ "serde",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]

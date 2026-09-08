@@ -22,15 +22,6 @@ fn a_count_of_one_takes_the_singular_noun() {
 /// `agents` module view's now, held to the same rule in `crates/views/agents`.
 #[test]
 fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
-    let entry = FsEntry {
-        key: 0,
-        path: "/shared/notes".into(),
-        name: "notes".into(),
-        kind: "file".into(),
-        size: 0,
-        object: String::new(),
-    };
-
     let human = MemberRow {
         key: "aa".into(),
         label: "aa".into(),
@@ -43,11 +34,9 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
 
     // Nothing there: the plate on each screen says it in words.
     assert_eq!(members_summary(true, &[]), "");
-    assert_eq!(fs_counts_summary(true, true, &[]), "");
 
     // Something there: every subtitle speaks, zeros included.
     assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
-    assert_eq!(fs_counts_summary(true, true, &[entry]), "1 file · 0 dirs");
 }
 
 #[test]
@@ -117,9 +106,6 @@ fn explorer_ops_keep_the_full_hash_and_pretty_print_json_payloads() {
 
 #[test]
 fn machine_values_read_as_a_person_reads_them() {
-    assert_eq!(size_label(421_888), "412 KB");
-    assert_eq!(size_label(900), "900 B");
-    assert_eq!(size_label(3 * 1024 * 1024), "3.0 MB");
     assert_eq!(mmss(0), "00:00");
     assert_eq!(mmss(4 * 60 + 7), "04:07");
     assert_eq!(initials_of("Kestrel Song"), "KS");
