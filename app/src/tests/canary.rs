@@ -309,10 +309,12 @@ fn a_capture_draws_the_module_it_names() {
     }
     let governance = artifact(
         &std::fs::read(governance).unwrap(),
-        vec![1],
+        vec![7],
         seal("#d00000"),
     );
-    let chat = artifact(&std::fs::read(chat).unwrap(), vec![2], seal("#d00000"));
+    // codes of their own: a seat left at the transition test's A would
+    // swallow that test's first transition
+    let chat = artifact(&std::fs::read(chat).unwrap(), vec![8], seal("#d00000"));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
