@@ -3422,6 +3422,65 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
 pub(crate) mod tests {
     use super::*;
 
+    // Explicit manual measurement, not a wall-clock performance assertion.
+    // Use a fresh XDG cache directory for cold-cache evidence.
+    #[test]
+    #[ignore = "requires DUCKTAPE_BENCH_VIEW pointing to a matching governance guest"]
+    fn measure_governance_view_code_and_first_tree() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let path =
+            std::env::var_os("DUCKTAPE_BENCH_VIEW").expect("DUCKTAPE_BENCH_VIEW is required");
+        let bytes = std::fs::read(path).expect("read matching governance wasm");
+        let mut config = Config::new();
+        config.cranelift_opt_level(OptLevel::Speed);
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let uncached = Engine::new(&config).unwrap();
+        let before = Instant::now();
+        let baseline = Component::new(&uncached, &bytes).expect("uncached compilation");
+        let baseline_time = before.elapsed();
+        drop(baseline);
+        let before = Instant::now();
+        let cold = Guest::compile(&bytes, "benchmark").unwrap();
+        let cold_time = before.elapsed();
+        let before = Instant::now();
+        let warm = Guest::compile(&bytes, "benchmark").unwrap();
+        let warm_time = before.elapsed();
+        assert!(
+            Arc::ptr_eq(&cold, &warm),
+            "actual guest code must be reused"
+        );
+        let before = Instant::now();
+        let mut first = Guest::instantiate("governance", &warm, "benchmark").unwrap();
+        first.init("benchmark").unwrap();
+        let initialized = before.elapsed();
+        let before = Instant::now();
+        first.redraw(&register());
+        first.redraw(&register());
+        assert!(first.fault.is_none(), "{:?}", first.fault);
+        assert!(
+            texts(&first).iter().any(|text| text == "node-7"),
+            "real register tree: {:?}",
+            texts(&first)
+        );
+        let tree_time = before.elapsed();
+        let second = Guest::from_bytes("governance", &bytes, "benchmark").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.alive, &second.alive),
+            "code reuse must not reuse mutable instances"
+        );
+        assert!(second.frame.root.is_none());
+        tracing::info!(
+            baseline_compile_us = baseline_time.as_micros(),
+            cold_compile_us = cold_time.as_micros(),
+            warm_compile_us = warm_time.as_micros(),
+            instantiate_init_us = initialized.as_micros(),
+            first_tree_us = tree_time.as_micros(),
+            source_bytes = bytes.len(),
+            "view_code_benchmark"
+        );
+    }
+
     #[test]
     fn view_code_reuses_identical_bytes_but_not_changed_code() {
         let engine = Engine::default();
