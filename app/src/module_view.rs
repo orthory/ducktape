@@ -4518,6 +4518,13 @@ mod tests {
         let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        {
+            let locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &locked.slot else {
+                panic!("A is seated");
+            };
+            assert_eq!(guest.ticks, 0);
+        }
 
         node.deploy("forge", &b);
         let hold = hold_blob(&node);
