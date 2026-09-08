@@ -37,6 +37,8 @@ use tracing::warn;
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
 // and it is the one caller that wants the raw, pre-resolution shapes.
 pub mod genesis;
+mod view_files;
+pub use view_files::{ensure_view_ready, read_deployment_files};
 pub mod identity;
 pub mod invite;
 pub mod join;

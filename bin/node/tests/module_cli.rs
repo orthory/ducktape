@@ -69,6 +69,49 @@ fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
 }
 
 #[test]
+fn pack_includes_view_assets_and_refuses_pending_or_missing_declared_view() {
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path();
+    let code = dir.join("custom.component.wasm");
+    let view = dir.join("custom.view.wasm");
+    let assets = dir.join("custom.assets");
+    let out = dir.join("module.artifact");
+    std::fs::write(&code, b"code").unwrap();
+    std::fs::write(&view, b"view").unwrap();
+    std::fs::create_dir(&assets).unwrap();
+    std::fs::write(assets.join("logo.svg"), b"svg").unwrap();
+    let pack = || {
+        ducktape(&[
+            "module",
+            "pack",
+            code.to_str().unwrap(),
+            "--view",
+            view.to_str().unwrap(),
+            "--assets",
+            assets.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+    };
+    let (ok, message) = pack();
+    assert!(ok, "{message}");
+    let saved = std::fs::read(&out).unwrap();
+    let artifact = module_artifact::ModuleArtifact::decode(&saved).unwrap();
+    let packaged = artifact.view.unwrap();
+    assert_eq!(packaged.component, b"view");
+    assert_eq!(packaged.assets["logo.svg"], b"svg");
+    std::fs::write(dir.join("custom.view.pending"), b"pending").unwrap();
+    let (ok, message) = pack();
+    assert!(!ok && message.contains("pending"), "{message}");
+    assert_eq!(std::fs::read(&out).unwrap(), saved);
+    std::fs::remove_file(dir.join("custom.view.pending")).unwrap();
+    std::fs::remove_file(&view).unwrap();
+    let (ok, message) = pack();
+    assert!(!ok, "{message}");
+    assert_eq!(std::fs::read(&out).unwrap(), saved);
+}
+
+#[test]
 fn status_against_no_node_says_the_node_is_not_running() {
     let ws = tempfile::tempdir().expect("tempdir");
     // a dev-shape node.toml with rpc_listen and no node behind it

@@ -40,6 +40,12 @@ pub struct PackArgs {
     /// Optional mapper included in the deployment; omission removes it on activation.
     #[arg(long, value_name = "INDEX.WASM")]
     pub index: Option<PathBuf>,
+    /// View deployed with the module; omission removes its UI.
+    #[arg(long, value_name = "VIEW.WASM")]
+    pub view: Option<PathBuf>,
+    /// View assets rooted here, using canonical relative paths.
+    #[arg(long, value_name = "ASSETS", requires = "view")]
+    pub assets: Option<PathBuf>,
     /// Write the canonical deployment artifact here.
     #[arg(long, value_name = "ARTIFACT")]
     pub out: PathBuf,
@@ -57,6 +63,12 @@ pub struct StageArgs {
     /// Optional mapper deployed and activated with this component; omission removes it.
     #[arg(long, value_name = "INDEX.WASM")]
     pub index: Option<PathBuf>,
+    /// View deployed with the module; omission removes its UI.
+    #[arg(long, value_name = "VIEW.WASM")]
+    pub view: Option<PathBuf>,
+    /// View assets rooted here, using canonical relative paths.
+    #[arg(long, value_name = "ASSETS", requires = "view")]
+    pub assets: Option<PathBuf>,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -77,24 +89,13 @@ pub fn run(cmd: ModuleCmd) -> CommandResult {
     }
 }
 
-fn read_artifact(
-    component: &std::path::Path,
-    index: Option<&std::path::Path>,
-) -> Result<module_artifact::ModuleArtifact, String> {
-    let component =
-        std::fs::read(component).map_err(|e| format!("read {}: {e}", component.display()))?;
-    let index = index
-        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
-        .transpose()?;
-    Ok(module_artifact::ModuleArtifact {
-        component,
-        index,
-        view: None,
-    })
-}
-
 fn cmd_pack(args: PackArgs) -> CommandResult {
-    let artifact = read_artifact(&args.component, args.index.as_deref())?;
+    let artifact = workspace_config::read_deployment_files(
+        &args.component,
+        args.index.as_deref(),
+        args.view.as_deref(),
+        args.assets.as_deref(),
+    )?;
     std::fs::write(&args.out, artifact.encode())?;
     println!("{}", hex_bytes(&artifact.hash()));
     Ok(())
@@ -210,7 +211,13 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let bytes = read_artifact(&args.component, args.index.as_deref())?.encode();
+    let bytes = workspace_config::read_deployment_files(
+        &args.component,
+        args.index.as_deref(),
+        args.view.as_deref(),
+        args.assets.as_deref(),
+    )?
+    .encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;

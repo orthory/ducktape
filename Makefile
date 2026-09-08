@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release views dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -128,18 +128,23 @@ $(WASM_TOOLS_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/wasm-tools-build" $(CARGO) install wasm-tools \
 		--locked --version "$(WASM_TOOLS_VERSION)" --root "$(WASM_TOOLS_ROOT)"
 
-## build every module-owned view (crates/views) as an `ice:view` component
+## build every desktop view (crates/views) as an `ice:view` component
 ## and stage it under target/views, where a built desktop app loads it from
 ## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
 ## binary). Installs wasm-tools like `wasm-modules`. The views workspace pins the
 ## same ducktape-ui rev as the app, and this refuses when they differ: a view
 ## compiled by another language revision than the host that renders it is a
 ## wire nobody tested.
+VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
+
 views: $(ICE_BIN) $(WASM_TOOLS_BIN)
 	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" "$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p chat-view -p files-view -p forge-view -p pages-view -p shell-view \
-		--target wasm32-unknown-unknown --out target/views
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
+
+## rebuild the committed view sources in two isolated roots and compare bytes
+views-repro-check: $(ICE_BIN) $(WASM_TOOLS_BIN)
+	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
