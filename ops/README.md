@@ -82,6 +82,81 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   telemetry (`cargo run -p ducktape-app --features iced/debug`), for QA rigs
   where the upstream GUI is useless; own `Cargo.toml`, not a workspace member.
 
+## Dedicated Proxmox view lane
+
+`proxmox-view-lane.py` uses the existing Proxmox SSH tools and node CLI; it
+requires Python 3.11+ on a POSIX workstation. A local record lock refuses
+concurrent operations on the same lane. Its record lives on the operator workstation, outside
+container data. The record holds the exact host, randomly named lane, runtime
+container IDs, release revisions and file hashes. It never adopts an existing
+container. A partial failed provision remains recorded for manual inspection;
+re-running provision with that record is refused.
+
+```sh
+# Inspect live VM/CT allocation and storage before selecting these resource names.
+python3 ops/proxmox-view-lane.py --record "$LANE_RECORD" inventory
+# TEMPLATE, STORAGE and BRIDGE come from that inventory / Proxmox configuration.
+# SSH_PUBLIC_KEY is a public key whose private half the operator already owns.
+python3 ops/proxmox-view-lane.py --record "$LANE_RECORD" provision \
+  --template "$TEMPLATE" --storage "$STORAGE" --bridge "$BRIDGE" \
+  --ssh-key "$SSH_PUBLIC_KEY"
+python3 ops/proxmox-view-lane.py --record "$LANE_RECORD" check
+python3 ops/proxmox-view-lane.py --record "$LANE_RECORD" rollout \
+  --binary "$NODE_BINARY" --modules "$MODULES_DIR" \
+  --revision "$REPOSITORY_SHA" --ui-revision "$UI_SHA" \
+  --reason "integrated build; state layout unchanged"
+```
+
+Provision allocates three free IDs from the live cluster inventory, at or above
+200, and creates unprivileged 4 GiB / 2 core / 12 GiB containers. It does not
+create or alter bridges or storage. It installs/enables SSH only inside those
+new containers. CT descriptions and inner owner files must both match before
+any later operation. DHCP IPv4 addresses are read from the actual containers at
+rollout; all three configurations use concrete WireGuard addresses, loopback
+RPC/HTTP and no public coordinator. A DHCP address change requires another
+rollout to regenerate the peer configuration.
+
+Rollout packages the executable and runtime module directory separately, hashes
+every file, stages/checks all three copies before stopping services, then writes
+all configurations before starting any service. It records the caller-supplied
+source revisions and actual byte hashes; it does not infer build provenance.
+`started_unverified` in `<record>.events.jsonl` means services were started,
+not that consensus or views were verified. A failed stage leaves running
+services alone; a failure after stopping services remains visible in
+`pending_release` and requires operator repair. Three validators need all three
+online for consensus progress.
+
+For a breaking schema/ABI/state change, archive diagnostics and run
+`reset-network --reason "<specific breaking change>"`, then repeat rollout.
+Reset stops all three owned services before removing only their fixed
+`/var/lib/ducktape-view-lane/network` directories. It preserves owner markers,
+release files and the workstation record/journal. It never destroys a CT.
+
+Use ordinary SSH forwards through the Proxmox host to each recorded CT's
+`127.0.0.1:8844`, with the public key installed at provision. Keep host-key
+verification enabled (the CT's host public key can be read via `pct exec`).
+Pass the three resulting loopback URLs to the Node 22+ observer:
+
+```sh
+node ops/proxmox-view-observe.mjs "$NODE_A_WS" "$NODE_B_WS" "$NODE_C_WS"
+```
+
+The URLs must end in `/v1/ws`. The observer requires a new committed height
+beyond all three starting heights and an identical root at that height. Repeated
+unchanged heartbeats do not pass; mismatched roots, regressing heights, socket
+failure or the 180-second deadline fail. Keep its JSON result with the rollout
+journal. This proves consensus progress/root agreement, not view activation or
+rendering. View replacement/removal still uses the existing `module update`
+ceremony, verified active artifact hashes on every node, and the actual app
+host's rendering/asset/removal checks.
+
+Offline command/ownership and heartbeat checks (no SSH/Proxmox access):
+
+```sh
+python3 -B ops/proxmox-view-lane-test.py
+node ops/proxmox-view-observe-test.mjs
+```
+
 ## Hosted auth page
 
 - `auth-page/` — the `auth.ducktape.industries` WebAuthn relying-party page
