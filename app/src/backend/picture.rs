@@ -332,25 +332,10 @@ mod tests {
 
     #[test]
     fn the_extension_is_the_paths_call() {
-        for yes in [
-            "a.png",
-            "dir/b.JPG",
-            "c.jpeg",
-            "d.gif",
-            "e.webp",
-            "f.bmp",
-            "g.svg",
-        ] {
+        for yes in ["a.png", "dir/b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp", "g.svg"] {
             assert!(picture_path(yes.into()), "{yes}");
         }
-        for no in [
-            "README.md",
-            "logo",
-            "png",
-            "dir.png/file",
-            "x.png.txt",
-            "a.xml",
-        ] {
+        for no in ["README.md", "logo", "png", "dir.png/file", "x.png.txt", "a.xml"] {
             assert!(!picture_path(no.into()), "{no}");
         }
     }
@@ -448,20 +433,10 @@ mod tests {
         let picture = decode_picture(&svg(10, 4, "red")).expect("decodes");
         assert_eq!((picture.width, picture.height), (10, 4));
         assert!(matches!(picture.handle, PictureHandle::Vector(_)));
-        let prologue = [
-            b"\xef\xbb\xbf<?xml version=\"1.0\"?>".as_slice(),
-            &svg(3, 3, "blue"),
-        ]
-        .concat();
-        assert!(
-            decode_picture(&prologue).is_ok(),
-            "a BOM and an XML prologue are still an SVG"
-        );
+        let prologue = [b"\xef\xbb\xbf<?xml version=\"1.0\"?>".as_slice(), &svg(3, 3, "blue")].concat();
+        assert!(decode_picture(&prologue).is_ok(), "a BOM and an XML prologue are still an SVG");
         let padded = [b"  \n".as_slice(), &svg(3, 3, "blue")].concat();
-        assert!(
-            decode_picture(&padded).is_ok(),
-            "leading whitespace is still an SVG"
-        );
+        assert!(decode_picture(&padded).is_ok(), "leading whitespace is still an SVG");
         let raster = decode_picture(&png(2, 2)).expect("decodes");
         assert!(matches!(raster.handle, PictureHandle::Raster(_)));
     }
@@ -483,11 +458,7 @@ mod tests {
         let cases = [
             ("docs/README.md", "img/a.png", Some("docs/img/a.png")),
             ("README.md", "./a.png", Some("a.png")),
-            (
-                "docs/guide/x.md",
-                "../assets/b.jpg",
-                Some("docs/assets/b.jpg"),
-            ),
+            ("docs/guide/x.md", "../assets/b.jpg", Some("docs/assets/b.jpg")),
             ("docs/x.md", "/logo.png", Some("logo.png")),
             ("x.md", "a.png?raw=1#frag", Some("a.png")),
             ("x.md", "https://host/a.png", None),
@@ -497,32 +468,19 @@ mod tests {
             ("x.md", "./", None),
         ];
         for (doc, url, want) in cases {
-            assert_eq!(
-                resolve_repo_path(doc, url).as_deref(),
-                want,
-                "{doc} + {url}"
-            );
+            assert_eq!(resolve_repo_path(doc, url).as_deref(), want, "{doc} + {url}");
         }
     }
 
     #[test]
     fn a_documents_inline_pictures_answer_only_under_that_document() {
         let picture = decode_picture(&png(2, 2)).expect("decodes");
-        park_inline_pictures(
-            "README.md".into(),
-            HashMap::from([("a.png".to_string(), picture)]),
-        );
+        park_inline_pictures("README.md".into(), HashMap::from([("a.png".to_string(), picture)]));
         assert!(inline_picture("README.md", "a.png").is_some());
         assert!(inline_picture("README.md", "b.png").is_none());
-        assert!(
-            inline_picture("docs/README.md", "a.png").is_none(),
-            "another document's set never answers"
-        );
+        assert!(inline_picture("docs/README.md", "a.png").is_none(), "another document's set never answers");
         park_inline_pictures("docs/README.md".into(), HashMap::new());
-        assert!(
-            inline_picture("README.md", "a.png").is_none(),
-            "the next document replaces the set"
-        );
+        assert!(inline_picture("README.md", "a.png").is_none(), "the next document replaces the set");
     }
 
     #[test]
@@ -536,17 +494,11 @@ mod tests {
             .expect("stored");
         assert_eq!(dims, (4, 4));
         assert!(stored_picture("test", "a.png").is_some());
-        assert!(
-            stored_picture("test", "b.png").is_none(),
-            "a stale slot never draws under a new path"
-        );
+        assert!(stored_picture("test", "b.png").is_none(), "a stale slot never draws under a new path");
         runtime
             .block_on(store_picture("test", "b.png".into(), png(2, 2)))
             .expect("stored");
-        assert!(
-            stored_picture("test", "a.png").is_none(),
-            "one slot per surface"
-        );
+        assert!(stored_picture("test", "a.png").is_none(), "one slot per surface");
         assert_eq!(stored_picture("test", "b.png").map(|p| p.width), Some(2));
     }
 }

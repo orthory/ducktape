@@ -284,14 +284,12 @@ pub(crate) async fn data_plane_signer(
             .key
             .clone()
     };
-    Ok(std::sync::Arc::new(
-        move |method: &str, path: &str, body: &[u8]| {
-            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect()
-        },
-    ))
+    Ok(std::sync::Arc::new(move |method: &str, path: &str, body: &[u8]| {
+        ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect()
+    }))
 }
 
 /// The session seat, opened under `password` if it is not already: the lock

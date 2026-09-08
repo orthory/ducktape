@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use iced::{Element, Rectangle, Size};
 use media_service::call_wire::{CapturedFrame, PeerFrame};
+use iced::{Element, Rectangle, Size};
 
 mod live_surface;
 
