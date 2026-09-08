@@ -1,5 +1,5 @@
-// node ops/auth-page/test.mjs — runs the page's pure helper block and the
-// relay worker under node.
+// node ops/auth-page/test.mjs — runs the page helpers, browser ceremony
+// with a stub authenticator, and relay worker under node.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -14,17 +14,24 @@ assert.equal(b64u.enc(bytes), "-_-_AAE");
 assert.deepEqual(b64u.dec("-_-_AAE"), bytes);
 
 // fragment contract
-const user42 = "KgAAAAAAAAA"; // 42u64 LE
-const req = parseRequest(`#op=create&challenge=AQID&user=${user42}&name=de%20mo&cb=http://127.0.0.1:9/`, ORIGIN);
+// Shared with crates/authpage: SHA-256(domain || full chain ID) || 42u64 LE.
+const user42 = "6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA";
+const userBytes = Uint8Array.from(Buffer.from("eb30fa5a88a9d16fcf3e4d0459918d65dc233c782f63676a3051d0549ef1c88c2a00000000000000", "hex"));
+const label = "eddy · demo#a1b2c3d4";
+const createURL = new URL(`${ORIGIN}/#op=create&challenge=AQID&user=${user42}&name=eddy%20%C2%B7%20demo%23a1b2c3d4&cb=http://127.0.0.1:9/`);
+const req = parseRequest(createURL.hash, ORIGIN);
 assert.equal(req.op, "create");
 assert.deepEqual(req.challenge, Uint8Array.from([1, 2, 3]));
-assert.deepEqual(req.user, Uint8Array.from([42, 0, 0, 0, 0, 0, 0, 0]));
-assert.equal(req.name, "de mo");
+assert.deepEqual(req.user, userBytes);
+assert.equal(req.name, label, "the encoded # preserves the full chain ID");
 assert.equal(req.cb, "http://127.0.0.1:9/");
 assert.equal(parseRequest("#op=get&challenge=AQID", ORIGIN).cb, null);
 assert.throws(() => parseRequest("#op=get", ORIGIN), /missing challenge/);
 assert.throws(() => parseRequest(`#op=create&challenge=AQID&user=${user42}`, ORIGIN), /missing name/);
-assert.throws(() => parseRequest("#op=create&challenge=AQID&user=AQ&name=x", ORIGIN), /8-byte/);
+for (const length of [1, 8, 32, 39, 41, 64]) {
+  const user = b64u.enc(new Uint8Array(length));
+  assert.throws(() => parseRequest(`#op=create&challenge=AQID&user=${user}&name=x`, ORIGIN), /40-byte/, `reject ${length}-byte user ID`);
+}
 assert.throws(() => parseRequest("#op=nope&challenge=AQID", ORIGIN), /unknown op/);
 
 // the callback is loopback, or this origin's relay: a crafted link cannot relay the signature elsewhere
@@ -47,6 +54,56 @@ const spkiPrefix = unhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
 const spki = Uint8Array.from([...spkiPrefix, 0x04, ...unhex(gx), ...unhex(gy)]);
 assert.equal(spki.length, 91);
 assert.deepEqual(spkiToSec1(spki), Uint8Array.from([0x03, ...unhex(gx)]));
+
+// Execute the actual browser script and click its button. Only the DOM and
+// authenticator are stubbed: changes to the real create options must fail here.
+const browserSrc = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const elements = new Map();
+const document = {
+  getElementById(id) {
+    if (!elements.has(id)) elements.set(id, { hidden: true, textContent: "" });
+    return elements.get(id);
+  },
+};
+let submit;
+const submitted = new Promise((resolve) => { submit = resolve; });
+const form = document.getElementById("cb");
+form.result = { value: "" };
+form.submit = submit;
+let createOptions;
+const navigator = { credentials: {
+  async create(options) {
+    createOptions = options;
+    return {
+      rawId: Uint8Array.from([4, 5, 6]),
+      response: {
+        getPublicKey: () => spki,
+        getPublicKeyAlgorithm: () => -7,
+        attestationObject: Uint8Array.from([7]),
+        clientDataJSON: Uint8Array.from([8]),
+      },
+    };
+  },
+} };
+new Function("document", "location", "navigator", `${src}\n${browserSrc}`)(document, createURL, navigator);
+assert.equal(document.getElementById("who").textContent, label);
+const go = document.getElementById("go");
+assert.equal(go.hidden, false);
+assert.equal(typeof go.onclick, "function");
+go.onclick();
+await submitted;
+assert.equal(createOptions.publicKey.user.name, label);
+assert.equal(createOptions.publicKey.user.displayName, label);
+assert.deepEqual(createOptions.publicKey.user.id, userBytes);
+assert.equal(createOptions.publicKey.user.id.length, 40);
+assert.equal(createOptions.publicKey.rp.id, "auth.example");
+assert.equal(createOptions.publicKey.authenticatorSelection.residentKey, "required");
+assert.equal(form.action, "http://127.0.0.1:9/");
+assert.deepEqual(JSON.parse(form.result.value), {
+  op: "create", credentialId: "BAUG",
+  publicKey: b64u.enc(Uint8Array.from([0x03, ...unhex(gx)])),
+  alg: -7, attestationObject: "Bw", clientDataJSON: "CA",
+});
 
 // DER → raw R‖S: a high-bit r gets a 0x00 pad byte in DER; a short s gets left-padded
 const r = Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 0xff : i));

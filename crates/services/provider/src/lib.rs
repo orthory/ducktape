@@ -31,8 +31,8 @@
 //! to parse their output is all described by TOML capability specs (see
 //! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
-//! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `<ducktape home>/capabilities`). adding an executor — or retuning a built-in's
+//! path as operator-provided specs under the workspace's `capabilities/`
+//! dir. adding an executor — or retuning a built-in's
 //! flags, including which model it runs — is a config change on the
 //! operator's machine, never a code change here. dispatch is by EXPLICIT
 //! capability tag: [`ProviderSet::resolve`] takes the tag a job names,
@@ -3189,11 +3189,10 @@ fn excerpt(s: &str) -> String {
 
 /// load this host's capability specs and probe for their binaries.
 ///
-/// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
-/// (explicitly set and missing = hard error — the operator asked for a dir
-/// that is not there) or `<ducktape home>/capabilities` when it exists. a broken
-/// spec is a hard `Err`: an operator config error fails the boot loudly, it
-/// does not silently drop an executor.
+/// spec sources: the embedded built-ins, then the workspace's `capability_dir`
+/// when it exists (an absent dir is a node offering only the built-ins). a
+/// broken spec is a hard `Err`: an operator config error fails the boot
+/// loudly, it does not silently drop an executor.
 ///
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.

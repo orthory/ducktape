@@ -536,7 +536,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis_hash = config::sha256(&genesis_bytes);
     let hashes = genesis.module_hashes();
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
-    // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
+    // the home — `~/.ducktape/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
     // founded. the default dir is NAMED by the chain id, and the chain id is
     // minted from the identity pubkey, so the key is born in memory and only

@@ -15,6 +15,7 @@ identity = { workspace = true }
 sdk = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 # Asynchronous callback sockets and relay polling.
 tokio = { workspace = true, features = ["net", "io-util"] }

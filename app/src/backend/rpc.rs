@@ -309,6 +309,28 @@ pub(crate) async fn seat_signer(
     Ok(pubkey)
 }
 
+/// Sign one data-plane request with the key ALREADY SEATED — the seat the
+/// action before this one opened under the person's password — or `None`
+/// while the seat is locked. For a caller that has no password of its own:
+/// the huddle's call socket is a subscription the app runs `when
+/// huddle_joined`, and the join that set that flag is what seated the key.
+pub(crate) async fn seated_request_headers(
+    method: &str,
+    path_and_query: &str,
+    node_key: &[u8],
+    body: &[u8],
+) -> Option<[(&'static str, String); 3]> {
+    let session = SIGNER.lock().await;
+    let signer = session.as_ref()?;
+    Some(::node::signed_req::request_headers(
+        &signer.key,
+        method,
+        path_and_query,
+        node_key,
+        body,
+    ))
+}
+
 /// The session seat, when `password` is the one it was taken with. The lock
 /// is what makes the seat singular — a burst of reactions shares one opened
 /// key instead of racing five argon2 passes into it. No seat, or another
