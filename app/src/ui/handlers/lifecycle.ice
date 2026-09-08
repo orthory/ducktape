@@ -44,6 +44,13 @@ on desktop_notifications_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
@@ -681,6 +688,16 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(_cause)
 
 on select_shell_tab(next)
+  let staying_on_settings = shell_tab == ShellTab.settings && next == ShellTab.settings
+  let keeping_authentication = staying_on_settings && !empty(account_ceremony_phase)
+  return if keeping_authentication
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   // A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)` from
   // the seat that is already active, and Settings' rows emit their own tab
   // while the reader is on it — so the retires below have to ask, or one click
@@ -1024,12 +1041,37 @@ subscribe
 // their predecessor after the successor is registered, so a handoff never
 // counts as the last close.
 on window_was_closed(id)
+  let closed_welcome = onboarding_win == some(id) && hub_step == HubStep.account
+  let closed_account = console_win == some(id)
+  let retirement = ceremony_retirement(closed_welcome, closed_account)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
   let leaving = last_window_closed_exits(console_win, onboarding_win)
-  return if !leaving
-  exit
+  match retirement
+    CeremonyRetirement.welcome
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      ceremony_detail = ""
+      ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.account
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.keep
+      return if !leaving
+      exit
 
 // THE STATUS ITEM'S MENU. Since a close no longer ends the process, a
 // connected network can have nothing tracked — an ordinary state, not "never
@@ -1053,6 +1095,10 @@ on tray_open
         task window focus target=window_target(onboarding_win)
 
 on tray_quit
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
   exit
 
 // ⌘ IS HELD OR IT IS NOT. The whole of this state, set from the one event that
@@ -1085,6 +1131,10 @@ on command_chord_pressed(event)
   let chord = command_chord(event.key, event.physical_key, event.modifiers)
   match chord
     CommandChord.quit
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
       exit
     CommandChord.close_window
       task window close target=window_target(focused_win)

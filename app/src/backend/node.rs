@@ -1588,11 +1588,12 @@ fn identity_msg(msg: &identity::IdentityMsg) -> sdk::Msg {
 /// How long a browser touch may take before the app gives up on it.
 const CEREMONY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// One browser round trip, off the async runtime (the callback listener is a
-/// blocking accept): open the page, block for its result. On timeout the
-/// listener is poked with an abandon result so its thread ends too.
+/// The ceremony owns its callback socket. Cancelling the UI task or timing out
+/// drops the listener and any partial request along with the wait.
 async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcome, String> {
-    let listener = authpage::Listener::bind().map_err(|e| format!("auth callback: {e}"))?;
+    let listener = authpage::Listener::bind()
+        .await
+        .map_err(|e| format!("auth callback: {e}"))?;
     let callback = listener.callback_url();
     let url = authpage::request_url(authpage::AUTH_PAGE, &request, &callback);
     let op = request_op(&request);
@@ -1602,15 +1603,10 @@ async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcom
         return Err("no browser opener on this machine (xdg-open / open)".to_string());
     }
     tracing::info!(target: "ducktape::auth", event = "ceremony_shown", surface = "browser", op);
-    let waiting = tokio::task::spawn_blocking(move || listener.wait());
-    let answered = tokio::time::timeout(CEREMONY_TIMEOUT, waiting).await;
-    let outcome = match answered {
-        Ok(joined) => joined.map_err(|_| "the browser ceremony did not finish".to_string())?,
-        Err(_elapsed) => {
-            authpage::abandon(&callback, "no answer from the browser");
-            Err("the browser did not answer in time".to_string())
-        }
-    };
+    let outcome = tokio::time::timeout(CEREMONY_TIMEOUT, listener.wait())
+        .await
+        .map_err(|_| "the browser did not answer in time".to_string())
+        .and_then(|outcome| outcome);
     match &outcome {
         Ok(_) => {
             tracing::info!(target: "ducktape::auth", event = "ceremony_answered", surface = "browser", op)
@@ -1893,7 +1889,7 @@ pub(crate) async fn qr_ceremony(
     )
     .await?;
     let started = std::time::Instant::now();
-    let waiting = tokio::task::spawn_blocking(move || relay.wait(CEREMONY_TIMEOUT));
+    let waiting = relay.wait(CEREMONY_TIMEOUT);
     tokio::pin!(waiting);
     // The countdown: the same QR re-sent each second with the time it has
     // left, so the screen can show it. The first tick is a second away —
@@ -1902,8 +1898,8 @@ pub(crate) async fn qr_ceremony(
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + second, second);
     let outcome = loop {
         tokio::select! {
-            joined = &mut waiting => {
-                break joined.map_err(|_| "the ceremony did not finish".to_string())?;
+            answered = &mut waiting => {
+                break answered;
             }
             _ = ticks.tick() => {
                 let left = CEREMONY_TIMEOUT.saturating_sub(started.elapsed());
@@ -2247,12 +2243,12 @@ mod qr_ceremony_tests {
     use super::*;
     use std::io::{BufRead as _, BufReader, Write as _};
 
-    /// a relay that answers 204 `absent` times, then `json` once, then 204.
+    /// A relay that answers 204 `absent` times, then `json` once and exits.
     fn fake_relay(absent: usize, json: &'static str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for (served, stream) in listener.incoming().enumerate() {
+            for (served, stream) in listener.incoming().take(absent + 1).enumerate() {
                 let mut stream = stream.unwrap();
                 let mut line = String::new();
                 BufReader::new(&stream).read_line(&mut line).unwrap();
@@ -2272,6 +2268,51 @@ mod qr_ceremony_tests {
     }
 
     const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#;
+
+    /// Invalidating the UI stream must close the request already at the relay,
+    /// even if that relay never sends a response or the next countdown tick.
+    #[tokio::test]
+    async fn cancelling_a_ceremony_stream_closes_the_pending_relay_request() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let mut stream = ceremony_stream(move |mut tx| async move {
+            qr_ceremony(
+                &base,
+                authpage::Request::Get { challenge: [7; 32] },
+                "Confirm with the passkey.",
+                &mut tx,
+            )
+            .await?;
+            Ok(())
+        });
+        let receive_request = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            loop {
+                let mut line = String::new();
+                let read = socket.read_line(&mut line).await.unwrap();
+                assert_ne!(read, 0, "the request must reach the relay before cancellation");
+                let headers_complete = line == "\r\n";
+                if headers_complete {
+                    return socket;
+                }
+            }
+        };
+        let mut socket = {
+            let consume = async {
+                while stream.next().await.is_some() {}
+            };
+            tokio::select! {
+                socket = receive_request => socket,
+                () = consume => panic!("the unanswered ceremony ended before cancellation"),
+            }
+        };
+        drop(stream);
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    }
 
     /// the first reading is the QR — the auth page URL carrying this relay's
     /// slot as its callback — and the outcome is the phone's answer.

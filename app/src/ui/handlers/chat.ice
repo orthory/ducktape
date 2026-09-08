@@ -81,6 +81,13 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_at_tail = true
   unread_marker_seq = 0
   palette_open = false
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   shell_tab = ShellTab.chat
   chat_search_phase = SearchPhase.idle
   // Same abandoned request, same dead button — see `choose_channel`. This route
@@ -933,6 +940,13 @@ on open_message_link(url)
       run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
     DuckKind.files
       fs_focus_path = link.path
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.files
       run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
     DuckKind.forge_repo
@@ -940,6 +954,13 @@ on open_message_link(url)
       forge_focus_path = ""
       forge_focus_rev = ""
       forge_focus_seq = 0
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_item
@@ -947,6 +968,13 @@ on open_message_link(url)
       forge_focus_path = ""
       forge_focus_rev = ""
       forge_focus_seq = link.seq
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_blob
@@ -954,6 +982,13 @@ on open_message_link(url)
       forge_focus_path = link.path
       forge_focus_rev = link.rev
       forge_focus_seq = 0
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.channel

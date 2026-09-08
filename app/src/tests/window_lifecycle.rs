@@ -239,3 +239,167 @@ fn a_dropped_file_starts_a_files_upload_only_on_the_files_tab() {
         "the files view stopped reading the lock as its `loading` prop"
     );
 }
+
+// Cancellation is an effect contract: the scenario harness cannot observe a
+// dropped backend future, so pin lane ownership alongside its state scenarios.
+#[test]
+fn authentication_operations_always_have_replace_lanes() {
+    for source in [
+        include_str!("../ui/handlers/node.ice"),
+        include_str!("../ui/handlers/onboarding.ice"),
+    ] {
+        for line in source.lines() {
+            let authenticates = ["register_passkey(", "login_with_passkey(", "link_wallet("]
+                .iter()
+                .any(|operation| line.contains(operation));
+            if authenticates {
+                assert!(
+                    line.trim_start().starts_with("run replace lane="),
+                    "uncancellable authentication: {line}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn authentication_lanes_retire_before_navigation_and_quit() {
+    let onboarding = include_str!("../ui/handlers/onboarding.ice");
+    for name in ["switch_network", "open_account_welcome", "console_opened"] {
+        let body = super::ice_handler_body(onboarding, name);
+        assert!(
+            body.contains("invalidate lane=account_ceremony"),
+            "{name} leaves account authentication alive"
+        );
+    }
+    for name in ["tray_quit", "command_chord_pressed", "window_was_closed"] {
+        let body = handler(name);
+        for lane in [
+            "ceremony",
+            "desktop_ceremony",
+            "account_ceremony",
+            "account_desktop_ceremony",
+        ] {
+            assert!(
+                body.contains(&format!("invalidate lane={lane}")),
+                "{name} leaves {lane} alive"
+            );
+        }
+    }
+    let body = handler("select_shell_tab");
+    let cancel = body
+        .find("invalidate lane=account_ceremony")
+        .expect("leaving Settings aborts authentication");
+    assert!(cancel < body.find("return if !connected").unwrap());
+}
+
+#[test]
+fn browser_authentication_keeps_a_visible_cancel_action() {
+    let source = include_str!("../../../crates/views/settings/src/ui/kit.ice");
+    let plate = source.split("component CeremonyPlate(").nth(1).unwrap();
+    let working = plate.split("if phase == \"working\"").nth(1).unwrap();
+    assert!(working.contains("#plate-cancel-working -> emit(account_ceremony_cancel)"));
+}
+
+#[test]
+fn leaving_settings_clears_authentication_but_reselecting_keeps_it() {
+    let (mut app, _) = Ducktape::__boot();
+    app.shell_tab = ShellTab::Settings;
+    app.account_busy = true;
+    app.account_ceremony_phase = "working".into();
+    app.account_ceremony_detail = "Continue in the browser…".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    assert!(app.account_busy);
+    assert_eq!(app.account_ceremony_phase, "working");
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert!(!app.account_busy);
+    assert!(app.account_ceremony_phase.is_empty());
+    assert!(app.account_ceremony_detail.is_empty());
+}
+
+#[test]
+fn reselecting_settings_without_authentication_still_refreshes() {
+    let (mut app, _) = Ducktape::__boot();
+    app.shell_tab = ShellTab::Settings;
+    app.connected = true;
+    app.settings_generation = 10;
+    app.error = "old error".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
+    assert_eq!(app.settings_generation, 11);
+    assert!(app.error.is_empty());
+}
+
+#[test]
+fn closing_a_window_cancels_only_its_own_authentication() {
+    let (mut app, _) = Ducktape::__boot();
+    let launch = iced::window::Id::unique();
+    let console = iced::window::Id::unique();
+    let huddle = iced::window::Id::unique();
+    app.onboarding_win = Some(launch);
+    app.console_win = Some(console);
+    app.huddle_win = Some(huddle);
+    app.hub_step = crate::HubStep::Account;
+    app.mutation_phase = crate::MutationPhase::Onboarding;
+    app.ceremony_phase = "working".into();
+    app.account_busy = true;
+    app.account_ceremony_phase = "working".into();
+
+    let _ = app.__update(__DucktapeMessage::WindowWasClosed(huddle));
+    assert_eq!(app.ceremony_phase, "working");
+    assert!(app.account_busy);
+    let _ = app.__update(__DucktapeMessage::WindowWasClosed(launch));
+    assert!(app.ceremony_phase.is_empty());
+    assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
+    assert!(
+        app.account_busy,
+        "the console still owns its authentication"
+    );
+    let _ = app.__update(__DucktapeMessage::WindowWasClosed(console));
+    assert!(!app.account_busy);
+    assert!(app.account_ceremony_phase.is_empty());
+}
+
+#[test]
+fn returning_to_the_picker_cancels_welcome_authentication() {
+    let (mut app, _) = Ducktape::__boot();
+    app.hub_step = crate::HubStep::Account;
+    app.mutation_phase = crate::MutationPhase::Onboarding;
+    app.ceremony_phase = "working".into();
+    app.ceremony_detail = "Continue in the browser…".into();
+    let _ = app.__update(__DucktapeMessage::GoNetworks);
+    assert!(matches!(app.hub_step, crate::HubStep::Networks));
+    assert!(matches!(app.mutation_phase, crate::MutationPhase::Idle));
+    assert!(app.ceremony_phase.is_empty());
+    assert!(app.ceremony_detail.is_empty());
+}
+
+#[test]
+fn phone_and_desktop_account_authentication_retire_together() {
+    for source in [
+        include_str!("../ui/handlers/node.ice"),
+        include_str!("../ui/handlers/onboarding.ice"),
+        include_str!("../ui/handlers/lifecycle.ice"),
+        include_str!("../ui/handlers/chat.ice"),
+        include_str!("../ui/handlers/pages.ice"),
+        include_str!("../ui/handlers/huddle.ice"),
+    ] {
+        let lines: Vec<_> = source.lines().map(str::trim).collect();
+        for (index, line) in lines.iter().enumerate() {
+            if *line == "invalidate lane=account_ceremony" {
+                assert_eq!(
+                    lines.get(index + 1),
+                    Some(&"invalidate lane=account_desktop_ceremony")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn passkey_login_shows_its_cancellation_plate_without_an_account() {
+    let source = include_str!("../../../crates/views/settings/src/ui/settings.ice");
+    let missing_account = source.split("if !account_exists").nth(1).unwrap();
+    let missing_account = missing_account.split("if account_exists").next().unwrap();
+    assert!(missing_account.contains("CeremonyPlate #account-login-ceremony"));
+    assert!(missing_account.contains("account_ceremony_cancel"));
+}

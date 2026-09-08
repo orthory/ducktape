@@ -214,14 +214,19 @@ on settings_view_event(event)
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Preparing the passkey…"
       stream replace lane=account_ceremony add_passkey_by_qr(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_ceremony_stepped _
     SettingsIntent.passkey_desktop
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every register_passkey(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony register_passkey(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
     SettingsIntent.ceremony_cancel
       invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
       account_busy = false
       account_ceremony_phase = ""
       account_ceremony_qr = ""
@@ -231,7 +236,9 @@ on settings_view_event(event)
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every link_wallet(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony link_wallet(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
     // Logging in is the other op a key OUTSIDE every account performs: a
     // passkey registered on a member device consents, in the browser, to
     // admitting this one.
@@ -239,7 +246,9 @@ on settings_view_event(event)
       return if !connected || account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
     SettingsIntent.copy
       toast = event_text(event, "label")
       toast_age = 0

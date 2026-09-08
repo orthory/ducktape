@@ -233,8 +233,7 @@ on account_probe_failed(cause)
 
 // THE WELCOME'S DOORS. Skipping opens the console without an account (the
 // banner there is the way back); cancel drops a ceremony mid-flight — the
-// lane invalidation drops the stream's receiver, and the backend task ends
-// on its next step.
+// lane invalidation aborts the owned future and drops its browser session.
 on welcome_skip
   return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
@@ -336,6 +335,16 @@ on welcome_failed(cause)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  ceremony_left = ""
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = false
   account_banner_dismissed = false
   account_ceremony_phase = ""
   account_ceremony_qr = ""
@@ -586,7 +595,15 @@ on go_join
   onboarding_error = ""
 
 on go_networks
-  return if mutation_phase != MutationPhase.idle
+  let unrelated_mutation = mutation_phase != MutationPhase.idle && hub_step != HubStep.account
+  return if unrelated_mutation
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  ceremony_left = ""
   restore_words = ""
   join_invite = ""
   onboarding_error = ""
@@ -678,6 +695,13 @@ on onboarding_failed(cause)
 // (or the user's deliberate read-only skip) survives a network switch.
 on switch_network
   return if mutation_phase != MutationPhase.idle
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=page_autosave
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal
@@ -710,6 +734,13 @@ on dismiss_account_banner
 
 on open_account_welcome
   return if mutation_phase != MutationPhase.idle
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=page_autosave
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal

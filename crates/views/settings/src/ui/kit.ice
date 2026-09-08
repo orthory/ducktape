@@ -215,3 +215,8 @@ component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
           w=fill
           size=12.0
           @text-meta
+      button "Cancel" #plate-cancel-working -> emit(account_ceremony_cancel)
+        with
+          h=26.0
+          p=5.0
+          @secondary_action

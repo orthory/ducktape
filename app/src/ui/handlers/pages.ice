@@ -153,6 +153,13 @@ on open_page_search_hit(page_id, _block_id)
   invalidate lane=block_threads
   invalidate lane=block_comments
   palette_open = false
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   shell_tab = ShellTab.pages
   // Same tab-move rule as `select_shell_tab`.
   page_searching = false
