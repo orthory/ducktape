@@ -58,6 +58,29 @@ pub enum Command {
     },
     /// end a session now. Idempotent; an unknown id is a no-op.
     TermClose { session: String },
+    /// attach a participant's collaboration input to ONE local provider
+    /// session, named by the opaque `device` label the network already records.
+    /// Answered by [`Event::MsgBound`] or [`Event::MsgBindRefused`].
+    MsgBind(Bind),
+    /// release a binding. `generation` must be the one currently held, so a
+    /// stale attachment cannot detach the device that replaced it.
+    MsgUnbind {
+        conversation: String,
+        participant: String,
+        generation: u64,
+    },
+    /// place one immutable, already-admitted message into a bound session.
+    /// Answered by one or more [`Event::MsgDelivery`] frames.
+    MsgDeliver(Deliver),
+    /// the agreed network clock has advanced to `network_now`.
+    ///
+    /// A daemon owns no clock — deliberately, because expiry is a network fact
+    /// and a laptop's wall clock is not one. Without this it could only ever
+    /// judge a deadline against the value frozen onto the frame at admission,
+    /// which goes stale the moment a message waits: a message queued behind an
+    /// offline provider for a day would still look fresh. The node pushes the
+    /// agreed value as it advances, and the daemon takes the larger of the two.
+    MsgTime { network_now: u64 },
 }
 
 /// everything the daemon needs to spawn one session. The node has already
@@ -117,6 +140,178 @@ pub struct Credential {
 /// snake_case on this wire exactly as the lender serializes it.
 pub use provider_host::CredentialKind;
 
+/// attach one participant's collaboration input to a local provider session.
+///
+/// `device` is the SAME opaque label the collaboration module records on its
+/// binding — and it is deliberately all this frame carries about the target.
+/// Which local session that label names is the daemon's own business: it
+/// resolves the label through its local attachment map
+/// (`messaging::Attachments`), which no node reads and nothing serializes onto
+/// a network payload. A provider session id, thread id, socket path or token
+/// therefore never reaches even this localhost link, let alone the mesh.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Bind {
+    pub conversation: String,
+    pub participant: String,
+    /// this attachment's generation. Strictly increasing per
+    /// (conversation, participant): a bind at or below the generation already
+    /// held is refused [`BindRefusal::StaleGeneration`], so two devices cannot
+    /// both claim one participant's input.
+    pub generation: u64,
+    /// the opaque device label to resolve locally. Never a path or session id.
+    pub device: String,
+}
+
+/// one immutable, already-admitted message to place into a bound session.
+///
+/// The network decided admission, authority and ordering before this exists.
+/// Nothing here is re-authorized by the daemon and nothing here claims a task:
+/// [`Deliver::task`] is a REFERENCE the model is told about, never a claim the
+/// daemon makes on the sender's behalf.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Deliver {
+    pub conversation: String,
+    /// the RECIPIENT participant, whose binding this delivery selects.
+    pub participant: String,
+    /// this message's position in the conversation's committed event sequence.
+    /// With `conversation` it is the receipt key the module acknowledges on.
+    pub seq: u64,
+    /// the recipient BINDING generation this delivery is for — not the
+    /// sender's credential generation, which lives in `message_id`. A delivery
+    /// naming a generation the daemon no longer holds is fenced, so a message
+    /// aimed at a replaced attachment never reaches the device that replaced
+    /// it.
+    pub binding_generation: u64,
+    /// {sender credential generation, sender sequence} — the sender-side dedup
+    /// key, echoed on every receipt so two senders' sequence 1 stay distinct.
+    pub message_id: MessageId,
+    /// the sender participant, as the authenticated envelope resolved it. It
+    /// reaches the model inside a wrapper, as peer-supplied content — never as
+    /// an instruction with the standing of its operator.
+    pub sender: String,
+    pub kind: Kind,
+    pub task: Option<TaskRef>,
+    /// the conversation sequence this replies to, if any.
+    pub reply_to: Option<u64>,
+    pub body: String,
+    pub references: Vec<Reference>,
+    /// the agreed network clock value this message stops being deliverable at.
+    ///
+    /// Deliberately UNITLESS here: the agreed clock is a logical one
+    /// (`sdk::Env::consensus_time`), so the daemon must never convert it,
+    /// interpret it as milliseconds, or compare it against a laptop's wall
+    /// clock. It compares it against `network_now` below and nothing else.
+    pub expires_at: u64,
+    /// the agreed network clock as of admission, in the same unit as
+    /// `expires_at`. Sending it is what lets a daemon with no clock of its own
+    /// decide expiry without ever inventing one.
+    pub network_now: u64,
+    /// may steer an ACTIVE turn where the adapter supports it. Unsupported
+    /// steering stays visibly queued; it never falls back to keystrokes.
+    pub urgent: bool,
+}
+
+/// {sender credential generation, sender sequence} — the sender-side identity
+/// of a message, stable across every retry of it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct MessageId {
+    pub generation: u64,
+    pub sequence: u64,
+}
+
+/// what a message is for. Mirrors the collaboration module's `MessageKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Notice,
+    Question,
+    TaskRequest,
+    TaskUpdate,
+    Result,
+}
+
+/// the task a message is about, and the attempt the sender believed was
+/// current. The daemon carries it into the wrapper; it never claims it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRef {
+    pub id: String,
+    pub expected_attempt: u64,
+}
+
+/// an immutable reference a message points at. A local filesystem path is not
+/// a portable artifact reference and never appears here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Reference {
+    pub kind: String,
+    pub value: String,
+}
+
+/// one recipient's delivery state, exactly the collaboration module's
+/// `DeliveryState` minus `Stored` — which is the network's own admission fact
+/// and never something a daemon reports.
+///
+/// `AdapterAccepted` means THE PROVIDER'S INPUT INTERFACE accepted it. It does
+/// not mean the model read it, understood it, acted on it, or claimed a task.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    /// durably queued by this daemon, not yet offered to a provider.
+    Queued,
+    /// the provider's input interface accepted it, and said so itself.
+    AdapterAccepted,
+    /// a provider or local approval barrier is holding it. Exposed, not
+    /// overridden.
+    Held,
+    /// the provider refused it, for a nameable reason.
+    Refused,
+    /// its deadline passed on the agreed clock before it was accepted.
+    Expired,
+    /// the daemon cannot establish whether the input was accepted. The honest
+    /// answer whenever the selected interface supplies no acceptance signal —
+    /// never upgraded by a write completing or a process exiting 0.
+    DeliveryUnknown,
+}
+
+/// why a bind was refused. A stable snake_case token on the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BindRefusal {
+    /// a binding at or above this generation is already held: the attachment
+    /// this one would replace is the current one, or newer.
+    StaleGeneration,
+    /// no local attachment carries that device label. The operator attaches a
+    /// device on the machine that owns the session; the network never names it.
+    UnknownDevice,
+    /// the label resolves, but the session behind it cannot be reached (no
+    /// registry entry, a dead process, an unreadable key).
+    SessionUnreachable,
+    /// this daemon already holds its ceiling of bindings.
+    AtCapacity,
+}
+
+/// what a bound session says it can do. The node publishes this so a sender
+/// learns, before it sends, that (say) this binding will never report
+/// acceptance — so `DeliveryUnknown` from it is the expected answer and not a
+/// fault to chase.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Capabilities {
+    /// input may be offered while a turn is running.
+    pub accepts_while_busy: bool,
+    /// an idle session can be woken by a question or task request.
+    pub wakes_idle: bool,
+    /// the interface supplies an acceptance signal of its own. When false,
+    /// every write that draws no explicit refusal settles `DeliveryUnknown`.
+    pub reports_acceptance: bool,
+    /// an active turn can be steered, under an expected-turn precondition.
+    pub steers_active_turn: bool,
+}
+
 /// daemon → node. The lifecycle of a session, as the process that owns it sees
 /// it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +335,40 @@ pub enum Event {
     /// whichever path actually removed it, so a close racing an EOF cannot
     /// double-terminate.
     TermEnded { session: String },
+    /// the binding is live, and this is what it can do.
+    MsgBound {
+        conversation: String,
+        participant: String,
+        generation: u64,
+        capabilities: Capabilities,
+    },
+    /// the bind was refused, for one nameable reason.
+    MsgBindRefused {
+        conversation: String,
+        participant: String,
+        generation: u64,
+        reason: BindRefusal,
+    },
+    /// one recipient's delivery state changed.
+    ///
+    /// Self-describing on purpose: `conversation` + `seq` is the module's
+    /// receipt key, and `sender` + `message_id` name WHICH send this answers,
+    /// so two senders' sequence 1 can never be confused for one another.
+    /// `binding_generation` is the attachment that produced it — the module
+    /// refuses one from a generation older than the record's own, so a
+    /// returning stale device cannot overwrite the current state.
+    MsgDelivery {
+        conversation: String,
+        participant: String,
+        seq: u64,
+        binding_generation: u64,
+        sender: String,
+        message_id: MessageId,
+        state: State,
+        /// a stable snake_case token, or `null`. Never prose, never a path,
+        /// never a token, never a body excerpt.
+        reason: Option<String>,
+    },
 }
 
 /// why a create refused. A stable snake_case token on the wire: the node maps
@@ -181,6 +410,50 @@ impl Refusal {
             Refusal::AtCapacity => "at_capacity",
             Refusal::UnknownProvider => "unknown_provider",
             Refusal::SpawnFailed => "spawn_failed",
+        }
+    }
+}
+
+impl BindRefusal {
+    /// the stable token the logs carry.
+    pub fn token(self) -> &'static str {
+        match self {
+            BindRefusal::StaleGeneration => "stale_generation",
+            BindRefusal::UnknownDevice => "unknown_device",
+            BindRefusal::SessionUnreachable => "session_unreachable",
+            BindRefusal::AtCapacity => "at_capacity",
+        }
+    }
+}
+
+impl State {
+    /// the stable token the logs carry — the same spelling as the wire.
+    pub fn token(self) -> &'static str {
+        match self {
+            State::Queued => "queued",
+            State::AdapterAccepted => "adapter_accepted",
+            State::Held => "held",
+            State::Refused => "refused",
+            State::Expired => "expired",
+            State::DeliveryUnknown => "delivery_unknown",
+        }
+    }
+
+    /// whether this state is terminal — nothing later may move it.
+    ///
+    /// The spec's machine is
+    /// `Queued -> AdapterAccepted | Held | Refused | Expired | DeliveryUnknown`,
+    /// `Held -> AdapterAccepted | Refused | Expired`, and
+    /// `DeliveryUnknown -> AdapterAccepted | Expired`. So a hold being released
+    /// and an unknown being RECONCILED are both legal later moves, while an
+    /// accepted, refused or expired record is finished. `DeliveryUnknown`
+    /// leaving is legal only on evidence: this daemon reaches
+    /// `AdapterAccepted` from a provider's own acceptance signal and from
+    /// nothing else, so "not terminal" is not a licence to guess.
+    pub fn terminal(self) -> bool {
+        match self {
+            State::Queued | State::Held | State::DeliveryUnknown => false,
+            State::AdapterAccepted | State::Refused | State::Expired => true,
         }
     }
 }
@@ -291,5 +564,200 @@ mod tests {
         let event = serde_json::from_str::<Event>(r#"{"op":"term_ended","session":"a","code":0}"#)
             .expect_err("an unknown field must refuse on an event too");
         assert!(event.to_string().contains("unknown field"), "{event}");
+    }
+
+    fn a_deliver() -> Deliver {
+        Deliver {
+            conversation: "conv-1".into(),
+            participant: "p-recipient".into(),
+            seq: 7,
+            binding_generation: 3,
+            message_id: MessageId {
+                generation: 2,
+                sequence: 1,
+            },
+            sender: "p-sender".into(),
+            kind: Kind::Question,
+            task: Some(TaskRef {
+                id: "job-9".into(),
+                expected_attempt: 4,
+            }),
+            reply_to: Some(5),
+            body: "does the review cover the migration?".into(),
+            references: vec![Reference {
+                kind: "commit".into(),
+                value: "deadbeef".into(),
+            }],
+            expires_at: 1_200,
+            network_now: 1_000,
+            urgent: false,
+        }
+    }
+
+    #[test]
+    fn a_messaging_command_round_trips_through_json() {
+        for command in [
+            Command::MsgBind(Bind {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
+                generation: 3,
+                device: "laptop-a".into(),
+            }),
+            Command::MsgUnbind {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
+                generation: 3,
+            },
+            Command::MsgDeliver(a_deliver()),
+        ] {
+            let text = serde_json::to_string(&command).expect("encodes");
+            assert_eq!(serde_json::from_str::<Command>(&text).unwrap(), command);
+        }
+    }
+
+    #[test]
+    fn a_messaging_event_round_trips_through_json() {
+        for event in [
+            Event::MsgBound {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
+                generation: 3,
+                capabilities: Capabilities {
+                    accepts_while_busy: true,
+                    wakes_idle: true,
+                    reports_acceptance: false,
+                    steers_active_turn: false,
+                },
+            },
+            Event::MsgBindRefused {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
+                generation: 1,
+                reason: BindRefusal::StaleGeneration,
+            },
+            Event::MsgDelivery {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
+                seq: 7,
+                binding_generation: 3,
+                sender: "p-sender".into(),
+                message_id: MessageId {
+                    generation: 2,
+                    sequence: 1,
+                },
+                state: State::DeliveryUnknown,
+                reason: Some("no_acceptance_signal".into()),
+            },
+        ] {
+            let text = serde_json::to_string(&event).expect("encodes");
+            assert_eq!(serde_json::from_str::<Event>(&text).unwrap(), event);
+        }
+    }
+
+    /// The binding frame carries an OPAQUE device label and nothing else about
+    /// the target. Which local session that label names is resolved on the
+    /// device that owns it, so no provider session id, thread id, socket path
+    /// or token is on this link at all — let alone on a network payload.
+    ///
+    /// This is a shape assertion, not a comment: adding a `session_id` or
+    /// `socket` field to [`Bind`] to "make attach easier" is the mistake it
+    /// exists to fail.
+    #[test]
+    fn a_bind_frame_names_a_device_label_and_nothing_about_the_session() {
+        let text = serde_json::to_string(&Command::MsgBind(Bind {
+            conversation: "conv-1".into(),
+            participant: "p-recipient".into(),
+            generation: 3,
+            device: "laptop-a".into(),
+        }))
+        .expect("encodes");
+        let fields: serde_json::Value = serde_json::from_str(&text).expect("decodes as json");
+        let keys: Vec<&str> = fields
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["op", "conversation", "participant", "generation", "device"],
+            "the bind frame grew a field: {text}"
+        );
+        for leak in ["session_id", "thread", "socket", "token", "path", "pid"] {
+            assert!(
+                !text.contains(leak),
+                "a bind frame must not carry {leak}: {text}"
+            );
+        }
+    }
+
+    /// A receipt names the send it answers — both halves. `conversation`+`seq`
+    /// is the module's receipt key; `sender`+`message_id` is what keeps two
+    /// senders' sequence 1 apart when a reader correlates its own outstanding
+    /// sends.
+    #[test]
+    fn a_receipt_names_which_send_it_answers() {
+        let text = serde_json::to_string(&Event::MsgDelivery {
+            conversation: "conv-1".into(),
+            participant: "p-recipient".into(),
+            seq: 7,
+            binding_generation: 3,
+            sender: "p-sender".into(),
+            message_id: MessageId {
+                generation: 2,
+                sequence: 1,
+            },
+            state: State::Held,
+            reason: Some("provider_hold".into()),
+        })
+        .expect("encodes");
+        for named in [
+            r#""conversation":"conv-1""#,
+            r#""seq":7"#,
+            r#""binding_generation":3"#,
+            r#""sender":"p-sender""#,
+            r#""generation":2"#,
+            r#""sequence":1"#,
+            r#""state":"held""#,
+        ] {
+            assert!(text.contains(named), "a receipt must carry {named}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_delivery_tokens_are_the_states_the_module_records() {
+        // these spellings are the wire contract with the collaboration
+        // module's `DeliveryState`; renaming one is a wire change.
+        assert_eq!(State::Queued.token(), "queued");
+        assert_eq!(State::AdapterAccepted.token(), "adapter_accepted");
+        assert_eq!(State::Held.token(), "held");
+        assert_eq!(State::Refused.token(), "refused");
+        assert_eq!(State::Expired.token(), "expired");
+        assert_eq!(State::DeliveryUnknown.token(), "delivery_unknown");
+        // and the json spelling is the same one, so a log line and a frame
+        // never disagree about what happened.
+        for state in [
+            State::Queued,
+            State::AdapterAccepted,
+            State::Held,
+            State::Refused,
+            State::Expired,
+            State::DeliveryUnknown,
+        ] {
+            let text = serde_json::to_string(&state).expect("encodes");
+            assert_eq!(text, format!("\"{}\"", state.token()));
+        }
+    }
+
+    #[test]
+    fn only_accepted_refused_and_expired_are_terminal() {
+        // the spec's machine lets a hold be released and an unknown be
+        // reconciled; treating either as finished would strand it forever.
+        assert!(!State::Queued.terminal());
+        assert!(!State::Held.terminal());
+        assert!(!State::DeliveryUnknown.terminal());
+        assert!(State::AdapterAccepted.terminal());
+        assert!(State::Refused.terminal());
+        assert!(State::Expired.terminal());
     }
 }
