@@ -234,25 +234,94 @@ pub fn call_session(rpc: String, channel_id: String) -> BoxStream<'static, CallE
     Box::pin(events_rx)
 }
 
-/// The upgrade itself is what the hub admits, so the workspace secret rides
-/// the query string: the same `service-link.token` the `/v1/ws` subscribe
-/// presents, because the call socket hands out live mic and camera bytes and
-/// the node gates those on proof of reading its own workspace.
-fn ws_url(rpc: &str, channel_id: &str, token: &str) -> String {
+/// How this device proves itself to the hub. The upgrade itself is what the
+/// hub admits — the call socket hands out live mic and camera bytes — and it
+/// takes ONE of two proofs, decided by whether this device hosts the node.
+enum Admission {
+    /// This device hosts the node: its 0600 workspace secret, on the query
+    /// string — the same `service-link.token` the `/v1/ws` subscribe presents.
+    Workspace(String),
+    /// This device is pointed at a node it does not host: the seated user
+    /// key's data-plane signature over the upgrade (`GET`, the exact
+    /// path+query, an empty body), as headers. The node admits it only for an
+    /// account the channel's committed huddle roster names at that node —
+    /// which the join that seated the key put there.
+    Signed([(&'static str, String); 3]),
+}
+
+/// The path+query the upgrade goes to — and, for a signed admission, the
+/// exact bytes the signature binds.
+fn ws_path(channel_id: &str) -> String {
+    format!("/v1/call/ws?channel={channel_id}")
+}
+
+fn ws_url(rpc: &str, path_and_query: &str) -> String {
     let base = rpc.trim_end_matches('/');
     let base = base
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    format!("{base}/v1/call/ws?channel={channel_id}&token={token}")
+    format!("{base}{path_and_query}")
 }
 
+/// The upgrade request, carrying the proof where the hub reads it.
+fn ws_request(
+    rpc: &str,
+    channel_id: &str,
+    admission: Admission,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let path = ws_path(channel_id);
+    match admission {
+        Workspace(token) => ws_url(rpc, &format!("{path}&token={token}"))
+            .into_client_request()
+            .map_err(|error| format!("call socket: {error}")),
+        Signed(headers) => {
+            let mut request = ws_url(rpc, &path)
+                .into_client_request()
+                .map_err(|error| format!("call socket: {error}"))?;
+            for (name, value) in headers {
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|error| format!("call socket: {error}"))?;
+                request
+                    .headers_mut()
+                    .insert(HeaderName::from_static(name), value);
+            }
+            Ok(request)
+        }
+    }
+}
+use Admission::{Signed, Workspace};
+
 /// This node's workspace secret, found the way the agent stream finds it:
-/// the registered workspace whose endpoint is `rpc`. A node with no local
-/// workspace cannot be called into — the hub refuses every socket without it.
-fn workspace_secret(rpc: &str) -> Result<String, String> {
-    let (_, workspace) = crate::backend::workspace_at(rpc)
-        .ok_or_else(|| "this node has no local workspace, so its call hub cannot admit this device".to_string())?;
-    crate::backend::read_link_token(&workspace)
+/// the registered workspace whose endpoint is `rpc`. `None` when this device
+/// holds no workspace for the node — a remote node.
+fn workspace_secret(rpc: &str) -> Option<String> {
+    let (_, workspace) = crate::backend::workspace_at(rpc)?;
+    crate::backend::read_link_token(&workspace).ok()
+}
+
+/// Decide the proof: the workspace secret where this device hosts the node,
+/// else the seated key's signature bound to that node's identity. A remote
+/// node with the seat locked is the one way in that is closed — the join
+/// that would have seated the key is the join that starts this session.
+async fn admission(rpc: &str, channel_id: &str) -> Result<Admission, String> {
+    if let Some(token) = workspace_secret(rpc) {
+        return Ok(Workspace(token));
+    }
+    let status = crate::backend::rpc_client(rpc)?
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+    let node_key = crate::backend::hex_decode(&status.public_key)?;
+    let headers = crate::backend::seated_request_headers("GET", &ws_path(channel_id), &node_key, b"")
+        .await
+        .ok_or_else(|| {
+            "this device does not host the node, and its user key is locked; unlock it to \
+             huddle through a remote node"
+                .to_string()
+        })?;
+    Ok(Signed(headers))
 }
 
 async fn run_session(
@@ -261,19 +330,20 @@ async fn run_session(
     mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
 ) {
     let _ = events.send(CallEvent::of("connecting")).await;
-    let token = match workspace_secret(&rpc) {
-        Ok(token) => token,
+    let request = match admission(&rpc, &channel_id).await {
+        Ok(admission) => ws_request(&rpc, &channel_id, admission),
+        Err(reason) => Err(format!("call socket: {reason}")),
+    };
+    let request = match request {
+        Ok(request) => request,
         Err(reason) => {
-            let _ = events
-                .send(CallEvent::failed("error", format!("call socket: {reason}")))
-                .await;
+            let _ = events.send(CallEvent::failed("error", reason)).await;
             return;
         }
     };
-    let url = ws_url(&rpc, &channel_id, &token);
     let connected = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio_tungstenite::connect_async(&url),
+        tokio_tungstenite::connect_async(request),
     )
     .await;
     let (socket, _) = match connected {
@@ -1016,14 +1086,42 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_swaps_scheme_only_and_carries_the_workspace_secret() {
+    fn a_workspace_admission_swaps_scheme_only_and_carries_the_secret_on_the_query() {
+        let request = ws_request("http://127.0.0.1:8844/", "eng", Workspace("s3cret".into()))
+            .unwrap();
         assert_eq!(
-            ws_url("http://127.0.0.1:8844/", "eng", "s3cret"),
+            request.uri().to_string(),
             "ws://127.0.0.1:8844/v1/call/ws?channel=eng&token=s3cret"
         );
+        assert!(request.headers().get("x-ducktape-sig").is_none());
+        let request =
+            ws_request("https://node.example", "general", Workspace("s3cret".into())).unwrap();
         assert_eq!(
-            ws_url("https://node.example", "general", "s3cret"),
+            request.uri().to_string(),
             "wss://node.example/v1/call/ws?channel=general&token=s3cret"
         );
+    }
+
+    /// A remote node's admission: the trio rides as headers over a query with
+    /// NO token, and the signed path is exactly the path the request goes to
+    /// — the node verifies the signature against what it received.
+    #[test]
+    fn a_signed_admission_carries_the_trio_as_headers_over_the_exact_path() {
+        use commonware_cryptography::Signer as _;
+        let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(3);
+        let node_key = [9u8; 32];
+        let headers =
+            ::node::signed_req::request_headers(&signer, "GET", &ws_path("eng"), &node_key, b"");
+        let request = ws_request("http://127.0.0.1:8844", "eng", Signed(headers.clone())).unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "ws://127.0.0.1:8844/v1/call/ws?channel=eng"
+        );
+        assert_eq!(request.uri().path_and_query().unwrap().as_str(), ws_path("eng"));
+        for (name, value) in headers {
+            assert_eq!(request.headers().get(name).unwrap(), value.as_str());
+        }
+        // the websocket handshake headers the client fills in are still there.
+        assert!(request.headers().get("sec-websocket-key").is_some());
     }
 }
