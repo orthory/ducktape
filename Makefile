@@ -40,8 +40,12 @@ dev-clear:
 	@bash ops/dev-clear.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
-## messages, a tasks board, pages, a registered agent (with a live @mention run),
-## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
+## messages, a tasks board, pages, a registered TEST agent with the dogfood
+## e2e runner's shape (a script-backed provider staged as a capability spec,
+## forge read+push on a seeded `playground` repo with an issue mentioning it —
+## once `make dev` starts the compute service it replies in chat and opens a
+## pull request from a microVM, no model credential needed), jobs, an
+## automation rule — plus TWO gateway web-app routes: a
 ## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
 ## "demo" workspace in ~/.ducktape and makes it active. Builds ducktape if needed
 ## (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
@@ -120,7 +124,7 @@ views: $(ICE_BIN)
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
 	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
 	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
-	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p files-view \
+	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p chat-view -p files-view -p forge-view -p pages-view -p shell-view \
 		--target wasm32-unknown-unknown --out target/views
 
 ifeq ($(UNAME_S),Darwin)

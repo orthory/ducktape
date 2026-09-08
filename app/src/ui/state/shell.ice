@@ -29,7 +29,6 @@ state
   shell_terminal_error = ""
   shell_chat_entries:[AgentChatEntry] = []
   shell_chat_activity:[AgentActivity] = []
-  shell_chat_draft:editor = ""
   shell_chat_busy = false
   shell_chat_status = ""
   shell_chat_detail = ""
@@ -41,4 +40,6 @@ state
   // whole transcript across the extern ABI on each one.
   shell_detached_saga = ""
   // Which settled turn has its work open. 0 is none — an entry id is never 0.
-  shell_steps_open:i64 = 0
+  // the host-side composer's acknowledgement of a clear — `shell_composer_clear`
+  // returns nothing to bind
+  shell_draft_cleared = false

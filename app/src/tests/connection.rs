@@ -100,7 +100,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 
     // THE ARM. The plate may not be keyed on a flag, and may not fire during
     // the round trip its own submit opened.
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     assert!(pages_screen.contains(
         "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
@@ -137,7 +137,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
 /// opaque card UNDER the document it is supposed to cover.
 #[test]
 fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
-    let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
+    let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
     // Both needles carry the SAME ten-space indent, and the indent is the
     // sibling pin: re-nesting the plate inside the document arm deepens its
     // indent and its needle stops matching, exactly as hoisting the document
@@ -236,11 +236,10 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
-        app.chat_search_draft = draft.into();
-        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
-        // nothing.
+        // A DRAFT IS NOT A QUERY: the draft is the view's own, and typing
+        // alone runs nothing and captures nothing.
         assert!(app.chat_search_query.is_empty());
-        let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+        let _ = app.__update(__DucktapeMessage::SearchChatSubmit(draft.into()));
         assert_eq!(app.chat_search_phase, SearchPhase::Searching);
         assert_eq!(
             app.chat_search_query, "zzz",
@@ -253,19 +252,17 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
         app
     };
 
-    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY, and one more character
-    // walks the draft away from it with no handler run.
-    let mut empty = answered("  zzz  ", Vec::new());
+    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY — the view retires it
+    // the moment the draft walks away from `search_query`, with no handler
+    // run.
+    let empty = answered("  zzz  ", Vec::new());
     assert!(empty.chat_search_hits.is_empty());
-    assert_eq!(empty.chat_search_draft.trim(), empty.chat_search_query);
-    empty.chat_search_draft = "zzzq".into();
-    assert_ne!(empty.chat_search_draft.trim(), empty.chat_search_query);
+    assert_eq!(empty.chat_search_query, "zzz");
 
     // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
     // keystroke, and the float's gate says so on its own `!empty(search_hits)`
     // term.
-    let mut rows = answered("zzz", vec![stale_chat_hit()]);
-    rows.chat_search_draft = "zzzq".into();
+    let rows = answered("zzz", vec![stale_chat_hit()]);
     assert_eq!(rows.chat_search_hits.len(), 1);
 
     // A FAILED search never ran, so nothing may stand for it.
@@ -296,7 +293,7 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
     // THE GATE. The float stands while the search is out, while hits are in
     // hand, or while the box still holds the string the answer speaks for —
     // and for no other reason, so a zero-hit answer cannot outlive its query.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         chat.contains(
             "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
@@ -325,11 +322,11 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
     // The three arms read it, so none of them can drift from the others.
     for (source, call) in [
         (
-            inlined(include_str!("../ui/screens/pages.ice")),
+            inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice")),
             "search_answer_stands(page_search_query, page_search_draft, page_searching)",
         ),
         (
-            inlined(include_str!("../ui/screens/chat.ice")),
+            inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice")),
             "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
         ),
         (
@@ -690,8 +687,9 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
     /// Settings (which owns connection repair and stays useful with the node
-    /// down) and Node (which owns the daemon diagnostics) are module-owned
-    /// views now and not in this inventory; every native data screen answers.
+    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages,
+    /// Forge and Shell are module-owned views now and not in this inventory;
+    /// every native data screen answers.
     const EXEMPT: [&str; 0] = [];
 
     let mut screens: Vec<&str> = SCREENS
@@ -703,8 +701,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
     screens.sort_unstable();
 
     assert_eq!(
-        screens,
-        ["ChatScreen", "ForgeScreen", "PagesScreen", "ShellScreen",],
+        screens, [""; 0],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
@@ -749,7 +746,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 fn a_disconnected_screen_stands_its_registers_down_too() {
     const EXEMPT: [&str; 0] = [];
 
-    for source in [include_str!("../ui/screens/forge.ice")] {
+    for source in [include_str!("../../../crates/views/forge/src/ui/forge.ice")] {
         for chunk in source.split("\ncomponent ").skip(1) {
             let name = chunk.split('(').next().unwrap_or("").trim();
             if !name.ends_with("Screen") || EXEMPT.contains(&name) {
@@ -1027,8 +1024,7 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
-    app.chat_search_draft = "ledger".into();
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     assert_eq!(app.chat_search_phase, SearchPhase::Searching);
 
     let _ = app.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
@@ -1044,7 +1040,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     assert_eq!(app.error, "rpc unreachable");
 
     // And the empty result IS still reachable — "done" with no hits is the miss.
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
     let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
         backend::ChatSearchData { hits: Vec::new() },
     ));
@@ -1065,7 +1061,7 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
 /// answer that still stands for the box means the box is not empty.
 #[test]
 fn the_clear_search_button_survives_a_zero_hit_result() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
         "the clear × must open on the float's discriminant or on a live field"

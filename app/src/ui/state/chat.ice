@@ -15,8 +15,6 @@ state
   // in the view would clone the member list once per composer per frame.
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   // THE COPY RANGE'S TWO ENDS, as seqs. `copy_anchor_seq` is where the reader
   // clicked and `copy_head_seq` is where they shift-clicked, in either
   // direction; 0 is no range. Seqs and not indices because history prepends —
@@ -41,6 +39,11 @@ state
   thread_message_action:MessageAction = MessageAction.toolbar
   thread_edit_draft = ""
   history_loading = false
+  // A refused or failed send hands its words back to the composer it came
+  // from; the composer is a host surface, so the hand-off is a call.
+  composer_stashed = false
+  // Moves once per admitted send: the view snaps its stream to the tail on it.
+  chat_sent_serial:i64 = 0
   channel_draft = ""
   channel_create_open = false
   channel_create_members_only = false
@@ -50,7 +53,6 @@ state
   // so no app state can be handed to the wrong room — and neither is the
   // failed-send stash, which followed the reader out of the room its words
   // were written in until a slice keyed it to that room (ducktape-ui#698).
-  chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_search_phase:SearchPhase = SearchPhase.idle
   // THE STRING THE FLOAT'S ZERO-HIT ARM IS SPEAKING FOR — the query a search

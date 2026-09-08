@@ -173,6 +173,27 @@ fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
     serde_json::from_str(&event.detail).ok()
 }
 
+/// The number in one field of an intent's detail, 0 when absent or not one.
+pub fn event_number(event: &ModuleViewEvent, field: &str) -> i64 {
+    detail(event)
+        .and_then(|detail| detail.get(field)?.as_i64())
+        .unwrap_or_default()
+}
+
+/// The integer under `field` in an intent's JSON detail; 0 when absent.
+pub fn event_int(event: &ModuleViewEvent, field: &str) -> i64 {
+    detail(event)
+        .and_then(|detail| detail.get(field).and_then(serde_json::Value::as_i64))
+        .unwrap_or_default()
+}
+
+/// The number under `field` in an intent's JSON detail; 0 when absent.
+pub fn event_num(event: &ModuleViewEvent, field: &str) -> f64 {
+    detail(event)
+        .and_then(|detail| detail.get(field).and_then(serde_json::Value::as_f64))
+        .unwrap_or_default()
+}
+
 // ---------- the node seat ----------
 
 /// The Node tab: the facts the app holds, drawn by the `node` view. Its
@@ -452,6 +473,843 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
     }
 }
 
+// ---------- the forge seat ----------
+
+/// The forge view's props as one document: borrowed where the app holds the
+/// fact, folded where the view wants a word or a painted row.
+#[derive(serde::Serialize)]
+struct ForgeProps<'a> {
+    dark: bool,
+    connected: bool,
+    org: &'a str,
+    about: &'a str,
+    tier: &'a str,
+    network_chain_id: &'a str,
+    connected_rpc: &'a str,
+    repos: &'a [crate::backend::ForgeRepo],
+    list_phase: &'static str,
+    open_repo: &'a str,
+    repo_menu: bool,
+    repo_phase: &'static str,
+    branches: &'a [String],
+    tab: &'static str,
+    items: &'a [crate::backend::ForgeItem],
+    forge_item_number: i64,
+    item_phase: &'static str,
+    forge_item_kind: &'a str,
+    forge_item_title: &'a str,
+    forge_item_state: &'a str,
+    forge_item_author: &'a str,
+    forge_item_branches: &'a str,
+    forge_item_body: &'a str,
+    forge_item_blocks: &'a [crate::backend::ChatBlock],
+    forge_item_files_changed: i64,
+    forge_item_additions: i64,
+    forge_item_deletions: i64,
+    diff_rows: Vec<crate::backend::DiffLine>,
+    forge_item_diff_truncated: bool,
+    forge_item_merge_oid: &'a str,
+    forge_item_source_oid: &'a str,
+    forge_item_approvals: i64,
+    forge_item_change_requests: i64,
+    forge_item_reviews: &'a [crate::backend::ForgeReview],
+    merge_conflicts: &'a [String],
+    merge_busy: bool,
+    review_verdict: &'static str,
+    review_busy: bool,
+    staged_comments: &'a [crate::backend::ForgeDraftComment],
+    comment_cap_reached: bool,
+    discussion: &'a [crate::backend::ChatMessage],
+    linked_note: &'a [crate::backend::ChatMessage],
+    landed_seq: i64,
+    landed_tick: i64,
+    tree_path: &'a str,
+    tree_rev: &'a str,
+    tree_entries: &'a [crate::backend::TreeEntry],
+    tree_born: bool,
+    tree_truncated: bool,
+    tree_phase: &'static str,
+    file_path: &'a str,
+    file_text: &'a str,
+    file_binary: bool,
+    file_truncated: bool,
+    file_picture: bool,
+    file_width: i64,
+    file_height: i64,
+    file_note: &'a str,
+    file_header: &'a str,
+    file_phase: &'static str,
+    drafts_cleared: i64,
+    drafts_scope: &'a str,
+}
+
+/// The Forge tab: the register the app holds, the repo and item it has
+/// open, the code browse's listing and file, and the discussion, drawn by
+/// the `forge` view. The phases, the tab and the verdict cross as their
+/// enum words; the patch crosses as painted rows; the optional landed note
+/// as a list of at most one. Its intents come back one per act
+/// (`forge_intent`), carrying only what the reader picked or typed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn forge_view(
+    dark: bool,
+    connected: bool,
+    org: &str,
+    about: &str,
+    tier: &str,
+    network_chain_id: &str,
+    connected_rpc: &str,
+    repos: &[crate::backend::ForgeRepo],
+    list_phase: crate::ForgePhase,
+    open_repo: &str,
+    repo_menu: bool,
+    repo_phase: crate::ForgePhase,
+    branches: &[String],
+    tab: crate::ForgeTab,
+    items: &[crate::backend::ForgeItem],
+    item_number: i64,
+    item_phase: crate::ForgePhase,
+    item_kind: &str,
+    item_title: &str,
+    item_state: &str,
+    item_author: &str,
+    item_branches: &str,
+    item_body: &str,
+    item_blocks: &[crate::backend::ChatBlock],
+    files_changed: i64,
+    additions: i64,
+    deletions: i64,
+    diff: &str,
+    diff_truncated: bool,
+    merge_oid: &str,
+    source_oid: &str,
+    approvals: i64,
+    change_requests: i64,
+    reviews: &[crate::backend::ForgeReview],
+    merge_conflicts: &[String],
+    merge_busy: bool,
+    review_verdict: crate::ForgeReviewVerdict,
+    review_busy: bool,
+    staged_comments: &[crate::backend::ForgeDraftComment],
+    discussion: &[crate::backend::ChatMessage],
+    linked_note: Option<crate::backend::ChatMessage>,
+    landed_seq: i64,
+    landed_tick: i64,
+    tree_path: &str,
+    tree_rev: &str,
+    tree_entries: &[crate::backend::TreeEntry],
+    tree_born: bool,
+    tree_truncated: bool,
+    tree_phase: crate::ForgeTreePhase,
+    file_path: &str,
+    file_text: &str,
+    file_binary: bool,
+    file_truncated: bool,
+    file_picture: bool,
+    file_width: i64,
+    file_height: i64,
+    file_note: &str,
+    file_header: &str,
+    file_phase: crate::ForgeFilePhase,
+    drafts_cleared: i64,
+    drafts_scope: &str,
+) -> Element<'static, ModuleViewEvent> {
+    let props = ForgeProps {
+        dark,
+        connected,
+        org,
+        about,
+        tier,
+        network_chain_id,
+        connected_rpc,
+        repos,
+        list_phase: forge_phase_word(list_phase),
+        open_repo,
+        repo_menu,
+        repo_phase: forge_phase_word(repo_phase),
+        branches,
+        tab: match tab {
+            crate::ForgeTab::Code => "code",
+            crate::ForgeTab::Pulls => "pulls",
+            crate::ForgeTab::Issues => "issues",
+        },
+        items,
+        forge_item_number: item_number,
+        item_phase: forge_phase_word(item_phase),
+        forge_item_kind: item_kind,
+        forge_item_title: item_title,
+        forge_item_state: item_state,
+        forge_item_author: item_author,
+        forge_item_branches: item_branches,
+        forge_item_body: item_body,
+        forge_item_blocks: item_blocks,
+        forge_item_files_changed: files_changed,
+        forge_item_additions: additions,
+        forge_item_deletions: deletions,
+        diff_rows: crate::backend::diff_lines(diff),
+        forge_item_diff_truncated: diff_truncated,
+        forge_item_merge_oid: merge_oid,
+        forge_item_source_oid: source_oid,
+        forge_item_approvals: approvals,
+        forge_item_change_requests: change_requests,
+        forge_item_reviews: reviews,
+        merge_conflicts,
+        merge_busy,
+        review_verdict: forge_verdict_word(review_verdict),
+        review_busy,
+        staged_comments,
+        comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
+        discussion,
+        linked_note: linked_note.as_slice(),
+        landed_seq,
+        landed_tick,
+        tree_path,
+        tree_rev,
+        tree_entries,
+        tree_born,
+        tree_truncated,
+        tree_phase: match tree_phase {
+            crate::ForgeTreePhase::Loading => "loading",
+            crate::ForgeTreePhase::Ready => "ready",
+            crate::ForgeTreePhase::Failed => "failed",
+        },
+        file_path,
+        file_text,
+        file_binary,
+        file_truncated,
+        file_picture,
+        file_width,
+        file_height,
+        file_note,
+        file_header,
+        file_phase: match file_phase {
+            crate::ForgeFilePhase::Idle => "idle",
+            crate::ForgeFilePhase::Loading => "loading",
+            crate::ForgeFilePhase::Ready => "ready",
+            crate::ForgeFilePhase::Failed => "failed",
+        },
+        drafts_cleared,
+        drafts_scope,
+    };
+    module_view("forge", serde_json::to_vec(&props).expect("props encode"))
+}
+
+fn forge_phase_word(phase: crate::ForgePhase) -> &'static str {
+    match phase {
+        crate::ForgePhase::Idle => "idle",
+        crate::ForgePhase::Loading => "loading",
+        crate::ForgePhase::Ready => "ready",
+        crate::ForgePhase::Failed => "failed",
+    }
+}
+
+fn forge_verdict_word(verdict: crate::ForgeReviewVerdict) -> &'static str {
+    match verdict {
+        crate::ForgeReviewVerdict::Comment => "comment",
+        crate::ForgeReviewVerdict::Approve => "approve",
+        crate::ForgeReviewVerdict::RequestChanges => "request_changes",
+    }
+}
+
+pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
+    use crate::ForgeIntent as Intent;
+    match event.kind.as_str() {
+        "open_repo" => Intent::OpenRepo,
+        "close_repo" => Intent::CloseRepo,
+        "toggle_repo_menu" => Intent::ToggleRepoMenu,
+        "tab" => Intent::Tab,
+        "open_item" => Intent::OpenItem,
+        "close_item" => Intent::CloseItem,
+        "merge" => Intent::Merge,
+        "review_pick" => Intent::ReviewPick,
+        "review_submit" => Intent::ReviewSubmit,
+        "comment_stage" => Intent::CommentStage,
+        "comment_drop" => Intent::CommentDrop,
+        "tree" => Intent::Tree,
+        "blob" => Intent::Blob,
+        "open_link" => Intent::OpenLink,
+        _ => Intent::Copy,
+    }
+}
+
+/// The repo seat a `tab` intent names; a word the screen has no seat for is
+/// the code browse.
+pub fn forge_event_tab(event: &ModuleViewEvent) -> crate::ForgeTab {
+    match event_text(event, "tab").as_str() {
+        "pulls" => crate::ForgeTab::Pulls,
+        "issues" => crate::ForgeTab::Issues,
+        _ => crate::ForgeTab::Code,
+    }
+}
+
+/// The verdict a `review_pick` intent names; an unknown word is a comment.
+pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict {
+    match event_text(event, "verdict").as_str() {
+        "approve" => crate::ForgeReviewVerdict::Approve,
+        "request_changes" => crate::ForgeReviewVerdict::RequestChanges,
+        _ => crate::ForgeReviewVerdict::Comment,
+    }
+}
+
+// ---------- the shell seat ----------
+
+/// The Shell tab: the app's agent picks, the terminal it holds and the run
+/// it is watching, drawn by the `shell` view. The provider's wording — the
+/// header line, the grant note, the terminal note, the blurbs — is folded
+/// here, so the view names no provider; the terminal session is parked for
+/// the `agent_terminal_surface` slot. Intents come back as `surface`,
+/// `setup`, `identity`, `host_node`, `refresh`, `terminal_start`,
+/// `terminal_stop`, `reset`, `detach`, `reopen`, `discard`, `open_link`,
+/// and — from the host's own composer surface — `send` (`body`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn shell_view(
+    dark: bool,
+    connected: bool,
+    surface: crate::ShellSurface,
+    setup_open: bool,
+    identity_options: &[String],
+    identity: &str,
+    provider: &str,
+    credential: &str,
+    host_node_options: &[String],
+    host_node: &str,
+    credentials_loading: bool,
+    terminal: &crate::backend::AgentTerminalSession,
+    terminal_running: bool,
+    terminal_busy: bool,
+    terminal_title: &str,
+    terminal_error: &str,
+    entries: &[crate::backend::AgentChatEntry],
+    activity: &[crate::backend::AgentActivity],
+    chat_busy: bool,
+    chat_status: &str,
+    chat_detail: &str,
+    live: &str,
+    saga_id: &str,
+    detached_saga: &str,
+) -> Element<'static, ModuleViewEvent> {
+    use crate::backend as b;
+    *shell_terminal().lock().expect("shell terminal") = Some(terminal.clone());
+    let entries: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "id": entry.id,
+                "role": entry.role,
+                "body": entry.body,
+                "provider_label": b::agent_provider_label(&entry.provider),
+                "provider_initial": b::agent_provider_initial(&entry.provider),
+                "status": entry.status,
+                "run_label": b::agent_run_label(&entry.saga_id),
+                "steps": entry.steps,
+                "steps_label": entry.steps_label,
+            })
+        })
+        .collect();
+    let props = serde_json::json!({
+        "dark": dark,
+        "connected": connected,
+        "surface": match surface {
+            crate::ShellSurface::Tasks => "tasks",
+            crate::ShellSurface::Terminal => "terminal",
+        },
+        "setup_open": setup_open,
+        "identity_options": identity_options,
+        "identity": identity,
+        "provider_initial": b::agent_provider_initial(provider),
+        "credential": credential,
+        "host_node_options": host_node_options,
+        "host_node": host_node,
+        "credentials_loading": credentials_loading,
+        "terminal_running": terminal_running,
+        "terminal_busy": terminal_busy,
+        "terminal_title": terminal_title,
+        "terminal_error": terminal_error,
+        "entries": entries,
+        "activity": activity,
+        "chat_busy": chat_busy,
+        "chat_status": chat_status,
+        "chat_detail": chat_detail,
+        "live": live,
+        "saga_id": saga_id,
+        "detached_saga": detached_saga,
+        "run_line": b::agent_run_line(identity, host_node),
+        "grant_note": b::agent_host_grant_note(host_node, credential),
+        "terminal_note": b::agent_terminal_note(provider, credential),
+        "composer_hint": b::agent_composer_hint(provider),
+        "task_blurb": b::agent_task_blurb(host_node),
+        "register_hint": b::agent_register_hint(provider),
+    });
+    module_view("shell", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn shell_intent(event: &ModuleViewEvent) -> crate::ShellIntent {
+    use crate::ShellIntent as Intent;
+    match event.kind.as_str() {
+        "surface" => Intent::Surface,
+        "setup" => Intent::Setup,
+        "identity" => Intent::Identity,
+        "host_node" => Intent::HostNode,
+        "refresh" => Intent::Refresh,
+        "terminal_start" => Intent::TerminalStart,
+        "terminal_stop" => Intent::TerminalStop,
+        "send" => Intent::Send,
+        "reset" => Intent::Reset,
+        "detach" => Intent::Detach,
+        "reopen" => Intent::Reopen,
+        "discard" => Intent::Discard,
+        _ => Intent::OpenLink,
+    }
+}
+
+/// The surface a `surface` intent names; a word the screen has no surface
+/// for is the tasks.
+pub fn shell_event_surface(event: &ModuleViewEvent) -> crate::ShellSurface {
+    match event_text(event, "surface").as_str() {
+        "terminal" => crate::ShellSurface::Terminal,
+        _ => crate::ShellSurface::Tasks,
+    }
+}
+
+/// Empties the host-side shell composer.
+pub fn shell_composer_clear() -> bool {
+    crate::shell_composer::clear();
+    true
+}
+
+/// The terminal session behind the shell view's slot: the one the app
+/// last drew the tab with. One per process, like the view it belongs to.
+fn shell_terminal() -> &'static Mutex<Option<crate::backend::AgentTerminalSession>> {
+    static TERMINAL: OnceLock<Mutex<Option<crate::backend::AgentTerminalSession>>> =
+        OnceLock::new();
+    TERMINAL.get_or_init(Mutex::default)
+}
+
+// ---------- the pages seat ----------
+
+/// The Pages tab: the facts the app holds, drawn by the `pages` view. The
+/// document is NOT among them — it is the app's editor, stashed for the
+/// `page_document` surface the view leaves a slot for (`crate::pages::surface`)
+/// and painted there by the host. Its intents come back one per act
+/// (`pages_intent`); the drafts the view holds cross only with the act that
+/// reads them, and `seed_rev` moving tells the view to take `page_draft` /
+/// `block_comment_draft` back as its own (a recovered comment, a refused
+/// post or create handed back).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn pages_view(
+    dark: bool,
+    connected: bool,
+    loading: bool,
+    mutation_phase: crate::MutationPhase,
+    network_chain_id: &str,
+    pages: &[crate::backend::PageItem],
+    page_create_open: bool,
+    page_draft: &str,
+    block_comment_draft: &str,
+    seed_rev: i64,
+    active_page: &str,
+    active_page_title: &str,
+    active_page_parent: &str,
+    page_searching: bool,
+    page_search_hits: &[crate::backend::PageSearchHit],
+    page_search_query: &str,
+    page_delete_armed: bool,
+    autosave: crate::AutosaveStatus,
+    page_refusal: &str,
+    doc_tabs: &[String],
+    blocks: &[crate::backend::PageBlock],
+    commented_block_hits: &[String],
+    caret_comment_target: &str,
+    active_thread_anchor: &str,
+    orphaned_comment_drafts: &[String],
+    page_editor: &iced::widget::text_editor::Content,
+    block_comments_open: bool,
+    thread_total: i64,
+    threads: &[crate::backend::PageCommentThread],
+    comment_rows: &[crate::pages::PageCommentThreadRow],
+    threads_loading: bool,
+    threads_has_more: bool,
+    active_thread: &str,
+    comments: &[crate::backend::PageComment],
+    comments_loading: bool,
+    comments_has_more: bool,
+) -> Element<'static, ModuleViewEvent> {
+    crate::pages::surface::show(
+        page_editor,
+        dark,
+        loading || !connected,
+        blocks,
+        commented_block_hits,
+    );
+    let autosave = match autosave {
+        crate::AutosaveStatus::Idle => "idle",
+        crate::AutosaveStatus::Saving => "saving",
+        crate::AutosaveStatus::Saved => "saved",
+        crate::AutosaveStatus::Error => "error",
+    };
+    let subpages: Vec<serde_json::Value> = crate::backend::subpage_blocks(blocks)
+        .into_iter()
+        .map(|block| serde_json::json!({ "id": block.id, "title": block.text }))
+        .collect();
+    let props = serde_json::json!({
+        "dark": dark,
+        "connected": connected,
+        "loading": loading,
+        "busy": mutation_phase != crate::MutationPhase::Idle,
+        "page_link": crate::backend::duck_page_link(active_page.to_owned(), network_chain_id.to_owned()),
+        "pages": pages,
+        "page_create_open": page_create_open,
+        "active_page": active_page,
+        "active_page_title": active_page_title,
+        "active_page_parent": active_page_parent,
+        "page_searching": page_searching,
+        "page_search_hits": page_search_hits,
+        "page_search_query": page_search_query,
+        "page_delete_armed": page_delete_armed,
+        "autosave": autosave,
+        "page_refusal": page_refusal,
+        "doc_tabs": crate::backend::doc_tab_rows(doc_tabs, pages, active_page),
+        "subpages": subpages,
+        "orphaned_comment_drafts": orphaned_comment_drafts,
+        "block_comments_open": block_comments_open,
+        "thread_total": thread_total,
+        "comment_rows": comment_rows,
+        "threads_loading": threads_loading,
+        "threads_has_more": threads_has_more,
+        "active_thread": active_thread,
+        "thread_resolved": crate::backend::thread_is_resolved(threads, active_thread),
+        "active_thread_anchor": active_thread_anchor,
+        "comments": comments,
+        "comments_loading": comments_loading,
+        "comments_has_more": comments_has_more,
+        "compose_hint": crate::pages::comment_compose_hint(blocks, caret_comment_target, active_page),
+        "seed_rev": seed_rev,
+        "page_seed": page_draft,
+        "comment_seed": block_comment_draft,
+    });
+    module_view("pages", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
+    use crate::PagesIntent as Intent;
+    match event.kind.as_str() {
+        "toggle_create" => Intent::ToggleCreate,
+        "create" => Intent::Create,
+        "choose" => Intent::Choose,
+        "search" => Intent::Search,
+        "clear_search" => Intent::ClearSearch,
+        "arm_delete" => Intent::ArmDelete,
+        "disarm_delete" => Intent::DisarmDelete,
+        "delete" => Intent::Delete,
+        "close_tab" => Intent::CloseTab,
+        "open_hit" => Intent::OpenHit,
+        "use_draft" => Intent::UseDraft,
+        "discard_draft" => Intent::DiscardDraft,
+        "edited" => Intent::Edited,
+        "toggle_comments" => Intent::ToggleComments,
+        "close_comments" => Intent::CloseComments,
+        "open_thread" => Intent::OpenThread,
+        "resolve" => Intent::Resolve,
+        "more_threads" => Intent::MoreThreads,
+        "close_thread" => Intent::CloseThread,
+        "more_comments" => Intent::MoreComments,
+        "post" => Intent::Post,
+        _ => Intent::Copy,
+    }
+}
+
+// ---------- the chat seat ----------
+
+/// The chat view's props, as one document — a struct rather than a `json!`
+/// literal because the macro recurses once per field and this screen has
+/// more than the compiler's default limit.
+#[derive(serde::Serialize)]
+struct ChatProps<'a> {
+    dark: bool,
+    endpoint: &'a str,
+    network_name: &'a str,
+    network_chain_id: &'a str,
+    status: &'a str,
+    block_height: i64,
+    search_phase: &'static str,
+    search_query: &'a str,
+    search_hits: &'a [crate::backend::ChatSearchHit],
+    rooms: &'a [crate::backend::ChatSidebarRow],
+    dm_rows: &'a [crate::backend::DmSidebarRow],
+    channel_create_open: bool,
+    connected: bool,
+    loading: bool,
+    busy: bool,
+    active_channel: &'a str,
+    active_dm_peer: &'a str,
+    active_dm: &'a crate::backend::DmPeer,
+    active_channel_name: &'a str,
+    active_channel_archived: bool,
+    active_channel_members_only: bool,
+    channel_members: &'a [crate::backend::ChatMember],
+    post_refusal: &'a str,
+    huddle_joined: bool,
+    huddle_channel: &'a str,
+    huddle_channel_name: &'a str,
+    huddle_joined_at: i64,
+    huddle_now: i64,
+    call_muted: bool,
+    messages: &'a [crate::backend::ChatMessage],
+    has_older_history: bool,
+    history_view: bool,
+    at_live_tail: bool,
+    history_loading: bool,
+    unread_boundary: i64,
+    unread_marker_seq: i64,
+    selected_message_seq: i64,
+    selected_message_rev: i64,
+    message_action: &'static str,
+    channel_settings_open: bool,
+    active_thread_seq: i64,
+    thread_target_seq: i64,
+    thread_messages: &'a [crate::backend::ChatMessage],
+    thread_selected_seq: i64,
+    thread_selected_rev: i64,
+    thread_message_action: &'static str,
+    thread_has_more: bool,
+    thread_next_reply_seq: i64,
+    thread_loading: bool,
+    copy_anchor_seq: i64,
+    copy_head_seq: i64,
+    copy_surface: &'static str,
+    sent_serial: i64,
+}
+
+/// The Chat tab: the room list, the stream, the rail and the drawer as the
+/// app holds them, drawn by the `chat` view. Its intents come back one per
+/// act ([`chat_intent`]), carrying what the reader chose or typed; the two
+/// composers are host surfaces (`crate::composer_surface`), whose submit
+/// comes back as `composer`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn chat_view(
+    dark: bool,
+    endpoint: &str,
+    network_name: &str,
+    network_chain_id: &str,
+    status: &str,
+    block_height: i64,
+    search_phase: crate::SearchPhase,
+    search_query: &str,
+    search_hits: &[crate::backend::ChatSearchHit],
+    rooms: &[crate::backend::ChatSidebarRow],
+    dm_rows: &[crate::backend::DmSidebarRow],
+    channel_create_open: bool,
+    connected: bool,
+    loading: bool,
+    mutation_phase: crate::MutationPhase,
+    active_channel: &str,
+    active_dm_peer: &str,
+    active_dm: &crate::backend::DmPeer,
+    active_channel_name: &str,
+    active_channel_archived: bool,
+    active_channel_members_only: bool,
+    channel_members: &[crate::backend::ChatMember],
+    post_refusal: &str,
+    huddle_joined: bool,
+    huddle_channel: &str,
+    huddle_channel_name: &str,
+    huddle_joined_at: i64,
+    huddle_now: i64,
+    call_muted: bool,
+    messages: &[crate::backend::ChatMessage],
+    has_older_history: bool,
+    history_view: bool,
+    at_live_tail: bool,
+    history_loading: bool,
+    unread_boundary: i64,
+    unread_marker_seq: i64,
+    selected_message_seq: i64,
+    selected_message_rev: i64,
+    message_action: crate::MessageAction,
+    channel_settings_open: bool,
+    active_thread_seq: i64,
+    thread_target_seq: i64,
+    thread_messages: &[crate::backend::ChatMessage],
+    thread_selected_seq: i64,
+    thread_selected_rev: i64,
+    thread_message_action: crate::MessageAction,
+    thread_has_more: bool,
+    thread_next_reply_seq: i64,
+    thread_loading: bool,
+    copy_anchor_seq: i64,
+    copy_head_seq: i64,
+    copy_surface: crate::CopySurface,
+    sent_serial: i64,
+) -> Element<'static, ModuleViewEvent> {
+    let props = ChatProps {
+        dark,
+        endpoint,
+        network_name,
+        network_chain_id,
+        status,
+        block_height,
+        search_phase: search_phase_name(search_phase),
+        search_query,
+        search_hits,
+        rooms,
+        dm_rows,
+        channel_create_open,
+        connected,
+        loading,
+        busy: mutation_phase != crate::MutationPhase::Idle,
+        active_channel,
+        active_dm_peer,
+        active_dm,
+        active_channel_name,
+        active_channel_archived,
+        active_channel_members_only,
+        channel_members,
+        post_refusal,
+        huddle_joined,
+        huddle_channel,
+        huddle_channel_name,
+        huddle_joined_at,
+        huddle_now,
+        call_muted,
+        messages,
+        has_older_history,
+        history_view,
+        at_live_tail,
+        history_loading,
+        unread_boundary,
+        unread_marker_seq,
+        selected_message_seq,
+        selected_message_rev,
+        message_action: message_action_name(message_action),
+        channel_settings_open,
+        active_thread_seq,
+        thread_target_seq,
+        thread_messages,
+        thread_selected_seq,
+        thread_selected_rev,
+        thread_message_action: message_action_name(thread_message_action),
+        thread_has_more,
+        thread_next_reply_seq,
+        thread_loading,
+        copy_anchor_seq,
+        copy_head_seq,
+        copy_surface: copy_surface_name(copy_surface),
+        sent_serial,
+    };
+    module_view("chat", serde_json::to_vec(&props).expect("props encode"))
+}
+
+fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
+    match phase {
+        crate::SearchPhase::Idle => "idle",
+        crate::SearchPhase::Searching => "searching",
+        crate::SearchPhase::Done => "done",
+    }
+}
+
+fn message_action_name(action: crate::MessageAction) -> &'static str {
+    match action {
+        crate::MessageAction::Toolbar => "toolbar",
+        crate::MessageAction::More => "more",
+        crate::MessageAction::Reactions => "reactions",
+        crate::MessageAction::Editing => "editing",
+        crate::MessageAction::Delete => "delete",
+    }
+}
+
+fn copy_surface_name(surface: crate::CopySurface) -> &'static str {
+    match surface {
+        crate::CopySurface::Nowhere => "nowhere",
+        crate::CopySurface::Timeline => "timeline",
+        crate::CopySurface::Thread => "thread",
+    }
+}
+
+pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
+    use crate::ChatIntent as Intent;
+    match event.kind.as_str() {
+        "search" => Intent::Search,
+        "clear_search" => Intent::ClearSearch,
+        "open_hit" => Intent::OpenHit,
+        "toggle_create" => Intent::ToggleCreate,
+        "choose_channel" => Intent::ChooseChannel,
+        "choose_dm" => Intent::ChooseDm,
+        "toggle_settings" => Intent::ToggleSettings,
+        "show_huddle" => Intent::ShowHuddle,
+        "leave_huddle" => Intent::LeaveHuddle,
+        "join_huddle" => Intent::JoinHuddle,
+        "load_history" => Intent::LoadHistory,
+        "scrolled" => Intent::Scrolled,
+        "open_link" => Intent::OpenLink,
+        "copy" => Intent::Copy,
+        "copy_link" => Intent::CopyLink,
+        "add_reaction" => Intent::AddReaction,
+        "remove_reaction" => Intent::RemoveReaction,
+        "open_thread" => Intent::OpenThread,
+        "message_actions" => Intent::MessageActions,
+        "message_reactions" => Intent::MessageReactions,
+        "begin_edit" => Intent::BeginEdit,
+        "arm_delete" => Intent::ArmDelete,
+        "press" => Intent::Press,
+        "clear_range" => Intent::ClearRange,
+        "copy_range" => Intent::CopyRange,
+        "reaction_submit" => Intent::ReactionSubmit,
+        "edit" => Intent::Edit,
+        "delete" => Intent::Delete,
+        "rename" => Intent::Rename,
+        "archive" => Intent::Archive,
+        "unarchive" => Intent::Unarchive,
+        "add_member" => Intent::AddMember,
+        "remove_member" => Intent::RemoveMember,
+        "close_thread" => Intent::CloseThread,
+        "thread_actions" => Intent::ThreadActions,
+        "thread_reactions" => Intent::ThreadReactions,
+        "thread_begin_edit" => Intent::ThreadBeginEdit,
+        "thread_arm_delete" => Intent::ThreadArmDelete,
+        "thread_clear_selection" => Intent::ThreadClearSelection,
+        "thread_edit" => Intent::ThreadEdit,
+        "thread_delete" => Intent::ThreadDelete,
+        "load_thread" => Intent::LoadThread,
+        "composer" => Intent::Composer,
+        _ => Intent::ClearSelection,
+    }
+}
+
+/// The surface a `press` intent names; a name the view has no surface for
+/// is nowhere, which draws no range.
+pub fn chat_event_surface(event: &ModuleViewEvent) -> crate::CopySurface {
+    match event_text(event, "surface").as_str() {
+        "timeline" => crate::CopySurface::Timeline,
+        "thread" => crate::CopySurface::Thread,
+        _ => crate::CopySurface::Nowhere,
+    }
+}
+
+/// Which composer a `composer` intent came from.
+pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
+    match event_text(event, "kind").as_str() {
+        "reply" => crate::ComposerKind::Reply,
+        _ => crate::ComposerKind::Message,
+    }
+}
+
+/// A refused or failed body, handed back to the composer it was written in.
+pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
+    crate::composer_surface::unsent(scope, text, committed);
+    true
+}
+
 // ---------- the files seat ----------
 
 /// The Files tab: one directory's listing, the preview open in it, the
@@ -568,6 +1426,78 @@ fn node_timeline() -> &'static Mutex<NodeTimeline> {
 /// activated link goes back to the guest's own handler as a string.
 fn surfaces_of(module: &str) -> Surfaces {
     let mut surfaces = Surfaces::default();
+    // the shell view's three: the terminal for the session the app parked,
+    // the answer Markdown (a link it opens goes back to the guest's
+    // handler), and the composer, whose submit is the app's `send` intent
+    if module == "shell" {
+        surfaces.insert(
+            "agent_terminal_surface".into(),
+            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
+                let session = shell_terminal().lock().expect("shell terminal").clone();
+                let Some(session) = session else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::agent_terminal_surface(&session).map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "agent_markdown".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
+                    .map(wire::SurfaceValue::Str)
+            }),
+        );
+        surfaces.insert("shell_composer".into(), crate::shell_composer::provider());
+    }
+    if module == "chat" {
+        surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
+    }
+    if module == "forge" {
+        surfaces.insert(
+            "picture".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(surface),
+                    wire::SurfaceValue::Str(path),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::picture(surface.clone(), path.clone())
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "forge_markdown".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(doc),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_markdown(source.clone(), doc.clone(), *dark)
+                    .map(wire::SurfaceValue::Str)
+            }),
+        );
+        surfaces.insert(
+            "forge_code".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(path),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_code(source.clone(), path.clone(), *dark)
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+    }
     if module == "files" {
         surfaces.insert(
             "picture".into(),
@@ -614,7 +1544,19 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
+    if module == "pages" {
+        surfaces.insert("page_document".into(), crate::pages::surface::provider());
+    }
     surfaces
+}
+
+/// The intent a host surface's event comes back as, by module: the node's
+/// log ring, the pages document.
+fn surface_intent(module: &str) -> &'static str {
+    match module {
+        "pages" => "edited",
+        _ => "log_timeline",
+    }
 }
 
 /// The operations a view may ask of the app, by module. An intent outside
@@ -626,6 +1568,84 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "agents" => &[],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
+        // `send` is deliberately NOT here: a send crosses only from the
+        // host's own composer surface (`deliver`), never as a guest request.
+        "shell" => &[
+            "surface",
+            "setup",
+            "identity",
+            "host_node",
+            "refresh",
+            "terminal_start",
+            "terminal_stop",
+            "reset",
+            "detach",
+            "reopen",
+            "discard",
+            "open_link",
+        ],
+        "chat" => &[
+            "search",
+            "clear_search",
+            "open_hit",
+            "toggle_create",
+            "choose_channel",
+            "choose_dm",
+            "toggle_settings",
+            "show_huddle",
+            "leave_huddle",
+            "join_huddle",
+            "load_history",
+            "scrolled",
+            "open_link",
+            "copy",
+            "copy_link",
+            "add_reaction",
+            "remove_reaction",
+            "open_thread",
+            "message_actions",
+            "message_reactions",
+            "begin_edit",
+            "arm_delete",
+            "clear_selection",
+            "press",
+            "clear_range",
+            "copy_range",
+            "reaction_submit",
+            "edit",
+            "delete",
+            "rename",
+            "archive",
+            "unarchive",
+            "add_member",
+            "remove_member",
+            "close_thread",
+            "thread_actions",
+            "thread_reactions",
+            "thread_begin_edit",
+            "thread_arm_delete",
+            "thread_clear_selection",
+            "thread_edit",
+            "thread_delete",
+            "load_thread",
+        ],
+        "forge" => &[
+            "open_repo",
+            "close_repo",
+            "toggle_repo_menu",
+            "tab",
+            "open_item",
+            "close_item",
+            "merge",
+            "review_pick",
+            "review_submit",
+            "comment_stage",
+            "comment_drop",
+            "tree",
+            "blob",
+            "open_link",
+            "copy",
+        ],
         "files" => &[
             "open_dir",
             "open_file",
@@ -662,6 +1682,29 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "light",
             "dark",
             "notifications",
+        ],
+        "pages" => &[
+            "toggle_create",
+            "create",
+            "choose",
+            "search",
+            "clear_search",
+            "arm_delete",
+            "disarm_delete",
+            "delete",
+            "close_tab",
+            "open_hit",
+            "use_draft",
+            "discard_draft",
+            "toggle_comments",
+            "close_comments",
+            "open_thread",
+            "resolve",
+            "more_threads",
+            "close_thread",
+            "more_comments",
+            "post",
+            "copy",
         ],
         _ => &[],
     }
@@ -1132,11 +2175,23 @@ impl Guest {
     /// app's own ring, whose event was queued where the surface keeps it,
     /// and the app is told to drain it.
     fn deliver(&mut self, output: Output) {
-        if let Output::Surface { handler: None, .. } = output {
-            self.intents.push(ModuleViewEvent {
-                kind: "log_timeline".into(),
-                detail: String::new(),
-            });
+        if let Output::Surface {
+            handler: None,
+            value,
+        } = output
+        {
+            // the shell composer's submit carries its body; the other
+            // unrouted surfaces only say that something happened
+            if self.module == "shell" {
+                self.intents.extend(crate::shell_composer::intent(&value));
+            } else if self.module == "chat" {
+                self.intents.extend(crate::composer_surface::intent(&value));
+            } else {
+                self.intents.push(ModuleViewEvent {
+                    kind: surface_intent(self.module).into(),
+                    detail: String::new(),
+                });
+            }
             return;
         }
         self.inputs.apply(output, &mut self.pending);
@@ -1590,7 +2645,13 @@ mod tests {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert!(intents_of("agents").is_empty());
-        assert!(intents_of("chat").is_empty());
+        let chat = intents_of("chat");
+        assert_eq!(chat.len(), 43);
+        assert!(chat.contains(&"choose_channel"));
+        assert!(
+            !chat.contains(&"composer"),
+            "a submit reaches the app only through the composer surface it was typed in"
+        );
     }
 
     /// A roster intent is read field by field off its JSON; a missing or
@@ -1937,6 +2998,229 @@ mod tests {
         assert!(guest.fault.is_none());
     }
 
+    /// The bundled Pages view through the host: the sidebar and the header,
+    /// a pick that leaves as an intent carrying the rail's draft, and the
+    /// document slot the host paints — what the reader does in it comes back
+    /// as the `edited` intent rather than going to the guest.
+    #[test]
+    fn the_staged_pages_view_boots_takes_the_facts_and_leaves_the_document_to_the_host() {
+        let Some(staged) = staged("pages") else {
+            return;
+        };
+        let mut guest = Guest::load_from("pages", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("page_document"));
+        guest.redraw(&None);
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "loading": false, "busy": false,
+                "page_link": "duck://pages/alpha",
+                "pages": [
+                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
+                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
+                ],
+                "page_create_open": false, "active_page": "alpha",
+                "active_page_title": "Alpha", "active_page_parent": "",
+                "page_searching": false, "page_search_hits": [], "page_search_query": "",
+                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
+                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
+                "subpages": [], "orphaned_comment_drafts": [],
+                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
+                "threads_loading": false, "threads_has_more": false, "active_thread": "",
+                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
+                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
+                "seed_rev": 0, "page_seed": "", "comment_seed": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["Pages", "Alpha", "Beta", "✓ synced"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["page_document"]);
+
+        guest.deliver(Output::Activate(button_message(&guest, "Beta")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "choose".into(),
+                detail: r#"{"id":"beta","comment_draft":""}"#.into(),
+            }]
+        );
+
+        // what the reader does in the host's document never reaches the guest
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Unit,
+        });
+        assert!(guest.pending.is_empty());
+        assert_eq!(
+            guest.intents,
+            [ModuleViewEvent {
+                kind: "edited".into(),
+                detail: String::new(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Chat view through the host: the rooms and the stream,
+    /// a room pressed that leaves as `choose_channel`, the composer slot
+    /// the host paints per room, and its submit crossing as the `composer`
+    /// intent rather than a guest request.
+    #[test]
+    fn the_staged_chat_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("chat_composer"));
+        guest.redraw(&None);
+        let general = crate::backend::ChatChannel {
+            id: "channel-a".into(),
+            name: "general".into(),
+            ..Default::default()
+        };
+        let ops = crate::backend::ChatChannel {
+            id: "channel-b".into(),
+            name: "ops".into(),
+            ..Default::default()
+        };
+        let rooms = [
+            crate::backend::ChatSidebarRow {
+                channel: general,
+                unread: false,
+            },
+            crate::backend::ChatSidebarRow {
+                channel: ops,
+                unread: true,
+            },
+        ];
+        let messages = [crate::backend::ChatMessage {
+            id: "m1".into(),
+            view_key: 1,
+            seq: 1,
+            author: "mallard".into(),
+            meta: "h 84,912".into(),
+            body: "first light".into(),
+            blocks: crate::backend::paragraph_blocks("first light"),
+            show_author: true,
+            initial: "M".into(),
+            avatar_kind: "human".into(),
+            height: 84_912,
+            time: 84_912,
+            rev: 1,
+            ..Default::default()
+        }];
+        let props = ChatProps {
+            dark: false,
+            endpoint: "http://127.0.0.1:1",
+            network_name: "testnet",
+            network_chain_id: "testnet#abcd",
+            status: "Live",
+            block_height: 84_912,
+            search_phase: "idle",
+            search_query: "",
+            search_hits: &[],
+            rooms: &rooms,
+            dm_rows: &[],
+            channel_create_open: false,
+            connected: true,
+            loading: false,
+            busy: false,
+            active_channel: "channel-a",
+            active_dm_peer: "",
+            active_dm: &crate::backend::DmPeer::default(),
+            active_channel_name: "general",
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            channel_members: &[],
+            post_refusal: "",
+            huddle_joined: false,
+            huddle_channel: "",
+            huddle_channel_name: "",
+            huddle_joined_at: 0,
+            huddle_now: 0,
+            call_muted: false,
+            messages: &messages,
+            has_older_history: false,
+            history_view: false,
+            at_live_tail: true,
+            history_loading: false,
+            unread_boundary: 0,
+            unread_marker_seq: 0,
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            message_action: "toolbar",
+            channel_settings_open: false,
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: &[],
+            thread_selected_seq: 0,
+            thread_selected_rev: 0,
+            thread_message_action: "toolbar",
+            thread_has_more: false,
+            thread_next_reply_seq: 0,
+            thread_loading: false,
+            copy_anchor_seq: 0,
+            copy_head_seq: 0,
+            copy_surface: "nowhere",
+            sent_serial: 0,
+        };
+        let props = Some(serde_json::to_vec(&props).expect("props encode"));
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["testnet", "general", "ops", "first light"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["chat_composer"]);
+
+        guest.deliver(Output::Activate(button_message(&guest, "ops")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "choose_channel".into(),
+                detail: r#"{"id":"channel-b"}"#.into(),
+            }]
+        );
+
+        // a submit in the host's composer is the `composer` intent, and an
+        // edit there never reaches the guest
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Record {
+                name: "composer".into(),
+                fields: vec![
+                    ("kind".into(), wire::SurfaceValue::Str("message".into())),
+                    ("body".into(), wire::SurfaceValue::Str("hello".into())),
+                    ("id".into(), wire::SurfaceValue::Str("message-1".into())),
+                ],
+            },
+        });
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Unit,
+        });
+        assert!(guest.pending.is_empty());
+        assert_eq!(guest.intents.len(), 1);
+        assert_eq!(guest.intents[0].kind, "composer");
+        assert!(guest.intents[0].detail.contains(r#""body":"hello""#));
+        assert!(guest.fault.is_none());
+    }
+
     /// The bundled Explorer view through the host: the ledger, then a
     /// search that leaves as an intent and lands back as props.
     #[test]
@@ -2196,6 +3480,139 @@ mod tests {
             !guest.assets.contains_key("a.svg"),
             "A's late answer landed"
         );
+    }
+
+    /// The bundled Shell view through the host: the facts, the welcome
+    /// for a picked credential, the three host slots, a surface switch as
+    /// an intent — and a send, which only the host's composer can raise.
+    #[test]
+    fn the_staged_shell_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
+        let Some(staged) = staged("shell") else {
+            return;
+        };
+        let mut guest = Guest::load_from("shell", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "surface": "tasks", "setup_open": false,
+                "identity_options": ["team-codex · Codex"], "identity": "team-codex · Codex",
+                "provider_initial": "C", "credential": "team-codex",
+                "host_node_options": ["This node"], "host_node": "This node",
+                "credentials_loading": false, "terminal_running": false,
+                "terminal_busy": false, "terminal_title": "", "terminal_error": "",
+                "entries": [], "activity": [], "chat_busy": false, "chat_status": "",
+                "chat_detail": "", "live": "", "saga_id": "", "detached_saga": "",
+                "run_line": "team-codex · Codex · This node", "grant_note": "",
+                "terminal_note": "A sandboxed Codex session.", "composer_hint": "Message Codex…",
+                "task_blurb": "Each message runs an agent in a sandbox on this node.",
+                "register_hint": "Register one with `ducktape user cred add codex`"
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in [
+            "Shell",
+            "What should the agent do?",
+            "team-codex · Codex · This node",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["shell_composer"]);
+        assert!(guest.surfaces.contains_key("shell_composer"));
+        assert!(guest.surfaces.contains_key("agent_terminal_surface"));
+        assert!(guest.surfaces.contains_key("agent_markdown"));
+        guest.deliver(Output::Activate(button_message(&guest, "Terminal")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "surface".into(),
+                detail: r#"{"surface":"terminal"}"#.into(),
+            }]
+        );
+        // the composer's submit is the host's intent, not a guest request
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Str("ship it".into()),
+        });
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "send".into(),
+                detail: r#"{"body":"ship it"}"#.into(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Forge view through the host: the register, then a repo
+    /// opened from its card as the intent the handler signs — and with the
+    /// item open, the review body leaves as the intent's payload while the
+    /// three reader surfaces are the host's to paint.
+    #[test]
+    fn the_staged_forge_view_boots_takes_the_register_and_opens_a_repo() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        // the whole register as the app encodes it — a literal, since the
+        // document is past `json!`'s recursion limit
+        let props = Some(
+            br#"{
+              "dark": false, "connected": true, "org": "duckhouse", "about": "",
+              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+              "connected_rpc": "http://127.0.0.1:1",
+              "repos": [{"name": "core", "head": "main"}],
+              "list_phase": "ready", "open_repo": "", "repo_menu": false,
+              "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
+              "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
+              "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
+              "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
+              "forge_item_files_changed": 0, "forge_item_additions": 0,
+              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
+              "forge_item_merge_oid": "", "forge_item_source_oid": "",
+              "forge_item_approvals": 0, "forge_item_change_requests": 0,
+              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
+              "tree_entries": [], "tree_born": false, "tree_truncated": false,
+              "tree_phase": "loading", "file_path": "", "file_text": "",
+              "file_binary": false, "file_truncated": false, "file_picture": false,
+              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
+              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
+            }"#
+            .to_vec(),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["duckhouse", "core"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        guest.deliver(Output::Activate(button_message(&guest, "Open repo")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "open_repo".into(),
+                detail: r#"{"name":"core"}"#.into(),
+            }]
+        );
+        for surface in ["picture", "forge_markdown", "forge_code"] {
+            assert!(
+                surfaces_of("forge").contains_key(surface),
+                "the host paints the {surface} slot the view leaves"
+            );
+        }
+        assert!(guest.fault.is_none());
     }
 
     #[test]

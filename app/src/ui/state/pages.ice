@@ -7,6 +7,10 @@ state
   active_page_parent = ""
   page_draft = ""
   page_create_open = false
+  // Moves once per draft the app hands BACK to the pages view (a recovered
+  // comment taken up, a refused post or create returned): the view keeps
+  // its own fields and adopts `page_draft`/`block_comment_draft` only then.
+  pages_seed_rev:i64 = 0
   pending_page = ""
 
   block_comments_open = false

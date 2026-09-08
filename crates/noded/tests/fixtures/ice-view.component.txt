@@ -1,0 +1,23 @@
+Test-only Ice surface component, built from the actual app-store surface guest.
+Source: byeongsu-hong/ducktape-ui c2aec5febcf715cddbae9a739a3648b1d96165f9
+Package: app-store-surface-fixture (uses ui_lang_guest::export_app!)
+Build: cargo ice bundle --manifest-path examples/app-store/Cargo.toml -p app-store-surface-fixture --target wasm32-unknown-unknown --no-wasm-opt --out /tmp/ice-view-fixture
+Output filename: app_store_surface_fixture.wasm
+SHA-256: ae0cc0cf06805870eef2d6059a923072a1634aae9e0aee8b10ac431aa361906b
+
+Build with CARGO_TARGET_DIR explicitly set and CARGO_ENCODED_RUSTFLAGS containing
+these four arguments, separated by ASCII unit separator (0x1f):
+  --remap-path-prefix=<absolute UI checkout>=/ice-source
+  --remap-path-prefix=<absolute CARGO_HOME>=/cargo-home
+  --remap-path-prefix=<absolute RUSTUP_HOME>=/rustup-home
+  --remap-path-prefix=<absolute CARGO_TARGET_DIR>=/ice-target
+The two home directories default to ~/.cargo and ~/.rustup. Unset RUSTFLAGS to
+avoid ambiguity. Regenerate using the source revision above and its cargo-ice,
+copy the output to this directory as ice-view.component.wasm, update its digest,
+then run wasm-tools validate and make wasm-modules-check. The fixture contains
+no /home/, /Users/, /root/, or originating worktree prefix.
+
+This fixture lives with noded tests because it implements the Ice view ABI,
+not the consensus ABI enumerated by kernel/host/tests/declared_shapes.rs.
+Tests read it from disk; production binaries do not embed it. The fixture proves
+static view readiness and deployment identity, not cross-toolchain byte equality.

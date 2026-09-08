@@ -22,9 +22,10 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer, Settings and Files tabs are
-not native: each is an Ice application under `crates/views` (`governance`,
-`members`, `agents`, `node`, `explorer`, `settings`, `files`) compiled
+The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
+Pages, Forge and Shell tabs are not native: each is an Ice application under `crates/views`
+(`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`,
+`pages`, `forge`, `shell`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -49,8 +50,31 @@ the Explorer's workspace search is run by the app on the view's behalf. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
-tells the view which drafts it consumed. The
-views workspace pins the same `ducktape-ui` rev as this crate; `make views`
+tells the view which drafts it consumed. A view may also leave the host a
+whole editor: the Pages document is the app's own `page_document` (its
+buffer, history and save tick never cross), painted into the view's slot
+from what the tab was last drawn with (`pages/surface.rs`); the view's page,
+search and comment drafts leave with the act that reads them, and the app
+hands one back only by moving `seed_rev`.
+The Shell view goes further: its
+composer, its terminal and its answer Markdown are host surfaces, so a task's
+words never cross the wire — the host's composer raises the `send` intent
+itself.
+A view may also hand data to a
+host surface that reads it: Forge's code browse leaves slots for the
+decoded picture, the document-aware Markdown reader and the highlighted
+code reader, each painted by the app from the arguments the view passes,
+and the reader's links come back to the view's own handler. What cannot
+cross the wire stays native beside the view: Forge's discussion note
+composer edits an editor the app holds, so the app docks it under the view
+while an item is open.
+A view whose screen needs a widget
+the tree wire does not carry leaves that widget to the host too: the Chat
+view declares `chat_composer` as a host surface per room and per thread,
+and the app paints its rich composer there (`src/composer_surface.rs`),
+keeps every box's words for the life of the process, and hears a submit as
+the view's `composer` intent — the words themselves never cross the wire.
+The views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 
 ## Release build (macOS: signed and notarized)

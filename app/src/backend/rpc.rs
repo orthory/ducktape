@@ -455,7 +455,7 @@ pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
 }
 
 /// One rendered doc tab.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct DocTab {
     pub id: String,
     pub title: String,

@@ -68,8 +68,6 @@ extern crate::backend
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
-  component agent_terminal_surface(session:&AgentTerminalSession) -> unit
-  component agent_markdown(source:str, dark:bool) -> str
   component forge_markdown(source:str, doc:str, dark:bool) -> str
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
   load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
@@ -82,15 +80,6 @@ extern crate::backend
   pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
   pure agent_host_node_choice(options:[str], current:str) -> str
   pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
-  pure agent_host_grant_note(host_node:&str, credential:&str) -> str
-  pure agent_run_line(identity:&str, host_node:&str) -> str
-  pure agent_provider_label(provider:&str) -> str
-  pure agent_provider_initial(provider:&str) -> str
-  pure agent_register_hint(provider:&str) -> str
-  pure agent_composer_hint(provider:&str) -> str
-  pure agent_task_blurb(host_node:&str) -> str
-  pure agent_terminal_note(provider:&str, credential:&str) -> str
-  pure agent_run_label(saga_id:&str) -> str
   pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
   pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
   pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
@@ -241,13 +230,12 @@ extern crate::backend
   pure duck_page_link(page:str, chain_id:str) -> str
   pure duck_channel_link(channel:str, chain_id:str) -> str
   pure duck_channel_message_link(channel:str, seq:i64, chain_id:str) -> str
-  pure duck_forge_item_link(repo:str, number:i64, chain_id:str) -> str
-  pure duck_forge_repo_link(repo:str, chain_id:str) -> str
   pure startup_duck_url() -> str
   pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
   pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
+  duck_echo_f64(value:f64) -> f64 ! AppError
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:&[FsEntry]) -> [FsEntry]
@@ -367,9 +355,8 @@ extern crate::backend
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
   pure forge_comment_cap_reached(staged:&[ForgeDraftComment]) -> bool
   pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
-  pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
+  pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure forge_parent(path:str) -> str
   pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
@@ -378,19 +365,11 @@ extern crate::backend
   pure forge_live_hit(kind:LiveKind, module:str) -> bool
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  pure forge_push_command(rpc:&str) -> str
-  pure diff_lines(diff:&str) -> [DiffLine]
   component forge_code(source:str, path:str, dark:bool) -> unit
   pure markdown_path(path:&str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
-  pure binary_note(text:&str) -> str
   component picture(surface:str, path:str) -> unit
-  pure filter_forge_items(items:&[ForgeItem], tab:ForgeTab) -> [ForgeItem]
-  pure forge_open_count(items:&[ForgeItem], kind:&str) -> i64
-  pure forge_merge_note(merge_oid:&str, branches:&str) -> str
-  pure verdict_label(verdict:&str) -> str
-  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:&str) -> str
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError

@@ -155,13 +155,11 @@ component PageCommentThreadButton(thread:PageCommentThread, anchor:str)
           w=fill
           gap=8.0
           align=center
-        PrincipalAvatar
+        PersonAvatar
           with
             initials=initials_of(thread.author)
-            is_agent=false
             plate=22.0
             ink=9.0
-            ring=""
         text thread.author
           with
             w=fill
@@ -211,13 +209,11 @@ component PageCommentCard(comment:PageComment)
           w=fill
           gap=8.0
           align=center
-        PrincipalAvatar
+        PersonAvatar
           with
             initials=initials_of(comment.author)
-            is_agent=false
             plate=22.0
             ink=9.0
-            ring=""
         text comment.author
           with
             w=fill
