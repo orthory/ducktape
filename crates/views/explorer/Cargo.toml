@@ -16,7 +16,7 @@ test = false
 
 [dependencies]
 # the product icon set, as bytes the wire carries
-design = { path = "../../design" }
+design = { path = "../support/design" }
 iced.workspace = true
 serde.workspace = true
 serde_json.workspace = true

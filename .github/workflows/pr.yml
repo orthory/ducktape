@@ -182,8 +182,8 @@ jobs:
       - run: rustup show
       - run: cargo test --locked --manifest-path crates/views/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/views/Cargo.toml --tests --no-deps -- -D warnings
-      # `cargo fmt --all` follows path dependencies (design) into the root
-      # workspace, whose files this gate does not own: format only the views.
+      # Format the views workspace, including its shared design source; the
+      # desktop host workspace is checked independently.
       - run: rustfmt --edition 2024 --check $(git ls-files 'crates/views/*.rs')
       # the default workspace build never enables airlock's `verify` feature
       # (#1302 — dcap-qvl/sev/a second reqwest-0.13 stack are opt-in), so the

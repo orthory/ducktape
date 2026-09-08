@@ -302,7 +302,9 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!lifecycle.contains("appearance = \""));
     assert!(app.contains("titlebar-transparent true"));
     assert!(app.contains("fullsize-content-view true"));
-    assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
+    assert!(
+        app.contains("font \"../../../crates/views/support/design/assets/fonts/Geist[wght].ttf\"")
+    );
     assert!(!ui.contains("white/"));
     assert!(!ui.contains("bg=glass_"));
     assert!(!SCREENS.contains("white/"));
@@ -996,7 +998,9 @@ fn ice_sources_hold_to_the_design_system() {
     let app = inlined(include_str!("../ui/app.ice"));
     for asset in ::design::fonts::ASSETS {
         assert!(
-            app.contains(&format!("font \"../../../crates/design/{asset}\"")),
+            app.contains(&format!(
+                "font \"../../../crates/views/support/design/{asset}\""
+            )),
             "app.ice must embed {asset}"
         );
     }
