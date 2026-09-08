@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release views dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -107,14 +107,21 @@ ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' a
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
+ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
 
 # The build dir is keyed by rev too: `cargo install --git` reuses whatever a
 # shared target dir already holds for the same crate name and version, so a
 # bump used to install the PREVIOUS rev's binary under the new rev's path
 # (`cargo ice bundle` then refused flags the new rev has).
-$(ICE_BIN):
+# An existing binary can predate the isolated build dir. Only reuse an install
+# completed by this recipe; --force also replaces Cargo's stale registration.
+.PHONY: ice-tool
+ice-tool:
+	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
+	rm -f "$(ICE_INSTALL_STAMP)" && \
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
-		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
+	touch "$(ICE_INSTALL_STAMP)"
 
 # wasm-tools at the version in wasm-tools.version, installed the same way
 # cargo-ice is: under target, keyed by version, so `make views` and
@@ -128,18 +135,23 @@ $(WASM_TOOLS_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/wasm-tools-build" $(CARGO) install wasm-tools \
 		--locked --version "$(WASM_TOOLS_VERSION)" --root "$(WASM_TOOLS_ROOT)"
 
-## build every module-owned view (crates/views) as an `ice:view` component
+## build every desktop view (crates/views) as an `ice:view` component
 ## and stage it under target/views, where a built desktop app loads it from
 ## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
 ## binary). Installs wasm-tools like `wasm-modules`. The views workspace pins the
 ## same ducktape-ui rev as the app, and this refuses when they differ: a view
 ## compiled by another language revision than the host that renders it is a
 ## wire nobody tested.
-views: $(ICE_BIN) $(WASM_TOOLS_BIN)
+VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
+
+views: ice-tool $(WASM_TOOLS_BIN)
 	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" "$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p chat-view -p files-view -p forge-view -p pages-view -p shell-view \
-		--target wasm32-unknown-unknown --out target/views
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
+
+## rebuild the committed view sources in two isolated roots and compare bytes
+views-repro-check: ice-tool $(WASM_TOOLS_BIN)
+	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
@@ -160,7 +172,7 @@ ifeq ($(UNAME_S),Darwin)
 ##                          before the upload — Apple rejects an ad-hoc
 ##                          signature.
 ## The release recipe is app/README.md § "Release build".
-app: $(ICE_BIN) views
+app: ice-tool views
 	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## `make app-release` for a build that leaves this machine: refuses unless a

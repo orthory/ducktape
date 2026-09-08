@@ -66,13 +66,15 @@ jobs:
 
   genesis-pin:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
+      - run: make views
+      - run: make views-repro-check
       - run: cargo test --locked -p node-bin host_state
 
   # the wasm/native cutover-continuity proofs (crates/kernel/host/tests/wasm_*_parity.rs):
@@ -124,6 +126,7 @@ jobs:
         with:
           cache-directories: target/sim-wasm-cache
       - run: rustup show
+      - run: make views
       - run: cargo test --locked -p simnode
 
   # The rendezvous/coordinator unit lane had no PR gate at all: three
