@@ -2,7 +2,7 @@ use super::*;
 use ::forge;
 
 /// One workspace-search result row, whatever plane it came from.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ExplorerHit {
     /// `message` | `page` | `code` | `file` | `run`.
     pub kind: String,
@@ -18,7 +18,7 @@ pub struct ExplorerHit {
 
 /// One filter chip. Only kinds with a real loader are emitted — a chip that
 /// always reads zero is a fake surface.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct KindCount {
     pub kind: String,
     pub label: String,

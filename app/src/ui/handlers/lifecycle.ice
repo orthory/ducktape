@@ -229,6 +229,12 @@ on workspace_connected(next)
   hydration_retry_attempt = 0
   error = ""
   explorer_generation = explorer_generation + 1
+  invalidate lane=workspace_search
+  explorer_hits = []
+  explorer_kinds = []
+  explorer_partial = ""
+  explorer_searching = false
+  explorer_sent_query = ""
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1

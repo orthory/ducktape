@@ -723,12 +723,14 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         6
     );
 
-    for binding in [
-        "StatusBadge label=forge_item_state",
-        "StatusBadge label=op.disposition",
-    ] {
-        assert!(SCREENS.contains(binding), "{binding}");
-    }
+    assert!(SCREENS.contains("StatusBadge label=forge_item_state"));
+    // the explorer's is the guest's: the Explorer is a module-owned view
+    assert!(
+        inlined(include_str!(
+            "../../../crates/views/explorer/src/ui/app.ice"
+        ))
+        .contains("StatusBadge label=op.disposition")
+    );
     for mapping in [
         "\"active\"\n        Badge.Success label=label",
         "\"paused\"\n        Badge.Warning label=label",
@@ -1217,6 +1219,8 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/node/src/ui/app.ice",
         "../../crates/views/node/src/ui/node.ice",
         "../../crates/views/node/src/ui/kit.ice",
+        "../../crates/views/explorer/src/ui/app.ice",
+        "../../crates/views/explorer/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
         "ui/screens/settings.ice",
@@ -1262,8 +1266,8 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/shell.ice",
             "ui/screens/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
+            "../../crates/views/explorer/src/ui/app.ice",
             "ui/screens/shell.ice",
-            "ui/screens/storage.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
     );
@@ -1424,8 +1428,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "components/shell.ice",
             "for item in shell_nav(tab, approvals, agent_live)",
         ),
-        ("screens/storage.ice", "for kind_count in kinds"),
-        ("screens/storage.ice", "for block in blocks"),
         // One provider turn, hard-capped to MAX_ACTIVITY_ROWS in the backend.
         (
             "screens/shell.ice",
@@ -1442,11 +1444,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         (
             "screens/pages.ice",
             "for page_comment in block_thread_comments",
-        ),
-        ("screens/storage.ice", "for hit in hits"),
-        (
-            "screens/storage.ice",
-            "for op in explorer_ops_at(ops, selected)",
         ),
     ];
 

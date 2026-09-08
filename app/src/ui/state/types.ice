@@ -235,6 +235,14 @@ enum NodeIntent
   log_filter
   log_timeline
 
+// what the Explorer view asks of the app: reload the ledger, a clipboard
+// write, a workspace search, or dropping the standing answer
+enum ExplorerIntent
+  refresh
+  copy
+  search
+  clear
+
 enum MutationPhase
   idle
   recovering
