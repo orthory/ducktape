@@ -74,6 +74,26 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         serde_json::to_vec(&serde_json::json!({ "tasks": [] })).unwrap()
                     ));
                 }
+                // the AUTHENTICATED read lane, answered as the real actors
+                // answer it: `reader` becomes the module's `Origin::External`.
+                // Echoed back beside the request so a test can assert WHICH key
+                // the module was told is asking — the one thing this lane
+                // exists to establish.
+                NodeCommand::QueryAs {
+                    target,
+                    req,
+                    reader,
+                    reply,
+                } => {
+                    let query: serde_json::Value =
+                        serde_json::from_slice(&req).expect("query is json");
+                    let _ = reply.send(Ok(serde_json::to_vec(&serde_json::json!({
+                        "target": target,
+                        "reader": noded::hex_bytes(&reader),
+                        "query": query,
+                    }))
+                    .unwrap()));
+                }
             }
         }
     });
@@ -869,6 +889,252 @@ async fn query_returns_the_decoded_module_reply() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body, serde_json::json!({ "tasks": [] }));
+}
+
+// ============================================================================
+// /v1/query/reader — the AUTHENTICATED read lane
+//
+// `/v1/query` proves nothing about its caller, so a module answering it must
+// treat every reader as anonymous. This lane is how a module can be told who is
+// asking, and these tests pin the only property that makes that worth anything:
+// the reader is the VERIFIED signer and nothing a caller wrote.
+// ============================================================================
+
+/// the reader identity the fake actor echoes back — what the module was told.
+async fn reader_of(response: axum::response::Response) -> String {
+    body_json(response).await["reader"]
+        .as_str()
+        .expect("the actor echoes the reader")
+        .to_string()
+}
+
+/// no trio, no read. The command lane must never see the request: an
+/// unauthenticated caller learns nothing, not even whether the module exists.
+#[tokio::test]
+async fn an_unsigned_reader_query_is_refused_before_the_actor() {
+    let (handle, mut cmd_rx, _events) = local_node();
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/query/reader",
+            serde_json::json!({ "target": "collaboration", "query": "mailbox" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(response).await["reason"],
+        "signature_missing",
+        "the refusal must name why"
+    );
+    // nothing was forwarded: `try_next` on an empty, still-open channel is
+    // `Ok(None)`-or-pending, never a command.
+    assert!(
+        cmd_rx.try_next().is_err(),
+        "a refused read must not reach the actor"
+    );
+}
+
+/// a valid trio names the signer, and the module is told exactly that key.
+#[tokio::test]
+async fn a_signed_reader_query_reaches_the_module_as_its_signer() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/query/reader",
+            serde_json::json!({ "target": "collaboration", "query": "mailbox" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        reader_of(response).await,
+        noded::hex_bytes(caller().public_key().as_ref()),
+        "the module must be told the key that signed"
+    );
+}
+
+/// THE test this lane exists for.
+///
+/// A caller supplies request BYTES. If a reader identity could ride in them,
+/// every protected read would be forgeable by anyone who can POST the
+/// unauthenticated `/v1/query` — which is anything that can dial this port,
+/// a sandboxed guest on its vsock tunnel included. So one key signs while the
+/// body loudly claims to be another, and the module must hear the signer.
+#[tokio::test]
+async fn a_reader_named_in_the_body_cannot_displace_the_signer() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let victim = commonware_cryptography::ed25519::PrivateKey::from_seed(9001);
+    let victim_hex = noded::hex_bytes(victim.public_key().as_ref());
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/query/reader",
+            serde_json::json!({
+                "target": "collaboration",
+                // every shape an attacker would try, at both levels.
+                "reader": victim_hex,
+                "viewer": victim_hex,
+                "query": {
+                    "messages": { "conversation_id": "c1", "viewer": victim_hex },
+                    "reader": victim_hex,
+                },
+            }),
+        ))
+        .await
+        .unwrap();
+
+    // the envelope's extra top-level keys are simply not part of the request
+    // shape, and the query rides through verbatim as the module's own business.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = body_json(response).await;
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("{target, query}"),
+        "an unknown envelope field is refused, not ignored: {refusal}"
+    );
+}
+
+/// ...and with a WELL-FORMED envelope, a reader claim inside the module's own
+/// query never becomes the reader. The module's `Origin` comes from the
+/// signature; whatever the query says is the module's own business and cannot
+/// reach the identity slot.
+#[tokio::test]
+async fn a_reader_claim_inside_the_query_is_not_the_reader() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let victim = commonware_cryptography::ed25519::PrivateKey::from_seed(9001);
+    let victim_hex = noded::hex_bytes(victim.public_key().as_ref());
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/query/reader",
+            serde_json::json!({
+                "target": "collaboration",
+                "query": { "mailbox": { "participant_id": "someone-else",
+                                        "viewer": victim_hex } },
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["reader"].as_str().unwrap(),
+        noded::hex_bytes(caller().public_key().as_ref()),
+        "the signer is the reader, whatever the query claims"
+    );
+    assert_ne!(
+        body["reader"].as_str().unwrap(),
+        victim_hex,
+        "a claimed viewer must never become the reader"
+    );
+    // the query itself is passed through untouched — the module owns its shape.
+    assert_eq!(body["query"]["mailbox"]["participant_id"], "someone-else");
+}
+
+/// a signature minted for ANOTHER node does not verify here. The node key is
+/// folded into the signed bytes precisely so a captured read cannot be
+/// replayed against a different node.
+#[tokio::test]
+async fn a_reader_query_signed_for_another_node_is_refused() {
+    let (handle, mut cmd_rx, _events) = local_node();
+
+    const OTHER_NODE: [u8; 32] = [0x22; 32];
+    let body = serde_json::json!({ "target": "collaboration", "query": "mailbox" });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/query/reader")
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in noded::signed_req::request_headers(
+        &caller(),
+        "POST",
+        "/v1/query/reader",
+        &OTHER_NODE,
+        &bytes,
+    ) {
+        req = req.header(name, value);
+    }
+
+    let response = noded::router(handle)
+        .oneshot(req.body(Body::from(bytes)).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "signature_invalid");
+    assert!(cmd_rx.try_next().is_err(), "nothing reaches the actor");
+}
+
+/// the body is signed, so swapping it after signing is caught. Without this the
+/// signature would authenticate a caller while leaving an attacker free to
+/// change which conversation was read.
+#[tokio::test]
+async fn a_reader_query_whose_body_was_swapped_is_refused() {
+    let (handle, mut cmd_rx, _events) = local_node();
+
+    let signed_for = serde_json::json!({ "target": "collaboration", "query": "mine" });
+    let sent = serde_json::to_vec(&serde_json::json!({
+        "target": "collaboration", "query": "someone-elses"
+    }))
+    .unwrap();
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/query/reader")
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in noded::signed_req::request_headers(
+        &caller(),
+        "POST",
+        "/v1/query/reader",
+        &NODE_KEY,
+        &serde_json::to_vec(&signed_for).unwrap(),
+    ) {
+        req = req.header(name, value);
+    }
+
+    let response = noded::router(handle)
+        .oneshot(req.body(Body::from(sent)).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "signature_invalid");
+    assert!(cmd_rx.try_next().is_err(), "nothing reaches the actor");
+}
+
+/// the open lane is UNCHANGED and still anonymous. That is not an oversight to
+/// be fixed later by a refusal rule here — it is the premise: a module serving
+/// protected content refuses `Origin::System`, which is what this lane passes.
+#[tokio::test]
+async fn the_open_query_lane_stays_open_and_anonymous() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/query",
+            serde_json::json!({ "target": "tasks", "query": "list" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "adding an authenticated lane must not gate the open one"
+    );
 }
 
 #[tokio::test]

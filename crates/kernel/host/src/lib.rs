@@ -1469,6 +1469,14 @@ pub struct Host {
     /// read at — see [`RegistryIdentity`]. Per-node bookkeeping, never part of
     /// `root()`.
     status_cache: Mutex<Option<(RegistryIdentity, Vec<modules::ModuleCode>)>>,
+    /// the `(height, consensus_time)` of the last block this host COMMITTED —
+    /// the agreed clock a read is answered against ([`Host::query_as`]).
+    ///
+    /// Sourced from the block, never from a request and never from the host's
+    /// wall clock: an eligibility answer that moved with a laptop's clock would
+    /// differ between two nodes reading the same committed state. `(0, 0)`
+    /// before the first commit, which is genesis and is the truth then.
+    committed: (u64, u64),
 }
 
 /// what the modules registry's `ModuleStatus` reply is a pure function of: the
@@ -1486,6 +1494,7 @@ impl Host {
             module_factory: None,
             foreign_admissions: BTreeSet::new(),
             status_cache: Mutex::new(None),
+            committed: (0, 0),
         }
     }
 
@@ -1516,7 +1525,37 @@ impl Host {
 
     /// external read-only query of a registered module (sync, like [`Ctx::query`]
     /// but from outside a dispatch). routes to [`Module::query_with`].
+    ///
+    /// [`Origin::System`], which is the WIDEST origin there is — the node asking
+    /// its own host. That is right for a read the node performs for itself and
+    /// wrong for one it performs for a caller, so a route that has authenticated
+    /// somebody uses [`Host::query_as`] and passes who.
     pub async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.query_as(target, req, Origin::System).await
+    }
+
+    /// [`Host::query`] under an explicit reader.
+    ///
+    /// The origin reaches the module through [`Env::origin`] — the SAME field a
+    /// write's authority is read from — so a module gates a protected read with
+    /// the vocabulary it already gates writes with. A caller cannot name a
+    /// reader: it produces `req`, and the origin is not in it.
+    ///
+    /// A module serving protected content MUST refuse [`Origin::System`] for
+    /// it: System is what the unauthenticated `/v1/query` lane passes.
+    ///
+    /// `height`/`consensus_time` are the last COMMITTED block's
+    /// ([`Host::committed`]), so an eligibility answer — is this message still
+    /// deliverable, is this binding still current — is computed against the
+    /// agreed clock. Expiry bounds DELIVERY, not history: a reader authorized
+    /// for a conversation still reads expired messages that retention holds.
+    pub async fn query_as(
+        &self,
+        target: &str,
+        req: &[u8],
+        origin: Origin,
+    ) -> Result<Vec<u8>, Error> {
+        let (height, consensus_time) = self.committed;
         match self.registry.get(target) {
             Some(m) => {
                 let snapshot: BTreeMap<ModuleId, StateRoot> = self
@@ -1527,9 +1566,9 @@ impl Host {
                 let target = target.to_string();
                 let ctx = ReadOnlyQueryCtx {
                     env: Env {
-                        height: 0,
-                        consensus_time: 0,
-                        origin: Origin::System,
+                        height,
+                        consensus_time,
+                        origin,
                         me: target.clone(),
                         cause: Cause::Direct,
                     },
@@ -2681,6 +2720,10 @@ impl Host {
 
         // 7. COMMIT once — the single boundary for the whole block.
         self.commit_boundary(&touched, commit_only).await?;
+        // and the clock a read is answered against advances with it, never
+        // before: a query between blocks sees the last AGREED time, so two
+        // nodes answering the same eligibility question agree.
+        self.committed = (block.height, block.consensus_time);
 
         // 8. ONE root-hash over the committed registry, shared by every unit.
         Ok(BatchOutcome {

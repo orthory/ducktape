@@ -145,7 +145,7 @@ pub mod testkit;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -679,6 +679,10 @@ pub fn router(handle: NodeHandle) -> Router {
         // caller-supplied string.
         .route("/v1/submit/frame", post(submit_frame))
         .route("/v1/query", post(query))
+        // the AUTHENTICATED read lane, to `/v1/query` what `/v1/submit/frame`
+        // is to `/v1/submit`: the caller's own proof decides who is asking, so
+        // a module can serve content it would refuse an anonymous reader.
+        .route("/v1/query/reader", post(query_as_reader))
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
         .route("/v1/blocks", get(blocks))
@@ -986,6 +990,86 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
         .send(NodeCommand::Query {
             target: req.target,
             req: req_bytes,
+            reply,
+        })
+        .await
+    {
+        return resp;
+    }
+    match rx.await {
+        Ok(Ok(bytes)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "module reply was not json",
+            ),
+        },
+        Ok(Err(err)) => error_response(StatusCode::BAD_REQUEST, &err),
+        Err(_) => actor_gone(),
+    }
+}
+
+/// POST /v1/query/reader — the AUTHENTICATED read lane.
+///
+/// Same `{target, query}` body as `/v1/query`, and the same committed state
+/// behind it. The one difference is the whole point: the caller proves
+/// possession of a key with the data-plane signature trio
+/// ([`crate::signed_req`]), and that verified key reaches the module as
+/// [`host::Origin::External`] — the SAME `Env::origin` field a write's
+/// authority arrives in, so a module gates a protected read with the vocabulary
+/// it already gates writes with.
+///
+/// ## why the reader cannot ride in the body
+///
+/// It was tried. A `{"reader": …}` envelope inside `query` is forgeable by
+/// anyone who can POST the UNAUTHENTICATED `/v1/query`, which is open to
+/// anything that can dial this port — a sandboxed guest reaching this listener
+/// through its vsock tunnel included (see [`crate::signed_req`]'s module doc).
+/// A caller supplies request BYTES and nothing else; putting the reader outside
+/// those bytes is what makes it unforgeable, and no refusal rule on the open
+/// lane is needed to keep it that way.
+///
+/// ## fail-closed, and where
+///
+/// This route establishes WHO. It deliberately does not decide what that reader
+/// may see: only the module holds the roster. The corollary is the module's
+/// obligation — a module serving protected content MUST refuse
+/// [`host::Origin::System`] for it, because System is exactly what the open
+/// lane still passes. A module that forgets is open on `/v1/query`, and no
+/// route can fix that for it.
+///
+/// This authenticates the READER at the RPC edge. It is not confidentiality:
+/// bodies live in replicated committed state, so every validator can read them.
+/// Nothing here promises end-to-end encryption.
+async fn query_as_reader(
+    State(handle): State<NodeHandle>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
+    // the signature covers the EXACT bytes below, so verify before decoding:
+    // an unauthenticated caller learns nothing about the body's shape.
+    let reader = match crate::signed_req::verify_signed_request(
+        &handle,
+        &axum::http::Method::POST,
+        path_and_query,
+        &headers,
+        &body,
+    ) {
+        Ok(key) => key,
+        Err(refusal) => return crate::signed_req::refuse(path_and_query, refusal),
+    };
+    let Ok(req) = serde_json::from_slice::<QueryRequest>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "body must be {target, query}");
+    };
+    let req_bytes = serde_json::to_vec(&req.query).expect("a decoded json value re-serializes");
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle
+        .send(NodeCommand::QueryAs {
+            target: req.target,
+            req: req_bytes,
+            reader,
             reply,
         })
         .await

@@ -405,6 +405,18 @@ fn run_node(
                         .map_err(|err| err.to_string());
                     let _ = reply.send(result);
                 }
+                NodeCommand::QueryAs {
+                    target,
+                    req,
+                    reader,
+                    reply,
+                } => {
+                    let result = host
+                        .query_as(&target, &req, sdk::Origin::External(reader))
+                        .await
+                        .map_err(|err| err.to_string());
+                    let _ = reply.send(result);
+                }
             }
         }
     });
