@@ -4397,11 +4397,21 @@ pub(crate) mod tests {
 
     /// Inspect the guest frame before the host sanitizer, not its already
     /// sanitized held tree. Resync prevents patch application hiding a loss.
-    fn assert_display_projection_survives_wire(module: &str, props: &[u8], expected: &str) {
+    fn assert_display_projection_survives_wire(
+        module: &str,
+        props: &[u8],
+        expected: &str,
+        actions: &[&str],
+    ) {
         let path = staged(module).expect("build the actual budget fixture with make views");
         let mut guest = Guest::load_from(module, &path).expect("actual guest loads");
         guest.redraw(&None);
-        guest.sync_props(&Some(props.to_vec()));
+        let supplied = Some(props.to_vec());
+        guest.redraw(&supplied);
+        for action in actions {
+            guest.deliver(Output::Activate(button_message(&guest, action)));
+            guest.redraw(&supplied);
+        }
         guest.pending.push(wire::Event::Resync);
         let events = std::mem::take(&mut guest.pending);
         arm(&mut guest.store);
@@ -4447,7 +4457,7 @@ pub(crate) mod tests {
             .map(|n| serde_json::json!({"path": format!("/shared/{n}"), "kind": "added"}))
             .collect::<Vec<_>>()
             .into();
-        let bytes = display_budget::files(facts);
+        let bytes = display_budget::files(facts.clone());
         let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(projected["preview_text"], source);
         assert_eq!(projected["preview_truncated"], false);
@@ -4459,7 +4469,22 @@ pub(crate) mod tests {
                 .starts_with("한글 preview")
         );
         assert!(projected["display_omitted"].as_i64().unwrap() > 0);
-        assert_display_projection_survives_wire("files", &bytes, "Preview shortened for display.");
+        assert_display_projection_survives_wire(
+            "files",
+            &bytes,
+            "Preview shortened for display.",
+            &[],
+        );
+        facts["entries"] = Vec::<serde_json::Value>::new().into();
+        facts["directories"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "".into();
+        let history = display_budget::files(facts.clone());
+        assert_display_projection_survives_wire("files", &history, "historyhistory", &["History"]);
+        facts["history"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "s0".into();
+        facts["diff"] = (0..80).map(|n| serde_json::json!({"path": format!("/shared/{n}-{}", "long".repeat(200)), "kind": "added"})).collect::<Vec<_>>().into();
+        let diff = display_budget::files(facts);
+        assert_display_projection_survives_wire("files", &diff, "/shared/0-long", &["History"]);
     }
 
     #[test]
@@ -4506,7 +4531,7 @@ pub(crate) mod tests {
             40
         );
         assert_eq!(projected["has_staged_comments"], true);
-        assert_display_projection_survives_wire("forge", &bytes, "latest-40");
+        assert_display_projection_survives_wire("forge", &bytes, "latest-40", &[]);
         assert!(projected["display_omitted"].as_i64().unwrap() > 0);
         assert!(projected["staged_comments"].as_array().unwrap().is_empty());
         assert!(projected["merge_conflicts"].as_array().unwrap().is_empty());
