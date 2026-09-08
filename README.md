@@ -88,12 +88,12 @@ ordering arm.
 ## Quick Start
 
 Prerequisites: `rustup` (the pinned toolchain and its wasm32 target install
-themselves on the first build), a C compiler and `pkg-config`, and on Linux
+themselves on the first build), a C compiler, and on Linux `pkg-config`,
 `libclang-dev` and `libasound2-dev`:
 
 ```sh
 sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu
-xcode-select --install && brew install pkg-config                         # macOS
+xcode-select --install                                                    # macOS
 ```
 
 `make` checks for them up front and prints that line when one is missing.

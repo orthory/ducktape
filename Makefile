@@ -20,24 +20,24 @@ UNAME_S := $(shell uname -s)
 
 ## the system packages a build needs and cargo cannot install: rustup (the
 ## pinned toolchain and its wasm32 target install themselves through it), a C
-## compiler and pkg-config (aws-lc-sys, libz-sys), and on Linux libclang
-## (bindgen, for the app's camera bindings) and ALSA's headers (the app's
-## audio). Checked up front, so a fresh machine hears the one install line
+## compiler, and on Linux pkg-config, libclang (bindgen, for the app's camera
+## bindings) and ALSA's headers (the app's audio). macOS builds with the
+## command line tools alone. Checked up front, so a fresh machine hears the one install line
 ## instead of a linker error twenty minutes into the build.
 .PHONY: prereqs
 prereqs:
 	@missing=""; \
 	command -v rustup >/dev/null || missing="$$missing rustup"; \
 	command -v cc >/dev/null || missing="$$missing cc"; \
-	command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	if [ "$(UNAME_S)" = Linux ]; then \
+	  command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
 	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
 	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
 	fi; \
 	[ -z "$$missing" ] || { \
 	  echo "missing build prerequisites:$$missing" >&2; \
 	  if [ "$(UNAME_S)" = Darwin ]; then \
-	    echo "  xcode-select --install && brew install pkg-config" >&2; \
+	    echo "  xcode-select --install" >&2; \
 	  else \
 	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
 	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
