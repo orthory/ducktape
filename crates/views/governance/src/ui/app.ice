@@ -14,11 +14,11 @@ app GovernanceView
 use "../../../../../app/src/ui/theme.ice"
 
 extern crate::host
-  HostError(message:str)
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
   GovernanceProps(rows:[ProposalRow], voting:str, admin:bool, connected:bool, answered:bool, dark:bool)
   QuorumSeat(filled:bool)
-  stream props() -> GovernanceProps ! HostError
+  PropsItem(next:GovernanceProps, error:str)
+  subscription props() -> PropsItem
   sync vote(proposal_id:str, approve:bool) -> bool
   sync execute(proposal_id:str) -> bool
   pure proposals_summary(connected:bool, rows:&[ProposalRow]) -> str
@@ -26,6 +26,9 @@ extern crate::host
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure settled_proposals(rows:&[ProposalRow]) -> [ProposalRow]
   pure quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
+  // the deployment's own seal, painted by the host from the artifact's
+  // assets (`icons/seal.svg`); a deployment without one leaves the slot
+  component artifact_svg(path:str) -> unit
   pure tally_label(approvals:i64, required:i64) -> str
   pure tally_tone(approvals:i64, required:i64) -> str
   pure tally_note(approvals:i64, required:i64) -> str
@@ -42,11 +45,16 @@ state
   answered = false
   host_error = ""
 
-// The register is the host's: one subscription, one item per change.
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// The register is the host's: one subscription, one item per change. A
+// subscription, not a mount task, so a replacement restored from this
+// view's state asks for the register again on its own.
+subscribe
+  props() -> props_arrived _
 
-on props_changed(next)
+on props_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   rows = next.rows
   voting = next.voting
   admin = next.admin
@@ -55,9 +63,6 @@ on props_changed(next)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
-
-on props_failed(error)
-  host_error = error.message
 
 on gov_vote(proposal_id, approve)
   return if !connected || !empty(voting)
@@ -215,6 +220,8 @@ view
             h=fill
             gap=10.0
             align=center
+          box #seal w=24.0 h=24.0
+            extern artifact_svg("icons/seal.svg") #seal-svg
           text "Approvals" #title
             with
               size=16.0

@@ -118,36 +118,42 @@ struct Activation {
     code_hash: Vec<u8>,
 }
 
-/// The module's active code hash, or `None` for an admission that has not
-/// reached its boundary.
-pub async fn active_hash(client: &Client, module: &str) -> Result<Option<[u8; 32]>, Error> {
+/// Every registered module's active code hash — `None` for an admission
+/// that has not reached its boundary — in one registry read.
+pub async fn active_hashes(client: &Client) -> Result<BTreeMap<String, Option<[u8; 32]>>, Error> {
     let reply: StatusReply = client
         .query("modules", &serde_json::json!("module_status"))
         .await
         .map_err(|error| Error::Status(error.to_string()))?;
-    let mut entries = reply
-        .module_status
-        .modules
-        .into_iter()
-        .filter(|entry| entry.module_id == module);
-    let entry = entries
-        .next()
-        .ok_or_else(|| Error::Status(format!("module {module:?} is not registered")))?;
-    if entries.next().is_some() {
-        return Err(Error::Status(format!(
-            "module {module:?} is registered more than once"
-        )));
+    let mut hashes = BTreeMap::new();
+    for entry in reply.module_status.modules {
+        let module = entry.module_id;
+        let hash = if entry.active_code_hash.is_empty() {
+            None
+        } else {
+            Some(entry.active_code_hash.as_slice().try_into().map_err(|_| {
+                Error::Status(format!(
+                    "module {module:?}: active code hash is {} bytes, not 32",
+                    entry.active_code_hash.len()
+                ))
+            })?)
+        };
+        if hashes.insert(module.clone(), hash).is_some() {
+            return Err(Error::Status(format!(
+                "module {module:?} is registered more than once"
+            )));
+        }
     }
-    if entry.active_code_hash.is_empty() {
-        return Ok(None);
-    }
-    let hash: [u8; 32] = entry.active_code_hash.as_slice().try_into().map_err(|_| {
-        Error::Status(format!(
-            "module {module:?}: active code hash is {} bytes, not 32",
-            entry.active_code_hash.len()
-        ))
-    })?;
-    Ok(Some(hash))
+    Ok(hashes)
+}
+
+/// The module's active code hash, or `None` for an admission that has not
+/// reached its boundary.
+pub async fn active_hash(client: &Client, module: &str) -> Result<Option<[u8; 32]>, Error> {
+    active_hashes(client)
+        .await?
+        .remove(module)
+        .ok_or_else(|| Error::Status(format!("module {module:?} is not registered")))
 }
 
 /// The module's view as its active deployment ships it.
@@ -172,6 +178,7 @@ pub async fn resolve(client: &Client, module: &str) -> Result<ViewSource, Error>
 pub(crate) mod tests {
     use super::*;
     use module_artifact::{ModuleArtifact, ViewArtifact};
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     /// A node that answers `module_status` with `status` and serves
@@ -183,35 +190,110 @@ pub(crate) mod tests {
         artifact: Option<ModuleArtifact>,
         hold: Option<Arc<tokio::sync::Notify>>,
     ) -> Client {
+        let deployment = FakeDeployment {
+            status: Mutex::new(status),
+            artifacts: Mutex::new(artifact.into_iter().collect()),
+            by_digest: false,
+            hold: Mutex::new(hold),
+            hold_status: Mutex::new(None),
+            held: tokio::sync::Notify::new(),
+        };
+        fake_node(Arc::new(deployment)).await
+    }
+
+    /// What a fake node serves, changeable under a running host: the
+    /// registry reply, the artifacts (by their own digest when `by_digest`,
+    /// else the first for any digest), and a one-shot hold on the next
+    /// blob served.
+    pub(crate) struct FakeDeployment {
+        pub status: Mutex<serde_json::Value>,
+        pub artifacts: Mutex<Vec<ModuleArtifact>>,
+        pub by_digest: bool,
+        /// One-shot holds: the next blob, or status, answer waits on it.
+        pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        pub hold_status: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// Told each time an answer starts waiting on a hold.
+        pub held: tokio::sync::Notify,
+    }
+
+    impl FakeDeployment {
+        pub(crate) fn serving(module: &str, artifact: &ModuleArtifact) -> Arc<Self> {
+            Arc::new(Self {
+                status: Mutex::new(status_naming(module, &artifact.hash())),
+                artifacts: Mutex::new(vec![artifact.clone()]),
+                by_digest: true,
+                hold: Mutex::new(None),
+                hold_status: Mutex::new(None),
+                held: tokio::sync::Notify::new(),
+            })
+        }
+
+        /// The registry now names `artifact` as `module`'s active code,
+        /// and the blob store has it.
+        pub(crate) fn deploy(&self, module: &str, artifact: &ModuleArtifact) {
+            *self.status.lock().unwrap() = status_naming(module, &artifact.hash());
+            self.artifacts.lock().unwrap().push(artifact.clone());
+        }
+    }
+
+    pub(crate) fn status_naming(module: &str, hash: &[u8]) -> serde_json::Value {
+        serde_json::json!({"module_status": {"modules": [
+            {"module_id": module, "active_code_hash": hash, "pending": null,
+             "history": [{"height": 7, "code_hash": hash}]}
+        ]}})
+    }
+
+    pub(crate) async fn fake_node(deployment: Arc<FakeDeployment>) -> Client {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0u8; 4096];
-                let read = socket.read(&mut request).await.unwrap();
-                let head = String::from_utf8_lossy(&request[..read]).into_owned();
-                let route = head.split(' ').nth(1).unwrap_or("").to_owned();
-                let (status_line, body) = if route == "/v1/query" {
-                    ("200 OK", status.to_string().into_bytes())
-                } else if route.starts_with("/v1/files/blob/") {
-                    if let Some(hold) = &hold {
-                        hold.notified().await;
-                    }
-                    match &artifact {
-                        Some(artifact) => ("200 OK", artifact.encode()),
-                        None => ("404 Not Found", Vec::new()),
-                    }
-                } else {
-                    ("404 Not Found", Vec::new())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-                let _ = socket.write_all(&body).await;
-                let _ = socket.shutdown().await;
+                // each request on its own: a held blob leaves the status
+                // answering, as a node does
+                let deployment = deployment.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let head = String::from_utf8_lossy(&request[..read]).into_owned();
+                    let route = head.split(' ').nth(1).unwrap_or("").to_owned();
+                    let (status_line, body) = if route == "/v1/query" {
+                        let hold = deployment.hold_status.lock().unwrap().take();
+                        if let Some(hold) = hold {
+                            deployment.held.notify_one();
+                            hold.notified().await;
+                        }
+                        let status = deployment.status.lock().unwrap().clone();
+                        ("200 OK", status.to_string().into_bytes())
+                    } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
+                        let hold = deployment.hold.lock().unwrap().take();
+                        if let Some(hold) = hold {
+                            deployment.held.notify_one();
+                            hold.notified().await;
+                        }
+                        let artifacts = deployment.artifacts.lock().unwrap();
+                        let served = if deployment.by_digest {
+                            artifacts.iter().find(|artifact| {
+                                crate::backend::hex_encode(&artifact.hash()) == digest
+                            })
+                        } else {
+                            artifacts.first()
+                        };
+                        match served {
+                            Some(artifact) => ("200 OK", artifact.encode()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    } else {
+                        ("404 Not Found", Vec::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
             }
         });
         Client::new(&origin).unwrap()

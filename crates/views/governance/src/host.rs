@@ -3,14 +3,9 @@
 //! ordinary record data crossing as values — and leaves as intents nobody
 //! waits on: the host performs the write and pushes the next register.
 
-use iced::futures::{Stream, StreamExt};
+use iced::futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use ui_lang_guest::host;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HostError {
-    pub message: String,
-}
 
 /// One governance proposal, rendered by the host: the same fields the
 /// desktop app's own register carries, and nothing derived.
@@ -43,12 +38,30 @@ pub struct GovernanceProps {
     pub dark: bool,
 }
 
+/// One item of the register subscription: the register, or why not.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct PropsItem {
+    pub next: GovernanceProps,
+    pub error: String,
+}
+
 /// The register now, and again on every change the host sees.
-pub fn props() -> impl Stream<Item = Result<GovernanceProps, HostError>> + Send + 'static {
-    host::subscribe("governance.props", &[]).map(|answer| {
-        let bytes = answer.map_err(|message| HostError { message })?;
-        serde_json::from_slice(&bytes).map_err(|error| HostError {
-            message: error.to_string(),
+pub fn props() -> iced::Subscription<PropsItem> {
+    iced::Subscription::run(|| {
+        host::subscribe("governance.props", &[]).map(|answer| {
+            let read = answer.and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+            });
+            match read {
+                Ok(next) => PropsItem {
+                    next,
+                    error: String::new(),
+                },
+                Err(error) => PropsItem {
+                    next: GovernanceProps::default(),
+                    error,
+                },
+            }
         })
     })
 }
