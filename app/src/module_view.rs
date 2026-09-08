@@ -4466,8 +4466,18 @@ mod tests {
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = mounted("forge");
+        // whatever an earlier test left drawn: this one starts from a view
+        // booted fresh, never ticked, so the init branch is the one exercised
+        mounted.lock().unwrap().slot = Slot::Empty;
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        {
+            let locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &locked.slot else {
+                panic!("A is seated");
+            };
+            assert_eq!(guest.ticks, 0);
+        }
 
         node.deploy("forge", &b);
         let hold = hold_blob(&node);
