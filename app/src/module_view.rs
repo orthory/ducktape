@@ -1730,10 +1730,16 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 /// loaded stays for the process (the swap-in-place on a new deployment is
 /// the next step, behind the `generation` this registry already keeps).
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
+    mounted(module).lock().expect("module view lock").props = Some(props);
+    drawn(module)
+}
+
+/// The mounted view as it stands — its current frame, or the notice for a
+/// slot without one — with no props pushed.
+pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
     let (content, rev, generation) = {
         let mut locked = mounted.lock().expect("module view lock");
-        locked.props = Some(props);
         let generation = locked.generation;
         match &mut locked.slot {
             Slot::Loading => return notice("Loading the view…"),
@@ -2106,6 +2112,7 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
 pub(crate) mod canary {
     use std::sync::{Mutex, mpsc};
 
+    pub(crate) use super::drawn;
     pub(crate) use super::tests::connection_turn;
 
     pub(crate) static TAPS: Mutex<Vec<mpsc::Sender<String>>> = Mutex::new(Vec::new());
