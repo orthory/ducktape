@@ -1,5 +1,116 @@
 use super::*;
 
+/// What `send_message` answers a failed note with.
+fn note_failure(op: &str, channel: &str, body: &str) -> backend::OptimisticMutationError {
+    backend::OptimisticMutationError {
+        message: "node refused".into(),
+        committed: false,
+        operation_id: op.into(),
+        scope_id: channel.into(),
+        thread_seq: 0,
+        body: body.into(),
+    }
+}
+
+/// Opens item `number` through the real handlers and lands its load.
+fn land_item(app: &mut Ducktape, number: i64) {
+    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(number));
+    let _ = app.__update(__DucktapeMessage::ForgeItemLoaded(backend::ForgeItemData {
+        generation: app.forge_generation,
+        repo: "core".into(),
+        number,
+        channel_id: format!("forge:core:{number}"),
+        ..backend::ForgeItemData::default()
+    }));
+    assert_eq!(app.forge_item_phase, ForgePhase::Ready);
+    assert_eq!(app.forge_item_channel, format!("forge:core:{number}"));
+}
+
+/// Submits a note for `scope` the way the host composer's intent arrives,
+/// through the async hop, and hands back the operation id it went out under.
+fn send_note(app: &mut Ducktape, scope: &str, body: &str) -> String {
+    let task = app.__update(__DucktapeMessage::ForgeViewEvent(composer_intent(
+        scope, "note", body,
+    )));
+    pump(app, task);
+    app.forge_discussion_pending.clone()
+}
+
+/// A NOTE DELAYED ACROSS A NAVIGATION LANDS WHERE IT WAS WRITTEN. The real
+/// handlers drive this: item A is open and a note leaves it; the reader
+/// opens item B, which retires A's channel at once and clears the pending
+/// flag; a submit for A that was still crossing the hop is refused and goes
+/// back to A's box; B lands and sends its own note; then A's send fails —
+/// its body lands in A's box, not B's, and B's pending flag stands, because
+/// the failure carried A's scope and A's operation id, not the app's
+/// current ones.
+#[test]
+fn a_note_delayed_across_a_navigation_lands_where_it_was_written() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+    land_item(&mut app, 7);
+    let a = backend::composer_scope("http://node", "forge:core:7");
+    let op_a = send_note(&mut app, &a, "from A");
+    assert!(!op_a.is_empty(), "A's note is in flight");
+
+    // the reader opens B while A's note is still out
+    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(9));
+    assert!(
+        app.forge_item_channel.is_empty(),
+        "the previous channel retires when the navigation starts"
+    );
+    assert!(app.forge_discussion_pending.is_empty());
+
+    // a submit for A that was crossing the hop is refused and restored to A
+    assert!(send_note(&mut app, &a, "late for A").is_empty());
+    assert_eq!(composer_stash(&a), "late for A");
+
+    // B lands and sends its own note
+    let _ = app.__update(__DucktapeMessage::ForgeItemLoaded(backend::ForgeItemData {
+        generation: app.forge_generation,
+        repo: "core".into(),
+        number: 9,
+        channel_id: "forge:core:9".into(),
+        ..backend::ForgeItemData::default()
+    }));
+    let b = backend::composer_scope("http://node", "forge:core:9");
+    let op_b = send_note(&mut app, &b, "from B");
+    assert!(!op_b.is_empty() && op_b != op_a);
+
+    // A's send fails now: A's box takes the body, B's flag stands
+    let _ = app.__update(__DucktapeMessage::ForgeNoteFailed(
+        a.clone(),
+        op_a.clone(),
+        note_failure(&op_a, "forge:core:7", "from A"),
+    ));
+    assert_eq!(composer_stash(&a), "late for A\nfrom A");
+    assert!(composer_stash(&b).is_empty());
+    assert_eq!(
+        app.forge_discussion_pending, op_b,
+        "a stale failure never clears a newer note"
+    );
+
+    // and A's stale success does not either; B's own answer does
+    let _ = app.__update(__DucktapeMessage::ForgeNoteSent(
+        op_a,
+        backend::SendReceipt {
+            operation_id: String::new(),
+            channel_id: "forge:core:7".into(),
+        },
+    ));
+    assert_eq!(app.forge_discussion_pending, op_b);
+    let _ = app.__update(__DucktapeMessage::ForgeNoteFailed(
+        b.clone(),
+        op_b.clone(),
+        note_failure(&op_b, "forge:core:9", "from B"),
+    ));
+    assert!(app.forge_discussion_pending.is_empty());
+    assert_eq!(composer_stash(&b), "from B");
+}
+
 /// THE NOTE GOES BACK TO THE BOX IT WAS WRITTEN IN. The host's composer
 /// clears itself before it emits, so a body the delivery gate refuses —
 /// the tab loading, the item's channel gone, a note already in flight — is
@@ -14,6 +125,7 @@ fn a_note_refused_at_delivery_goes_back_to_the_box_it_was_written_in() {
     app.connected_rpc = "http://node".into();
     app.forge_repo = "core".into();
     app.forge_item_number = 7;
+    app.forge_item_phase = ForgePhase::Ready;
     app.forge_item_channel = "forge:core:7".into();
     let here = backend::composer_scope("http://node", "forge:core:7");
 
@@ -61,16 +173,11 @@ fn a_note_refused_at_delivery_goes_back_to_the_box_it_was_written_in() {
         !app.forge_discussion_pending.is_empty(),
         "the live note is in flight"
     );
-    assert_eq!(app.forge_note_scope, here);
+    let op = app.forge_discussion_pending.clone();
     let _ = app.__update(__DucktapeMessage::ForgeNoteFailed(
-        backend::OptimisticMutationError {
-            message: "node refused".into(),
-            committed: false,
-            operation_id: app.forge_discussion_pending.clone(),
-            scope_id: "forge:core:7".into(),
-            thread_seq: 0,
-            body: "third".into(),
-        },
+        here.clone(),
+        op.clone(),
+        note_failure(&op, "forge:core:7", "third"),
     ));
     assert_eq!(
         composer_stash(&here),
@@ -101,8 +208,11 @@ fn forge_depth_rides_the_established_seams() {
     // the item's hidden channel — never a forge-private message path.
     assert!(lifecycle.contains("forge_discussion = folded_chat.forge_discussion"));
     assert!(lifecycle.contains("fold_live_chat(next.chat"));
+    // the note goes out under an id the send carries on BOTH its routes, so a
+    // stale answer can be told from the pending one
     assert!(lifecycle.contains(
-        "run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
+        "run every send_message(connected_rpc, password, forge_item_channel, op, trim(body), \
+         forge_discussion_members) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)"
     ));
 
     // Replace lanes own request freshness. Their payloads keep only the

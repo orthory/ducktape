@@ -53,9 +53,6 @@ state
   forge_discussion:[ChatMessage] = []
   forge_discussion_members:[ChatMember] = []
   forge_discussion_pending = ""
-  // the box the pending note was written in — the network and the
-  // channel — so a failure goes back there, not to the item on screen
-  forge_note_scope = ""
   forge_generation:i64 = 0
   // THE CODE BROWSE: the open directory's listing, pinned to the commit the
   // root listing answered with, and the file opened under it. The view
