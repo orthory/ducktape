@@ -4692,9 +4692,8 @@ pub(crate) mod tests {
     async fn a_block_that_waits_on_pending_work_keeps_the_generation() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
         let component = std::fs::read(staged).expect("the staged view");
         let (a, b) = (
             deployment(&component, "a.svg"),
@@ -4727,9 +4726,8 @@ pub(crate) mod tests {
     async fn a_view_without_a_tree_is_replaced_once_its_pending_work_outlives_the_wait() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
         let component = std::fs::read(staged).expect("the staged view");
         let (a, b) = (
             deployment(&component, "a.svg"),
@@ -4779,9 +4777,8 @@ pub(crate) mod tests {
     async fn a_view_that_drew_a_tree_keeps_waiting_past_the_wait() {
         let _turn = connection_turn().await;
         use crate::backend::view_source::tests::{FakeDeployment, fake_node};
-        let Some(staged) = staged("governance") else {
-            return;
-        };
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
         let component = std::fs::read(staged).expect("the staged view");
         let (a, b) = (
             deployment(&component, "a.svg"),
