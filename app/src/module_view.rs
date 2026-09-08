@@ -750,258 +750,6 @@ pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict
     }
 }
 
-/// The native log ring behind the node view's slot: the timeline the app
-/// last drew the tab with, and what the reader did in it since the app
-/// last drained. One per process, like the view it belongs to.
-#[derive(Default)]
-struct NodeTimeline {
-    shown: Option<(crate::backend::NodeLogTimelineState, String)>,
-    events: Vec<crate::backend::NodeLogTimelineEvent>,
-}
-
-fn node_timeline() -> &'static Mutex<NodeTimeline> {
-    static TIMELINE: OnceLock<Mutex<NodeTimeline>> = OnceLock::new();
-    TIMELINE.get_or_init(Mutex::default)
-}
-
-/// The surfaces a module's view may leave slots for. The node view's
-/// `node_log_timeline` is the app's own ring, painted from the timeline the
-/// tab was last drawn with; what the reader does in it is queued for
-/// [`node_log_timeline_drain`], and the guest — which declared the slot as
-/// `-> unit` — hears only that something happened. The forge view's three
-/// are readers over data the guest hands across: the decoded picture parked
-/// under the forge surface, the document-aware Markdown (a link it opens
-/// goes back to the guest's handler), and the highlighted code.
-fn surfaces_of(module: &str) -> Surfaces {
-    let mut surfaces = Surfaces::default();
-    if module == "forge" {
-        surfaces.insert(
-            "picture".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(surface),
-                    wire::SurfaceValue::Str(path),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::picture(surface.clone(), path.clone())
-                    .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "forge_markdown".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(source),
-                    wire::SurfaceValue::Str(doc),
-                    wire::SurfaceValue::Bool(dark),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::forge_markdown(source.clone(), doc.clone(), *dark)
-                    .map(wire::SurfaceValue::Str)
-            }),
-        );
-        surfaces.insert(
-            "forge_code".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                let [
-                    wire::SurfaceValue::Str(source),
-                    wire::SurfaceValue::Str(path),
-                    wire::SurfaceValue::Bool(dark),
-                ] = args
-                else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::forge_code(source.clone(), path.clone(), *dark)
-                    .map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-    }
-    if module == "node" {
-        surfaces.insert(
-            "node_log_timeline".into(),
-            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
-                let shown = node_timeline().lock().expect("node timeline").shown.clone();
-                let Some((timeline, source)) = shown else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::node_log_timeline(timeline, source).map(|event| {
-                    node_timeline()
-                        .lock()
-                        .expect("node timeline")
-                        .events
-                        .push(event);
-                    wire::SurfaceValue::Unit
-                })
-            }),
-        );
-    }
-    surfaces
-}
-
-/// The operations a view may ask of the app, by module. An intent outside
-/// the list is refused at the door, never handed to a handler.
-fn intents_of(module: &str) -> &'static [&'static str] {
-    match module {
-        "governance" => &["vote", "execute"],
-        "members" => &["copy", "agent_status", "propose"],
-        "agents" => &[],
-        "node" => &["copy", "tab", "log_filter"],
-        "explorer" => &["refresh", "copy", "search", "clear"],
-        "forge" => &[
-            "open_repo",
-            "close_repo",
-            "toggle_repo_menu",
-            "tab",
-            "open_item",
-            "close_item",
-            "merge",
-            "review_pick",
-            "review_submit",
-            "comment_stage",
-            "comment_drop",
-            "tree",
-            "blob",
-            "open_link",
-            "copy",
-        ],
-        "settings" => &[
-            "tab",
-            "reconnect",
-            "switch_network",
-            "unlock",
-            "lock",
-            "rename",
-            "create",
-            "key_add",
-            "join",
-            "key_remove",
-            "passkey",
-            "passkey_desktop",
-            "ceremony_cancel",
-            "wallet",
-            "login",
-            "copy",
-            "clear_tabs",
-            "forget",
-            "light",
-            "dark",
-            "notifications",
-        ],
-        _ => &[],
-    }
-}
-
-// ---------- mounting ----------
-
-/// The widget for one module's view, with `props` as the app has them now.
-/// The view is loaded once per process, on its own thread, and the tab
-/// shows what stage it is at until then.
-fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
-    let mounted = mounted(module);
-    let (content, rev) = {
-        let mut locked = mounted.lock().expect("module view lock");
-        locked.props = Some(props);
-        match &mut locked.slot {
-            Slot::Loading => return notice("Loading the view…"),
-            Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (guest.render(), guest.frame_rev),
-        }
-    };
-    Element::new(ModuleView {
-        mounted,
-        rev,
-        content,
-    })
-}
-
-/// What the tab shows while the view is not there to show itself.
-fn notice(text: &str) -> Element<'static, ModuleViewEvent> {
-    widget::container(widget::text(text.to_owned()).size(13))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .into()
-}
-
-/// One module's view for the life of the process: the instance once it is
-/// there, and the props the app last handed it, which it takes on its next
-/// redraw whether the instance was ready when they arrived or not.
-struct Mounted {
-    slot: Slot,
-    props: Option<Vec<u8>>,
-}
-
-enum Slot {
-    Loading,
-    Ready(Box<Guest>),
-    Failed(String),
-}
-
-type Registry = Mutex<HashMap<&'static str, Arc<Mutex<Mounted>>>>;
-
-fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
-    static MOUNTED: OnceLock<Registry> = OnceLock::new();
-    let mut registry = MOUNTED
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("module views");
-    registry
-        .entry(module)
-        .or_insert_with(|| {
-            let mounted = Arc::new(Mutex::new(Mounted {
-                slot: Slot::Loading,
-                props: None,
-            }));
-            // A cold cranelift compile is a second or more; the window
-            // thread shows "Loading" instead of freezing for it.
-            let loading = mounted.clone();
-            std::thread::spawn(move || {
-                let slot = match Guest::load(module) {
-                    Ok(guest) => Slot::Ready(Box::new(guest)),
-                    Err(reason) => {
-                        tracing::warn!(
-                            target: "ducktape::app",
-                            module,
-                            reason = "module_view_unloadable",
-                            error = %reason,
-                            "module view not loaded"
-                        );
-                        Slot::Failed(reason)
-                    }
-                };
-                loading.lock().expect("module view lock").slot = slot;
-            });
-            mounted
-        })
-        .clone()
-}
-
-/// Where the staged views are: `$DUCKTAPE_VIEWS_DIR`, else `views/` beside
-/// the binary or beside its profile directory — the shape
-/// `workspace_config::staged_modules_dir` gives the founding set.
-fn views_dir() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("DUCKTAPE_VIEWS_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let exe = std::env::current_exe().map_err(|error| format!("current executable: {error}"))?;
-    let exe_dir = exe.parent().ok_or("the executable has no directory")?;
-    [Some(exe_dir), exe_dir.parent()]
-        .into_iter()
-        .flatten()
-        .map(|dir| dir.join("views"))
-        .find(|dir| dir.is_dir())
-        .ok_or_else(|| {
-            format!(
-                "no views beside {} — `make views` stages them under target/views, or set $DUCKTAPE_VIEWS_DIR",
-                exe.display()
-            )
-        })
-}
-
 // ---------- the shell seat ----------
 
 /// The Shell tab: the app's agent picks, the terminal it holds and the run
@@ -1701,6 +1449,52 @@ fn surfaces_of(module: &str) -> Surfaces {
     if module == "chat" {
         surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
     }
+    if module == "forge" {
+        surfaces.insert(
+            "picture".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(surface),
+                    wire::SurfaceValue::Str(path),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::picture(surface.clone(), path.clone())
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "forge_markdown".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(doc),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_markdown(source.clone(), doc.clone(), *dark)
+                    .map(wire::SurfaceValue::Str)
+            }),
+        );
+        surfaces.insert(
+            "forge_code".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(path),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_code(source.clone(), path.clone(), *dark)
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+    }
     if module == "files" {
         surfaces.insert(
             "picture".into(),
@@ -1831,6 +1625,23 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "thread_edit",
             "thread_delete",
             "load_thread",
+        ],
+        "forge" => &[
+            "open_repo",
+            "close_repo",
+            "toggle_repo_menu",
+            "tab",
+            "open_item",
+            "close_item",
+            "merge",
+            "review_pick",
+            "review_submit",
+            "comment_stage",
+            "comment_drop",
+            "tree",
+            "blob",
+            "open_link",
+            "copy",
         ],
         "files" => &[
             "open_dir",
