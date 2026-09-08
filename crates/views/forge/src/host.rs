@@ -122,6 +122,9 @@ pub struct DiffLine {
 /// landed on `landed_seq` in the discussion.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForgeProps {
+    pub display_omitted: i64,
+    pub display_shortened: bool,
+    pub display_unavailable: bool,
     pub dark: bool,
     pub connected: bool,
     pub org: String,

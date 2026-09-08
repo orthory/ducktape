@@ -40,9 +40,12 @@ fn facts() -> FilesProps {
         preview_width: 0,
         preview_height: 0,
         preview_text: "# Hello\n".into(),
+        preview_display_text: "# Hello\n".into(),
+        preview_display_clipped: false,
         dark: false,
         write_refusal: String::new(),
         writes: 0,
+        ..FilesProps::default()
     }
 }
 

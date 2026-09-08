@@ -3,7 +3,7 @@
 // readings arrive as props, interaction-local state stays here, and only
 // application effects leave as named events the view root turns into intents.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
+component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, preview_display_clipped:bool, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
   lifetime retained
   emits
     open_message_link(str)
@@ -386,7 +386,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             // plate that said "Empty directory" or a list of the previous
             // directory's objects would each be a claim about a path nobody
             // has answered for yet.
-            if listed && empty(entries)
+            if listed && empty(entries) && display_omitted == 0
               box w=fill p=22.0
                 EmptyPlate message="Empty directory — nothing is committed under this path."
             if listed && !empty(entries)
@@ -431,7 +431,13 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                           font=code
                           @text-meta
                       if preview_truncated
-                        text "first 48 KiB"
+                        text "first 64 KiB"
+                          with
+                            size=12.5
+                            wrap=none
+                            @text-caption
+                      if preview_display_clipped && !editing
+                        text "Preview shortened for display."
                           with
                             size=12.5
                             wrap=none

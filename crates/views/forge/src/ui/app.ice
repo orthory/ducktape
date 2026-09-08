@@ -33,7 +33,7 @@ extern crate::host
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   TreeEntry(name:str, path:str, kind:str)
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  ForgeProps(dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
+  ForgeProps(display_omitted:i64, display_shortened:bool, display_unavailable:bool, dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
   PropsItem(next:ForgeProps, error:str)
   subscription props() -> PropsItem
   pure open_repo(name:&str) -> bool
@@ -86,6 +86,9 @@ enum Appearance
   dark
 
 state
+  display_omitted:i64 = 0
+  display_shortened = false
+  display_unavailable = false
   active_palette:palette[AppTheme] = AppTheme.app
   connected = false
   dark = false
@@ -175,6 +178,9 @@ on props_arrived(item)
   host_error = item.error
   return if !empty(item.error)
   let next = item.next
+  display_omitted = next.display_omitted
+  display_shortened = next.display_shortened
+  display_unavailable = next.display_unavailable
   connected = next.connected
   dark = next.dark
   org = next.org
@@ -345,85 +351,95 @@ on copy_to_clipboard(text, label)
   sent = copy(text, label)
 
 view
-  ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
-    with
-      org
-      about
-      tier
-      network_chain_id
-      connected_rpc
-      repos
-      list_phase
-      open_repo
-      repo_menu
-      repo_phase
-      branches
-      tab
-      items
-      forge_item_number
-      item_phase
-      forge_item_kind
-      forge_item_title
-      forge_item_state
-      forge_item_author
-      forge_item_branches
-      forge_item_body
-      forge_item_blocks
-      forge_item_files_changed
-      forge_item_additions
-      forge_item_deletions
-      diff_rows
-      forge_item_diff_truncated
-      forge_item_merge_oid
-      forge_item_source_oid
-      forge_item_approvals
-      forge_item_change_requests
-      forge_item_reviews
-      merge_conflicts
-      merge_busy
-      review_verdict
-      review_busy
-      comment_target=forge_comment_target(comment_path, comment_line, comment_side)
-      staged_comments
-      comment_cap_reached
-      discussion
-      linked_note
-      discussion_clipped
-      note_scope
-      note_blocked
-      tree_path
-      tree_rev
-      tree_entries
-      tree_born
-      tree_truncated
-      tree_phase
-      file_path
-      file_text
-      file_binary
-      file_truncated
-      file_picture
-      file_width
-      file_height
-      file_note
-      file_header
-      file_phase
-      connected
-      dark
-    events
-      forge_open_repo -> forge_open_repo _
-      forge_close_repo -> forge_close_repo
-      forge_toggle_repo_menu -> forge_toggle_repo_menu
-      select_forge_tab -> select_forge_tab _
-      forge_open_item -> forge_open_item _
-      forge_close_item -> forge_close_item
-      forge_merge_submit -> forge_merge_submit
-      forge_review_pick -> forge_review_pick _
-      forge_review_submit -> forge_review_submit _
-      forge_comment_open -> forge_comment_open _ _ _
-      forge_comment_stage -> forge_comment_stage _
-      forge_comment_cancel -> forge_comment_cancel
-      forge_comment_drop -> forge_comment_drop _
-      forge_open_dir -> forge_open_dir _
-      forge_open_file -> forge_open_file _
-      open_message_link -> open_message_link _
-      copy_to_clipboard -> copy_to_clipboard _ _
+  col w=fill h=fill
+    if display_unavailable
+      text "Too much display data. Open a smaller directory or item." size=13.0
+    if !display_unavailable
+      col w=fill h=fill
+        if display_omitted > 0
+          text "{display_omitted} rows are not shown." size=12.5
+        if display_shortened
+          text "Some content is shortened for display." size=12.5
+        ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
+          with
+            display_omitted
+            org
+            about
+            tier
+            network_chain_id
+            connected_rpc
+            repos
+            list_phase
+            open_repo
+            repo_menu
+            repo_phase
+            branches
+            tab
+            items
+            forge_item_number
+            item_phase
+            forge_item_kind
+            forge_item_title
+            forge_item_state
+            forge_item_author
+            forge_item_branches
+            forge_item_body
+            forge_item_blocks
+            forge_item_files_changed
+            forge_item_additions
+            forge_item_deletions
+            diff_rows
+            forge_item_diff_truncated
+            forge_item_merge_oid
+            forge_item_source_oid
+            forge_item_approvals
+            forge_item_change_requests
+            forge_item_reviews
+            merge_conflicts
+            merge_busy
+            review_verdict
+            review_busy
+            comment_target=forge_comment_target(comment_path, comment_line, comment_side)
+            staged_comments
+            comment_cap_reached
+            discussion
+            linked_note
+            discussion_clipped
+            note_scope
+            note_blocked
+            tree_path
+            tree_rev
+            tree_entries
+            tree_born
+            tree_truncated
+            tree_phase
+            file_path
+            file_text
+            file_binary
+            file_truncated
+            file_picture
+            file_width
+            file_height
+            file_note
+            file_header
+            file_phase
+            connected
+            dark
+          events
+            forge_open_repo -> forge_open_repo _
+            forge_close_repo -> forge_close_repo
+            forge_toggle_repo_menu -> forge_toggle_repo_menu
+            select_forge_tab -> select_forge_tab _
+            forge_open_item -> forge_open_item _
+            forge_close_item -> forge_close_item
+            forge_merge_submit -> forge_merge_submit
+            forge_review_pick -> forge_review_pick _
+            forge_review_submit -> forge_review_submit _
+            forge_comment_open -> forge_comment_open _ _ _
+            forge_comment_stage -> forge_comment_stage _
+            forge_comment_cancel -> forge_comment_cancel
+            forge_comment_drop -> forge_comment_drop _
+            forge_open_dir -> forge_open_dir _
+            forge_open_file -> forge_open_file _
+            open_message_link -> open_message_link _
+            copy_to_clipboard -> copy_to_clipboard _ _
