@@ -249,7 +249,13 @@ async fn confirm_ownership(handle: &NodeHandle, channel: &str) -> EnsureChannelO
     EnsureChannelOutcome::Squatted("channel_owned_by_another_account")
 }
 
-async fn account_of_key(handle: &NodeHandle, key: Vec<u8>) -> Result<Option<u64>, String> {
+/// the account `key` belongs to, read from committed identity state over the
+/// command lane. shared with the huddle gates (`crate::call`, the node-proof
+/// mint), which admit only a key that holds an account.
+pub(crate) async fn account_of_key(
+    handle: &NodeHandle,
+    key: Vec<u8>,
+) -> Result<Option<u64>, String> {
     let (reply, rx) = futures::channel::oneshot::channel();
     handle
         .send(NodeCommand::Query {
@@ -299,7 +305,7 @@ async fn query_messages(
 /// query committed chat for the session channel's record — the projector reads
 /// it once, for `Channel.owner`. Rides the same command lane as
 /// [`query_messages`].
-async fn query_channel(
+pub(crate) async fn query_channel(
     handle: &NodeHandle,
     channel: &str,
 ) -> Result<Option<chat::Channel>, String> {

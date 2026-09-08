@@ -230,6 +230,12 @@ enum Lane {
     Submit,
     /// a fixed path that mutates the NODE ([`NODE_LEVEL_POSTS`]).
     NodeLevel,
+    /// `/v1/huddle/node-proof` ([`HUDDLE_PROOF_PATH`]) — this node signs that it
+    /// will route the SIGNER's huddle media. the handler reads [`SignedBy`]
+    /// and binds exactly that key, so possession is the right bar here:
+    /// a device pointed at a node it does not host has no operator credential
+    /// and still has to be able to join a huddle through it.
+    HuddleProof,
     Open,
 }
 
@@ -251,12 +257,15 @@ enum Authority {
 
 /// the exact mutating POST paths that mutate the NODE rather than module state:
 /// `/v1/log-filter` retunes this process's tracing filter (a `trace` fills the
-/// operator's disk through `daemon.log`), `/v1/invite` mints a bearer right to
-/// join this mesh for up to a year, and `/v1/huddle/node-proof` signs with
-/// THIS node's own mesh-identity key — none of which is a module write any
-/// acting key should be able to ask for. neither handler reads [`SignedBy`],
-/// which is exactly why none may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/huddle/node-proof"];
+/// operator's disk through `daemon.log`) and `/v1/invite` mints a bearer right
+/// to join this mesh for up to a year — neither is a module write any acting
+/// key should be able to ask for. neither handler reads [`SignedBy`], which is
+/// exactly why neither may be admitted on possession alone.
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+
+/// the huddle node-proof mint ([`Lane::HuddleProof`]). an exact path: the
+/// handler binds the verified signer, and the account check is its own.
+pub(crate) const HUDDLE_PROOF_PATH: &str = "/v1/huddle/node-proof";
 
 /// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
 /// carries its own signature inside the frame and stays open, and the other
@@ -287,6 +296,9 @@ fn lane_of(path: &str) -> Lane {
     }
     if NODE_LEVEL_POSTS.contains(&path) {
         return Lane::NodeLevel;
+    }
+    if path == HUDDLE_PROOF_PATH {
+        return Lane::HuddleProof;
     }
     match path == SUBMIT_PATH {
         true => Lane::Submit,
@@ -325,6 +337,9 @@ impl Lane {
             Lane::Submit => posts.then_some(Authority::Operator),
             // a pty/microVM on the HOST, and the two fixed node mutations.
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
+            // the proof binds the SIGNER; the handler refuses a key that holds
+            // no account, so possession is the gate's whole job here.
+            Lane::HuddleProof => posts.then_some(Authority::Acting),
             Lane::Open => None,
         }
     }
@@ -348,9 +363,12 @@ impl Lane {
             // json bodies and the log-filter string. `Open` never reaches here
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
-            Lane::Workspace | Lane::Term | Lane::Submit | Lane::NodeLevel | Lane::Open => {
-                DEFAULT_JSON_BODY_BYTES
-            }
+            Lane::Workspace
+            | Lane::Term
+            | Lane::Submit
+            | Lane::NodeLevel
+            | Lane::HuddleProof
+            | Lane::Open => DEFAULT_JSON_BODY_BYTES,
         }
     }
 }
@@ -539,23 +557,9 @@ pub(crate) async fn signed_write_guard(
         // error, and the cap is the likelier of the two by far.
         Err(_) => return refuse(&path, WriteRefusal::BodyOverCap),
     };
-    // the node key SALTS the signature: a mutation signed for this node cannot
-    // be replayed against another node the same key acts on. an embedded
-    // daemon with no consensus identity has nothing to salt with — refuse
-    // rather than bind the empty salt, which would verify a signature minted
-    // for ANY such keyless daemon.
-    let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
-        return refuse(&path, WriteRefusal::NodeUnidentified);
-    };
-    let verified = verify_pop(&headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
-        request_message(method.as_str(), &path_and_query, &node_key, ts, &body)
-    });
-    let acting = match verified {
+    let acting = match verify_signed_request(&handle, &method, &path_and_query, &headers, &body) {
         Ok(key) => key,
-        Err(PopError::MissingAuth) => return refuse(&path, WriteRefusal::SignatureMissing),
-        Err(PopError::Stale) => return refuse(&path, WriteRefusal::SignatureStale),
-        Err(PopError::BadKey) => return refuse(&path, WriteRefusal::SignatureMalformed),
-        Err(PopError::BadSig) => return refuse(&path, WriteRefusal::SignatureInvalid),
+        Err(refusal) => return refuse(&path, refusal),
     };
     // possession is the WHOLE proof on an `Acting` lane, because the module
     // downstream reads the key and decides. a node-level handler reads nothing,
@@ -572,6 +576,38 @@ pub(crate) async fn signed_write_guard(
     next.run(req).await
 }
 
+/// the data-plane PoP over ONE request, answering the key that signed it.
+///
+/// the node key SALTS the signature: a mutation signed for this node cannot
+/// be replayed against another node the same key acts on. an embedded
+/// daemon with no consensus identity has nothing to salt with — refuse
+/// rather than bind the empty salt, which would verify a signature minted
+/// for ANY such keyless daemon.
+///
+/// the guard above runs it on every gated route; the realtime upgrades
+/// (`crate::call`) run it on a `GET` with an empty body, because a websocket
+/// upgrade is admitted by the handler, not by this middleware.
+pub(crate) fn verify_signed_request(
+    handle: &NodeHandle,
+    method: &Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Vec<u8>, WriteRefusal> {
+    let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
+        return Err(WriteRefusal::NodeUnidentified);
+    };
+    let verified = verify_pop(headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
+        request_message(method.as_str(), path_and_query, &node_key, ts, body)
+    });
+    verified.map_err(|error| match error {
+        PopError::MissingAuth => WriteRefusal::SignatureMissing,
+        PopError::Stale => WriteRefusal::SignatureStale,
+        PopError::BadKey => WriteRefusal::SignatureMalformed,
+        PopError::BadSig => WriteRefusal::SignatureInvalid,
+    })
+}
+
 /// the write half: one refusal body, the plane's `reason` token, and nothing
 /// about the URI.
 ///
@@ -581,7 +617,7 @@ pub(crate) async fn signed_write_guard(
 /// 50th, carrying `occurrences` — the counter is the diagnosis anyway. keyed by
 /// the reason token, which comes from a FIXED variant set, so no caller string
 /// can vary the key to mint unbounded "first occurrences".
-fn refuse(path: &str, refusal: WriteRefusal) -> Response {
+pub(crate) fn refuse(path: &str, refusal: WriteRefusal) -> Response {
     static REFUSED: crate::log::Latch = crate::log::Latch::new(50);
     if let Some(occurrences) = REFUSED.hit(refusal.reason()) {
         match plane_of(path) {
@@ -830,6 +866,10 @@ mod tests {
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
+            // the huddle proof binds the SIGNER, and a remote device has no
+            // operator credential to offer: possession, then the handler's
+            // own account check.
+            (Method::POST, "/v1/huddle/node-proof", Authority::Acting),
             // the frameless op lane: the framed op is re-signed as the NODE,
             // never the caller (#1808), so it takes the same operator-only bar.
             (Method::POST, "/v1/submit", Authority::Operator),
