@@ -18,8 +18,35 @@ UNAME_S := $(shell uname -s)
 
 .PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
+## the system packages a build needs and cargo cannot install: rustup (the
+## pinned toolchain and its wasm32 target install themselves through it), a C
+## compiler and pkg-config (aws-lc-sys, libz-sys), and on Linux libclang
+## (bindgen, for the app's camera bindings) and ALSA's headers (the app's
+## audio). Checked up front, so a fresh machine hears the one install line
+## instead of a linker error twenty minutes into the build.
+.PHONY: prereqs
+prereqs:
+	@missing=""; \
+	command -v rustup >/dev/null || missing="$$missing rustup"; \
+	command -v cc >/dev/null || missing="$$missing cc"; \
+	command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
+	if [ "$(UNAME_S)" = Linux ]; then \
+	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
+	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
+	fi; \
+	[ -z "$$missing" ] || { \
+	  echo "missing build prerequisites:$$missing" >&2; \
+	  if [ "$(UNAME_S)" = Darwin ]; then \
+	    echo "  xcode-select --install && brew install pkg-config" >&2; \
+	  else \
+	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
+	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
+	  fi; \
+	  echo "  rustup: https://rustup.rs" >&2; \
+	  exit 1; }
+
 ## build every workspace crate (the default target)
-all:
+all: prereqs
 	$(CARGO) build $(LOCKED) --workspace
 
 ## the app dev loop: seed the "demo" localnet if it does not exist yet
@@ -79,7 +106,7 @@ labs-gate:
 	$(CARGO) check $(LOCKED) --manifest-path crates/labs/Cargo.toml
 
 ## release build of the networked node (the app-facing daemon surface)
-node:
+node: prereqs
 	$(CARGO) build $(LOCKED) --release -p node-bin
 
 ## release build of the untrusted UDP coordinator
@@ -172,7 +199,7 @@ ifeq ($(UNAME_S),Darwin)
 ##                          before the upload — Apple rejects an ad-hoc
 ##                          signature.
 ## The release recipe is app/README.md § "Release build".
-app: ice-tool views
+app: prereqs ice-tool views
 	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## `make app-release` for a build that leaves this machine: refuses unless a
@@ -207,7 +234,7 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 install: install-node install-app
 
 ## build the desktop app binary and the views it loads
-app: views
+app: prereqs views
 	$(CARGO) build $(LOCKED) --release -p ducktape-app
 
 ## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
@@ -240,7 +267,7 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 ## (target/<profile>/modules), so installing the node installs that set
 ## beside the installed binary. `--target-dir target` keeps the install build
 ## in the checkout's target dir, which is where the staged set lands.
-install-node:
+install-node: prereqs
 	$(CARGO) install --path bin/node --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r target/release/modules "$(CARGO_BIN)/modules"
@@ -282,7 +309,9 @@ test: wasm-modules-check wasm-embed-check
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
 # browser half of `crates/authpage`'s contract, dependency-free under node.
-	node ops/auth-page/test.mjs
+# Skips with a notice where there is no node, like the bun line below.
+	@if command -v node >/dev/null; then node ops/auth-page/test.mjs; \
+	else echo "[test] skipped ops/auth-page/test.mjs — node (nodejs) is not installed" >&2; fi
 # demo-clear's refusal line against a stub admin surface: the reason token it
 # prints has to be the node's own, not one invented in the script. Needs `bun`
 # (so does demo-clear itself); the script skips with a notice where there is
