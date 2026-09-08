@@ -16,7 +16,7 @@
 //! that holds none of them cannot leak one — and a view that traps shows why
 //! in its place instead of taking the window with it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -27,7 +27,10 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector, widget, window};
 use ui_lang_runtime::view_tree::{self, Inputs, Output, Pictures, Surfaces};
 use ui_lang_wire as wire;
 use wasmtime::component::{Component, Linker, TypedFunc};
-use wasmtime::{Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Cache, CacheConfig, Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits,
+    StoreLimitsBuilder,
+};
 
 /// What a module view asked the app to do: `kind` is the operation
 /// (`vote`, `execute`), `detail` the guest's JSON for it.
@@ -2339,6 +2342,80 @@ fn hex_short(hash: &[u8; 32]) -> String {
     hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+const COMPILED_VIEW_LIMIT: usize = 16;
+const COMPILED_VIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct ViewCodeCache {
+    entries: VecDeque<CompiledView>,
+}
+
+struct CompiledView {
+    hash: [u8; 32],
+    source_bytes: usize,
+    component: Arc<Component>,
+}
+
+impl ViewCodeCache {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<Component>> {
+        let index = self.entries.iter().position(|entry| &entry.hash == hash)?;
+        let entry = self.entries.remove(index)?;
+        let component = entry.component.clone();
+        self.entries.push_back(entry);
+        Some(component)
+    }
+
+    fn insert(&mut self, entry: CompiledView) {
+        if entry.source_bytes > COMPILED_VIEW_SOURCE_BYTES {
+            return;
+        }
+        let mut bytes: usize = self.entries.iter().map(|entry| entry.source_bytes).sum();
+        loop {
+            let fits = self.entries.len() < COMPILED_VIEW_LIMIT
+                && bytes + entry.source_bytes <= COMPILED_VIEW_SOURCE_BYTES;
+            if fits {
+                break;
+            }
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            bytes -= old.source_bytes;
+        }
+        self.entries.push_back(entry);
+    }
+}
+
+fn compiled_view(bytes: &[u8]) -> Result<Arc<Component>, String> {
+    static CODE: OnceLock<Mutex<ViewCodeCache>> = OnceLock::new();
+    compile_view(engine(), CODE.get_or_init(Mutex::default), bytes)
+}
+
+// Cache code only: every load still creates its own Store, instance and assets.
+// The cache belongs to this one Engine. Compile outside the lock so unrelated
+// views can prepare concurrently; a competing result adopts the existing entry.
+fn compile_view(
+    engine: &Engine,
+    cache: &Mutex<ViewCodeCache>,
+    bytes: &[u8],
+) -> Result<Arc<Component>, String> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes).into();
+    if let Some(component) = cache.lock().expect("view code cache").get(&hash) {
+        return Ok(component);
+    }
+    let component = Arc::new(Component::new(engine, bytes).map_err(|error| error.to_string())?);
+    let mut cache = cache.lock().expect("view code cache");
+    if let Some(existing) = cache.get(&hash) {
+        return Ok(existing);
+    }
+    cache.insert(CompiledView {
+        hash,
+        source_bytes: bytes.len(),
+        component: component.clone(),
+    });
+    Ok(component)
+}
+
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -2351,6 +2428,19 @@ fn engine() -> &'static Engine {
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        match crate::backend::cache_dir() {
+            Ok(directory) => {
+                let mut cache = CacheConfig::new();
+                cache.with_directory(directory.join("view-code"));
+                match Cache::new(cache) {
+                    Ok(cache) => {
+                        config.cache(Some(cache));
+                    }
+                    Err(error) => tracing::warn!(reason = "view_cache_unavailable", %error),
+                }
+            }
+            Err(error) => tracing::warn!(reason = "view_cache_directory_unavailable", %error),
+        }
         let engine = Engine::new(&config).expect("wasmtime engine");
         // The clock every tick's deadline is measured against: one thread
         // for the process, never stopped.
@@ -2665,8 +2755,7 @@ impl Guest {
         ui_lang_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
         let engine = engine();
-        let component =
-            Component::new(engine, bytes).map_err(|error| format!("{shown}: {error}"))?;
+        let component = compiled_view(bytes).map_err(|error| format!("{shown}: {error}"))?;
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
         // instances — the app, the stub adapters `cargo ice bundle` gave it,
@@ -3215,6 +3304,44 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn view_code_reuses_identical_bytes_but_not_changed_code() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let first = compile_view(&engine, &cache, b"(component)").unwrap();
+        let repeated = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &repeated),
+            "warm loads must reuse compiled code"
+        );
+        let changed = compile_view(&engine, &cache, b"(component (type (func)))").unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(compile_view(&engine, &cache, b"invalid wasm").is_err());
+        assert_eq!(cache.lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn view_code_evicts_old_entries_and_bounds_retained_source_size() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let oldest = compile_view(&engine, &cache, b"(component)").unwrap();
+        for i in 0..COMPILED_VIEW_LIMIT {
+            let source = format!("(component) ;; entry {i}");
+            compile_view(&engine, &cache, source.as_bytes()).unwrap();
+        }
+        assert_eq!(cache.lock().unwrap().entries.len(), COMPILED_VIEW_LIMIT);
+        let revisited = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(!Arc::ptr_eq(&oldest, &revisited));
+        let mut retained = cache.lock().unwrap();
+        retained.insert(CompiledView {
+            hash: [99; 32],
+            source_bytes: COMPILED_VIEW_SOURCE_BYTES,
+            component: revisited,
+        });
+        assert_eq!(retained.entries.len(), 1);
+        assert_eq!(retained.entries[0].hash, [99; 32]);
+    }
 
     fn event(kind: &str, detail: &str) -> ModuleViewEvent {
         ModuleViewEvent {
