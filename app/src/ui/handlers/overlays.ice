@@ -144,31 +144,6 @@ on global_key_pressed(event)
   return if !palette_open
   task widget focus #workspace-tabs/overlays/palette-input window=window_target(console_win)
 
-// THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no
-// key handling, so Page Down over Settings moved nothing — and neither did
-// Home or End, on any screen. One decide-fn turns the press into a pixel delta
-// and every full-pane content scroll takes the same delta: the shell mounts
-// exactly ONE of these at a time (`match tab` in WorkspaceTabs), and
-// `scroll-by` against a pane that is not on screen is a no-op, so naming them
-// all IS the routing — the same shape as the escape ladder above, where the
-// keepers do the dispatch.
-//
-// `topmost_overlay` is the SAME reading the escape ladder takes, not a second
-// derivation of it: with the palette or the bell up, the pane the reader can
-// see is not the one a `scroll-by` would move, and `content_scroll_step`
-// answers 0.0 for every key while any layer is over the content.
-//
-// The multi-pane screens (chat, pages, files, forge, the explorer) are absent
-// on purpose: they show two or three scrolls side by side and nothing here can
-// say which one the reader means. Giving them a keyboard scroll is a focus
-// design, not a bug fix, and guessing a pane would move the wrong one. The
-// module-owned views (Node among them) are absent because their scrolls are
-// the guest's, not this tree's.
-on content_scroll_key(event)
-  let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu))
-  return if content_scroll == 0.0
-  task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
-
 on palette_changed(next)
   invalidate lane=palette_search
   palette_draft = next

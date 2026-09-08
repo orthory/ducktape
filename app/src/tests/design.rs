@@ -403,9 +403,12 @@ fn shell_uses_canonical_glass_and_opaque_content() {
 
     // The endpoint field is GONE from Settings — the launch window's picker
     // owns which network; Settings keeps only Reconnect / Switch network.
-    assert!(!SCREENS.contains("#rpc"));
-    assert!(SCREENS.contains("emit(switch_network)"));
-    assert!(SCREENS.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
+    let settings = inlined(include_str!(
+        "../../../crates/views/settings/src/ui/settings.ice"
+    ));
+    assert!(!settings.contains("#rpc"));
+    assert!(settings.contains("emit(switch_network)"));
+    assert!(settings.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
     // Both chat composers wear the SAME plate — and now they wear the same
     // SOURCE: one `ChatComposer` mounted twice (ducktape-ui#697), so the
@@ -659,17 +662,19 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert!(shell.contains("bg=alert_bg border=alert_line"));
     assert!(shell.contains("bg=alert_dot r=3.5"));
     assert!(!shell.contains("danger_"));
+    let settings = inlined(include_str!(
+        "../../../crates/views/settings/src/ui/settings.ice"
+    ));
     assert!(
-        SCREENS.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false")
+        settings.contains("KeyValueRow label=\"Key state\" value=settings_key_state last=false")
     );
-    assert!(SCREENS.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=false"));
+    assert!(settings.contains("KeyValueRow label=\"Key path\" value=settings_key_path last=false"));
 
     for target in [
         "rename_channel_submit",
         "add_channel_member_submit",
         "fs_mkdir_submit",
         "fs_new_file_submit",
-        "account_rename_submit",
     ] {
         let kit_components = inlined(include_str!("../ui/components/kit.ice"));
         let action = SCREENS
@@ -1221,9 +1226,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/node/src/ui/kit.ice",
         "../../crates/views/explorer/src/ui/app.ice",
         "../../crates/views/explorer/src/ui/kit.ice",
+        "../../crates/views/settings/src/ui/app.ice",
+        "../../crates/views/settings/src/ui/settings.ice",
+        "../../crates/views/settings/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
-        "ui/screens/settings.ice",
         "ui/screens/shell.ice",
         "ui/screens/storage.ice",
         "ui/view.ice",
@@ -1408,10 +1415,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // on a step with nothing else on it — the list cannot be longer and
         // cannot change while it is up.
         ("components/onboarding.ice", "for pair in rows"),
-        // The account's key associations: how many devices, wallets and
-        // passkeys ONE account holds, moved only by an add-key ticket or a
-        // removal — a handful, and never a scroll.
-        ("screens/settings.ice", "for row in account_key_rows"),
         ("components/onboarding.ice", "for step in steps"),
         ("components/forge.ice", "for item in items"),
         // 2. WITHIN ONE ROW — one message's blocks and reactions, one

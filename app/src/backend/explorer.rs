@@ -396,68 +396,6 @@ pub fn close_message_action(close: bool, current: crate::MessageAction) -> crate
     }
 }
 
-/// One keyboard "page", in pixels. iced's scrollable reports its viewport only
-/// through `on_scroll`, so a pane that has never been scrolled cannot tell us
-/// its own height and there is nothing to page BY — a constant is the only
-/// reading available. It is deliberately shorter than the shortest content band
-/// the console can render (the window's own minimum is 820x540, less a 40px
-/// titlebar and a 50px screen header), so Page Down always overlaps and can
-/// never skip past unread content. Undershooting costs a keypress; overshooting
-/// loses text.
-const KEY_PAGE_STEP: f64 = 400.0;
-/// Larger than any content the console can stack. `scroll_by` clamps the result
-/// to the pane's own extent, so this IS Home/End — no content measurement, no
-/// second operation kind.
-const KEY_SCROLL_EXTREME: f64 = 1.0e9;
-
-/// The vertical scroll, in pixels, that a key press asks the console's content
-/// pane for — `0.0` for every key the pane does not own.
-///
-/// iced's `scrollable` answers the wheel, the drag rail and touch; it has no
-/// focus and no keyboard handling at all (0.14's widget matches on
-/// `Event::Keyboard` only to track modifiers for shift-wheel), so the app is
-/// the only layer that can route a keyboard scroll at one. THIS is the whole
-/// decision — three conditions, in one place, rather than a guard per key:
-///
-/// 1. **A focused widget's key is not the pane's.** The subscription feeding
-///    this is `status=ignored`, so anything a focused widget consumed never
-///    arrives — which covers Home/End (iced's `text_input` captures both,
-///    `text_input.rs:1119`/`1139`) and every key the rich composers take. It
-///    does NOT cover the arrows: single-line `text_input` falls through
-///    Up/Down to `_ => {}` (`text_input.rs:1245`) without capturing them, so a
-///    pane that claimed an arrow scrolled the page out from under a live
-///    caret. Nothing in this stack can read widget focus (ui-lang has no focus
-///    predicate — see the same note on `composer_focus`), so the pane cannot
-///    tell an arrow meant for an input from one meant for itself, and an arrow
-///    inside an input belongs to the input. The pane claims only Page Up/Down
-///    and Home/End: keys no focused widget in this console owns silently.
-/// 2. **A transient layer's key is not the pane's.** `topmost_overlay` is the
-///    reading — with the palette or the bell up, the pane the reader can see
-///    is not the one this would move.
-/// 3. **A chord is not the pane's.** Any modifier disqualifies the press;
-///    chords belong to their own routers (`palette_key_action`, the composer
-///    marks, the page history), and a keyboard-selection chord like
-///    Shift+PageDown must not also move the pane.
-pub fn content_scroll_step(
-    logical: iced::keyboard::Key,
-    modifiers: iced::keyboard::Modifiers,
-    overlay: String,
-) -> f64 {
-    use iced::keyboard::{Key, key::Named};
-    let layer_over_the_pane = !overlay.is_empty();
-    let chord = !modifiers.is_empty();
-    if layer_over_the_pane || chord {
-        return 0.0;
-    }
-    match logical {
-        Key::Named(Named::PageDown) => KEY_PAGE_STEP,
-        Key::Named(Named::PageUp) => -KEY_PAGE_STEP,
-        Key::Named(Named::End) => KEY_SCROLL_EXTREME,
-        Key::Named(Named::Home) => -KEY_SCROLL_EXTREME,
-        _ => 0.0,
-    }
-}
-
 /// True when the live connection is in a state the shell should banner:
 /// the stream is down, retrying, or a resync failed and is backing off.
 pub fn connection_degraded(status: &str) -> bool {
@@ -488,6 +426,5 @@ pub fn is_copy_chord(
     modifiers: iced::keyboard::Modifiers,
 ) -> bool {
     use iced::keyboard::key::{Code, Physical};
-    modifiers.command()
-        && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
+    modifiers.command() && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
 }

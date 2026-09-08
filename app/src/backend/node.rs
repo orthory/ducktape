@@ -1281,7 +1281,7 @@ impl AccountData {
 
 /// One key association as the settings card lists it: the scheme token the
 /// CLI prints, the hex key, the label ("" when none) and the admission time.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AccountKeyRow {
     pub scheme: String,
     pub pubkey: String,

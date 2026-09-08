@@ -22,9 +22,9 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node and Explorer tabs are not native: each
-is an Ice application under `crates/views` (`governance`, `members`, `agents`,
-`node`, `explorer`) compiled
+The Approvals, Members, Agents, Node, Explorer and Settings tabs are not
+native: each is an Ice application under `crates/views` (`governance`,
+`members`, `agents`, `node`, `explorer`, `settings`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -45,7 +45,11 @@ Activity tab declares `node_log_timeline` as a host surface, and the app
 paints its own retained log ring there (`surfaces_of` in `module_view.rs`),
 queuing what the reader does in it for the handler to drain. A view that
 needs the network asks through an intent and reads the answer off its props:
-the Explorer's workspace search is run by the app on the view's behalf. The
+the Explorer's workspace search is run by the app on the view's behalf. A
+view keeps its own drafts and hands the app only what the reader submitted:
+Settings' rename, key and ticket fields cross as intents, the signing seat
+crosses in as a flag (the password never leaves the app), and a committed op
+tells the view which drafts it consumed. The
 views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 

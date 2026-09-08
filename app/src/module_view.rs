@@ -326,6 +326,129 @@ pub fn explorer_intent(event: &ModuleViewEvent) -> crate::ExplorerIntent {
     }
 }
 
+// ---------- the settings seat ----------
+
+/// The Settings tab: this device's preferences, the account and its keys, the
+/// signing seat and the workspace's lifecycle, drawn by the `settings` view.
+/// The roster folds to the readings the card shows, the mutation phase to
+/// the two flags the buttons gate on, and the password to whether the seat is
+/// held — the password itself never crosses. Its intents come back one per
+/// act (`settings_intent`), carrying only what the reader typed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn settings_view(
+    dark: bool,
+    connected: bool,
+    loading: bool,
+    status: &str,
+    mutation_phase: crate::MutationPhase,
+    appearance: crate::Appearance,
+    desktop_notifications: bool,
+    password: &str,
+    account_name: &str,
+    network_name: &str,
+    connected_rpc: &str,
+    account_ceremony_phase: &str,
+    account_ceremony_qr: &str,
+    account_ceremony_detail: &str,
+    account_ceremony_left: &str,
+    settings_key_state: &str,
+    settings_key_path: &str,
+    settings_open_tabs: i64,
+    members_rows: &[crate::backend::MemberRow],
+    members_answered: bool,
+    account_number: &str,
+    account_renaming: bool,
+    account_exists: bool,
+    account_keys: i64,
+    account_key_rows: &[crate::backend::AccountKeyRow],
+    account_busy: bool,
+    account_ticket: &str,
+    drafts_cleared: i64,
+    drafts_scope: &str,
+) -> Element<'static, ModuleViewEvent> {
+    let appearance = match appearance {
+        crate::Appearance::System => "system",
+        crate::Appearance::Light => "light",
+        crate::Appearance::Dark => "dark",
+    };
+    let props = serde_json::json!({
+        "dark": dark,
+        "connected": connected,
+        "loading": loading,
+        "status": status,
+        "busy": mutation_phase != crate::MutationPhase::Idle,
+        "recovering": mutation_phase == crate::MutationPhase::Recovering,
+        "appearance": appearance,
+        "desktop_notifications": desktop_notifications,
+        "unlocked": !password.is_empty(),
+        "account_name": account_name,
+        "network_name": network_name,
+        "connected_rpc": connected_rpc,
+        "account_ceremony_phase": account_ceremony_phase,
+        "account_ceremony_qr": account_ceremony_qr,
+        "account_ceremony_detail": account_ceremony_detail,
+        "account_ceremony_left": account_ceremony_left,
+        "settings_key_state": settings_key_state,
+        "settings_key_path": settings_key_path,
+        "settings_open_tabs": settings_open_tabs,
+        "tier": crate::backend::member_tier(members_rows),
+        "admin": crate::backend::members_is_admin(members_rows),
+        "members_line": crate::backend::members_summary(connected, members_rows),
+        "members_answered": members_answered,
+        "account_number": account_number,
+        "account_renaming": account_renaming,
+        "account_exists": account_exists,
+        "account_keys": account_keys,
+        "account_key_rows": account_key_rows,
+        "account_busy": account_busy,
+        "account_ticket": account_ticket,
+        "drafts_cleared": drafts_cleared,
+        "drafts_scope": drafts_scope,
+    });
+    module_view(
+        "settings",
+        serde_json::to_vec(&props).expect("props encode"),
+    )
+}
+
+pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
+    use crate::SettingsIntent as Intent;
+    match event.kind.as_str() {
+        "tab" => Intent::Tab,
+        "reconnect" => Intent::Reconnect,
+        "switch_network" => Intent::SwitchNetwork,
+        "unlock" => Intent::Unlock,
+        "lock" => Intent::Lock,
+        "rename" => Intent::Rename,
+        "create" => Intent::Create,
+        "key_add" => Intent::KeyAdd,
+        "join" => Intent::Join,
+        "key_remove" => Intent::KeyRemove,
+        "passkey" => Intent::Passkey,
+        "passkey_desktop" => Intent::PasskeyDesktop,
+        "ceremony_cancel" => Intent::CeremonyCancel,
+        "wallet" => Intent::Wallet,
+        "login" => Intent::Login,
+        "clear_tabs" => Intent::ClearTabs,
+        "forget" => Intent::Forget,
+        "light" => Intent::Light,
+        "dark" => Intent::Dark,
+        "notifications" => Intent::Notifications,
+        _ => Intent::Copy,
+    }
+}
+
+/// The rail tab a `tab` intent names; the two the settings cards link to.
+pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
+    match event_text(event, "tab").as_str() {
+        "members" => crate::ShellTab::Members,
+        _ => crate::ShellTab::Node,
+    }
+}
+
 /// The native log ring behind the node view's slot: the timeline the app
 /// last drew the tab with, and what the reader did in it since the app
 /// last drained. One per process, like the view it belongs to.
@@ -378,6 +501,29 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "agents" => &[],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
+        "settings" => &[
+            "tab",
+            "reconnect",
+            "switch_network",
+            "unlock",
+            "lock",
+            "rename",
+            "create",
+            "key_add",
+            "join",
+            "key_remove",
+            "passkey",
+            "passkey_desktop",
+            "ceremony_cancel",
+            "wallet",
+            "login",
+            "copy",
+            "clear_tabs",
+            "forget",
+            "light",
+            "dark",
+            "notifications",
+        ],
         _ => &[],
     }
 }
@@ -1475,6 +1621,58 @@ mod tests {
             [ModuleViewEvent {
                 kind: "refresh".into(),
                 detail: "null".into(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Settings view through the host: the facts, then a
+    /// rename that leaves as an intent carrying the trimmed name — and the
+    /// password crosses in as a flag only.
+    #[test]
+    fn the_staged_settings_view_boots_takes_the_facts_and_sends_a_rename() {
+        let Some(staged) = staged("settings") else {
+            return;
+        };
+        let mut guest = Guest::load_from("settings", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "dark": false, "connected": true, "loading": false, "status": "Connected",
+                "busy": false, "recovering": false, "appearance": "system",
+                "desktop_notifications": true, "unlocked": true,
+                "account_name": "duck", "network_name": "testnet",
+                "connected_rpc": "http://127.0.0.1:1",
+                "account_ceremony_phase": "", "account_ceremony_qr": "",
+                "account_ceremony_detail": "", "account_ceremony_left": "",
+                "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
+                "settings_open_tabs": 2, "tier": "validator", "admin": true,
+                "members_line": "3 humans · 1 agent", "members_answered": true,
+                "account_number": "42", "account_renaming": false, "account_exists": true,
+                "account_keys": 2,
+                "account_key_rows": [{"scheme": "ed25519", "pubkey": "ab12cd34", "label": "laptop"}],
+                "account_busy": false, "account_ticket": "",
+                "drafts_cleared": 0, "drafts_scope": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["Settings", "Theme"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        guest.deliver(Output::Activate(button_message(&guest, "Account")));
+        guest.redraw(&props);
+        guest.deliver(Output::Activate(button_message(&guest, "Copy number")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "copy".into(),
+                detail: r#"{"text":"42","label":"Number copied"}"#.into(),
             }]
         );
         assert!(guest.fault.is_none());

@@ -523,62 +523,11 @@ view
         // the app paints from `node_log_timeline` (module_view.rs).
         node:
           extern node_view(dark, connected, members_is_admin(members_rows), member_tier(members_rows), status, loading, module_rows, node_key, node_data_dir, node_height, node_checkpoint, node_last_finalized, node_reachable_label, node_quorum_label, node_version, node_root_hash, sync_label(node_phase, node_sync_applied, node_sync_target), node_phase_since, node_sync_retries, node_sync_failures, node_sync_last_error, node_peers, wall_now, node_log_timeline, connected_rpc) #node -> node_view_event _
+        // Settings is a MODULE-OWNED VIEW too: the facts go in as props — the
+        // signing seat as a flag, never the password — and every act comes
+        // back as an intent the handler signs. The drafts are the view's.
         settings:
-          SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
-            with
-              account_name
-              network_name
-              connected_rpc
-              account_ceremony_phase
-              account_ceremony_qr
-              account_ceremony_detail
-              account_ceremony_left
-              settings_key_state
-              settings_key_path
-              settings_open_tabs
-              members_rows
-              members_answered
-              account_number
-              account_renaming
-              account_exists
-              account_keys
-              account_key_rows
-              account_busy
-              account_ticket
-              appearance
-              desktop_notifications
-              password
-              status
-              loading
-              connected
-              mutation_phase
-            events
-              select_shell_tab -> select_shell_tab _
-              reconnect -> reconnect
-              account_name_draft_changed -> account_name_draft_changed _
-              account_rename_submit -> account_rename_submit
-              account_create_draft_changed -> account_create_draft_changed _
-              account_create_submit -> account_create_submit
-              account_key_draft_changed -> account_key_draft_changed _
-              account_key_label_draft_changed -> account_key_label_draft_changed _
-              account_key_add_submit -> account_key_add_submit
-              account_join_draft_changed -> account_join_draft_changed _
-              account_key_join_submit -> account_key_join_submit
-              account_key_remove -> account_key_remove _
-              account_passkey_submit -> account_passkey_submit
-              account_passkey_desktop -> account_passkey_desktop
-              account_ceremony_cancel -> account_ceremony_cancel
-              account_wallet_submit -> account_wallet_submit
-              account_login_submit -> account_login_submit
-              copy_to_clipboard -> copy_to_clipboard _ _
-              settings_clear_tabs -> settings_clear_tabs
-              switch_network -> switch_network
-              settings_unlock_submit -> settings_unlock_submit _
-              lock_session -> lock_session
-              forget_workspace_submit -> forget_workspace_submit
-              set_appearance_light -> set_appearance_light
-              set_appearance_dark -> set_appearance_dark
-              set_desktop_notifications -> set_desktop_notifications _
+          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, settings_open_tabs, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
         // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
         // the last search go in as props; a refresh, a search, its clearing
         // and a copy come back as intents the handler acts on.

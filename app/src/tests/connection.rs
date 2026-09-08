@@ -689,11 +689,10 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 /// Exemptions are named with their reason, never left implicit.
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
-    /// Settings owns connection repair and remains useful while the node is
-    /// down instead of claiming the network's module contents are empty. (Node,
-    /// which owns the daemon diagnostics, is a module-owned view now and is
-    /// not in this inventory.)
-    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+    /// Settings (which owns connection repair and stays useful with the node
+    /// down) and Node (which owns the daemon diagnostics) are module-owned
+    /// views now and not in this inventory; every native data screen answers.
+    const EXEMPT: [&str; 0] = [];
 
     let mut screens: Vec<&str> = SCREENS
         .lines()
@@ -710,7 +709,6 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
             "FilesScreen",
             "ForgeScreen",
             "PagesScreen",
-            "SettingsScreen",
             "ShellScreen",
         ],
         "a screen appeared or vanished: decide what it says with the node down, \
@@ -755,7 +753,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// rows)` is already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
-    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+    const EXEMPT: [&str; 0] = [];
 
     for source in [
         include_str!("../ui/screens/storage.ice"),
@@ -843,12 +841,10 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         })
         .collect();
     sites.sort_unstable();
-    // Approvals', Members' and Agents' subtitles are their module views' now,
-    // gated the same way in `crates/views/*`.
-    let mut expected = [
-        "members_summary(connected, members_rows)",
-        "fs_counts_summary(connected, listed, entries)",
-    ];
+    // Approvals', Members', Agents' and Settings' subtitles are their module
+    // views' now, gated the same way in `crates/views/*` (Settings' members
+    // line is folded host-side, `members_summary` in `module_view.rs`).
+    let mut expected = ["fs_counts_summary(connected, listed, entries)"];
     expected.sort_unstable();
 
     assert_eq!(
