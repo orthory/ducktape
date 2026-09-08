@@ -141,7 +141,10 @@ pub fn chat_live_agents(
                 if record["channel_id"].as_str() != Some(channel_id.as_str()) {
                     continue;
                 }
-                let dispatch = record["dispatch_id"].as_str().unwrap_or_default().to_string();
+                let dispatch = record["dispatch_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
                 seen.push(dispatch.clone());
                 if watchers.contains_key(&dispatch) {
                     continue;
@@ -218,8 +221,7 @@ async fn watch_live_output(
             .await
             .map_err(|error| format!("could not open the node event stream: {error}"))?;
         let topic = format!("run-output:{dispatch}");
-        let subscribe =
-            serde_json::json!({"op": "subscribe", "topics": [topic], "token": token});
+        let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic], "token": token});
         socket
             .send(Message::Text(subscribe.to_string()))
             .await

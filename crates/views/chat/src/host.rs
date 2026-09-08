@@ -486,7 +486,12 @@ pub fn send_open_thread(seq: i64) -> bool {
 }
 
 pub fn send_cancel_run(run_id: &str) -> bool {
-    notify("chat.cancel_run", &RunId { run_id: run_id.into() })
+    notify(
+        "chat.cancel_run",
+        &RunId {
+            run_id: run_id.into(),
+        },
+    )
 }
 
 fn selection(operation: &str, seq: i64, body: &str, rev: i64) -> bool {
@@ -650,6 +655,22 @@ pub(crate) fn seq_in_copy_range(
         return false;
     }
     range_seqs(anchor, head).is_some_and(|(low, high)| seq >= low && seq <= high)
+}
+
+/// The stream and the runs live in it, as one value: the timeline memo
+/// hashes its one dependency, so the two lists that draw together cross
+/// the boundary together.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct Timeline {
+    pub messages: Vec<ChatMessage>,
+    pub live_agents: Vec<LiveAgentRow>,
+}
+
+pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveAgentRow]) -> Timeline {
+    Timeline {
+        messages: messages.to_vec(),
+        live_agents: live_agents.to_vec(),
+    }
 }
 
 pub fn copy_range_count(messages: &[ChatMessage], anchor: i64, head: i64) -> i64 {

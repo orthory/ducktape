@@ -58,7 +58,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
   live_agents = []
-  stream replace lane=live_agents chat_live_agents(connected_rpc, channel_id) -> live_agents_event _
   active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
@@ -123,7 +122,9 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_generation = chat_generation + 1
   // Reads the room back from state, like `choose_dm` does: `active_channel =
   // channel_id` above already moved the payload.
-  run replace lane=chat_load load_chat_hit(connected_rpc, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
+  parallel
+    run replace lane=chat_load load_chat_hit(connected_rpc, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
+    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
 
 // THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
 // true for the entire switch it starts — so the second click of a fast A→B→C
@@ -159,7 +160,6 @@ on choose_channel(id)
   // highlight, then paints an empty loading state until its root window lands.
   active_channel = id
   live_agents = []
-  stream replace lane=live_agents chat_live_agents(connected_rpc, id) -> live_agents_event _
   active_channel_name = next_channel.name
   // BOTH GATE FACTS RIDE THE CLICK. `post_refusal` is recomputed here, and
   // computing it from the room she LEFT is how a public channel came up
@@ -219,7 +219,9 @@ on choose_channel(id)
   //
   // One root-window read is the whole switch. Emptying `messages` above also
   // unmounts the old scroll state, so the arriving room starts at its tail.
-  run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
+  parallel
+    run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
+    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -262,7 +264,6 @@ on choose_dm(peer_key)
   unread_boundary = next_channel.unread_boundary
   active_channel = dm_room
   live_agents = []
-  stream replace lane=live_agents chat_live_agents(connected_rpc, dm_room) -> live_agents_event _
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
@@ -311,7 +312,9 @@ on choose_dm(peer_key)
   // `open_dm`'s own "it already exists" early return would then treat as
   // finished forever. `chat_generation` drops the superseded REPLY instead.
   chat_generation = chat_generation + 1
-  run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
+  parallel
+    run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
+    stream replace lane=live_agents chat_live_agents(connected_rpc, active_channel) -> live_agents_event _
 
 on create_channel_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(trim(channel_draft))

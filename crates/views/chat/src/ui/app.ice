@@ -61,6 +61,7 @@ extern crate::host
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(anchor_seq:i64, thread_root:i64, run_id:str, dispatch:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str, elapsed_ms:i64)
+  Timeline(messages:[ChatMessage], live_agents:[LiveAgentRow])
   ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64, live_agents:[LiveAgentRow])
   PropsItem(next:ChatProps, error:str)
   subscription props() -> PropsItem
@@ -118,6 +119,7 @@ extern crate::host
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
+  pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveAgentRow]) -> Timeline
   pure copy_range_label(count:i64) -> str
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
@@ -180,6 +182,7 @@ state
   thread_target_seq = 0
   thread_messages:[ChatMessage] = []
   live_agents:[LiveAgentRow] = []
+  timeline:Timeline = timeline_of([], [])
   thread_selected_seq = 0
   thread_selected_rev = 0
   thread_message_action:MessageAction = MessageAction.toolbar
@@ -258,6 +261,7 @@ on props_arrived(item)
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   live_agents = next.live_agents
+  timeline = timeline_of(next.messages, next.live_agents)
   thread_selected_seq = next.thread_selected_seq
   thread_selected_rev = next.thread_selected_rev
   thread_message_action = message_action_of(next.thread_message_action)
@@ -515,6 +519,7 @@ view
       thread_target_seq
       thread_messages
       live_agents
+      timeline
       thread_selected_seq
       thread_selected_rev
       thread_message_action

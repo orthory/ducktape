@@ -1164,10 +1164,7 @@ component LiveAgentCard(live:LiveAgentRow)
           p=4.0
           @secondary_action
     for act in live.activity
-      row
-        with
-          gap=5.0
-          align=center
+      row gap=5.0 align=center
         if act.done
           text "✓"
             with
@@ -1186,7 +1183,4 @@ component LiveAgentCard(live:LiveAgentRow)
             wrap=none
             @text-muted
     if !empty(live.answer_preview)
-      text live.answer_preview
-        with
-          size=12.5
-          @text-fg
+      text live.answer_preview size=12.5 @text-fg
