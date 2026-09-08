@@ -108,8 +108,12 @@ ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Ca
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
 
+# The build dir is keyed by rev too: `cargo install --git` reuses whatever a
+# shared target dir already holds for the same crate name and version, so a
+# bump used to install the PREVIOUS rev's binary under the new rev's path
+# (`cargo ice bundle` then refused flags the new rev has).
 $(ICE_BIN):
-	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
+	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
 # wasm-tools at the version in wasm-tools.version, installed the same way
