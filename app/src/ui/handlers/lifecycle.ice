@@ -1167,6 +1167,7 @@ on mutation_failed(cause)
   mutation_phase = mutation_failure_phase(cause.committed)
   channel_draft = restore_draft(channel_draft, pending_channel, cause.committed)
   page_draft = restore_draft(page_draft, pending_page, cause.committed)
+  pages_seed_rev = pages_seed_rev + 1
   pending_channel = ""
   pending_page = ""
   error = cause.message

@@ -201,9 +201,9 @@ fn message_action_toolbar_stays_compact_and_accessible() {
 
 #[test]
 fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
-    let components = inlined(include_str!("../ui/components/pages.ice"));
+    let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     let handlers = inlined(include_str!("../ui/handlers/pages.ice"));
-    let view = inlined(include_str!("../ui/screens/pages.ice"));
+    let view = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
 
     // THE TITLE IS LINE 0 OF THE BUFFER, not a control. The click-to-edit
     // title editor is gone the same way the click-to-edit blocks are; these
@@ -229,8 +229,9 @@ fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     assert!(!components.contains("component DocumentBlock"));
     // The one overlay the surface still raises is the page-delete confirm.
     assert!(view.contains("overlay when=page_delete_armed"));
-    // The document column opens directly on the one editor.
-    assert!(view.contains("extern page_document(page_editor, dark,"));
+    // The document column opens directly on the one editor — the app's,
+    // painted by the host into the slot the view leaves.
+    assert!(view.contains("extern page_document() #document"));
 }
 
 #[test]
@@ -263,7 +264,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/components/kit.ice"),
         include_str!("../ui/components/onboarding.ice"),
         include_str!("../ui/components/overlay.ice"),
-        include_str!("../ui/components/pages.ice"),
+        include_str!("../../../crates/views/pages/src/ui/rows.ice"),
         include_str!("../ui/components/patterns.ice"),
         include_str!("../ui/components/shell.ice"),
         include_str!("../ui/handlers/lifecycle.ice"),
@@ -395,7 +396,11 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     ));
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat_screen.contains("box w=236.0 h=fill bg=sidebar clip=true"));
-    assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
+    // the pages sidebar keeps the same plate from the `pages` view
+    assert!(
+        inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
+            .contains("box w=230.0 h=fill bg=sidebar clip=true")
+    );
 
     // THE WAY BACK TO NOW IS A FLOAT, NOT A BAND. There is no amber "Viewing
     // history" strip: it pushed the conversation down 32px to say something the
@@ -433,7 +438,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         "bg=surface border=border border-w=1.0 r=14.0 shadow=shadow_modal shadow-y=24.0 shadow-blur=60.0"
     ));
 
-    let authored_pages = inlined(include_str!("../ui/components/pages.ice"));
+    let authored_pages = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     for authored in [&shell, &authored_pages, &*SCREENS] {
         assert!(!authored.contains("shadow=black/"));
         assert!(!authored.contains("shadow=shadow "));
@@ -478,15 +483,21 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     let components = inlined(concat!(
         include_str!("../ui/components/shell.ice"),
         include_str!("../../../crates/views/chat/src/ui/components.ice"),
-        include_str!("../ui/components/pages.ice"),
+        include_str!("../../../crates/views/pages/src/ui/rows.ice"),
     ));
     // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
     // centered row. Chat and pages both draw it, from their screens — the
     // components carry the pane bodies, never a second header shape.
-    let screens = format!("{}\n{chat_screen}", *SCREENS);
-    let pane_headers: Vec<_> = screens
+    // Chat and pages both draw it, from their screens — both live in their
+    // views now, so the three sources are swept together.
+    let pane_sources = format!(
+        "{}\n{chat_screen}\n{}",
+        *SCREENS,
+        inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
+    );
+    let pane_headers: Vec<_> = pane_sources
         .lines()
-        .zip(screens.lines().skip(1))
+        .zip(pane_sources.lines().skip(1))
         .filter(|(plate, _)| {
             let plate = plate.trim_start();
             plate == "box w=fill h=50.0 pl=18.0 pr=18.0"
@@ -644,7 +655,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         "../../../crates/views/chat/src/ui/components.ice"
     ));
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    let pages = inlined(include_str!("../ui/components/pages.ice"));
+    let pages = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     let kit = inlined(include_str!("../ui/components/kit.ice"));
     let forge = inlined(include_str!("../ui/components/forge.ice"));
 
@@ -776,7 +787,11 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         // where the component lives.
         assert!(kit.contains(mapping), "{mapping}");
     }
-    assert!(SCREENS.contains("bg=danger_bg border=danger_line"));
+    // the "not saved" chip moved to the `pages` view with its screen
+    assert!(
+        inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
+            .contains("bg=danger_bg border=danger_line")
+    );
     assert!(chat_screen.contains("bg=danger_dot"));
     assert!(SCREENS.contains("bg=success_dot"));
     // the semantic status plate is the kit's, so every screen that reports
@@ -916,7 +931,7 @@ fn ice_sources_hold_to_the_design_system() {
         ),
         (
             "pages.ice",
-            inlined(include_str!("../ui/components/pages.ice")),
+            inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice")),
         ),
         (
             "patterns.ice",
@@ -1241,7 +1256,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/kit.ice",
         "ui/components/onboarding.ice",
         "ui/components/overlay.ice",
-        "ui/components/pages.ice",
         "ui/components/patterns.ice",
         "ui/components/richbody.ice",
         "ui/components/shell.ice",
@@ -1269,8 +1283,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/files/src/ui/files.ice",
         "../../crates/views/files/src/ui/browser.ice",
         "../../crates/views/files/src/ui/kit.ice",
+        "../../crates/views/pages/src/ui/app.ice",
+        "../../crates/views/pages/src/ui/pages.ice",
+        "../../crates/views/pages/src/ui/rows.ice",
+        "../../crates/views/pages/src/ui/kit.ice",
         "ui/screens/overlays.ice",
-        "ui/screens/pages.ice",
         "ui/screens/shell.ice",
         "ui/view.ice",
     ];
@@ -1305,7 +1322,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         [
             "ui/components/forge.ice",
             "ui/components/onboarding.ice",
-            "ui/components/pages.ice",
             "ui/components/shell.ice",
             "ui/screens/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
@@ -1313,6 +1329,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "../../crates/views/chat/src/ui/components.ice",
             "../../crates/views/chat/src/ui/dm.ice",
             "../../crates/views/files/src/ui/browser.ice",
+            "../../crates/views/pages/src/ui/rows.ice",
             "ui/screens/shell.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
@@ -1440,11 +1457,9 @@ fn every_repeated_component_mount_is_culled_or_argued() {
     // `messages` and `thread_messages` are deliberately absent: both are
     // chain-fed, both grow with a "load older" click, and both are virtualized.
     const ARGUED: &[(&str, &str)] = &[
-        // 1. WORKSPACE-SHAPED — channels, DMs, members, repos, pages,
+        // 1. WORKSPACE-SHAPED — channels, DMs, members, repos,
         //    validators, peers. Length tracks how big the workspace is, not
         //    how long the chain has run, and it moves on a delta, not a scroll.
-        ("screens/pages.ice", "for page in pages"),
-        ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
         ("screens/forge.ice", "for repo in repos"),
         ("screens/forge.ice", "for entry in tree_entries"),
         ("screens/forge.ice", "for review in forge_item_reviews"),
@@ -1482,12 +1497,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
-        ("screens/pages.ice", "for hit in page_search_hits"),
-        ("screens/pages.ice", "for comment_row in block_comment_rows"),
-        (
-            "screens/pages.ice",
-            "for page_comment in block_thread_comments",
-        ),
     ];
 
     let mut unculled: Vec<String> = Vec::new();

@@ -148,7 +148,7 @@ pub struct ChatSearchData {
     pub hits: Vec<ChatSearchHit>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageItem {
     pub id: String,
     pub title: String,
@@ -185,7 +185,7 @@ pub struct PagesData {
     pub commented_block_hits: Vec<String>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageCommentThread {
     pub id: String,
     /// The block (or page) id the thread anchors to — the wire always carried
@@ -197,7 +197,7 @@ pub struct PageCommentThread {
     pub comment_count: i64,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageComment {
     pub id: String,
     pub ordinal: i64,
@@ -228,7 +228,7 @@ pub struct BlockCommentData {
     pub has_more: bool,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageSearchHit {
     pub page_id: String,
     /// The title of the page the block lives in. The index's hit row carries

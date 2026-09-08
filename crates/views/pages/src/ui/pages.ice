@@ -29,7 +29,7 @@
 // the very defect the body just lost: you had to CLICK the title to edit it.
 // As line 0 it needs no control at all, and Enter at its end / Backspace at the
 // body's start are ordinary text edits that cross the boundary for free.
-component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:MutationPhase, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, block_autosave_status:AutosaveStatus, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -43,7 +43,6 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
     open_page_search_hit(str, str)
     use_orphaned_comment_draft(str)
     discard_orphaned_comment_draft(str)
-    page_edited(PageEvent)
     toggle_block_comments()
     close_block_comments()
     open_block_comment_thread(str, str)
@@ -76,7 +75,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 with
                   label="New page"
                   expanded=page_create_open
-                  disabled=(loading || mutation_phase != MutationPhase.idle || !connected)
+                  disabled=(loading || busy || !connected)
                   p=0.0
                   @icon_action
                 Icon
@@ -92,7 +91,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 with
                   label="Close new page"
                   expanded=page_create_open
-                  disabled=(loading || mutation_phase != MutationPhase.idle)
+                  disabled=(loading || busy)
                   w=24.0
                   h=24.0
                   p=0.0
@@ -122,7 +121,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
               with
                 label="New page title"
                 hint="New page"
-                disabled=(loading || mutation_phase != MutationPhase.idle || !connected)
+                disabled=(loading || busy || !connected)
                 submit=emit(create_page_submit)
                 w=fill
                 p=6.2
@@ -135,7 +134,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
             button -> emit(create_page_submit)
               with
                 label="Create page"
-                disabled=(loading || mutation_phase != MutationPhase.idle || !connected || empty(trim(page_draft)))
+                disabled=(loading || busy || !connected || empty(trim(page_draft)))
                 w=28.0
                 h=28.0
                 p=0.0
@@ -257,7 +256,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                   with
                     label="Comments"
                     expanded=block_comments_open
-                    disabled=(mutation_phase != MutationPhase.idle)
+                    disabled=(busy)
                     h=26.0
                     p=5.0
                     @ghost_action
@@ -276,8 +275,8 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                         size=11.5
                         wrap=none
                         @text-muted
-                    if block_comment_thread_total > 0
-                      text count_label(block_comment_thread_total)
+                    if thread_total > 0
+                      text count_label(thread_total)
                         with
                           size=10.5
                           wrap=none
@@ -289,7 +288,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 // A page id is a uuid, so this button is the only way a
                 // member gets a page's address out of the app at all. The
                 // link it copies names the network it belongs to.
-                button -> emit(copy_to_clipboard, duck_page_link(active_page, network_chain_id), "Page link copied")
+                button -> emit(copy_to_clipboard, page_link, "Page link copied")
                   with
                     label="Copy page link"
                     disabled=empty(active_page)
@@ -317,7 +316,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 button -> emit(arm_page_delete)
                   with
                     label="Delete page"
-                    disabled=(mutation_phase != MutationPhase.idle || page_delete_armed)
+                    disabled=(busy || page_delete_armed)
                     w=28.0
                     h=28.0
                     p=0.0
@@ -337,61 +336,58 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 // alone: a write the node REFUSED says so, and an edit
                 // still sitting in the buffer ("idle") carries no mark
                 // at all.
-                match block_autosave_status
-                  AutosaveStatus.saving
-                    box
+                if autosave == "saving"
+                  box
+                    with
+                      px=9.0
+                      py=4.0
+                      bg=warning_bg
+                      border=warning_line
+                      border-w=1.0
+                      r=7.0
+                    text "saving…"
                       with
-                        px=9.0
-                        py=4.0
-                        bg=warning_bg
-                        border=warning_line
-                        border-w=1.0
-                        r=7.0
-                      text "saving…"
-                        with
-                          size=10.5
-                          wrap=none
-                          font=code_medium
-                          @text-warning
-                  AutosaveStatus.error
-                    box
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-warning
+                if autosave == "error"
+                  box
+                    with
+                      px=9.0
+                      py=4.0
+                      bg=danger_bg
+                      border=danger_line
+                      border-w=1.0
+                      r=7.0
+                    text "not saved"
                       with
-                        px=9.0
-                        py=4.0
-                        bg=danger_bg
-                        border=danger_line
-                        border-w=1.0
-                        r=7.0
-                      text "not saved"
-                        with
-                          size=10.5
-                          wrap=none
-                          font=code_medium
-                          @text-danger
-                  AutosaveStatus.saved
-                    box
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-danger
+                if autosave == "saved"
+                  box
+                    with
+                      px=9.0
+                      py=4.0
+                      bg=final_bg
+                      border=final_line
+                      border-w=1.0
+                      r=7.0
+                    text "✓ synced"
                       with
-                        px=9.0
-                        py=4.0
-                        bg=final_bg
-                        border=final_line
-                        border-w=1.0
-                        r=7.0
-                      text "✓ synced"
-                        with
-                          size=10.5
-                          wrap=none
-                          font=code_medium
-                          @text-success_tick
-                  AutosaveStatus.idle
-                    space w=1.0 h=1.0
+                        size=10.5
+                        wrap=none
+                        font=code_medium
+                        @text-success_tick
             box
               with
                 w=fill
                 h=1.0
                 bg=separator
               space w=1.0 h=1.0
-        if connected && !empty(doc_tab_rows(doc_tabs, pages, active_page))
+        if connected && !empty(doc_tabs)
           box
             with
               w=fill
@@ -412,7 +408,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                   h=fill
                   gap=2.0
                   align=center
-                for tab in doc_tab_rows(doc_tabs, pages, active_page)
+                for tab in doc_tabs
                   row gap=0.0 align=center
                     button -> emit(choose_page, tab.id)
                       with
@@ -550,7 +546,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                           button "Use" -> emit(use_orphaned_comment_draft, recovered_comment)
                             with
                               label="Use as comment"
-                              disabled=(loading || mutation_phase != MutationPhase.idle)
+                              disabled=(loading || busy)
                               h=26.0
                               p=5.0
                               @ghost_action
@@ -559,7 +555,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                             pressed bg=fg/18
                           button "Discard" -> emit(discard_orphaned_comment_draft, recovered_comment)
                             with
-                              disabled=(loading || mutation_phase != MutationPhase.idle)
+                              disabled=(loading || busy)
                               h=26.0
                               p=5.0
                               @danger_action
@@ -567,9 +563,9 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 // header. It is never disabled while connected: a page you
                 // can read is a page you can type in. It FILLS the column
                 // and scrolls itself.
-                extern page_document(page_editor, dark, (loading || !connected), blocks, commented_block_hits) #document -> emit(page_edited, _)
+                extern page_document() #document
                 // Subpages: navigation, listed rather than typed.
-                if !empty(subpage_blocks(blocks))
+                if !empty(subpages)
                   // The 46px inset matches the editor's hover-gutter strip, so
                   // subpages align with the text column, not the gutter.
                   col
@@ -584,11 +580,11 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                         wrap=none
                         font=code_medium
                         @text-hint
-                    for child in subpage_blocks(blocks)
+                    for child in subpages
                       button -> emit(choose_page, child.id)
                         with
                           label="Open subpage"
-                          description=child.text
+                          description=child.title
                           w=fill
                           p=6.0
                           @ghost_action
@@ -602,7 +598,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                               name="doc"
                               tone="label"
                               px=14.0
-                          if empty(child.text)
+                          if empty(child.title)
                             text "Untitled"
                               with
                                 w=fill
@@ -610,8 +606,8 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                                 wrap=none
                                 font=medium
                                 @text-muted
-                          if !empty(child.text)
-                            text child.text
+                          if !empty(child.title)
+                            text child.title
                               with
                                 w=fill
                                 size=13.5
@@ -738,7 +734,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                   subject=keep_str(!empty(active_page_title), active_page_title, "Untitled")
                   note="Everything nested under it goes too — its blocks, any subpages beneath them, and every comment thread on any of it — for every member. This cannot be undone from the app."
                   action="Delete page"
-                  busy=(mutation_phase != MutationPhase.idle)
+                  busy=(busy)
                 events
                   cancel -> emit(disarm_page_delete)
                   confirm -> emit(delete_page_submit)
@@ -774,13 +770,13 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 TabLabel
                   with
                     label="Comments"
-                    count=block_comment_thread_total
+                    count=thread_total
                     active=true
                 space w=fill
                 button -> emit(close_block_comments)
                   with
                     label="Close comments"
-                    disabled=(mutation_phase != MutationPhase.idle)
+                    disabled=(busy)
                     w=24.0
                     h=24.0
                     p=4.0
@@ -811,35 +807,35 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                 h=fill
                 p=12.0
                 gap=6.0
-              if empty(active_block_comment_thread)
+              if empty(active_thread)
                 scroll
                   with
                     dir=vertical
                     w=fill
                     h=fill
                   col w=fill gap=1.0
-                    if empty(block_comment_threads) && !block_comment_threads_loading
+                    if empty(comment_rows) && !threads_loading
                       text "No comments yet"
                         with
                           w=fill
                           size=12.5
                           align-x=center
                           @text-muted
-                    for comment_row in block_comment_rows
+                    for comment_row in comment_rows
                       PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor
                         forward
                           open_block_comment_thread
-                    if block_comment_threads_has_more
+                    if threads_has_more
                       button "More" -> emit(load_more_block_threads)
                         with
-                          disabled=(block_comment_threads_loading || mutation_phase != MutationPhase.idle)
+                          disabled=(threads_loading || busy)
                           h=24.0
                           p=4.0
                           @secondary_action
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
-              if !empty(active_block_comment_thread)
+              if !empty(active_thread)
                 row
                   with
                     w=fill
@@ -847,7 +843,7 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                     align=center
                   button "← Threads" -> emit(close_block_comment_thread)
                     with
-                      disabled=(block_thread_comments_loading || mutation_phase != MutationPhase.idle)
+                      disabled=(comments_loading || busy)
                       h=24.0
                       p=4.0
                       @secondary_action
@@ -861,20 +857,20 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                       wrap=none
                       font=code_medium
                       @text-hint
-                  if !thread_is_resolved(block_comment_threads, active_block_comment_thread)
+                  if !thread_resolved
                     button "Resolve" -> emit(resolve_thread_submit, true)
                       with
-                        disabled=(mutation_phase != MutationPhase.idle)
+                        disabled=(busy)
                         h=24.0
                         p=4.0
                         @secondary_action
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
-                  if thread_is_resolved(block_comment_threads, active_block_comment_thread)
+                  if thread_resolved
                     button "Reopen" -> emit(resolve_thread_submit, false)
                       with
-                        disabled=(mutation_phase != MutationPhase.idle)
+                        disabled=(busy)
                         h=24.0
                         p=4.0
                         @secondary_action
@@ -887,20 +883,20 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                     w=fill
                     h=fill
                   col w=fill gap=1.0
-                    for page_comment in block_thread_comments
+                    for page_comment in comments
                       PageCommentCard comment=page_comment
-                    if block_thread_comments_has_more
+                    if comments_has_more
                       button "More" -> emit(load_more_block_comments)
                         with
-                          disabled=(block_thread_comments_loading || mutation_phase != MutationPhase.idle)
+                          disabled=(comments_loading || busy)
                           h=24.0
                           p=4.0
                           @secondary_action
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
-              if empty(active_block_comment_thread)
-                text comment_compose_hint(blocks, caret_comment_target, active_page)
+              if empty(active_thread)
+                text compose_hint
                   with
                     w=fill
                     size=10.5
@@ -912,11 +908,11 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                   w=fill
                   gap=5.0
                   align=center
-                input "" #page-comment(scope_key(connected_rpc, active_page)) <-> block_comment_draft
+                input "" #page-comment(active_page) <-> block_comment_draft
                   with
                     label="New page comment"
                     hint="Add a comment…"
-                    disabled=(mutation_phase != MutationPhase.idle || block_comment_threads_loading || block_thread_comments_loading)
+                    disabled=(busy || threads_loading || comments_loading)
                     submit=emit(post_block_comment_submit)
                     w=fill
                     p=6.2
@@ -927,9 +923,9 @@ component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:b
                   hovered bg=fg/4 border=fg/11
                   focused bg=fg/4 border=ring
                   disabled value=muted
-                button "Post" -> emit(post_block_comment_submit)
+                button "Post" #post -> emit(post_block_comment_submit)
                   with
-                    disabled=(mutation_phase != MutationPhase.idle || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading)
+                    disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
                     h=28.0
                     p=5.0
                     @primary_action

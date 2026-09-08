@@ -17,7 +17,7 @@
 //!     language field, so there is nothing to colour BY; a fence body is one
 //!     mono plate.
 //!
-//! The line metrics are the Pages design tokens from `components/pages.ice`
+//! The line metrics are the Pages design tokens from the pages view's `rows.ice`
 //! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.65, quote 14/1.6, code 12/1.6,
 //! callout 13/1.6), so a saved document reads at exactly the size it was typed.
 
