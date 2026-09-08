@@ -51,12 +51,22 @@ pub(crate) fn show(
     hits: &[String],
 ) {
     cell().lock().expect("page surface").shown = Some(Shown {
-        document: document.clone(),
+        document: copy(document),
         dark,
         disabled,
         blocks: blocks.to_vec(),
         hits: hits.to_vec(),
     });
+}
+
+/// The buffer for the surface to paint: `Content::clone` is `with_text`,
+/// so the copy starts with its caret on the title and no selection — and
+/// painted as-is it showed every reader a caret that never moved, a current
+/// line that never changed, and no slash menu (which reads the caret too).
+fn copy(document: &Content) -> Content {
+    let mut copy = document.clone();
+    copy.move_to(document.cursor());
+    copy
 }
 
 /// The oldest event the surface queued, for the handler an `edited` intent
@@ -240,5 +250,55 @@ impl Widget<SurfaceValue, iced::Theme, iced::Renderer> for PageSurface {
         // The editor draws its menu inside its own bounds; it has no overlay,
         // and one could not outlive the editor built for this call.
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pages::{PageAction, menu};
+    use iced::widget::text_editor::{Action, Edit, Motion, Position};
+
+    fn at_end(text: &str) -> Content {
+        let mut document = Content::with_text(text);
+        document.perform(Action::Move(Motion::DocumentEnd));
+        document
+    }
+
+    /// The caret (and a selection) the reader has is the one the surface paints.
+    #[test]
+    fn the_copy_the_surface_paints_keeps_the_caret_and_the_selection() {
+        let document = at_end("Title\nhello");
+        assert_eq!(document.cursor().position, Position { line: 1, column: 5 });
+        assert_eq!(copy(&document).cursor(), document.cursor());
+
+        let mut selecting = at_end("Title\nhello");
+        selecting.perform(Action::Select(Motion::WordLeft));
+        let cursor = selecting.cursor();
+        assert_eq!(
+            cursor.selection,
+            Some(Position { line: 1, column: 5 }),
+            "{cursor:?}"
+        );
+        assert_eq!(copy(&selecting).cursor(), cursor);
+    }
+
+    /// A `/` typed into the page opens the palette; the surface, painting
+    /// its copy, must still see it up — the palette reads the caret.
+    #[test]
+    fn a_slash_typed_into_the_page_is_up_on_the_surface() {
+        let mut document = at_end("Title\nhello ");
+        let action = PageAction::Edit(Action::Edit(Edit::Insert('/')));
+        document.perform(Action::Edit(Edit::Insert('/')));
+        menu::after_action(&document, &action);
+        assert!(menu::current(&document).is_some(), "the palette is up");
+        let painted = copy(&document);
+        let shown = menu::current(&painted).expect("the surface shows the palette");
+        assert!(
+            shown.items.iter().any(|item| item.tag == "bullet"),
+            "{:?}",
+            shown.items.iter().map(|item| &item.tag).collect::<Vec<_>>()
+        );
+        menu::close();
     }
 }
