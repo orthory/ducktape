@@ -419,14 +419,15 @@ impl Guest {
             .instantiate(&mut store, &component)
             .map_err(|error| format!("{shown}: {}", first_line(&error)))?;
         let init = instance
-            .get_typed_func::<(), ()>(&mut store, "init")
+            .get_typed_func::<(bool,), ()>(&mut store, "init")
             .map_err(|error| format!("{shown}: {error}"))?;
         let tick = instance
             .get_typed_func::<(Vec<u8>,), (Vec<u8>,)>(&mut store, "tick")
             .map_err(|error| format!("{shown}: {error}"))?;
         // `on mount` runs in here, with a budget of its own.
         arm(&mut store);
-        if let Err(error) = init.call(&mut store, ()) {
+        // `on mount` runs in here, told which platform it keys for.
+        if let Err(error) = init.call(&mut store, (cfg!(target_os = "macos"),)) {
             let trap = format!("{shown}: init trapped: {}", first_line(&error));
             return Err(panic_message(&mut store).unwrap_or(trap));
         }
