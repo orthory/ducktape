@@ -98,7 +98,9 @@ pub const MAX_PATCHES: usize = 256;
 /// editor's own grouping cadence.
 const COALESCE_MS: u64 = 750;
 const MAX_STEPS: usize = 200;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Snapshots live inside the guest's own snapshot, which the runtime caps
+/// at 8 MiB for everything; the history takes a quarter of that at most.
+const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 impl EditorPosition {
     pub fn new(line: usize, column: usize) -> Self {
