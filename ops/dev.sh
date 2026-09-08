@@ -13,8 +13,8 @@
 # guests and views the build just staged, and installs its guest and agent
 # CLIs into the fresh workspace, so nothing from an earlier lap — a genesis
 # without today's views, a service bound to a workspace that no longer
-# exists, a CLI at last month's pin — survives into the next. Every file the
-# network owns lives under its workspace. Ctrl-C quits the app and leaves the node
+# exists, a CLI behind the vendor's latest — survives into the next. Every
+# file the network owns lives under its workspace. Ctrl-C quits the app and leaves the node
 # and services up for app-only relaunches (`cargo run -p ducktape-app`); the
 # next `make dev` replaces them. `make dev-clear` stops that background
 # runtime without deleting state; `make demo-clear` removes the workspace
@@ -57,7 +57,7 @@ bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 
 # What this network's guest lends to runs: the agent CLIs, installed into the
 # fresh workspace's executors dir. A checklist, because it is the operator's
-# call: each entry is a vendor download at its pin, shown with its url and
+# call: each entry is the vendor's latest release, shown with its url and
 # expected hash, and checking none is a complete answer.
 "$NODE_BIN" agent install -n "$ID" || log "agent CLI setup skipped — runs will refuse the providers that are missing"
 
