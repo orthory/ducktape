@@ -1634,6 +1634,7 @@ pub async fn register_passkey(
         let client = rpc_client(&rpc)?;
         let account = own_account(&client).await?;
         let registered = browser_ceremony(authpage::Request::Create {
+            chain_id: chain_id.to_string(),
             challenge: authpage::create_challenge(),
             user: account.number,
             name: account.name,
@@ -1731,8 +1732,10 @@ pub async fn login_with_passkey(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let number =
-            authpage::assertion_account(&browser_ceremony(authpage::account_request()).await?)?;
+        let number = authpage::assertion_account(
+            &chain_id,
+            &browser_ceremony(authpage::account_request()).await?,
+        )?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
@@ -1748,7 +1751,7 @@ pub async fn login_with_passkey(
             expires_at,
         ))
         .await?;
-        let (_, proof) = authpage::login_consent(&consent)?;
+        let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
         let msg = authpage::login_add_key(
             &chain_id,
             &device_key,
@@ -1997,6 +2000,7 @@ async fn add_passkey_steps(
     let registered = qr_ceremony(
         authpage::AUTH_PAGE,
         authpage::Request::Create {
+            chain_id: chain_id.to_string(),
             challenge: authpage::create_challenge(),
             user: account.number,
             name: account.name,
@@ -2061,7 +2065,7 @@ pub fn login_by_qr(
             &mut tx,
         )
         .await?;
-        let number = authpage::assertion_account(&named)?;
+        let number = authpage::assertion_account(&chain_id, &named)?;
         step(&mut tx, CeremonyStep::working("Reading the account…")).await?;
         let account = account_reply(
             client
@@ -2077,7 +2081,7 @@ pub fn login_by_qr(
             &mut tx,
         )
         .await?;
-        let (_, proof) = authpage::login_consent(&consent)?;
+        let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
         step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
         let msg = authpage::login_add_key(
             &chain_id,
@@ -2267,7 +2271,7 @@ mod qr_ceremony_tests {
         base
     }
 
-    const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#;
+    const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#;
 
     /// Invalidating the UI stream must close the request already at the relay,
     /// even if that relay never sends a response or the next countdown tick.
@@ -2333,9 +2337,9 @@ mod qr_ceremony_tests {
         assert!(matches!(
             outcome,
             authpage::Outcome::Get {
-                user_handle: Some(42),
+                user_handle: Some(handle),
                 ..
-            }
+            } if handle == authpage::UserHandle::new("demo#a1b2c3d4", 42)
         ));
         let shown = rx.next().await.unwrap();
         assert_eq!(shown.phase, "show_qr");
