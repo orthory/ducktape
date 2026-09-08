@@ -10672,6 +10672,7 @@ dependencies = [
  "bincode",
  "iced_core",
  "serde",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]
