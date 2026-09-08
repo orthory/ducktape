@@ -195,6 +195,8 @@ pub(crate) mod tests {
             artifacts: Mutex::new(artifact.into_iter().collect()),
             by_digest: false,
             hold: Mutex::new(hold),
+            hold_status: Mutex::new(None),
+            held: tokio::sync::Notify::new(),
         };
         fake_node(Arc::new(deployment)).await
     }
@@ -207,7 +209,11 @@ pub(crate) mod tests {
         pub status: Mutex<serde_json::Value>,
         pub artifacts: Mutex<Vec<ModuleArtifact>>,
         pub by_digest: bool,
+        /// One-shot holds: the next blob, or status, answer waits on it.
         pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        pub hold_status: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// Told each time an answer starts waiting on a hold.
+        pub held: tokio::sync::Notify,
     }
 
     impl FakeDeployment {
@@ -217,6 +223,8 @@ pub(crate) mod tests {
                 artifacts: Mutex::new(vec![artifact.clone()]),
                 by_digest: true,
                 hold: Mutex::new(None),
+                hold_status: Mutex::new(None),
+                held: tokio::sync::Notify::new(),
             })
         }
 
@@ -241,40 +249,51 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = vec![0u8; 4096];
-                let read = socket.read(&mut request).await.unwrap();
-                let head = String::from_utf8_lossy(&request[..read]).into_owned();
-                let route = head.split(' ').nth(1).unwrap_or("").to_owned();
-                let (status_line, body) = if route == "/v1/query" {
-                    let status = deployment.status.lock().unwrap().clone();
-                    ("200 OK", status.to_string().into_bytes())
-                } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
-                    let hold = deployment.hold.lock().unwrap().take();
-                    if let Some(hold) = hold {
-                        hold.notified().await;
-                    }
-                    let artifacts = deployment.artifacts.lock().unwrap();
-                    let served = if deployment.by_digest {
-                        artifacts
-                            .iter()
-                            .find(|artifact| crate::backend::hex_encode(&artifact.hash()) == digest)
+                // each request on its own: a held blob leaves the status
+                // answering, as a node does
+                let deployment = deployment.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let head = String::from_utf8_lossy(&request[..read]).into_owned();
+                    let route = head.split(' ').nth(1).unwrap_or("").to_owned();
+                    let (status_line, body) = if route == "/v1/query" {
+                        let hold = deployment.hold_status.lock().unwrap().take();
+                        if let Some(hold) = hold {
+                            deployment.held.notify_one();
+                            hold.notified().await;
+                        }
+                        let status = deployment.status.lock().unwrap().clone();
+                        ("200 OK", status.to_string().into_bytes())
+                    } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
+                        let hold = deployment.hold.lock().unwrap().take();
+                        if let Some(hold) = hold {
+                            deployment.held.notify_one();
+                            hold.notified().await;
+                        }
+                        let artifacts = deployment.artifacts.lock().unwrap();
+                        let served = if deployment.by_digest {
+                            artifacts.iter().find(|artifact| {
+                                crate::backend::hex_encode(&artifact.hash()) == digest
+                            })
+                        } else {
+                            artifacts.first()
+                        };
+                        match served {
+                            Some(artifact) => ("200 OK", artifact.encode()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
                     } else {
-                        artifacts.first()
+                        ("404 Not Found", Vec::new())
                     };
-                    match served {
-                        Some(artifact) => ("200 OK", artifact.encode()),
-                        None => ("404 Not Found", Vec::new()),
-                    }
-                } else {
-                    ("404 Not Found", Vec::new())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-                let _ = socket.write_all(&body).await;
-                let _ = socket.shutdown().await;
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
             }
         });
         Client::new(&origin).unwrap()
