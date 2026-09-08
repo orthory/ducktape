@@ -97,6 +97,8 @@ on agents_loaded(next)
   return if next.generation != agents_generation
   agents_answered = true
   agents_rows = next.agents
+  agents_capabilities = next.capabilities
+  agents_actions = next.actions
 
 on agents_failed(cause)
   return if cause.generation != agents_generation
@@ -173,13 +175,30 @@ on dm_peers_loaded(next)
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation
 
-// The invite modal is pure view state — minting is a separate, explicit act.
-// Pause or resume an agent. The payload is the DESIRED state and it is named
-// for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
-// roster's Pause control passes `true` and its Resume control passes `false`;
-// a row wired from `agent.status` would have to invert. The registry is the
-// authority on whether the signing owner may apply the requested state.
+// What the Agents view asks of the app. A pause is the same owner-gated
+// write the Members record offers; a save rewrites one record from the
+// editor's whole draft; a register provisions the program account under the
+// signing account and registers the draft against it. The endpoint, the key
+// and the writes are this handler's; the view only ever hands over what the
+// reader typed.
+on agents_view_event(event)
+  return if !connected
+  match agents_intent(event)
+    AgentsIntent.status
+      run every set_agent_status(connected_rpc, password, event_text(event, "agent_id"), event_flag(event, "paused")) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.save
+      run every save_agent(connected_rpc, password, event.detail) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.register
+      run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
+
+// Every committed agent write lands here: pause, resume, save, register. The
+// pause payload is the DESIRED state and it is named for the backend
+// parameter it becomes: `true` PAUSES, `false` resumes. The registry is the
+// authority on whether the signing owner may apply any of them. The register
+// is re-read under a fresh generation, and `agents_committed` tells the view
+// the drafts it held were consumed.
 on agent_status_set(_result)
+  agents_committed = agents_committed + 1
   agents_generation = agents_generation + 1
   error = ""
   run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _

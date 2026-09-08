@@ -298,6 +298,7 @@ on forge_discussion_loaded(next)
   return if next.channel_id != forge_item_channel
   forge_discussion = next.messages
   forge_discussion_members = next.members
+  composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, forge_item_channel), forge_discussion_members)
   // A deep link's `#seq` lands here, once: the note is picked out of the list and
   // the view scrolls the item's page to that row — by its key in the
   // Discussion's keyed column, on the landing the tick counts (a seq the

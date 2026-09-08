@@ -2,8 +2,8 @@
 # make demo-seed — a self-contained "demo" network preloaded with sample data.
 #
 # Inits a solo (1-validator) workspace named "demo" under the ducktape home —
-# the SAME directory listing the desktop app reads — builds its guest images
-# and its shell executor, starts its node briefly, POSTs a batch of seed ops
+# the SAME directory listing the desktop app reads — builds its guest images,
+# starts its node briefly, POSTs a batch of seed ops
 # over the node's /v1/submit lane (each finalized into DURABLE qmdb state),
 # then stops the node. Open the app and pick the "demo" network: the app
 # respawns the node from the same durable dir, fully populated.
@@ -18,13 +18,14 @@
 # node's own validator key as the op origin. Its account controls the model
 # user; the separate demo wallet signs and owns the gateway routes.
 #
-# The model user (Quackbot) is a TEST agent with the dogfood e2e runner's
-# shape: its provider is the guest shell running a literal script, staged as
-# a capability spec in the workspace's capability dir, and its grant carries
-# forge read and push on a seeded `playground` repo. The two seeded @mentions
-# (one in #general, one on a playground issue) complete on `make dev` with no
-# model credential at all: a chat reply, and a pull request opened from a
-# microVM.
+# The model user (ChiefDuck) is the network's resident maintainer: a real
+# agent on the `claude` capability, granted every action the platform knows,
+# forge read and push on `ducktape` and on a seeded `playground` repo, every
+# page, and the shared skill library — with its persona curated as an
+# always-loaded skill (ops/chiefduck/SKILL.md). The two seeded @mentions (one
+# in #general, one on a playground issue) run once `make dev` has installed
+# the claude CLI into the workspace and the compute service announces it:
+# a chat reply, and a pull request opened from a microVM.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -137,94 +138,23 @@ printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" wallet new demo --workspace "$WSDIR
   || die "could not mint the demo wallet"
 log "minted the demo wallet (password: $DEMO_PASSWORD)"
 
-# ── 3b. the guest images and the shell executor ───────────────
+# ── 3b. the guest images ──────────────────────────────────────
 # Every run of this network boots the workspace's OWN guest
 # (`<workspace>/guest`) and execs out of the workspace's OWN executors dir:
-# two networks on one box share no image, and a lap rebuilds both into the
-# fresh workspace. The base rootfs and kernel downloads are cached under the
-# repo's target dir, so a lap rebuilds the image, not the download. A box
-# that cannot build one (no unsquashfs/mke2fs) still seeds; its Quackbot
-# runs stay pending.
+# two networks on one box share no image, and a lap rebuilds the image into
+# the fresh workspace. The base rootfs and kernel downloads are cached under
+# the repo's target dir, so a lap rebuilds the image, not the download. A box
+# that cannot build one (no unsquashfs/mke2fs) still seeds; ChiefDuck's runs
+# stay pending. The executors dir is filled by `ducktape agent install`
+# (`make dev` offers it), and the capability dir stays empty: the claude spec
+# is the binary's built-in default.
 GUEST_DIR="$WSDIR/guest"
-EXEC_DIR="$WSDIR/executors"
-CAP_DIR="$WSDIR/capabilities"
-mkdir -p "$EXEC_DIR" "$CAP_DIR" || die "cannot create the workspace's compute dirs"
-# e2fsprogs is keg-only on macOS, so debugfs is looked up the way the
-# sandbox looks it up: PATH, then the standard prefixes.
-debugfs_bin(){
-  local candidate
-  for candidate in "$(command -v debugfs 2>/dev/null)" /usr/sbin/debugfs /sbin/debugfs \
-    /opt/homebrew/opt/e2fsprogs/sbin/debugfs /usr/local/opt/e2fsprogs/sbin/debugfs; do
-    [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s' "$candidate"; return; }
-  done
-  return 1
-}
+mkdir -p "$WSDIR/executors" "$WSDIR/capabilities" || die "cannot create the workspace's compute dirs"
 if OUT="$GUEST_DIR" bash "$SCRIPT_DIR/build-guest-rootfs.sh" >"$WSDIR/guest-build.log" 2>&1; then
   log "built the guest images into $GUEST_DIR"
-  # The provider below runs `sh` INSIDE the guest, so the executor is the
-  # guest's own shell, lifted out of the image just built — a host shell
-  # links a libc the guest need not carry.
-  DEBUGFS="$(debugfs_bin)" || die "debugfs not found; install e2fsprogs"
-  "$DEBUGFS" -R "dump -p /usr/bin/dash $EXEC_DIR/sh" "$GUEST_DIR/rootfs.ext4" >/dev/null 2>&1
-  [ -x "$EXEC_DIR/sh" ] || die "could not lift /usr/bin/dash out of $GUEST_DIR/rootfs.ext4"
-  log "staged the guest shell at $EXEC_DIR/sh"
 else
-  log "guest image build failed — see $WSDIR/guest-build.log; Quackbot's runs stay pending on this box"
+  log "guest image build failed — see $WSDIR/guest-build.log; ChiefDuck's runs stay pending on this box"
 fi
-
-# ── 3c. the test provider spec ─────────────────────────────────
-# The seeded model user (step 5) names a capability tag, and its @mention run
-# completes only on a node whose compute service announces that tag. A real
-# coding agent needs a credential this seed does not have, so the demo's
-# provider is the guest shell running a literal script: it reads the prompt
-# envelope off stdin and replies from inside the microVM. The spec is
-# workspace config, read the way the compute daemon reads it
-# (`<workspace>/capabilities`), and the daemon probes `sh` in the workspace's
-# executors dir the guest image is derived from. Staged BEFORE the compute
-# grant below: the grant is minted from the daemon's live hello, which offers
-# only what discovery found.
-TEST_TAG="quack-test"
-# An unquoted heredoc so $TEST_TAG names the tag ONCE; the executor script's
-# own `$` and `\` are escaped so they reach the file verbatim.
-cat >"$CAP_DIR/$TEST_TAG.toml" <<TOML || die "cannot write the $TEST_TAG spec"
-# Rewritten by \`make demo-seed\`: the demo's script-backed test provider.
-# Format: docs/records/specs/capability-spec.md.
-spec = 1
-
-[capability]
-tag = "$TEST_TAG"
-description = "demo test agent: the guest shell replying from inside a microVM, no model credential"
-
-[detect]
-bin = "sh"
-
-[invoke]
-# The whole executor, doing what the dogfood e2e's script runner does so the
-# demo proves the same loop. argv is literal (no host shell sees it). The
-# prompt envelope arrives on stdin. \`ducktape mcp\` is on the run's PATH and
-# posts a live progress reply through the same tool a model uses. In a forge
-# checkout the script leaves a file for the host to commit and push (.git/HEAD
-# holds the bare pinned oid: the clone is detached by construction). Plain
-# stdout is the final reply the runs module posts in the mention's thread.
-args = ["-c", '''
-set -e
-bytes=\$(wc -c)
-printf '%s\\n' \\
-  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}' \\
-  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \\
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ducktape_action","arguments":{"operation":"reply","input":{"content":[{"type":"text","text":"Quack, on it: reading the run context."}]},"request_id":"progress"}}}' \\
-  | ducktape mcp > /dev/null
-if [ -f .git/HEAD ]; then
-  printf 'Quackbot was here, forked from %s.\\n' "\$(cat .git/HEAD)" > QUACKBOT.md
-fi
-printf "Quack! I am the demo test agent: a shell script that ran inside this node's microVM. I read %s bytes of run context.\\n" "\$bytes"
-''']
-prompt = "stdin"
-
-[output]
-format = "text"
-TOML
-log "staged the $TEST_TAG provider spec at $CAP_DIR/$TEST_TAG.toml"
 
 # ── 4. start the node, wait for its published identity ─────────
 log "starting node (http $DEV_LISTEN:$P2)…"
@@ -336,8 +266,10 @@ submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # model user — the operator account controls a keyless programmable account.
 # The recipe is emitted by the current binary, never copied into this script.
-# Its capability is the test provider staged in step 3c, so the @mention below
-# is a run this host's own compute service executes.
+# Its capability is `claude`: the run executes on a node whose compute
+# service announces that tag, which `make dev` arranges by installing the
+# claude CLI into this workspace's executors dir. Until then the @mention
+# below is a pending run, not a lost one.
 query(){ # query <module> <query-json>
   local body
   body=$(bun -e 'const [target,query]=process.argv.slice(1);process.stdout.write(JSON.stringify({target,query:JSON.parse(query)}))' "$1" "$2") || die "invalid query"
@@ -350,34 +282,49 @@ if [ -z "$CONTROLLER" ]; then
   CONTROLLER=$(query identity "{\"of_key\":{\"key\":$NODE_BYTES}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).account?.number ?? ""))')
 fi
 [ -n "$CONTROLLER" ] || die "the operator has no controller account"
-PROGRAM=$("$NODE_BIN" agent model-program quackbot) || die "cannot encode the default model program"
-PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{name:"Quackbot",program:await Bun.stdin.json()}}))') || die "invalid program"
+AGENT_ID="chiefduck"
+AGENT_NAME="ChiefDuck"
+# The persona: an always-loaded skill in the shared library, which the host
+# assembles into the context document the CLI auto-loads for every run.
+curl -fsS -X PUT "$URL/v1/files/object/shared/skills/$AGENT_ID/SKILL.md" \
+  -H "x-ducktape-admin-token: $OPERATOR" \
+  --data-binary @"$SCRIPT_DIR/chiefduck/SKILL.md" >/dev/null \
+  || die "cannot stage the $AGENT_NAME persona skill"
+PROGRAM=$("$NODE_BIN" agent model-program "$AGENT_ID") || die "cannot encode the default model program"
+PROVISION=$(printf '%s' "$PROGRAM" | bun -e 'process.stdout.write(JSON.stringify({provision:{name:process.argv[1],program:await Bun.stdin.json()}}))' "$AGENT_NAME") || die "invalid program"
 submit agent "$PROVISION"
 MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" | bun -e '
-  const matches=(await Bun.stdin.json()).accounts.filter(account=>account.name==="Quackbot" && account.control.program?.executor==="agent");
-  if(matches.length!==1) throw new Error("expected exactly one Quackbot program account");
+  const matches=(await Bun.stdin.json()).accounts.filter(account=>account.name===process.argv[1] && account.control.program?.executor==="agent");
+  if(matches.length!==1) throw new Error(`expected exactly one ${process.argv[1]} program account`);
   process.stdout.write(String(matches[0].number));
-') || die "cannot resolve the model account"
-# The grant has the dogfood e2e runner's shape: chat replies, plus forge read
-# and push on the playground repo seeded below and on the dogfood mirror
-# `make dev` pushes (`ops/dogfood-forge.sh`, repo `ducktape`).
+' "$AGENT_NAME") || die "cannot resolve the model account"
+# The grant is the whole vocabulary: every action the runs module knows, forge
+# read and push on the playground repo seeded below and on the dogfood mirror
+# `make dev` pushes (`ops/dogfood-forge.sh`, repo `ducktape`), every page, and
+# the shared skill library its persona is read from.
 PLAYGROUND="playground"
-submit runs "{\"configure_model\":{\"operation\":{\"register_model\":{\"account\":$MODEL_ACCOUNT,\"agent_id\":\"quackbot\",\"display_name\":\"Quackbot\",\"capability\":\"$TEST_TAG\",\"allowed_actions\":[\"chat.post\",\"tasks.create\"],\"caps\":{\"forge_read\":[\"ducktape\",\"$PLAYGROUND\"],\"forge_push\":[\"ducktape\",\"$PLAYGROUND\"]}}}}}"
-MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:"@quackbot can you follow up?",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT")
+REGISTER=$(bun -e 'process.stdout.write(JSON.stringify({configure_model:{operation:{register_model:{
+  account:Number(process.argv[1]),agent_id:process.argv[2],display_name:process.argv[3],capability:"claude",
+  allowed_actions:["chat.post","chat.post_message","jobs.comment","tasks.create","tasks.update_status","pages.comment","pages.set_checked","duckfs.write_text","modules.update"],
+  caps:{forge_read:["ducktape",process.argv[4]],forge_push:["ducktape",process.argv[4]],pages_write:["*"],duckfs_read:["/shared/skills"]},
+  skills:[{name:process.argv[2],source_prefix:`/shared/skills/${process.argv[2]}`,load:"always"}]
+}}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME" "$PLAYGROUND") || die "invalid registration"
+submit runs "$REGISTER"
+MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:`@${process.argv[2]} introduce yourself: what can you do on this network?`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$AGENT_ID")
 submit chat "$MENTION"
 
-# forge — a playground repo, an issue on it, and a Quackbot mention in the
+# forge — a playground repo, an issue on it, and a ChiefDuck mention in the
 # issue's discussion channel: the trigger the dogfood e2e drives. A push must
 # prove itself, so this one carries the operator credential (the node becomes
 # the repo's owner) through GIT_CONFIG_*, never an argv. The run itself waits
 # for `make dev`: the compute service clones the repo into a microVM, the
-# script writes QUACKBOT.md, the host commits and pushes agent/item-1, and the
-# PR sink opens the pull request onto dev.
+# agent works the issue there, the host commits and pushes agent/item-1, and
+# the PR sink opens the pull request onto dev.
 if command -v git >/dev/null; then
   SEED_REPO="$(mktemp -d)"
   ( cd "$SEED_REPO" \
     && git -c init.defaultBranch=dev init -q \
-    && printf '# %s\n\nA scratch repository the demo seeds for Quackbot. Mention @quackbot on an issue here and it opens a pull request.\n' "$PLAYGROUND" > README.md \
+    && printf '# %s\n\nA scratch repository the demo seeds for %s. Mention @%s on an issue here and it opens a pull request.\n' "$PLAYGROUND" "$AGENT_NAME" "$AGENT_ID" > README.md \
     && git add README.md \
     && git -c user.name="Demo seed" -c user.email="seed@demo.duck" -c commit.gpgsign=false commit -q -m "seed the playground" \
     && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $OPERATOR" \
@@ -385,13 +332,13 @@ if command -v git >/dev/null; then
   pushed=$?
   rm -rf "$SEED_REPO"
   [ "$pushed" -eq 0 ] || die "cannot push the $PLAYGROUND repo into the forge"
-  submit forge "{\"open_issue\":{\"repo\":\"$PLAYGROUND\",\"title\":\"Say hello from a microVM\",\"body\":\"Mention @quackbot here: it clones this repo inside a microVM, writes QUACKBOT.md, and opens a pull request.\"}}"
+  submit forge "{\"open_issue\":{\"repo\":\"$PLAYGROUND\",\"title\":\"Say hello from a microVM\",\"body\":\"Mention @$AGENT_ID here: it clones this repo inside a microVM, adds a HELLO.md that says who it is, and opens a pull request.\"}}"
   ISSUE_CHANNEL=$(query forge "{\"get_item\":{\"repo\":\"$PLAYGROUND\",\"number\":1}}" | bun -e 'process.stdout.write(String((await Bun.stdin.json()).item?.channel_id ?? ""))')
   [ -n "$ISSUE_CHANNEL" ] || die "the $PLAYGROUND issue has no discussion channel"
-  ISSUE_MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:process.argv[2],message_id:"i1",blocks:[{paragraph:[{text:"@quackbot say hello",marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$ISSUE_CHANNEL")
+  ISSUE_MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:process.argv[2],message_id:"i1",blocks:[{paragraph:[{text:`@${process.argv[3]} say hello`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$ISSUE_CHANNEL" "$AGENT_ID")
   submit chat "$ISSUE_MENTION"
 else
-  log "no host git — skipping the $PLAYGROUND forge repo and its Quackbot issue"
+  log "no host git — skipping the $PLAYGROUND forge repo and its $AGENT_NAME issue"
 fi
 
 # jobs — a job on the board. the job board shares the "tasks" target under the

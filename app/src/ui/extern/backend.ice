@@ -378,11 +378,17 @@ extern crate::backend
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
-  AgentsData(generation:i64, agents:[AgentRow])
+  AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
+  AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
+  AgentsData(generation:i64, agents:[AgentRow], capabilities:[str], actions:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
+  // the editor's whole draft record, as the Agents view hands it back
+  save_agent(rpc:str, password:str, draft:str) -> bool ! AppError
+  // provision the program account under the signing account, then register
+  register_agent(rpc:str, password:str, controller:str, draft:str) -> bool ! AppError
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
   GovernanceData(generation:i64, proposals:[ProposalRow])
   load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError

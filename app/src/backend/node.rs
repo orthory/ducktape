@@ -1047,7 +1047,91 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One configured model, rendered with its live-run fact.
+/// One curated skill as the record carries it: a duckfs subtree, pinned at a
+/// snapshot or tracking the committed head (an empty `source_snapshot`), and
+/// whether its body is the agent's persona (`always`) or read on demand.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentSkill {
+    pub name: String,
+    pub source_prefix: String,
+    pub source_snapshot: String,
+    pub always: bool,
+}
+
+impl From<runs::SkillRef> for AgentSkill {
+    fn from(skill: runs::SkillRef) -> Self {
+        Self {
+            name: skill.name,
+            source_prefix: skill.source_prefix,
+            source_snapshot: skill.source_snapshot.unwrap_or_default(),
+            always: matches!(skill.load, runs::LoadMode::Always),
+        }
+    }
+}
+
+impl From<AgentSkill> for runs::SkillRef {
+    fn from(skill: AgentSkill) -> Self {
+        let pinned = !skill.source_snapshot.is_empty();
+        Self {
+            name: skill.name,
+            source_prefix: skill.source_prefix,
+            source_snapshot: pinned.then_some(skill.source_snapshot),
+            load: if skill.always {
+                runs::LoadMode::Always
+            } else {
+                runs::LoadMode::OnDemand
+            },
+        }
+    }
+}
+
+/// The resource grant, list by list: the record's caps as the register shows
+/// them and the editor hands them back.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentCaps {
+    pub forge_read: Vec<String>,
+    pub forge_push: Vec<String>,
+    pub duckfs_read: Vec<String>,
+    pub duckfs_write: Vec<String>,
+    pub tools: Vec<String>,
+    pub secrets: Vec<String>,
+    pub pages_write: Vec<String>,
+    pub subagent_budget: i64,
+}
+
+impl From<runs::ResourceCaps> for AgentCaps {
+    fn from(caps: runs::ResourceCaps) -> Self {
+        Self {
+            forge_read: caps.forge_read,
+            forge_push: caps.forge_push,
+            duckfs_read: caps.duckfs_read,
+            duckfs_write: caps.duckfs_write,
+            tools: caps.tools,
+            secrets: caps.secrets,
+            pages_write: caps.pages_write,
+            subagent_budget: i64::from(caps.subagent_budget),
+        }
+    }
+}
+
+impl AgentCaps {
+    fn into_resource_caps(self) -> Result<runs::ResourceCaps, String> {
+        let subagent_budget = u32::try_from(self.subagent_budget)
+            .map_err(|_| "the subagent budget must be a whole number of calls".to_string())?;
+        Ok(runs::ResourceCaps {
+            forge_read: self.forge_read,
+            forge_push: self.forge_push,
+            duckfs_read: self.duckfs_read,
+            duckfs_write: self.duckfs_write,
+            tools: self.tools,
+            secrets: self.secrets,
+            pages_write: self.pages_write,
+            subagent_budget,
+        })
+    }
+}
+
+/// One configured model: its record, whole, with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
     pub id: String,
@@ -1055,20 +1139,29 @@ pub struct AgentRow {
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// The current controller of the model's programmable account.
+    /// The current controller of the model's programmable account, by name.
     pub owner_handle: String,
+    /// That controller's account number, decimal: the one principal whose
+    /// signature may change this record.
+    pub controller: String,
     /// this agent holds a RUN in flight right now — the runs module's pending
     /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub skill_count: i64,
-    pub cap_count: i64,
+    pub allowed_actions: Vec<String>,
+    pub caps: AgentCaps,
+    pub skills: Vec<AgentSkill>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentsData {
     pub generation: i64,
     pub agents: Vec<AgentRow>,
+    /// Every capability tag a node on this network announces — what a
+    /// record's `capability` can be dispatched on today.
+    pub capabilities: Vec<String>,
+    /// The action vocabulary a grant draws from.
+    pub actions: Vec<String>,
 }
 
 /// Load model configurations with current account controllers and run activity.
@@ -1087,8 +1180,11 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
             return Err("the runs module returned the wrong model roster reply".into());
         };
-        let (accounts, working) =
-            tokio::join!(read_accounts(&client), agents_with_a_run_in_flight(&client));
+        let (accounts, working, capabilities) = tokio::join!(
+            read_accounts(&client),
+            agents_with_a_run_in_flight(&client),
+            announced_capabilities(&client)
+        );
         let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
             .filter_map(|account| match account.control {
@@ -1110,35 +1206,54 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                     .get(&record.account)
                     .ok_or_else(|| "the model account has no program controller".to_string())?;
                 let owner_handle = author_display(&format!("acct:{controller}"), &names);
-                let caps = &record.caps;
-                let cap_count = caps.forge_read.len()
-                    + caps.forge_push.len()
-                    + caps.duckfs_read.len()
-                    + caps.duckfs_write.len()
-                    + caps.tools.len()
-                    + caps.secrets.len()
-                    + caps.pages_write.len()
-                    + usize::from(caps.subagent_budget > 0);
                 Ok(AgentRow {
                     live: working.contains(&record.agent_id),
                     initials: initials_of(&record.display_name),
                     capability: record.capability,
-                    skill_count: count_i64(record.skills.len()),
-                    cap_count: count_i64(cap_count),
                     id: record.agent_id,
                     name: record.display_name,
                     status,
                     owner_handle,
+                    controller: controller.to_string(),
+                    allowed_actions: record.allowed_actions,
+                    caps: record.caps.into(),
+                    skills: record.skills.into_iter().map(AgentSkill::from).collect(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(AgentsData { generation, agents })
+        Ok(AgentsData {
+            generation,
+            agents,
+            capabilities,
+            actions: runs::KNOWN_ACTIONS
+                .iter()
+                .map(|action| (*action).to_string())
+                .collect(),
+        })
     }
     .await
     .map_err(|message: String| HydrationError {
         generation,
         message: user_error(message),
     })
+}
+
+/// Every capability tag some node announces, sorted and deduped — the
+/// executors a record can name and be dispatched on. A node that cannot
+/// answer the registry offers none, never a guess.
+async fn announced_capabilities(rpc: &RpcClient) -> Vec<String> {
+    let Ok(capability::CapabilityReply::All(registry)) = rpc
+        .query::<_, capability::CapabilityReply>("capability", &capability::CapabilityQuery::All)
+        .await
+    else {
+        return Vec::new();
+    };
+    registry
+        .into_iter()
+        .flat_map(|(_, tags)| tags)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 /// The agents holding a run in flight, from the runs module's pending
@@ -1246,6 +1361,155 @@ pub async fn set_agent_status(
     .await
     .map_err(app_error)?;
     Ok(true)
+}
+
+/// The editor's record as the Agents view hands it back: every field the
+/// controller may set, in one piece. The view holds the drafts; this is what
+/// leaves it with the save.
+#[derive(Debug, serde::Deserialize)]
+pub struct AgentDraft {
+    pub agent_id: String,
+    pub display_name: String,
+    pub capability: String,
+    pub allowed_actions: Vec<String>,
+    pub caps: AgentCaps,
+    pub skills: Vec<AgentSkill>,
+}
+
+impl AgentDraft {
+    fn decode(draft: &str) -> Result<Self, String> {
+        serde_json::from_str(draft)
+            .map_err(|error| format!("the agent draft does not decode: {error}"))
+    }
+}
+
+/// Rewrite an agent's record with the editor's draft. Every editable field is
+/// sent, so the record afterwards IS the draft; the registry decides whether
+/// the signing account controls it.
+pub async fn save_agent(rpc: String, password: String, draft: String) -> Result<bool, AppError> {
+    async {
+        let draft = AgentDraft::decode(&draft)?;
+        let agent_id = required_id(draft.agent_id, "agent")?;
+        let rpc = rpc_client(&rpc)?;
+        let operation = runs::ModelMsg::UpdateModel {
+            agent_id,
+            display_name: Some(draft.display_name),
+            capability: Some(draft.capability),
+            allowed_actions: Some(draft.allowed_actions),
+            recipe_hash: None,
+            caps: Some(draft.caps.into_resource_caps()?),
+            skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
+        };
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Bring a new agent into the register: provision its keyless program account
+/// under the signing account (`controller`, the wallet's own account number),
+/// read that account back, and register the draft against it. Two committed
+/// writes and one read, in order; the first write is a full block, so the
+/// read never runs ahead of it.
+pub async fn register_agent(
+    rpc: String,
+    password: String,
+    controller: String,
+    draft: String,
+) -> Result<bool, AppError> {
+    async {
+        let draft = AgentDraft::decode(&draft)?;
+        let controller: u64 = controller.parse().map_err(|_| {
+            "registering an agent needs an account to control it — create one in Settings first"
+                .to_string()
+        })?;
+        runs::validate_agent_id(&draft.agent_id)?;
+        let display_name = draft.display_name.trim().to_owned();
+        if display_name.is_empty() {
+            return Err("give the agent a display name".to_string());
+        }
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "agent",
+            ::agent::encode_msg(&::agent::AgentMsg::Provision {
+                name: display_name.clone(),
+                program: runs::model_program(&draft.agent_id),
+            }),
+            password.clone(),
+        )
+        .await?;
+        let account = newest_program_account(&rpc, controller, &display_name).await?;
+        let operation = runs::ModelMsg::RegisterModel {
+            account,
+            agent_id: draft.agent_id,
+            display_name,
+            capability: draft.capability,
+            allowed_actions: draft.allowed_actions,
+            recipe_hash: None,
+            caps: Some(draft.caps.into_resource_caps()?),
+            skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
+        };
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The highest-numbered agent-executed program account named `name` under
+/// `controller`. Accounts are numbered upward with no gaps, so after a
+/// provision the newest match IS the account it minted, whatever older
+/// accounts share the name.
+async fn newest_program_account(
+    rpc: &RpcClient,
+    controller: u64,
+    name: &str,
+) -> Result<u64, String> {
+    let page_limit =
+        usize::try_from(identity::MAX_QUERY_LIMIT).expect("the identity page cap fits a usize");
+    let mut newest = None;
+    let mut from: identity::AccountNumber = 0;
+    loop {
+        let reply: identity::IdentityReply = rpc
+            .query(
+                "identity",
+                &identity::IdentityQuery::Controlled {
+                    by: controller,
+                    from,
+                    limit: identity::MAX_QUERY_LIMIT,
+                },
+            )
+            .await?;
+        let identity::IdentityReply::Accounts(page) = reply else {
+            return Err("the identity module returned the wrong reply".to_string());
+        };
+        let page_is_last = page.len() < page_limit;
+        let Some(last) = page.last().map(|account| account.number) else {
+            break;
+        };
+        let runs_agent_program = |account: &identity::AccountView| {
+            matches!(
+                &account.control,
+                identity::Control::Program { executor, .. } if executor == "agent"
+            )
+        };
+        newest = page
+            .iter()
+            .filter(|account| account.name == name && runs_agent_program(account))
+            .map(|account| account.number)
+            .max()
+            .or(newest);
+        if page_is_last {
+            break;
+        }
+        from = last + 1;
+    }
+    newest
+        .ok_or_else(|| format!("the program account for {name:?} was not found after provisioning"))
 }
 
 /// The local account picture: whether the local user key belongs to an
