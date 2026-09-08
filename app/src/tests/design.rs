@@ -799,7 +799,11 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
             .contains("bg=danger_bg border=danger_line")
     );
     assert!(chat_screen.contains("bg=danger_dot"));
-    assert!(SCREENS.contains("bg=success_dot"));
+    // the live dots moved to the `shell` view with its screen
+    assert!(
+        inlined(include_str!("../../../crates/views/shell/src/ui/shell.ice"))
+            .contains("bg=success_dot")
+    );
     // the semantic status plate is the kit's, so every screen that reports
     // a good outcome paints the same three tokens.
     assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
