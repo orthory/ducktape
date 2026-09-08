@@ -38,6 +38,7 @@ use tokio::net::{TcpListener, TcpStream};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use keyscheme::KeyScheme;
+use sha2::{Digest as _, Sha256};
 
 /// the live page. Its host IS the RP ID every passkey is scoped to — changing
 /// it invalidates every registered passkey (acceptable at zero live networks).
@@ -51,6 +52,33 @@ pub const REVEAL_NS: &[u8] = b"ducktape:reveal-key:v1";
 /// the largest form body the listener reads — an assertion is a few KiB.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// The discoverable passkey's chain and account hint, stored as `user.id`.
+/// An assertion returns this unsigned; a matching signature still proves access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserHandle {
+    chain_hash: [u8; 32],
+    number: u64,
+}
+
+impl UserHandle {
+    pub fn new(chain_id: &str, number: u64) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"ducktape:passkey-account:v1\0");
+        hash.update(chain_id.as_bytes());
+        Self {
+            chain_hash: hash.finalize().into(),
+            number,
+        }
+    }
+
+    pub fn to_bytes(self) -> [u8; 40] {
+        let mut bytes = [0; 40];
+        bytes[..32].copy_from_slice(&self.chain_hash);
+        bytes[32..].copy_from_slice(&self.number.to_le_bytes());
+        bytes
+    }
+}
+
 /// one ceremony, as the page's fragment names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -60,6 +88,7 @@ pub enum Request {
     Create {
         challenge: [u8; 32],
         user: u64,
+        chain_id: String,
         name: String,
     },
     /// `navigator.credentials.get()` with `allowCredentials: []` — the
@@ -84,9 +113,9 @@ pub enum Outcome {
         client_data_json: Vec<u8>,
         /// raw `R‖S`, 64 bytes (the page normalizes DER away).
         signature: Vec<u8>,
-        /// the account number a registration wrote as `user.id`; `None` for a
-        /// credential registered without one.
-        user_handle: Option<u64>,
+        /// The unsigned chain and account hint a registration wrote as `user.id`;
+        /// `None` for a credential registered without one.
+        user_handle: Option<UserHandle>,
     },
     Eth {
         address: String,
@@ -110,12 +139,15 @@ pub fn request_url(page: &str, request: &Request, callback: &str) -> String {
         Request::Create {
             challenge,
             user,
+            chain_id,
             name,
         } => {
             params.push("op=create".into());
             params.push(format!("challenge={}", B64.encode(challenge)));
-            params.push(format!("user={}", B64.encode(user.to_le_bytes())));
-            params.push(format!("name={}", url_encode(name)));
+            let handle = UserHandle::new(chain_id, *user);
+            params.push(format!("user={}", B64.encode(handle.to_bytes())));
+            let label = format!("{name} · {chain_id}");
+            params.push(format!("name={}", url_encode(&label)));
         }
         Request::Get { challenge } => {
             params.push("op=get".into());
@@ -217,17 +249,28 @@ fn binary(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("auth page result field {field:?} is not base64url: {e}"))
 }
 
-fn user_handle(value: &serde_json::Value) -> Result<Option<u64>, String> {
+fn user_handle(value: &serde_json::Value) -> Result<Option<UserHandle>, String> {
     let Some(text) = value["userHandle"].as_str() else {
         return Ok(None);
     };
     let bytes = B64
         .decode(text)
         .map_err(|e| format!("auth page userHandle is not base64url: {e}"))?;
-    let Ok(le) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-        return Err("auth page userHandle is not an 8-byte account number".into());
+    let Ok(bytes) = <[u8; 40]>::try_from(bytes.as_slice()) else {
+        return Err(
+            "the passkey has an unsupported userHandle; recreate it with \
+            `ducktape account key add --passkey` from a member device"
+                .into(),
+        );
     };
-    Ok(Some(u64::from_le_bytes(le)))
+    let mut chain_hash = [0; 32];
+    chain_hash.copy_from_slice(&bytes[..32]);
+    let mut number = [0; 8];
+    number.copy_from_slice(&bytes[32..]);
+    Ok(Some(UserHandle {
+        chain_hash,
+        number: u64::from_le_bytes(number),
+    }))
 }
 
 fn hex_0x(text: &str) -> Result<Vec<u8>, String> {
@@ -697,15 +740,25 @@ pub fn account_request() -> Request {
 /// the account a passkey assertion names in its `userHandle`. Unsigned, so it
 /// is a HINT: it picks which account to ask about, and [`login_add_key`] then
 /// accepts only a consent a key OF that account actually signed.
-pub fn assertion_account(outcome: &Outcome) -> Result<u64, String> {
+pub fn assertion_account(chain_id: &str, outcome: &Outcome) -> Result<u64, String> {
     let Outcome::Get { user_handle, .. } = outcome else {
         return Err("expected a passkey assertion (op=get)".into());
     };
-    user_handle.ok_or_else(|| {
-        "the passkey names no account (no userHandle) — register it with \
+    let Some(handle) = user_handle else {
+        return Err(
+            "the passkey names no account (no userHandle) — register it with \
          `ducktape account key add --passkey` from a member device"
-            .to_string()
-    })
+                .to_string(),
+        );
+    };
+    let expected = UserHandle::new(chain_id, handle.number);
+    let different_chain = handle.chain_hash != expected.chain_hash;
+    if different_chain {
+        return Err(format!(
+            "this passkey belongs to a different chain; select a passkey for {chain_id}"
+        ));
+    }
+    Ok(handle.number)
 }
 
 /// login, touch 2: the `get` a passkey answers to CONSENT to admitting
@@ -735,8 +788,8 @@ pub fn login_request(
 /// envelope proof an `AddKey { authorizer: { key: <that passkey>, proof } }`
 /// carries. Which of the account's `Secp256r1` keys signed is the caller's to
 /// find — by verifying the proof against each.
-pub fn login_consent(outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
-    let number = assertion_account(outcome)?;
+pub fn login_consent(chain_id: &str, outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
+    let number = assertion_account(chain_id, outcome)?;
     let Outcome::Get {
         authenticator_data,
         client_data_json,
@@ -812,6 +865,90 @@ mod tests {
     };
 
     const RP: &str = "auth.ducktape.industries";
+    const CHAIN: &str = "demo#a1b2c3d4";
+    // Independently computed with Python hashlib and Node node:crypto.
+    const HANDLE_42: &str = "6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA";
+
+    #[test]
+    fn a_chain_bound_handle_decodes_from_the_page() {
+        let json = serde_json::json!({
+            "op": "get",
+            "authenticatorData": "AQ",
+            "clientDataJSON": "Ag",
+            "signature": "Aw",
+            "userHandle": HANDLE_42,
+        });
+        let outcome = parse_result(&json.to_string()).unwrap();
+        assert_eq!(assertion_account(CHAIN, &outcome).unwrap(), 42);
+        assert!(
+            assertion_account("demo#other", &outcome)
+                .unwrap_err()
+                .contains("different chain")
+        );
+        assert!(
+            login_consent("demo#other", &outcome)
+                .unwrap_err()
+                .contains("different chain")
+        );
+    }
+
+    #[test]
+    fn registration_handles_are_stable_and_chain_scoped() {
+        let handle = UserHandle::new(CHAIN, 42);
+        assert_eq!(B64.encode(handle.to_bytes()), HANDLE_42);
+        assert_eq!(handle, UserHandle::new(CHAIN, 42));
+        assert_ne!(handle, UserHandle::new("demo#different", 42));
+        assert_ne!(handle, UserHandle::new(CHAIN, 43));
+        // Account numbers retain all 64 bits in little-endian order.
+        assert_eq!(
+            &UserHandle::new(CHAIN, u64::MAX).to_bytes()[32..],
+            &[255; 8]
+        );
+    }
+
+    #[test]
+    fn registration_labels_preserve_and_escape_the_entire_chain_id() {
+        let url = request_url(
+            "https://p/",
+            &Request::Create {
+                challenge: [0; 32],
+                user: 42,
+                chain_id: "demo#0123456789abcdef&x=+끝".into(),
+                name: "a&b #+".into(),
+            },
+            "cb",
+        );
+        assert!(url.contains(
+            "&name=a%26b%20%23%2B%20%C2%B7%20demo%230123456789abcdef%26x%3D%2B%EB%81%9D&cb="
+        ));
+    }
+
+    #[test]
+    fn old_account_only_handles_require_recreating_the_passkey() {
+        let result = parse_result(
+            r#"{"op":"get","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
+        );
+        assert!(result.is_err(), "old account-only handles must be refused");
+        assert!(result.unwrap_err().contains("recreate"));
+    }
+
+    #[test]
+    fn every_other_handle_length_is_refused() {
+        for length in 0..=65 {
+            if length == 40 {
+                continue;
+            }
+            let json = serde_json::json!({
+                "op": "get",
+                "authenticatorData": "AQ",
+                "clientDataJSON": "Ag",
+                "signature": "Aw",
+                "userHandle": B64.encode(vec![0; length]),
+            });
+            let error = parse_result(&json.to_string()).unwrap_err();
+            assert!(error.contains("recreate"), "{length} bytes: {error}");
+        }
+    }
 
     fn msg() -> sdk::Msg {
         sdk::Msg {
@@ -821,7 +958,7 @@ mod tests {
     }
 
     /// the fragment is the README's, field for field: b64url no padding,
-    /// `user` = 8-byte LE, `name`/`cb` percent-encoded.
+    /// `user` = 32-byte chain hash followed by 8-byte LE account, `name`/`cb` percent-encoded.
     #[test]
     fn the_request_url_is_the_pages_contract() {
         let mut challenge = [0u8; 32];
@@ -831,6 +968,7 @@ mod tests {
             &Request::Create {
                 challenge,
                 user: 42,
+                chain_id: CHAIN.into(),
                 name: "de mo".into(),
             },
             "http://127.0.0.1:9/",
@@ -840,8 +978,8 @@ mod tests {
         let params: Vec<&str> = fragment.split('&').collect();
         assert_eq!(params[0], "op=create");
         assert!(params[1].starts_with("challenge=AQID"), "{}", params[1]);
-        assert_eq!(params[2], "user=KgAAAAAAAAA");
-        assert_eq!(params[3], "name=de%20mo");
+        assert_eq!(params[2], format!("user={HANDLE_42}"));
+        assert_eq!(params[3], "name=de%20mo%20%C2%B7%20demo%23a1b2c3d4");
         assert_eq!(params[4], "cb=http%3A%2F%2F127.0.0.1%3A9%2F");
 
         let eth = request_url(
@@ -878,7 +1016,7 @@ mod tests {
                 .is_err()
         );
         let get = parse_result(
-            r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
+            r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -887,7 +1025,7 @@ mod tests {
                 authenticator_data: vec![1],
                 client_data_json: vec![2],
                 signature: vec![3],
-                user_handle: Some(42)
+                user_handle: Some(UserHandle::new(CHAIN, 42))
             }
         );
         let anonymous = parse_result(
@@ -1094,9 +1232,9 @@ mod tests {
             authenticator_data: authenticator_data.clone(),
             client_data_json: client_data_json.clone(),
             signature: signature.clone(),
-            user_handle: Some(11),
+            user_handle: Some(UserHandle::new("chain-a", 11)),
         };
-        let (number, proof) = login_consent(&outcome).unwrap();
+        let (number, proof) = login_consent("chain-a", &outcome).unwrap();
         assert_eq!(number, 11);
         assert!(KeyScheme::Secp256r1.verify(
             &passkey_pubkey(&sk),
@@ -1111,7 +1249,7 @@ mod tests {
             user_handle: None,
         };
         assert!(
-            login_consent(&anonymous)
+            login_consent("chain-a", &anonymous)
                 .unwrap_err()
                 .contains("no userHandle")
         );
@@ -1289,7 +1427,7 @@ mod tests {
     async fn a_relay_waits_through_204s_and_takes_the_first_200() {
         let (base, server) = fake_relay(
             2,
-            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
         ).await;
         let outcome = Relay::at(&base)
             .wait(Duration::from_secs(20))
@@ -1299,9 +1437,9 @@ mod tests {
         assert!(matches!(
             outcome,
             Outcome::Get {
-                user_handle: Some(42),
+                user_handle: Some(handle),
                 ..
-            }
+            } if handle == UserHandle::new(CHAIN, 42)
         ));
     }
 
@@ -1382,7 +1520,7 @@ mod tests {
     async fn a_relay_reports_the_time_left_before_each_poll() {
         let (base, server) = fake_relay(
             2,
-            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
         ).await;
         let mut seen = Vec::new();
         Relay::at(&base)
@@ -1404,6 +1542,7 @@ mod tests {
             &Request::Create {
                 challenge: [9u8; 32],
                 user: 1234,
+                chain_id: CHAIN.into(),
                 name: "byeongsu".into(),
             },
             &relay.callback_url(),

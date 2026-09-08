@@ -463,6 +463,7 @@ fn cmd_key_add_passkey(
     let registered = ceremony(
         auth,
         &Request::Create {
+            chain_id: chain_id.clone(),
             challenge: authpage::create_challenge(),
             user: account.number,
             name: account.name.clone(),
@@ -557,7 +558,10 @@ fn cmd_login(
             key: device_key.clone(),
         },
     )?)?;
-    let number = authpage::assertion_account(&ceremony(auth, &authpage::account_request())?)?;
+    let number = authpage::assertion_account(
+        &chain_id,
+        &ceremony(auth, &authpage::account_request())?,
+    )?;
     let account = account_reply(query_identity(&base, &IdentityQuery::Get { number })?)?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
     let expires_at = consent_expiry(&base)?;
@@ -566,7 +570,7 @@ fn cmd_login(
         auth,
         &authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
     )?;
-    let (_, proof) = authpage::login_consent(&consent)?;
+    let (_, proof) = authpage::login_consent(&chain_id, &consent)?;
     let msg = authpage::login_add_key(
         &chain_id,
         &device_key,
@@ -1332,9 +1336,9 @@ mod tests {
             authenticator_data,
             client_data_json,
             signature,
-            user_handle: Some(11),
+            user_handle: Some(authpage::UserHandle::new("chain-a", 11)),
         };
-        let (number, proof) = authpage::login_consent(&outcome).unwrap();
+        let (number, proof) = authpage::login_consent("chain-a", &outcome).unwrap();
         assert_eq!(number, 11);
         let msg = authpage::login_add_key(
             "chain-a",
