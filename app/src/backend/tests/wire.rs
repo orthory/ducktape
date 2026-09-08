@@ -545,6 +545,9 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         after.blocks[0].text, "A signed page block",
         "the refused save must not have touched the page it fell back to"
     );
+    // the module views load from whatever node connects last: take the
+    // turn the deployment tests take, so this node is not theirs
+    let _turn = crate::module_view::tests::connection_turn().await;
     let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = next_change(&mut live).await;

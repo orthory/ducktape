@@ -258,11 +258,16 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     // back at the price of carrying a last-height in this state,
                     // and the fold path — the part that actually cost something
                     // — is already unreachable.
-                    Some(Ok(ModuleEvent::Tip { height })) => live_update(
-                        crate::LiveKind::Tip,
-                        &format!("Live · block {height}"),
-                        i64::try_from(height).unwrap_or(i64::MAX),
-                    ),
+                    Some(Ok(ModuleEvent::Tip { height })) => {
+                        // a block may have activated a module's code: the
+                        // module-owned views check their deployments
+                        tokio::spawn(crate::module_view::deployments_checked());
+                        live_update(
+                            crate::LiveKind::Tip,
+                            &format!("Live · block {height}"),
+                            i64::try_from(height).unwrap_or(i64::MAX),
+                        )
+                    }
                     Some(Err(error)) => {
                         state.stream = None;
                         state.retry_attempt = state.retry_attempt.saturating_add(1);

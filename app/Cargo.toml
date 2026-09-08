@@ -138,7 +138,7 @@ ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", re
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
 # in one binary is one set of semantics to reason about.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "97a3b810c842ac423676deb9cd9e25b841692a77" }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "97a3b810c842ac423676deb9cd9e25b841692a77", features = ["manifest"] }
 wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or

@@ -49,7 +49,6 @@ enum Tone
   dark
 
 extern crate::host
-  HostError(message:str)
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
@@ -61,7 +60,8 @@ extern crate::host
   DmSidebarRow(peer:DmPeer, unread:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64)
-  stream props() -> ChatProps ! HostError
+  PropsItem(next:ChatProps, error:str)
+  subscription props() -> PropsItem
   pure search_phase_of(name:&str) -> SearchPhase
   pure message_action_of(name:&str) -> MessageAction
   pure copy_surface_of(name:&str) -> CopySurface
@@ -199,10 +199,16 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// The facts are the host's: one subscription, one item per change. A
+// subscription, not a mount task, so a replacement restored from this
+// view's state asks for the facts again on its own.
+subscribe
+  props() -> props_arrived _
 
-on props_changed(next)
+on props_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   let sent_now = next.sent_serial != sent_serial
   sent_serial = next.sent_serial
   endpoint = next.endpoint
@@ -276,9 +282,6 @@ on props_changed(next)
 on snap_stream(moved)
   return if !moved
   task widget snap #chat/message-stream 0.0 0.0
-
-on props_failed(error)
-  host_error = error.message
 
 on press_message(seq, surface)
   sent = send_press(seq, surface)

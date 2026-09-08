@@ -21,12 +21,12 @@ use "files.ice"
 use "kit.ice"
 
 extern crate::host
-  HostError(message:str)
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsDiffEntry(path:str, kind:str)
   FilesProps(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:str, dark:bool, write_refusal:str, writes:i64)
-  stream props() -> FilesProps ! HostError
+  PropsItem(next:FilesProps, error:str)
+  subscription props() -> PropsItem
   pure open_dir(path:&str) -> bool
   pure open_file(path:&str) -> bool
   pure open_parent() -> bool
@@ -84,10 +84,16 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// The facts are the host's: one subscription, one item per change. A
+// subscription, not a mount task, so a replacement restored from this
+// view's state asks for the facts again on its own.
+subscribe
+  props() -> props_arrived _
 
-on props_changed(next)
+on props_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
   path = next.path
   listed = next.listed
   entries = next.entries
@@ -116,9 +122,6 @@ on props_changed(next)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
-
-on props_failed(error)
-  host_error = error.message
 
 on open_dir_at(target)
   sent = open_dir(target)
