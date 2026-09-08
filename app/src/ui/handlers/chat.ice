@@ -462,7 +462,7 @@ on huddle_joined_ack(_result)
 // ONE EVENT, ONE HANDLER, ONE DISPATCH. Both composers fire the same intent,
 // and the kind says which composer it was rather than the route naming one
 // of two near-identical handlers.
-on composer_submitted(kind, pending_body, pending_id)
+on composer_submitted(kind, pending_body, pending_id, scope)
   match kind
     ComposerKind.message
       // THE GATE, RE-READ AT DELIVERY. The instance refused with the verdict
@@ -471,9 +471,9 @@ on composer_submitted(kind, pending_body, pending_id)
       // arm each, not a bool read twice. A refused body cannot go back into
       // the box by itself (the composer cleared itself before emitting), so
       // the refusing arm hands it to that room's own plate (ducktape-ui#698).
-      match submit_verdict(loading, connected, active_channel, post_refusal, true)
+      match submit_verdict(loading, connected, active_channel, post_refusal, true, scope, composer_scope(connected_rpc, active_channel))
         SubmitVerdict.refused
-          composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), pending_body, false)
+          composer_stashed = chat_composer_unsent(scope, pending_body, false)
         SubmitVerdict.admitted
           hydration_generation = hydration_generation + 1
           hydration_retry_attempt = 0
@@ -501,9 +501,9 @@ on composer_submitted(kind, pending_body, pending_id)
     ComposerKind.reply
       // The rail twin, with the rail's own two terms: its readiness is
       // `thread_loading`, and an open rail is what `seated` says.
-      match submit_verdict(thread_loading, connected, active_channel, post_refusal, active_thread_seq > 0)
+      match submit_verdict(thread_loading, connected, active_channel, post_refusal, active_thread_seq > 0, scope, thread_scope(connected_rpc, active_channel, active_thread_seq))
         SubmitVerdict.refused
-          composer_stashed = chat_composer_unsent(thread_scope(connected_rpc, active_channel, active_thread_seq), pending_body, false)
+          composer_stashed = chat_composer_unsent(scope, pending_body, false)
         SubmitVerdict.admitted
           invalidate lane=live_thread
           hydration_generation = hydration_generation + 1
@@ -1535,4 +1535,5 @@ on chat_view_event(event)
     ChatIntent.composer
       let kind = chat_event_kind(event)
       let id = event_text(event, "id")
-      run every duck_echo_str(event_text(event, "body")) -> composer_submitted(kind, _, id) | external_url_failed _
+      let scope = event_text(event, "scope")
+      run every duck_echo_str(event_text(event, "body")) -> composer_submitted(kind, _, id, scope) | external_url_failed _

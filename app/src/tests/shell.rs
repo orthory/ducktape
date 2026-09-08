@@ -1146,7 +1146,7 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "the composer surface mints its own operation id as it publishes"
     );
     assert!(
-        chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id)"),
+        chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id, scope)"),
         "and the app takes it as a parameter, not from state"
     );
     assert!(

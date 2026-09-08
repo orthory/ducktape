@@ -65,9 +65,8 @@ on forge_view_event(event)
         from done event_text(event, "url")
         done -> open_message_link _
     ForgeIntent.composer
-      flow
-        from done event_text(event, "body")
-        done -> forge_composer_event _
+      let scope = event_text(event, "scope")
+      run every duck_echo_str(event_text(event, "body")) -> forge_composer_event(scope, _) | external_url_failed _
     ForgeIntent.copy
       toast = event_text(event, "label")
       toast_age = 0
@@ -355,12 +354,19 @@ on forge_merge_failed(started_rpc, started_repo, started_number, cause)
   error = cause.message
 
 // The note's words live in the host's composer (`forge_composer`, the chat
-// composer over the item's channel as its scope); a send arrives here as
-// the trimmed body, and a failed one goes back to that box's banner.
-on forge_composer_event(body)
-  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(body))
-  forge_discussion_pending = fresh_operation_id("forge-note")
-  run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(body), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
+// composer over the item's channel on this network as its scope); a send
+// arrives here as the trimmed body and the scope it was written in. The
+// composer cleared itself before it emitted, so a body the gate refuses —
+// or one written for an item or a network the reader has since left — goes
+// back to THAT box, never to the item on screen, and a failed send too.
+on forge_composer_event(scope, body)
+  match submit_verdict(loading, connected, forge_item_channel, forge_discussion_pending, true, scope, composer_scope(connected_rpc, forge_item_channel))
+    SubmitVerdict.refused
+      composer_stashed = chat_composer_unsent(scope, body, false)
+    SubmitVerdict.admitted
+      forge_note_scope = scope
+      forge_discussion_pending = fresh_operation_id("forge-note")
+      run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(body), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
 
 on forge_note_sent(next)
   return if next.channel_id != forge_item_channel
@@ -368,7 +374,7 @@ on forge_note_sent(next)
   error = ""
 
 on forge_note_failed(cause)
-  composer_stashed = chat_composer_unsent(cause.scope_id, cause.body, cause.committed)
+  composer_stashed = chat_composer_unsent(forge_note_scope, cause.body, cause.committed)
   return if cause.scope_id != forge_item_channel
   forge_discussion_pending = ""
   error = cause.message

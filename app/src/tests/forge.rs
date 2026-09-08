@@ -1,5 +1,85 @@
 use super::*;
 
+/// THE NOTE GOES BACK TO THE BOX IT WAS WRITTEN IN. The host's composer
+/// clears itself before it emits, so a body the delivery gate refuses —
+/// the tab loading, the item's channel gone, a note already in flight — is
+/// not dropped: it is stashed into the composer it came from. And the
+/// scope rides the intent, so a note written for this item on ANOTHER
+/// network, or for an item since closed, is refused at delivery and
+/// restored into that original box rather than posted here.
+#[test]
+fn a_note_refused_at_delivery_goes_back_to_the_box_it_was_written_in() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    app.forge_item_number = 7;
+    app.forge_item_channel = "forge:core:7".into();
+    let here = backend::composer_scope("http://node", "forge:core:7");
+
+    // (a) the gate refuses: the tab is loading
+    app.loading = true;
+    let task = app.__update(__DucktapeMessage::ForgeViewEvent(composer_intent(
+        &here, "note", "first",
+    )));
+    pump(&mut app, task);
+    assert!(app.forge_discussion_pending.is_empty(), "nothing was sent");
+    assert_eq!(
+        composer_stash(&here),
+        "first",
+        "the refused body is back in its box"
+    );
+
+    // (b) a stale box: the same item on another network
+    app.loading = false;
+    let elsewhere = backend::composer_scope("http://other", "forge:core:7");
+    let task = app.__update(__DucktapeMessage::ForgeViewEvent(composer_intent(
+        &elsewhere, "note", "second",
+    )));
+    pump(&mut app, task);
+    assert!(
+        app.forge_discussion_pending.is_empty(),
+        "a stale note is never posted here"
+    );
+    assert_eq!(
+        composer_stash(&elsewhere),
+        "second",
+        "…it goes back where it was written"
+    );
+    assert_eq!(
+        composer_stash(&here),
+        "first",
+        "and the box on screen is untouched"
+    );
+
+    // (c) the live box sends, and remembers where it came from for a failure
+    let task = app.__update(__DucktapeMessage::ForgeViewEvent(composer_intent(
+        &here, "note", "third",
+    )));
+    pump(&mut app, task);
+    assert!(
+        !app.forge_discussion_pending.is_empty(),
+        "the live note is in flight"
+    );
+    assert_eq!(app.forge_note_scope, here);
+    let _ = app.__update(__DucktapeMessage::ForgeNoteFailed(
+        backend::OptimisticMutationError {
+            message: "node refused".into(),
+            committed: false,
+            operation_id: app.forge_discussion_pending.clone(),
+            scope_id: "forge:core:7".into(),
+            thread_seq: 0,
+            body: "third".into(),
+        },
+    ));
+    assert_eq!(
+        composer_stash(&here),
+        "first\nthird",
+        "a failed send joins the stash of its box"
+    );
+    assert!(app.forge_discussion_pending.is_empty());
+}
+
 #[test]
 fn forge_depth_rides_the_established_seams() {
     // the forge handlers moved out of lifecycle.ice into their own file;

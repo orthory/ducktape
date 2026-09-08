@@ -271,12 +271,33 @@ fn pump(app: &mut Ducktape, task: iced::Task<__DucktapeMessage>) {
 /// the send lane's receipts and failures are keyed by.
 fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
     let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
+    let scope = match kind {
+        ComposerKind::Message => composer_scope(app),
+        ComposerKind::Reply => reply_composer_scope(app),
+    };
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         kind,
         body.to_owned(),
         id.clone(),
+        scope,
     ));
     id
+}
+
+/// A `composer` intent as the host surface publishes it for `scope` — the
+/// way a submit reaches the app when the box it was written in may no
+/// longer be the one on screen.
+fn composer_intent(scope: &str, kind: &str, body: &str) -> module_view::ModuleViewEvent {
+    module_view::ModuleViewEvent {
+        kind: "composer".into(),
+        detail: serde_json::json!({
+            "scope": scope,
+            "kind": kind,
+            "body": body,
+            "id": backend::fresh_operation_id(kind.to_owned()),
+        })
+        .to_string(),
+    }
 }
 
 /// One composer's draft, as the reader sees it.

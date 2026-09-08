@@ -736,6 +736,7 @@ pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
         "tree" => Intent::Tree,
         "blob" => Intent::Blob,
         "open_link" => Intent::OpenLink,
+        "composer" => Intent::Composer,
         _ => Intent::Copy,
     }
 }
@@ -3214,6 +3215,10 @@ mod tests {
             value: wire::SurfaceValue::Record {
                 name: "composer".into(),
                 fields: vec![
+                    (
+                        "scope".into(),
+                        wire::SurfaceValue::Str("testnet\u{1f}channel-b".into()),
+                    ),
                     ("kind".into(), wire::SurfaceValue::Str("message".into())),
                     ("body".into(), wire::SurfaceValue::Str("hello".into())),
                     ("id".into(), wire::SurfaceValue::Str("message-1".into())),
