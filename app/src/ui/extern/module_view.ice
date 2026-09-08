@@ -36,3 +36,7 @@ extern crate::module_view
   pure forge_event_tab(event:&ModuleViewEvent) -> ForgeTab
   pure forge_event_verdict(event:&ModuleViewEvent) -> ForgeReviewVerdict
   pure event_number(event:&ModuleViewEvent, field:&str) -> i64
+  // the document itself stays here: the fold stashes the buffer for the
+  // `page_document` surface the view leaves a slot for
+  component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, doc_tabs:&[str], blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_editor:&editor, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent
+  pure pages_intent(event:&ModuleViewEvent) -> PagesIntent

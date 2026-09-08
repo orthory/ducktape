@@ -336,67 +336,11 @@ view
               shell_chat_steps_toggled -> shell_chat_steps_toggled _
               shell_open_link -> open_message_link _
 
+        // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
+        // strip and the comments rail go in as props; the document is the
+        // app's editor, painted into the view's slot by the host.
         pages:
-          PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
-            with
-              network_chain_id
-              pages
-              page_create_open
-              loading
-              mutation_phase
-              connected
-              connected_rpc
-              password
-              dark
-              active_page
-              active_page_title
-              active_page_parent
-              page_searching
-              page_search_hits
-              page_search_query
-              page_delete_armed
-              block_autosave_status
-              page_refusal
-              doc_tabs
-              blocks
-              commented_block_hits
-              caret_comment_target
-              active_thread_target
-              active_thread_anchor
-              orphaned_comment_drafts
-              block_comments_open
-              block_comment_thread_total
-              block_comment_threads
-              block_comment_rows
-              block_comment_threads_loading
-              block_comment_threads_has_more
-              active_block_comment_thread
-              block_thread_comments
-              block_thread_comments_loading
-              block_thread_comments_has_more
-            events
-              toggle_page_create -> toggle_page_create
-              create_page_submit -> create_page_submit
-              choose_page -> choose_page _
-              search_pages_submit -> search_pages_submit
-              clear_page_search -> clear_page_search
-              arm_page_delete -> arm_page_delete
-              disarm_page_delete -> disarm_page_delete
-              delete_page_submit -> delete_page_submit
-              close_doc_tab -> close_doc_tab _
-              open_page_search_hit -> open_page_search_hit _ _
-              use_orphaned_comment_draft -> use_orphaned_comment_draft _
-              discard_orphaned_comment_draft -> discard_orphaned_comment_draft _
-              page_edited -> page_edited _
-              toggle_block_comments -> toggle_block_comments
-              close_block_comments -> close_block_comments
-              open_block_comment_thread -> open_block_comment_thread _ _
-              load_more_block_threads -> load_more_block_threads
-              close_block_comment_thread -> close_block_comment_thread
-              load_more_block_comments -> load_more_block_comments
-              post_block_comment_submit -> post_block_comment_submit
-              resolve_thread_submit -> resolve_thread_submit _
-              copy_to_clipboard -> copy_to_clipboard _ _
+          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, doc_tabs, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_editor, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW: the listing, the preview, the
         // history and the write refusal go in as props; every navigation

@@ -443,7 +443,7 @@ fn a_page_search_hit_names_the_page_it_came_from() {
     // The palette and the pages search panel render the same hit type; #997's
     // lesson is that a fix at one surface leaves the siblings broken.
     const PALETTE: &str = include_str!("../../ui/screens/overlays.ice");
-    const PANEL: &str = include_str!("../../ui/components/pages.ice");
+    const PANEL: &str = include_str!("../../../../crates/views/pages/src/ui/rows.ice");
     assert!(
         PALETTE.contains("text hit.page_title"),
         "the palette's page hit names its page"
