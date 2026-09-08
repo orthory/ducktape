@@ -1056,6 +1056,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "forge-view"
+version = "0.1.0"
+dependencies = [
+ "design",
+ "iced",
+ "serde",
+ "serde_json",
+ "ui-lang",
+ "ui-lang-build",
+ "ui-lang-guest",
+ "ui-lang-runtime",
+]
+
+[[package]]
 name = "fs2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
