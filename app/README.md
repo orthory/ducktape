@@ -5,6 +5,7 @@ Native Chat + Pages client, with its UI declared in
 
 ```bash
 cargo build -p node-bin
+make views                  # the tabs: wasm views staged under target/views
 cargo run -p ducktape-app
 ```
 
