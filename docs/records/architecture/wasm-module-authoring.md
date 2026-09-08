@@ -17,7 +17,7 @@ implementation it replaced (same root, same snapshot encoding) — the template
 every later port followed. It is in no genesis set either: the crate is a test
 tenant the kernel suites construct directly. The node binary embeds
 no component: `node init` composes every wasm tenant's `<id>.component.wasm`
-and every declared `<id>.index.wasm` out of the founding set (`--modules <dir>`,
+and every declared mapper, view and asset tree out of the founding set (`--modules <dir>`,
 default `$DUCKTAPE_MODULES_DIR`, else the `modules/` dir noded's build script
 stages beside the binary) into the workspace `genesis` file, and pins that file
 and every deployment in the network descriptor. A node hydrates its blob store
@@ -238,10 +238,38 @@ component.wasm`; the network verifies the bytes by hash.
 ## Live update: how new code ships
 
 Each deployment is a canonical Borsh `ModuleArtifact`: component bytes followed
-by an optional mapper (`Vec<u8>`, `Option<Vec<u8>>`). Its SHA-256 covers both.
+by an optional mapper and an optional view with its asset map. Its SHA-256
+covers the complete deployment.
 `ducktape module pack component.wasm --out module.artifact` packages the files
-and prints this hash offline; `--index index.wasm` includes a mapper. Agents
-commit the artifact and request `modules.update` through their final response
+and prints this hash offline; `--index index.wasm` includes a mapper.
+`--view view.wasm --assets assets/` includes the module's desktop view and its
+asset tree in the same deployment hash. These flags also apply to `register`
+and `update`; `--assets` requires `--view`. Asset paths are exact, relative,
+UTF-8 slash paths; symlinks are refused. Materialization rejects paths that
+collide or cannot be represented exactly on the destination filesystem.
+
+A founding directory uses `<id>.component.wasm`, optional `<id>.index.wasm`,
+optional `<id>.view.wasm`, and optional `<id>.assets/`. Arbitrary external
+module ids remain supported. `Genesis::compose` and runtime artifact reads
+share the same preparation checks. A `<id>.view.pending` marker blocks both,
+even when an older view file is still present.
+
+`make views` bundles the packages declared under `crates/views/`, with fixed
+source-path prefixes and explicit unoptimized output independent of PATH.
+`make views-repro-check` builds the committed HEAD snapshot in two isolated
+roots, compares all view bytes, and rejects embedded builder-home paths.
+The consensus guest `wasm-rebuild-check` does not cover these views. The noded
+build stages module views for governance, files, pages, chat, and forge when
+that owner's `crates/views/<id>/Cargo.toml` exists. Other desktop views remain
+desktop resources. Missing or empty declared view output leaves a pending
+marker; compiling noded succeeds, but founding or packing that deployment
+fails. Run `make views` and rebuild noded to prepare the founding set. A
+restored view clears pending after its assets are synchronized. Removing the
+owner declaration removes staged view files and assets; removing only a build
+output does not. Asset files removed from a restored source tree are removed
+from staging as well.
+
+Agents commit the artifact and request `modules.update` through their final response
 (see [dogfood](../../dogfood.md)). The operator CLI packages the same unit,
 proposes that hash to governance, and only then stages it on the blob plane — a
 peer admits a pushed digest only when consensus names it, and for a brand-new

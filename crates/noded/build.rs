@@ -28,10 +28,14 @@
 //! module the topology names, plus one index guest per module whose crate
 //! declares one by carrying `src/index_guest.rs`. A declared artifact the
 //! checkout lacks fails the build here, naming the path, instead of `node
-//! init` later.
+//! init` later. Desktop view declarations instead leave a pending marker when
+//! output is missing: compilation succeeds and deployment preparation refuses
+//! the incomplete set until `make views` and restaging complete.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub(crate) mod view_staging;
 
 fn main() {
     // re-run when HEAD moves. `--git-path` resolves correctly inside a git
@@ -78,7 +82,7 @@ fn stage_founding_set() {
     stage_preset(&checkout, &profile_dir.join("sim-modules"), &simulation);
 }
 
-fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
+pub(crate) fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
     std::fs::create_dir_all(dest).expect("create the staged module directory");
     for entry in std::fs::read_dir(dest).expect("read staged module directory") {
         let path = entry.expect("read staged artifact").path();
@@ -88,10 +92,20 @@ fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
             .unwrap_or_default();
         let artifact_id = name
             .strip_suffix(".component.wasm")
-            .or_else(|| name.strip_suffix(".index.wasm"));
+            .or_else(|| name.strip_suffix(".index.wasm"))
+            .or_else(|| name.strip_suffix(".view.wasm"))
+            .or_else(|| name.strip_suffix(".view.pending"))
+            .or_else(|| name.strip_suffix(".assets"));
         let obsolete = artifact_id.is_some_and(|id| id != "netstack" && !ids.contains(&id));
         if obsolete {
-            std::fs::remove_file(&path).expect("remove obsolete staged artifact");
+            if std::fs::symlink_metadata(&path)
+                .expect("inspect obsolete staged artifact")
+                .is_dir()
+            {
+                std::fs::remove_dir_all(&path).expect("remove obsolete staged assets");
+            } else {
+                std::fs::remove_file(&path).expect("remove obsolete staged artifact");
+            }
         }
     }
     for id in ids {
@@ -103,6 +117,7 @@ fn stage_preset(checkout: &Path, dest: &Path, ids: &[&str]) {
             &module_dir.join("component.wasm"),
             &dest.join(format!("{}.component.wasm", spec.id)),
         );
+        view_staging::stage_view(checkout, dest, id).expect("stage module view");
         let ships_guest = declares_index_guest(&module_dir);
         // The catalog and source declaration must agree for build presets.
         assert_eq!(
