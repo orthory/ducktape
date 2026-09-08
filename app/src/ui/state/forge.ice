@@ -37,13 +37,17 @@ state
   forge_item_approvals:i64 = 0
   forge_item_change_requests:i64 = 0
   forge_review_verdict:ForgeReviewVerdict = ForgeReviewVerdict.comment
-  forge_review_draft = ""
   forge_review_busy:bool = false
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
   forge_comment_staged:[ForgeDraftComment] = []
+  // The review body and the line comment being written are the Forge
+  // view's. A committed op tells it which drafts it consumed: the count
+  // moves once per op, the scope names them (`item`, `review`, `comment`).
+  forge_drafts_cleared:i64 = 0
+  forge_drafts_scope = ""
+  // A forge item deep link's `#seq` landing, counted for the view's scroll:
+  // the tick moves once per landing, the seq is the row it lands on.
+  forge_landed_seq:i64 = 0
+  forge_landed_tick:i64 = 0
   forge_merge_busy:bool = false
   forge_merge_conflicts:[str] = []
   forge_discussion:[ChatMessage] = []
@@ -51,6 +55,27 @@ state
   forge_discussion_editor:editor = ""
   forge_discussion_pending = ""
   forge_generation:i64 = 0
+  // THE CODE BROWSE: the open directory's listing, pinned to the commit the
+  // root listing answered with, and the file opened under it. The view
+  // draws the file only while the tree still stands where it was opened
+  // (`forge_file_header`).
+  forge_tree_path = ""
+  forge_tree_rev = ""
+  forge_tree_entries:[TreeEntry] = []
+  forge_tree_born:bool = false
+  forge_tree_truncated:bool = false
+  forge_tree_phase:ForgeTreePhase = ForgeTreePhase.loading
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary:bool = false
+  forge_file_truncated:bool = false
+  forge_file_picture:bool = false
+  forge_file_width:i64 = 0
+  forge_file_height:i64 = 0
+  forge_file_note = ""
+  forge_opened_dir = ""
+  forge_opened_rev = ""
+  forge_file_phase:ForgeFilePhase = ForgeFilePhase.idle
 
   forge_tab:ForgeTab = ForgeTab.code
   forge_repo_menu = false

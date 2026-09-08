@@ -51,7 +51,9 @@ fn closing_a_window_exits_only_where_no_status_item_lives() {
         "the survivor guard is spelled inline again: {body}"
     );
     assert!(
-        EXTERNS.contains("pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool"),
+        EXTERNS.contains(
+            "pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool"
+        ),
         "backend.ice lost the close-exits discriminant"
     );
 }
@@ -131,9 +133,8 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
         "the console arm no longer reopens the console: {body}"
     );
     assert!(
-        EXTERNS.contains(
-            "pure tray_open_action(network_open:bool, window_tracked:bool) -> TrayOpen"
-        ),
+        EXTERNS
+            .contains("pure tray_open_action(network_open:bool, window_tracked:bool) -> TrayOpen"),
         "backend.ice lost the tray-open discriminant"
     );
 }
@@ -151,7 +152,8 @@ fn the_quit_route_is_armed_by_the_modifier_stream() {
         "the cheap half is gone: nothing sets cmd_held"
     );
     assert!(
-        LIFECYCLE.contains("keyboard press status=ignored when cmd_held -> command_chord_pressed _"),
+        LIFECYCLE
+            .contains("keyboard press status=ignored when cmd_held -> command_chord_pressed _"),
         "the quit key route lost its `when cmd_held` arming, and now taxes every keystroke"
     );
     assert!(

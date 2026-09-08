@@ -158,7 +158,6 @@ pub fn foreign_network_error(link_net: String, connected_chain_id: String) -> St
     format!("this link belongs to network {link_net} — this app is on {here}")
 }
 
-
 /// `duck://page/<id>?net=…` — the only handle on a page, whose id is a uuid.
 pub fn duck_page_link(page: String, chain_id: String) -> String {
     format!("duck://page/{page}{}", net_query(&chain_id))
@@ -173,17 +172,6 @@ pub fn duck_channel_link(channel: String, chain_id: String) -> String {
 /// fragment, as in every other URI.
 pub fn duck_channel_message_link(channel: String, seq: i64, chain_id: String) -> String {
     format!("duck://channel/{channel}{}#{seq}", net_query(&chain_id))
-}
-
-/// `duck://forge/<repo>/<number>?net=…` — one issue or PR.
-pub fn duck_forge_item_link(repo: String, number: i64, chain_id: String) -> String {
-    format!("duck://forge/{repo}/{number}{}", net_query(&chain_id))
-}
-
-/// `duck://forge/<repo>?net=…` — the repo itself. Its name is typeable, but
-/// the digest that scopes it to THIS network is not.
-pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
-    format!("duck://forge/{repo}{}", net_query(&chain_id))
 }
 
 /// The `duck://` URL the OS launched this process with, or "" for a plain
@@ -393,36 +381,72 @@ mod tests {
             (DuckKind::Files, "/shared/attachments/u1/doc.pdf")
         );
         assert_eq!(kind("duck://files/shared/skills/x.md"), DuckKind::Unknown);
-        assert_eq!(kind("duck://files/shared/attachments/a/b/c"), DuckKind::Unknown);
-        assert_eq!(kind("duck://files/shared/attachments/../etc/pw"), DuckKind::Unknown);
-        assert_eq!(kind("duck://files/shared/attachments/u1/a.png"), DuckKind::Files);
+        assert_eq!(
+            kind("duck://files/shared/attachments/a/b/c"),
+            DuckKind::Unknown
+        );
+        assert_eq!(
+            kind("duck://files/shared/attachments/../etc/pw"),
+            DuckKind::Unknown
+        );
+        assert_eq!(
+            kind("duck://files/shared/attachments/u1/a.png"),
+            DuckKind::Files
+        );
 
         let repo = classify_duck_link("duck://forge/ducktape".into());
-        assert_eq!((repo.kind, repo.repo.as_str()), (DuckKind::ForgeRepo, "ducktape"));
+        assert_eq!(
+            (repo.kind, repo.repo.as_str()),
+            (DuckKind::ForgeRepo, "ducktape")
+        );
         let item = classify_duck_link("duck://forge/ducktape/58".into());
-        assert_eq!((item.kind, item.number, item.seq), (DuckKind::ForgeItem, 58, 0));
+        assert_eq!(
+            (item.kind, item.number, item.seq),
+            (DuckKind::ForgeItem, 58, 0)
+        );
         let anchored = classify_duck_link("duck://forge/ducktape/58#12".into());
-        assert_eq!((anchored.kind, anchored.number, anchored.seq), (DuckKind::ForgeItem, 58, 12));
+        assert_eq!(
+            (anchored.kind, anchored.number, anchored.seq),
+            (DuckKind::ForgeItem, 58, 12)
+        );
         assert_eq!(kind("duck://forge/ducktape#12"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/0"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/58#0"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/-1"), DuckKind::Unknown);
 
         let channel = classify_duck_link("duck://channel/general".into());
-        assert_eq!((channel.kind, channel.channel.as_str()), (DuckKind::Channel, "general"));
+        assert_eq!(
+            (channel.kind, channel.channel.as_str()),
+            (DuckKind::Channel, "general")
+        );
         let hidden = classify_duck_link("duck://channel/forge:ducktape:58".into());
-        assert_eq!((hidden.kind, hidden.channel.as_str()), (DuckKind::Channel, "forge:ducktape:58"));
+        assert_eq!(
+            (hidden.kind, hidden.channel.as_str()),
+            (DuckKind::Channel, "forge:ducktape:58")
+        );
         let message = classify_duck_link("duck://channel/general#42".into());
         assert_eq!((message.kind, message.seq), (DuckKind::ChannelMessage, 42));
         assert_eq!(kind("duck://channel/general#0"), DuckKind::Unknown);
         assert_eq!(kind("duck://channel/"), DuckKind::Unknown);
 
-        assert_eq!(kind("duck://memory/notes/a.md"), DuckKind::Unknown, "reserved");
-        assert_eq!(kind("duck://team.duck/index.html"), DuckKind::Unknown, "gateway plane");
+        assert_eq!(
+            kind("duck://memory/notes/a.md"),
+            DuckKind::Unknown,
+            "reserved"
+        );
+        assert_eq!(
+            kind("duck://team.duck/index.html"),
+            DuckKind::Unknown,
+            "gateway plane"
+        );
         assert_eq!(kind("duck://net.duck"), DuckKind::Unknown, "gateway plane");
         assert_eq!(kind("duck://"), DuckKind::Unknown);
         assert_eq!(kind("mailto:a@b"), DuckKind::Unknown);
-        assert_eq!(kind("./img/a.png"), DuckKind::Unknown, "a relative path is the caller's to resolve");
+        assert_eq!(
+            kind("./img/a.png"),
+            DuckKind::Unknown,
+            "a relative path is the caller's to resolve"
+        );
         assert_eq!(kind("https://example.com/a.png"), DuckKind::Web);
         assert_eq!(kind("http://example.com"), DuckKind::Web);
     }
@@ -432,7 +456,12 @@ mod tests {
     fn a_forge_blob_names_a_committed_file_at_a_revision_or_the_head() {
         let head = classify_duck_link("duck://forge/ducktape/blob/docs/logo.png".into());
         assert_eq!(
-            (head.kind, head.repo.as_str(), head.path.as_str(), head.rev.as_str()),
+            (
+                head.kind,
+                head.repo.as_str(),
+                head.path.as_str(),
+                head.rev.as_str()
+            ),
             (DuckKind::ForgeBlob, "ducktape", "docs/logo.png", "")
         );
         assert_eq!(
@@ -450,10 +479,26 @@ mod tests {
         );
         assert_eq!(oid.path, "a/b.png");
         assert_eq!(oid.rev.len(), 40);
-        assert_eq!(kind("duck://forge/ducktape/blob"), DuckKind::Unknown, "no file");
-        assert_eq!(kind("duck://forge/ducktape/blob/"), DuckKind::Unknown, "no file");
-        assert_eq!(kind("duck://forge/ducktape/blob/../x"), DuckKind::Unknown, "no dot-segments");
-        assert_eq!(kind("duck://forge/ducktape/blob/a.png#L3"), DuckKind::Unknown, "no fragment yet");
+        assert_eq!(
+            kind("duck://forge/ducktape/blob"),
+            DuckKind::Unknown,
+            "no file"
+        );
+        assert_eq!(
+            kind("duck://forge/ducktape/blob/"),
+            DuckKind::Unknown,
+            "no file"
+        );
+        assert_eq!(
+            kind("duck://forge/ducktape/blob/../x"),
+            DuckKind::Unknown,
+            "no dot-segments"
+        );
+        assert_eq!(
+            kind("duck://forge/ducktape/blob/a.png#L3"),
+            DuckKind::Unknown,
+            "no fragment yet"
+        );
     }
 
     /// The `?net=` component: parsed off every row, refused when malformed,
@@ -520,24 +565,14 @@ mod tests {
             "duck://channel/c1?net=d0cdf950"
         );
         assert_eq!(
-            duck_forge_item_link("ducktape".into(), 58, "mynet#d0cdf950".into()),
-            "duck://forge/ducktape/58?net=d0cdf950"
-        );
-        assert_eq!(
             duck_page_link("p1".into(), String::new()),
             "duck://page/p1",
             "no chain id yet, no query — never a `?net=` naming nothing"
-        );
-        assert_eq!(
-            duck_forge_repo_link("ducktape".into(), "mynet#d0cdf950".into()),
-            "duck://forge/ducktape?net=d0cdf950"
         );
         for built in [
             duck_page_link("p1".into(), "mynet#d0cdf950".into()),
             duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
             duck_channel_message_link("c1".into(), 3, "mynet#d0cdf950".into()),
-            duck_forge_item_link("r".into(), 7, "mynet#d0cdf950".into()),
-            duck_forge_repo_link("r".into(), "mynet#d0cdf950".into()),
         ] {
             let link = resolve_duck_link(built.clone(), "mynet#d0cdf950".into());
             assert_ne!(link.kind, DuckKind::Unknown, "{built} must round-trip");
@@ -592,6 +627,10 @@ mod tests {
         assert_eq!(forge_focus_kind(0, String::new()), crate::ForgeFocus::Idle);
         assert_eq!(forge_focus_kind(7, String::new()), crate::ForgeFocus::Item);
         assert_eq!(forge_focus_kind(0, "a.png".into()), crate::ForgeFocus::Blob);
-        assert_eq!(forge_focus_kind(7, "a.png".into()), crate::ForgeFocus::Item, "a number wins");
+        assert_eq!(
+            forge_focus_kind(7, "a.png".into()),
+            crate::ForgeFocus::Item,
+            "a number wins"
+        );
     }
 }

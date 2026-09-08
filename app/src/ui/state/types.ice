@@ -207,6 +207,40 @@ enum ForgeReviewVerdict
   approve
   request_changes
 
+// The code browse's two reads — the directory listing and the file — as the
+// app tracks them for the Forge view.
+enum ForgeTreePhase
+  loading
+  ready
+  failed
+
+enum ForgeFilePhase
+  idle
+  loading
+  ready
+  failed
+
+// what the Forge view asks of the app: one variant per act the screen
+// offers, each carrying only what the reader picked or typed (a repo, an
+// item, a directory or file, a review body, a line comment) — the review
+// and comment drafts themselves are the view's
+enum ForgeIntent
+  open_repo
+  close_repo
+  toggle_repo_menu
+  tab
+  open_item
+  close_item
+  merge
+  review_pick
+  review_submit
+  comment_stage
+  comment_drop
+  tree
+  blob
+  open_link
+  copy
+
 // What a `governance` module view asks of the app: the two writes the
 // Approvals screen makes, routed to the handlers that sign them.
 enum GovIntent

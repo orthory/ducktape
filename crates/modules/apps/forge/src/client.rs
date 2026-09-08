@@ -12,7 +12,7 @@ use crate::{ForgeMsg, decode_msg};
 use chat::client::{ChatBlock, NameDirectory, author_display, author_handle, paragraph_blocks};
 
 /// One tracker listing row.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ItemRow {
     pub number: i64,
     /// `issue` | `pr`.
@@ -47,7 +47,7 @@ pub fn item_rows(items: &[ItemSummary], names: &NameDirectory) -> Vec<ItemRow> {
 
 /// One rendered line-anchored review comment. `anchor` is display-ready
 /// (`src/main.rs:14 (new)`), so the view never re-derives diff vocabulary.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ReviewCommentRow {
     pub anchor: String,
     pub body: String,
@@ -56,7 +56,7 @@ pub struct ReviewCommentRow {
 }
 
 /// One submitted review, rendered.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ReviewRow {
     /// the rendered author handle (`user:{hex}`, ...) — avatar identity.
     pub author: String,

@@ -184,6 +184,13 @@ fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
     serde_json::from_str(&event.detail).ok()
 }
 
+/// The number in one field of an intent's detail, 0 when absent or not one.
+pub fn event_number(event: &ModuleViewEvent, field: &str) -> i64 {
+    detail(event)
+        .and_then(|detail| detail.get(field)?.as_i64())
+        .unwrap_or_default()
+}
+
 // ---------- the node seat ----------
 
 /// The Node tab: the facts the app holds, drawn by the `node` view. Its
@@ -883,6 +890,267 @@ pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
     }
 }
 
+// ---------- the forge seat ----------
+
+/// The forge view's props as one document: borrowed where the app holds the
+/// fact, folded where the view wants a word or a painted row.
+#[derive(serde::Serialize)]
+struct ForgeProps<'a> {
+    dark: bool,
+    connected: bool,
+    org: &'a str,
+    about: &'a str,
+    tier: &'a str,
+    network_chain_id: &'a str,
+    connected_rpc: &'a str,
+    repos: &'a [crate::backend::ForgeRepo],
+    list_phase: &'static str,
+    open_repo: &'a str,
+    repo_menu: bool,
+    repo_phase: &'static str,
+    branches: &'a [String],
+    tab: &'static str,
+    items: &'a [crate::backend::ForgeItem],
+    forge_item_number: i64,
+    item_phase: &'static str,
+    forge_item_kind: &'a str,
+    forge_item_title: &'a str,
+    forge_item_state: &'a str,
+    forge_item_author: &'a str,
+    forge_item_branches: &'a str,
+    forge_item_body: &'a str,
+    forge_item_blocks: &'a [crate::backend::ChatBlock],
+    forge_item_files_changed: i64,
+    forge_item_additions: i64,
+    forge_item_deletions: i64,
+    diff_rows: Vec<crate::backend::DiffLine>,
+    forge_item_diff_truncated: bool,
+    forge_item_merge_oid: &'a str,
+    forge_item_source_oid: &'a str,
+    forge_item_approvals: i64,
+    forge_item_change_requests: i64,
+    forge_item_reviews: &'a [crate::backend::ForgeReview],
+    merge_conflicts: &'a [String],
+    merge_busy: bool,
+    review_verdict: &'static str,
+    review_busy: bool,
+    staged_comments: &'a [crate::backend::ForgeDraftComment],
+    comment_cap_reached: bool,
+    discussion: &'a [crate::backend::ChatMessage],
+    linked_note: &'a [crate::backend::ChatMessage],
+    landed_seq: i64,
+    landed_tick: i64,
+    tree_path: &'a str,
+    tree_rev: &'a str,
+    tree_entries: &'a [crate::backend::TreeEntry],
+    tree_born: bool,
+    tree_truncated: bool,
+    tree_phase: &'static str,
+    file_path: &'a str,
+    file_text: &'a str,
+    file_binary: bool,
+    file_truncated: bool,
+    file_picture: bool,
+    file_width: i64,
+    file_height: i64,
+    file_note: &'a str,
+    file_header: &'a str,
+    file_phase: &'static str,
+    drafts_cleared: i64,
+    drafts_scope: &'a str,
+}
+
+/// The Forge tab: the register the app holds, the repo and item it has
+/// open, the code browse's listing and file, and the discussion, drawn by
+/// the `forge` view. The phases, the tab and the verdict cross as their
+/// enum words; the patch crosses as painted rows; the optional landed note
+/// as a list of at most one. Its intents come back one per act
+/// (`forge_intent`), carrying only what the reader picked or typed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn forge_view(
+    dark: bool,
+    connected: bool,
+    org: &str,
+    about: &str,
+    tier: &str,
+    network_chain_id: &str,
+    connected_rpc: &str,
+    repos: &[crate::backend::ForgeRepo],
+    list_phase: crate::ForgePhase,
+    open_repo: &str,
+    repo_menu: bool,
+    repo_phase: crate::ForgePhase,
+    branches: &[String],
+    tab: crate::ForgeTab,
+    items: &[crate::backend::ForgeItem],
+    item_number: i64,
+    item_phase: crate::ForgePhase,
+    item_kind: &str,
+    item_title: &str,
+    item_state: &str,
+    item_author: &str,
+    item_branches: &str,
+    item_body: &str,
+    item_blocks: &[crate::backend::ChatBlock],
+    files_changed: i64,
+    additions: i64,
+    deletions: i64,
+    diff: &str,
+    diff_truncated: bool,
+    merge_oid: &str,
+    source_oid: &str,
+    approvals: i64,
+    change_requests: i64,
+    reviews: &[crate::backend::ForgeReview],
+    merge_conflicts: &[String],
+    merge_busy: bool,
+    review_verdict: crate::ForgeReviewVerdict,
+    review_busy: bool,
+    staged_comments: &[crate::backend::ForgeDraftComment],
+    discussion: &[crate::backend::ChatMessage],
+    linked_note: Option<crate::backend::ChatMessage>,
+    landed_seq: i64,
+    landed_tick: i64,
+    tree_path: &str,
+    tree_rev: &str,
+    tree_entries: &[crate::backend::TreeEntry],
+    tree_born: bool,
+    tree_truncated: bool,
+    tree_phase: crate::ForgeTreePhase,
+    file_path: &str,
+    file_text: &str,
+    file_binary: bool,
+    file_truncated: bool,
+    file_picture: bool,
+    file_width: i64,
+    file_height: i64,
+    file_note: &str,
+    file_header: &str,
+    file_phase: crate::ForgeFilePhase,
+    drafts_cleared: i64,
+    drafts_scope: &str,
+) -> Element<'static, ModuleViewEvent> {
+    let props = ForgeProps {
+        dark,
+        connected,
+        org,
+        about,
+        tier,
+        network_chain_id,
+        connected_rpc,
+        repos,
+        list_phase: forge_phase_word(list_phase),
+        open_repo,
+        repo_menu,
+        repo_phase: forge_phase_word(repo_phase),
+        branches,
+        tab: match tab {
+            crate::ForgeTab::Code => "code",
+            crate::ForgeTab::Pulls => "pulls",
+            crate::ForgeTab::Issues => "issues",
+        },
+        items,
+        forge_item_number: item_number,
+        item_phase: forge_phase_word(item_phase),
+        forge_item_kind: item_kind,
+        forge_item_title: item_title,
+        forge_item_state: item_state,
+        forge_item_author: item_author,
+        forge_item_branches: item_branches,
+        forge_item_body: item_body,
+        forge_item_blocks: item_blocks,
+        forge_item_files_changed: files_changed,
+        forge_item_additions: additions,
+        forge_item_deletions: deletions,
+        diff_rows: crate::backend::diff_lines(diff),
+        forge_item_diff_truncated: diff_truncated,
+        forge_item_merge_oid: merge_oid,
+        forge_item_source_oid: source_oid,
+        forge_item_approvals: approvals,
+        forge_item_change_requests: change_requests,
+        forge_item_reviews: reviews,
+        merge_conflicts,
+        merge_busy,
+        review_verdict: forge_verdict_word(review_verdict),
+        review_busy,
+        staged_comments,
+        comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
+        discussion,
+        linked_note: linked_note.as_slice(),
+        landed_seq,
+        landed_tick,
+        tree_path,
+        tree_rev,
+        tree_entries,
+        tree_born,
+        tree_truncated,
+        tree_phase: match tree_phase {
+            crate::ForgeTreePhase::Loading => "loading",
+            crate::ForgeTreePhase::Ready => "ready",
+            crate::ForgeTreePhase::Failed => "failed",
+        },
+        file_path,
+        file_text,
+        file_binary,
+        file_truncated,
+        file_picture,
+        file_width,
+        file_height,
+        file_note,
+        file_header,
+        file_phase: match file_phase {
+            crate::ForgeFilePhase::Idle => "idle",
+            crate::ForgeFilePhase::Loading => "loading",
+            crate::ForgeFilePhase::Ready => "ready",
+            crate::ForgeFilePhase::Failed => "failed",
+        },
+        drafts_cleared,
+        drafts_scope,
+    };
+    module_view("forge", serde_json::to_vec(&props).expect("props encode"))
+}
+
+fn forge_phase_word(phase: crate::ForgePhase) -> &'static str {
+    match phase {
+        crate::ForgePhase::Idle => "idle",
+        crate::ForgePhase::Loading => "loading",
+        crate::ForgePhase::Ready => "ready",
+        crate::ForgePhase::Failed => "failed",
+    }
+}
+
+fn forge_verdict_word(verdict: crate::ForgeReviewVerdict) -> &'static str {
+    match verdict {
+        crate::ForgeReviewVerdict::Comment => "comment",
+        crate::ForgeReviewVerdict::Approve => "approve",
+        crate::ForgeReviewVerdict::RequestChanges => "request_changes",
+    }
+}
+
+pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
+    use crate::ForgeIntent as Intent;
+    match event.kind.as_str() {
+        "open_repo" => Intent::OpenRepo,
+        "close_repo" => Intent::CloseRepo,
+        "toggle_repo_menu" => Intent::ToggleRepoMenu,
+        "tab" => Intent::Tab,
+        "open_item" => Intent::OpenItem,
+        "close_item" => Intent::CloseItem,
+        "merge" => Intent::Merge,
+        "review_pick" => Intent::ReviewPick,
+        "review_submit" => Intent::ReviewSubmit,
+        "comment_stage" => Intent::CommentStage,
+        "comment_drop" => Intent::CommentDrop,
+        "tree" => Intent::Tree,
+        "blob" => Intent::Blob,
+        "open_link" => Intent::OpenLink,
+        _ => Intent::Copy,
+    }
+}
+
 // ---------- the files seat ----------
 
 /// The Files tab: one directory's listing, the preview open in it, the
@@ -975,6 +1243,25 @@ fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
     matches!(args.get(index), Some(wire::SurfaceValue::Bool(true)))
 }
 
+/// The repo seat a `tab` intent names; a word the screen has no seat for is
+/// the code browse.
+pub fn forge_event_tab(event: &ModuleViewEvent) -> crate::ForgeTab {
+    match event_text(event, "tab").as_str() {
+        "pulls" => crate::ForgeTab::Pulls,
+        "issues" => crate::ForgeTab::Issues,
+        _ => crate::ForgeTab::Code,
+    }
+}
+
+/// The verdict a `review_pick` intent names; an unknown word is a comment.
+pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict {
+    match event_text(event, "verdict").as_str() {
+        "approve" => crate::ForgeReviewVerdict::Approve,
+        "request_changes" => crate::ForgeReviewVerdict::RequestChanges,
+        _ => crate::ForgeReviewVerdict::Comment,
+    }
+}
+
 /// The native log ring behind the node view's slot: the timeline the app
 /// last drew the tab with, and what the reader did in it since the app
 /// last drained. One per process, like the view it belongs to.
@@ -994,6 +1281,7 @@ fn node_timeline() -> &'static Mutex<NodeTimeline> {
 /// tab was last drawn with; what the reader does in it is queued for
 /// [`node_log_timeline_drain`], and the guest — which declared the slot as
 /// `-> unit` — hears only that something happened. The files view's three
+/// (and the forge view's, over the data the guest hands across)
 /// are the preview's readers: the picture viewer over the Files surface's
 /// store, the highlighted code reader, and the Markdown document, whose
 /// activated link goes back to the guest's own handler as a string.
@@ -1023,6 +1311,52 @@ fn surfaces_of(module: &str) -> Surfaces {
             Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
                 crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
                     .map(wire::SurfaceValue::Str)
+            }),
+        );
+    }
+    if module == "forge" {
+        surfaces.insert(
+            "picture".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(surface),
+                    wire::SurfaceValue::Str(path),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::picture(surface.clone(), path.clone())
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "forge_markdown".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(doc),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_markdown(source.clone(), doc.clone(), *dark)
+                    .map(wire::SurfaceValue::Str)
+            }),
+        );
+        surfaces.insert(
+            "forge_code".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                let [
+                    wire::SurfaceValue::Str(source),
+                    wire::SurfaceValue::Str(path),
+                    wire::SurfaceValue::Bool(dark),
+                ] = args
+                else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::forge_code(source.clone(), path.clone(), *dark)
+                    .map(|()| wire::SurfaceValue::Unit)
             }),
         );
     }
@@ -1085,6 +1419,23 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "show_diff",
             "close_diff",
             "open_link",
+        ],
+        "forge" => &[
+            "open_repo",
+            "close_repo",
+            "toggle_repo_menu",
+            "tab",
+            "open_item",
+            "close_item",
+            "merge",
+            "review_pick",
+            "review_submit",
+            "comment_stage",
+            "comment_drop",
+            "tree",
+            "blob",
+            "open_link",
+            "copy",
         ],
         "settings" => &[
             "tab",
@@ -1475,8 +1826,8 @@ impl Guest {
     /// host-side (an input's text) and queued for the guest's next tick. A
     /// host surface the guest routed (`-> handler _`) reaches that handler
     /// with the value the surface produced; one it left unrouted is the
-    /// app's own ring, whose event was queued where the surface keeps it,
-    /// and the app is told to drain it.
+    /// app's own ring (or the chat composer's submit), whose event was queued
+    /// where the surface keeps it, and the app is told to drain it.
     fn deliver(&mut self, output: Output) {
         if let Output::Surface {
             handler: None,
@@ -2532,6 +2883,72 @@ mod tests {
                 detail: r#"{"name":"reports"}"#.into(),
             }]
         );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Forge view through the host: the register, then a repo
+    /// opened from its card as the intent the handler signs — and with the
+    /// item open, the review body leaves as the intent's payload while the
+    /// three reader surfaces are the host's to paint.
+    #[test]
+    fn the_staged_forge_view_boots_takes_the_register_and_opens_a_repo() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        // the whole register as the app encodes it — a literal, since the
+        // document is past `json!`'s recursion limit
+        let props = Some(
+            br#"{
+              "dark": false, "connected": true, "org": "duckhouse", "about": "",
+              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
+              "connected_rpc": "http://127.0.0.1:1",
+              "repos": [{"name": "core", "head": "main"}],
+              "list_phase": "ready", "open_repo": "", "repo_menu": false,
+              "repo_phase": "idle", "branches": [], "tab": "code", "items": [],
+              "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
+              "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
+              "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
+              "forge_item_files_changed": 0, "forge_item_additions": 0,
+              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
+              "forge_item_merge_oid": "", "forge_item_source_oid": "",
+              "forge_item_approvals": 0, "forge_item_change_requests": 0,
+              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
+              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
+              "tree_entries": [], "tree_born": false, "tree_truncated": false,
+              "tree_phase": "loading", "file_path": "", "file_text": "",
+              "file_binary": false, "file_truncated": false, "file_picture": false,
+              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
+              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
+            }"#
+            .to_vec(),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["duckhouse", "core"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        guest.deliver(Output::Activate(button_message(&guest, "Open repo")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "open_repo".into(),
+                detail: r#"{"name":"core"}"#.into(),
+            }]
+        );
+        for surface in ["picture", "forge_markdown", "forge_code"] {
+            assert!(
+                surfaces_of("forge").contains_key(surface),
+                "the host paints the {surface} slot the view leaves"
+            );
+        }
         assert!(guest.fault.is_none());
     }
 

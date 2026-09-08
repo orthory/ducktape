@@ -1,27 +1,6 @@
 use super::*;
 
 #[test]
-fn the_forge_hint_is_a_command_that_actually_pushes() {
-    // Verified end to end against a live node: a push to a NEW lowercase name
-    // creates the repo, and an uppercase one 404s the ref advertisement because
-    // `forge::norm_repo` accepts `[a-z0-9._-]` only — so the placeholder has to
-    // be a name the reader can paste unchanged.
-    let hint = forge_push_command("http://127.0.0.1:38259");
-    assert_eq!(
-        hint,
-        "git remote add ducktape http://127.0.0.1:38259/forge/my-repo && git push ducktape main"
-    );
-    let placeholder = hint
-        .split("/forge/")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .expect("the hint names a repo");
-    assert!(forge::norm_repo(placeholder).is_ok());
-    // A trailing slash on the endpoint must not double up in the URL.
-    assert_eq!(forge_push_command("http://127.0.0.1:38259/"), hint);
-}
-
-#[test]
 fn highlight_ranges_hold_char_boundaries_on_real_sources() {
     // this repo's own sources carry the multibyte punctuation ('—', '·', '→')
     // an ASCII probe never exercises; a syntect range that split a UTF-8 char
@@ -70,29 +49,6 @@ fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
         1,
         "an unknown token is plain text in one ink"
     );
-}
-
-#[test]
-fn the_tracker_splits_into_open_prs_and_open_issues() {
-    let item = |number: i64, kind: &str, state: &str| ForgeItem {
-        number,
-        kind: kind.into(),
-        state: state.into(),
-        title: format!("item {number}"),
-        author: "user:aa".into(),
-        author_name: "aa".into(),
-    };
-    let items = vec![
-        item(1, "pr", "open"),
-        item(2, "pr", "merged"),
-        item(3, "issue", "open"),
-        item(4, "issue", "closed"),
-    ];
-    assert_eq!(filter_forge_items(&items, ForgeTab::Pulls).len(), 2);
-    assert_eq!(filter_forge_items(&items, ForgeTab::Issues).len(), 2);
-    assert!(filter_forge_items(&items, ForgeTab::Code).is_empty());
-    assert_eq!(forge_open_count(&items, "pr"), 1);
-    assert_eq!(forge_open_count(&items, "issue"), 1);
 }
 
 #[test]

@@ -327,24 +327,14 @@ fn dropping_one_staged_comment_leaves_the_others() {
     assert!(drop_forge_comment(staged, "src/main.rs:15 (new)".into())[0].body == "a");
 }
 
-/// The composer's visibility IS this string, and it is spelled by the same
-/// helper the staged rows wear — so the header over the draft and the chip
-/// it becomes can never disagree.
+/// The staged chip's anchor is the one the view's composer header spells
+/// (`forge_comment_target` in crates/views/forge), so the header over the
+/// draft and the chip it becomes can never disagree.
 #[test]
-fn the_composer_opens_only_on_a_picked_line() {
+fn a_staged_comment_wears_the_composers_anchor() {
     assert_eq!(
-        forge_comment_target("src/main.rs", "14", "new"),
-        "src/main.rs:14 (new)"
-    );
-    assert_eq!(
-        forge_comment_target("", "14", "new"),
-        "",
-        "no line picked, no composer"
-    );
-    assert_eq!(
-        forge_comment_target("src/main.rs", "14", "new"),
         stage(Vec::new(), "14", "body")[0].anchor,
-        "the composer header and the staged chip are the same anchor"
+        "src/main.rs:14 (new)"
     );
 }
 
@@ -363,9 +353,9 @@ fn a_moved_branch_discards_the_comments_staged_against_the_old_diff() {
         keep_staged_comments(true, held.0.clone(), held.1.clone(), staged.clone()).len(),
         1
     );
-    assert_eq!(
-        keep_comment_text(true, held.0.clone(), held.1.clone(), "draft".into()),
-        "draft"
+    assert!(
+        !forge_branch_moved(true, &held.0, &held.1),
+        "the view keeps its line comment"
     );
     assert_eq!(
         staged_comment_drop_note(
@@ -382,9 +372,13 @@ fn a_moved_branch_discards_the_comments_staged_against_the_old_diff() {
     assert!(
         keep_staged_comments(true, moved.0.clone(), moved.1.clone(), staged.clone()).is_empty()
     );
-    assert_eq!(
-        keep_comment_text(true, moved.0.clone(), moved.1.clone(), "draft".into()),
-        ""
+    assert!(
+        forge_branch_moved(true, &moved.0, &moved.1),
+        "and the view is told to drop its line comment"
+    );
+    assert!(
+        !forge_branch_moved(true, "", &moved.1) && !forge_branch_moved(false, &moved.0, &moved.1),
+        "an item without a head yet, or one not loaded by this refresh, moved nothing"
     );
     assert!(
         staged_comment_drop_note(
