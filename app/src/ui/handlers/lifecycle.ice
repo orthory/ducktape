@@ -35,10 +35,6 @@ on appearance_saved(_written)
 on desktop_notifications_loaded(enabled)
   desktop_notifications = enabled
 
-on set_desktop_notifications(enabled)
-  desktop_notifications = enabled
-  run replace lane=notify_save save_desktop_notifications(enabled) -> desktop_notifications_saved _
-
 on desktop_notifications_saved(_written)
 
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
@@ -968,14 +964,6 @@ subscribe
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
   keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)) -> global_key_pressed _
-  // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
-  // a focused widget CONSUMED — Home in a text field, an arrow in an open
-  // list — but it is only half the arbitration: iced's single-line input drops
-  // Up/Down uncaptured, so the router itself refuses the arrows and every key
-  // under an open overlay (`content_scroll_step`). Ungated on purpose: the
-  // launch and huddle windows mount no content pane, and a scroll operation
-  // whose target is not on screen is a no-op.
-  keyboard press status=ignored -> content_scroll_key _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows: a close just unregisters the slot (below).
   // The process leaves only when someone says so — the tray's Quit, or ⌘Q.

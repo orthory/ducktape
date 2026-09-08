@@ -178,22 +178,8 @@ component GroupLabel(label:str)
       font=code_semibold
       @text-label
 
-// The bordered card a settings/detail group lives in. Children draw their own
-// separators, so the card only owns the outline and the clip.
-component GroupCard()
-  box #root
-    with
-      w=fill
-      bg=surface
-      border=card_line
-      border-w=1.0
-      r=11.0
-      clip=true
-    col w=fill
-      slot
-
-// One label/value line inside a GroupCard. `last` drops the rule so the card's
-// own border finishes the stack.
+// One label/value line inside a bordered card. `last` drops the rule so the
+// card's own border finishes the stack.
 component KeyValueRow(label:str, value:str, last:bool)
   col #root w=fill
     box

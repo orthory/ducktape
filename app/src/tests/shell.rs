@@ -220,12 +220,12 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
 /// the screen in Settings again while leaving its handlers intact.
 #[test]
 fn node_operations_are_a_first_class_screen() {
-    let settings = include_str!("../ui/screens/settings.ice");
-    // the Node screen ships as a module-owned view; its source is the guest's
+    // both screens ship as module-owned views; their sources are the guests'
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
     let node = include_str!("../../../crates/views/node/src/ui/app.ice");
     assert!(settings.contains("component SettingsScreen("));
     assert!(node.contains("component NodeScreen("));
-    assert!(settings.contains("emit(select_shell_tab, ShellTab.node)"));
+    assert!(settings.contains("emit(show_tab, \"node\")"));
     for node_detail in [
         "node-overview-tab",
         "node-permissions-tab",
@@ -243,7 +243,7 @@ fn node_operations_are_a_first_class_screen() {
     assert!(shell.contains("ShellTab.node\n                  slot node"));
     let view = include_str!("../ui/view.ice");
     assert!(view.contains("node:\n          extern node_view("));
-    assert!(view.contains("settings:\n          SettingsScreen"));
+    assert!(view.contains("settings:\n          extern settings_view("));
 }
 
 /// A hydration error belongs to the pane that raised it.
@@ -878,7 +878,9 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
 /// not given to the screen.
 #[test]
 fn the_identity_card_counts_only_an_existing_account() {
-    let settings = inlined(include_str!("../ui/screens/settings.ice"));
+    let settings = inlined(include_str!(
+        "../../../crates/views/settings/src/ui/settings.ice"
+    ));
     assert!(
         settings.contains("account_exists:bool"),
         "the screen has to be handed the fact before it can use it"
@@ -2047,52 +2049,59 @@ fn choosing_an_identity_settles_the_provider_and_re_narrows_the_hosts() {
 }
 
 /// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
-/// handler that re-reads the account for them, and it clears every draft an op
-/// consumed — a ticket left on screen after its device joined is a stale blob
-/// that looks like a secret, and a create draft after the account exists is a
-/// second Create waiting to be refused.
+/// handler that re-reads the account for them, and it tells the Settings view
+/// — which holds the drafts — that every draft an op consumed is spent: a
+/// ticket left on screen after its device joined is a stale blob that looks
+/// like a secret, and a create draft after the account exists is a second
+/// Create waiting to be refused.
 #[test]
 fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.account_busy = true;
-    app.account_create_draft = "me".into();
-    app.account_join_draft = "{}".into();
     app.account_ticket = "{}".into();
     let before = app.account_generation;
+    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountChanged(true));
 
     assert!(!app.account_busy, "the op is over");
     assert_eq!(app.account_generation, before + 1, "the account is re-read");
-    assert!(app.account_create_draft.is_empty());
-    assert!(app.account_join_draft.is_empty());
-    assert!(app.account_key_draft.is_empty());
-    assert!(app.account_key_label_draft.is_empty());
     assert!(app.account_ticket.is_empty());
+    assert_eq!(app.settings_drafts_cleared, cleared + 1);
+    assert_eq!(app.settings_drafts_scope, "account");
 }
 
 /// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
-/// its own signal, each handler runs its backend fn on the connected chain
-/// under the signing seat, and every one lands in `account_changed` /
-/// `account_op_failed` — the one pair that re-reads the account and frees
-/// the card. And each is offered only where consensus would accept it:
-/// registering/linking with an account, logging in without one.
+/// its own signal, the Settings view sends it as an intent, and each intent's
+/// arm runs its backend fn on the connected chain under the signing seat,
+/// landing in `account_changed` / `account_op_failed` — the one pair that
+/// re-reads the account and frees the card. And each is offered only where
+/// consensus would accept it: registering/linking with an account, logging in
+/// without one.
 #[test]
 fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
-    let settings = include_str!("../ui/screens/settings.ice");
-    let roster = include_str!("../ui/handlers/roster.ice");
-    for (button, signal, backend) in [
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
+    let view_app = include_str!("../../../crates/views/settings/src/ui/app.ice");
+    let handlers = include_str!("../ui/handlers/node.ice");
+    for (button, signal, intent, backend) in [
         (
             "In this browser",
             "account_passkey_desktop",
+            "passkey_desktop",
             "register_passkey",
         ),
-        ("Link a wallet", "account_wallet_submit", "link_wallet"),
+        (
+            "Link a wallet",
+            "account_wallet_submit",
+            "wallet",
+            "link_wallet",
+        ),
         (
             "Log in with a passkey",
             "account_login_submit",
+            "login",
             "login_with_passkey",
         ),
     ] {
@@ -2100,11 +2109,15 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
             settings.contains(&format!(r#"button "{button}" -> emit({signal})"#)),
             "{button} emits {signal}"
         );
-        let handler = roster
-            .split(&format!("\non {signal}\n"))
+        assert!(
+            view_app.contains(&format!("\non {signal}\n")),
+            "the view sends {signal} as an intent"
+        );
+        let handler = handlers
+            .split(&format!("\n    SettingsIntent.{intent}\n"))
             .nth(1)
-            .unwrap_or_else(|| panic!("a handler for {signal}"))
-            .split("\non ")
+            .unwrap_or_else(|| panic!("an arm for {intent}"))
+            .split("\n    SettingsIntent.")
             .next()
             .unwrap();
         assert!(
@@ -2151,9 +2164,8 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
 fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
     let (mut app, _) = Ducktape::__boot();
     app.account_busy = true;
-    app.account_key_draft = "ab".into();
-    app.account_key_label_draft = "phone".into();
     let before = app.account_generation;
+    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
         r#"{"add_key":{}}"#.into(),
@@ -2161,8 +2173,11 @@ fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
 
     assert!(!app.account_busy);
     assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
-    assert!(app.account_key_draft.is_empty());
-    assert!(app.account_key_label_draft.is_empty());
+    assert_eq!(app.settings_drafts_cleared, cleared + 1);
+    assert_eq!(
+        app.settings_drafts_scope, "keys",
+        "the key and its label are spent; nothing else is"
+    );
     assert_eq!(app.account_generation, before, "minting re-reads nothing");
 }
 
@@ -2171,7 +2186,7 @@ fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
 /// it, and a button that always refuses is a lie).
 #[test]
 fn the_account_card_gates_founding_and_the_last_key() {
-    let settings = include_str!("../ui/screens/settings.ice");
+    let settings = include_str!("../../../crates/views/settings/src/ui/settings.ice");
     let create = settings.find("#account-create").expect("the create input");
     assert!(
         settings[..create].rfind("if !account_exists").is_some(),

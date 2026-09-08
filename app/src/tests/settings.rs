@@ -7,9 +7,8 @@
 //! the only way to pick one, and a new pane fails the build until it is both
 //! reachable and routed.
 
-const SETTINGS: &str = include_str!("../ui/screens/settings.ice");
-const TYPES: &str = include_str!("../ui/state/types.ice");
-const OVERLAYS: &str = include_str!("../ui/handlers/overlays.ice");
+// Settings ships as a module-owned view; its screen is the guest's.
+const SETTINGS: &str = include_str!("../../../crates/views/settings/src/ui/settings.ice");
 
 /// The panes, in the order the strip offers them. General first because it is
 /// the one nothing has to be true for; danger last because it is the one act
@@ -92,7 +91,7 @@ fn every_pane_has_a_tab_and_an_arm() {
 /// nothing behind a tab that is not there.
 #[test]
 fn the_enum_names_the_same_panes_in_the_same_order() {
-    let declared: Vec<String> = TYPES
+    let declared: Vec<String> = SETTINGS
         .lines()
         .skip_while(|line| line.trim() != "enum SettingsPane")
         .skip(1)
@@ -115,7 +114,10 @@ fn the_screen_branches_once_and_holds_nothing_above_the_branch() {
         .lines()
         .filter(|line| line.trim_start().starts_with("match settings_pane"))
         .count();
-    assert_eq!(dispatches, 1, "Settings branches on its pane more than once");
+    assert_eq!(
+        dispatches, 1,
+        "Settings branches on its pane more than once"
+    );
     let branch = SETTINGS
         .lines()
         .position(|line| line.trim_start().starts_with("match settings_pane"))
@@ -155,17 +157,13 @@ fn the_pane_moves_only_through_the_strip() {
     );
 }
 
-/// THE SCROLL PANE IS STILL THE ROOT. `overlays.ice` scrolls Settings by the
-/// literal id path, so a container wrapped around the scrollable renames the
-/// target and Page Down goes dead with nothing failing to say so.
+/// THE SCROLL PANE IS STILL THE ROOT: the strip and the pane under it scroll
+/// as one, so a container wrapped around the scrollable is a strip that
+/// scrolls away from its own pane.
 #[test]
 fn the_scrollable_is_the_screens_root() {
     assert!(
         SETTINGS.contains("\n  scroll #settings-body\n"),
         "the scrollable is no longer a top-level node of the screen"
-    );
-    assert!(
-        OVERLAYS.contains("#workspace-tabs/content/settings/settings-body"),
-        "the keyboard-scroll handler stopped naming the settings pane"
     );
 }

@@ -104,10 +104,7 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
             // rather than any app state — the words are never a reading this
             // process keeps, and both screens are gone the moment it lets go.
             HubStep.phrase
-              PhraseScreen #phrase
-                with
-                  rows=phrase_rows()
-                  busy
+              PhraseScreen #phrase rows=phrase_rows() busy
                 forward
                   phrase_written_down
             HubStep.confirm
@@ -807,10 +804,7 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
     welcome_cancel
     welcome_skip
   col #root w=428.0 gap=0.0
-    HubBrand
-      with
-        title="No account on this network yet"
-        caption=network
+    HubBrand title="No account on this network yet" caption=network
     if phase == "show_qr"
       box w=fill pt=22.0
         col
@@ -2149,36 +2143,3 @@ component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, pas
               active bg=transparent text=muted r=7.0
               hovered bg=fg/9 text=fg
               pressed bg=fg/14
-
-// A PHONE CEREMONY ON A CARD: the QR while the phone is asked, the line
-// while the chain is; an empty phase renders nothing. The Settings card's
-// reading of the same stream the welcome shows full-size.
-component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
-  emits
-    account_ceremony_cancel()
-  col #root w=fill gap=8.0 align=center
-    if phase == "show_qr"
-      qr qr #plate-qr cell-size=3.0 correction=medium
-      text detail
-        with
-          w=fill
-          size=12.0
-          align-x=center
-          @text-meta
-      text left #plate-left
-        with
-          size=11.0
-          wrap=none
-          font=code_medium
-          @text-hint
-      button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
-        with
-          h=26.0
-          p=5.0
-          @secondary_action
-    if phase == "working"
-      text detail
-        with
-          w=fill
-          size=12.0
-          @text-meta

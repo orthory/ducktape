@@ -284,5 +284,9 @@ pub fn drafts_cleared_by(scope: &str, draft: &str) -> bool {
 
 /// The draft as it stands, or nothing once an op consumed it.
 pub fn keep_draft(consumed: bool, draft: &str) -> String {
-    if consumed { String::new() } else { draft.into() }
+    if consumed {
+        String::new()
+    } else {
+        draft.into()
+    }
 }

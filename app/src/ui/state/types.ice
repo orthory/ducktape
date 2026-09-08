@@ -142,13 +142,6 @@ enum WelcomeDoor
 // give it, and the destructive act sat at the bottom of the same list as the
 // theme switch. Each variant is one group of settings, and the danger zone is
 // a place you go rather than a card you scroll past.
-enum SettingsPane
-  general
-  network
-  account
-  security
-  danger
-
 enum NodeTab
   overview
   permissions
@@ -242,6 +235,32 @@ enum ExplorerIntent
   copy
   search
   clear
+
+// what the Settings view asks of the app: one variant per act the screen
+// offers, each carrying only what the reader typed (a name, a key, a ticket,
+// the key password) — the drafts themselves are the view's
+enum SettingsIntent
+  tab
+  reconnect
+  switch_network
+  unlock
+  lock
+  rename
+  create
+  key_add
+  join
+  key_remove
+  passkey
+  passkey_desktop
+  ceremony_cancel
+  wallet
+  login
+  copy
+  clear_tabs
+  forget
+  light
+  dark
+  notifications
 
 enum MutationPhase
   idle

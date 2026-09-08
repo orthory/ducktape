@@ -658,6 +658,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         space w=fill
                         button "Copy number" -> emit(copy_to_clipboard, account_number, "Number copied")
                           with
+                            label="Copy number"
                             disabled=empty(account_number)
                             h=28.0
                             p=7.0

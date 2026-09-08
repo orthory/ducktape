@@ -81,7 +81,11 @@ fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_link_leaves_as_a_ta
     }
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
     let frame = tick_native(press(&frame, "Network"));
-    assert!(has_text(&frame, "3 humans · 1 agent"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "3 humans · 1 agent"),
+        "{:?}",
+        texts(&frame)
+    );
     let frame = tick_native(press(&frame, "manage"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "settings.tab");
@@ -127,11 +131,7 @@ fn a_committed_op_consumes_only_the_drafts_it_read() {
     let (subscription, frame) = shown(&facts());
     let frame = tick_native(press(&frame, "Account"));
     let frame = tick_native(type_into(&frame, "rename account…", "  mallard  "));
-    let frame = tick_native(type_into(
-        &frame,
-        "paste its ed25519 key (hex)…",
-        "ff00",
-    ));
+    let frame = tick_native(type_into(&frame, "paste its ed25519 key (hex)…", "ff00"));
     let frame = tick_native(press(&frame, "Rename"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "settings.rename");

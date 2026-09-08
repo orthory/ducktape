@@ -217,7 +217,6 @@ extern crate::backend
   pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str, forge_repo_menu:bool) -> str
   pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
-  pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord
   // below asks for — because a route armed on one modifier and a chord judged
@@ -270,7 +269,6 @@ extern crate::backend
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
-  pure members_summary(connected:bool, rows:&[MemberRow]) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str

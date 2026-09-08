@@ -619,9 +619,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 // A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
 // clears menu state (`select_shell_tab` leaves every menu flag set), so a
 // ⋯ menu opened on Chat is still SET while Pages is on screen —
-// unscoped, that stale flag ate the first Escape on every other tab, and the
-// same reading made `content_scroll_step` refuse to move a pane nothing was
-// covering. The palette, bell and create modal are mounted OUTSIDE the tab
+// unscoped, that stale flag ate the first Escape on every other tab. The
+// palette, bell and create modal are mounted OUTSIDE the tab
 // match in `components/shell.ice` and keep answering from every tab.
 #[test]
 fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
@@ -740,61 +739,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
         target(ShellTab::Node, false, true, MessageAction::Toolbar, false),
         "channel_create"
     );
-}
-
-// THE PANE SCROLL'S THREE CONDITIONS, one assertion each, over the router
-// itself rather than over one key's pixels. #1006 shipped it with only the
-// modifier condition: it claimed the arrows (which a focused single-line
-// `text_input` leaves UNCAPTURED — `iced_widget-0.14.2/src/text_input.rs:1245`
-// falls Up/Down through to `_ => {}` — so `status=ignored` handed them here
-// while a caret sat in the field), and it never asked whether a transient
-// layer was over the pane it was about to move.
-#[test]
-fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
-    use iced::keyboard::{Key, Modifiers, key::Named};
-
-    let step = |named: Named, modifiers: Modifiers, overlay: &str| {
-        content_scroll_step(Key::Named(named), modifiers, overlay.into())
-    };
-    let free = Modifiers::empty();
-
-    // 1. THE PANE'S OWN KEYS. Page Up/Down and Home/End: iced's text widgets
-    //    capture Home/End when focused, so one only ever reaches here with
-    //    nothing focused, and no widget in this console owns a Page key.
-    assert!(step(Named::PageDown, free, "") > 0.0);
-    assert!(step(Named::PageUp, free, "") < 0.0);
-    assert!(step(Named::End, free, "") > 0.0);
-    assert!(step(Named::Home, free, "") < 0.0);
-
-    // 2. AN ARROW BELONGS TO WHATEVER HAS FOCUS. Nothing in this stack can
-    //    read widget focus, and a single-line input does not capture Up/Down,
-    //    so the pane cannot tell a caret's arrow from its own and must not
-    //    claim one — at any time, under any layer.
-    assert_eq!(step(Named::ArrowDown, free, ""), 0.0);
-    assert_eq!(step(Named::ArrowUp, free, ""), 0.0);
-
-    // 3. A TRANSIENT LAYER'S KEY IS NOT THE PANE'S. Every rung `topmost_overlay`
-    //    can name stops every scroll key, so no press moves the screen behind
-    //    an open palette or bell.
-    for overlay in [
-        "palette",
-        "bell",
-        "channel_create",
-        "thread_menu",
-        "message_menu",
-        "channel_settings",
-        "page_delete",
-        "fs_delete",
-        "repo_menu",
-    ] {
-        for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {
-            assert_eq!(step(key, free, overlay), 0.0, "{overlay} is over the pane");
-        }
-    }
-
-    // 4. A CHORD IS NOT THE PANE'S — it belongs to its own router.
-    assert_eq!(step(Named::PageDown, Modifiers::SHIFT, ""), 0.0);
-    assert_eq!(step(Named::Home, Modifiers::CTRL, ""), 0.0);
 }
 
 #[test]

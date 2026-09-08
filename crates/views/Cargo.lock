@@ -2916,6 +2916,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "settings-view"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "serde",
+ "serde_json",
+ "ui-lang",
+ "ui-lang-build",
+ "ui-lang-guest",
+ "ui-lang-runtime",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

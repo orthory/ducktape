@@ -23,3 +23,6 @@ extern crate::module_view
   pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
   component explorer_view(dark:bool, connected:bool, loading:bool, blocks:&[ExplorerBlock], ops:&[ExplorerOp], head:i64, sync_line:&str, hits:&[ExplorerHit], kinds:&[KindCount], partial:&str, searching:bool, sent_query:&str) -> ModuleViewEvent
   pure explorer_intent(event:&ModuleViewEvent) -> ExplorerIntent
+  component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, settings_open_tabs:i64, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
+  pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
+  pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
