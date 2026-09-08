@@ -227,6 +227,16 @@ struct Composer {
 }
 
 impl Composer {
+    /// The child tree diffed against the element `document` builds. iced
+    /// does this on a rebuild of the app's view and never on a relayout, so
+    /// a document change inside `update` does it itself: the element the
+    /// next layout builds is not the one the tree was last diffed against
+    /// (the mention menu appears and disappears with the word under the
+    /// caret), and a stale tree is a widget laid out with another's state.
+    fn diff_document(&self, tree: &mut Tree, document: &Document) {
+        tree.diff_children(&[self.build(document).as_widget()]);
+    }
+
     /// The mention menu over the word under the caret, if one is showing:
     /// the word is a mention in progress, the reader has not closed the menu
     /// for it, and at least one handle prefixes it. The highlighted row is
@@ -700,7 +710,7 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
 
     fn diff(&self, tree: &mut Tree) {
         let document = lock(&self.document);
-        tree.diff_children(&[self.build(&document).as_widget()]);
+        self.diff_document(tree, &document);
     }
 
     fn layout(
@@ -792,13 +802,17 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
             iced::window::RedrawRequest::Wait => {}
         }
         shell.input_method_mut().merge(local.input_method());
+        if interactions.is_empty() {
+            return;
+        }
         for interaction in interactions {
             if let Some(submitted) = self.apply(&mut document, interaction) {
                 shell.publish(submitted);
             }
-            shell.invalidate_layout();
-            shell.request_redraw();
         }
+        self.diff_document(tree, &document);
+        shell.invalidate_layout();
+        shell.request_redraw();
     }
 
     fn mouse_interaction(
@@ -984,6 +998,87 @@ mod tests {
         assert_eq!(detail["body"], "hi");
         assert_eq!(detail["id"], "reply-1");
         assert!(intent(&Value::Unit).is_none());
+    }
+
+    /// THE MENU IS A WIDGET THAT APPEARS UNDER A TREE DIFFED FOR ITS ABSENCE.
+    /// iced lays a relayout out over the tree the last build diffed, so the
+    /// composer diffs its own child after every interaction it applies: the
+    /// `@` that opens the menu, typed through the painted widget, is followed
+    /// by the relayout and the draw the window runs on it.
+    #[test]
+    fn the_menu_opening_under_the_caret_survives_the_relayout() {
+        use iced::advanced::clipboard;
+        use iced::keyboard;
+        use iced_test::runtime::user_interface::{self, UserInterface};
+
+        let room = "net\u{1f}mention-relayout";
+        let _names = seat_directory_and_roster(room);
+        let composer = Element::<Value>::new(Composer {
+            document: document(room),
+            scope: room.into(),
+            kind: "message".into(),
+            compact: false,
+            hint: String::new(),
+            blocked: false,
+            restore_blocked: false,
+            failed_note: String::new(),
+        });
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(600.0, 300.0);
+        let mut clipboard = clipboard::Null;
+        let mut published: Vec<Value> = Vec::new();
+        let mut ui =
+            UserInterface::build(composer, size, user_interface::Cache::new(), &mut renderer);
+
+        // a press on the editor's first line focuses it
+        let position = iced::Point::new(200.0, 30.0);
+        let cursor = mouse::Cursor::Available(position);
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        // the `@` opens the menu inside this update
+        ui.update(
+            &[Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("@".into()),
+                modified_key: keyboard::Key::Character("@".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit2),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::SHIFT,
+                text: Some("@".into()),
+                repeat: false,
+            })],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        assert_eq!(
+            testing::text(room),
+            "@",
+            "the press focused the editor and the key typed"
+        );
+        assert_eq!(
+            testing::menu_rows(room).map(|(rows, _)| rows.len()),
+            Some(3),
+            "the menu is open over the word"
+        );
+        assert!(published.is_empty(), "no submit");
+
+        let mut ui = ui.relayout(size, &mut renderer);
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            cursor,
+        );
     }
 
     /// THE MENU OFFERS WHAT THE SEND RESOLVES, AND ONLY WHILE A MENTION IS

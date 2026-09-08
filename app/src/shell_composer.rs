@@ -72,6 +72,14 @@ struct Composer {
 }
 
 impl Composer {
+    /// The child tree diffed against the element `document` builds. iced
+    /// does this on a rebuild of the app's view and never on a relayout, so
+    /// a document change inside `update` does it itself, before the layout
+    /// that reuses the tree.
+    fn diff_document(&self, tree: &mut Tree, document: &Content) {
+        tree.diff_children(&[self.build(document).as_widget()]);
+    }
+
     /// One editor event applied to the document; a submit that goes
     /// through is the body published to the guest tree.
     fn apply(&self, document: &mut Content, event: ComposerEvent) -> Option<Value> {
@@ -159,7 +167,7 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
 
     fn diff(&self, tree: &mut Tree) {
         let document = lock();
-        tree.diff_children(&[self.build(&document).as_widget()]);
+        self.diff_document(tree, &document);
     }
 
     fn layout(
@@ -251,13 +259,17 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
             iced::window::RedrawRequest::Wait => {}
         }
         shell.input_method_mut().merge(local.input_method());
+        if events.is_empty() {
+            return;
+        }
         for event in events {
             if let Some(submitted) = self.apply(&mut document, event) {
                 shell.publish(submitted);
             }
-            shell.invalidate_layout();
-            shell.request_redraw();
         }
+        self.diff_document(tree, &document);
+        shell.invalidate_layout();
+        shell.request_redraw();
     }
 
     fn mouse_interaction(
