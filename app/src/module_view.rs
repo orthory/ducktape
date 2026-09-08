@@ -1837,7 +1837,9 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
         .filter(|(module, _)| crate::backend::view_source::module_owned(module))
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
-            let active = hashes.get(*module).copied().flatten();
+            // a module the node does not run has no deployment to move
+            // to: the view stays as `connected` left it
+            let active = hashes.get(*module).copied()?;
             // a load already after this deployment — or after whatever is
             // active, as a reconnect's is — lands or fails on its own;
             // starting over on every block would never let it land
@@ -2307,8 +2309,14 @@ impl Guest {
                     fresh.restore(&snapshot, &shown)?;
                     fresh.first_frame(&shown)?;
                 }
-                // one mounted but never ticked has no state worth carrying
-                _ => fresh.init(&shown)?,
+                // one mounted but never ticked has no state worth carrying;
+                // its replacement still proves its first tree before it
+                // takes the slot
+                Some(_) => {
+                    fresh.init(&shown)?;
+                    fresh.first_frame(&shown)?;
+                }
+                None => fresh.init(&shown)?,
             }
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
@@ -2399,12 +2407,15 @@ impl Guest {
     }
 
     /// Everything this instance was asked to do is done: nothing pending,
-    /// no first tree waiting, no trap.
+    /// no request the host has yet to route, no trap. A replacement not
+    /// yet redrawn is settled too: the only requests its first tree
+    /// carries are the subscriptions its restore rebuilt, which its own
+    /// replacement rebuilds again — a tab not shown between two
+    /// deployments is not stuck on the first.
     fn settled(&self) -> bool {
         self.fault.is_none()
             && self.pending.is_empty()
-            && !self.staged
-            && self.frame.requests.is_empty()
+            && (self.staged || self.frame.requests.is_empty())
     }
 
     fn snapshot(&mut self) -> Result<Vec<u8>, String> {
@@ -2444,6 +2455,10 @@ impl Guest {
     /// replacement. Its requests wait for the first redraw.
     fn first_frame(&mut self, shown: &str) -> Result<(), String> {
         self.tick();
+        #[cfg(test)]
+        if tests::FIRST_FRAME_TRAPS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.fault = Some("the first frame trapped (test)".into());
+        }
         if let Some(fault) = &self.fault {
             return Err(format!("{shown}: {fault}"));
         }
@@ -4101,6 +4116,10 @@ mod tests {
             .await
     }
 
+    /// Set by a test: the next candidate's first frame traps.
+    pub(super) static FIRST_FRAME_TRAPS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     /// One open proposal, as the host pushes the register.
     fn register() -> Option<Vec<u8>> {
         Some(
@@ -4242,18 +4261,18 @@ mod tests {
             deployment(&component, "b.svg"),
             deployment(&component, "c.svg"),
         );
-        let node = FakeDeployment::serving("chat", &a);
+        let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("chat");
+        let mounted = mounted("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
         // B activates, but its bytes are slow — and C activates meanwhile
-        node.deploy("chat", &b);
-        let hold = Arc::new(tokio::sync::Notify::new());
-        *node.hold.lock().unwrap() = Some(hold.clone());
+        node.deploy("forge", &b);
+        let hold = hold_blob(&node);
         let loads = deployments_checked().await;
-        node.deploy("chat", &c);
+        node.held.notified().await;
+        node.deploy("forge", &c);
         hold.notify_one();
         join_all(loads);
         assert_eq!(slot_assets(&mounted), ["a.svg"], "B is not installed");
@@ -4275,12 +4294,12 @@ mod tests {
         let component = std::fs::read(staged).expect("the staged view");
         let a = deployment(&component, "a.svg");
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
-        let node = FakeDeployment::serving("files", &a);
+        let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("files");
+        let mounted = mounted("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
-        node.deploy("files", &removed);
+        node.deploy("forge", &removed);
         join_all(deployments_checked().await);
         let locked = mounted.lock().unwrap();
         assert!(
@@ -4348,16 +4367,17 @@ mod tests {
             deployment(&component, "c.svg"),
         );
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
-        let node = FakeDeployment::serving("pages", &a);
+        let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("pages");
+        let mounted = mounted("governance");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
-        node.deploy("pages", &removed);
+        node.deploy("governance", &removed);
         let hold = hold_blob(&node);
         let loads = deployments_checked().await;
-        node.deploy("pages", &c);
+        node.held.notified().await;
+        node.deploy("governance", &c);
         hold.notify_one();
         join_all(loads);
         assert_eq!(slot_assets(&mounted), ["a.svg"], "A is still drawn");
@@ -4382,13 +4402,16 @@ mod tests {
             deployment(&component, "a.svg"),
             deployment(&component, "b.svg"),
         );
-        let node = FakeDeployment::serving("files", &a);
+        let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("files");
+        let mounted = mounted("governance");
+        // whatever an earlier test left drawn: this one starts from a view
+        // booted fresh, never ticked
+        mounted.lock().unwrap().slot = Slot::Empty;
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
-        node.deploy("files", &b);
+        node.deploy("governance", &b);
         // the candidate reads the instance after its bytes arrive, and is
         // seated after the node confirms the code did not move: hold the
         // bytes to get past the first, the confirmation to sit between
@@ -4424,6 +4447,44 @@ mod tests {
             panic!("the view of B");
         };
         assert!(guest.staged, "restored from A, not booted fresh");
+    }
+
+    /// A candidate for a view never ticked proves its first tree too: one
+    /// whose first frame traps is not seated, and the view stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fresh_candidate_whose_first_frame_fails_is_not_installed() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("forge", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = mounted("forge");
+        join_all(connected(&client));
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+
+        node.deploy("forge", &b);
+        let hold = hold_blob(&node);
+        let loads = deployments_checked().await;
+        node.held.notified().await;
+        FIRST_FRAME_TRAPS.store(true, std::sync::atomic::Ordering::SeqCst);
+        hold.notify_one();
+        join_all(loads);
+        assert!(!FIRST_FRAME_TRAPS.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(slot_assets(&mounted), ["a.svg"], "A stays");
+        {
+            let locked = mounted.lock().unwrap();
+            assert_eq!((locked.hash, locked.in_flight), (Some(a.hash()), false));
+        }
+        // the next block's candidate, drawing its first tree, is seated
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
 
     /// An artifact asset is found by its canonical relative path, exactly.
