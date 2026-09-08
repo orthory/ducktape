@@ -7,8 +7,9 @@
 # state), then stops the node. Open the app and switch to the "demo" workspace:
 # the app respawns the node from the same durable dir, fully populated.
 #
-# Re-runnable: wipes and recreates the "demo" workspace each time (other
-# workspaces in the registry are untouched). Ports are freshly allocated.
+# Re-runnable: stops whatever still serves the "demo" workspace, wipes it and
+# recreates it each time (ops/demo-clear.sh; other workspaces in the registry
+# are untouched). Ports are freshly allocated.
 #
 # It also publishes two gateway web-app routes (see ops/demo-gateway.mjs): a
 # NETWORK-hosted static site served from DuckFS, and a USER-hosted route that
@@ -69,9 +70,14 @@ if [ -z "$NODE_BIN" ]; then
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
-# ── 2. fresh demo workspace (idempotent) ───────────────────────
+# ── 2. fresh demo workspace ────────────────────────────────────
+# demo-clear stops the node and the service daemons a previous run left
+# serving this workspace BEFORE anything under it is deleted — a daemon whose
+# directory was pulled out from under it is not a fresh start — and refuses to
+# delete while one is still alive.
+bash "$SCRIPT_DIR/demo-clear.sh" || die "could not clear the previous '$ID' workspace"
 log "creating a fresh '$ID' workspace at $WSDIR"
-rm -rf "$WSDIR"; mkdir -p "$WSDIR"
+mkdir -p "$WSDIR"
 # Free-port probe only — always loopback regardless of DEV_LISTEN, since it
 # never binds anything the node itself serves from.
 read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')

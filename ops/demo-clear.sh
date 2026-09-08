@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # make demo-clear — remove the "demo" workspace that demo-seed created.
 #
-# Stops any node still serving the workspace (graceful /v1/admin/shutdown first,
-# then a pgrep sweep where every candidate's command line is verified against
-# the workspace dir before it may be killed — a recycled pid must never take an
-# innocent process down), deletes <ducktape home>/workspaces/<id>, and
+# Stops the node and the service daemons still serving the workspace (graceful
+# /v1/admin/shutdown first, then a sweep that admits only `ducktape node run`
+# and `ducktape service run` processes whose command line names the workspace
+# dir — a recycled pid, or an editor open on a log in here, must never be
+# taken down), deletes <ducktape home>/workspaces/<id>, and
 # drops the entry from <ducktape home>/registry.json, handing "active" to
 # another workspace when the demo held it. Other workspaces are untouched.
 # The home is $DUCKTAPE_HOME when set, else ~/.ducktape.
@@ -35,15 +36,28 @@ json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 
 command -v bun >/dev/null || die "bun is required"
 
-# pids of LIVE processes verifiably serving THIS workspace: a `pgrep -f` sweep
-# for the workspace dir. Nothing writes a pidfile — a node is started by hand
-# (`ducktape node run`) or by a seed run, and the app only ever PRINTS that
-# command — so the sweep is the whole discovery. Every candidate's command line
-# is checked before it may be killed.
-node_pids(){
+# pids of LIVE ducktape processes serving THIS workspace: the node
+# (`ducktape node run`) and the service daemons (`ducktape service run`) whose
+# command line names the workspace dir. Nothing writes a pidfile — a node is
+# started by hand, by a seed run or by `make dev`, and the app only ever PRINTS
+# that command — so a `pgrep -f` sweep for the workspace dir is the discovery.
+# Admission is deliberately narrow: mentioning this workspace in an editor,
+# shell, or diagnostic command is not enough.
+managed_pids(){
+  local pid executable command
   pgrep -f "$WSDIR" 2>/dev/null | while read -r pid; do
     [ -n "$pid" ] && [ "$pid" != "$$" ] || continue
-    case "$(ps -p "$pid" -o command= 2>/dev/null)" in
+    executable="$(ps -ww -p "$pid" -o comm= 2>/dev/null)"
+    case "${executable##*/}" in
+      ducktape) ;;
+      *) continue ;;
+    esac
+    command="$(ps -p "$pid" -o command= 2>/dev/null)"
+    case "$command" in
+      *ducktape*" node run "*|*ducktape*" service run "*) ;;
+      *) continue ;;
+    esac
+    case "$command" in
       *"$WSDIR"*) printf '%s\n' "$pid" ;;
     esac
   done
@@ -118,21 +132,21 @@ else
   esac
 fi
 
-PIDS="$(node_pids | xargs)"
+PIDS="$(managed_pids | xargs)"
 if [ -n "$PIDS" ]; then
-  log "stopping node process(es): $PIDS"
+  log "stopping node/service process(es): $PIDS"
   # shellcheck disable=SC2086
   kill -TERM $PIDS 2>/dev/null
-  for _ in $(seq 1 50); do [ -z "$(node_pids)" ] && break; sleep 0.1; done
-  REMAIN="$(node_pids | xargs)"
+  for _ in $(seq 1 50); do [ -z "$(managed_pids)" ] && break; sleep 0.1; done
+  REMAIN="$(managed_pids | xargs)"
   if [ -n "$REMAIN" ]; then
     # shellcheck disable=SC2086
     kill -KILL $REMAIN 2>/dev/null
-    for _ in $(seq 1 20); do [ -z "$(node_pids)" ] && break; sleep 0.1; done
+    for _ in $(seq 1 20); do [ -z "$(managed_pids)" ] && break; sleep 0.1; done
   fi
 fi
 # the honest gate: never delete state a live process would just re-create.
-[ -z "$(node_pids)" ] || die "a '$ID' node is still running and could not be stopped — stop it manually, then re-run"
+[ -z "$(managed_pids)" ] || die "a '$ID' node or service is still running and could not be stopped — stop it manually, then re-run"
 
 # ── 3. delete the workspace dir ────────────────────────────────
 if [ -d "$WSDIR" ]; then

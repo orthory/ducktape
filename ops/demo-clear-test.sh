@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Guards the one line in demo-clear.sh AND dev-clear.sh that can silently rot:
-# what each prints when the node REFUSES /v1/admin/shutdown (both extract the
-# body's fields with the same sed). The reason token there must be the
+# Guards two things in demo-clear.sh AND dev-clear.sh that can silently rot.
+#
+# The line each prints when the node REFUSES /v1/admin/shutdown (both extract
+# the body's fields with the same sed). The reason token there must be the
 # node's own (`refuse` in crates/noded/src/admin.rs puts it in the response
-# body) — a token invented in the script greps to nothing, which is how three
-# fictional ones lived there until #1331.
+# body) — a token invented in the script greps to nothing.
+#
+# And the process sweep behind that call: it admits only `ducktape … node run`
+# and `ducktape … service run` processes naming the workspace, never a
+# bystander that merely mentions the path.
 #
 # So the stub answers with a reason and an error sentence NO script could
 # plausibly hardcode. That IS the test: were the stub to reply with a real token
@@ -102,6 +106,37 @@ run_dev_case(){
   printf '%s\n' "$out"
 }
 
+# demo-clear's sweep admits only `ducktape … node run …` and `ducktape …
+# service run …` processes naming THIS workspace. Two processes carry the
+# workspace dir on their command line: a copy of /bin/sh named `ducktape` in
+# the service shape, and a bystander shell that merely has the path among its
+# arguments — an editor open on a log in here has that shape. demo-clear must
+# stop the first and leave the second alone. Runs in THIS shell, not a command
+# substitution, so the pids it started are the ones it asserts on.
+run_sweep_case(){
+  local port fake service bystander
+  port="$(start_stub 404 '')"
+  printf '{"active":"%s","workspaces":[{"id":"%s","ports":{"http":%s}}]}\n' "$ID" "$ID" "$port" \
+    > "$TMP/.ducktape/registry.json"
+  fake="$TMP/ducktape"
+  cp /bin/sh "$fake"
+  "$fake" -c 'sleep 10; :' service run airlock --enable --workspace "$WS" &
+  service=$!
+  /bin/sh -c 'sleep 10; :' bystander "$WS" &
+  bystander=$!
+  HOME="$TMP" DUCKTAPE_HOME="$TMP/.ducktape" DEMO_WORKSPACE_ID="$ID" \
+    bash "$OPS/demo-clear.sh" >/dev/null 2>&1
+  stop_stub
+  # reap the service so a zombie cannot answer kill -0 for it
+  wait "$service" 2>/dev/null
+  kill -0 "$service" 2>/dev/null && fail "the sweep left a ducktape service run process alive"
+  kill -0 "$bystander" 2>/dev/null || fail "the sweep killed a bystander that only mentioned the workspace"
+  kill "$bystander" 2>/dev/null
+  wait "$bystander" 2>/dev/null
+  [ -d "$WS" ] && fail "the workspace survived a clear with a live service"
+  return 0
+}
+
 # 1. a refusal that names itself: the script must print THAT token and THAT
 #    sentence, verbatim — neither is guessable from the 403 alone.
 REFUSED="$(run_case 403 "{\"error\":\"$ERROR\",\"reason\":\"$REASON\"}")"
@@ -147,5 +182,8 @@ esac
 case "$DEV_ABSENT" in
   *"reason="*) printf '%s\n' "$DEV_ABSENT" >&2; fail "a body with no reason must not produce one" ;;
 esac
+
+# 5. demo-clear's sweep stops the workspace's service daemon and nothing else.
+run_sweep_case
 
 printf '\033[32m[demo-clear-test] ok\033[0m\n'
