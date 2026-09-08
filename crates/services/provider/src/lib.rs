@@ -219,7 +219,9 @@ pub use interactive::InteractiveSession;
 /// signal `ensure` rebuilds the guest image from.
 pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
-pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
+pub use spec::{
+    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource, SpecSet,
+};
 
 /// canonical label-safe identity for the node executing a provider run.
 pub fn execution_node_id(identity: &[u8]) -> String {

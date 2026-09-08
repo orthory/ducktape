@@ -632,7 +632,7 @@ pub struct InitArgs {
     /// human-readable network name (the chain id becomes <name>#<salt>)
     #[arg(long, value_name = "NAME")]
     pub name: String,
-    /// found the network here instead of the registry default
+    /// found the network here instead of under the ducktape home
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// the founding set to compose the genesis from: a directory holding every
@@ -689,7 +689,7 @@ pub struct JoinCmd {
     /// blob is read from stdin — paste it at the prompt and press Enter.
     #[arg(value_name = "INVITE-BLOB", num_args = 0..)]
     pub blob: Vec<String>,
-    /// materialize here instead of the registry dir named by the chain id
+    /// materialize here instead of the home dir named by the chain id
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// the network's genesis file (the founder's `<workspace>/genesis`). A
