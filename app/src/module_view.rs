@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
@@ -2192,6 +2192,68 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
     }
 }
 
+/// How long each stage of one module-owned load took: `status` and
+/// `fetch` are the node's answers, `compile` is cranelift, `init` the
+/// instance and its `on mount` or restore, `first_frame` the tree a
+/// replacement proves (a fresh view draws its first on the window thread),
+/// `check` the second look at the registry before the seat. `path` is
+/// `tab` for a mount (the tab's first draw), `first` for a load the
+/// connection asked for over an empty slot, `swap` over a view drawn.
+#[derive(Default)]
+struct LoadTiming {
+    path: &'static str,
+    status: Duration,
+    fetch: Duration,
+    compile: Duration,
+    init: Duration,
+    first_frame: Option<Duration>,
+    check: Duration,
+}
+
+impl LoadTiming {
+    /// One `view_load` line per load, every field every time, through the
+    /// same logger and test tap as `view_source`.
+    fn log(&self, module: &str, hash: Option<&[u8; 32]>, started: Instant, state: &str) {
+        let ms = |duration: Duration| duration.as_millis();
+        let hash = hash.map_or_else(|| "-".to_owned(), |hash| crate::backend::hex_encode(hash));
+        let first_frame = self
+            .first_frame
+            .map_or_else(|| "-".to_owned(), |frame| ms(frame).to_string());
+        let total = ms(started.elapsed());
+        tracing::info!(
+            target: "ducktape::app",
+            module,
+            hash = %hash,
+            path = self.path,
+            outcome = state,
+            status_ms = ms(self.status),
+            fetch_ms = ms(self.fetch),
+            compile_ms = ms(self.compile),
+            init_ms = ms(self.init),
+            first_frame_ms = %first_frame,
+            check_ms = ms(self.check),
+            total_ms = total,
+            "view_load"
+        );
+        #[cfg(test)]
+        {
+            let line = format!(
+                "view_load module={module} hash={hash} path={} outcome={state} status_ms={} fetch_ms={} compile_ms={} init_ms={} first_frame_ms={first_frame} check_ms={} total_ms={total}",
+                self.path,
+                ms(self.status),
+                ms(self.fetch),
+                ms(self.compile),
+                ms(self.init),
+                ms(self.check),
+            );
+            canary::TAPS
+                .lock()
+                .expect("view_source taps")
+                .retain(|tap| tap.send(line.clone()).is_ok());
+        }
+    }
+}
+
 /// What the canary runner (`tests::canary`) needs of this registry: the
 /// `view_source` lines as they are logged, the module-owned views mounted
 /// without an app around them, and the hash a slot answers for.
@@ -2409,28 +2471,46 @@ impl Guest {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let source = match runtime.block_on(view_source::resolve(client, module)) {
+        let started = Instant::now();
+        let mut timing = LoadTiming {
+            // the mount is the tab's first draw; a later load is one the
+            // connection asked for, over a view drawn or not
+            path: if generation == 0 { "tab" } else { "first" },
+            ..LoadTiming::default()
+        };
+        let mut asked = view_source::Asked::default();
+        let source = runtime.block_on(view_source::resolve(client, module, &mut asked));
+        timing.status = asked.status;
+        timing.fetch = asked.fetch;
+        let source = match source {
             Ok(source) => source,
             Err(error) => {
                 let reason = error.to_string();
                 logged(None, "Failed", &reason);
+                timing.log(module, None, started, "Failed");
                 return Err(reason);
             }
         };
         let (hash, component, assets) = match source {
             ViewSource::NotActivated => {
                 logged(None, "NotActivated", "");
+                timing.log(module, None, started, "NotActivated");
                 return Err(format!("the {module} module is not activated yet"));
             }
             ViewSource::Missing { hash } => {
                 // a removal answered late, after the code moved on, is not
                 // the current deployment's word
-                if !runtime.block_on(still_active(client, module, hash))? {
+                let checked = Instant::now();
+                let active = runtime.block_on(still_active(client, module, hash));
+                timing.check = checked.elapsed();
+                if !active? {
                     let reason = "the active code moved while the view was prepared";
                     logged(Some(&hash), "Failed", reason);
+                    timing.log(module, Some(&hash), started, "Failed");
                     return Err(reason.to_owned());
                 }
                 logged(Some(&hash), "Missing", "");
+                timing.log(module, Some(&hash), started, "Missing");
                 return Ok(Loaded::Empty(hash));
             }
             ViewSource::Ready {
@@ -2452,6 +2532,13 @@ impl Guest {
                     _ => None,
                 }
             };
+            if against.is_some() {
+                timing.path = "swap";
+            }
+            let compiled = Instant::now();
+            let component = Self::compile(&component, &shown)?;
+            timing.compile = compiled.elapsed();
+            let seated = Instant::now();
             let mut fresh = Self::instantiate(module, &component, &shown)?;
             fresh.deployed(hash, assets);
             match against {
@@ -2469,20 +2556,32 @@ impl Guest {
                     };
                     wire::Snapshot::decode(&snapshot)?;
                     fresh.restore(&snapshot, &shown)?;
+                    timing.init = seated.elapsed();
+                    let framed = Instant::now();
                     fresh.first_frame(&shown)?;
+                    timing.first_frame = Some(framed.elapsed());
                 }
                 // one mounted but never ticked has no state worth carrying;
                 // its replacement still proves its first tree before it
                 // takes the slot
                 Some(_) => {
                     fresh.init(&shown)?;
+                    timing.init = seated.elapsed();
+                    let framed = Instant::now();
                     fresh.first_frame(&shown)?;
+                    timing.first_frame = Some(framed.elapsed());
                 }
-                None => fresh.init(&shown)?,
+                None => {
+                    fresh.init(&shown)?;
+                    timing.init = seated.elapsed();
+                }
             }
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
-            if !runtime.block_on(still_active(client, module, hash))? {
+            let checked = Instant::now();
+            let active = runtime.block_on(still_active(client, module, hash));
+            timing.check = checked.elapsed();
+            if !active? {
                 return Err("the active code moved while the view was prepared".into());
             }
             Ok(match against {
@@ -2494,12 +2593,20 @@ impl Guest {
                 None => Loaded::Fresh(Box::new(fresh)),
             })
         })();
-        match &outcome {
-            Ok(Loaded::Fresh(_)) => logged(Some(&hash), "Ready", ""),
+        let state = match &outcome {
+            Ok(Loaded::Fresh(_)) => {
+                logged(Some(&hash), "Ready", "");
+                "Ready"
+            }
+            Ok(Loaded::Unchanged) => "Unchanged",
             // `Swapped` is logged at the seat: the swap can still be refused there
-            Ok(_) => {}
-            Err(reason) => logged(Some(&hash), "Failed", reason),
-        }
+            Ok(_) => "Swap",
+            Err(reason) => {
+                logged(Some(&hash), "Failed", reason);
+                "Failed"
+            }
+        };
+        timing.log(module, Some(&hash), started, state);
         outcome
     }
 
@@ -2648,14 +2755,15 @@ impl Guest {
 
     /// The component instantiated and mounted; `shown` names it in errors.
     fn from_bytes(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
-        let mut guest = Self::instantiate(module, bytes, shown)?;
+        let component = Self::compile(bytes, shown)?;
+        let mut guest = Self::instantiate(module, &component, shown)?;
         guest.init(shown)?;
         Ok(guest)
     }
 
-    /// The component instantiated, its exports bound, nothing run yet: a
-    /// fresh view is `init`ed, a replacement `restore`d.
-    fn instantiate(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
+    /// The component's bytes checked and compiled — the cranelift stage of
+    /// a load, measured on its own.
+    fn compile(bytes: &[u8], shown: &str) -> Result<Component, String> {
         if bytes.len() as u64 > MAX_MODULE_BYTES {
             return Err(format!(
                 "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
@@ -2664,9 +2772,17 @@ impl Guest {
         // its preferred size is for placing a new window; the tab embeds
         ui_lang_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
+        Component::new(engine(), bytes).map_err(|error| format!("{shown}: {error}"))
+    }
+
+    /// The component instantiated, its exports bound, nothing run yet: a
+    /// fresh view is `init`ed, a replacement `restore`d.
+    fn instantiate(
+        module: &'static str,
+        component: &Component,
+        shown: &str,
+    ) -> Result<Self, String> {
         let engine = engine();
-        let component =
-            Component::new(engine, bytes).map_err(|error| format!("{shown}: {error}"))?;
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
         // instances — the app, the stub adapters `cargo ice bundle` gave it,
@@ -2703,11 +2819,11 @@ impl Guest {
             )
             .map_err(|error| error.to_string())?;
         linker
-            .define_unknown_imports_as_traps(&component)
+            .define_unknown_imports_as_traps(component)
             .map_err(|error| error.to_string())?;
         arm(&mut store);
         let instance = linker
-            .instantiate(&mut store, &component)
+            .instantiate(&mut store, component)
             .map_err(|error| format!("{shown}: {}", first_line(&error)))?;
         let init = instance
             .get_typed_func::<(bool,), ()>(&mut store, "init")
@@ -4720,6 +4836,78 @@ pub(crate) mod tests {
         assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["c.svg"]);
+    }
+
+    /// Every module-owned load leaves one `view_load` line naming its path
+    /// and the time of each of its stages — the node's two answers, the
+    /// compile, the instance, the tree a replacement proves, the second
+    /// look at the registry — so where a "Loading" wait goes is read off
+    /// the log, not guessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_load_reports_the_time_of_each_of_its_stages() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let lines = super::canary::tap();
+        let _mounted = fresh("governance");
+        join_all(connected(&client));
+        node.deploy("governance", &b);
+        join_all(deployments_checked().await);
+
+        let loads: Vec<String> = lines
+            .try_iter()
+            .filter(|line| line.starts_with("view_load module=governance "))
+            .collect();
+        let field = |line: &str, name: &str| -> String {
+            line.split_whitespace()
+                .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("no {name} in {line}"))
+                .to_owned()
+        };
+        let of = |hash: [u8; 32]| -> String {
+            let hash = crate::backend::hex_encode(&hash);
+            loads
+                .iter()
+                .find(|line| field(line, "hash") == hash)
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for {hash} in {loads:?}"))
+        };
+        let (first, swap) = (of(a.hash()), of(b.hash()));
+        assert_eq!(field(&first, "path"), "first");
+        assert_eq!(field(&first, "outcome"), "Ready");
+        assert_eq!(
+            field(&first, "first_frame_ms"),
+            "-",
+            "a fresh view draws its first tree on the window thread"
+        );
+        assert_eq!(field(&swap, "path"), "swap");
+        assert_eq!(field(&swap, "outcome"), "Swap");
+        field(&swap, "first_frame_ms")
+            .parse::<u128>()
+            .expect("the replacement's first frame is timed");
+        for line in [&first, &swap] {
+            let ms = |name: &str| {
+                field(line, name)
+                    .parse::<u128>()
+                    .unwrap_or_else(|_| panic!("{name} in {line}"))
+            };
+            let total = ms("total_ms");
+            let stages = ms("status_ms")
+                + ms("fetch_ms")
+                + ms("compile_ms")
+                + ms("init_ms")
+                + ms("check_ms");
+            assert!(total >= stages, "{line}");
+        }
     }
 
     /// A view mounted but not yet ticked names its instance too: a tick
