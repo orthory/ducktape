@@ -156,6 +156,80 @@ rendering. View replacement/removal still uses the existing `module update`
 ceremony, verified active artifact hashes on every node, and the actual app
 host's rendering/asset/removal checks.
 
+### Preparing the actual view ceremony
+
+After the aggregate UI pin and view/assets staging CLI are integrated, prepare
+views before rebuilding the node in the same checkout:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" make views
+CARGO_TARGET_DIR="$PWD/target" cargo build --locked -p node-bin --bin ducktape
+```
+
+`make views` writes all eleven guests to the checkout's `target/views` even
+when the Cargo build target is elsewhere. The subsequent noded build stages
+`governance`, `files`, `pages`, `chat`, and `forge` views into the node profile's
+`modules` directory. Require all five `<id>.view.wasm` files and no
+`<id>.view.pending` markers before founding or rollout. Preserve
+`pages.index.wasm` and `chat.index.wasm` in every ceremony; the other three
+owners have no mapper. Pass `--assets` only for an existing asset directory.
+Do not edit founding files to perform a live swap.
+
+Governance's header surface calls `artifact_svg("icons/seal.svg")`. It resolves
+that exact canonical path in the current verified deployment's assets; a
+missing entry leaves an empty slot and logs `reason=asset_missing`. The two
+static canary asset roots are `ops/proxmox-view-assets/a` and
+`ops/proxmox-view-assets/b`. Both contain `icons/seal.svg`, a 24×24 seal with
+identical geometry and a white check. Only its fill differs:
+
+| Root | Fill | SHA-256 of `icons/seal.svg` |
+| --- | --- | --- |
+| `a` | blue `#2563eb` | `4006efe23a11bf16828074bc23920a185e984258ac3276cd8fedf15a9950df21` |
+| `b` | orange `#f97316` | `7985e6eebe72292a8cf3c50d3f9c9a47725745cd98df27848cbb75a91168d216` |
+
+These are asset-byte hashes, not deployment hashes. Once the real consensus
+component and view bytes are available, package each exact combination and
+record the whole artifact hash printed by `module pack`. For governance's
+asset-only comparison, keep `COMPONENT` and `VIEW` identical:
+
+```sh
+"$NODE_BINARY" module pack "$COMPONENT" --view "$VIEW" \
+  --assets ops/proxmox-view-assets/a --out "$ARTIFACT_A"
+"$NODE_BINARY" module pack "$COMPONENT" --view "$VIEW" \
+  --assets ops/proxmox-view-assets/b --out "$ARTIFACT_B"
+```
+
+Run the matching `module update governance COMPONENT --view VIEW --assets ROOT
+--after 600 --config NODE_CONFIG` on the dedicated validators with the same
+inputs and lead. The CLI proposes/votes before staging; a successful ballot
+or blob receipt is not activation. Require all three validators' committed
+active hash and activation history to agree, plus an advancing common root.
+Record view A→B with the same asset root first, then hold view B fixed while
+changing the asset root from `a` to `b`. Removal omits **both** `--view` and
+`--assets` while retaining the backend and any mapper. Removing just the seal
+asset is a separate `asset_missing` check, not view removal. No artifact hash
+or successful activation is implied by the static fixtures in this directory.
+
+The Mac client check is coordinated separately with the app owner. Use fresh
+preferences because an explicit saved endpoint takes priority over the
+environment. Its staged view directory must contain only the six globals
+`agents`, `explorer`, `members`, `node`, `settings`, and `shell` (`*_view.wasm`),
+with the five owner views absent:
+
+```sh
+DUCKTAPE_HOME="$MAC_SCRATCH" DUCKTAPE_NODE="$NODE_A_HTTP" \
+DUCKTAPE_VIEWS_DIR="$GLOBALS_ONLY" \
+  "$APP_BUNDLE/Contents/MacOS/ducktape-app"
+```
+
+Read-only checks need no `DUCKTAPE_USER_KEY` or server operator credential.
+The app must run RPC-only, without a local node. Hand off three forwarded HTTP
+URLs, the five owners' actual full artifact hashes and activation heights,
+`icons/seal.svg`, and the removal module. Capture module/hash/state/generation
+logs and actual PNGs for view A, view B, asset color change, missing asset, and
+verified view removal. Static readiness/ABI validation and the local
+three-process consensus smoke do not prove Proxmox deployment or Mac rendering.
+
 Offline command/ownership and heartbeat checks (no SSH/Proxmox access):
 
 ```sh
