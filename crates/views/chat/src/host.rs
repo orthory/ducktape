@@ -3,14 +3,9 @@
 //! composers are the host's own surfaces: a submit never passes through
 //! here.
 
-use iced::futures::{Stream, StreamExt};
+use iced::futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use ui_lang_guest::host;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HostError {
-    pub message: String,
-}
 
 // The chat module's own rows, as the desktop app serializes them
 // (`chat::client`, `app/src/backend`). Fields the view never reads are not
@@ -176,12 +171,31 @@ pub struct ChatProps {
     pub sent_serial: i64,
 }
 
-/// The facts now, and again on every change the host sees.
-pub fn props() -> impl Stream<Item = Result<ChatProps, HostError>> + Send + 'static {
-    host::subscribe("chat.props", &[]).map(|answer| {
-        let bytes = answer.map_err(|message| HostError { message })?;
-        serde_json::from_slice(&bytes).map_err(|error| HostError {
-            message: error.to_string(),
+/// One item of the facts subscription: the facts, or why not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PropsItem {
+    pub next: ChatProps,
+    pub error: String,
+}
+
+/// The facts now, and again on every change the host sees — a
+/// subscription, so a view restored from a snapshot asks again on its own.
+pub fn props() -> iced::Subscription<PropsItem> {
+    iced::Subscription::run(|| {
+        host::subscribe("chat.props", &[]).map(|answer| {
+            let read = answer.and_then(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+            });
+            match read {
+                Ok(next) => PropsItem {
+                    next,
+                    error: String::new(),
+                },
+                Err(error) => PropsItem {
+                    next: ChatProps::default(),
+                    error,
+                },
+            }
         })
     })
 }

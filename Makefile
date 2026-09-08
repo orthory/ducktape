@@ -112,19 +112,29 @@ $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
+# wasm-tools at the version in wasm-tools.version, installed the same way
+# cargo-ice is: under target, keyed by version, so `make views` and
+# `make wasm-modules` need nothing on PATH and cannot pick up a global copy
+# at another version (component bytes depend on it).
+WASM_TOOLS_VERSION = $(shell cat wasm-tools.version)
+WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
+WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
+
+$(WASM_TOOLS_BIN):
+	CARGO_TARGET_DIR="$(CURDIR)/target/wasm-tools-build" $(CARGO) install wasm-tools \
+		--locked --version "$(WASM_TOOLS_VERSION)" --root "$(WASM_TOOLS_ROOT)"
+
 ## build every module-owned view (crates/views) as an `ice:view` component
 ## and stage it under target/views, where a built desktop app loads it from
 ## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-## binary). Needs wasm-tools like `wasm-modules`. The views workspace pins the
+## binary). Installs wasm-tools like `wasm-modules`. The views workspace pins the
 ## same ducktape-ui rev as the app, and this refuses when they differ: a view
 ## compiled by another language revision than the host that renders it is a
 ## wire nobody tested.
-views: $(ICE_BIN)
+views: $(ICE_BIN) $(WASM_TOOLS_BIN)
 	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
-	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
-	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p chat-view -p files-view -p forge-view -p pages-view -p shell-view \
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" "$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p chat-view -p files-view -p forge-view -p pages-view -p shell-view \
 		--target wasm32-unknown-unknown --out target/views
 
 ifeq ($(UNAME_S),Darwin)
@@ -278,8 +288,8 @@ test: wasm-modules-check wasm-embed-check
 ## rebuild every wasm guest into its artifact and refresh EVERY committed copy
 ## in one sweep (the canonical artifact in the module's own directory, which
 ## the build stages into the founding set, + the kernel test fixtures), so the
-## copies can never drift apart. requires wasm-tools (cargo install
-## wasm-tools --version "$$(cat wasm-tools.version)"); the wasm32 target uses
+## copies can never drift apart. installs wasm-tools at the pinned version
+## under target on first use; the wasm32 target uses
 ## rust-toolchain.toml. every guest is built ALONE, out of the platform
 ## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
 ## pushed first; each module's guest.lock records the revision and the
@@ -330,12 +340,10 @@ INDEX_MODULES := \
 # the netstack-wasm scenario lane reads it from the crate directory.
 NETSTACK_GUEST := crates/networking/netstack-machine
 
-wasm-modules:
-	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
-	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
+wasm-modules: $(WASM_TOOLS_BIN)
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
+	  PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
@@ -350,7 +358,7 @@ wasm-modules:
 	# committed lock, so $(LOCKED) applies same as everywhere else) — their
 	# components are kernel test fixtures, nothing the genesis hash pins.
 	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	wasm-tools component new \
+	"$(WASM_TOOLS_BIN)" component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
 	  -o crates/guests/hello-wasm/component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
@@ -361,21 +369,21 @@ wasm-modules:
 	# nothing. Its component is committed beside the crate and pinned in the
 	# host fixtures, the hello shape.
 	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	wasm-tools component new \
+	"$(WASM_TOOLS_BIN)" component new \
 	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
 	  -o crates/guests/noop-wasm/component.wasm
 	cp crates/guests/noop-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	wasm-tools component new \
+	"$(WASM_TOOLS_BIN)" component new \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
 	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
 	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	wasm-tools component new \
+	"$(WASM_TOOLS_BIN)" component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
 	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
-	wasm-tools component new \
+	"$(WASM_TOOLS_BIN)" component new \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 
