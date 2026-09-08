@@ -328,8 +328,8 @@ fn cmd_z_walks_the_history_and_shift_redoes() {
     let mut history = History::default();
     let before = typed("Title\nbod", 1, 3);
     // 'y' is a native edit: the host commits it, the guest groups it.
-    history.commit(&before, EditorHistoryEffect::Native, 0);
     let typed_doc = typed("Title\nbody", 1, 4);
+    history.commit(&before, &typed_doc, EditorHistoryEffect::Native, 0);
     let EditorDecision::Apply {
         patches,
         cursor,
@@ -363,12 +363,22 @@ fn cmd_z_walks_the_history_and_shift_redoes() {
 #[test]
 fn keystrokes_inside_the_window_coalesce_into_one_step() {
     let mut history = History::default();
-    history.commit(&typed("a", 0, 1), EditorHistoryEffect::Native, 0);
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("ab", 0, 2),
+        EditorHistoryEffect::Native,
+        0,
+    );
     assert_eq!(
         history.group_effect(500),
         EditorHistoryEffect::ExtendPrevious
     );
-    history.commit(&typed("ab", 0, 2), EditorHistoryEffect::Native, 500);
+    history.commit(
+        &typed("ab", 0, 2),
+        &typed("abc", 0, 3),
+        EditorHistoryEffect::Native,
+        500,
+    );
     let undone = history.undo(&typed("abc", 0, 3)).expect("one step");
     let EditorDecision::Apply {
         patches, cursor, ..
@@ -386,10 +396,20 @@ fn keystrokes_inside_the_window_coalesce_into_one_step() {
 #[test]
 fn a_fresh_edit_clears_the_redo_lane() {
     let mut history = History::default();
-    history.commit(&typed("a", 0, 1), EditorHistoryEffect::Native, 0);
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("ab", 0, 2),
+        EditorHistoryEffect::Native,
+        0,
+    );
     let _ = history.undo(&typed("ab", 0, 2));
     assert_eq!(history.group_effect(100), EditorHistoryEffect::NewGroup);
-    history.commit(&typed("a", 0, 1), EditorHistoryEffect::Native, 100);
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("aX", 0, 2),
+        EditorHistoryEffect::Native,
+        100,
+    );
     assert!(
         history.redo(&typed("aX", 0, 2)).is_none(),
         "redo dies on a fresh edit"
@@ -400,7 +420,8 @@ fn a_fresh_edit_clears_the_redo_lane() {
 fn an_applied_decision_joins_the_open_group_it_named() {
     let mut history = History::default();
     let doc = typed("- one", 0, 5);
-    history.commit(&doc, EditorHistoryEffect::Native, 0);
+    // a native step from "- one" opens the group at t=0
+    history.commit(&doc, &typed("- onex", 0, 6), EditorHistoryEffect::Native, 0);
     let EditorDecision::Apply {
         patches,
         cursor,
@@ -411,7 +432,7 @@ fn an_applied_decision_joins_the_open_group_it_named() {
     };
     assert_eq!(effect, EditorHistoryEffect::ExtendPrevious);
     let after = apply(&doc, &patches, cursor);
-    history.commit(&doc, effect, 200);
+    history.commit(&doc, &after, effect, 200);
     // One group: the undo lands before the whole burst.
     let EditorDecision::Apply {
         patches, cursor, ..
@@ -432,8 +453,8 @@ fn an_applied_decision_joins_the_open_group_it_named() {
 fn a_restore_across_multibyte_text_stays_on_char_boundaries() {
     let mut history = History::default();
     let before = typed("Title\n한글", 1, 6);
-    history.commit(&before, EditorHistoryEffect::Native, 0);
     let after = typed("Title\n한국", 1, 6);
+    history.commit(&before, &after, EditorHistoryEffect::Native, 0);
     let EditorDecision::Apply {
         patches, cursor, ..
     } = history.undo(&after).expect("a step")
@@ -442,4 +463,42 @@ fn a_restore_across_multibyte_text_stays_on_char_boundaries() {
     };
     check_patches(&after, &patches);
     assert_eq!(apply(&after, &patches, cursor).text, "Title\n한글");
+}
+
+/// The lane acks a `Noop` as a commit whose text did not move, and caret
+/// observations come the same way: neither is an undo step, and neither
+/// kills the redo lane an undo just filled.
+#[test]
+fn a_caret_only_commit_after_undo_keeps_the_redo_lane() {
+    let mut history = History::default();
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("ab", 0, 2),
+        EditorHistoryEffect::Native,
+        0,
+    );
+    let _ = history.undo(&typed("ab", 0, 2));
+    // a Noop ack, then a caret move: same text, other caret
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("a", 0, 1),
+        EditorHistoryEffect::Native,
+        100,
+    );
+    history.commit(
+        &typed("a", 0, 1),
+        &typed("a", 0, 0),
+        EditorHistoryEffect::Native,
+        200,
+    );
+    assert_eq!(
+        history.group_effect(250),
+        EditorHistoryEffect::NewGroup,
+        "no group opened"
+    );
+    let redone = history.redo(&typed("a", 0, 0)).expect("redo survives");
+    let EditorDecision::Apply { cursor, .. } = redone else {
+        panic!("redo applies");
+    };
+    assert_eq!(cursor, EditorCursor::at(0, 2));
 }
