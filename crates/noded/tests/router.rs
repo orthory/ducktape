@@ -908,11 +908,27 @@ async fn reader_of(response: axum::response::Response) -> String {
         .to_string()
 }
 
+/// an actor that PANICS if any command crosses — the file's idiom for "the gate
+/// refused before the handler ran". Deliberately not a `try_next()` probe on the
+/// receiver: `oneshot` consumes the router, so by the time a test could poll,
+/// the sender may already be dropped and an empty CLOSED channel reads `Ok(None)`
+/// rather than the `Err` an empty open one gives. The panic does not care when
+/// it runs.
+fn spawn_forbidden_actor(cmd_rx: mpsc::Receiver<NodeCommand>) {
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("a refused read reached the node actor");
+        }
+    });
+}
+
 /// no trio, no read. The command lane must never see the request: an
 /// unauthenticated caller learns nothing, not even whether the module exists.
 #[tokio::test]
 async fn an_unsigned_reader_query_is_refused_before_the_actor() {
-    let (handle, mut cmd_rx, _events) = local_node();
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_forbidden_actor(cmd_rx);
 
     let response = noded::router(handle)
         .oneshot(post(
@@ -928,12 +944,7 @@ async fn an_unsigned_reader_query_is_refused_before_the_actor() {
         "signature_missing",
         "the refusal must name why"
     );
-    // nothing was forwarded: `try_next` on an empty, still-open channel is
-    // `Ok(None)`-or-pending, never a command.
-    assert!(
-        cmd_rx.try_next().is_err(),
-        "a refused read must not reach the actor"
-    );
+    // and the forbidden actor above proves nothing was forwarded.
 }
 
 /// a valid trio names the signer, and the module is told exactly that key.
@@ -1049,7 +1060,8 @@ async fn a_reader_claim_inside_the_query_is_not_the_reader() {
 /// replayed against a different node.
 #[tokio::test]
 async fn a_reader_query_signed_for_another_node_is_refused() {
-    let (handle, mut cmd_rx, _events) = local_node();
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_forbidden_actor(cmd_rx);
 
     const OTHER_NODE: [u8; 32] = [0x22; 32];
     let body = serde_json::json!({ "target": "collaboration", "query": "mailbox" });
@@ -1075,7 +1087,6 @@ async fn a_reader_query_signed_for_another_node_is_refused() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(body_json(response).await["reason"], "signature_invalid");
-    assert!(cmd_rx.try_next().is_err(), "nothing reaches the actor");
 }
 
 /// the body is signed, so swapping it after signing is caught. Without this the
@@ -1083,7 +1094,8 @@ async fn a_reader_query_signed_for_another_node_is_refused() {
 /// change which conversation was read.
 #[tokio::test]
 async fn a_reader_query_whose_body_was_swapped_is_refused() {
-    let (handle, mut cmd_rx, _events) = local_node();
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_forbidden_actor(cmd_rx);
 
     let signed_for = serde_json::json!({ "target": "collaboration", "query": "mine" });
     let sent = serde_json::to_vec(&serde_json::json!({
@@ -1111,7 +1123,6 @@ async fn a_reader_query_whose_body_was_swapped_is_refused() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(body_json(response).await["reason"], "signature_invalid");
-    assert!(cmd_rx.try_next().is_err(), "nothing reaches the actor");
 }
 
 /// the open lane is UNCHANGED and still anonymous. That is not an oversight to
