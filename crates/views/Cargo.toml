@@ -8,9 +8,11 @@
 # The Ice pin is the app's: `make views` refuses when this rev and the one in
 # app/Cargo.toml differ, so a view is never compiled by a different language
 # revision than the host that renders it.
+# Shared design source lives in this workspace so Cargo hashes guest package
+# identities relative to the workspace instead of an external checkout path.
 [workspace]
 resolver = "2"
-members = ["governance", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "shell"]
+members = ["governance", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "shell", "support/design"]
 
 [workspace.dependencies]
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "97a3b810c842ac423676deb9cd9e25b841692a77" }

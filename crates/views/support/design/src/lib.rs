@@ -269,7 +269,10 @@ mod tests {
             );
             count += 1;
         }
-        assert!(count >= 49, "expected the full artifact icon set, saw {count}");
+        assert!(
+            count >= 49,
+            "expected the full artifact icon set, saw {count}"
+        );
     }
 
     #[test]
