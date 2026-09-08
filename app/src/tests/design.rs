@@ -459,8 +459,11 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
             .count(),
         1
     );
-    // the forge note is the app's, docked under the module view
-    assert!(inlined(include_str!("../ui/view.ice")).contains(", 38.0, 120.0, 6.0) #forge-note"));
+    // the forge note is the same composer, as the host surface the view
+    // leaves a slot for — compact, over the item's channel
+    assert!(inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice")).contains(
+        "extern forge_composer(note_scope, \"note\", true, \"Write a note…\", note_blocked, false,"
+    ));
     assert!(chat_composer.contains("widget::text(\"Send\")"));
     assert!(chat_composer.contains(".height(if self.compact { 28 } else { 29 })"));
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));

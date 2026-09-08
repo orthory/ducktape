@@ -64,6 +64,10 @@ on forge_view_event(event)
       flow
         from done event_text(event, "url")
         done -> open_message_link _
+    ForgeIntent.composer
+      flow
+        from done event_text(event, "body")
+        done -> forge_composer_event _
     ForgeIntent.copy
       toast = event_text(event, "label")
       toast_age = 0
@@ -249,7 +253,6 @@ on forge_open_item(number)
   forge_discussion = []
   forge_discussion_members = []
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   forge_generation = forge_generation + 1
   run replace lane=forge_item load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_item_failed _
 
@@ -351,20 +354,21 @@ on forge_merge_failed(started_rpc, started_repo, started_number, cause)
   return if started_rpc != connected_rpc || started_repo != forge_repo || started_number != forge_item_number
   error = cause.message
 
-on forge_composer_event(event)
-  forge_discussion_editor = apply_composer_event(forge_discussion_editor, event)
-  return if !composer_submits(event)
-  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
+// The note's words live in the host's composer (`forge_composer`, the chat
+// composer over the item's channel as its scope); a send arrives here as
+// the trimmed body, and a failed one goes back to that box's banner.
+on forge_composer_event(body)
+  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(body))
   forge_discussion_pending = fresh_operation_id("forge-note")
-  run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
+  run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(body), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
 
 on forge_note_sent(next)
   return if next.channel_id != forge_item_channel
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   error = ""
 
 on forge_note_failed(cause)
+  composer_stashed = chat_composer_unsent(cause.scope_id, cause.body, cause.committed)
   return if cause.scope_id != forge_item_channel
   forge_discussion_pending = ""
   error = cause.message
