@@ -202,6 +202,14 @@ def rollout(args, record):
     with tempfile.TemporaryDirectory() as directory:
         archive = Path(directory) / "release.tar"
         manifest = package_release(args.binary, args.modules, args.revision, args.ui_revision, archive)
+        previous = record.get("release")
+        if previous is not None:
+            old_founding = {name: digest for name, digest in previous["files"].items()
+                           if name.startswith("modules/")}
+            new_founding = {name: digest for name, digest in manifest["files"].items()
+                           if name.startswith("modules/")}
+            if old_founding != new_founding:
+                raise ValueError("founding files changed; run reset-network before rollout")
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         manifest.update(archive_sha256=digest, addresses=addresses, reason=args.reason)
         stage_dir = remote_stage(args.host, record["owner"])
@@ -215,7 +223,7 @@ def rollout(args, record):
                 remote(args.host, "pct", "exec", node["id"], "--", "sh", "-ec",
                        f"printf '%s\\n' '{digest}  {ROOT}/release.tar' | sha256sum -c -; "
                        f"mkdir -p {release}; tar -xf {ROOT}/release.tar -C {release} --no-same-owner; "
-                       f"cd {release}; sha256sum -c SHA256SUMS; chmod 755 ducktape")
+                       f"cd {release}; sha256sum -c SHA256SUMS; chmod 755 ducktape; ./ducktape --version")
             with args.record.with_suffix(".events.jsonl").open("a") as journal:
                 journal.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
                                           "action": "rollout", "result": "staged", "release": manifest}) + "\n")
@@ -317,6 +325,11 @@ def execute(args):
             # Fixed path below the owner marker. Never accept a caller-supplied
             # removal path, and never remove/recreate the containers themselves.
             remote(args.host, "pct", "exec", node["id"], "--", "rm", "-rf", "--", ROOT + "/network")
+        # Genesis is reconstructed from founding files on each dev-shape boot.
+        # Only a completed reset permits a different founding set next time.
+        record.pop("release", None)
+        record.pop("pending_release", None)
+        save_record(args.record, record)
         event["result"] = "network_data_removed"
         with journal.open("a") as output:
             output.write(json.dumps(event, sort_keys=True) + "\n")

@@ -117,7 +117,8 @@ RPC/HTTP and no public coordinator. A DHCP address change requires another
 rollout to regenerate the peer configuration.
 
 Rollout packages the executable and runtime module directory separately, hashes
-every file, stages/checks all three copies before stopping services, then writes
+every file, stages/checks all three copies and executes each staged binary's
+`--version` before stopping services, then writes
 all configurations before starting any service. It records the caller-supplied
 source revisions and actual byte hashes; it does not infer build provenance.
 `started_unverified` in `<record>.events.jsonl` means services were started,
@@ -125,6 +126,11 @@ not that consensus or views were verified. A failed stage leaves running
 services alone; a failure after stopping services remains visible in
 `pending_release` and requires operator repair. Three validators need all three
 online for consensus progress.
+
+The dev configuration recomputes genesis from founding files on every boot.
+A changed `modules/` hash set is therefore refused while an existing release
+record remains; complete `reset-network` before rolling out those files. A live
+view replacement uses the module ceremony, not a changed founding directory.
 
 For a breaking schema/ABI/state change, archive diagnostics and run
 `reset-network --reason "<specific breaking change>"`, then repeat rollout.

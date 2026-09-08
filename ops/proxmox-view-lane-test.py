@@ -149,8 +149,28 @@ class LaneGuardTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "record already exists"):
                     lane.provision(args)
 
+    def test_changed_founding_files_require_reset_before_any_remote_rollout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "ducktape"
+            binary.write_bytes(b"binary")
+            modules = root / "modules"
+            modules.mkdir()
+            (modules / "chat.component.wasm").write_bytes(b"replacement genesis component")
+            record = {"owner": "ducktape-view-lane-test", "host": "root@zk", "nodes": [],
+                      "release": {"files": {"modules/chat.component.wasm": "old-hash"}}}
+            args = SimpleNamespace(host="root@zk", record=root / "lane.json", binary=binary,
+                                   modules=modules, revision="ab" * 20, ui_revision="cd" * 20,
+                                   reason="binary upgrade")
+            with patch.object(lane, "live_addresses", return_value=["192.0.2.11", "192.0.2.12", "192.0.2.13"]), \
+                 patch.object(lane, "remote_stage", return_value="/var/tmp/test-stage"), \
+                 patch.object(lane, "remote"), patch.object(lane, "send_file") as upload:
+                with self.assertRaisesRegex(ValueError, "founding files changed.*reset-network"):
+                    lane.rollout(args, record)
+                upload.assert_not_called()
+
     def test_three_node_rollout_validates_every_release_before_stopping(self):
-        for fail_validation in [False, True]:
+        for fail_validation in [None, "checksum", "runtime"]:
             with self.subTest(fail_validation=fail_validation), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 binary = root / "ducktape"
@@ -174,13 +194,16 @@ class LaneGuardTests(unittest.TestCase):
                     if "ip" in command:
                         index = [801, 802, 803].index(command[2])
                         return json.dumps([{"addr_info": [{"scope": "global", "local": addresses[index]}]}])
-                    if fail_validation and len(command) > 2 and command[2] == 802 and "sha256sum -c" in str(command):
-                        raise ValueError("injected release checksum failure")
+                    if len(command) > 2 and command[2] == 802:
+                        if fail_validation == "checksum" and "sha256sum -c" in str(command):
+                            raise ValueError("injected stage failure: checksum mismatch")
+                        if fail_validation == "runtime" and "./ducktape --version" in str(command):
+                            raise ValueError("injected stage failure: missing ELF interpreter")
                     return ""
 
                 with patch.object(lane, "remote", remote), patch.object(lane, "send_file", lambda *a: uploads.append(a)):
                     if fail_validation:
-                        with self.assertRaisesRegex(ValueError, "checksum failure"):
+                        with self.assertRaisesRegex(ValueError, "stage failure"):
                             lane.rollout(args, record)
                         self.assertFalse(any("systemctl stop" in str(c) for c in commands),
                                          "bad staging must preserve every running node")
