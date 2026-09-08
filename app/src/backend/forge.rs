@@ -3,7 +3,7 @@ use ::forge;
 use std::net::IpAddr;
 
 /// One forge repo row: the module's committed name and head.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct ForgeRepo {
     pub name: String,
     pub head: String,
@@ -537,13 +537,14 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
     Ok(mirror)
 }
 
-/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root IS the root
-/// the user key resolves through, [`ducktape_home::root`].
+/// `<app cache>/forge-remote/<endpoint-slug>/<repo>` — a rebuildable mirror,
+/// so it lives in the app's cache directory ([`super::app_dirs::cache_dir`]),
+/// never under the ducktape home.
 fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
     if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
         return Err(format!("invalid forge repo name {repo:?}"));
     }
-    let root = ducktape_home::root()?;
+    let root = super::app_dirs::cache_dir()?;
     let slug: String = endpoint
         .chars()
         .map(|character| match character.is_ascii_alphanumeric() {
@@ -589,7 +590,7 @@ impl Drop for ScratchDir {
 }
 
 /// One entry of a repo's tree at one revision. `kind` is `dir` | `file`.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct TreeEntry {
     pub name: String,
     /// The full path from the repo root, so a row navigates without the view
@@ -1058,15 +1059,6 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
     }
 }
 
-/// The binary plate's line: the loader's reason when it gave one (a picture
-/// past the cap or one that did not decode), else the generic one.
-pub fn binary_note(text: &str) -> String {
-    match text.is_empty() {
-        true => "This is not text — the reader shows no preview for it.".to_owned(),
-        false => text.to_owned(),
-    }
-}
-
 /// The binary plate with `note` as its line — why the reader shows no
 /// preview, in the reader's words.
 fn binary_blob(repo: String, rev: String, path: String, note: String) -> BlobView {
@@ -1192,7 +1184,7 @@ pub async fn forge_live_refresh(
 /// The PR stats line: `3 files · +12 −4`.
 /// One rendered line of a unified patch. `kind` is `file` | `hunk` | `add` |
 /// `del` | `ctx` — the gutters, the sign column and the row tint all key on it.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct DiffLine {
     /// Session-stable identity for keyed rendering.
     pub key: i64,
@@ -2254,21 +2246,6 @@ pub fn markdown_path(path: &str) -> bool {
     lower.ends_with(".md") || lower.ends_with(".markdown")
 }
 
-/// Split a unified patch into painted rows, tracking both line counters
-/// across hunk headers.
-/// The command that makes a repo. Forge IS a git remote — there is no "new
-/// repository" button anywhere, because a repo comes into existence when a push
-/// lands on it. An empty Forge screen that does not say so is a dead end: it
-/// tells the reader a repo "appears here once it is created" and names no way
-/// to create one.
-pub fn forge_push_command(rpc: &str) -> String {
-    let endpoint = rpc.trim_end_matches('/');
-    // `my-repo`, not `NAME`: `forge::norm_repo` accepts `[a-z0-9._-]` only, so
-    // an uppercase placeholder pasted verbatim 404s the ref advertisement and
-    // git reports "repository not found" — a hint that teaches the wrong thing.
-    format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
-}
-
 pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     // A patch line has no durable id. Reusing content/occurrence across two
     // patch revisions can move focus to an identical line's comment button,
@@ -2443,7 +2420,7 @@ fn diff_row(
 /// diff vocabulary — and it doubles as the row's IDENTITY. Restaging a line
 /// replaces the comment there instead of stacking a second one on one position,
 /// which is the only sane reading of clicking the same gutter twice.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ForgeDraftComment {
     pub anchor: String,
     pub path: String,
@@ -2476,7 +2453,7 @@ pub fn stage_forge_comment(
         return staged;
     }
     let comment = ForgeDraftComment {
-        anchor: comment_anchor(&path, &line, &side),
+        anchor: format!("{path}:{line} ({side})"),
         path,
         line,
         side,
@@ -2540,21 +2517,6 @@ pub fn forge_file_header(
     }
 }
 
-/// The label a picked-but-unstaged line wears above the composer, empty when no
-/// line is picked — the composer keys its whole visibility on this.
-pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
-    if path.is_empty() {
-        return String::new();
-    }
-    comment_anchor(path, line, side)
-}
-
-/// `src/main.rs:14 (new)` — the one place the anchor string is spelled, shared
-/// by the staged rows and the composer header so they can never disagree.
-fn comment_anchor(path: &str, line: &str, side: &str) -> String {
-    format!("{path}:{line} ({side})")
-}
-
 /// A staged comment outlives the diff it was written against when a live
 /// refresh moves the PR's source head.
 ///
@@ -2564,7 +2526,11 @@ fn comment_anchor(path: &str, line: &str, side: &str) -> String {
 /// that number, and `outdated` would read false because the pin matches. The
 /// module has no position tracking across a moved branch by design; dropping is
 /// the only reading that cannot publish a false claim.
-fn staged_comments_outlived_their_diff(loaded: bool, next_oid: &str, current_oid: &str) -> bool {
+/// The PR's source head moved under the open item: a refresh that landed the
+/// item with another head than the one on screen. What was written against
+/// the old diff — the staged comments here, the line comment in the view —
+/// goes with it.
+pub fn forge_branch_moved(loaded: bool, next_oid: &str, current_oid: &str) -> bool {
     let moved = !next_oid.is_empty() && !current_oid.is_empty() && next_oid != current_oid;
     loaded && moved
 }
@@ -2576,24 +2542,10 @@ pub fn keep_staged_comments(
     current_oid: String,
     staged: Vec<ForgeDraftComment>,
 ) -> Vec<ForgeDraftComment> {
-    if staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid) {
+    if forge_branch_moved(loaded, &next_oid, &current_oid) {
         return Vec::new();
     }
     staged
-}
-
-/// One in-composer string (the picked path, the body being typed) held only
-/// while the diff it belongs to is still on screen.
-pub fn keep_comment_text(
-    loaded: bool,
-    next_oid: String,
-    current_oid: String,
-    value: String,
-) -> String {
-    if staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid) {
-        return String::new();
-    }
-    value
 }
 
 /// Discarded work is never silent. This says WHY the staged comments vanished,
@@ -2606,8 +2558,7 @@ pub fn staged_comment_drop_note(
     staged: Vec<ForgeDraftComment>,
     error: String,
 ) -> String {
-    let lost =
-        !staged.is_empty() && staged_comments_outlived_their_diff(loaded, &next_oid, &current_oid);
+    let lost = !staged.is_empty() && forge_branch_moved(loaded, &next_oid, &current_oid);
     if !lost {
         return error;
     }
@@ -2647,35 +2598,6 @@ fn hunk_span(line: &str) -> Option<HunkSpan> {
     })
 }
 
-/// The tracker's Pull requests / Issues split.
-pub fn filter_forge_items(items: &[ForgeItem], tab: crate::ForgeTab) -> Vec<ForgeItem> {
-    let kind = match tab {
-        crate::ForgeTab::Code => return Vec::new(),
-        crate::ForgeTab::Pulls => "pr",
-        crate::ForgeTab::Issues => "issue",
-    };
-    items
-        .iter()
-        .filter(|item| item.kind == kind)
-        .cloned()
-        .collect()
-}
-
-/// The tab count chips — open work only: a PR counts until it merges, an
-/// issue until it closes.
-pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
-    count_i64(
-        items
-            .iter()
-            .filter(|item| item.kind == kind)
-            .filter(|item| match kind {
-                "pr" => item.state != "merged",
-                _ => item.state == "open",
-            })
-            .count(),
-    )
-}
-
 // There is NO forge write gate, and this file used to invent one. `MergePr`,
 // `SubmitReview` and the tracker verbs each check only `author_from_origin`
 // (crates/modules/apps/forge/src/lib.rs) — any user key may merge, and this
@@ -2684,36 +2606,6 @@ pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
 
 pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
     format!("{files} files · +{additions} −{deletions}")
-}
-
-/// The merged-state banner: the short merge oid plus the branch line.
-pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
-    let short: String = merge_oid.chars().take(8).collect();
-    match branches.is_empty() {
-        true => format!("Merged as {short}"),
-        false => format!("Merged as {short} · {branches}"),
-    }
-}
-
-/// A review verdict key as its timeline verb.
-pub fn verdict_label(verdict: &str) -> String {
-    match verdict {
-        "approve" => "approved".into(),
-        "request_changes" => "requested changes".into(),
-        _ => "commented".into(),
-    }
-}
-
-/// A verdict picker label, dotted when it is the current pick.
-pub fn verdict_pick_label(
-    current: crate::ForgeReviewVerdict,
-    key: crate::ForgeReviewVerdict,
-    label: &str,
-) -> String {
-    match current == key {
-        true => format!("● {label}"),
-        false => label.to_owned(),
-    }
 }
 
 pub fn keep_forge_repos(

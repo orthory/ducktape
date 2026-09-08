@@ -133,7 +133,7 @@ pub struct LiveThreadData {
     pub messages: Vec<ChatMessage>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -386,6 +386,7 @@ impl Default for LiveUpdate {
 }
 
 mod agent;
+mod app_dirs;
 mod bell;
 mod chat;
 mod document;
@@ -405,8 +406,11 @@ mod search;
 mod shell;
 mod storage;
 mod style;
+mod view_artifact;
+pub mod view_source;
 
 pub use agent::*;
+pub use app_dirs::app_log_path;
 pub use bell::*;
 pub use chat::*;
 pub use document::*;

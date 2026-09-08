@@ -24,7 +24,11 @@ fn full_view_fits_the_default_test_stack() {
 
 #[test]
 fn message_action_toolbar_stays_compact_and_accessible() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
+    // The chat rows, and the rich body they share with the forge.
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    )) + "\n"
+        + &inlined(include_str!("../ui/components/richbody.ice"));
     let toolbar = components
         .split_once("component MessageCard")
         .unwrap()
@@ -38,7 +42,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // and it is the ANCHOR CONTRACT: while the ♡/⋯ card this row opened is
     // up, the toolbar it hangs off stays, however far the pointer went.
     assert!(toolbar.contains("hover tint=row_hover r=9.0 open=menu_open"));
-    let stream = inlined(include_str!("../ui/screens/chat.ice"));
+    let stream = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(stream.contains("MessageCard message selected=true menu_open=true"));
     assert!(toolbar.contains("if !message.deleted && !message.pending"));
     assert!(!toolbar.contains("&& hovered"));
@@ -91,7 +95,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         "button label=\"Open thread\" p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
     ));
 
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(chat.contains(
         "overlay when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)"
     ));
@@ -166,11 +170,13 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // dismisses it (see `reactions_run_outside_the_mutation_lock`).
     assert!(!picker.contains("mutation_phase"));
 
-    let handlers = inlined(include_str!("../ui/handlers/chat.ice"));
+    // The focus moves are the view's own: its handlers seat the caret on
+    // the control the act opened, under the view's `#chat` mount.
+    let handlers = inlined(include_str!("../../../crates/views/chat/src/ui/app.ice"));
     for focus in [
-        "#workspace-tabs/content/chat/message-action-focus",
-        "#workspace-tabs/content/chat/message-reaction-focus",
-        "#workspace-tabs/content/chat/message-delete-focus",
+        "#chat/message-action-focus",
+        "#chat/message-reaction-focus",
+        "#chat/message-delete-focus",
     ] {
         assert!(handlers.contains(focus));
     }
@@ -190,7 +196,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("\non ")
         .unwrap()
         .0;
-    assert!(activate.contains("task widget focus #workspace-tabs/content/chat/message-edit"));
+    assert!(activate.contains("task widget focus #chat/message-edit"));
 }
 
 #[test]
@@ -249,10 +255,9 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/state/derived.ice"),
         include_str!("../ui/theme.ice"),
         include_str!("../ui/view.ice"),
-        include_str!("../ui/components/chat.ice"),
-        include_str!("../ui/components/dm.ice"),
+        include_str!("../../../crates/views/chat/src/ui/components.ice"),
+        include_str!("../../../crates/views/chat/src/ui/dm.ice"),
         include_str!("../../../crates/views/files/src/ui/browser.ice"),
-        include_str!("../ui/components/forge.ice"),
         include_str!("../ui/components/huddle.ice"),
         include_str!("../ui/components/icon.ice"),
         include_str!("../ui/components/kit.ice"),
@@ -297,7 +302,9 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!lifecycle.contains("appearance = \""));
     assert!(app.contains("titlebar-transparent true"));
     assert!(app.contains("fullsize-content-view true"));
-    assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
+    assert!(
+        app.contains("font \"../../../crates/views/support/design/assets/fonts/Geist[wght].ttf\"")
+    );
     assert!(!ui.contains("white/"));
     assert!(!ui.contains("bg=glass_"));
     assert!(!SCREENS.contains("white/"));
@@ -388,7 +395,8 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
     ));
-    assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    assert!(chat_screen.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     // the pages sidebar keeps the same plate from the `pages` view
     assert!(
         inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
@@ -401,10 +409,10 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // me back to now" as far from now as the pane allows. The pill is a stack
     // layer at the timeline's bottom edge, shown when the reader is away from
     // the tail — a history window OR her own scroll.
-    assert!(!SCREENS.contains("text \"Viewing history\""));
-    assert!(SCREENS.contains("if !empty(messages) && (history_view || !at_live_tail)"));
-    assert!(SCREENS.contains("button \"↓  Jump to latest\""));
-    assert!(SCREENS.contains("emit(choose_channel, active_channel)"));
+    assert!(!chat_screen.contains("text \"Viewing history\""));
+    assert!(chat_screen.contains("if !empty(messages) && (history_view || !at_live_tail)"));
+    assert!(chat_screen.contains("button \"↓  Jump to latest\""));
+    assert!(chat_screen.contains("emit(choose_channel, active_channel)"));
 
     // The endpoint field is GONE from Settings — the launch window's picker
     // owns which network; Settings keeps only Reconnect / Switch network.
@@ -414,21 +422,15 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!settings.contains("#rpc"));
     assert!(settings.contains("emit(switch_network)"));
     assert!(settings.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
-    assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
+    assert!(chat_screen.contains("if active_thread_seq > 0 && !channel_settings_open"));
     // Both chat composers wear the SAME plate — and now they wear the same
-    // SOURCE: one `ChatComposer` mounted twice (ducktape-ui#697), so the
-    // chrome cannot drift between the stream and the rail by editing one.
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
+    // SOURCE: the one `chat_composer` host surface (`composer_surface.rs`)
+    // seated twice by the view, so the chrome cannot drift between the
+    // stream and the rail by editing one.
     assert_eq!(
-        chat_components
-            .matches("box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true")
-            .count(),
-        1
-    );
-    assert_eq!(
-        SCREENS.matches("ChatComposer #").count(),
+        chat_screen.matches("extern chat_composer(").count(),
         2,
-        "the stream and the rail are the two mounts of that one plate"
+        "the stream and the rail are the two seats of that one plate"
     );
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
@@ -449,19 +451,31 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
     // The composer geometry moved into the `rich_composer` extern args
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
-    // Both chat composers share ONE call now — they are one component — and
-    // the forge note keeps its own compact geometry on the screen.
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
-    assert_eq!(chat_components.matches(", 44.0, 150.0, 10.0) #").count(), 1);
-    assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
-    assert!(chat_components.contains("button \"Send\" disabled="));
-    assert!(chat_components.contains(
-        "h=29.0 @primary_action @px-12px @py-7px -> composer_event(composer_submit_event(), blocked, kind)"
+    // Both chat composers share ONE call now — the `chat_composer` host
+    // surface — and the forge note keeps its own compact geometry on the
+    // screen.
+    let chat_composer = include_str!("../composer_surface.rs");
+    assert_eq!(
+        chat_composer
+            .matches("44.0,\n            150.0,\n            10.0,")
+            .count(),
+        1
+    );
+    // the forge note is the same composer, as the host surface the view
+    // leaves a slot for — compact, over the item's channel
+    assert!(inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice")).contains(
+        "extern forge_composer(note_scope, \"note\", true, \"Write a note…\", note_blocked, false,"
     ));
+    assert!(chat_composer.contains("widget::text(\"Send\")"));
+    assert!(chat_composer.contains(".height(if self.compact { 28 } else { 29 })"));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         SCREENS
             .matches("box w=fill h=fill align-x=center align-y=center")
             .count()
+            + chat_screen
+                .matches("box w=fill h=fill align-x=center align-y=center")
+                .count()
             >= 10
     );
     for line in SCREENS
@@ -473,16 +487,16 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
 
     let components = inlined(concat!(
         include_str!("../ui/components/shell.ice"),
-        include_str!("../ui/components/chat.ice"),
+        include_str!("../../../crates/views/chat/src/ui/components.ice"),
         include_str!("../../../crates/views/pages/src/ui/rows.ice"),
     ));
     // the pane header is ONE geometry: a 50px plate holding a `gap=9.0`
     // centered row. Chat and pages both draw it, from their screens — the
     // components carry the pane bodies, never a second header shape.
-    // Chat and pages both draw it, from their screens — pages' lives in
-    // the `pages` view now, so both sources are swept together.
+    // Chat and pages both draw it, from their screens — both live in their
+    // views now, so the three sources are swept together.
     let pane_sources = format!(
-        "{}\n{}",
+        "{}\n{}\n{chat_screen}",
         *SCREENS,
         inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
     );
@@ -642,11 +656,16 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
 
     let view = inlined(include_str!("../ui/view.ice"));
     let shell = inlined(include_str!("../ui/components/shell.ice"));
-    let chat = inlined(include_str!("../ui/components/chat.ice"));
-    let chat_screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
+    let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let pages = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     let kit = inlined(include_str!("../ui/components/kit.ice"));
-    let forge = inlined(include_str!("../ui/components/forge.ice"));
+    // the forge components are the Forge view's now, held to the same tokens
+    let forge = inlined(include_str!(
+        "../../../crates/views/forge/src/ui/components.ice"
+    ));
 
     assert_recipe_owns_states("screens", &SCREENS, "@primary_action");
     assert_recipe_owns_states("screens", &SCREENS, "@danger_action");
@@ -658,7 +677,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert!(!SCREENS.contains("font=code @text-brand"));
     assert!(!chat.contains("bg=brand/10 border=brand/22"));
     assert!(!chat.contains("bg=brand/9 border=brand/20"));
-    assert!(SCREENS.contains("Badge.Outline label=\"Members only\""));
+    assert!(chat_screen.contains("Badge.Outline label=\"Members only\""));
     // a tracker row's kind is carried by the PLATE behind the glyph, not by
     // a second badge next to the state — one `match item.kind`, two plates.
     assert!(forge.contains(
@@ -692,6 +711,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         let files_view = inlined(include_str!("../../../crates/views/files/src/ui/files.ice"));
         let action = SCREENS
             .lines()
+            .chain(chat_screen.lines())
             .chain(kit_components.lines())
             .chain(files_view.lines())
             .find(|line| line.trim_start().starts_with("button ") && line.contains(target))
@@ -708,7 +728,7 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // icon.ice is swept so the deleted `IconAction` ramp component itself
     // cannot quietly return.
     assert_icon_controls_inherit_ink("chat.ice", &chat);
-    assert_icon_controls_inherit_ink("screens/chat.ice", &chat_screen);
+    assert_icon_controls_inherit_ink("chat/src/ui/chat.ice", &chat_screen);
     assert_icon_controls_inherit_ink(
         "components/icon.ice",
         &inlined(include_str!("../ui/components/icon.ice")),
@@ -745,11 +765,17 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     assert_eq!(
         SCREENS
             .matches("focused bg=transparent border=transparent value=transparent border-w=0.0")
-            .count(),
+            .count()
+            + chat_screen
+                .matches("focused bg=transparent border=transparent value=transparent border-w=0.0")
+                .count(),
         6
     );
 
-    assert!(SCREENS.contains("StatusBadge label=forge_item_state"));
+    assert!(
+        inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice"))
+            .contains("StatusBadge label=forge_item_state")
+    );
     // the explorer's is the guest's: the Explorer is a module-owned view
     assert!(
         inlined(include_str!(
@@ -777,8 +803,12 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"))
             .contains("bg=danger_bg border=danger_line")
     );
-    assert!(SCREENS.contains("bg=danger_dot"));
-    assert!(SCREENS.contains("bg=success_dot"));
+    assert!(chat_screen.contains("bg=danger_dot"));
+    // the live dots moved to the `shell` view with its screen
+    assert!(
+        inlined(include_str!("../../../crates/views/shell/src/ui/shell.ice"))
+            .contains("bg=success_dot")
+    );
     // the semantic status plate is the kit's, so every screen that reports
     // a good outcome paints the same three tokens.
     assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
@@ -879,9 +909,14 @@ fn ice_sources_hold_to_the_design_system() {
         ("view.ice", inlined(include_str!("../ui/view.ice"))),
         (
             "chat.ice",
-            inlined(include_str!("../ui/components/chat.ice")),
+            inlined(include_str!(
+                "../../../crates/views/chat/src/ui/components.ice"
+            )),
         ),
-        ("dm.ice", inlined(include_str!("../ui/components/dm.ice"))),
+        (
+            "dm.ice",
+            inlined(include_str!("../../../crates/views/chat/src/ui/dm.ice")),
+        ),
         (
             "files/browser.ice",
             inlined(include_str!(
@@ -889,8 +924,10 @@ fn ice_sources_hold_to_the_design_system() {
             )),
         ),
         (
-            "forge.ice",
-            inlined(include_str!("../ui/components/forge.ice")),
+            "forge/components.ice",
+            inlined(include_str!(
+                "../../../crates/views/forge/src/ui/components.ice"
+            )),
         ),
         (
             "huddle.ice",
@@ -961,7 +998,9 @@ fn ice_sources_hold_to_the_design_system() {
     let app = inlined(include_str!("../ui/app.ice"));
     for asset in ::design::fonts::ASSETS {
         assert!(
-            app.contains(&format!("font \"../../../crates/design/{asset}\"")),
+            app.contains(&format!(
+                "font \"../../../crates/views/support/design/{asset}\""
+            )),
             "app.ice must embed {asset}"
         );
     }
@@ -1118,7 +1157,9 @@ fn every_status_fill_carries_a_readable_foreground_in_both_themes() {
 /// this one only has to say what these three chips wear.
 #[test]
 fn no_chip_inside_a_message_row_deflates_onto_the_row() {
-    let chat = inlined(include_str!("../ui/components/chat.ice"));
+    let chat = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
     for (chip, states) in [
         (
             "reacted",
@@ -1228,18 +1269,23 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         ($($path:literal),* $(,)?) => { [$(($path, include_str!(concat!("../", $path)))),*] };
     }
     let sources = ice_sources![
-        "ui/components/chat.ice",
-        "ui/components/dm.ice",
-        "ui/components/forge.ice",
+        "../../crates/views/chat/src/ui/components.ice",
+        "../../crates/views/chat/src/ui/dm.ice",
+        "../../crates/views/chat/src/ui/app.ice",
+        "../../crates/views/chat/src/ui/kit.ice",
+        "../../crates/views/forge/src/ui/components.ice",
+        "../../crates/views/forge/src/ui/kit.ice",
+        "../../crates/views/forge/src/ui/app.ice",
         "ui/components/huddle.ice",
         "ui/components/icon.ice",
         "ui/components/kit.ice",
         "ui/components/onboarding.ice",
         "ui/components/overlay.ice",
         "ui/components/patterns.ice",
+        "ui/components/richbody.ice",
         "ui/components/shell.ice",
-        "ui/screens/chat.ice",
-        "ui/screens/forge.ice",
+        "../../crates/views/chat/src/ui/chat.ice",
+        "../../crates/views/forge/src/ui/forge.ice",
         // The Approvals, Members, Agents and Node screens ship as
         // module-owned views; their sources are held to the same conventions
         // as the native ones.
@@ -1254,16 +1300,23 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/settings/src/ui/app.ice",
         "../../crates/views/settings/src/ui/settings.ice",
         "../../crates/views/settings/src/ui/kit.ice",
+        "../../crates/views/chat/src/ui/app.ice",
+        "../../crates/views/chat/src/ui/chat.ice",
+        "../../crates/views/chat/src/ui/components.ice",
+        "../../crates/views/chat/src/ui/dm.ice",
+        "../../crates/views/chat/src/ui/kit.ice",
         "../../crates/views/files/src/ui/app.ice",
         "../../crates/views/files/src/ui/files.ice",
         "../../crates/views/files/src/ui/browser.ice",
         "../../crates/views/files/src/ui/kit.ice",
+        "../../crates/views/shell/src/ui/app.ice",
+        "../../crates/views/shell/src/ui/shell.ice",
+        "../../crates/views/shell/src/ui/kit.ice",
+        "ui/screens/overlays.ice",
         "../../crates/views/pages/src/ui/app.ice",
         "../../crates/views/pages/src/ui/pages.ice",
         "../../crates/views/pages/src/ui/rows.ice",
         "../../crates/views/pages/src/ui/kit.ice",
-        "ui/screens/overlays.ice",
-        "ui/screens/shell.ice",
         "ui/view.ice",
     ];
 
@@ -1295,17 +1348,19 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     assert_eq!(
         carriers,
         [
-            "ui/components/chat.ice",
-            "ui/components/dm.ice",
-            "ui/components/forge.ice",
+            "../../crates/views/chat/src/ui/components.ice",
+            "../../crates/views/chat/src/ui/dm.ice",
+            "../../crates/views/forge/src/ui/components.ice",
             "ui/components/onboarding.ice",
             "ui/components/shell.ice",
-            "ui/screens/forge.ice",
+            "../../crates/views/forge/src/ui/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
             "../../crates/views/explorer/src/ui/app.ice",
+            "../../crates/views/chat/src/ui/components.ice",
+            "../../crates/views/chat/src/ui/dm.ice",
             "../../crates/views/files/src/ui/browser.ice",
+            "../../crates/views/shell/src/ui/shell.ice",
             "../../crates/views/pages/src/ui/rows.ice",
-            "ui/screens/shell.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
     );
@@ -1319,9 +1374,12 @@ fn every_current_row_marker_rests_on_one_selection_token() {
 /// screenshot nobody takes.
 #[test]
 fn the_chat_surface_holds_to_its_measured_geometry() {
-    let components = inlined(include_str!("../ui/components/chat.ice"));
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
-    let dm = inlined(include_str!("../ui/components/dm.ice"));
+    let components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    )) + "\n"
+        + &inlined(include_str!("../ui/components/richbody.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
+    let dm = inlined(include_str!("../../../crates/views/chat/src/ui/dm.ice"));
 
     // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
     // window and ~320 maximized — past every readability bound there is.
@@ -1387,11 +1445,14 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
     // A FAILED SEND WEARS GateNote's REVERSIBLE-DANGER PLATE, not a muted
     // sentence quieter than the archived-channel notice above it. It lives
-    // with the composer it offers the words back to (ducktape-ui#697), which
-    // is why there is one of it instead of a stream copy and a rail copy.
-    assert!(components.contains(
-        "box w=fill px=13.0 py=11.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=9.0"
-    ));
+    // with the composer it offers the words back to (ducktape-ui#697) — the
+    // `chat_composer` host surface — which is why there is one of it instead
+    // of a stream copy and a rail copy.
+    let composer = include_str!("../composer_surface.rs");
+    assert!(composer.contains(".padding([11, 13])"));
+    assert!(composer.contains("background: Some(tokens.palette.destructive_background.into())"));
+    assert!(composer.contains("color: tokens.palette.destructive_line,"));
+    assert!(composer.contains("radius: 9.0.into(),"));
 
     // THE DM ROW CARRIES THE SAME PREPARED UNREAD MARK AS A CHANNEL ROW.
     assert!(screen.contains("unread=dm.unread"));
@@ -1429,12 +1490,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // 1. WORKSPACE-SHAPED — channels, DMs, members, repos,
         //    validators, peers. Length tracks how big the workspace is, not
         //    how long the chain has run, and it moves on a delta, not a scroll.
-        ("screens/chat.ice", "for room in rooms"),
-        ("screens/chat.ice", "for dm in dm_rows"),
-        ("screens/chat.ice", "for member in channel_members"),
-        ("screens/forge.ice", "for repo in repos"),
-        ("screens/forge.ice", "for entry in tree_entries"),
-        ("screens/forge.ice", "for review in forge_item_reviews"),
         ("components/huddle.ice", "for tile in rows"),
         ("components/onboarding.ice", "for row in networks"),
         // The keystore's wallets: how many identities this DEVICE holds, and
@@ -1445,32 +1500,19 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // cannot change while it is up.
         ("components/onboarding.ice", "for pair in rows"),
         ("components/onboarding.ice", "for step in steps"),
-        ("components/forge.ice", "for item in items"),
         // 2. WITHIN ONE ROW — one message's blocks and reactions, one
         //    proposal's quorum dots, the nav bar. Bounded by the row that
         //    contains them, and the chat ones already sit inside the stream's
         //    own `lazy`, so they are built once per row change, not per frame.
         // `RichBody` is the one markdown renderer: a chat row, a forge body
         // and a review comment each hand it ONE body's blocks.
-        ("components/chat.ice", "for block in blocks"),
-        ("components/chat.ice", "for reaction in message.reactions"),
-        // One review's inline comments, bounded by the review that holds them.
-        ("components/forge.ice", "for comment in review.comments"),
+        ("components/richbody.ice", "for block in blocks"),
         (
             "components/shell.ice",
             "for item in shell_nav(tab, approvals, agent_live)",
         ),
-        // One provider turn, hard-capped to MAX_ACTIVITY_ROWS in the backend.
-        (
-            "screens/shell.ice",
-            "keyed row in activity by=row.id #activity w=fill gap=8.0",
-        ),
-        // The same cap, kept with the turn it belongs to, and drawn only for
-        // the ONE entry whose fold is open (`steps_open == entry.id`).
-        ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
-        ("screens/chat.ice", "for hit in search_hits"),
     ];
 
     let mut unculled: Vec<String> = Vec::new();

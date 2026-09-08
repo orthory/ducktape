@@ -9,7 +9,8 @@
 //!
 //! - the hypervisor, the shim or e2fsprogs arrives after the workspace does;
 //! - the workspace was seeded on a host that could not sandbox yet;
-//! - the guest images move, and the table keeps naming where they used to be.
+//! - the guest images were never built into the workspace's `guest/`, or the
+//!   workspace was copied to a machine whose hypervisor is the other one.
 //!
 //! The symptom is always the same and always late: every setup step reports
 //! ready, and then the compute and agent daemons die at boot — `no [sandbox]
@@ -19,8 +20,7 @@
 //!
 //! It PROPOSES and the operator approves, like `agent install` beside it.
 //! Enabling this table is what makes a node start announcing compute to a
-//! network, and repointing one changes which images every run boots — neither is
-//! ours to do unasked.
+//! network — not ours to do unasked.
 
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
@@ -39,7 +39,7 @@ enum WorkspaceSandbox {
     Off,
     /// A table whose images are both present — this node can isolate a run.
     Ready(SandboxToml),
-    /// A table naming an image that is not there. The node advertises the
+    /// A table, but a guest image is not there. The node advertises the
     /// compute plane and still fails every run, which is the worst of the three.
     Stale {
         table: SandboxToml,
@@ -56,7 +56,8 @@ pub(crate) fn run(args: SandboxArgs) -> SandboxResult {
 
     // The host first: it is the question with a live answer, and the one whose
     // failure names its own fix.
-    let (platform, backend) = workspace_config::platform_sandbox()?;
+    let platform = workspace_config::platform_sandbox();
+    let backend = workspace_config::sandbox_backend(dir, provider_host::Vmm::platform_default());
     let host = backend.probe_adapter();
     match &host {
         Ok(found) => println!(
@@ -70,9 +71,9 @@ pub(crate) fn run(args: SandboxArgs) -> SandboxResult {
     match read_workspace(dir)? {
         WorkspaceSandbox::Ready(table) => {
             println!(
-                "  workspace  on    runtime = \"{}\", kernel = {}",
+                "  workspace  on    runtime = \"{}\", guest = {}",
                 table.runtime,
-                table.kernel.display()
+                workspace_config::guest_dir(dir).display()
             );
             Ok(())
         }
@@ -94,8 +95,9 @@ pub(crate) fn run(args: SandboxArgs) -> SandboxResult {
             // not built, and the builder is the whole remedy.
             if table == platform {
                 return Err(format!(
-                    "{} is not built yet — build it:\n    {BUILDER}",
-                    missing.display()
+                    "{} is not built yet — build it:\n    {}",
+                    missing.display(),
+                    build_command(dir)
                 )
                 .into());
             }
@@ -104,15 +106,29 @@ pub(crate) fn run(args: SandboxArgs) -> SandboxResult {
     }
 }
 
+/// the builder invocation that fills THIS workspace's `guest/`.
+fn build_command(dir: &Path) -> String {
+    format!(
+        "OUT={} {BUILDER}",
+        workspace_config::guest_dir(dir).display()
+    )
+}
+
+/// the guest image this workspace is missing, if any.
+fn unbuilt_image(dir: &Path) -> Option<PathBuf> {
+    [
+        workspace_config::guest_kernel(dir),
+        workspace_config::guest_rootfs(dir),
+    ]
+    .into_iter()
+    .find(|image| !image.is_file())
+}
+
 fn read_workspace(dir: &Path) -> Result<WorkspaceSandbox, String> {
     let Some(table) = workspace_config::default_plumbing(dir)?.sandbox else {
         return Ok(WorkspaceSandbox::Off);
     };
-    let missing = [&table.kernel, &table.rootfs]
-        .into_iter()
-        .find(|image| !image.is_file())
-        .cloned();
-    Ok(match missing {
+    Ok(match unbuilt_image(dir) {
         Some(missing) => WorkspaceSandbox::Stale { table, missing },
         None => WorkspaceSandbox::Ready(table),
     })
@@ -135,8 +151,10 @@ fn offer(dir: &Path, platform: &SandboxToml, host_ok: bool, yes: bool) -> Sandbo
 
     println!("\n  enabling it writes:");
     println!("    runtime = \"{}\"", platform.runtime);
-    println!("    kernel  = \"{}\"", platform.kernel.display());
-    println!("    rootfs  = \"{}\"", platform.rootfs.display());
+    println!(
+        "  and boots every run from {}",
+        workspace_config::guest_dir(dir).display()
+    );
     if !approved(yes)? {
         return Ok(());
     }
@@ -146,13 +164,11 @@ fn offer(dir: &Path, platform: &SandboxToml, host_ok: bool, yes: bool) -> Sandbo
     let written = workspace_config::write_node_toml(dir, &plumbing)?;
     println!("\n  wrote [sandbox] into {}", written.display());
 
-    let unbuilt = [&platform.kernel, &platform.rootfs]
-        .into_iter()
-        .find(|image| !image.is_file());
-    match unbuilt {
+    match unbuilt_image(dir) {
         Some(unbuilt) => println!(
-            "  {} is not built yet — build it:\n    {BUILDER}",
-            unbuilt.display()
+            "  {} is not built yet — build it:\n    {}",
+            unbuilt.display(),
+            build_command(dir)
         ),
         None => println!("  restart the node to pick it up."),
     }
@@ -181,20 +197,24 @@ fn approved(yes: bool) -> Result<bool, String> {
 mod tests {
     use super::*;
 
-    /// A workspace whose `[sandbox]` table names `kernel`/`rootfs` under `dir`,
-    /// creating the images only if `built`.
+    /// both guest images, where the workspace's node looks for them.
+    fn stage_images(dir: &Path) {
+        std::fs::create_dir_all(workspace_config::guest_dir(dir)).unwrap();
+        std::fs::write(workspace_config::guest_kernel(dir), b"kernel").unwrap();
+        std::fs::write(workspace_config::guest_rootfs(dir), b"rootfs").unwrap();
+    }
+
+    /// A workspace carrying a `[sandbox]` table, its guest images staged only
+    /// if `built`.
     fn workspace(built: bool) -> (tempfile::TempDir, SandboxToml) {
         let dir = tempfile::tempdir().unwrap();
         let table = SandboxToml {
             runtime: "firecracker".into(),
-            kernel: dir.path().join("vmlinux"),
-            rootfs: dir.path().join("rootfs.ext4"),
             cores: 0,
             mem_gb: 0,
         };
         if built {
-            std::fs::write(&table.kernel, b"kernel").unwrap();
-            std::fs::write(&table.rootfs, b"rootfs").unwrap();
+            stage_images(dir.path());
         }
         let mut plumbing = workspace_config::default_plumbing(dir.path()).unwrap();
         plumbing.sandbox = Some(table.clone());
@@ -203,23 +223,27 @@ mod tests {
     }
 
     /// The three states this verb exists to tell apart. Only the third was ever
-    /// hard: a table that IS there and IS wrong reports the same "ready" through
-    /// every setup step as one that is right, and then kills the compute daemon
-    /// at boot.
+    /// hard: a table that IS there over images that are NOT reports the same
+    /// "ready" through every setup step as one over built images, and then
+    /// kills the compute daemon at boot.
     #[test]
-    fn a_table_that_names_images_it_does_not_have_is_not_enabled() {
+    fn a_table_over_unbuilt_images_is_not_enabled() {
         let (built, table) = workspace(true);
         assert!(
             matches!(read_workspace(built.path()).unwrap(), WorkspaceSandbox::Ready(found) if found == table),
             "images present: the node can isolate a run"
         );
 
-        let (unbuilt, table) = workspace(false);
+        let (unbuilt, _) = workspace(false);
         let state = read_workspace(unbuilt.path()).unwrap();
         let WorkspaceSandbox::Stale { missing, .. } = state else {
-            panic!("a table naming an absent kernel is stale, not ready");
+            panic!("a table over an absent kernel is stale, not ready");
         };
-        assert_eq!(missing, table.kernel, "the refusal names the missing image");
+        assert_eq!(
+            missing,
+            workspace_config::guest_kernel(unbuilt.path()),
+            "the refusal names the missing image"
+        );
 
         // ...and the same workspace with the table taken back out.
         let mut plumbing = workspace_config::default_plumbing(unbuilt.path()).unwrap();
@@ -241,7 +265,7 @@ mod tests {
         workspace_config::write_node_toml(dir.path(), &plumbing).unwrap();
         let before = std::fs::read(dir.path().join("node.toml")).unwrap();
 
-        let (platform, _) = workspace_config::platform_sandbox().unwrap();
+        let platform = workspace_config::platform_sandbox();
         offer(dir.path(), &platform, true, false).unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("node.toml")).unwrap(),
@@ -267,14 +291,10 @@ mod tests {
             WorkspaceSandbox::Off
         ));
 
-        let (mut platform, _) = workspace_config::platform_sandbox().unwrap();
-        // point at images that exist so the readback is Ready on any box,
-        // built guest images or not.
-        platform.kernel = dir.path().join("vmlinux");
-        platform.rootfs = dir.path().join("rootfs.ext4");
-        std::fs::write(&platform.kernel, b"kernel").unwrap();
-        std::fs::write(&platform.rootfs, b"rootfs").unwrap();
-
+        // images staged so the readback is Ready on any box, built guest
+        // images or not.
+        stage_images(dir.path());
+        let platform = workspace_config::platform_sandbox();
         offer(dir.path(), &platform, true, true).unwrap();
         let state = read_workspace(dir.path()).unwrap();
         let WorkspaceSandbox::Ready(written) = state else {

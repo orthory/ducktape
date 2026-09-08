@@ -30,8 +30,8 @@
 #   After=ducktape-node@mynet.service
 #   BindsTo=ducktape-node@mynet.service
 #
-# With exactly one workspace registered under DUCKTAPE_HOME no selector is
-# needed; with several, put `-n <chain-id>` in DUCKTAPE_SERVICE_ARGS.
+# With exactly one workspace under DUCKTAPE_HOME no selector is needed; with
+# several, put `-n <chain-id>` in DUCKTAPE_SERVICE_ARGS.
 # The daemon logs to <workspace>/<kind>.log (tee'd from stderr).
 [Unit]
 Description=Ducktape service daemon (%i)

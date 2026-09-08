@@ -72,7 +72,7 @@ pub(crate) fn theme_is_dark(theme: &iced::Theme) -> bool {
 }
 
 /// The token set matching the live palette reading.
-fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
+pub(crate) fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
     if theme_is_dark(theme) {
         ui_lang_components::ui::theme::DARK
     } else {

@@ -55,23 +55,27 @@ pub fn index_guest_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.index.wasm"))
 }
 
-/// Package one module's component and optional mapper from a directory.
+/// Package a module's component, optional mapper, view and assets from a directory.
 pub fn read_module_artifact(dir: &Path, id: &str) -> Result<ModuleArtifact, String> {
-    crate::validate_module_id(id)?;
-    let component_path = component_path(dir, id);
-    let component = std::fs::read(&component_path)
-        .map_err(|error| format!("read {}: {error}", component_path.display()))?;
-    let index_path = index_guest_path(dir, id);
-    let index = match std::fs::read(&index_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("read {}: {error}", index_path.display())),
-    };
-    Ok(ModuleArtifact {
-        component,
-        index,
-        view: None,
-    })
+    crate::ensure_view_ready(dir, id)?;
+    let component = component_path(dir, id);
+    let index = optional_path(index_guest_path(dir, id))?;
+    let view = optional_path(dir.join(format!("{id}.view.wasm")))?;
+    let assets = optional_path(dir.join(format!("{id}.assets")))?;
+    crate::read_deployment_files(
+        &component,
+        index.as_deref(),
+        view.as_deref(),
+        assets.as_deref(),
+    )
+}
+
+fn optional_path(path: PathBuf) -> Result<Option<PathBuf>, String> {
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+    }
 }
 
 /// `<dir>/netstack.component.wasm` — the netstack guest in a founding set.
@@ -100,34 +104,40 @@ impl Genesis {
     /// encountered. An index guest belongs to the component with the same
     /// id. The reachability component is a separate plane's artifact.
     pub fn compose(source: &Path) -> Result<Self, String> {
-        let components = discover_artifacts(source, ".component.wasm")?;
+        let components = discover_artifact_ids(source, ".component.wasm")?;
         if components.is_empty() {
             return Err(format!(
                 "modules directory {} holds no module components",
                 source.display()
             ));
         }
-        let mut index_guests: BTreeMap<String, Vec<u8>> =
-            discover_artifacts(source, ".index.wasm")?
-                .into_iter()
-                .map(|artifact| (artifact.id, artifact.bytes))
-                .collect();
+        let mut index_guests = discover_artifact_ids(source, ".index.wasm")?;
         let modules = components
             .into_iter()
-            .map(|artifact| {
-                let index = index_guests.remove(&artifact.id);
-                Artifact {
-                    id: artifact.id,
-                    bytes: ModuleArtifact {
-                        view: None,
-                        component: artifact.bytes,
-                        index,
-                    }
-                    .encode(),
-                }
+            .map(|id| {
+                index_guests.remove(&id);
+                let bytes = read_module_artifact(source, &id)?.encode();
+                Ok(Artifact { id, bytes })
             })
-            .collect();
-        if let Some(id) = index_guests.keys().next() {
+            .collect::<Result<Vec<_>, String>>()?;
+        for entry in std::fs::read_dir(source).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err("non-UTF-8 founding file name".into());
+            };
+            let id = [".view.wasm", ".assets", ".view.pending"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix));
+            if let Some(id) = id
+                && !modules.iter().any(|module| module.id == id)
+            {
+                return Err(format!(
+                    "view or assets {id} has no module component in the genesis"
+                ));
+            }
+        }
+        if let Some(id) = index_guests.first() {
             return Err(format!(
                 "index guest {id} has no module component in the genesis"
             ));
@@ -138,7 +148,8 @@ impl Genesis {
     }
 
     /// unpack every artifact into `dir` in founding-set layout
-    /// (`<id>.component.wasm`, `<id>.index.wasm`): the genesis's readable
+    /// (`<id>.component.wasm`, `<id>.index.wasm`, `<id>.view.wasm`,
+    /// `<id>.assets/`): the genesis's readable
     /// twin on disk. Rewritten in full on every call (each file atomically),
     /// so the directory always says what the genesis says — a founding set
     /// composed from it yields this genesis again.
@@ -151,6 +162,21 @@ impl Genesis {
             if let Some(index) = artifact.index {
                 write_atomic(&index_guest_path(dir, &module.id), index)?;
             }
+            let view_path = dir.join(format!("{}.view.wasm", module.id));
+            let asset_path = dir.join(format!("{}.assets", module.id));
+            let pending = dir.join(format!("{}.view.pending", module.id));
+            match artifact.view {
+                Some(view) => {
+                    write_atomic(&pending, b"view materialization pending")?;
+                    crate::view_files::materialize_assets(dir, &module.id, &view.assets)?;
+                    write_atomic(&view_path, view.component)?;
+                }
+                None => {
+                    crate::view_files::remove_owned(&view_path)?;
+                    crate::view_files::remove_owned(&asset_path)?;
+                }
+            }
+            crate::view_files::remove_owned(&pending)?;
         }
         let entries = std::fs::read_dir(dir)
             .map_err(|e| format!("read modules directory {}: {e}", dir.display()))?;
@@ -169,11 +195,17 @@ impl Genesis {
             let obsolete_index = filename
                 .strip_suffix(".index.wasm")
                 .is_some_and(|id| self.index_guest(id).is_none());
-            let obsolete_artifact = obsolete_component || obsolete_index;
+            let obsolete_view = [".view.wasm", ".view.pending", ".assets"]
+                .iter()
+                .any(|suffix| {
+                    filename
+                        .strip_suffix(suffix)
+                        .is_some_and(|id| self.component(id).is_none())
+                });
+            let obsolete_artifact = obsolete_component || obsolete_index || obsolete_view;
             if obsolete_artifact {
                 let path = entry.path();
-                std::fs::remove_file(&path)
-                    .map_err(|e| format!("remove obsolete artifact {}: {e}", path.display()))?;
+                crate::view_files::remove_owned(&path)?;
             }
         }
         Ok(())
@@ -312,10 +344,13 @@ pub fn install_genesis(
     Ok(genesis)
 }
 
-fn discover_artifacts(source: &Path, suffix: &str) -> Result<Vec<Artifact>, String> {
+fn discover_artifact_ids(
+    source: &Path,
+    suffix: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
     let entries = std::fs::read_dir(source)
         .map_err(|e| format!("read modules directory {}: {e}", source.display()))?;
-    let mut paths = BTreeMap::new();
+    let mut ids = std::collections::BTreeSet::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("read {}: {e}", source.display()))?;
         let filename = entry.file_name();
@@ -329,19 +364,9 @@ fn discover_artifacts(source: &Path, suffix: &str) -> Result<Vec<Artifact>, Stri
             continue;
         };
         crate::validate_module_id(id)?;
-        paths.insert(id.to_string(), entry.path());
+        ids.insert(id.to_string());
     }
-    paths
-        .into_iter()
-        .map(|(id, path)| {
-            let bytes =
-                std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            if bytes.is_empty() {
-                return Err(format!("{} is empty", path.display()));
-            }
-            Ok(Artifact { id, bytes })
-        })
-        .collect()
+    Ok(ids)
 }
 
 /// write `bytes` to `path` via tmp-file + rename: a reader never observes a
@@ -349,10 +374,25 @@ fn discover_artifacts(source: &Path, suffix: &str) -> Result<Vec<Artifact>, Stri
 /// with [`crate::NetworkDescriptor::save`] — the descriptor is as much a
 /// workspace identity file as the genesis is.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let result = file
+        .write_all(bytes)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&tmp, path)
+                .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]

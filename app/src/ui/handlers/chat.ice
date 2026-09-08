@@ -2,13 +2,13 @@
 // on it: a refined query pressed while the first one is still out must run, not be
 // swallowed. The `chat_search` replace lane drops superseded replies, so the
 // last Enter wins exactly as the last click does.
-on search_chat_submit
-  return if empty(trim(chat_search_draft))
+on search_chat_submit(query)
+  return if empty(trim(query))
   chat_search_phase = SearchPhase.searching
   chat_search_hits = []
   // Captured at the last place the draft and the string being sent are known
   // to match — and sent from here, so the two cannot drift apart.
-  chat_search_query = trim(chat_search_draft)
+  chat_search_query = trim(query)
   error = ""
   run replace lane=chat_search search_chat(connected_rpc, "", chat_search_query) -> chat_search_loaded _ | chat_search_failed _
 
@@ -30,7 +30,6 @@ on chat_search_failed(cause)
 
 on clear_chat_search
   invalidate lane=chat_search
-  chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
@@ -82,6 +81,13 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_at_tail = true
   unread_marker_seq = 0
   palette_open = false
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   shell_tab = ShellTab.chat
   chat_search_phase = SearchPhase.idle
   // Same abandoned request, same dead button — see `choose_channel`. This route
@@ -98,8 +104,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   // The copy range ends with the room — see `choose_channel`.
   copy_anchor_seq = 0
   copy_head_seq = 0
@@ -179,8 +183,6 @@ on choose_channel(id)
   message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   // THE COPY RANGE ENDS WITH THE ROOM. Its two ends are seqs in THIS channel's
   // sequence, so carried next door they would tint rows nobody picked — and
   // the bar that holds the only Clear button is gated on a count the arriving
@@ -276,8 +278,6 @@ on choose_dm(peer_key)
   message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   // The copy range ends with the room — see `choose_channel`.
   copy_anchor_seq = 0
   copy_head_seq = 0
@@ -344,7 +344,6 @@ on toggle_channel_settings
   // caret retires whether the panel is opening or closing. This handler is on
   // the NAMED list for that reason — it no longer writes `active_thread_seq = 0`
   // and so the rail rule cannot derive it.
-  channel_name_draft = active_channel_name
   // AND IT DOES NOT TEAR THE RAIL DOWN. It used to clear the thread and its
   // messages — so opening this drawer DISCARDED a reply you were part-way
   // through typing. Nobody asked to close the thread; they asked to see the
@@ -359,13 +358,13 @@ on toggle_channel_settings
   // draft, because no transition touches one — each composer instance keeps
   // its own (ducktape-ui#697).
 
-on rename_channel_submit
-  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(channel_name_draft))
+on rename_channel_submit(name)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(name))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.channel_rename
   error = ""
-  run every rename_channel(connected_rpc, password, active_channel, trim(channel_name_draft)) -> chat_acked _ | mutation_failed _
+  run every rename_channel(connected_rpc, password, active_channel, trim(name)) -> chat_acked _ | mutation_failed _
 
 on archive_channel_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
@@ -383,13 +382,13 @@ on unarchive_channel_submit
   error = ""
   run every unarchive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
-on add_channel_member_submit
-  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(member_key_draft))
+on add_channel_member_submit(key)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(key))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.channel_member
   error = ""
-  run every add_channel_member(connected_rpc, password, active_channel, trim(member_key_draft)) -> chat_acked _ | mutation_failed _
+  run every add_channel_member(connected_rpc, password, active_channel, trim(key)) -> chat_acked _ | mutation_failed _
 
 on remove_channel_member_submit(key)
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel)
@@ -460,22 +459,17 @@ on huddle_joined_ack(_result)
 // channel-header ✕ and the popped panel, so a second leave that targets
 // `active_channel` would be a way to leave the wrong huddle.
 
-// One handler carries the whole composer: every rich-editor event lands here,
-// the apply is a no-op on Submit, and the single guard below is the send/edit
-// fork. The Send button emits a synthetic Submit through the same route, so
-// there is exactly ONE send path.
-// A toolbar mark is an edit, not a send — and both live in the composer
-// instance now (`ChatComposer.mark`), beside the content they wrap. The
-// formatting CHORDS live there too: the widget's `on_chord` claims them at
-// the caret (`composer_chord`), which retired `composer_focus` outright —
-// the app's keyboard subscription never needed to know which composer was
-// focused, only the chord did.
-
-// ONE EVENT, ONE HANDLER, ONE DISPATCH. Both composer instances fire the same
-// `submitted` — a handler-emitted event resolves to one app handler
-// (ducktape-ui#712), and the instance says which composer it is rather than
-// the route naming one of two near-identical handlers.
-on composer_submitted(kind, pending_body, pending_id)
+// THE COMPOSERS ARE HOST SURFACES (`crate::composer_surface`): the chat view
+// leaves a slot per room and per thread, the app paints the editor there and
+// keeps every box's words, and a submit arrives as the view's `composer`
+// intent — kind, trimmed body, fresh operation id — routed here. Marks and
+// the formatting chords are the surface's own; a refused or failed body goes
+// back to its box through `chat_composer_unsent`.
+//
+// ONE EVENT, ONE HANDLER, ONE DISPATCH. Both composers fire the same intent,
+// and the kind says which composer it was rather than the route naming one
+// of two near-identical handlers.
+on composer_submitted(kind, pending_body, pending_id, scope)
   match kind
     ComposerKind.message
       // THE GATE, RE-READ AT DELIVERY. The instance refused with the verdict
@@ -484,9 +478,9 @@ on composer_submitted(kind, pending_body, pending_id)
       // arm each, not a bool read twice. A refused body cannot go back into
       // the box by itself (the composer cleared itself before emitting), so
       // the refusing arm hands it to that room's own plate (ducktape-ui#698).
-      match submit_verdict(loading, connected, active_channel, post_refusal, true)
+      match submit_verdict(loading, connected, active_channel, post_refusal, true, scope, composer_scope(connected_rpc, active_channel))
         SubmitVerdict.refused
-          slice ChatComposer.unsent(pending_body, false) at composer_scope(connected_rpc, active_channel)
+          composer_stashed = chat_composer_unsent(scope, pending_body, false)
         SubmitVerdict.admitted
           hydration_generation = hydration_generation + 1
           hydration_retry_attempt = 0
@@ -509,15 +503,14 @@ on composer_submitted(kind, pending_body, pending_id)
           // reader who had scrolled up would otherwise get her own send below the
           // fold — an optimistic insert she cannot see is no confirmation at all.
           // The stream is `anchor-y=end`, where relative 0.0 is the tail.
-          parallel
-            run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
-            task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
+          chat_sent_serial = chat_sent_serial + 1
+          run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
     ComposerKind.reply
       // The rail twin, with the rail's own two terms: its readiness is
       // `thread_loading`, and an open rail is what `seated` says.
-      match submit_verdict(thread_loading, connected, active_channel, post_refusal, active_thread_seq > 0)
+      match submit_verdict(thread_loading, connected, active_channel, post_refusal, active_thread_seq > 0, scope, thread_scope(connected_rpc, active_channel, active_thread_seq))
         SubmitVerdict.refused
-          slice ChatComposer.unsent(pending_body, false) at thread_scope(connected_rpc, active_channel, active_thread_seq)
+          composer_stashed = chat_composer_unsent(scope, pending_body, false)
         SubmitVerdict.admitted
           invalidate lane=live_thread
           hydration_generation = hydration_generation + 1
@@ -545,7 +538,7 @@ on message_sent(next)
 // error banner are written first, unconditionally, above the guard.
 on message_send_failed(cause)
   error = cause.message
-  slice ChatComposer.unsent(cause.body, cause.committed) at composer_scope(connected_rpc, cause.scope_id)
+  composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, cause.scope_id), cause.body, cause.committed)
   // THE ROOM IT WAS WRITTEN IN GETS ITS WORDS BACK — not whatever room she
   // has moved to since. The plate is the composer instance's own state now
   // (ducktape-ui#698) and `cause.scope_id` names the room the send was for,
@@ -820,9 +813,6 @@ on open_thread_message_actions(seq, body, rev)
   // hand, and dismissing the menu does not move it back. Every handler with a
   // `task widget focus` retires the discriminant for exactly this reason;
   // `tests.rs` lints the rule so a ninth one cannot forget it.
-  sequential
-    task widget focus #workspace-tabs/content/chat/thread-action-focus window=window_target(console_win)
-    task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
   return if seq <= 0
@@ -835,9 +825,6 @@ on open_thread_message_reactions(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.reactions
   thread_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/thread-reaction-focus window=window_target(console_win)
-    task widget focus-next
 
 on arm_thread_message_delete(seq, body, rev)
   return if seq <= 0
@@ -845,9 +832,6 @@ on arm_thread_message_delete(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.delete
   thread_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/thread-delete-focus window=window_target(console_win)
-    task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
   return if seq <= 0
@@ -855,7 +839,6 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.editing
   thread_edit_draft = body
-  task widget focus #workspace-tabs/content/chat/thread-edit window=window_target(console_win)
 
 on clear_thread_message_selection
   thread_selected_seq = 0
@@ -863,8 +846,9 @@ on clear_thread_message_selection
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
 
-on edit_thread_message_submit
-  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(thread_edit_draft))
+on edit_thread_message_submit(text)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(text))
+  thread_edit_draft = trim(text)
   invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -887,9 +871,6 @@ on open_message_actions(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.more
   message_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/message-action-focus window=window_target(console_win)
-    task widget focus-next
 
 on open_message_reactions(seq, body, rev)
   return if seq <= 0
@@ -903,9 +884,6 @@ on open_message_reactions(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.reactions
   message_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/message-reaction-focus window=window_target(console_win)
-    task widget focus-next
 
 on arm_message_delete(seq, body, rev)
   return if seq <= 0
@@ -913,9 +891,6 @@ on arm_message_delete(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.delete
   message_edit_draft = body
-  sequential
-    task widget focus #workspace-tabs/content/chat/message-delete-focus window=window_target(console_win)
-    task widget focus-next
 
 on begin_message_edit(seq, body, rev)
   return if seq <= 0
@@ -923,7 +898,6 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.editing
   message_edit_draft = body
-  task widget focus #workspace-tabs/content/chat/message-edit window=window_target(console_win)
 
 // COPY LINK CLOSES THE MENU IT WAS PRESSED IN. Every other row of the message
 // menu moves `message_action` on its way out; a bare clipboard write would
@@ -966,6 +940,13 @@ on open_message_link(url)
       run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
     DuckKind.files
       fs_focus_path = link.path
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.files
       run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
     DuckKind.forge_repo
@@ -973,6 +954,13 @@ on open_message_link(url)
       forge_focus_path = ""
       forge_focus_rev = ""
       forge_focus_seq = 0
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_item
@@ -980,6 +968,13 @@ on open_message_link(url)
       forge_focus_path = ""
       forge_focus_rev = ""
       forge_focus_seq = link.seq
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_blob
@@ -987,6 +982,13 @@ on open_message_link(url)
       forge_focus_path = link.path
       forge_focus_rev = link.rev
       forge_focus_seq = 0
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.channel
@@ -1182,8 +1184,10 @@ on close_thread
   copy_head_seq = 0
   copy_surface = CopySurface.nowhere
 
-on edit_message_submit
-  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+on edit_message_submit(text)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(text))
+  // The view owns the keystrokes; the body it submits is the draft from here on.
+  message_edit_draft = trim(text)
   invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -1312,7 +1316,7 @@ on thread_reply_send_failed(cause)
   // THE THREAD IT WAS WRITTEN IN, which is why the failure carries one: a
   // reply belongs to its thread, and `cause.thread_seq` is the only thing
   // that can name the box it came from once the rail has moved on.
-  slice ChatComposer.unsent(cause.body, cause.committed) at thread_scope(connected_rpc, cause.scope_id, cause.thread_seq)
+  composer_stashed = chat_composer_unsent(thread_scope(connected_rpc, cause.scope_id, cause.thread_seq), cause.body, cause.committed)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
@@ -1381,3 +1385,190 @@ on copy_selected_messages
   toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
   toast_age = 0
   task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)
+
+// ============================================================================
+// THE VIEW'S INTENTS. The Chat tab is a module-owned view (crates/views/chat):
+// every act the screen offers comes back here as one intent carrying what the
+// reader chose or typed, and each arm reaches the handler that always signed
+// it — Ice has no handler-to-handler call, but a flow can route to one, and a
+// handler that takes several values is reached the way `open_message_link`
+// reaches one: through an echo lane, its other values read first. The
+// composers are host surfaces, so a submit arrives as `composer` with the
+// kind, the body and the operation id the surface minted.
+// ============================================================================
+on chat_view_event(event)
+  match chat_intent(event)
+    ChatIntent.search
+      flow
+        from done event_text(event, "query")
+        done -> search_chat_submit _
+    ChatIntent.clear_search
+      flow
+        from done true
+        done -> clear_chat_search()
+    ChatIntent.open_hit
+      let root_seq = event_int(event, "root_seq")
+      let target_seq = event_int(event, "target_seq")
+      run every duck_echo_str(event_text(event, "channel")) -> open_chat_search_hit(_, root_seq, target_seq) | external_url_failed _
+    ChatIntent.toggle_create
+      flow
+        from done true
+        done -> toggle_channel_create()
+    ChatIntent.choose_channel
+      flow
+        from done event_text(event, "id")
+        done -> choose_channel _
+    ChatIntent.choose_dm
+      flow
+        from done event_text(event, "key")
+        done -> choose_dm _
+    ChatIntent.toggle_settings
+      flow
+        from done true
+        done -> toggle_channel_settings()
+    ChatIntent.show_huddle
+      flow
+        from done true
+        done -> show_huddle()
+    ChatIntent.leave_huddle
+      flow
+        from done true
+        done -> leave_huddle_here()
+    ChatIntent.join_huddle
+      flow
+        from done true
+        done -> join_huddle_submit()
+    ChatIntent.load_history
+      flow
+        from done true
+        done -> load_more_history()
+    ChatIntent.scrolled
+      let absolute_y = event_num(event, "absolute_y")
+      let relative_x = event_num(event, "relative_x")
+      let relative_y = event_num(event, "relative_y")
+      run every duck_echo_f64(event_num(event, "absolute_x")) -> chat_scrolled(_, absolute_y, relative_x, relative_y) | external_url_failed _
+    ChatIntent.open_link
+      flow
+        from done event_text(event, "url")
+        done -> open_message_link _
+    ChatIntent.copy
+      let label = event_text(event, "label")
+      run every duck_echo_str(event_text(event, "text")) -> copy_to_clipboard(_, label) | external_url_failed _
+    ChatIntent.copy_link
+      flow
+        from done event_text(event, "link")
+        done -> copy_message_link _
+    ChatIntent.add_reaction
+      let emoji = event_text(event, "emoji")
+      run every duck_echo_i64(event_int(event, "seq")) -> add_reaction_at(_, emoji) | external_url_failed _
+    ChatIntent.remove_reaction
+      let emoji = event_text(event, "emoji")
+      run every duck_echo_i64(event_int(event, "seq")) -> remove_reaction_at(_, emoji) | external_url_failed _
+    ChatIntent.open_thread
+      flow
+        from done event_int(event, "seq")
+        done -> open_thread_for _
+    ChatIntent.message_actions
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> open_message_actions(_, body, rev) | external_url_failed _
+    ChatIntent.message_reactions
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> open_message_reactions(_, body, rev) | external_url_failed _
+    ChatIntent.begin_edit
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> begin_message_edit(_, body, rev) | external_url_failed _
+    ChatIntent.arm_delete
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> arm_message_delete(_, body, rev) | external_url_failed _
+    ChatIntent.clear_selection
+      flow
+        from done true
+        done -> clear_message_selection()
+    ChatIntent.press
+      let surface = chat_event_surface(event)
+      run every duck_echo_i64(event_int(event, "seq")) -> press_message(_, surface) | external_url_failed _
+    ChatIntent.clear_range
+      flow
+        from done true
+        done -> clear_copy_range()
+    ChatIntent.copy_range
+      flow
+        from done true
+        done -> copy_selected_messages()
+    ChatIntent.reaction_submit
+      flow
+        from done event_text(event, "emoji")
+        done -> add_reaction_submit _
+    ChatIntent.edit
+      flow
+        from done event_text(event, "text")
+        done -> edit_message_submit _
+    ChatIntent.delete
+      flow
+        from done true
+        done -> delete_message_submit()
+    ChatIntent.rename
+      flow
+        from done event_text(event, "name")
+        done -> rename_channel_submit _
+    ChatIntent.archive
+      flow
+        from done true
+        done -> archive_channel_submit()
+    ChatIntent.unarchive
+      flow
+        from done true
+        done -> unarchive_channel_submit()
+    ChatIntent.add_member
+      flow
+        from done event_text(event, "key")
+        done -> add_channel_member_submit _
+    ChatIntent.remove_member
+      flow
+        from done event_text(event, "key")
+        done -> remove_channel_member_submit _
+    ChatIntent.close_thread
+      flow
+        from done true
+        done -> close_thread()
+    ChatIntent.thread_actions
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> open_thread_message_actions(_, body, rev) | external_url_failed _
+    ChatIntent.thread_reactions
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> open_thread_message_reactions(_, body, rev) | external_url_failed _
+    ChatIntent.thread_begin_edit
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> begin_thread_message_edit(_, body, rev) | external_url_failed _
+    ChatIntent.thread_arm_delete
+      let body = event_text(event, "body")
+      let rev = event_int(event, "rev")
+      run every duck_echo_i64(event_int(event, "seq")) -> arm_thread_message_delete(_, body, rev) | external_url_failed _
+    ChatIntent.thread_clear_selection
+      flow
+        from done true
+        done -> clear_thread_message_selection()
+    ChatIntent.thread_edit
+      flow
+        from done event_text(event, "text")
+        done -> edit_thread_message_submit _
+    ChatIntent.thread_delete
+      flow
+        from done true
+        done -> delete_thread_message_submit()
+    ChatIntent.load_thread
+      flow
+        from done true
+        done -> load_more_thread()
+    ChatIntent.composer
+      let kind = chat_event_kind(event)
+      let id = event_text(event, "id")
+      let scope = event_text(event, "scope")
+      run every duck_echo_str(event_text(event, "body")) -> composer_submitted(kind, _, id, scope) | external_url_failed _

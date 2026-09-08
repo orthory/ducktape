@@ -204,7 +204,7 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
     press_message(i64, CopySurface)
@@ -219,7 +219,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     toggle_channel_settings()
     show_huddle()
     leave_huddle_here()
-    huddle_go_channel()
     join_huddle_submit()
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
@@ -237,7 +236,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     add_reaction_submit(str)
     edit_message_submit()
     delete_message_submit()
-    composer_submitted(ComposerKind, str, str)
     rename_channel_submit()
     archive_channel_submit()
     unarchive_channel_submit()
@@ -413,7 +411,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                 with
                   label="New channel"
                   expanded=channel_create_open
-                  disabled=(loading || mutation_phase != MutationPhase.idle || !connected)
+                  disabled=(loading || busy || !connected)
                   p=0.0
                   @icon_action
                 // `color=inherit` (ducktape-ui#606): the glyph draws the
@@ -435,7 +433,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                 with
                   label="Close new channel"
                   expanded=channel_create_open
-                  disabled=(loading || mutation_phase != MutationPhase.idle)
+                  disabled=(loading || busy)
                   w=24.0
                   h=24.0
                   p=0.0
@@ -470,7 +468,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   // no longer refuses a click — the last one wins — so a row
                   // greyed while one is in flight would put the swallowing back.
                   // A mutation does still refuse, and the row now says so.
-                  disabled=(mutation_phase != MutationPhase.idle)
+                  disabled=(busy)
                 forward
                   choose_channel
             // DIRECT — the artifact's own word for it, and the honest
@@ -509,7 +507,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   peer=dm.peer
                   selected=(dm.peer.key == active_dm_peer)
                   unread=dm.unread
-                  disabled=(mutation_phase != MutationPhase.idle)
+                  disabled=(busy)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -786,7 +784,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                 pb=8.0
                               button "Load older messages" -> emit(load_more_history)
                                 with
-                                  disabled=(mutation_phase != MutationPhase.idle)
+                                  disabled=(busy)
                                   h=30.0
                                   p=6.0
                                   @secondary_action
@@ -905,7 +903,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                 with
                                   w=200.0
                                   p=5.0
-                                  style=raised_style()
+                                  bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                                 col w=fill gap=1.0
                                   // LIVE, SO THE PRESS REACHES THE REFUSAL. A
                                   // disabled row is pixel-identical to a live
@@ -1103,7 +1101,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                               // the message's own reaction chips, which
                               // already toggle off for `reacted_by_me`. Esc
                               // and the backdrop dismiss — no × row.
-                              box p=8.0 style=raised_style()
+                              box p=8.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                                 flex
                                   with
                                     w=234.0
@@ -1144,7 +1142,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                               with
                                 w=fill
                                 p=3.0
-                                style=raised_style()
+                                bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                               row
                                 with
                                   w=fill
@@ -1154,7 +1152,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                   with
                                     label="Edit message"
                                     hint="Edit message"
-                                    disabled=(mutation_phase != MutationPhase.idle)
+                                    disabled=(busy)
                                     submit=emit(edit_message_submit)
                                     w=fill
                                     p=6.2
@@ -1174,14 +1172,14 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                 button "Save" -> emit(edit_message_submit)
                                   with
                                     label="Save message changes"
-                                    disabled=(mutation_phase != MutationPhase.idle || empty(trim(message_edit_draft)))
+                                    disabled=(busy || empty(trim(message_edit_draft)))
                                     h=28.0
                                     p=6.0
                                     @primary_action
                                 button -> emit(clear_message_selection)
                                   with
                                     label="Cancel message edit"
-                                    disabled=(mutation_phase != MutationPhase.idle)
+                                    disabled=(busy)
                                     w=28.0
                                     h=28.0
                                     p=0.0
@@ -1207,18 +1205,18 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                   line-h=1.0
                                 active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                                 focused bg=transparent border=transparent value=transparent border-w=0.0
-                              box p=3.0 style=raised_style()
+                              box p=3.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                                 row gap=5.0 align=center
                                   text "Delete this message?" size=12.5 @text-muted
                                   button "Delete" -> emit(delete_message_submit)
                                     with
-                                      disabled=(mutation_phase != MutationPhase.idle)
+                                      disabled=(busy)
                                       h=26.0
                                       p=5.0
                                       @danger_action
                                   button "Cancel" -> emit(clear_message_selection)
                                     with
-                                      disabled=(mutation_phase != MutationPhase.idle)
+                                      disabled=(busy)
                                       h=26.0
                                       p=5.0
                                       @secondary_action
@@ -1371,16 +1369,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
             // ducktape-ui#697: the room's own composer instance. The key is
             // the room, so the draft IS the room's draft; the plate, marks
             // row, Send and the failed-send banner all moved inside.
-            ChatComposer #composer(composer_scope(endpoint, active_channel))
-              with
-                kind=ComposerKind.message
-                compact=false
-                hint="Message the channel…"
-                blocked=(loading || !connected || empty(active_channel) || !empty(post_refusal))
-                restore_blocked=(mutation_phase != MutationPhase.idle)
-                failed_note="An earlier message wasn’t sent"
-              events
-                submitted -> emit(composer_submitted, _, _, _)
+            extern chat_composer(composer_scope(endpoint, active_channel), "message", false, "Message the channel…", loading || !connected || empty(active_channel) || !empty(post_refusal), busy, "An earlier message wasn’t sent") #composer
         // THE DETAILS DRAWER — a sidebar-toned rail with one header bar, the
         // channel's identity up top, eyebrowed NAME and MEMBERS sections, and
         // the archive act alone at the bottom where a destructive control
@@ -1501,7 +1490,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         with
                           label="Channel name"
                           hint="Channel name"
-                          disabled=(mutation_phase != MutationPhase.idle)
+                          disabled=(busy)
                           submit=emit(rename_channel_submit)
                           w=fill
                           p=6.6
@@ -1513,7 +1502,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         disabled value=muted
                       button "Rename" -> emit(rename_channel_submit)
                         with
-                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(channel_name_draft)))
+                          disabled=(busy || empty(trim(channel_name_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1552,7 +1541,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         with
                           label="Member account or public key"
                           hint="acct:123 or public key"
-                          disabled=(mutation_phase != MutationPhase.idle)
+                          disabled=(busy)
                           submit=emit(add_channel_member_submit)
                           w=fill
                           p=7.4
@@ -1565,7 +1554,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         disabled value=muted
                       button "Add" -> emit(add_channel_member_submit)
                         with
-                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(member_key_draft)))
+                          disabled=(busy || empty(trim(member_key_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1582,7 +1571,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                           ChatMemberRow
                             with
                               member=member
-                              disabled=(mutation_phase != MutationPhase.idle)
+                              disabled=(busy)
                             forward
                               remove_channel_member_submit
               box
@@ -1608,7 +1597,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   if !active_channel_archived
                     button "Archive channel" -> emit(archive_channel_submit)
                       with
-                        disabled=(mutation_phase != MutationPhase.idle)
+                        disabled=(busy)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1619,7 +1608,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   if active_channel_archived
                     button "Unarchive channel" -> emit(unarchive_channel_submit)
                       with
-                        disabled=(mutation_phase != MutationPhase.idle)
+                        disabled=(busy)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1695,7 +1684,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                       button -> emit(close_thread)
                         with
                           label="Close thread"
-                          disabled=(mutation_phase != MutationPhase.idle)
+                          disabled=(busy)
                           w=24.0
                           h=24.0
                           p=0.0
@@ -1787,7 +1776,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                       if thread_has_more && thread_next_reply_seq > 0 && !thread_loading
                         button "Load more replies" -> emit(load_more_thread)
                           with
-                            disabled=(mutation_phase != MutationPhase.idle)
+                            disabled=(busy)
                             w=fill
                             h=28.0
                             p=5.0
@@ -1843,16 +1832,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                     // closing the rail no longer discards it — the instance
                     // (and its words) are simply waiting for the rail to
                     // reopen on the same thread.
-                    ChatComposer #reply_composer(thread_scope(endpoint, active_channel, active_thread_seq))
-                      with
-                        kind=ComposerKind.reply
-                        compact=true
-                        hint="Reply…"
-                        blocked=(thread_loading || !connected || !empty(post_refusal))
-                        restore_blocked=false
-                        failed_note="Unsent reply"
-                      events
-                        submitted -> emit(composer_submitted, _, _, _)
+                    extern chat_composer(thread_scope(endpoint, active_channel, active_thread_seq), "reply", true, "Reply…", thread_loading || !connected || !empty(post_refusal), false, "Unsent reply") #reply_composer
               overlay
                 with
                   when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)
@@ -1885,7 +1865,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             with
                               w=200.0
                               p=5.0
-                              style=raised_style()
+                              bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                             col w=fill gap=1.0
                               // Live for the same reason as the stream's twin.
                               button -> emit(open_thread_message_reactions, thread_selected_seq, thread_edit_draft, thread_selected_rev)
@@ -2039,7 +2019,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             focused bg=transparent border=transparent value=transparent border-w=0.0
                           // Same ADD grid as the stream picker — removal is
                           // the reply's own reaction chips.
-                          box p=8.0 style=raised_style()
+                          box p=8.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                             flex
                               with
                                 w=234.0
@@ -2076,7 +2056,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                           with
                             w=fill
                             p=3.0
-                            style=raised_style()
+                            bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                           row
                             with
                               w=fill
@@ -2086,7 +2066,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                               with
                                 label="Edit message"
                                 hint="Edit message"
-                                disabled=(mutation_phase != MutationPhase.idle)
+                                disabled=(busy)
                                 submit=emit(edit_thread_message_submit)
                                 w=fill
                                 p=6.2
@@ -2102,14 +2082,14 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             button "Save" -> emit(edit_thread_message_submit)
                               with
                                 label="Save message changes"
-                                disabled=(mutation_phase != MutationPhase.idle || empty(trim(thread_edit_draft)))
+                                disabled=(busy || empty(trim(thread_edit_draft)))
                                 h=28.0
                                 p=6.0
                                 @primary_action
                             button -> emit(clear_thread_message_selection)
                               with
                                 label="Cancel message edit"
-                                disabled=(mutation_phase != MutationPhase.idle)
+                                disabled=(busy)
                                 w=28.0
                                 h=28.0
                                 p=0.0
@@ -2135,18 +2115,18 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                               line-h=1.0
                             active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                             focused bg=transparent border=transparent value=transparent border-w=0.0
-                          box p=3.0 style=raised_style()
+                          box p=3.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
                             row gap=5.0 align=center
                               text "Delete this message?" size=12.5 @text-muted
                               button "Delete" -> emit(delete_thread_message_submit)
                                 with
-                                  disabled=(mutation_phase != MutationPhase.idle)
+                                  disabled=(busy)
                                   h=26.0
                                   p=5.0
                                   @danger_action
                               button "Cancel" -> emit(clear_thread_message_selection)
                                 with
-                                  disabled=(mutation_phase != MutationPhase.idle)
+                                  disabled=(busy)
                                   h=26.0
                                   p=5.0
                                   @secondary_action

@@ -25,6 +25,15 @@ description = "Claude Code CLI, print mode (auth via the host-owned Anthropic br
 bin = "claude"
 env = "DUCKTAPE_CLAUDE_BIN"
 
+[source]
+# Where `ducktape agent install claude` gets the guest's Linux build: the
+# LATEST release on Anthropic's feed, resolved at install time — `<base>/latest`
+# names the version, `<base>/<version>/manifest.json` publishes a sha256 per
+# platform, and `<base>/<version>/<platform>/claude` is the binary (glibc, not
+# musl: the guest base is a full Ubuntu userland).
+kind = "claude-releases"
+base = "https://downloads.claude.ai/claude-code-releases"
+
 [invoke]
 # Headless runs may use shell, file and MCP tools without a prompt.
 # The VM and committed run grant enforce access. Interactive args remain separate.

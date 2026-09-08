@@ -18,7 +18,6 @@ view
           wallet_selected=hub_wallet_selected
           networks=hub_networks
           selected=hub_selected
-          hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
           steps=provision_steps
@@ -49,14 +48,12 @@ view
           restore_submit -> restore_submit _ _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
-          forget_network_submit -> forget_network_submit _ _
+          forget_network_submit -> forget_network_submit _
           go_join -> go_join
           go_networks -> go_networks
-          go_wallets -> go_wallets
           join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
-          restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
         restore_phrase:
           input "" #restore-words <-> restore_words
@@ -191,150 +188,14 @@ view
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
+        // Chat is a MODULE-OWNED VIEW: the facts go in as props — the mutation
+        // lock as a flag, the enums by name — and every act comes back as an
+        // intent the handler signs. The drafts are the view's; the composers
+        // are host surfaces the view leaves slots for (module_view.rs).
         chat:
-          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
-            with
-              endpoint=connected_rpc
-              network_name
-              network_chain_id
-              status
-              block_height
-              search_phase=chat_search_phase
-              search_query=chat_search_query
-              search_hits=chat_search_hits
-              rooms
-              dm_rows
-              channel_create_open
-              connected
-              loading
-              mutation_phase
-              active_channel
-              active_dm_peer
-              active_dm
-              active_channel_name
-              active_channel_archived
-              active_channel_members_only
-              channel_members
-              post_refusal
-              huddle_joined
-              huddle_channel
-              huddle_channel_name
-              huddle_joined_at
-              huddle_now
-              call_muted
-              messages
-              has_older_history
-              history_view
-              at_live_tail=chat_at_tail
-              history_loading
-              unread_boundary
-              unread_marker_seq
-              selected_message_seq
-              selected_message_rev
-              message_action
-              channel_settings_open
-              active_thread_seq
-              thread_target_seq
-              thread_messages
-              thread_selected_seq
-              thread_selected_rev
-              thread_message_action
-              thread_has_more
-              thread_next_reply_seq
-              thread_loading
-              copy_anchor_seq
-              copy_head_seq
-              copy_surface
-            events
-              search_chat_submit -> search_chat_submit
-              clear_chat_search -> clear_chat_search
-              open_chat_search_hit -> open_chat_search_hit _ _ _
-              toggle_channel_create -> toggle_channel_create
-              choose_channel -> choose_channel _
-              choose_dm -> choose_dm _
-              toggle_channel_settings -> toggle_channel_settings
-              show_huddle -> show_huddle
-              leave_huddle_here -> leave_huddle_here
-              huddle_go_channel -> huddle_go_channel
-              join_huddle_submit -> join_huddle_submit
-              load_more_history -> load_more_history
-              chat_scrolled -> chat_scrolled _ _ _ _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
-              copy_message_link -> copy_message_link _
-              add_reaction_at -> add_reaction_at _ _
-              remove_reaction_at -> remove_reaction_at _ _
-              open_thread_for -> open_thread_for _
-              open_message_actions -> open_message_actions _ _ _
-              open_message_reactions -> open_message_reactions _ _ _
-              begin_message_edit -> begin_message_edit _ _ _
-              arm_message_delete -> arm_message_delete _ _ _
-              clear_message_selection -> clear_message_selection
-              press_message -> press_message _ _
-              clear_copy_range -> clear_copy_range
-              copy_selected_messages -> copy_selected_messages
-              add_reaction_submit -> add_reaction_submit _
-              edit_message_submit -> edit_message_submit
-              delete_message_submit -> delete_message_submit
-              composer_submitted -> composer_submitted _ _ _
-              rename_channel_submit -> rename_channel_submit
-              archive_channel_submit -> archive_channel_submit
-              unarchive_channel_submit -> unarchive_channel_submit
-              add_channel_member_submit -> add_channel_member_submit
-              remove_channel_member_submit -> remove_channel_member_submit _
-              close_thread -> close_thread
-              open_thread_message_actions -> open_thread_message_actions _ _ _
-              open_thread_message_reactions -> open_thread_message_reactions _ _ _
-              begin_thread_message_edit -> begin_thread_message_edit _ _ _
-              arm_thread_message_delete -> arm_thread_message_delete _ _ _
-              clear_thread_message_selection -> clear_thread_message_selection
-              edit_thread_message_submit -> edit_thread_message_submit
-              delete_thread_message_submit -> delete_thread_message_submit
-              load_more_thread -> load_more_thread
-
+          extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial) #chat -> chat_view_event _
         shell:
-          ShellScreen draft<->shell_chat_draft #shell
-            with
-              surface=shell_surface
-              setup_open=shell_setup_open
-              identity_options=shell_identity_options
-              identity=shell_identity
-              provider=shell_provider
-              credential=shell_credential
-              host_node_options=shell_host_node_options
-              host_node=shell_host_node
-              credentials_loading=shell_credentials_loading
-              terminal=shell_terminal
-              terminal_running=shell_terminal_running
-              terminal_busy=shell_terminal_busy
-              terminal_title=shell_terminal_title
-              terminal_error=shell_terminal_error
-              entries=shell_chat_entries
-              activity=shell_chat_activity
-              chat_busy=shell_chat_busy
-              chat_status=shell_chat_status
-              chat_detail=shell_chat_detail
-              live=shell_chat_live
-              saga_id=shell_chat_saga
-              steps_open=shell_steps_open
-              detached_saga=shell_detached_saga
-              connected
-              dark
-            events
-              shell_surface_changed -> shell_surface_changed _
-              shell_setup_toggled -> shell_setup_toggled
-              shell_identity_changed -> shell_identity_changed _
-              shell_host_node_changed -> shell_host_node_changed _
-              shell_credentials_refresh -> shell_credentials_refresh
-              shell_terminal_start -> shell_terminal_start
-              shell_terminal_stop -> shell_terminal_stop
-              shell_composer_event -> shell_composer_event _
-              shell_chat_reset -> shell_chat_reset
-              shell_chat_detach -> shell_chat_detach
-              shell_chat_reopen -> shell_chat_reopen
-              shell_chat_discard -> shell_chat_discard
-              shell_chat_steps_toggled -> shell_chat_steps_toggled _
-              shell_open_link -> open_message_link _
+          extern shell_view(dark, connected, shell_surface, shell_setup_open, shell_identity_options, shell_identity, shell_provider, shell_credential, shell_host_node_options, shell_host_node, shell_credentials_loading, shell_terminal, shell_terminal_running, shell_terminal_busy, shell_terminal_title, shell_terminal_error, shell_chat_entries, shell_chat_activity, shell_chat_busy, shell_chat_status, shell_chat_detail, shell_chat_live, shell_chat_saga, shell_detached_saga) #shell -> shell_view_event _
 
         // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
         // strip and the comments rail go in as props; the document is the
@@ -356,71 +217,13 @@ view
           // this route; the extern needs one and the roster handler is the
           // honest destination
           extern agents_view(dark, connected, agents_answered, agents_rows) #agents -> members_view_event _
+        // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
+        // the code browse's listing and file, and the discussion go in as
+        // props; every act comes back as an intent the handler signs. The
+        // note composer is a host surface the view leaves a slot for — the
+        // chat composer over the item's channel — so its words stay here.
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
-            with
-              org=network_name
-              about=account_bio
-              network_chain_id
-              connected_rpc
-              tier=member_tier(members_rows)
-              repos=forge_repos
-              list_phase=forge_list_phase
-              open_repo=forge_repo
-              repo_menu=forge_repo_menu
-              repo_phase=forge_repo_phase
-              branches=forge_branches
-              tab=forge_tab
-              items=forge_items
-              forge_item_number
-              item_phase=forge_item_phase
-              forge_item_kind
-              forge_item_title
-              forge_item_state
-              forge_item_author
-              forge_item_branches
-              forge_item_body
-              forge_item_blocks
-              forge_item_files_changed
-              forge_item_additions
-              forge_item_deletions
-              forge_item_diff
-              forge_item_diff_truncated
-              forge_item_merge_oid
-              forge_item_source_oid
-              forge_item_channel
-              forge_item_approvals
-              forge_item_change_requests
-              forge_item_reviews
-              merge_conflicts=forge_merge_conflicts
-              merge_busy=forge_merge_busy
-              review_verdict=forge_review_verdict
-              review_busy=forge_review_busy
-              comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
-              staged_comments=forge_comment_staged
-              discussion=forge_discussion
-              discussion_pending=forge_discussion_pending
-              linked_note=forge_linked_note
-              connected
-              loading
-              dark
-            events
-              forge_open_repo -> forge_open_repo _
-              forge_close_repo -> forge_close_repo
-              forge_toggle_repo_menu -> forge_toggle_repo_menu
-              select_forge_tab -> select_forge_tab _
-              forge_open_item -> forge_open_item _
-              forge_close_item -> forge_close_item
-              forge_merge_submit -> forge_merge_submit
-              forge_review_pick -> forge_review_pick _
-              forge_review_submit -> forge_review_submit
-              forge_comment_open -> forge_comment_open _ _ _
-              forge_comment_stage -> forge_comment_stage
-              forge_comment_cancel -> forge_comment_cancel
-              forge_comment_drop -> forge_comment_drop _
-              note_composer_event -> forge_composer_event _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
+          extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_repos, forge_list_phase, forge_repo, forge_repo_menu, forge_repo_phase, forge_branches, forge_tab, forge_items, forge_item_number, forge_item_phase, forge_item_kind, forge_item_title, forge_item_state, forge_item_author, forge_item_branches, forge_item_body, forge_item_blocks, forge_item_files_changed, forge_item_additions, forge_item_deletions, forge_item_diff, forge_item_diff_truncated, forge_item_merge_oid, forge_item_source_oid, forge_item_approvals, forge_item_change_requests, forge_item_reviews, forge_merge_conflicts, forge_merge_busy, forge_review_verdict, forge_review_busy, forge_comment_staged, forge_discussion, forge_linked_note, forge_landed_seq, forge_landed_tick, forge_tree_path, forge_tree_rev, forge_tree_entries, forge_tree_born, forge_tree_truncated, forge_tree_phase, forge_file_path, forge_file_text, forge_file_binary, forge_file_truncated, forge_file_picture, forge_file_width, forge_file_height, forge_file_note, forge_file_header(forge_opened_dir, forge_opened_rev, forge_tree_path, forge_tree_rev, forge_file_path), forge_file_phase, forge_drafts_cleared, forge_drafts_scope, composer_scope(connected_rpc, forge_item_channel), (loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending))) #forge -> forge_view_event _
         // Approvals is a MODULE-OWNED VIEW: the register the app holds goes
         // in as props, and what the reader does comes back as an intent the
         // handler below signs — the guest sees no key and no endpoint.

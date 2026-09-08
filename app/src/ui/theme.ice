@@ -85,7 +85,6 @@ theme contract AppTheme
   danger_zone_bg
   danger_solid
   danger_solid_hover
-  danger_label
   ink_hover
   strong_ink
   caption
@@ -218,7 +217,6 @@ palette app for AppTheme
   danger_zone_bg #fdf6f4
   danger_solid #a35248
   danger_solid_hover #8f463d
-  danger_label #c79a8a
   // INK — body copy forward, each step fades one notch further back.
   ink_hover #322f28
   strong_ink #3a3934
@@ -398,7 +396,6 @@ palette app_dark for AppTheme
   danger_zone_bg #2a1d1b
   danger_solid #c25a4f
   danger_solid_hover #d3685c
-  danger_label #8a5a4d
   // INK — the ramp fades toward the surface, mirroring the light order.
   ink_hover #f4f2ea
   strong_ink #dcdad2

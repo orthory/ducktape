@@ -1,6 +1,14 @@
 // THE LAUNCH WINDOW'S HANDLERS. One `hub_step` machine inside the onboarding
-// window: loading -> (password | wallets) -> [restore] -> networks ->
-// [join -> provisioning -> live] -> [account] -> console window.
+// window: loading -> networks -> (password | wallets) -> [restore] ->
+// [account] -> console window, with [join -> provisioning -> live] off the
+// network list.
+//
+// THE NETWORK COMES FIRST. A wallet is an identity ON a network, kept in that
+// network's workspace (`<workspace>/keys/`), so there is nothing to unlock
+// until a network is picked: the pick loads THAT workspace's keystore
+// (`load_wallets`), and its rows decide whether the next screen unlocks one,
+// mints the device key, or — for an endpoint this device holds no workspace
+// for — opens read-only.
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
 // is `ducktape node init` on the node, where the coordinator and the rest of the
@@ -11,12 +19,12 @@
 // that starts it, instead of a spinner on an 850ms fake clock.
 //
 // Sign-in is the SAME password every signing extern already threads: unlock
-// opens the SELECTED wallet's key with the keystore library once, makes that
-// wallet active, then stores the password in `password` for the session.
-// Nothing new touches the wire.
+// opens the SELECTED wallet's key with the keystore library once, seats it as
+// the session's signer, makes that wallet active, then stores the password in
+// `password` for the session. Nothing new touches the wire.
 
 // The launch window is up: register it, then load everything it renders —
-// the keystore's wallets, the network list, and the persisted appearance.
+// the network list and the persisted appearance.
 on onboarding_opened(id)
   onboarding_win = some(id)
   parallel
@@ -24,31 +32,21 @@ on onboarding_opened(id)
     run replace lane=notify_load load_desktop_notifications() -> desktop_notifications_loaded _
     run replace lane=hub_state hub_state() -> hub_booted _
 
-// Boot answer: pick the entry step from the keystore and start probing the
-// rows. `hub_booted` OWNS the step; the refresh route below never moves it.
-// A keystore that could not be READ is not a keystore that is EMPTY: the
-// error rides the same boot answer and lands on the create screen's own plate,
-// where "Continue read-only" is the way past it.
+// Boot answer: the network list, and probes for its rows. `hub_booted` OWNS
+// the step; the refresh route below never moves it.
 on hub_booted(state)
-  hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = state.preselect
-  hub_wallets = state.wallets
-  hub_wallet_selected = preselect_wallet(state.wallets)
-  hub_step = hub_entry_step(state.wallets)
-  onboarding_error = state.wallets_error
+  hub_step = HubStep.networks
+  onboarding_error = ""
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
-// A refresh (after forget / after a join / on the way back to the wallet
-// list) updates the rows where the user already is — the step stays put, and
-// so does the row she picked while the refresh was in flight.
+// A refresh (after a forget, after a join, on the way back to the list)
+// updates the rows where the user already is — the step stays put, and so
+// does the row she picked while the refresh was in flight.
 on hub_refreshed(state)
-  hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
-  hub_wallets = state.wallets
-  hub_wallet_selected = refreshed_wallet_selection(state.wallets, hub_wallet_selected, preselect_wallet(state.wallets))
-  onboarding_error = state.wallets_error
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 on network_probed(probe)
@@ -57,40 +55,47 @@ on network_probed(probe)
 on pick_wallet(name)
   hub_wallet_selected = name
 
-// UNLOCK — verify the password opens the SELECTED wallet and make it the
-// active one, then keep the password as the session's signing password.
-// Optimistically stored: the failure arm clears it.
+// UNLOCK — verify the password opens the SELECTED wallet of the picked
+// network, seat it, and make it the active one, then keep the password as the
+// session's signing password. Optimistically stored: the failure arm clears
+// it.
 on unlock_submit(pw)
   return if mutation_phase != MutationPhase.idle || empty(pw) || empty(hub_wallet_selected)
   onboarding_error = ""
   password = pw
   mutation_phase = MutationPhase.onboarding
-  run every unlock_wallet(hub_wallet_selected, password) -> key_unlocked _ | login_failed _
+  run every unlock_wallet(rpc, hub_wallet_selected, password) -> key_unlocked _ | login_failed _
 
+// The wallet is open: now the account probe, for THIS key on THIS chain. The
+// console opens only for a key that has an account there; one with none lands
+// on the welcome step. The probe block is inlined wherever a key becomes the
+// session's — a handler cannot call a handler.
 on key_unlocked(_pubkey)
-  mutation_phase = MutationPhase.idle
   onboarding_error = ""
-  hub_step = HubStep.networks
+  parallel
+    run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+    run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
-// Reads never need the password — the quiet way past a forgotten one. The
-// wallet selection goes with the password: a read-only session signs as
-// NOBODY, and leaving a name behind made the network list claim otherwise.
+// Reads never need the password — the quiet way past a forgotten one. A
+// read-only session signs as NOBODY, so the wallet selection goes with the
+// password, and the console opens on the picked network without an account
+// probe: there is no key to look an account up for.
 on login_skip
   return if mutation_phase != MutationPhase.idle
   password = ""
   hub_wallet_selected = ""
   onboarding_error = ""
-  hub_step = HubStep.networks
+  task window open console -> console_opened _
 
-// PASSWORD — the device key is BEGUN here: a name and 24 words, and nothing
-// on disk yet. The password field's confirm is checked in the component
-// (`password_problem`); this only fires clean.
+// PASSWORD — the device key is BEGUN here, in the picked network's keystore:
+// a name and 24 words, and nothing on disk yet. The password field's confirm
+// is checked in the component (`password_problem`); this only fires clean.
 on password_submit(pw)
   return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
   password = pw
   mutation_phase = MutationPhase.onboarding
-  run every create_device_key(password) -> device_key_created _ | login_failed _
+  run every create_device_key(rpc, password) -> device_key_created _ | login_failed _
 
 // The words exist and the key does not. Straight into the ceremony.
 on device_key_created(_name)
@@ -116,16 +121,16 @@ on confirm_phrase_submit(answer)
   return if mutation_phase != MutationPhase.idle || empty(trim(answer))
   onboarding_error = ""
   mutation_phase = MutationPhase.onboarding
-  run every confirm_recovery_phrase(answer, password) -> phrase_confirmed _ | phrase_confirm_failed _
+  run every confirm_recovery_phrase(rpc, answer, password) -> phrase_confirmed _ | phrase_confirm_failed _
 
-// The key is sealed and the words are gone from this process. The list is
-// refreshed so "signing as …" can name the wallet that now exists, and the
-// network list is where a device with a key belongs.
+// The key is sealed, seated, and the words are gone from this process. A
+// fresh key has no account on the picked chain yet, which the probe is about
+// to say: the welcome step is where it lands.
 on phrase_confirmed(_pubkey)
-  mutation_phase = MutationPhase.idle
   onboarding_error = ""
-  hub_step = HubStep.networks
-  run replace lane=hub_state hub_state() -> hub_refreshed _
+  parallel
+    run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+    run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 // A miss keeps the phrase AND the step: the retry is the point.
 on phrase_confirm_failed(cause)
@@ -145,19 +150,22 @@ on go_login
   hub_step = hub_entry_step(hub_wallets)
 
 // Same stash as `create_submit`, same reason: `key_restored` carries only a
-// pubkey, and the list it lands on names the wallet by name.
+// pubkey, and the session names the wallet by name.
 on restore_submit(name, pw)
   return if mutation_phase != MutationPhase.idle || empty(restore_words) || empty(pw) || empty(name)
   onboarding_error = ""
   password = pw
   hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
-  run every restore_user_key(name, restore_words, password) -> key_restored _ | login_failed _
+  run every restore_user_key(rpc, name, restore_words, password) -> key_restored _ | login_failed _
 
+// Restored and seated: the same probe an unlock runs.
 on key_restored(_pubkey)
   restore_words = ""
-  mutation_phase = MutationPhase.idle
-  hub_step = HubStep.networks
+  onboarding_error = ""
+  parallel
+    run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+    run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 on login_failed(cause)
   mutation_phase = MutationPhase.idle
@@ -168,40 +176,54 @@ on login_failed(cause)
 on pick_network(id)
   hub_selected = id
 
-// A NETWORK PICK PROBES THE ACCOUNT FIRST. The console opens only for a
-// device key that has one on that chain (or a read-only session, which has
-// no key to ask about); a key with none lands on the welcome step. The probe
-// block is inlined in the three pickers — a handler cannot call a handler.
+// A NETWORK PICK LOADS ITS KEYSTORE. The picked workspace's wallets decide
+// the next step (`wallets_loaded`): rows are the unlock surface, an empty
+// keystore mints the device key, and an endpoint this device holds no
+// workspace for (a remote) has no keystore at all and opens read-only. The
+// account probe comes AFTER the wallet, not before: which account to look for
+// depends on which key signs. A previous pick's password names a wallet on
+// another network, so it goes. The wallet screens name the network they are
+// about, so its name is settled here, on the pick.
 on open_network_submit
   return if mutation_phase != MutationPhase.idle || empty(selected_network_endpoint(hub_networks, hub_selected))
   rpc = selected_network_endpoint(hub_networks, hub_selected)
+  network_name = selected_network_name(hub_networks, hub_selected)
   onboarding_error = ""
-  let gate = pick_gate(password)
-  match gate
-    PickGate.read_only
-      task window open console -> console_opened _
-    PickGate.probe
-      mutation_phase = MutationPhase.onboarding
-      parallel
-        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
-        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
+  password = ""
+  hub_wallet_selected = ""
+  mutation_phase = MutationPhase.onboarding
+  run replace lane=hub_wallets load_wallets(rpc) -> wallets_loaded _
 
-// A remote endpoint this device holds no workspace for. On a successful
-// connect `remember_network` saves it, which is how a `saved_remotes` row is
-// born — the old Settings endpoint field was the only source before.
+// A remote endpoint this device holds no workspace for — unless it does: the
+// same keystore load answers both. On a successful connect `remember_network`
+// saves a remote, which is how a `saved_remotes` row is born.
 on connect_remote_submit(endpoint)
   return if mutation_phase != MutationPhase.idle || empty(trim(endpoint))
   rpc = canonical_endpoint(endpoint)
+  network_name = network_label("", rpc)
   onboarding_error = ""
-  let gate = pick_gate(password)
-  match gate
-    PickGate.read_only
+  password = ""
+  hub_wallet_selected = ""
+  mutation_phase = MutationPhase.onboarding
+  run replace lane=hub_wallets load_wallets(rpc) -> wallets_loaded _
+
+// The picked network's keystore, and the door it opens. A keystore that could
+// not be READ is not a keystore that is EMPTY: the error rides the same answer
+// and lands on the create screen's own plate, where "Continue read-only" is
+// the way past it.
+on wallets_loaded(list)
+  let door = wallet_door(list)
+  mutation_phase = MutationPhase.idle
+  hub_wallets = list.wallets
+  hub_wallet_selected = preselect_wallet(list.wallets)
+  onboarding_error = list.error
+  match door
+    WalletDoor.wallets
+      hub_step = HubStep.wallets
+    WalletDoor.password
+      hub_step = HubStep.password
+    WalletDoor.read_only
       task window open console -> console_opened _
-    PickGate.probe
-      mutation_phase = MutationPhase.onboarding
-      parallel
-        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
-        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 on chain_named(id)
   hub_chain_id = id
@@ -233,8 +255,7 @@ on account_probe_failed(cause)
 
 // THE WELCOME'S DOORS. Skipping opens the console without an account (the
 // banner there is the way back); cancel drops a ceremony mid-flight — the
-// lane invalidation drops the stream's receiver, and the backend task ends
-// on its next step.
+// lane invalidation aborts the owned future and drops its browser session.
 on welcome_skip
   return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
@@ -336,6 +357,16 @@ on welcome_failed(cause)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  ceremony_left = ""
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = false
   account_banner_dismissed = false
   account_ceremony_phase = ""
   account_ceremony_qr = ""
@@ -405,14 +436,13 @@ on console_opened(id)
   shell_terminal_error = ""
   shell_chat_entries = []
   shell_chat_activity = []
-  shell_chat_draft = editor("")
+  shell_draft_cleared = shell_composer_clear()
   shell_chat_busy = false
   shell_chat_status = ""
   shell_chat_detail = ""
   shell_chat_live = ""
   shell_chat_saga = ""
   shell_detached_saga = ""
-  shell_steps_open = 0
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
@@ -431,8 +461,6 @@ on console_opened(id)
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   channel_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
@@ -452,7 +480,6 @@ on console_opened(id)
   invalidate lane=live_thread
   thread_loading = false
   pending_channel = ""
-  chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
@@ -520,17 +547,25 @@ on console_opened(id)
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_item_channel = ""
-  forge_review_draft = ""
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
   forge_comment_staged = []
+  forge_drafts_cleared = forge_drafts_cleared + 1
+  forge_drafts_scope = "item"
+  forge_tree_path = ""
+  forge_tree_rev = ""
+  forge_tree_entries = []
+  forge_tree_born = false
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_note = ""
+  forge_opened_dir = ""
+  forge_opened_rev = ""
+  forge_file_phase = ForgeFilePhase.idle
   forge_merge_conflicts = []
   forge_discussion = []
   forge_discussion_members = []
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the
@@ -562,16 +597,14 @@ on console_opened(id)
       discard
     run replace lane=connect connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
 
-on forget_network_submit(id, kind)
+// Only a saved remote can be forgotten: a local network is a directory under
+// the ducktape home, and this app deletes none.
+on forget_network_submit(id)
   return if mutation_phase != MutationPhase.idle
-  run every forget_network(id, kind) -> network_forgotten _
+  run every forget_network(id) -> network_forgotten _
 
 on network_forgotten(_written)
   run replace lane=hub_state hub_state() -> hub_refreshed _
-
-on restore_hidden_submit
-  return if mutation_phase != MutationPhase.idle
-  run every restore_hidden_networks() -> network_forgotten _
 
 // JOIN — unchanged plumbing, new seams: it starts from the network list and
 // settles back into it through the provisioning/live screens.
@@ -581,21 +614,27 @@ on go_join
   hub_step = HubStep.join
   onboarding_error = ""
 
+// Back to the network list from anywhere past it. The pick is undone with
+// it: the wallets shown were the picked network's, and the password named
+// one of them.
 on go_networks
-  return if mutation_phase != MutationPhase.idle
+  let unrelated_mutation = mutation_phase != MutationPhase.idle && hub_step != HubStep.account
+  return if unrelated_mutation
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  invalidate lane=hub_wallets
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  ceremony_left = ""
   restore_words = ""
   join_invite = ""
   onboarding_error = ""
+  password = ""
+  hub_wallets = []
+  hub_wallet_selected = ""
   hub_step = HubStep.networks
-  run replace lane=hub_state hub_state() -> hub_refreshed _
-
-// Back to the wallet list from the network picker. Refreshed on the way in:
-// a wallet minted since boot is on disk but not in `hub_wallets`, and a list
-// that cannot show it is a list you cannot switch to it with.
-on go_wallets
-  return if mutation_phase != MutationPhase.idle
-  onboarding_error = ""
-  hub_step = HubStep.wallets
   run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on join_network_submit
@@ -644,21 +683,18 @@ on copy_onboarding_invite
   toast_age = 0
   task clipboard write invite_link
 
-// Leaving the live screen is the first real connect for the fresh network:
-// `rpc` already points at the workspace it materialized, so this is the
-// network-pick handoff with the pick pre-made.
+// Leaving the live screen is the network-pick handoff with the pick pre-made:
+// `rpc` already points at the workspace the join materialized, whose fresh
+// keystore is empty — so this lands on the password step and mints the
+// device key for the new network.
 on enter_console
   return if mutation_phase != MutationPhase.idle
+  network_name = network_label(onboarding_name, rpc)
   onboarding_error = ""
-  let gate = pick_gate(password)
-  match gate
-    PickGate.read_only
-      task window open console -> console_opened _
-    PickGate.probe
-      mutation_phase = MutationPhase.onboarding
-      parallel
-        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
-        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
+  password = ""
+  hub_wallet_selected = ""
+  mutation_phase = MutationPhase.onboarding
+  run replace lane=hub_wallets load_wallets(rpc) -> wallets_loaded _
 
 // A refusal here is recoverable — the workspace is already on disk — so the
 // screen keeps its controls and says what happened.
@@ -666,14 +702,21 @@ on onboarding_failed(cause)
   mutation_phase = MutationPhase.idle
   onboarding_error = cause.message
 
-// THE WAY BACK — the titlebar chip, Settings' Switch network, and Danger
-// Zone's forget all land here: reopen the launch window; once it is
-// registered, the console closes behind it — and the popped huddle with it,
-// since the huddle it showed belongs to the network being left. The network
-// list is where it lands — never the wallet list again; the session's password
-// (or the user's deliberate read-only skip) survives a network switch.
+// THE WAY BACK — the titlebar chip and Settings' Switch network land here:
+// reopen the launch window; once it is registered, the console closes behind
+// it — and the popped huddle with it, since the huddle it showed belongs to
+// the network being left. The network list is where it lands, and the session
+// ends with the network: its password named a wallet on the network being
+// left, so the signer seat is dropped with it and the next pick unlocks anew.
 on switch_network
   return if mutation_phase != MutationPhase.idle
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=page_autosave
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal
@@ -693,9 +736,15 @@ on switch_network
 on onboarding_reopened(id)
   onboarding_win = some(id)
   hub_step = HubStep.networks
+  password = ""
+  hub_wallets = []
+  hub_wallet_selected = ""
   parallel
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)
+    flow
+      from run lock_signer()
+      discard
     run replace lane=hub_state hub_state() -> hub_refreshed _
 
 // THE BANNER'S WAY BACK — the launch window at the welcome step for THIS
@@ -706,6 +755,13 @@ on dismiss_account_banner
 
 on open_account_welcome
   return if mutation_phase != MutationPhase.idle
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=page_autosave
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal

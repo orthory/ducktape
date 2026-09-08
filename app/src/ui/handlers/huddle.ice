@@ -103,6 +103,13 @@ on huddle_opened(id)
 // happen is the worse half of the failure.
 on huddle_go_channel
   return if loading || mutation_phase != MutationPhase.idle || empty(huddle_channel)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   shell_tab = ShellTab.chat
   // Same tab-move rule as `select_shell_tab`. `choose_channel` below retires it
   // again; the rule is uniform on purpose, so no reader has to prove the flow

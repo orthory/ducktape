@@ -3,7 +3,7 @@
 # This file is EMBEDDED in the provider crate as a built-in default and
 # parsed by the exact same code path as operator-provided specs — it is the
 # reference example of the format. An operator spec with `tag = "codex"` in
-# $DUCKTAPE_CAPABILITY_DIR overrides this file entirely (no field merging);
+# the workspace's capability dir overrides this file entirely (no field merging);
 # each [[variants]] tag below is its own tag and is overridden the same way.
 #
 # Which MODEL codex runs is host policy, not consensus data. The BASE tag
@@ -37,6 +37,20 @@ env = "DUCKTAPE_CODEX_BIN"
 # It is required at discovery and mounted beside `codex` in sandbox guests;
 # declaring it here keeps executor-specific package knowledge out of Rust.
 companions = ["codex-code-mode-host"]
+
+[source]
+# Where `ducktape agent install codex` gets the guest's Linux build: the
+# LATEST GitHub release, resolved at install time — no version is written
+# down anywhere. `asset` is the release artifact for the guest's arch
+# ({arch} = x86_64 | aarch64): the `codex-package` tar carries `bin/codex`
+# AND its Code Mode companion in one artifact the release publishes a
+# checksum for in `sums` (the bare `codex-<triple>` asset ships neither).
+# `members` are the archive paths of exactly the files [detect] declares.
+kind = "github-release"
+repo = "openai/codex"
+asset = "codex-package-{arch}-unknown-linux-musl.tar.gz"
+sums = "codex-package_SHA256SUMS"
+members = ["bin/codex", "bin/codex-code-mode-host"]
 
 [invoke]
 # One-shot exec, workspace-write sandbox (edits confined to the cwd = the

@@ -236,10 +236,6 @@ pub fn clear_tabs() -> bool {
     notify("settings.clear_tabs", &())
 }
 
-pub fn forget_network() -> bool {
-    notify("settings.forget", &())
-}
-
 pub fn set_light() -> bool {
     notify("settings.light", &())
 }

@@ -64,13 +64,15 @@ jobs:
 
   genesis-pin:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
+      - run: make views
+      - run: make views-repro-check
       - run: cargo test --locked -p node-bin host_state
 
   # the wasm/native cutover-continuity proofs (crates/kernel/host/tests/wasm_*_parity.rs):
@@ -122,6 +124,7 @@ jobs:
         with:
           cache-directories: target/sim-wasm-cache
       - run: rustup show
+      - run: make views
       - run: cargo test --locked -p simnode
 
   # The rendezvous/coordinator unit lane had no PR gate at all: three
@@ -180,8 +183,8 @@ jobs:
       - run: rustup show
       - run: cargo test --locked --manifest-path crates/views/Cargo.toml
       - run: cargo clippy --locked --manifest-path crates/views/Cargo.toml --tests --no-deps -- -D warnings
-      # `cargo fmt --all` follows path dependencies (design) into the root
-      # workspace, whose files this gate does not own: format only the views.
+      # Format the views workspace, including its shared design source; the
+      # desktop host workspace is checked independently.
       - run: rustfmt --edition 2024 --check $(git ls-files 'crates/views/*.rs')
       # the default workspace build never enables airlock's `verify` feature
       # (#1302 — dcap-qvl/sev/a second reqwest-0.13 stack are opt-in), so the

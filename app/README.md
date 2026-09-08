@@ -5,27 +5,33 @@ Native Chat + Pages client, with its UI declared in
 
 ```bash
 cargo build -p node-bin
+make views                  # the tabs: wasm views staged under target/views
 cargo run -p ducktape-app
 ```
 
-The RPC endpoint stays editable in the app and wins whenever it is set; left
-empty it resolves `DUCKTAPE_NODE`, else the active workspace's http port from
-the CLI registry (`<ducktape home>/registry.json`), else
+The launch window lists the workspaces under the ducktape home (one
+directory per network, `$DUCKTAPE_HOME` when set, else `~/.ducktape`) and the
+remote endpoints it has saved; picking one opens that workspace's keystore.
+An RPC endpoint typed in wins whenever it is set; left empty it resolves
+`DUCKTAPE_NODE`, else the one workspace under the home, else
 `http://127.0.0.1:8844`. Chat + Pages hydrate over HTTP after the resumable
 `module:chat` and `module:pages` WebSocket topics are active, then rehydrate on
 committed changes. Writes sign with the encrypted key at `DUCKTAPE_USER_KEY`,
-else the keystore's active wallet (`<ducktape home>/keys/<name>.key`); no
-active wallet is a refusal, not a guess — pick one in the launch window.
-`<ducktape home>` is `$DUCKTAPE_HOME` when set, else `~/.ducktape`. Set
-`DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app binary nor on
-`PATH`.
+else the picked workspace's active wallet (`<workspace>/keys/<name>.key`); no
+active wallet is a refusal, not a guess — unlock one in the launch window.
+The app's own state — its preferences, its log, its forge mirrors — lives in
+the platform's application directories (`~/.config`, `~/.local/state` and
+`~/.cache` on Linux, `~/Library/Application Support`, `~/Library/Logs` and
+`~/Library/Caches` on macOS; an `XDG_*` variable wins on either), never under
+the home. Set `DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app
+binary nor on `PATH`.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer, Settings, Files and Pages
-tabs are not native: each is an Ice application under `crates/views`
-(`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `files`,
-`pages`) compiled
+The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
+Pages, Forge and Shell tabs are not native: each is an Ice application under `crates/views`
+(`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`,
+`pages`, `forge`, `shell`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -55,8 +61,26 @@ whole editor: the Pages document is the app's own `page_document` (its
 buffer, history and save tick never cross), painted into the view's slot
 from what the tab was last drawn with (`pages/surface.rs`); the view's page,
 search and comment drafts leave with the act that reads them, and the app
-hands one back only by moving `seed_rev`. The
-views workspace pins the same `ducktape-ui` rev as this crate; `make views`
+hands one back only by moving `seed_rev`.
+The Shell view goes further: its
+composer, its terminal and its answer Markdown are host surfaces, so a task's
+words never cross the wire — the host's composer raises the `send` intent
+itself.
+A view may also hand data to a
+host surface that reads it: Forge's code browse leaves slots for the
+decoded picture, the document-aware Markdown reader and the highlighted
+code reader, each painted by the app from the arguments the view passes,
+and the reader's links come back to the view's own handler. Forge's
+discussion note composer is the chat composer as a host surface
+(`forge_composer`) over the item's channel, so a note's words stay in the
+app and only its send crosses.
+A view whose screen needs a widget
+the tree wire does not carry leaves that widget to the host too: the Chat
+view declares `chat_composer` as a host surface per room and per thread,
+and the app paints its rich composer there (`src/composer_surface.rs`),
+keeps every box's words for the life of the process, and hears a submit as
+the view's `composer` intent — the words themselves never cross the wire.
+The views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 
 ## Release build (macOS: signed and notarized)
@@ -162,7 +186,7 @@ guards hold the Ice sources to both authorities.
 
 - Faces: **Geist** (UI), **Geist Mono** (machine values, metadata, field
   labels, and badges).
-  The files are embedded from `crates/design/assets/fonts/` at build time.
+  The files are embedded from `crates/views/support/design/assets/fonts/` at build time.
 - Scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
   body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field
   label · 9.5 navigation · 9 badge.

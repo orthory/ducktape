@@ -12,7 +12,7 @@ use super::{hex_bytes, unhex};
 /// returns the signer and whether it was freshly generated. written 0600 on
 /// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
 /// the user's identity is a separate keypair in the keystore
-/// (`~/.ducktape/keys/<wallet>.key`), a member of an `identity` module
+/// (`<workspace>/keys/<wallet>.key`), a member of an `identity` module
 /// account (`crates/modules/system/identity`); no node is ever bound to an
 /// account, and this file never holds the user key.
 pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bool), String> {

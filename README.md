@@ -42,10 +42,10 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/guests/` | The kernel-fixture test guests only (hello, hello-replacement, noop, sibling, object). Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` builds it out of the repository at a revision — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (the first wasm port; a test tenant, in no genesis set), `greeter` (types-only composition example) |
 | `crates/testing/` | `nettest` — the raw-HTTP-over-TCP test client, collision-safe port allocation and coarse event poll every node/daemon/sim integration harness shares |
-| `crates/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
+| `crates/views/support/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
-| `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
+| `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/views/support/design` is its design system |
 | `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
 | `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`); `docs/README.md` indexes every document in the repo by the question it answers |
 
@@ -87,6 +87,19 @@ ordering arm.
 
 ## Quick Start
 
+Prerequisites: `rustup` (the pinned toolchain and its wasm32 target install
+themselves on the first build), a C compiler, and on Linux `pkg-config`,
+`libclang-dev` and `libasound2-dev`:
+
+```sh
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu
+xcode-select --install                                                    # macOS
+```
+
+`make` checks for them up front and prints that line when one is missing.
+`wasm-tools` and `cargo-ice` are pinned and installed under `target/` by the
+recipes that need them — nothing to install by hand.
+
 Run the workspace tests:
 
 ```sh
@@ -111,7 +124,8 @@ cargo test -p node-bin --test network_joiner_full
 
 Run everything the repo can verify locally (the wasm-artifact drift gate, the
 rust workspace including the e2e suites, the consensus sim-feature suite, and a
-build of the noded + simnode binaries the test harnesses stage):
+build of the noded + simnode binaries the test harnesses stage; two scripted
+checks want `node` and `bun` and skip with a notice without them):
 
 ```sh
 make test
@@ -231,13 +245,15 @@ Also runnable:
   (see the operator path above and `docs/deploy/coordinator.md`).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
-  `app/README.md` states which node it dials and which key it signs with.
+  Pages, its UI declared in `app/src/ui/*.ice`. `make views && cargo run -p
+  ducktape-app` (the tabs are wasm views the app loads from `target/views`;
+  without them every tab says so); `app/README.md` states which node it
+  dials and which key it signs with.
 
 Seed a local "demo" network preloaded with sample data — chat channels and
 messages, a tasks board, pages, a registered agent, an inbox note, an
-automation rule, plus gateway web-app routes — registered as a "demo"
-workspace under `~/.ducktape`:
+automation rule, plus gateway web-app routes — founded as a "demo" workspace
+under `~/.ducktape`, with its own guest images and shell executor:
 
 ```sh
 make demo-seed

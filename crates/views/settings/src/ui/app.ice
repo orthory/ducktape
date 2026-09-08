@@ -37,7 +37,6 @@ extern crate::host
   pure login() -> bool
   pure copy(text:&str, label:&str) -> bool
   pure clear_tabs() -> bool
-  pure forget_network() -> bool
   pure set_light() -> bool
   pure set_dark() -> bool
   pure set_notifications(enabled:bool) -> bool
@@ -196,9 +195,6 @@ on copy_to_clipboard(text, label)
 on settings_clear_tabs
   sent = clear_tabs()
 
-on forget_workspace_submit
-  sent = forget_network()
-
 on set_appearance_light
   sent = set_light()
 
@@ -263,7 +259,6 @@ view
         account_login_submit -> account_login_submit
         copy_to_clipboard -> copy_to_clipboard _ _
         settings_clear_tabs -> settings_clear_tabs
-        forget_workspace_submit -> forget_workspace_submit
         set_appearance_light -> set_appearance_light
         set_appearance_dark -> set_appearance_dark
         set_desktop_notifications -> set_desktop_notifications _

@@ -16,10 +16,10 @@
 # units (below), ~/.ducktape for a node run by hand — add that path if you
 # rotate one. `su` names the owner: logrotate refuses a directory it cannot
 # prove is safe to write as root.
-/var/lib/ducktape/workspaces/*/daemon.log
-/var/lib/ducktape/workspaces/*/compute.log
-/var/lib/ducktape/workspaces/*/agent.log
-/var/lib/ducktape/workspaces/*/airlock.log {
+/var/lib/ducktape/*/daemon.log
+/var/lib/ducktape/*/compute.log
+/var/lib/ducktape/*/agent.log
+/var/lib/ducktape/*/airlock.log {
     su ducktape ducktape
     weekly
     rotate 8

@@ -149,7 +149,7 @@ on settings_view_event(event)
       return if mutation_phase != MutationPhase.idle || empty(event_text(event, "password"))
       error = ""
       password = event_text(event, "password")
-      run every unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
+      run every unlock_user_key(connected_rpc, password) -> settings_unlocked _ | settings_unlock_failed _
     // Locking clears the password AND retires the session signer: the child
     // that holds the opened user key must not outlive the seat it was
     // opened for.
@@ -214,14 +214,19 @@ on settings_view_event(event)
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Preparing the passkey…"
       stream replace lane=account_ceremony add_passkey_by_qr(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_ceremony_stepped _
     SettingsIntent.passkey_desktop
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every register_passkey(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony register_passkey(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
     SettingsIntent.ceremony_cancel
       invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
       account_busy = false
       account_ceremony_phase = ""
       account_ceremony_qr = ""
@@ -231,7 +236,9 @@ on settings_view_event(event)
       return if !connected || !account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every link_wallet(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony link_wallet(connected_rpc, password, network_chain_id, event_text(event, "label")) -> account_changed _ | account_op_failed _
     // Logging in is the other op a key OUTSIDE every account performs: a
     // passkey registered on a member device consents, in the browser, to
     // admitting this one.
@@ -239,7 +246,9 @@ on settings_view_event(event)
       return if !connected || account_exists || account_busy || empty(password)
       account_busy = true
       error = ""
-      run every login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
+      account_ceremony_phase = "working"
+      account_ceremony_detail = "Continue in the browser…"
+      run replace lane=account_desktop_ceremony login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
     SettingsIntent.copy
       toast = event_text(event, "label")
       toast_age = 0
@@ -247,13 +256,6 @@ on settings_view_event(event)
     SettingsIntent.clear_tabs
       doc_tabs = []
       run every clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
-    // DANGER ZONE — forget this workspace on THIS DEVICE and go back to
-    // onboarding.
-    SettingsIntent.forget
-      return if !connected || mutation_phase != MutationPhase.idle
-      mutation_phase = MutationPhase.forget_workspace
-      error = ""
-      run every forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
     SettingsIntent.light
       flow
         from done true
@@ -272,20 +274,6 @@ on settings_unlocked(_pubkey)
 on settings_unlock_failed(cause)
   password = ""
   error = cause.message
-
-// `forget_workspace` answers false when the prefs file could not be written.
-// Throwing her out to onboarding on that answer meant the workspace was back in
-// the picker at the next launch, looking like the app had ignored her.
-// On success the launch window reopens; `onboarding_reopened`
-// (handlers/onboarding.ice) closes the console once it is registered.
-on workspace_forgotten(forgotten)
-  mutation_phase = MutationPhase.idle
-  error = "This device could not forget the workspace."
-  return if !forgotten
-  connected = false
-  status = "Not connected"
-  error = ""
-  task window open onboarding -> onboarding_reopened _
 
 // The app's one clipboard action: every Copy button routes here so the toast
 // copy lives at the call site and the write itself stays native.

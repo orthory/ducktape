@@ -3,8 +3,9 @@
 One static file (`index.html`) plus one Worker route (`worker.js`, the
 result relay — §Relay). Gate: `node ops/auth-page/test.mjs` — plain `node`,
 no dependencies, no install; it lifts the page's pure helper block and checks
-the fragment parser, DER→raw and SPKI→compressed-SEC1, and runs the relay
-against a Map. The app/CLI opens the system browser to the page with the
+the fragment parser, DER→raw and SPKI→compressed-SEC1, runs the browser
+script with a stub authenticator to check creation options, and runs the
+relay against a Map. The app/CLI opens the system browser to the page with the
 request in the URL fragment — or shows the same URL as a QR for a phone —
 the page runs the ceremony, and the result goes to a one-shot loopback
 listener in the app/CLI (the `gh auth login` shape) or, from a phone, to the
@@ -25,8 +26,8 @@ All binary fields are base64url, no padding.
 | param | ops | meaning |
 |---|---|---|
 | `challenge` | all | `create`/`get`: the 32 challenge bytes (`SHA-256(ns ‖ preimage)`, hashed by the client; passed straight through). `eth`: the exact `personal_sign` message bytes (`union_unique(ns, preimage)`, NOT hashed; the wallet prepends the EIP-191 prefix itself). |
-| `user` | create | `user.id`: the account number as 8 bytes u64 LE. |
-| `name` | create | `user.name` = `user.displayName`: the account's display name. |
+| `user` | create | `user.id`: exactly 40 bytes: `SHA-256(UTF-8("ducktape:passkey-account:v1\0") ‖ UTF-8(chain_id))` (32 bytes), then the account number as u64 LE (8 bytes). `\0` is one zero byte; `chain_id` is the full chain ID. |
+| `name` | create | `user.name` = `user.displayName`: `<account display name> · <full chain ID>`, percent-encoded in the fragment, including any `#` in the chain ID. |
 | `cb` | all, optional | where the result goes: **loopback** (`http://127.0.0.1`, `[::1]`, `localhost`), or **this origin's `/r/<id>`** (the relay, §Relay) — any other URL is refused before the ceremony. Without it the page prints the result JSON (manual testing). |
 
 Fixed options: `pubKeyCredParams` ES256 (-7) only; `residentKey: required`
@@ -49,7 +50,7 @@ app"), then it closes.
 
 // get — feeds keyscheme's Secp256r1 envelope: authenticatorData ‖ clientDataJSON ‖ signature
 {"op":"get","credentialId":"…","authenticatorData":"…","clientDataJSON":"…",
- "signature":"<64 raw R‖S>","userHandle":"<8-byte account number or null>"}
+ "signature":"<64 raw R‖S>","userHandle":"<40-byte chain-scoped account ID or null>"}
 
 // eth — the client recovers the pubkey (k256 recover, one line); the page has no secp256k1
 {"op":"eth","address":"0x…","signature":"0x<65 bytes r‖s‖v>","message":"<the bytes signed>"}
@@ -100,10 +101,12 @@ card has the same three buttons.
   RECOVERS the key from the signature (`keyscheme::recover_personal_sign`);
   touch 2 signs the real preimage. Nothing on chain verifies the reveal
   signature — it authorizes nothing.
-- **A login is one `get` with `allowCredentials: []`**: the discoverable
-  passkey answers with its `userHandle` (the account number written at
-  registration), and its assertion over the NEW device's `AddKey` preimage
-  is the member consent that frame carries; the device signs the frame.
+- **A login is two `get` ceremonies with `allowCredentials: []`.** The
+  first discovers the account from the passkey's `userHandle`; the client
+  checks its chain prefix before using the account number. This discovery
+  authorizes nothing. The second signs the new device's `AddKey` consent
+  preimage, bound to that account and chain. The device signs the frame
+  carrying this member consent.
 
 ## Deploy
 
@@ -115,5 +118,5 @@ in the zone.
 ```
 npx wrangler@4 login                                       # once per machine (OAuth; headless: --browser=false, then curl the callback URL within 120 s)
 npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
-node ops/auth-page/test.mjs                                # the pure helpers (fragment, DER→raw, SPKI→SEC1) + the relay against a Map
+node ops/auth-page/test.mjs                                # helpers + browser creation options + relay
 ```

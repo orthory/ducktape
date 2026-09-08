@@ -15,7 +15,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${DEMO_WORKSPACE_ID:-demo}"
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
+WSDIR="$DUCK/$ID"
 
 log(){ printf '\033[36m[demo-app]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-app] %s\033[0m\n' "$*" >&2; exit 1; }

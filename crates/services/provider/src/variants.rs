@@ -98,6 +98,9 @@ pub(crate) fn expand(
             // interactive TUI eligibility is a property of the CLI, not the
             // model pin, so variants inherit the parent's argv whole.
             interactive: base.interactive.clone(),
+            // WHERE the CLI's build comes from is a property of the CLI too;
+            // a variant runs the same executable.
+            source: base.source.clone(),
         });
     }
     Ok(specs)

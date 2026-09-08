@@ -21,8 +21,8 @@
   <key>Label</key>
   <string>@LABEL@</string>
 
-  <!-- The workspace selector `ducktape node run -n` takes: a registered chain
-       id or any unique prefix of it (`ducktape node list`). Unlike a systemd
+  <!-- The workspace selector `ducktape node run -n` takes: a chain id under
+       the ducktape home or any unique prefix of it (`ducktape node list`). Unlike a systemd
        instance name this needs no escaping — the `#` in a chain id is an
        ordinary character in an argument vector. -->
   <key>ProgramArguments</key>
@@ -36,9 +36,9 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <!-- Everything the node keeps on disk lives here (workspaces/, modules/,
-         executors/, keys/); `~/.ducktape` when the installer was not told
-         otherwise. -->
+    <!-- Everything the node keeps on disk lives here, one directory per
+         network (<chain-id>/ with its keys/, guest/, executors/ and state);
+         `~/.ducktape` when the installer was not told otherwise. -->
     <key>DUCKTAPE_HOME</key>
     <string>@DUCKTAPE_HOME@</string>
     <key>RUST_LOG</key>

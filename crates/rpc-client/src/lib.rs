@@ -818,18 +818,25 @@ impl Client {
     }
 
     /// Mint this node's `node_proof` for a `JoinHuddle`: its own mesh-identity
-    /// key signing `channel_id` ‖ `user` (hex origin bytes). The NODE mints
-    /// it, not the caller — proof of possession needs the private key this
-    /// node holds, never sent over the wire. Answers `(node, node_proof)`,
-    /// both hex. 503 on a daemon with no mesh identity.
-    pub async fn huddle_node_proof(
-        &self,
-        channel_id: &str,
-        user_hex: &str,
-    ) -> Result<(String, String)> {
+    /// key signing `channel_id` ‖ the key that SIGNED this request. The NODE
+    /// mints it, not the caller — proof of possession needs the private key
+    /// this node holds, never sent over the wire — and it binds the signer,
+    /// so this client must carry a [`WriteAuth`]: the person joining is
+    /// whoever signs, and the node answers only a key that holds an account.
+    /// Answers `(node, node_proof)`, both hex. 503 on a daemon with no mesh
+    /// identity.
+    pub async fn huddle_node_proof(&self, channel_id: &str) -> Result<(String, String)> {
+        let body = serde_json::to_vec(&serde_json::json!({ "channel_id": channel_id }))
+            .expect("a json literal serializes");
         let response = self
-            .credentialed(self.http.post(self.url("v1/huddle/node-proof")?))
-            .json(&serde_json::json!({ "channel_id": channel_id, "user": user_hex }))
+            .proven(
+                self.http.post(self.url("v1/huddle/node-proof")?),
+                "POST",
+                "/v1/huddle/node-proof",
+                &body,
+            )
+            .header("content-type", "application/json")
+            .body(body)
             .send()
             .await
             .map_err(|error| Error::new(format!("minting a huddle node proof failed: {error}")))?;

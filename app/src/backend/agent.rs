@@ -123,7 +123,7 @@ pub struct AgentChatEntry {
     pub steps_label: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentActivity {
     pub id: i64,
     pub title: String,

@@ -22,14 +22,15 @@ commentary in the app, with run outcomes available through the query API.
   — do NOT set `init.defaultObjectFormat = sha256` host-wide; a sha256 clone
   cannot interop with the node's repos.
 - **An enabled compute service with a working microVM sandbox.** Install
-  guest-architecture executors with `ducktape agent install claude` or
-  `ducktape agent install codex`, including the spec's declared companions.
-  Discovery checks the sandbox's executor directory. Custom specs live under
-  `DUCKTAPE_CAPABILITY_DIR` or `<ducktape home>/capabilities/`
-  (`docs/records/specs/capability-spec.md`); `make demo-seed` stages one
-  there, `quack-test.toml`, a script-backed test provider run by the guest
-  shell `sh` in the executor directory, and registers the demo's Quackbot
-  against it with forge read and push on the seeded `playground` repo and on
+  guest-architecture executors into the workspace with `ducktape agent
+  install claude -n <chain-id>` or `ducktape agent install codex -n
+  <chain-id>`, including the spec's declared companions. Discovery checks the
+  workspace's executor directory (`<workspace>/executors`). Custom specs live
+  under `<workspace>/capabilities/` (`docs/records/specs/capability-spec.md`);
+  `make demo-seed` stages one there, `quack-test.toml`, a script-backed test
+  provider run by the guest shell `sh` it lifts out of the guest rootfs it
+  builds into `<workspace>/guest`, and registers the demo's Quackbot against
+  it with forge read and push on the seeded `playground` repo and on
   `ducktape`.
 - **Provider authentication on the executing service.** Codex uses
   `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
@@ -49,9 +50,9 @@ make dogfood-forge
 ```
 
 `ops/dogfood-forge.sh` resolves the node's HTTP base
-from `DUCKTAPE_DEV_FORGE_URL` or the active workspace's `http_listen` in
-`<ducktape home>/registry.json` and `node.toml`, failing if neither resolves
-(the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
+from `DUCKTAPE_DEV_FORGE_URL` or, with exactly one workspace under the
+ducktape home, that workspace's `http_listen` in its `node.toml`, failing if
+neither resolves (the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`,
 fetches `origin/dev`, and reconciles it with the forge's `refs/heads/dev`.
 It fast-forwards when possible, retains a Forge descendant, or joins equal-tree
@@ -376,9 +377,12 @@ consume host disk. The read-only input image retains its measured size plus
 metadata margin. Headless Claude invocations allow shell, file and Ducktape MCP
 tools without interactive approval; the VM and committed grants define access.
 
-The live repair test uses the standard Claude capability, installed CLI, host
-broker credential and default guest location. Set `DUCKTAPE_GUEST_DIR` only when
-using an image elsewhere. Keep `TMPDIR` short and disk-backed for Unix sockets.
+The live repair test uses the standard Claude capability, an installed CLI and
+the host broker credential. The e2e lanes stage a node's workspace themselves:
+`DUCKTAPE_GUEST_DIR` names the guest build they link in as each node's
+`guest/`, and `DUCKTAPE_EXECUTOR_DIR` the installed CLIs the live lane execs
+(a workspace's `executors/` after `ducktape agent install`). Keep `TMPDIR`
+short and disk-backed for Unix sockets.
 The live test is opt-in because it spends provider budget:
 
 ```sh

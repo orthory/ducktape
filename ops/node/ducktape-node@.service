@@ -9,8 +9,10 @@
 # workspace; `%i` would pass the `\x23` form, which matches no chain id.
 #
 # Everything the node keeps lives under DUCKTAPE_HOME (/var/lib/ducktape, the
-# StateDirectory): workspaces/<chain-id>/{node.toml,network.toml,identity.key,
-# storage/,daemon.log}, modules/, executors/, keys/. See
+# StateDirectory), one directory per network and nothing else:
+# <chain-id>/{node.toml,network.toml,identity.key,keys/,guest/,executors/,
+# capabilities/,storage/,daemon.log}. The founding set is program data
+# (/usr/local/lib/ducktape/modules, DUCKTAPE_MODULES_DIR). See
 # docs/deploy/node-service.md for install, ports, logs and backup.
 #
 # Hardening mirrors ops/coordinator/ducktape-coordinator.service where the
@@ -27,15 +29,15 @@ Wants=network-online.target
 [Service]
 User=ducktape
 Group=ducktape
-# /var/lib/ducktape, created and chowned by systemd; DUCKTAPE_HOME points the
-# registry and the executor dir at it. The founding set the installer copied
-# there is what `node init` founds from and where the netstack guest is read
-# at boot; a network's own wasm is its workspace `genesis` file.
+# /var/lib/ducktape, created and chowned by systemd; DUCKTAPE_HOME is where
+# the workspaces live. The founding set the installer copied beside the
+# binary's prefix is what `node init` founds from and where the netstack
+# guest is read at boot; a network's own wasm is its workspace `genesis` file.
 StateDirectory=ducktape
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/ducktape
 Environment=DUCKTAPE_HOME=/var/lib/ducktape
-Environment=DUCKTAPE_MODULES_DIR=/var/lib/ducktape/modules
+Environment=DUCKTAPE_MODULES_DIR=/usr/local/lib/ducktape/modules
 # Optional: RUST_LOG, extra flags in DUCKTAPE_NODE_ARGS. The file is not
 # required.
 EnvironmentFile=-/etc/ducktape/node.env

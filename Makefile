@@ -16,25 +16,53 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release views dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release views views-repro-check dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+
+## the system packages a build needs and cargo cannot install: rustup (the
+## pinned toolchain and its wasm32 target install themselves through it), a C
+## compiler, and on Linux pkg-config, libclang (bindgen, for the app's camera
+## bindings) and ALSA's headers (the app's audio). macOS builds with the
+## command line tools alone. Checked up front, so a fresh machine hears the one install line
+## instead of a linker error twenty minutes into the build.
+.PHONY: prereqs
+prereqs:
+	@missing=""; \
+	command -v rustup >/dev/null || missing="$$missing rustup"; \
+	command -v cc >/dev/null || missing="$$missing cc"; \
+	if [ "$(UNAME_S)" = Linux ]; then \
+	  command -v pkg-config >/dev/null || missing="$$missing pkg-config"; \
+	  { [ -n "$$LIBCLANG_PATH" ] || $$(command -v ldconfig || echo /sbin/ldconfig) -p 2>/dev/null | grep -q libclang; } || missing="$$missing libclang"; \
+	  pkg-config --exists alsa 2>/dev/null || missing="$$missing alsa"; \
+	fi; \
+	[ -z "$$missing" ] || { \
+	  echo "missing build prerequisites:$$missing" >&2; \
+	  if [ "$(UNAME_S)" = Darwin ]; then \
+	    echo "  xcode-select --install" >&2; \
+	  else \
+	    echo "  sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu" >&2; \
+	    echo "  sudo dnf install gcc pkgconf-pkg-config clang-devel alsa-lib-devel       # Fedora" >&2; \
+	  fi; \
+	  echo "  rustup: https://rustup.rs" >&2; \
+	  exit 1; }
 
 ## build every workspace crate (the default target)
-all:
+all: prereqs
 	$(CARGO) build $(LOCKED) --workspace
 
-## the app dev loop: seed the "demo" localnet if it does not exist yet
-## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
-## serving, start the local compute/agent/airlock services, sync ducktape's own
-## repo into that node's forge (dogfood-forge — non-fatal when origin is
-## unreachable), then run the desktop app against it in the foreground. Ctrl-C
-## quits the app and leaves the node and services running; `make dev-clear`
-## stops that background runtime without deleting its state, while
-## `make demo-clear` removes the workspace entirely.
+## the app dev loop: found the "demo" localnet anew (stopping and clearing
+## what a previous lap left) from the modules, index guests and views this
+## build staged, start its node and the local compute/agent/airlock services,
+## sync ducktape's own repo into that node's forge (dogfood-forge — non-fatal
+## when origin is unreachable), then run the desktop app against it in the
+## foreground. Ctrl-C quits the app and leaves the node and services up for
+## `cargo run -p ducktape-app`; the next `make dev` replaces them.
+## `make dev-clear` stops that background runtime without deleting its state,
+## while `make demo-clear` removes the workspace entirely.
 dev: views
 	@bash ops/dev.sh
 
 ## stop the demo node and compute/agent/airlock services left by `make dev`.
-## Preserves the workspace, registry entry, module state, wallets, and
+## Preserves the workspace: its module state, wallets, guest, executors and
 ## credentials. The foreground app and `make demo-app` are not killed.
 dev-clear:
 	@bash ops/dev-clear.sh
@@ -46,9 +74,10 @@ dev-clear:
 ## once `make dev` starts the compute service it replies in chat and opens a
 ## pull request from a microVM, no model credential needed), jobs, an
 ## automation rule — plus TWO gateway web-app routes: a
-## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
-## "demo" workspace in ~/.ducktape and makes it active. Builds ducktape if needed
-## (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Stops and
+## replaces any previous "demo" workspace under ~/.ducktape (demo-clear), and
+## builds the workspace's own guest images and shell executor. Builds ducktape
+## if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed:
 	@bash ops/demo-seed.sh
 
@@ -59,8 +88,8 @@ demo-app:
 	@bash ops/demo-app.sh
 
 ## remove the seeded "demo" workspace: stop its node (cmdline-verified pid
-## sweep, graceful /v1/shutdown first), delete ~/.ducktape/workspaces/demo, and
-## drop it from the registry — other workspaces untouched. See ops/demo-clear.sh.
+## sweep, graceful /v1/shutdown first) and delete ~/.ducktape/demo — the whole
+## network; other workspaces untouched. See ops/demo-clear.sh.
 demo-clear:
 	@bash ops/demo-clear.sh
 
@@ -79,7 +108,7 @@ labs-gate:
 	$(CARGO) check $(LOCKED) --manifest-path crates/labs/Cargo.toml
 
 ## release build of the networked node (the app-facing daemon surface)
-node:
+node: prereqs
 	$(CARGO) build $(LOCKED) --release -p node-bin
 
 ## release build of the untrusted UDP coordinator
@@ -114,18 +143,31 @@ ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' a
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
+ICE_INSTALL_STAMP = $(ICE_ROOT)/.installed-from-rev-build
 
-$(ICE_BIN):
-	CARGO_TARGET_DIR="$(ICE_ROOT)/build" $(CARGO) install cargo-ice \
-		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+# The build dir is keyed by rev too: cargo treats every checkout under its git
+# cache as immutable (no mtime check on its sources) and hashes a git package's
+# outputs without the revision, so a build dir shared across revs handed a bump
+# the PREVIOUS rev's binary under the new rev's path (`cargo ice bundle` then
+# refused flags the new rev has). An existing binary can predate the isolated
+# build dir. Only reuse an install completed by this recipe; --force also
+# replaces Cargo's stale registration.
+.PHONY: ice-tool
+ice-tool:
+	@if test -x "$(ICE_BIN)" && test -f "$(ICE_INSTALL_STAMP)"; then exit 0; fi; \
+	rm -f "$(ICE_INSTALL_STAMP)" && \
+	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build/$(ICE_REV)" $(CARGO) install cargo-ice \
+		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)" --force && \
+	touch "$(ICE_INSTALL_STAMP)"
 
 # The `wasm-tools` CLI the view bundler drives (cargo-ice shells out to it to
-# wrap each view as a component). It is the componentizer's own release:
-# `wasm-tools 1.x.y` and the `wit-component 0.x.y` guest-builder links ship
-# together and write the same bytes. The version is read off guest-builder's
-# manifest — the one place the componentizer is pinned — and cargo builds the
-# CLI into a version-keyed root, so nothing is read off PATH and no second
-# number exists to drift.
+# wrap each view as a component), installed the same way cargo-ice is: under
+# target, keyed by version, so `make views` needs nothing on PATH and cannot
+# pick up a global copy at another version. It is the componentizer's own
+# release — `wasm-tools 1.x.y` and the `wit-component 0.x.y` guest-builder
+# links ship together and write the same bytes — so the version is read off
+# guest-builder's manifest, the one place the componentizer is pinned, and no
+# second number exists to drift.
 WASM_TOOLS_VERSION = 1.$(shell sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' bin/guest-builder/Cargo.toml | head -n1)
 WASM_TOOLS_ROOT = $(CURDIR)/target/wasm-tools/$(WASM_TOOLS_VERSION)
 WASM_TOOLS_BIN = $(WASM_TOOLS_ROOT)/bin/wasm-tools
@@ -134,19 +176,24 @@ $(WASM_TOOLS_BIN):
 	CARGO_TARGET_DIR="$(WASM_TOOLS_ROOT)/build" $(CARGO) install wasm-tools \
 		--version "$(WASM_TOOLS_VERSION)" --locked --root "$(WASM_TOOLS_ROOT)"
 
-## build every module-owned view (crates/views) as an `ice:view` component
+## build every desktop view (crates/views) as an `ice:view` component
 ## and stage it under target/views, where a built desktop app loads it from
 ## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
-## binary). The views workspace pins the
-## same ducktape-ui rev as the app, and this refuses when they differ: a view
-## compiled by another language revision than the host that renders it is a
-## wire nobody tested. The bundler finds its `wasm-tools` on the PATH this
-## recipe sets, never the operator's.
-views: $(ICE_BIN) $(WASM_TOOLS_BIN)
+## binary). Installs the bundler's wasm-tools under target on first use and
+## puts it on the recipe's PATH, never the operator's. The views workspace pins
+## the same ducktape-ui rev as the app, and this refuses when they differ: a
+## view compiled by another language revision than the host that renders it is
+## a wire nobody tested.
+VIEW_PACKAGES = $(shell awk '/^\[/{ in_package = ($$0 == "[package]") } in_package && /^name *= *"/ { split($$0, part, "\""); printf "-p %s ", part[2] }' crates/views/*/Cargo.toml)
+
+views: ice-tool $(WASM_TOOLS_BIN)
 	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
 	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
-	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" "$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view -p node-view -p explorer-view -p settings-view -p files-view -p pages-view \
-		--target wasm32-unknown-unknown --out target/views
+	PATH="$(WASM_TOOLS_ROOT)/bin:$$PATH" bash ops/build-views.sh "$(ICE_BIN)" $(VIEW_PACKAGES)
+
+## rebuild the committed view sources in two isolated roots and compare bytes
+views-repro-check: ice-tool $(WASM_TOOLS_BIN)
+	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
@@ -167,7 +214,7 @@ ifeq ($(UNAME_S),Darwin)
 ##                          before the upload — Apple rejects an ad-hoc
 ##                          signature.
 ## The release recipe is app/README.md § "Release build".
-app: $(ICE_BIN) views
+app: prereqs ice-tool views
 	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## `make app-release` for a build that leaves this machine: refuses unless a
@@ -202,7 +249,7 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 install: install-node install-app
 
 ## build the desktop app binary and the views it loads
-app: views
+app: prereqs views
 	$(CARGO) build $(LOCKED) --release -p ducktape-app
 
 ## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
@@ -235,7 +282,7 @@ CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 ## (target/<profile>/modules), so installing the node installs that set
 ## beside the installed binary. `--target-dir target` keeps the install build
 ## in the checkout's target dir, which is where the staged set lands.
-install-node:
+install-node: prereqs
 	$(CARGO) install --path bin/node --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r target/release/modules "$(CARGO_BIN)/modules"
@@ -277,11 +324,14 @@ test: wasm-modules-check wasm-embed-check
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
 # browser half of `crates/authpage`'s contract, dependency-free under node.
-	node ops/auth-page/test.mjs
-# demo-clear's refusal line against a stub admin surface: the reason token it
-# prints has to be the node's own, not one invented in the script. Needs `bun`
-# (so does demo-clear itself); the script skips with a notice where there is
-# none, like the podman lines above.
+# Skips with a notice where there is no node, like the bun line below.
+	@if command -v node >/dev/null; then node ops/auth-page/test.mjs; \
+	else echo "[test] skipped ops/auth-page/test.mjs — node (nodejs) is not installed" >&2; fi
+# demo-clear's refusal line against a stub admin surface (the reason token it
+# prints has to be the node's own, not one invented in the script) and its
+# process sweep (only the workspace's ducktape node and services, never a
+# bystander naming the path). Needs `bun` (so does demo-clear itself); the
+# script skips with a notice where there is none, like the podman lines above.
 	bash ops/demo-clear-test.sh
 # the #[ignore]d tests are ignored ONLY because they must not share a process
 # with the parallel suite — they still have to run. `absolute_configs_resolve_

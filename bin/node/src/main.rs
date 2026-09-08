@@ -277,9 +277,9 @@ enum Family {
     User(userkey_cli::UserCmd),
     /// the account this user key belongs to: create, keys, name, profile
     Account(account_cli::AccountArgs),
-    /// named user-key wallets: mint, import, list, switch the active one
-    #[command(subcommand)]
-    Wallet(wallet_cli::WalletCmd),
+    /// a workspace's named user-key wallets: mint, import, list, switch the
+    /// active one
+    Wallet(wallet_cli::WalletArgs),
     /// local loopback bindings for signed gateway routes
     #[command(subcommand)]
     Gateway(gateway_routes::GatewayCmd),
@@ -322,7 +322,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
         Family::Account(args) => account_cli::run(args),
-        Family::Wallet(cmd) => wallet_cli::run(cmd),
+        Family::Wallet(args) => wallet_cli::run(args),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # make demo-seed — a self-contained "demo" network preloaded with sample data.
 #
-# Inits a solo (1-validator) workspace named "demo" in ~/.ducktape — the SAME
-# registry the desktop app reads — starts its node briefly, POSTs a batch of
-# seed ops over the node's /v1/submit lane (each finalized into DURABLE qmdb
-# state), then stops the node. Open the app and switch to the "demo" workspace:
-# the app respawns the node from the same durable dir, fully populated.
+# Inits a solo (1-validator) workspace named "demo" under the ducktape home —
+# the SAME directory listing the desktop app reads — builds its guest images
+# and its shell executor, starts its node briefly, POSTs a batch of seed ops
+# over the node's /v1/submit lane (each finalized into DURABLE qmdb state),
+# then stops the node. Open the app and pick the "demo" network: the app
+# respawns the node from the same durable dir, fully populated.
 #
-# Re-runnable: wipes and recreates the "demo" workspace each time (other
-# workspaces in the registry are untouched). Ports are freshly allocated.
+# Re-runnable: stops whatever still serves the "demo" workspace, wipes it and
+# recreates it each time (ops/demo-clear.sh; other workspaces under the home
+# are untouched). Ports are freshly allocated.
 #
 # It also publishes two gateway web-app routes (see ops/demo-gateway.mjs): a
 # NETWORK-hosted static site served from DuckFS, and a USER-hosted route that
@@ -18,10 +20,11 @@
 #
 # The model user (Quackbot) is a TEST agent with the dogfood e2e runner's
 # shape: its provider is the guest shell running a literal script, staged as
-# a capability spec in this host's capability dir, and its grant carries forge
-# read and push on a seeded `playground` repo. The two seeded @mentions (one in
-# #general, one on a playground issue) complete on `make dev` with no model
-# credential at all: a chat reply, and a pull request opened from a microVM.
+# a capability spec in the workspace's capability dir, and its grant carries
+# forge read and push on a seeded `playground` repo. The two seeded @mentions
+# (one in #general, one on a playground issue) complete on `make dev` with no
+# model credential at all: a chat reply, and a pull request opened from a
+# microVM.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,15 +33,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # out of the founding set the build staged beside the binary (`<target>/
 # <profile>/modules`), which `node init` finds by itself — nothing to point at.
 ID="${DEMO_WORKSPACE_ID:-demo}"
-# The SAME root the CLI resolves (`wallet::duck_root`) and the app resolves
-# (`duck_home`). Hardcoding `$HOME` split the two under DUCKTAPE_HOME: the
-# guard below and the gateway's signing key looked at `$HOME/.ducktape/keys`
-# while `wallet new` minted into `$DUCKTAPE_HOME/keys`, so a second run died
-# on "already exists" and the gateway signed with the wrong key.
+# The SAME home the CLI and the app resolve: `$DUCKTAPE_HOME` when set, else
+# `~/.ducktape`. The home holds workspaces and nothing else; everything the
+# demo network owns — its config, its keystore, its guest images, its
+# executors, its capability specs — lives under $WSDIR and goes with it.
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
-REG="$DUCK/registry.json"
-USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
+WSDIR="$DUCK/$ID"
+USERKEY="$WSDIR/keys/demo.key"    # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
 # DEV_LISTEN widens the p2p mesh + HTTP API binds so a second machine can
@@ -55,8 +56,8 @@ DEV_ADVERTISED="${DEV_ADVERTISED:-127.0.0.1}"
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v bun     >/dev/null || die "bun is required"
-command -v curl    >/dev/null || die "curl is required"
+command -v bun     >/dev/null || die "bun is required: curl -fsSL https://bun.sh/install | bash"
+command -v curl    >/dev/null || die "curl is required (apt install curl / brew install curl)"
 
 # ── 1. node binary ─────────────────────────────────────────────
 NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
@@ -69,9 +70,14 @@ if [ -z "$NODE_BIN" ]; then
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
-# ── 2. fresh demo workspace (idempotent) ───────────────────────
+# ── 2. fresh demo workspace ────────────────────────────────────
+# demo-clear stops the node and the service daemons a previous run left
+# serving this workspace BEFORE anything under it is deleted — a daemon whose
+# directory was pulled out from under it is not a fresh start — and refuses to
+# delete while one is still alive.
+bash "$SCRIPT_DIR/demo-clear.sh" || die "could not clear the previous '$ID' workspace"
 log "creating a fresh '$ID' workspace at $WSDIR"
-rm -rf "$WSDIR"; mkdir -p "$WSDIR"
+mkdir -p "$WSDIR"
 # Free-port probe only — always loopback regardless of DEV_LISTEN, since it
 # never binds anything the node itself serves from.
 read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')
@@ -118,40 +124,52 @@ fi
 rm -f "$INIT_ERR"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
+log "founded '$ID' (chain $CHAIN) at $WSDIR"
 
-# ── 3. register in ~/.ducktape/registry.json (merge; make it active) ──
-bun - "$REG" "$ID" "$CHAIN" "$PUB" "$P1" "$P2" "$P3" <<'JS'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-const [path, id, chain, pubkey, listen, http, rpc] = process.argv.slice(2);
-let registry = { version: 1, active: null, workspaces: [] };
-if (existsSync(path)) {
-  try { registry = JSON.parse(readFileSync(path, "utf8")); } catch {}
+# ── 3. user identity ───────────────────────────────────────────
+# The app signs writes with a wallet from the WORKSPACE's keystore: a wallet
+# is an identity on one network. The demo gets its OWN named wallet ("demo",
+# password $DEMO_PASSWORD), minted into the fresh workspace, so the seed
+# always holds the signing password. Nothing outside this workspace is
+# touched — the app's wallet list for the demo network is where this
+# identity gets picked.
+printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" wallet new demo --workspace "$WSDIR" >/dev/null \
+  || die "could not mint the demo wallet"
+log "minted the demo wallet (password: $DEMO_PASSWORD)"
+
+# ── 3b. the guest images and the shell executor ───────────────
+# Every run of this network boots the workspace's OWN guest
+# (`<workspace>/guest`) and execs out of the workspace's OWN executors dir:
+# two networks on one box share no image, and a lap rebuilds both into the
+# fresh workspace. The base rootfs and kernel downloads are cached under the
+# repo's target dir, so a lap rebuilds the image, not the download. A box
+# that cannot build one (no unsquashfs/mke2fs) still seeds; its Quackbot
+# runs stay pending.
+GUEST_DIR="$WSDIR/guest"
+EXEC_DIR="$WSDIR/executors"
+CAP_DIR="$WSDIR/capabilities"
+mkdir -p "$EXEC_DIR" "$CAP_DIR" || die "cannot create the workspace's compute dirs"
+# e2fsprogs is keg-only on macOS, so debugfs is looked up the way the
+# sandbox looks it up: PATH, then the standard prefixes.
+debugfs_bin(){
+  local candidate
+  for candidate in "$(command -v debugfs 2>/dev/null)" /usr/sbin/debugfs /sbin/debugfs \
+    /opt/homebrew/opt/e2fsprogs/sbin/debugfs /usr/local/opt/e2fsprogs/sbin/debugfs; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s' "$candidate"; return; }
+  done
+  return 1
 }
-const workspace = {
-  id, name: id, chainId: chain, pubkey, founder: true, member: true,
-  ports: { listen: Number(listen), http: Number(http), rpc: Number(rpc) },
-};
-registry.workspaces = [...(registry.workspaces ?? []).filter((item) => item.id !== id), workspace];
-registry.active = id;
-mkdirSync(dirname(path), { recursive: true });
-writeFileSync(path, JSON.stringify(registry, null, 2));
-JS
-log "registered '$ID' (chain $CHAIN) — set as active workspace"
-
-# ── 3b. user identity ──────────────────────────────────────────
-# The app signs writes with a wallet from the keystore. The demo gets its
-# OWN named wallet ("demo", password $DEMO_PASSWORD) so the seed always
-# holds the signing password: the old "existing key, unknown password,
-# routes skipped" branch cannot happen. The user's other wallets are
-# untouched; the seed never flips the active pointer — the app's wallet
-# list is where the demo identity gets picked.
-if [ -e "$USERKEY" ]; then
-  log "demo wallet already present at $USERKEY"
+if OUT="$GUEST_DIR" bash "$SCRIPT_DIR/build-guest-rootfs.sh" >"$WSDIR/guest-build.log" 2>&1; then
+  log "built the guest images into $GUEST_DIR"
+  # The provider below runs `sh` INSIDE the guest, so the executor is the
+  # guest's own shell, lifted out of the image just built — a host shell
+  # links a libc the guest need not carry.
+  DEBUGFS="$(debugfs_bin)" || die "debugfs not found; install e2fsprogs"
+  "$DEBUGFS" -R "dump -p /usr/bin/dash $EXEC_DIR/sh" "$GUEST_DIR/rootfs.ext4" >/dev/null 2>&1
+  [ -x "$EXEC_DIR/sh" ] || die "could not lift /usr/bin/dash out of $GUEST_DIR/rootfs.ext4"
+  log "staged the guest shell at $EXEC_DIR/sh"
 else
-  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" wallet new demo >/dev/null \
-    || die "could not mint the demo wallet"
-  log "minted the demo wallet (password: $DEMO_PASSWORD)"
+  log "guest image build failed — see $WSDIR/guest-build.log; Quackbot's runs stay pending on this box"
 fi
 
 # ── 3c. the test provider spec ─────────────────────────────────
@@ -159,17 +177,13 @@ fi
 # completes only on a node whose compute service announces that tag. A real
 # coding agent needs a credential this seed does not have, so the demo's
 # provider is the guest shell running a literal script: it reads the prompt
-# envelope off stdin and replies from inside the microVM. The spec is host
-# config, resolved the way the compute daemon resolves it ($DUCKTAPE_CAPABILITY_DIR,
-# else <ducktape home>/capabilities), and the daemon probes `sh` in the
-# executors dir the guest image is derived from ($DUCKTAPE_EXECUTOR_DIR, else
-# <ducktape home>/executors). Staged BEFORE the compute grant below: the
-# grant is minted from the daemon's live hello, which offers only what
-# discovery found.
-CAP_DIR="${DUCKTAPE_CAPABILITY_DIR:-$DUCK/capabilities}"
-EXEC_DIR="${DUCKTAPE_EXECUTOR_DIR:-$DUCK/executors}"
+# envelope off stdin and replies from inside the microVM. The spec is
+# workspace config, read the way the compute daemon reads it
+# (`<workspace>/capabilities`), and the daemon probes `sh` in the workspace's
+# executors dir the guest image is derived from. Staged BEFORE the compute
+# grant below: the grant is minted from the daemon's live hello, which offers
+# only what discovery found.
 TEST_TAG="quack-test"
-mkdir -p "$CAP_DIR" || die "cannot create the capability dir $CAP_DIR"
 # An unquoted heredoc so $TEST_TAG names the tag ONCE; the executor script's
 # own `$` and `\` are escaped so they reach the file verbatim.
 cat >"$CAP_DIR/$TEST_TAG.toml" <<TOML || die "cannot write the $TEST_TAG spec"
@@ -210,14 +224,9 @@ prompt = "stdin"
 [output]
 format = "text"
 TOML
-if [ -x "$EXEC_DIR/sh" ]; then
-  log "staged the $TEST_TAG provider spec at $CAP_DIR/$TEST_TAG.toml"
-else
-  log "no guest shell at $EXEC_DIR/sh — Quackbot's runs stay pending until a"
-  log "  guest-compatible Linux sh is installed there (the guest image is derived from that dir)"
-fi
+log "staged the $TEST_TAG provider spec at $CAP_DIR/$TEST_TAG.toml"
 
-# ── 4. start the node, wait for its http surface ───────────────
+# ── 4. start the node, wait for its published identity ─────────
 log "starting node (http $DEV_LISTEN:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
 NODE_PID=$!
@@ -226,12 +235,19 @@ trap 'kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null' EXIT
 # wildcard bind still accepts loopback, so the seeder's own curl calls stay
 # on 127.0.0.1 regardless of DEV_LISTEN.
 URL="http://127.0.0.1:$P2"
+# The node binds its HTTP listener BEFORE it publishes its mesh identity, and
+# `/v1/status` serves an empty `public_key` in between. The compute daemon
+# below names its providers by that key and refuses an empty one, so the
+# node is up when the key is there, not when the route answers.
+identity_published(){
+  curl -sf "$URL/v1/status" 2>/dev/null | grep -Eq '"public_key" *: *"[0-9a-fA-F]+"'
+}
 for _ in $(seq 1 80); do
-  curl -sf "$URL/v1/status" >/dev/null 2>&1 && break
+  identity_published && break
   kill -0 "$NODE_PID" 2>/dev/null || die "node exited on start — see $WSDIR/seed.log"
   sleep 0.5
 done
-curl -sf "$URL/v1/status" >/dev/null 2>&1 || die "node http never came up — see $WSDIR/seed.log"
+identity_published || die "node never published its identity — see $WSDIR/seed.log"
 
 # ── 4b. grant the compute service ──────────────────────────────
 # The compute plane is consent-gated: a [sandbox] table says HOW a run would
@@ -404,12 +420,12 @@ kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null; trap - EXIT
 cat <<EOF
 
 $(printf '\033[32m[demo-seed] done.\033[0m')
-Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
+Open the Ducktape app and pick the "$ID" network — it boots preloaded.
 
 To WRITE (send a message, add a reaction, edit): the app signs with a wallet
-from your keystore. The launch window opens on the wallet list — pick the
-"demo" row, type its password into that row, and Unlock. That also makes it
-the active wallet, so the next launch opens on it.
+from the network's keystore. Picking the network opens its wallet list — pick
+the "demo" row, type its password into that row, and Unlock. That also makes
+it the network's active wallet, so the next pick opens on it.
 
   wallet: demo   password: $DEMO_PASSWORD
 

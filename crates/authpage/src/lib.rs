@@ -30,13 +30,15 @@
 //!   to by answering ([`account_request`] -> [`assertion_account`]). Touch 1
 //!   asks; touch 2 ([`login_request`]) is the consent, bound to that answer.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::Ipv4Addr;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use keyscheme::KeyScheme;
+use sha2::{Digest as _, Sha256};
 
 /// the live page. Its host IS the RP ID every passkey is scoped to — changing
 /// it invalidates every registered passkey (acceptable at zero live networks).
@@ -50,6 +52,33 @@ pub const REVEAL_NS: &[u8] = b"ducktape:reveal-key:v1";
 /// the largest form body the listener reads — an assertion is a few KiB.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// The discoverable passkey's chain and account hint, stored as `user.id`.
+/// An assertion returns this unsigned; a matching signature still proves access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserHandle {
+    chain_hash: [u8; 32],
+    number: u64,
+}
+
+impl UserHandle {
+    pub fn new(chain_id: &str, number: u64) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"ducktape:passkey-account:v1\0");
+        hash.update(chain_id.as_bytes());
+        Self {
+            chain_hash: hash.finalize().into(),
+            number,
+        }
+    }
+
+    pub fn to_bytes(self) -> [u8; 40] {
+        let mut bytes = [0; 40];
+        bytes[..32].copy_from_slice(&self.chain_hash);
+        bytes[32..].copy_from_slice(&self.number.to_le_bytes());
+        bytes
+    }
+}
+
 /// one ceremony, as the page's fragment names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -59,6 +88,7 @@ pub enum Request {
     Create {
         challenge: [u8; 32],
         user: u64,
+        chain_id: String,
         name: String,
     },
     /// `navigator.credentials.get()` with `allowCredentials: []` — the
@@ -83,9 +113,9 @@ pub enum Outcome {
         client_data_json: Vec<u8>,
         /// raw `R‖S`, 64 bytes (the page normalizes DER away).
         signature: Vec<u8>,
-        /// the account number a registration wrote as `user.id`; `None` for a
-        /// credential registered without one.
-        user_handle: Option<u64>,
+        /// The unsigned chain and account hint a registration wrote as `user.id`;
+        /// `None` for a credential registered without one.
+        user_handle: Option<UserHandle>,
     },
     Eth {
         address: String,
@@ -109,12 +139,15 @@ pub fn request_url(page: &str, request: &Request, callback: &str) -> String {
         Request::Create {
             challenge,
             user,
+            chain_id,
             name,
         } => {
             params.push("op=create".into());
             params.push(format!("challenge={}", B64.encode(challenge)));
-            params.push(format!("user={}", B64.encode(user.to_le_bytes())));
-            params.push(format!("name={}", url_encode(name)));
+            let handle = UserHandle::new(chain_id, *user);
+            params.push(format!("user={}", B64.encode(handle.to_bytes())));
+            let label = format!("{name} · {chain_id}");
+            params.push(format!("name={}", url_encode(&label)));
         }
         Request::Get { challenge } => {
             params.push("op=get".into());
@@ -216,17 +249,28 @@ fn binary(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("auth page result field {field:?} is not base64url: {e}"))
 }
 
-fn user_handle(value: &serde_json::Value) -> Result<Option<u64>, String> {
+fn user_handle(value: &serde_json::Value) -> Result<Option<UserHandle>, String> {
     let Some(text) = value["userHandle"].as_str() else {
         return Ok(None);
     };
     let bytes = B64
         .decode(text)
         .map_err(|e| format!("auth page userHandle is not base64url: {e}"))?;
-    let Ok(le) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-        return Err("auth page userHandle is not an 8-byte account number".into());
+    let Ok(bytes) = <[u8; 40]>::try_from(bytes.as_slice()) else {
+        return Err(
+            "the passkey has an unsupported userHandle; recreate it with \
+            `ducktape account key add --passkey` from a member device"
+                .into(),
+        );
     };
-    Ok(Some(u64::from_le_bytes(le)))
+    let mut chain_hash = [0; 32];
+    chain_hash.copy_from_slice(&bytes[..32]);
+    let mut number = [0; 8];
+    number.copy_from_slice(&bytes[32..]);
+    Ok(Some(UserHandle {
+        chain_hash,
+        number: u64::from_le_bytes(number),
+    }))
 }
 
 fn hex_0x(text: &str) -> Result<Vec<u8>, String> {
@@ -264,8 +308,8 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn bind() -> std::io::Result<Self> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    pub async fn bind() -> std::io::Result<Self> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let raw: [u8; 32] = rand::random();
         Ok(Self {
             listener,
@@ -284,18 +328,19 @@ impl Listener {
         format!("http://127.0.0.1:{port}/cb/{}", self.state)
     }
 
-    /// block until the page POSTs a result to `/cb/<state>` — anything else
+    /// Wait until the page POSTs a result to `/cb/<state>` — anything else
     /// (a wrong path, a stray GET, a malformed body) is answered and ignored,
-    /// never ends the wait — then answer it and return. Only [`abandon`],
-    /// which is handed this same `callback_url`, can end the wait early.
-    pub fn wait(self) -> Result<Outcome, String> {
+    /// never ends the wait — then answer it and return. Dropping the future
+    /// closes the listener and any accepted connection.
+    pub async fn wait(self) -> Result<Outcome, String> {
         let path = format!("/cb/{}", self.state);
         loop {
             let (stream, _) = self
                 .listener
                 .accept()
+                .await
                 .map_err(|e| format!("auth callback listener: {e}"))?;
-            if let Some(outcome) = serve_one(stream, &path)? {
+            if let Some(outcome) = serve_one(stream, &path).await? {
                 return Ok(outcome);
             }
         }
@@ -306,23 +351,23 @@ impl Listener {
 /// `expected_path`, `None` for anything else (answered and ignored — a wrong
 /// path gets a 404, a non-POST or a malformed body gets a holding/error page,
 /// but the wait keeps going in every case).
-fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcome>, String> {
-    let (method, path, body) = read_request(&mut stream)?;
+async fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcome>, String> {
+    let (method, path, body) = read_request(&mut stream).await?;
     if path != expected_path {
-        respond(&mut stream, 404, "Not found.");
+        respond(&mut stream, 404, "Not found.").await;
         return Ok(None);
     }
     if method != "POST" {
-        respond(&mut stream, 200, "Waiting for the ceremony to finish…");
+        respond(&mut stream, 200, "Waiting for the ceremony to finish…").await;
         return Ok(None);
     }
     let Some(result) = form_field(&body, "result") else {
-        respond(&mut stream, 400, "The callback carried no result.");
+        respond(&mut stream, 400, "The callback carried no result.").await;
         return Ok(None);
     };
     match parse_result(&result) {
         Ok(outcome) => {
-            respond(&mut stream, 200, "Done — you can return to ducktape.");
+            respond(&mut stream, 200, "Done — you can return to ducktape.").await;
             Ok(Some(outcome))
         }
         Err(message) => {
@@ -330,7 +375,8 @@ fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcom
                 &mut stream,
                 200,
                 "The ceremony did not complete; ducktape has the details.",
-            );
+            )
+            .await;
             Err(message)
         }
     }
@@ -338,11 +384,12 @@ fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcom
 
 /// the request line's method and path, and the body (`content-length`
 /// bounded).
-fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
+async fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
         .read_line(&mut line)
+        .await
         .map_err(|e| format!("auth callback: {e}"))?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
@@ -352,6 +399,7 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), Str
         line.clear();
         let read = reader
             .read_line(&mut line)
+            .await
             .map_err(|e| format!("auth callback: {e}"))?;
         let end_of_headers = read == 0 || line == "\r\n" || line == "\n";
         if end_of_headers {
@@ -370,11 +418,12 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), Str
     let mut body = vec![0u8; content_length];
     reader
         .read_exact(&mut body)
+        .await
         .map_err(|e| format!("auth callback body: {e}"))?;
     Ok((method, path, body))
 }
 
-fn respond(stream: &mut TcpStream, status: u16, text: &str) {
+async fn respond(stream: &mut TcpStream, status: u16, text: &str) {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
@@ -400,8 +449,8 @@ fn respond(stream: &mut TcpStream, status: u16, text: &str) {
     );
     // the page has already delivered its result; a peer that hung up before
     // reading the acknowledgement lost nothing.
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
 }
 
 /// one `application/x-www-form-urlencoded` field, decoded.
@@ -445,31 +494,6 @@ fn form_decode(value: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
-}
-
-/// give up on a ceremony: deliver an error result to `callback_url` ourselves,
-/// so a [`Listener::wait`] blocked on it returns `Err` and its thread ends —
-/// the one way to unblock a std accept. Best-effort; a listener already gone
-/// needs nothing. `callback_url` is the exact URL [`Listener::callback_url`]
-/// handed out, path (and state) included, so this lands on the same
-/// `serve_one` check any other request has to pass.
-pub fn abandon(callback_url: &str, reason: &str) {
-    let rest = callback_url.trim_start_matches("http://127.0.0.1:");
-    let (port_text, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let Ok(port) = port_text.parse::<u16>() else {
-        return;
-    };
-    let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
-        return;
-    };
-    let result = serde_json::json!({ "op": "", "error": "abandoned", "message": reason });
-    let body = format!("result={}", url_encode(&result.to_string()));
-    let request = format!(
-        "POST /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(request.as_bytes());
 }
 
 /// open `url` in the system browser; `false` when no opener is available (a
@@ -536,62 +560,75 @@ impl Relay {
         format!("{}r/{}", self.base, self.id)
     }
 
-    /// block until the phone's result lands (200) or `deadline` passes; a 204
-    /// is "not yet". Blocking on purpose — callers run it on a blocking
-    /// thread, exactly like [`Listener::wait`].
-    pub fn wait(self, deadline: Duration) -> Result<Outcome, String> {
-        self.wait_reporting(deadline, |_| {})
+    /// Wait until the phone answers (200) or `deadline` passes; a 204 is
+    /// "not yet". Dropping the future cancels requests and poll delays.
+    pub async fn wait(self, deadline: Duration) -> Result<Outcome, String> {
+        self.wait_reporting(deadline, |_| {}).await
     }
 
     /// [`Relay::wait`] that tells `progress` how long the code has left
     /// before every poll — a terminal's countdown line.
-    pub fn wait_reporting(
+    pub async fn wait_reporting(
         self,
         deadline: Duration,
         mut progress: impl FnMut(Duration),
     ) -> Result<Outcome, String> {
         let url = self.callback_url();
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| format!("relay client: {e}"))?;
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let mut polls: u32 = 0;
-        loop {
-            polls += 1;
-            progress(deadline.saturating_sub(started.elapsed()));
-            let response = client.get(&url).send().map_err(|e| {
-                tracing::warn!(target: "ducktape::auth", event = "relay_unreachable", relay = %self.id, polls, error = %e);
-                format!("relay: {e}")
-            })?;
-            match response.status().as_u16() {
-                200 => {
-                    let body = response.text().map_err(|e| format!("relay body: {e}"))?;
-                    let outcome = parse_result(&body);
-                    tracing::info!(
+        let polling = async {
+            loop {
+                polls += 1;
+                progress(deadline.saturating_sub(started.elapsed()));
+                let response = client.get(&url).send().await.map_err(|error| {
+                    let error = error.without_url();
+                    tracing::warn!(
                         target: "ducktape::auth",
-                        event = "relay_answered",
+                        event = "relay_unreachable",
                         relay = %self.id,
                         polls,
-                        waited_ms = started.elapsed().as_millis() as u64,
-                        ok = outcome.is_ok(),
+                        error = %error,
                     );
-                    return outcome;
+                    format!("relay: {error}")
+                })?;
+                match response.status().as_u16() {
+                    200 => {
+                        let body = response
+                            .text()
+                            .await
+                            .map_err(|error| format!("relay body: {}", error.without_url()))?;
+                        let outcome = parse_result(&body);
+                        tracing::info!(
+                            target: "ducktape::auth",
+                            event = "relay_answered",
+                            relay = %self.id,
+                            polls,
+                            waited_ms = started.elapsed().as_millis() as u64,
+                            ok = outcome.is_ok(),
+                        );
+                        return outcome;
+                    }
+                    204 => {
+                        tracing::trace!(target: "ducktape::auth", event = "relay_poll", relay = %self.id, polls)
+                    }
+                    other => {
+                        tracing::warn!(target: "ducktape::auth", event = "relay_refused", relay = %self.id, polls, status = other);
+                        return Err(format!("relay answered {other}"));
+                    }
                 }
-                204 => {
-                    tracing::trace!(target: "ducktape::auth", event = "relay_poll", relay = %self.id, polls)
-                }
-                other => {
-                    tracing::warn!(target: "ducktape::auth", event = "relay_refused", relay = %self.id, polls, status = other);
-                    return Err(format!("relay answered {other}"));
-                }
+                tokio::time::sleep(RELAY_POLL).await;
             }
-            let elapsed = started.elapsed();
-            if elapsed >= deadline {
+        };
+        match tokio::time::timeout_at(started + deadline, polling).await {
+            Ok(result) => result,
+            Err(_) => {
                 tracing::warn!(target: "ducktape::auth", event = "relay_timeout", relay = %self.id, polls);
-                return Err("the phone did not answer in time".into());
+                Err("the phone did not answer in time".into())
             }
-            std::thread::sleep(RELAY_POLL.min(deadline - elapsed));
         }
     }
 }
@@ -703,15 +740,25 @@ pub fn account_request() -> Request {
 /// the account a passkey assertion names in its `userHandle`. Unsigned, so it
 /// is a HINT: it picks which account to ask about, and [`login_add_key`] then
 /// accepts only a consent a key OF that account actually signed.
-pub fn assertion_account(outcome: &Outcome) -> Result<u64, String> {
+pub fn assertion_account(chain_id: &str, outcome: &Outcome) -> Result<u64, String> {
     let Outcome::Get { user_handle, .. } = outcome else {
         return Err("expected a passkey assertion (op=get)".into());
     };
-    user_handle.ok_or_else(|| {
-        "the passkey names no account (no userHandle) — register it with \
+    let Some(handle) = user_handle else {
+        return Err(
+            "the passkey names no account (no userHandle) — register it with \
          `ducktape account key add --passkey` from a member device"
-            .to_string()
-    })
+                .to_string(),
+        );
+    };
+    let expected = UserHandle::new(chain_id, handle.number);
+    let different_chain = handle.chain_hash != expected.chain_hash;
+    if different_chain {
+        return Err(format!(
+            "this passkey belongs to a different chain; select a passkey for {chain_id}"
+        ));
+    }
+    Ok(handle.number)
 }
 
 /// login, touch 2: the `get` a passkey answers to CONSENT to admitting
@@ -741,8 +788,8 @@ pub fn login_request(
 /// envelope proof an `AddKey { authorizer: { key: <that passkey>, proof } }`
 /// carries. Which of the account's `Secp256r1` keys signed is the caller's to
 /// find — by verifying the proof against each.
-pub fn login_consent(outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
-    let number = assertion_account(outcome)?;
+pub fn login_consent(chain_id: &str, outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
+    let number = assertion_account(chain_id, outcome)?;
     let Outcome::Get {
         authenticator_data,
         client_data_json,
@@ -818,6 +865,90 @@ mod tests {
     };
 
     const RP: &str = "auth.ducktape.industries";
+    const CHAIN: &str = "demo#a1b2c3d4";
+    // Independently computed with Python hashlib and Node node:crypto.
+    const HANDLE_42: &str = "6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA";
+
+    #[test]
+    fn a_chain_bound_handle_decodes_from_the_page() {
+        let json = serde_json::json!({
+            "op": "get",
+            "authenticatorData": "AQ",
+            "clientDataJSON": "Ag",
+            "signature": "Aw",
+            "userHandle": HANDLE_42,
+        });
+        let outcome = parse_result(&json.to_string()).unwrap();
+        assert_eq!(assertion_account(CHAIN, &outcome).unwrap(), 42);
+        assert!(
+            assertion_account("demo#other", &outcome)
+                .unwrap_err()
+                .contains("different chain")
+        );
+        assert!(
+            login_consent("demo#other", &outcome)
+                .unwrap_err()
+                .contains("different chain")
+        );
+    }
+
+    #[test]
+    fn registration_handles_are_stable_and_chain_scoped() {
+        let handle = UserHandle::new(CHAIN, 42);
+        assert_eq!(B64.encode(handle.to_bytes()), HANDLE_42);
+        assert_eq!(handle, UserHandle::new(CHAIN, 42));
+        assert_ne!(handle, UserHandle::new("demo#different", 42));
+        assert_ne!(handle, UserHandle::new(CHAIN, 43));
+        // Account numbers retain all 64 bits in little-endian order.
+        assert_eq!(
+            &UserHandle::new(CHAIN, u64::MAX).to_bytes()[32..],
+            &[255; 8]
+        );
+    }
+
+    #[test]
+    fn registration_labels_preserve_and_escape_the_entire_chain_id() {
+        let url = request_url(
+            "https://p/",
+            &Request::Create {
+                challenge: [0; 32],
+                user: 42,
+                chain_id: "demo#0123456789abcdef&x=+끝".into(),
+                name: "a&b #+".into(),
+            },
+            "cb",
+        );
+        assert!(url.contains(
+            "&name=a%26b%20%23%2B%20%C2%B7%20demo%230123456789abcdef%26x%3D%2B%EB%81%9D&cb="
+        ));
+    }
+
+    #[test]
+    fn old_account_only_handles_require_recreating_the_passkey() {
+        let result = parse_result(
+            r#"{"op":"get","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
+        );
+        assert!(result.is_err(), "old account-only handles must be refused");
+        assert!(result.unwrap_err().contains("recreate"));
+    }
+
+    #[test]
+    fn every_other_handle_length_is_refused() {
+        for length in 0..=65 {
+            if length == 40 {
+                continue;
+            }
+            let json = serde_json::json!({
+                "op": "get",
+                "authenticatorData": "AQ",
+                "clientDataJSON": "Ag",
+                "signature": "Aw",
+                "userHandle": B64.encode(vec![0; length]),
+            });
+            let error = parse_result(&json.to_string()).unwrap_err();
+            assert!(error.contains("recreate"), "{length} bytes: {error}");
+        }
+    }
 
     fn msg() -> sdk::Msg {
         sdk::Msg {
@@ -827,7 +958,7 @@ mod tests {
     }
 
     /// the fragment is the README's, field for field: b64url no padding,
-    /// `user` = 8-byte LE, `name`/`cb` percent-encoded.
+    /// `user` = 32-byte chain hash followed by 8-byte LE account, `name`/`cb` percent-encoded.
     #[test]
     fn the_request_url_is_the_pages_contract() {
         let mut challenge = [0u8; 32];
@@ -837,6 +968,7 @@ mod tests {
             &Request::Create {
                 challenge,
                 user: 42,
+                chain_id: CHAIN.into(),
                 name: "de mo".into(),
             },
             "http://127.0.0.1:9/",
@@ -846,8 +978,8 @@ mod tests {
         let params: Vec<&str> = fragment.split('&').collect();
         assert_eq!(params[0], "op=create");
         assert!(params[1].starts_with("challenge=AQID"), "{}", params[1]);
-        assert_eq!(params[2], "user=KgAAAAAAAAA");
-        assert_eq!(params[3], "name=de%20mo");
+        assert_eq!(params[2], format!("user={HANDLE_42}"));
+        assert_eq!(params[3], "name=de%20mo%20%C2%B7%20demo%23a1b2c3d4");
         assert_eq!(params[4], "cb=http%3A%2F%2F127.0.0.1%3A9%2F");
 
         let eth = request_url(
@@ -884,7 +1016,7 @@ mod tests {
                 .is_err()
         );
         let get = parse_result(
-            r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
+            r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -893,7 +1025,7 @@ mod tests {
                 authenticator_data: vec![1],
                 client_data_json: vec![2],
                 signature: vec![3],
-                user_handle: Some(42)
+                user_handle: Some(UserHandle::new(CHAIN, 42))
             }
         );
         let anonymous = parse_result(
@@ -933,11 +1065,13 @@ mod tests {
         (port.parse().unwrap(), format!("/{path}"))
     }
 
-    fn send(port: u16, request: &str) -> String {
-        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
+    async fn send(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
         let mut answer = String::new();
-        stream.read_to_string(&mut answer).unwrap();
+        stream.read_to_string(&mut answer).await.unwrap();
         answer
     }
 
@@ -955,36 +1089,36 @@ mod tests {
     /// process, a stray probe) is 404'd and the wait keeps going, and a
     /// right-path POST missing its `result` field is 400'd rather than
     /// aborting the ceremony.
-    #[test]
-    fn the_listener_ignores_the_wrong_path_and_serves_the_real_post() {
-        let listener = Listener::bind().unwrap();
+    #[tokio::test]
+    async fn the_listener_ignores_the_wrong_path_and_serves_the_real_post() {
+        let listener = Listener::bind().await.unwrap();
         let (port, path) = port_and_path(&listener.callback_url());
-        let served = std::thread::spawn(move || listener.wait());
+        let served = tokio::spawn(listener.wait());
 
         // wrong path entirely (an unrelated local peer guessing at paths).
-        let answer = send(port, "GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n");
+        let answer = send(port, "GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
 
         // a POST with the real body but the WRONG path — same as an attacker
         // who doesn't know this ceremony's state — must not land the result.
-        let answer = send(port, &post("/cb/wrong-state", REAL_BODY));
+        let answer = send(port, &post("/cb/wrong-state", REAL_BODY)).await;
         assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
 
         // right path, but a stray GET (a tab reload) — held, not landed.
-        let answer = send(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+        let answer = send(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")).await;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("Waiting"), "{answer}");
 
         // right path, malformed body — refused, but the wait keeps going.
-        let answer = send(port, &post(&path, "not a form body"));
+        let answer = send(port, &post(&path, "not a form body")).await;
         assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
 
         // right path, real body — this is the one that lands.
-        let answer = send(port, &post(&path, REAL_BODY));
+        let answer = send(port, &post(&path, REAL_BODY)).await;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("return to ducktape"), "{answer}");
 
-        let outcome = served.join().unwrap().unwrap();
+        let outcome = served.await.unwrap().unwrap();
         assert_eq!(
             outcome,
             Outcome::Eth {
@@ -1098,9 +1232,9 @@ mod tests {
             authenticator_data: authenticator_data.clone(),
             client_data_json: client_data_json.clone(),
             signature: signature.clone(),
-            user_handle: Some(11),
+            user_handle: Some(UserHandle::new("chain-a", 11)),
         };
-        let (number, proof) = login_consent(&outcome).unwrap();
+        let (number, proof) = login_consent("chain-a", &outcome).unwrap();
         assert_eq!(number, 11);
         assert!(KeyScheme::Secp256r1.verify(
             &passkey_pubkey(&sk),
@@ -1115,7 +1249,7 @@ mod tests {
             user_handle: None,
         };
         assert!(
-            login_consent(&anonymous)
+            login_consent("chain-a", &anonymous)
                 .unwrap_err()
                 .contains("no userHandle")
         );
@@ -1183,18 +1317,56 @@ mod tests {
         assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign, 900).is_err());
     }
 
-    /// abandoning delivers the page's error shape to the callback, so the
-    /// blocked wait returns an `Err` naming the reason and its thread ends.
-    #[test]
-    fn abandoning_unblocks_the_wait_with_the_reason() {
-        let listener = Listener::bind().unwrap();
-        let cb = listener.callback_url();
-        let served = std::thread::spawn(move || listener.wait());
-        abandon(&cb, "no answer from the browser");
-        let err = served.join().unwrap().unwrap_err();
-        assert!(err.contains("no answer from the browser"), "{err}");
-        abandon("not a callback url", "ignored");
-        abandon("http://127.0.0.1:1/", "nobody listening");
+    #[tokio::test]
+    async fn dropping_a_pending_accept_closes_the_listener() {
+        let listener = Listener::bind().await.unwrap();
+        let address = listener.listener.local_addr().unwrap();
+        let mut wait = Box::pin(listener.wait());
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partial_request_closes_the_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        peer.write_all(b"POST /cb/state HTTP/1.1\r\nContent-Length: 20\r\n\r\nx")
+            .await
+            .unwrap();
+        // Readiness is the event proving the partial request reached this socket.
+        stream.readable().await.unwrap();
+        let mut wait = Box::pin(serve_one(stream, "/cb/state"));
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_callback_ceremony_error_returns_the_reason() {
+        let listener = Listener::bind().await.unwrap();
+        let (port, path) = port_and_path(&listener.callback_url());
+        let served = tokio::spawn(listener.wait());
+        let body = format!(
+            "result={}",
+            url_encode(r#"{"op":"get","error":"cancelled","message":"browser closed"}"#)
+        );
+        let answer = send(port, &post(&path, &body)).await;
+        assert!(answer.starts_with("HTTP/1.1 200"));
+        let error = served.await.unwrap().unwrap_err();
+        assert!(error.contains("browser closed"), "{error}");
     }
 
     #[test]
@@ -1207,29 +1379,31 @@ mod tests {
         assert_eq!(form_field(b"x=1", "result"), None);
     }
 
-    /// a relay that answers 204 `absent` times, then the JSON once, then 204.
-    fn fake_relay(absent: usize, json: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    /// A finite relay server. Every accepted request is fully consumed.
+    async fn fake_relay(
+        absent: usize,
+        json: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            for (served, stream) in listener.incoming().enumerate() {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                BufReader::new(&stream).read_line(&mut line).unwrap();
-                assert!(line.starts_with("GET /r/"), "{line}");
+        let server = tokio::spawn(async move {
+            for served in 0..=absent {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, path, _) = read_request(&mut stream).await.unwrap();
+                assert_eq!(method, "GET");
+                assert!(path.starts_with("/r/"));
                 let is_the_answer = served == absent;
                 let response = match is_the_answer {
                     true => format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
                         json.len()
                     ),
                     false => "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
                 };
-                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        base
+        (base, server)
     }
 
     #[test]
@@ -1249,29 +1423,89 @@ mod tests {
         assert_ne!(Relay::at("x").id, Relay::at("x").id);
     }
 
-    #[test]
-    fn a_relay_waits_through_204s_and_takes_the_first_200() {
-        let base = fake_relay(
+    #[tokio::test]
+    async fn a_relay_waits_through_204s_and_takes_the_first_200() {
+        let (base, server) = fake_relay(
             2,
-            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
-        );
-        let outcome = Relay::at(&base).wait(Duration::from_secs(20)).unwrap();
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
+        ).await;
+        let outcome = Relay::at(&base)
+            .wait(Duration::from_secs(20))
+            .await
+            .unwrap();
+        server.await.unwrap();
         assert!(matches!(
             outcome,
             Outcome::Get {
-                user_handle: Some(42),
+                user_handle: Some(handle),
                 ..
-            }
+            } if handle == UserHandle::new(CHAIN, 42)
         ));
     }
 
-    #[test]
-    fn a_relay_gives_up_at_the_deadline() {
-        let base = fake_relay(usize::MAX, "{}");
-        let err = Relay::at(&base)
-            .wait(Duration::from_millis(10))
-            .unwrap_err();
-        assert!(err.contains("did not answer"), "{err}");
+    #[tokio::test]
+    async fn dropping_a_relay_request_closes_the_pending_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Relay::at(&format!("http://{}/", listener.local_addr().unwrap()));
+        let wait = tokio::spawn(relay.wait(Duration::from_secs(60)));
+        let (mut peer, _) = listener.accept().await.unwrap();
+        read_request(&mut peer).await.unwrap();
+        wait.abort();
+        assert!(wait.await.unwrap_err().is_cancelled());
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_relay_deadline_covers_pending_headers_and_body() {
+        for response in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let relay = Relay::at(&format!("http://{}/", listener.local_addr().unwrap()));
+            let wait = tokio::spawn(relay.wait(Duration::from_secs(5)));
+            let (mut peer, _) = listener.accept().await.unwrap();
+            read_request(&mut peer).await.unwrap();
+            peer.write_all(response.as_bytes()).await.unwrap();
+            // Pause only after the real socket exchange, then expire the entire ceremony.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let error = wait.await.unwrap().unwrap_err();
+            assert!(error.contains("did not answer"), "{error}");
+            let mut byte = [0];
+            let closed = match peer.read(&mut byte).await {
+                Ok(read) => read == 0,
+                Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+            };
+            assert!(closed, "deadline must close the pending connection");
+            tokio::time::resume();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_deadline_stops_the_delay_before_another_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Relay::at(&format!("http://{}/", listener.local_addr().unwrap()));
+        let (progress, mut polls) = tokio::sync::mpsc::unbounded_channel();
+        let wait = tokio::spawn(async move {
+            relay
+                .wait_reporting(Duration::from_secs(1), move |left| {
+                    progress.send(left).unwrap();
+                })
+                .await
+        });
+        let (mut peer, _) = listener.accept().await.unwrap();
+        read_request(&mut peer).await.unwrap();
+        peer.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        drop(peer);
+        assert!(polls.recv().await.is_some());
+        tokio::time::pause();
+        let error = wait.await.unwrap().unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
+        assert_eq!(polls.recv().await, None, "no poll after the deadline");
     }
 
     #[test]
@@ -1282,16 +1516,18 @@ mod tests {
     }
 
     /// the poller hears how long is left before each poll, shrinking.
-    #[test]
-    fn a_relay_reports_the_time_left_before_each_poll() {
-        let base = fake_relay(
+    #[tokio::test]
+    async fn a_relay_reports_the_time_left_before_each_poll() {
+        let (base, server) = fake_relay(
             2,
-            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
-        );
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"6zD6Woip0W_PPk0EWZGNZdwjPHgvY2dqMFHQVJ7xyIwqAAAAAAAAAA"}"#,
+        ).await;
         let mut seen = Vec::new();
         Relay::at(&base)
             .wait_reporting(Duration::from_secs(60), |left| seen.push(left))
+            .await
             .unwrap();
+        server.await.unwrap();
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert!(seen[0] > seen[1] && seen[1] > seen[2], "{seen:?}");
     }
@@ -1306,6 +1542,7 @@ mod tests {
             &Request::Create {
                 challenge: [9u8; 32],
                 user: 1234,
+                chain_id: CHAIN.into(),
                 name: "byeongsu".into(),
             },
             &relay.callback_url(),

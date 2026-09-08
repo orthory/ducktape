@@ -154,7 +154,6 @@ fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> boo
         | crate::MutationPhase::ChannelRename
         | crate::MutationPhase::ChannelUnarchive
         | crate::MutationPhase::CommentResolve
-        | crate::MutationPhase::ForgetWorkspace
         | crate::MutationPhase::Huddle
         | crate::MutationPhase::Onboarding
         | crate::MutationPhase::Page
@@ -442,14 +441,26 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
 /// it came from. One discriminant, one `match`, each arm ending in its own
 /// task — a boolean would have to be read twice, and the second read is
 /// where a `return if` swallows the words.
+///
+/// `scope` is the box the body was written in and `current` the box the
+/// screen would post from now: a submit queued before the reader moved —
+/// another room, another item, another network — is refused, and the arm
+/// hands it back to the box it came from rather than posting it here.
 pub fn submit_verdict(
     busy: bool,
     connected: bool,
     channel: String,
     refusal: String,
     seated: bool,
+    scope: String,
+    current: String,
 ) -> crate::SubmitVerdict {
-    let refused = busy || !connected || channel.is_empty() || !refusal.is_empty() || !seated;
+    let refused = busy
+        || !connected
+        || channel.is_empty()
+        || !refusal.is_empty()
+        || !seated
+        || scope != current;
     if refused {
         crate::SubmitVerdict::Refused
     } else {
@@ -502,7 +513,7 @@ pub fn mark_channel_read(
 
 /// One channel row with the unread decision already attached. Ice externs take
 /// lists by value, so a view-time lookup cloned the unread list once per row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSidebarRow {
     pub channel: ChatChannel,
     pub unread: bool,
@@ -562,7 +573,7 @@ pub fn chat_sidebar_rooms(
 }
 
 /// One DIRECT row with the unread decision already attached.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct DmSidebarRow {
     pub peer: DmPeer,
     pub unread: bool,
@@ -829,7 +840,7 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     let configured = if input.trim().is_empty() {
         std::env::var("DUCKTAPE_NODE")
             .ok()
-            .or_else(registered_endpoint)
+            .or_else(super::shell::lone_workspace_endpoint)
             .unwrap_or_else(|| DEFAULT_RPC.to_string())
     } else {
         input.trim().to_string()
@@ -876,7 +887,7 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
 /// [`rpc_client`], which is where this runs, holding its cache lock. The
 /// bug that shape produced was not a slow test but a dead process.
 fn operator_token_for(origin: &str) -> Option<String> {
-    let (_, workspace) = super::shell::registered_workspaces()
+    let (_, workspace) = super::shell::workspaces()
         .into_iter()
         .find(|(_, dir)| super::shell::workspace_endpoint(dir).as_deref() == Some(origin))?;
     let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;

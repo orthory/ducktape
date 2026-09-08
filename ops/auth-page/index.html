@@ -68,7 +68,7 @@ const pure = {
     const req = { op, challenge: pure.b64u.dec(get("challenge")), cb: pure.allowedCallback(p.get("cb"), origin) };
     if (op === "create") {
       req.user = pure.b64u.dec(get("user"));
-      if (req.user.length !== 8) throw new Error("user must be the 8-byte LE account number");
+      if (req.user.length !== 40) throw new Error("user must be the 40-byte chain-scoped account ID");
       req.name = get("name");
     } else if (op !== "get" && op !== "eth") {
       throw new Error(`unknown op ${op}`);

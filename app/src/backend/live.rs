@@ -79,6 +79,8 @@ pub async fn connect(
     }
     let result = async {
         let rpc = rpc_client(&rpc)?;
+        // the node the module-owned views load their deployments from
+        crate::module_view::connected(&rpc);
         load_workspace(&rpc, None, None, generation).await
     }
     .await;
@@ -256,11 +258,16 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     // back at the price of carrying a last-height in this state,
                     // and the fold path — the part that actually cost something
                     // — is already unreachable.
-                    Some(Ok(ModuleEvent::Tip { height })) => live_update(
-                        crate::LiveKind::Tip,
-                        &format!("Live · block {height}"),
-                        i64::try_from(height).unwrap_or(i64::MAX),
-                    ),
+                    Some(Ok(ModuleEvent::Tip { height })) => {
+                        // a block may have activated a module's code: the
+                        // module-owned views check their deployments
+                        tokio::spawn(crate::module_view::deployments_checked());
+                        live_update(
+                            crate::LiveKind::Tip,
+                            &format!("Live · block {height}"),
+                            i64::try_from(height).unwrap_or(i64::MAX),
+                        )
+                    }
                     Some(Err(error)) => {
                         state.stream = None;
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
@@ -1769,7 +1776,7 @@ pub async fn create_channel(
 /// (`dm_channel_id(me, key)`), computed once at load time rather than at
 /// every render. The prepared DIRECT projection uses it to attach the row's
 /// scalar unread reading when channels or read cursors move.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct DmPeer {
     pub key: String,
     pub name: String,

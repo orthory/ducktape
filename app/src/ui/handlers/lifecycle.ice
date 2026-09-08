@@ -44,6 +44,13 @@ on desktop_notifications_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
@@ -92,8 +99,6 @@ on reconnect
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -141,8 +146,8 @@ on reconnect
   page_refusal = ""
   block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
-  // The DRAFT survives, like `chat_search_draft` above — a typed-but-never-
-  // submitted query produced nothing this reset needs to discard, and this
+  // The DRAFT survives — it is the chat view's own now, and a typed-but-never-
+  // submitted query produced nothing this reset needs to discard; this
   // handler's doctrine is that typed drafts live through a reconnect. The
   // ANSWER does not: hits, flag and query go together, and the emptied query
   // is what keeps the zero-hit plate from reading the emptied list as a
@@ -449,13 +454,11 @@ on live_resynced(next)
   // that room (ducktape-ui#698). The plate is instance state now, so the
   // rescue has to say WHICH plate; a publication sits mid-handler, so the
   // guards below it still run.
-  slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing) at composer_scope(connected_rpc, active_channel)
+  composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing)
   selected_message_rev = message_seq_after_failure(selected_message_rev, MutationPhase.message_edit, selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, MutationPhase.message_edit, selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, MutationPhase.message_edit, selected_message_seq <= 0)
   channel_settings_open = channel_settings_open && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
-  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   // The line below zeroes the seq when the root was deleted or the room
@@ -685,6 +688,16 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(_cause)
 
 on select_shell_tab(next)
+  let staying_on_settings = shell_tab == ShellTab.settings && next == ShellTab.settings
+  let keeping_authentication = staying_on_settings && !empty(account_ceremony_phase)
+  return if keeping_authentication
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
   // A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)` from
   // the seat that is already active, and Settings' rows emit their own tab
   // while the reader is on it — so the retires below have to ask, or one click
@@ -1028,12 +1041,37 @@ subscribe
 // their predecessor after the successor is registered, so a handoff never
 // counts as the last close.
 on window_was_closed(id)
+  let closed_welcome = onboarding_win == some(id) && hub_step == HubStep.account
+  let closed_account = console_win == some(id)
+  let retirement = ceremony_retirement(closed_welcome, closed_account)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
   let leaving = last_window_closed_exits(console_win, onboarding_win)
-  return if !leaving
-  exit
+  match retirement
+    CeremonyRetirement.welcome
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      ceremony_detail = ""
+      ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.account
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
+      return if !leaving
+      exit
+    CeremonyRetirement.keep
+      return if !leaving
+      exit
 
 // THE STATUS ITEM'S MENU. Since a close no longer ends the process, a
 // connected network can have nothing tracked — an ordinary state, not "never
@@ -1057,6 +1095,10 @@ on tray_open
         task window focus target=window_target(onboarding_win)
 
 on tray_quit
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
   exit
 
 // ⌘ IS HELD OR IT IS NOT. The whole of this state, set from the one event that
@@ -1089,6 +1131,10 @@ on command_chord_pressed(event)
   let chord = command_chord(event.key, event.physical_key, event.modifiers)
   match chord
     CommandChord.quit
+      invalidate lane=ceremony
+      invalidate lane=desktop_ceremony
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
       exit
     CommandChord.close_window
       task window close target=window_target(focused_win)

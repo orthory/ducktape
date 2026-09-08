@@ -31,8 +31,8 @@
 //! to parse their output is all described by TOML capability specs (see
 //! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
-//! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `<ducktape home>/capabilities`). adding an executor — or retuning a built-in's
+//! path as operator-provided specs under the workspace's `capabilities/`
+//! dir. adding an executor — or retuning a built-in's
 //! flags, including which model it runs — is a config change on the
 //! operator's machine, never a code change here. dispatch is by EXPLICIT
 //! capability tag: [`ProviderSet::resolve`] takes the tag a job names,
@@ -219,7 +219,9 @@ pub use interactive::InteractiveSession;
 /// signal `ensure` rebuilds the guest image from.
 pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
-pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
+pub use spec::{
+    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource, SpecSet,
+};
 
 /// canonical label-safe identity for the node executing a provider run.
 pub fn execution_node_id(identity: &[u8]) -> String {
@@ -3189,11 +3191,10 @@ fn excerpt(s: &str) -> String {
 
 /// load this host's capability specs and probe for their binaries.
 ///
-/// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
-/// (explicitly set and missing = hard error — the operator asked for a dir
-/// that is not there) or `<ducktape home>/capabilities` when it exists. a broken
-/// spec is a hard `Err`: an operator config error fails the boot loudly, it
-/// does not silently drop an executor.
+/// spec sources: the embedded built-ins, then the workspace's `capability_dir`
+/// when it exists (an absent dir is a node offering only the built-ins). a
+/// broken spec is a hard `Err`: an operator config error fails the boot
+/// loudly, it does not silently drop an executor.
 ///
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.
@@ -3215,11 +3216,14 @@ type ExecutorLookup<'a> = (Option<OsString>, &'a dyn Fn(&str) -> Option<OsString
 
 pub fn discover(
     node_identity: &[u8],
+    capability_dir: &Path,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
     managed_owner: &str,
 ) -> Result<ProviderSet, String> {
-    let specs = SpecSet::load(operator_spec_dir().as_deref())?;
+    // the workspace's operator specs, when the workspace has any: an absent
+    // directory is a node offering only the built-in specs, not an error.
+    let specs = SpecSet::load(capability_dir.is_dir().then_some(capability_dir))?;
     let _executing_node = execution_node_id(node_identity);
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
@@ -3249,24 +3253,6 @@ pub fn discover(
         backend,
         managed_owner,
     ))
-}
-
-/// the operator spec dir: an explicit `$DUCKTAPE_CAPABILITY_DIR` is returned
-/// even if absent (so the load errors loudly), the default location only when
-/// it actually exists (absent default = simply no operator specs).
-///
-/// the default hangs off [`ducktape_home::root`] — the same root that gives
-/// this node its keys, workspaces, executors and guest images. a node run
-/// under `DUCKTAPE_HOME=/srv/duck` must not find all of those there and then
-/// read its operator specs out of `$HOME`. that resolver is a zero-dependency
-/// leaf crate, so linking it costs this crate's light consumers — agent-service
-/// and compute-service — nothing at all.
-fn operator_spec_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("DUCKTAPE_CAPABILITY_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let dir = ducktape_home::root().ok()?.join("capabilities");
-    dir.is_dir().then_some(dir)
 }
 
 /// the parameterized core of [`discover`]: specs in, providers out, all env
@@ -3472,6 +3458,14 @@ mod tests {
         None
     }
 
+    /// a workspace capability directory that does not exist: `discover`
+    /// then announces the built-in specs only, which is what every test
+    /// here wants (the crate is executor-agnostic; the tests never name an
+    /// operator spec).
+    fn no_specs() -> PathBuf {
+        scratch("no-operator-specs").join("capabilities")
+    }
+
     /// the microVM backend a hardware test uses, from the artifacts
     /// `ops/build-guest-rootfs.sh` produces.
     ///
@@ -3483,20 +3477,16 @@ mod tests {
         firecracker_backend_with(installed_executor_dir())
     }
 
-    /// this operator's own executors directory: `$DUCKTAPE_EXECUTOR_DIR`, else
-    /// `<ducktape home>/executors` — resolved through [`ducktape_home::root`],
-    /// which is what a real node resolves it through too.
+    /// the executors directory a hardware test lends its guest:
+    /// `$DUCKTAPE_EXECUTOR_DIR`, a workspace's `executors/` on the box running
+    /// the hardware lane. A test-harness variable, not the product's — a node
+    /// resolves its executors from its workspace and reads no env for them.
+    /// Unset, an empty directory: the test announces nothing and skips.
     fn installed_executor_dir() -> PathBuf {
         match std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => home_for_tests().join("executors"),
+            None => executors_of("no-installed-executors", &[]),
         }
-    }
-
-    /// the operator root a hardware test's artifacts sit under. `expect`
-    /// because a run with neither variable set has nowhere to look for them.
-    fn home_for_tests() -> PathBuf {
-        ducktape_home::root().expect("the test env resolves an operator root")
     }
 
     /// the live backend with an explicit executors directory — the one whose
@@ -3515,13 +3505,14 @@ mod tests {
         )
     }
 
-    /// the guest images the rootfs builder wrote: `$DUCKTAPE_GUEST_DIR` when a
-    /// hardware run points this at a build tree, else `<ducktape home>/guest`
-    /// — the same default the builder and the `[sandbox]` table use.
+    /// the guest images the rootfs builder wrote: `$DUCKTAPE_GUEST_DIR`, a
+    /// workspace's `guest/` on the box running the hardware lane. A
+    /// test-harness variable like `DUCKTAPE_EXECUTOR_DIR` above. Unset, a
+    /// directory holding no images: `probe()` refuses and the test skips.
     fn live_backend(vmm: sandbox_host::Vmm, executors: PathBuf) -> SandboxBackend {
         let dir = match std::env::var_os("DUCKTAPE_GUEST_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => home_for_tests().join("guest"),
+            None => scratch("no-guest-images").join("guest"),
         };
         SandboxBackend::MicroVm {
             vmm,
@@ -3562,9 +3553,15 @@ mod tests {
     fn a_microvm_node_announces_its_guest_and_never_the_host_path() {
         let empty = scratch("announce-empty").join("executors");
         std::fs::create_dir_all(&empty).expect("executors dir");
-        let announced = discover(b"n", None, firecracker_backend_with(empty), "test")
-            .expect("discover")
-            .capabilities();
+        let announced = discover(
+            b"n",
+            &no_specs(),
+            None,
+            firecracker_backend_with(empty),
+            "test",
+        )
+        .expect("discover")
+        .capabilities();
         assert!(
             announced.is_empty(),
             "an empty executors directory announces nothing, whatever is on PATH: {announced:?}"
@@ -3579,9 +3576,15 @@ mod tests {
         for name in ["codex", "codex-code-mode-host"] {
             std::fs::copy("/bin/true", installed.join(name)).expect("copy");
         }
-        let announced = discover(b"n", None, firecracker_backend_with(installed), "test")
-            .expect("discover")
-            .capabilities();
+        let announced = discover(
+            b"n",
+            &no_specs(),
+            None,
+            firecracker_backend_with(installed),
+            "test",
+        )
+        .expect("discover")
+        .capabilities();
         assert!(
             announced.iter().any(|tag| tag == "codex"),
             "an installed executor bundle is announced: {announced:?}"
@@ -4705,17 +4708,17 @@ format = "text"
         assert_eq!(set.capabilities(), vec!["myllm"]);
     }
 
-    /// This crate never resolves the operator root itself.
+    /// This crate never resolves an operator root itself.
     ///
     /// A source-parsing lint over every `src/*.rs` because the SHAPE is the
-    /// property and the seam reads process env, which this crate's discovery
-    /// path deliberately injects rather than mutates. Re-derive the root here
-    /// and a node under `DUCKTAPE_HOME=/srv/duck` finds its keys, workspaces,
-    /// executors and images there while reading its capability specs out of
-    /// `$HOME` — silently, since an absent default dir just means "no operator
-    /// specs". `ducktape_home::root()` is the answer and costs nothing to
-    /// link. The needles carry their own quotes, so the escaped spellings on
-    /// these lines are not themselves hits.
+    /// property: the capability directory is the WORKSPACE's
+    /// (`<workspace>/capabilities`), handed to [`discover`] by the daemon that
+    /// knows which workspace it serves. Re-derive a root here and a node
+    /// under `DUCKTAPE_HOME=/srv/duck` finds its keys, executors and images
+    /// in its workspace while reading its capability specs out of `$HOME` —
+    /// silently, since an absent dir just means "no operator specs". The
+    /// needles carry their own quotes, so the escaped spellings on these
+    /// lines are not themselves hits.
     #[test]
     fn operator_spec_root_is_never_resolved_in_this_crate() {
         const OVERRIDE_NEEDLE: &str = "\"DUCKTAPE_HOME\"";
@@ -4738,8 +4741,8 @@ format = "text"
         }
         assert!(
             offenders.is_empty(),
-            "these files resolve the operator root themselves instead of \
-             asking ducktape_home::root() for it: {offenders:?}"
+            "these files resolve an operator root themselves; the capability directory is \
+             the caller's workspace to name (`discover` takes it): {offenders:?}"
         );
     }
 
@@ -5785,6 +5788,7 @@ format = "text"
         Some(
             discover(
                 b"verify-node-000000000000000000000",
+                &no_specs(),
                 None,
                 backend,
                 "verify",

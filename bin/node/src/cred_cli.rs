@@ -223,14 +223,16 @@ impl VerbCtx {
     }
 
     /// the user key path for the signing verbs: explicit `--key` wins, else
-    /// THE shared wallet resolver ($DUCKTAPE_USER_KEY, else the keystore's
-    /// active wallet). A MISSING key is a loud error, never a cue to mint:
-    /// these verbs sign AS a key, and a silently minted stranger would be a
-    /// fresh, accountless identity wearing the right path.
+    /// `$DUCKTAPE_USER_KEY`, else the active wallet of the workspace behind
+    /// the node this verb dials (a wallet is an identity ON a network, so it
+    /// lives in that network's workspace). A MISSING key is a loud error,
+    /// never a cue to mint: these verbs sign AS a key, and a silently minted
+    /// stranger would be a fresh, accountless identity wearing the right path.
     pub(crate) fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-        let path = match &self.key {
-            Some(explicit) => explicit.clone(),
-            None => keystore::wallet::active_user_key()?,
+        let path = match (&self.key, keystore::wallet::env_user_key()) {
+            (Some(explicit), _) => explicit.clone(),
+            (None, Some(env)) => env,
+            (None, None) => keystore::wallet::active_key_path(&self.addr.workspace()?)?,
         };
         if !path.exists() {
             return Err(format!(

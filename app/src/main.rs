@@ -2,10 +2,12 @@ ui_lang::include_app!("src/ui/app.ice");
 
 mod backend;
 mod call;
-mod video;
+mod composer_surface;
 mod editor;
 mod module_view;
+mod shell_composer;
 mod pages;
+mod video;
 
 fn main() -> iced::Result {
     install_log();
@@ -51,9 +53,9 @@ fn install_log() {
     let filter = EnvFilter::builder()
         .parse(format!("info,{env}"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let file = backend::duck_home()
+    let file = backend::app_log_path()
         .ok()
-        .and_then(|home| node::log_file::open_rotating(&home.join("app.log")).ok());
+        .and_then(|path| node::log_file::open_rotating(&path).ok());
     let file_layer = file.map(|file| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)

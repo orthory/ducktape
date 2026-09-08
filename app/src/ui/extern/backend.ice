@@ -68,8 +68,6 @@ extern crate::backend
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
-  component agent_terminal_surface(session:&AgentTerminalSession) -> unit
-  component agent_markdown(source:str, dark:bool) -> str
   component forge_markdown(source:str, doc:str, dark:bool) -> str
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
   load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
@@ -82,15 +80,6 @@ extern crate::backend
   pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
   pure agent_host_node_choice(options:[str], current:str) -> str
   pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
-  pure agent_host_grant_note(host_node:&str, credential:&str) -> str
-  pure agent_run_line(identity:&str, host_node:&str) -> str
-  pure agent_provider_label(provider:&str) -> str
-  pure agent_provider_initial(provider:&str) -> str
-  pure agent_register_hint(provider:&str) -> str
-  pure agent_composer_hint(provider:&str) -> str
-  pure agent_task_blurb(host_node:&str) -> str
-  pure agent_terminal_note(provider:&str, credential:&str) -> str
-  pure agent_run_label(saga_id:&str) -> str
   pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
   pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
   pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
@@ -156,24 +145,35 @@ extern crate::backend
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
   HubProbe(id:str, live:bool, height:i64)
   WalletInfo(name:str, pubkey:str, state:str, active:bool)
-  HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
+  HubState(networks:[HubNetwork], preselect:str)
   hub_state() -> HubState
+  // THE PICKED NETWORK'S KEYSTORE. A wallet is an identity on one network,
+  // kept in that network's workspace, so the rows are loaded on the pick —
+  // and the load settles the session's identity to that workspace's active
+  // wallet (read without a password). `keystore` is false for an endpoint
+  // this device holds no workspace for: a remote, read-only.
+  WalletList(wallets:[WalletInfo], error:str, keystore:bool)
+  load_wallets(rpc:str) -> WalletList
+  pure wallet_door(list:&WalletList) -> WalletDoor
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
   pure network_run_hint(row:&HubNetwork) -> str
   pure hub_entry_step(wallets:[WalletInfo]) -> HubStep
   pure preselect_wallet(wallets:[WalletInfo]) -> str
-  pure refreshed_wallet_selection(wallets:[WalletInfo], current:str, preselect:str) -> str
   pure short_pubkey(pubkey:&str) -> str
-  pure active_wallet_label(name:&str) -> str
+  pure wallet_caption(network:&str) -> str
+  pure password_caption(network:&str) -> str
   pure wallet_info(name:str, pubkey:str, state:str, active:bool) -> WalletInfo
+  pure wallet_list(wallets:[WalletInfo], error:str, keystore:bool) -> WalletList
   pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
+  pure selected_network_name(networks:[HubNetwork], id:str) -> str
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   // Whether the close that just unregistered a slot ends the process: true
   // only off macOS, where no status item exists to live in, once no window
   // is left.
+  pure ceremony_retirement(welcome_closed:bool, account_closed:bool) -> CeremonyRetirement
   pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
   // "Open Ducktape" as a discriminant. Nothing tracked no longer means "never
   // connected": a connected network reopens the CONSOLE (reconnecting from
@@ -198,19 +198,18 @@ extern crate::backend
   // makes the bend safe: `hub_step` changes on every entry to these two steps,
   // so the view re-runs them. Never put either behind a `derived` — that would
   // cache an empty grid for the life of the frame cache.
-  create_device_key(password:str) -> str ! AppError
+  create_device_key(rpc:str, password:str) -> str ! AppError
   PhraseRow(left_number:str, left_word:str, right_number:str, right_word:str)
   pure phrase_rows() -> [PhraseRow]
   pure phrase_rows_of(words:&str) -> [PhraseRow]
   pure recovery_prompt() -> str
-  confirm_recovery_phrase(answer:str, password:str) -> str ! AppError
-  restore_user_key(name:str, words:secret, password:str) -> str ! AppError
-  unlock_wallet(name:str, password:str) -> str ! AppError
-  unlock_user_key(password:str) -> str ! AppError
+  confirm_recovery_phrase(rpc:str, answer:str, password:str) -> str ! AppError
+  restore_user_key(rpc:str, name:str, words:secret, password:str) -> str ! AppError
+  unlock_wallet(rpc:str, name:str, password:str) -> str ! AppError
+  unlock_user_key(rpc:str, password:str) -> str ! AppError
   lock_signer() -> bool
   remember_network(rpc:str) -> bool
-  forget_network(id:str, kind:str) -> bool
-  restore_hidden_networks() -> bool
+  forget_network(id:str) -> bool
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
@@ -241,13 +240,12 @@ extern crate::backend
   pure duck_page_link(page:str, chain_id:str) -> str
   pure duck_channel_link(channel:str, chain_id:str) -> str
   pure duck_channel_message_link(channel:str, seq:i64, chain_id:str) -> str
-  pure duck_forge_item_link(repo:str, number:i64, chain_id:str) -> str
-  pure duck_forge_repo_link(repo:str, chain_id:str) -> str
   pure startup_duck_url() -> str
   pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
   pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
+  duck_echo_f64(value:f64) -> f64 ! AppError
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:&[FsEntry]) -> [FsEntry]
@@ -311,7 +309,6 @@ extern crate::backend
   // seam for the "no account" reading Ice cannot construct itself.
   chain_id_of(rpc:str) -> str ! AppError
   pure account_data_none(generation:i64) -> AccountData
-  pure pick_gate(password:&str) -> PickGate
   pure account_probe(found:bool) -> AccountProbe
   set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
   create_account(rpc:str, password:str, name:str) -> bool ! AppError
@@ -342,7 +339,6 @@ extern crate::backend
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
-  forget_workspace(rpc:str) -> bool ! AppError
   ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
@@ -367,9 +363,8 @@ extern crate::backend
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
   pure forge_comment_cap_reached(staged:&[ForgeDraftComment]) -> bool
   pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
-  pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
+  pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure forge_parent(path:str) -> str
   pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
@@ -378,19 +373,11 @@ extern crate::backend
   pure forge_live_hit(kind:LiveKind, module:str) -> bool
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  pure forge_push_command(rpc:&str) -> str
-  pure diff_lines(diff:&str) -> [DiffLine]
   component forge_code(source:str, path:str, dark:bool) -> unit
   pure markdown_path(path:&str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
-  pure binary_note(text:&str) -> str
   component picture(surface:str, path:str) -> unit
-  pure filter_forge_items(items:&[ForgeItem], tab:ForgeTab) -> [ForgeItem]
-  pure forge_open_count(items:&[ForgeItem], kind:&str) -> i64
-  pure forge_merge_note(merge_oid:&str, branches:&str) -> str
-  pure verdict_label(verdict:&str) -> str
-  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:&str) -> str
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
@@ -455,7 +442,7 @@ extern crate::backend
   // a channel id is a user-chosen string, so two networks' `#general` are two
   // rooms — the park store this replaced had to be emptied by hand on every
   // network switch to keep one from handing its words to the other.
-  pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool) -> SubmitVerdict
+  pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool, scope:str, current:str) -> SubmitVerdict
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str

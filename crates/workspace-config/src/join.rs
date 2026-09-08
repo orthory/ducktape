@@ -20,9 +20,9 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::{
     Invite, Plumbing, Reach, ReachHint, SandboxToml, decode_invite, default_workspace_dir,
-    guard_join_descriptor, hex_bytes, list_workspaces_in, load_or_generate_identity,
+    ducktape_home, guard_join_descriptor, hex_bytes, list_workspaces_in, load_or_generate_identity,
     merged_plumbing, save_invite_fronts, save_invite_token, save_invite_wireguard,
-    validate_chain_id_shape, workspaces_root, write_node_toml,
+    validate_chain_id_shape, write_node_toml,
 };
 
 /// Plumbing the joiner wants instead of the defaults. Every field is an
@@ -70,9 +70,9 @@ pub struct JoinedWorkspace {
 
 /// Materialize the workspace an invite admits this device to.
 ///
-/// `dir` is the explicit destination; `None` puts it in the registry under the
-/// invite's chain id, so the joined node is `-n <chain-id>`-addressable and a
-/// re-join for the same chain lands in the same directory and reuses its
+/// `dir` is the explicit destination; `None` puts it in the ducktape home under
+/// the invite's chain id, so the joined node is `-n <chain-id>`-addressable and
+/// a re-join for the same chain lands in the same directory and reuses its
 /// identity.
 pub fn join_workspace(
     blob: &str,
@@ -88,7 +88,7 @@ pub fn join_workspace(
     let dir = match dir {
         Some(dir) => dir,
         None => {
-            guard_no_chain_id_collision(&workspaces_root()?, &descriptor.chain_id)?;
+            guard_no_chain_id_collision(&ducktape_home()?, &descriptor.chain_id)?;
             default_workspace_dir(&descriptor.chain_id)?
         }
     };
@@ -114,7 +114,9 @@ pub fn join_workspace(
     // platform runtime on PATH ⇒ a live `[sandbox]` table (announce stays off),
     // so agent runs and the terminal plane work without a config edit. A
     // re-join over an existing node.toml keeps the operator's choice.
-    let detected = fresh_workspace.then(detect_platform_sandbox).flatten();
+    let detected = fresh_workspace
+        .then(|| detect_platform_sandbox(&dir))
+        .flatten();
     let compute_runtime = detected.map(|(table, _found)| {
         let runtime = table.runtime.clone();
         plumbing.sandbox = Some(table);
@@ -212,38 +214,35 @@ fn fold_overlay_reach_hints(
     Ok(())
 }
 
-/// The `[sandbox]` table this platform would write, and the backend that same
-/// table resolves to.
+/// The `[sandbox]` table this platform writes: one adapter per OS —
+/// Firecracker on Linux, the vz shim on macOS — and capacity left to the boot
+/// probe. The written `0`s are "probe the host at boot", so the table carries
+/// no machine's CPU/RAM into a config that travels.
 ///
-/// Both come from ONE call so a host can never be probed for one thing and
-/// configured for another. One adapter per OS: Firecracker on Linux, the vz
-/// shim on macOS. The written `0`s are "probe the host at boot", so the table
-/// carries no machine's CPU/RAM into a config that travels.
-///
-/// The images need not exist yet — `init`/`join` run
-/// before `ops/build-guest-rootfs.sh` on a fresh box, and the loud error
-/// belongs to the boot probe, where an operator who uncommented the table is
-/// standing. [`detect_platform_sandbox`] therefore probes the ADAPTER only.
-pub fn platform_sandbox() -> Result<(SandboxToml, sandbox_host::SandboxBackend), String> {
-    let vmm = sandbox_host::Vmm::platform_default();
-    let guest = crate::default_guest_dir()?;
-    let (kernel, rootfs) = (guest.join("vmlinux"), guest.join("rootfs.ext4"));
-    let backend = sandbox_host::SandboxBackend::MicroVm {
-        vmm,
-        kernel: kernel.clone(),
-        rootfs: rootfs.clone(),
-        executors: crate::executor_dir()?,
-    };
-    let table = SandboxToml {
-        runtime: vmm.config_token().into(),
-        kernel,
-        rootfs,
-        // `0` is "probe the host at boot", not "no cores" — a written table must
-        // not pin this box's CPU/RAM into a config that travels.
+/// It names no path: the images and the executors a run needs are the
+/// workspace's own (`guest_dir`, `executor_dir`), so the table resolves to a
+/// backend only beside a workspace — [`sandbox_backend`].
+pub fn platform_sandbox() -> SandboxToml {
+    SandboxToml {
+        runtime: sandbox_host::Vmm::platform_default().config_token().into(),
         cores: 0,
         mem_gb: 0,
-    };
-    Ok((table, backend))
+    }
+}
+
+/// The backend a workspace's `[sandbox]` table resolves to: `vmm` over the
+/// guest images and the executors under `workspace`.
+///
+/// ONE constructor, so a host can never be probed over one set of paths and
+/// booted over another: `node sandbox`, `init`/`join` detection and the
+/// daemons' config resolution all build their backend here.
+pub fn sandbox_backend(workspace: &Path, vmm: sandbox_host::Vmm) -> sandbox_host::SandboxBackend {
+    sandbox_host::SandboxBackend::MicroVm {
+        vmm,
+        kernel: crate::guest_kernel(workspace),
+        rootfs: crate::guest_rootfs(workspace),
+        executors: crate::executor_dir(workspace),
+    }
 }
 
 /// Fresh-workspace compute detection: the platform adapter's runtime binary on
@@ -259,8 +258,9 @@ pub fn platform_sandbox() -> Result<(SandboxToml, sandbox_host::SandboxBackend),
 ///
 /// The path comes back because WHICH `firecracker` answered is the fact an
 /// operator with several on `PATH` needs, and only the probe knows it.
-pub fn detect_platform_sandbox() -> Option<(SandboxToml, PathBuf)> {
-    let (table, backend) = platform_sandbox().ok()?;
+pub fn detect_platform_sandbox(workspace: &Path) -> Option<(SandboxToml, PathBuf)> {
+    let table = platform_sandbox();
+    let backend = sandbox_backend(workspace, sandbox_host::Vmm::platform_default());
     backend.probe_adapter().ok().map(|found| (table, found))
 }
 
@@ -274,12 +274,15 @@ pub fn default_plumbing(dir: &Path) -> Result<Plumbing, String> {
 mod tests {
     use super::*;
 
-    /// The table `join`/`init` would write and the backend the probe would test
-    /// must name ONE runtime and ONE pair of images — a drift here surfaces as
-    /// a boot error on a machine whose images are exactly where init said.
+    /// The table `join`/`init` write and the backend a workspace resolves it
+    /// to must name ONE runtime, and every path in that backend must sit
+    /// inside the workspace — a drift here surfaces as a boot error on a
+    /// machine whose images are exactly where the builder put them.
     #[test]
-    fn the_written_table_and_the_probed_backend_name_one_runtime() {
-        let (table, backend) = platform_sandbox().expect("platform sandbox");
+    fn the_written_table_and_the_workspace_backend_name_one_runtime() {
+        let table = platform_sandbox();
+        let workspace = Path::new("/srv/duck/mynet#a1b2c3d4");
+        let backend = sandbox_backend(workspace, sandbox_host::Vmm::platform_default());
         // whether `SandboxBackend::Bare` exists here is decided by feature
         // unification — a workspace build turns sandbox-host's `testkit` on
         // through some other crate's dev-dependency, `-p workspace-config`
@@ -296,13 +299,10 @@ mod tests {
         else {
             panic!("test expects the MicroVm backend, got {backend:?}")
         };
-        assert_eq!(executors, &crate::executor_dir().expect("executor dir"));
         assert_eq!(table.runtime, vmm.config_token());
-        assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
-
-        let guest = crate::default_guest_dir().expect("guest dir");
-        assert_eq!(table.kernel, guest.join("vmlinux"));
-        assert_eq!(table.rootfs, guest.join("rootfs.ext4"));
+        assert_eq!(kernel, &workspace.join("guest").join("vmlinux"));
+        assert_eq!(rootfs, &workspace.join("guest").join("rootfs.ext4"));
+        assert_eq!(executors, &workspace.join("executors"));
         assert_eq!((table.cores, table.mem_gb), (0, 0));
     }
 
