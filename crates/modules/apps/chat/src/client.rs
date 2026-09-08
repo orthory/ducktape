@@ -2025,8 +2025,10 @@ impl MentionCandidates {
 
 /// A character that may sit inside a typed handle. Account names carry `-`,
 /// `_` and `.` (`orthory-ops` is one account), so the scan cannot stop at the
-/// first non-alphanumeric — it takes them all and then backs off.
-fn handle_char(c: char) -> bool {
+/// first non-alphanumeric — it takes them all and then backs off. The
+/// composer's mention menu reads the word under the caret by the same rule,
+/// so what it offers is exactly what this parser will resolve.
+pub fn handle_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 

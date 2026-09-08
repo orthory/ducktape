@@ -43,6 +43,8 @@ state
   // A refused or failed send hands its words back to the composer it came
   // from; the composer is a host surface, so the hand-off is a call.
   composer_stashed = false
+  // the roster hand-off's acknowledgement (`chat_composer_roster`)
+  composer_roster_set = false
   // Moves once per admitted send: the view snaps its stream to the tail on it.
   chat_sent_serial:i64 = 0
   channel_draft = ""

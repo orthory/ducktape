@@ -131,21 +131,44 @@ pub fn members_view(
     module_view("members", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The Agents tab: the registry as the app has it, drawn by the `agents`
-/// view. Nothing comes back — the register is read-only there.
+/// The Agents tab: the register as the app has it, drawn by the `agents`
+/// view — every record whole, the capability tags the network announces,
+/// the action vocabulary, and the signing account (`account`, its decimal
+/// number) so the view offers the editor to a record's controller. Its
+/// intents come back as `status` (`agent_id`, `paused`), `save` and
+/// `register` (both the whole draft record as JSON, `AgentDraft`). Every
+/// committed write bumps `committed`, which tells the view its drafts were
+/// consumed.
+#[allow(clippy::too_many_arguments)]
 pub fn agents_view(
     dark: bool,
     connected: bool,
     answered: bool,
+    account: &str,
+    committed: i64,
     rows: &[crate::backend::AgentRow],
+    capabilities: &[String],
+    actions: &[String],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "rows": rows,
+        "capabilities": capabilities,
+        "actions": actions,
+        "account": account,
+        "committed": committed,
         "connected": connected,
         "answered": answered,
         "dark": dark,
     });
     module_view("agents", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
+    match event.kind.as_str() {
+        "save" => crate::AgentsIntent::Save,
+        "register" => crate::AgentsIntent::Register,
+        _ => crate::AgentsIntent::Status,
+    }
 }
 
 pub fn roster_intent(event: &ModuleViewEvent) -> crate::RosterIntent {
@@ -1081,7 +1104,7 @@ struct ChatProps<'a> {
     channel_settings_open: bool,
     active_thread_seq: i64,
     thread_target_seq: i64,
-    thread_messages: &'a [crate::backend::ChatMessage],
+    thread_messages: std::borrow::Cow<'a, [crate::backend::ChatMessage]>,
     thread_selected_seq: i64,
     thread_selected_rev: i64,
     thread_message_action: &'static str,
@@ -1203,7 +1226,7 @@ pub fn chat_view(
         channel_settings_open,
         active_thread_seq,
         thread_target_seq,
-        thread_messages,
+        thread_messages: std::borrow::Cow::Borrowed(thread_messages),
         thread_selected_seq,
         thread_selected_rev,
         thread_message_action: message_action_name(thread_message_action),
@@ -1216,7 +1239,64 @@ pub fn chat_view(
         sent_serial,
         live_agents,
     };
-    module_view("chat", serde_json::to_vec(&props).expect("props encode"))
+    module_view("chat", encode_chat_props(props))
+}
+
+/// Body bytes the two timelines may put on one frame together: the wire
+/// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
+/// newest messages come last — a busy room's hot window (256 rows) drew its
+/// newest messages blank. The rest of the frame (rooms, names, times, the
+/// rail) lives in the headroom.
+const TIMELINE_TEXT_BUDGET: usize = 48 << 10;
+
+/// The facts encoded for the view, the timelines held to
+/// [`TIMELINE_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
+/// first, and a clipped stream says so through `has_older_history` (the
+/// thread through `thread_has_more`, its root always kept) so the view still
+/// offers what was left behind as history.
+fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
+    let (stream, stream_clipped) = newest_within(props.messages, TIMELINE_TEXT_BUDGET);
+    let stream_spent: usize = stream.iter().map(text_bytes).sum();
+    props.messages = stream;
+    props.has_older_history |= stream_clipped;
+    let thread = &*props.thread_messages;
+    // the root is drawn as its own block above the replies: it stays
+    let root = usize::from(
+        thread
+            .first()
+            .is_some_and(|message| message.thread_seq == 0),
+    );
+    let (replies, thread_clipped) = newest_within(
+        &thread[root..],
+        TIMELINE_TEXT_BUDGET
+            .saturating_sub(stream_spent + thread[..root].iter().map(text_bytes).sum::<usize>()),
+    );
+    if thread_clipped {
+        props.thread_messages =
+            std::borrow::Cow::Owned(thread[..root].iter().chain(replies).cloned().collect());
+        props.thread_has_more = true;
+    }
+    serde_json::to_vec(&props).expect("props encode")
+}
+
+/// The bytes a message puts on the wire as text.
+fn text_bytes(message: &crate::backend::ChatMessage) -> usize {
+    message.body.len() + message.author.len() + message.meta.len()
+}
+
+/// The newest tail of `messages` whose text fits `budget`, and whether
+/// anything older was left out.
+fn newest_within(
+    messages: &[crate::backend::ChatMessage],
+    budget: usize,
+) -> (&[crate::backend::ChatMessage], bool) {
+    let mut spent = 0;
+    let mut start = messages.len();
+    while start > 0 && spent + text_bytes(&messages[start - 1]) <= budget {
+        spent += text_bytes(&messages[start - 1]);
+        start -= 1;
+    }
+    (&messages[start..], start > 0)
 }
 
 fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
@@ -1317,6 +1397,13 @@ pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
 /// A refused or failed body, handed back to the composer it was written in.
 pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
     crate::composer_surface::unsent(scope, text, committed);
+    true
+}
+
+/// The room's explicit roster, as the app just read it, handed to the
+/// composers over that room (and its threads) for their mention menu.
+pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember]) -> bool {
+    crate::composer_surface::roster(scope, members);
     true
 }
 
@@ -1578,7 +1665,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         "governance" => &["vote", "execute"],
         "members" => &["copy", "agent_status", "propose"],
-        "agents" => &[],
+        "agents" => &["status", "save", "register"],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
         // `send` is deliberately NOT here: a send crosses only from the
@@ -3167,7 +3254,7 @@ pub(crate) mod tests {
     fn only_declared_intents_are_routed() {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
-        assert!(intents_of("agents").is_empty());
+        assert_eq!(intents_of("agents"), ["status", "save", "register"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(chat.contains(&"choose_channel"));
@@ -3406,7 +3493,7 @@ pub(crate) mod tests {
     }
 
     /// The bundled Agents view through the host: offline plate, then the
-    /// register, and nothing ever leaves it.
+    /// register; nothing leaves it until a reader edits a record.
     #[test]
     fn the_staged_agents_view_boots_and_takes_the_register() {
         let Some(staged) = staged("agents") else {
@@ -3424,8 +3511,21 @@ pub(crate) mod tests {
                 "rows": [{
                     "id": "reviewer-bot", "name": "Reviewer Bot", "initials": "RB",
                     "capability": "review", "status": "paused", "owner_handle": "eddy",
-                    "live": false, "skill_count": 3, "cap_count": 2
+                    "controller": "7", "live": false,
+                    "allowed_actions": ["chat.post"],
+                    "caps": {
+                        "forge_read": ["ducktape"], "forge_push": [], "duckfs_read": [],
+                        "duckfs_write": [], "tools": [], "secrets": [], "pages_write": ["*"],
+                        "subagent_budget": 0
+                    },
+                    "skills": [
+                        {"name": "review", "source_prefix": "/shared/skills/review", "source_snapshot": "", "always": true},
+                        {"name": "style", "source_prefix": "/shared/skills/style", "source_snapshot": "", "always": false},
+                        {"name": "tests", "source_prefix": "/shared/skills/tests", "source_snapshot": "", "always": false}
+                    ]
                 }],
+                "capabilities": ["claude", "review"], "actions": ["chat.post", "tasks.create"],
+                "account": "", "committed": 0,
                 "connected": true, "answered": true, "dark": false
             }))
             .expect("props encode"),
@@ -4172,6 +4272,34 @@ pub(crate) mod tests {
     }
 
     fn chat_facts() -> Option<Vec<u8>> {
+        chat_facts_with(&[first_light()], &[])
+    }
+
+    fn first_light() -> crate::backend::ChatMessage {
+        crate::backend::ChatMessage {
+            id: "m1".into(),
+            view_key: 1,
+            seq: 1,
+            author: "mallard".into(),
+            meta: "h 84,912".into(),
+            body: "first light".into(),
+            blocks: crate::backend::paragraph_blocks("first light"),
+            show_author: true,
+            initial: "M".into(),
+            avatar_kind: "human".into(),
+            height: 84_912,
+            time: 84_912,
+            rev: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The chat facts with `messages` as the stream, encoded the way the
+    /// host encodes them.
+    fn chat_facts_with(
+        messages: &[crate::backend::ChatMessage],
+        thread: &[crate::backend::ChatMessage],
+    ) -> Option<Vec<u8>> {
         let general = crate::backend::ChatChannel {
             id: "channel-a".into(),
             name: "general".into(),
@@ -4192,22 +4320,6 @@ pub(crate) mod tests {
                 unread: true,
             },
         ];
-        let messages = [crate::backend::ChatMessage {
-            id: "m1".into(),
-            view_key: 1,
-            seq: 1,
-            author: "mallard".into(),
-            meta: "h 84,912".into(),
-            body: "first light".into(),
-            blocks: crate::backend::paragraph_blocks("first light"),
-            show_author: true,
-            initial: "M".into(),
-            avatar_kind: "human".into(),
-            height: 84_912,
-            time: 84_912,
-            rev: 1,
-            ..Default::default()
-        }];
         let props = ChatProps {
             dark: false,
             endpoint: "http://127.0.0.1:1",
@@ -4238,7 +4350,7 @@ pub(crate) mod tests {
             huddle_joined_at: 0,
             huddle_now: 0,
             call_muted: false,
-            messages: &messages,
+            messages,
             has_older_history: false,
             history_view: false,
             at_live_tail: true,
@@ -4251,7 +4363,7 @@ pub(crate) mod tests {
             channel_settings_open: false,
             active_thread_seq: 0,
             thread_target_seq: 0,
-            thread_messages: &[],
+            thread_messages: std::borrow::Cow::Borrowed(thread),
             thread_selected_seq: 0,
             thread_selected_rev: 0,
             thread_message_action: "toolbar",
@@ -4263,7 +4375,100 @@ pub(crate) mod tests {
             copy_surface: "nowhere",
             sent_serial: 0,
         };
-        Some(serde_json::to_vec(&props).expect("props encode"))
+        Some(encode_chat_props(props))
+    }
+
+    /// A busy room's whole hot window through the real wire: the newest
+    /// message must still read, and the clipped older ones are offered as
+    /// history.
+    #[test]
+    fn the_newest_message_of_a_busy_room_still_reads_through_the_wire() {
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        // 40 rows of 2 KB: past the wire's 64 KiB frame budget, and few
+        // enough rows that the guest lays them out inside one tick
+        const ROWS: i64 = 40;
+        let messages: Vec<_> = (1..=ROWS)
+            .map(|seq| {
+                let body = format!("m{seq} {}", "x".repeat(2_000));
+                crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(seq)
+                }
+            })
+            .collect();
+        let props = chat_facts_with(&messages, &[]);
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let newest = format!("m{ROWS} ");
+        assert!(
+            shown.iter().any(|text| text.starts_with(&newest)),
+            "the newest message is blank (fault {:?}): last texts {:?}",
+            guest.fault,
+            shown
+                .iter()
+                .rev()
+                .take(6)
+                .map(|text| &text[..text.len().min(24)])
+                .collect::<Vec<_>>()
+        );
+        let props_text = String::from_utf8(props.unwrap()).unwrap();
+        assert!(
+            props_text.contains(r#""has_older_history":true"#),
+            "the clip is history"
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    fn first_light_at(seq: i64) -> crate::backend::ChatMessage {
+        crate::backend::ChatMessage {
+            id: format!("m{seq}"),
+            view_key: seq,
+            seq,
+            ..first_light()
+        }
+    }
+
+    /// The budget keeps the newest, drops the oldest, says so; the thread
+    /// keeps its root.
+    #[test]
+    fn the_timeline_budget_drops_the_oldest_first_and_keeps_the_thread_root() {
+        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
+            author: String::new(),
+            meta: String::new(),
+            body: "x".repeat(bytes),
+            ..first_light_at(seq)
+        };
+        let stream = [row(1, 100), row(2, 100), row(3, 100)];
+        assert_eq!(newest_within(&stream, 250).0.len(), 2);
+        assert_eq!(newest_within(&stream, 250).0[0].seq, 2);
+        assert!(newest_within(&stream, 250).1);
+        assert_eq!(newest_within(&stream, 300), (&stream[..], false));
+
+        let big = TIMELINE_TEXT_BUDGET / 2;
+        let root = crate::backend::ChatMessage {
+            thread_seq: 0,
+            ..row(10, 10)
+        };
+        let reply = |seq| crate::backend::ChatMessage {
+            thread_seq: 10,
+            ..row(seq, big)
+        };
+        let thread = [root, reply(11), reply(12), reply(13)];
+        let facts: serde_json::Value =
+            serde_json::from_slice(&chat_facts_with(&[], &thread).unwrap()).unwrap();
+        assert_eq!(facts["thread_has_more"], true);
+        let kept: Vec<i64> = facts["thread_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(kept, [10, 13], "the root, then the newest reply that fits");
     }
 
     /// The facts a module's host pushes, and one word of them the tree

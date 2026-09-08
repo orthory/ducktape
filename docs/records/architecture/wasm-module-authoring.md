@@ -146,9 +146,9 @@ repository are built the same way; only who writes the shell differs.
 default, so push first — and never out of the checkout in place: it synthesizes
 a shell workspace under `target/guest-builder/<id>/` whose one dependency is
 the module (its `guest` feature on) as a git source, pins the revision in the
-shell lock, builds for `wasm32-unknown-unknown`, componentizes with
-`wasm-tools` at the version pinned in `wasm-tools.version`, and writes `component.wasm` and `guest.lock` into the module
-directory. The lock is the record of the build (the revision, every registry
+shell lock, builds for `wasm32-unknown-unknown`, componentizes through the
+`wit-component` crate it links, and writes `component.wasm` and `guest.lock`
+into the module directory. The lock is the record of the build (the revision, every registry
 version) and the seed of the next one. Uncommitted inputs in the module,
 its resolved SDK and sibling packages, or workspace build configuration are
 refused, including staged and untracked sources. Artifacts and `guest.lock`
@@ -178,12 +178,12 @@ line added anywhere above them in `crates/module-sdk/src/lib.rs` (a comment
 included) moves every guest that expands them. They are identical from any box:
 the unpacked revision, the cargo home, the rustup home and the scratch are
 remapped to fixed tokens. They are toolchain-dependent, and the toolchain is two pins:
-a rebuild on another rustc, or through another `wasm-tools` (the componentizer
+a rebuild on another rustc, or through another componentizer release (it
 writes the component's own sections and they move between releases), may
 legitimately differ, so moving either pin rebuilds the whole set and commits it
-as one change. `rust-toolchain.toml` holds the channel and `wasm-tools.version`
-holds the componentizer version. `bin/guest-builder` refuses to build through any other
-componentizer version.
+as one change. `rust-toolchain.toml` holds the channel and
+`bin/guest-builder/Cargo.toml` pins the componentizer (`wit-component`), which
+the builder links rather than finds on a PATH.
 
 The committed copies of one module's component MUST stay byte-identical
 (nothing is embedded: the founder bundles the canonical artifact and the
@@ -191,7 +191,7 @@ descriptor commits the component-plus-mapper deployment hash; the kernel
 test fixtures — the node pins' bundle — carry the same bytes).
 `wasm-modules-check` gates that and rides the pre-push `make test` gate;
 `wasm-rebuild-check` gates the artifact against its source and needs the wasm32
-target, the pinned `wasm-tools` and a pushed HEAD.
+target and a pushed HEAD.
 
 ### Out-of-tree modules
 
@@ -225,9 +225,11 @@ blst = { git = "https://github.com/orthory/ducktape", rev = "<sha>" }
 `ducktape_module_sdk::sdk`. Build and componentize:
 
 ```
-cargo install wasm-tools --locked --version 1.253.0   # the pinned componentizer
 cargo build --target wasm32-unknown-unknown --release
-wasm-tools component new target/wasm32-unknown-unknown/release/example_module.wasm -o component.wasm
+# the componentizer at the revision the module pins — the bytes the network's
+# own modules came out of
+cargo install --locked --git https://github.com/orthory/ducktape --rev <sha> guest-builder
+guest-builder componentize target/wasm32-unknown-unknown/release/example_module.wasm --out component.wasm
 ```
 
 Every platform crate the module reads must come from that ONE revision: a

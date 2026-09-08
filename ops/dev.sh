@@ -66,9 +66,15 @@ bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 # this machine (hypervisor present, guest images built) and names the fix when
 # they disagree — otherwise the disagreement is silent until the compute daemon
 # dies at boot. --yes because the one write it may offer is enabling the table,
-# and a dev node's own compute plane is not a separate decision.
-"$NODE_BIN" node sandbox --config "$WSDIR/node.toml" --yes \
-  || log "this workspace will refuse provider runs — see above"
+# and a dev node's own compute plane is not a separate decision. Its exit status
+# IS the verdict: the two services that can only run inside that plane are
+# started below on it, instead of started to die on the same missing table.
+if "$NODE_BIN" node sandbox --config "$WSDIR/node.toml" --yes; then
+  COMPUTE_PLANE=on
+else
+  COMPUTE_PLANE=off
+  log "this workspace will refuse provider runs — see above"
+fi
 
 # The workspace's app endpoint — the same `http_listen` key the app reads.
 LISTEN="$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
@@ -136,8 +142,15 @@ start_service(){
   log "full log: $WSDIR/dev-$kind.log"
 }
 
-start_service compute
-start_service agent
+case "$COMPUTE_PLANE" in
+  on)
+    start_service compute
+    start_service agent
+    ;;
+  off)
+    log "no compute plane on this host — the compute and agent services are not started; Shell is unavailable until the sandbox prerequisites above are installed"
+    ;;
+esac
 start_service airlock
 
 # The forge module starts empty, so the fresh demo node hosts no repo at all.

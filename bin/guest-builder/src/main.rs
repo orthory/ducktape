@@ -12,6 +12,7 @@
 //! ```text
 //! guest-builder <module-dir> [--index] [--rev <sha>]
 //!               [--out <artifact.wasm>] [--scratch <dir>]
+//! guest-builder componentize <core.wasm> --out <component.wasm>
 //! ```
 //!
 //! the shell's ONE dependency is the module, reached out of the platform
@@ -19,8 +20,9 @@
 //! lock pins — never out of the checkout in place. that is what makes a module
 //! independently buildable and its bytes reproducible: the build inputs are
 //! the module's revision, its lock, and the toolchain — the rust channel
-//! `rust-toolchain.toml` pins and the componentizer [`WASM_TOOLS_VERSION`]
-//! pins — and nothing else.
+//! `rust-toolchain.toml` pins and the componentizer this crate links
+//! (`wit-component`, pinned in its manifest; see the crate root) — and
+//! nothing else.
 //!
 //! * every platform crate the module reads (the SDK, a sibling's wire types,
 //!   the wasm32 patch stubs) resolves inside that one git source at that one
@@ -53,10 +55,10 @@
 //! core wasm (`index.wasm`, no componentize step): the fluent31 engine
 //! executes plain wasm32 modules, not components.
 //!
-//! a module authored outside this repository needs none of this: its crate is
-//! the cdylib, it pins `ducktape-module-sdk` and the patch stubs by git
-//! revision in its own manifest, and plain cargo + `wasm-tools component new`
-//! build it.
+//! a module authored outside this repository needs none of the shell: its
+//! crate is the cdylib, it pins `ducktape-module-sdk` and the patch stubs by
+//! git revision in its own manifest, and plain cargo + the `componentize`
+//! verb (or `wasm-tools component new` at the same release) build it.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -70,18 +72,9 @@ use std::process::{self, Command};
 /// different bytes for the same revision.
 const PLATFORM_GIT: &str = "https://github.com/orthory/ducktape";
 
-/// the componentizer every committed component came out of. see
-/// [`refuse_other_componentizer`] for why it is pinned rather than floating;
-/// `the_workflows_install_the_pinned_componentizer` keeps CI in step with it.
-const WASM_TOOLS_VERSION: &str = include_str!("../../../wasm-tools.version").trim_ascii();
-
-/// how to get it, carried in every message that names it.
-fn install_wasm_tools() -> String {
-    format!("cargo install wasm-tools --locked --version {WASM_TOOLS_VERSION}")
-}
-
 const USAGE: &str = "usage: guest-builder <module-dir> [--index] [--rev <sha>] \
-     [--out <artifact.wasm>] [--scratch <dir>]";
+     [--out <artifact.wasm>] [--scratch <dir>]\n       \
+     guest-builder componentize <core.wasm> --out <component.wasm>";
 
 /// which of a module's two guests to build. the consensus component and the
 /// index mapper share the shell; everything guest-specific — contract
@@ -144,7 +137,13 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args = parse_args()?;
+    match parse_args()? {
+        Args::Build(args) => build_guest(args),
+        Args::Componentize { core, out } => componentize(&core, &out),
+    }
+}
+
+fn build_guest(args: BuildArgs) -> Result<(), String> {
     let kind = args.kind;
     let platform_root = default_platform_root()?;
     let module_dir = canonical(&args.module_dir)?;
@@ -217,7 +216,14 @@ fn write_artifact(kind: GuestKind, cdylib: &Path, out: &Path) -> Result<(), Stri
 // argument parsing
 // ============================================================================
 
-struct Args {
+/// the two things the tool does: build a module's guest out of the
+/// repository, or wrap one already-built core module as a component.
+enum Args {
+    Build(BuildArgs),
+    Componentize { core: PathBuf, out: PathBuf },
+}
+
+struct BuildArgs {
     module_dir: PathBuf,
     kind: GuestKind,
     rev: Option<String>,
@@ -226,13 +232,51 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    let mut argv = env::args().skip(1).peekable();
+    let is_the_componentize_verb = argv.peek().is_some_and(|arg| arg == "componentize");
+    if is_the_componentize_verb {
+        argv.next();
+        return parse_componentize_args(argv);
+    }
+    parse_build_args(argv).map(Args::Build)
+}
+
+fn parse_componentize_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut core = None;
+    let mut out = None;
+    while let Some(arg) = argv.next() {
+        match arg.as_str() {
+            "--out" => {
+                out = Some(PathBuf::from(
+                    argv.next()
+                        .ok_or_else(|| format!("--out needs a value\n{USAGE}"))?,
+                ));
+            }
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown flag {flag}\n{USAGE}"));
+            }
+            positional => {
+                let unclaimed = core.is_none();
+                if !unclaimed {
+                    return Err(format!("unexpected argument {positional}\n{USAGE}"));
+                }
+                core = Some(PathBuf::from(positional));
+            }
+        }
+    }
+    let (Some(core), Some(out)) = (core, out) else {
+        return Err(USAGE.to_string());
+    };
+    Ok(Args::Componentize { core, out })
+}
+
+fn parse_build_args(mut argv: impl Iterator<Item = String>) -> Result<BuildArgs, String> {
     let mut module_dir = None;
     let mut kind = GuestKind::Component;
     let mut rev = None;
     let mut out = None;
     let mut scratch = None;
 
-    let mut argv = env::args().skip(1);
     while let Some(arg) = argv.next() {
         let flag_value = |argv: &mut dyn Iterator<Item = String>| {
             argv.next()
@@ -259,7 +303,7 @@ fn parse_args() -> Result<Args, String> {
     let Some(module_dir) = module_dir else {
         return Err(USAGE.to_string());
     };
-    Ok(Args {
+    Ok(BuildArgs {
         module_dir,
         kind,
         rev,
@@ -290,7 +334,8 @@ fn read_module(platform_root: &Path, module_dir: &Path) -> Result<Module, String
         return Err(format!(
             "{} is outside the platform checkout {} — guest-builder builds the modules of \
              this repository; a module authored elsewhere is its own cdylib crate pinning \
-             ducktape-module-sdk by git revision, built with cargo and wasm-tools directly",
+             ducktape-module-sdk by git revision, built with cargo and `guest-builder \
+             componentize` directly",
             module_dir.display(),
             platform_root.display()
         ));
@@ -707,45 +752,13 @@ fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result
     Ok(())
 }
 
+/// the one place every gated artifact is componentized: the linked
+/// componentizer (the crate root), never a binary found on a PATH.
 fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
-    refuse_other_componentizer()?;
-    let status = Command::new("wasm-tools")
-        .arg("component")
-        .arg("new")
-        .arg(cdylib)
-        .arg("-o")
-        .arg(out)
-        .status()
-        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
-    if !status.success() {
-        return Err(format!("componentizing {} failed", cdylib.display()));
-    }
-    Ok(())
-}
-
-/// the componentizer writes the component's own sections, and they move
-/// between releases: 1.253 and 1.258 spell `target_features` differently, so
-/// one cdylib becomes two artifacts. that makes `wasm-tools` a build input
-/// exactly like the rust channel, and `cargo install wasm-tools` floats to the
-/// newest release — a box that ran it last week and a CI runner that runs it
-/// today disagree on every component. pinned here because this is the one
-/// place every gated artifact is componentized.
-fn refuse_other_componentizer() -> Result<(), String> {
-    let output = Command::new("wasm-tools")
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
-    let installed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let pinned = format!("wasm-tools {WASM_TOOLS_VERSION}");
-    let is_the_pinned_componentizer = output.status.success() && installed == pinned;
-    if is_the_pinned_componentizer {
-        return Ok(());
-    }
-    Err(format!(
-        "{installed} componentizes to different bytes than {pinned}, which every \
-         committed component came out of:\n    {}",
-        install_wasm_tools()
-    ))
+    let core = fs::read(cdylib).map_err(|e| format!("reading {}: {e}", cdylib.display()))?;
+    let component = guest_builder::componentize(&core)
+        .map_err(|e| format!("componentizing {}: {e}", cdylib.display()))?;
+    fs::write(out, component).map_err(|e| format!("writing {}: {e}", out.display()))
 }
 
 /// an index guest ships as the built cdylib itself — fluentabi is core wasm,
@@ -810,27 +823,6 @@ fn write(path: &Path, content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// every workflow that componentizes must install the pinned
-    /// componentizer, or the runner refuses the build it was added to run.
-    /// two places, one version: this is what keeps them one.
-    #[test]
-    fn the_workflows_install_the_pinned_componentizer() {
-        let root = default_platform_root().unwrap();
-        let install = r#"cargo install wasm-tools --locked --version "$(cat wasm-tools.version)""#;
-        for workflow in ["pr.yml", "guest-wasm-mac-smoke.yml"] {
-            let path = root.join(".github/workflows").join(workflow);
-            let text = fs::read_to_string(&path).unwrap();
-            let installs_wasm_tools = text.contains("cargo install wasm-tools");
-            if !installs_wasm_tools {
-                continue;
-            }
-            assert!(
-                text.contains(install),
-                "{workflow} installs a componentizer other than the pinned one:\n    {install}"
-            );
-        }
-    }
 
     /// a written git reference is hashed into every symbol name, so the shell
     /// must name the module by source alone and leave the revision to the lock.

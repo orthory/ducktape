@@ -213,10 +213,10 @@ view
         members:
           extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
         agents:
-          // the agents view declares no intents, so nothing ever arrives on
-          // this route; the extern needs one and the roster handler is the
-          // honest destination
-          extern agents_view(dark, connected, agents_answered, agents_rows) #agents -> members_view_event _
+          // the register whole, with the editor's pick lists and the signing
+          // account; every write comes back as an intent the roster handler
+          // signs
+          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_capabilities, agents_actions) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
         // the code browse's listing and file, and the discussion go in as
         // props; every act comes back as an intent the handler signs. The

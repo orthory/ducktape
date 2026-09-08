@@ -8,13 +8,16 @@
 //! marker grammar the message renderer parses, so what lights up while typing
 //! is exactly what the sent message will format. Marks do not nest; the first
 //! matching delimiter wins; there are no word-boundary rules. Mentions are the
-//! one renderer mark not previewed here: they need the member roster, and the
-//! composer is not worth a roster prop while the plain-ink fallback reads fine.
+//! one renderer mark not previewed as ink: they need the member roster, which
+//! reaches the composer surface as its mention menu instead — the `@word`
+//! under the caret ([`mention_query`]) against the handles the send will
+//! resolve ([`mention_matches`]), completed in place ([`complete_mention`]).
 
+use crate::backend::handle_char;
 use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
 use iced::keyboard::{Key, key::Named};
-use iced::widget::text_editor::{self, Binding, Content, Cursor, Edit, KeyPress, Motion};
+use iced::widget::text_editor::{self, Binding, Content, Cursor, Edit, KeyPress, Motion, Position};
 use iced::{Border, Color, Element, Font};
 use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
@@ -84,6 +87,112 @@ pub enum ComposerEvent {
     /// caret, instead of bubbling to the app's one keyboard subscription
     /// (which cannot see widget focus, let alone a component instance).
     Mark(String),
+    /// A key the open mention menu claimed: the arrows walk it, Enter and
+    /// Tab take the highlighted handle, Escape closes it for this word.
+    Menu(MenuKey),
+}
+
+/// What a key does to an open mention menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuKey {
+    Up,
+    Down,
+    Pick,
+    Dismiss,
+}
+
+/// The `@word` the caret sits at the end of: its line, where the `@` is and
+/// where the caret is (byte columns, the editor's own unit), and what has
+/// been typed after the `@`. `None` when the caret is not finishing a
+/// mention — a selection is standing, the `@` does not open a word, the word
+/// carries a character no handle can, or the caret is inside the word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionQuery {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub partial: String,
+}
+
+pub fn mention_query(document: &Content) -> Option<MentionQuery> {
+    let cursor = document.cursor();
+    if cursor.selection.is_some() {
+        return None;
+    }
+    let Position { line, column } = cursor.position;
+    let text = document.line(line)?.text.into_owned();
+    let before = text.get(..column)?;
+    let after = text.get(column..)?;
+    let caret_ends_the_word = after.chars().next().is_none_or(|c| !handle_char(c));
+    if !caret_ends_the_word {
+        return None;
+    }
+    let at = before.rfind('@')?;
+    let partial = &before[at + 1..];
+    let partial_is_a_handle = partial.chars().all(handle_char);
+    let at_opens_a_word = before[..at]
+        .chars()
+        .next_back()
+        .is_none_or(char::is_whitespace);
+    if !partial_is_a_handle || !at_opens_a_word {
+        return None;
+    }
+    Some(MentionQuery {
+        line,
+        start: at,
+        end: column,
+        partial: partial.to_owned(),
+    })
+}
+
+/// The handles `partial` prefixes, case-insensitively, alphabetical: the
+/// menu's rows. `handles` is what the send parser resolves, so a row is
+/// always a mention that will land.
+pub fn mention_matches(handles: &[&str], partial: &str) -> Vec<String> {
+    let needle = partial.to_ascii_lowercase();
+    let mut matches: Vec<String> = handles
+        .iter()
+        .filter(|handle| handle.starts_with(&needle))
+        .map(|handle| (*handle).to_owned())
+        .collect();
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+/// Replace the typed `@partial` with `@handle ` and leave the caret after
+/// the space, ready for the next word.
+pub fn complete_mention(mut document: Content, query: &MentionQuery, handle: &str) -> Content {
+    document.move_to(Cursor {
+        position: Position {
+            line: query.line,
+            column: query.end,
+        },
+        selection: Some(Position {
+            line: query.line,
+            column: query.start,
+        }),
+    });
+    document.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+        std::sync::Arc::new(format!("@{handle} ")),
+    )));
+    document
+}
+
+/// The menu key a press is, while the menu is open: the arrows, Enter, Tab
+/// and Escape without a command modifier. Every other press — and every press
+/// while the menu is closed — is the editor's.
+fn menu_key(press: &KeyPress, menu_open: bool) -> Option<MenuKey> {
+    if !menu_open || press.modifiers.command() {
+        return None;
+    }
+    match press.key {
+        Key::Named(Named::ArrowUp) => Some(MenuKey::Up),
+        Key::Named(Named::ArrowDown) => Some(MenuKey::Down),
+        Key::Named(Named::Enter) | Key::Named(Named::Tab) => Some(MenuKey::Pick),
+        Key::Named(Named::Escape) => Some(MenuKey::Dismiss),
+        _ => None,
+    }
 }
 
 /// Put the caret at `cursor`. iced 0.14's `Content::move_to` sets the caret
@@ -105,7 +214,8 @@ pub fn apply_composer_event(document: Content, event: ComposerEvent) -> Content 
         ComposerEvent::Apply(RichAction::Edit(action)) => document.perform(action),
         ComposerEvent::Apply(RichAction::MoveTo(cursor)) => move_to(&mut document, cursor),
         ComposerEvent::Mark(kind) => return composer_toggle_mark(document, kind),
-        ComposerEvent::Submit => {}
+        // the menu's keys act on the surface's menu state, not the words
+        ComposerEvent::Submit | ComposerEvent::Menu(_) => {}
     }
     document
 }
@@ -158,10 +268,14 @@ fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
     Some(ComposerEvent::Mark(mark.to_owned()))
 }
 
+/// The composer editor. `menu_open` says a mention menu is showing over
+/// this composer, so the arrows, Enter, Tab and Escape are the menu's
+/// ([`ComposerEvent::Menu`]) instead of the editor's for as long as it is.
 pub fn rich_composer(
     document: &Content,
     hint: String,
     disabled: bool,
+    menu_open: bool,
     min_h: f64,
     max_h: f64,
     pad: f64,
@@ -179,11 +293,18 @@ pub fn rich_composer(
         // format_key 0: the format table is static — no theme or mode inputs.
         .highlight_with::<InlineMarkdownHighlighter>((), 0, inline_format)
         .style(composer_style)
-        .key_binding(composer_key_binding);
+        .key_binding(move |press| composer_key_binding(press, menu_open));
     if disabled {
         return editor.into();
     }
-    editor.on_action(classify).on_chord(composer_chord).into()
+    editor
+        .on_action(classify)
+        .on_chord(move |press| {
+            menu_key(press, menu_open)
+                .map(ComposerEvent::Menu)
+                .or_else(|| composer_chord(press))
+        })
+        .into()
 }
 
 /// The widget's change-detection key: equal versions promise equal text
@@ -201,8 +322,13 @@ fn content_version(document: &Content) -> ContentVersion {
 /// widget's `key_binding` seam (ducktape-ui#601), which retired the lagged
 /// `shift_held` mirror and the `keyboard modifiers` subscription that fed it.
 /// ⇧↵ becomes a newline paste HERE, so the only press that can reach
-/// [`classify`] as `Edit::Enter` is a plain Enter — the submit.
-fn composer_key_binding(press: &KeyPress) -> Option<Binding<Edit>> {
+/// [`classify`] as `Edit::Enter` is a plain Enter — the submit. A press the
+/// open mention menu claims resolves to NO binding, which is what routes it
+/// to the `on_chord` seam where [`menu_key`] reads it.
+fn composer_key_binding(press: &KeyPress, menu_open: bool) -> Option<Binding<Edit>> {
+    if menu_key(press, menu_open).is_some() {
+        return None;
+    }
     let enter = matches!(press.key, Key::Named(Named::Enter));
     if !enter {
         return default_key_binding(press);
@@ -378,7 +504,6 @@ fn url_len(rest: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use text_editor::Position;
 
     /// A press after a drag is a fresh caret, not a drag from the old anchor:
     /// the widget sends `MoveTo { selection: None }`, and iced's own `move_to`
@@ -510,14 +635,14 @@ mod tests {
 
         // Plain Enter keeps the stock binding, and classify reads it as the
         // submit — the widget publishes `Edit::Enter` for no other press.
-        let plain = composer_key_binding(&enter_press(iced::keyboard::Modifiers::empty()));
+        let plain = composer_key_binding(&enter_press(iced::keyboard::Modifiers::empty()), false);
         assert!(matches!(plain, Some(Binding::Enter)));
         let enter = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter));
         assert_eq!(classify(enter), ComposerEvent::Submit);
 
         // ⇧↵ becomes a newline PASTE at the press, so it reaches classify as
         // an ordinary edit and breaks the line instead of posting.
-        let shifted = composer_key_binding(&enter_press(iced::keyboard::Modifiers::SHIFT))
+        let shifted = composer_key_binding(&enter_press(iced::keyboard::Modifiers::SHIFT), false)
             .expect("shift+enter binds");
         let Binding::Custom(edit) = shifted else {
             panic!("shift+enter must rewrite into a custom edit, got {shifted:?}");
@@ -606,6 +731,59 @@ mod tests {
         let document = Content::with_text("draft");
         let document = apply_composer_event(document, ComposerEvent::Mark("bold".into()));
         assert_eq!(document.text().trim_end(), "****draft");
+    }
+
+    /// While a mention menu is open, the arrows, Enter, Tab and Escape are
+    /// the menu's: they bind to NOTHING in the editor (which routes them to
+    /// the chord seam) and read as menu keys there. With the menu closed, or
+    /// under a command modifier, every one of them is the editor's again.
+    #[test]
+    fn menu_keys_are_claimed_only_while_the_menu_is_open() {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::{Code, Physical};
+        let press = |named: Named, modifiers: Modifiers| KeyPress {
+            key: Key::Named(named),
+            modified_key: Key::Named(named),
+            physical_key: Physical::Code(Code::Enter),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        for (named, expected) in [
+            (Named::ArrowUp, MenuKey::Up),
+            (Named::ArrowDown, MenuKey::Down),
+            (Named::Enter, MenuKey::Pick),
+            (Named::Tab, MenuKey::Pick),
+            (Named::Escape, MenuKey::Dismiss),
+        ] {
+            let open = press(named, Modifiers::empty());
+            assert_eq!(menu_key(&open, true), Some(expected), "{named:?}");
+            assert!(
+                composer_key_binding(&open, true).is_none(),
+                "{named:?} binds nothing"
+            );
+            assert_eq!(
+                menu_key(&open, false),
+                None,
+                "{named:?} with the menu closed"
+            );
+            assert_eq!(menu_key(&press(named, Modifiers::COMMAND), true), None);
+        }
+        // Plain Enter with the menu closed is still the submit
+        assert!(matches!(
+            composer_key_binding(&press(Named::Enter, Modifiers::empty()), false),
+            Some(Binding::Enter)
+        ));
+        // a letter is never the menu's
+        let letter = KeyPress {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            modifiers: Modifiers::empty(),
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        assert_eq!(menu_key(&letter, true), None);
     }
 
     #[test]
