@@ -65,6 +65,7 @@ fn marker(module: &str) -> &'static str {
 /// judged against.
 struct Seen {
     state: String,
+    hash: String,
     seal: Vec<u8>,
 }
 
@@ -151,6 +152,7 @@ fn run(node: &str, out: &Path, steps: usize, markers: bool) -> usize {
                     step.module.clone(),
                     Seen {
                         state: step.state.clone(),
+                        hash: step.hash.clone(),
                         seal,
                     },
                 );
@@ -178,18 +180,27 @@ fn shown(module: &str) -> Vec<String> {
 }
 
 /// The canary views' promise, held against this transition: an A (Ready)
-/// shows no marker, a B (Swapped) shows its module's, a B′ (a Swapped after
-/// a Swapped) changes the governance seal, a removal (Missing) shows nothing.
+/// shows no marker, a B (Swapped) moves the hash and shows its module's
+/// marker, a B′ (a Swapped after a Swapped) changes the governance seal, a
+/// removal (Missing) shows nothing. The Approvals tab is the one drawn
+/// here; another module's marker is read only where its tab has a tree and
+/// is past "Not connected" — this read-only client never connects the
+/// Files tab to a workspace, and its marker sits behind that.
 fn judge(step: &Transition, marked: bool, shown: &[String], seal: &[u8], before: Option<&Seen>) {
     let module = &step.module;
+    let readable = module == "governance"
+        || (!shown.is_empty() && !shown.iter().any(|text| text.contains("Not connected")));
     match step.state.as_str() {
         "Ready" => assert!(
             !marked,
             "{module} shows the B marker before any swap: {shown:?}"
         ),
         "Swapped" => {
+            if let Some(before) = before {
+                assert_ne!(before.hash, step.hash, "{module} swapped to the same hash");
+            }
             assert!(
-                marked,
+                marked || !readable,
                 "{module} swapped without its marker {:?}: {shown:?}",
                 marker(module)
             );
