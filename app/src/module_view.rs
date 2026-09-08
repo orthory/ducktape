@@ -2884,6 +2884,154 @@ mod tests {
         assert!(guest.fault.is_none());
     }
 
+    /// The bundled Chat view through the host: the rooms and the stream,
+    /// a room pressed that leaves as `choose_channel`, the composer slot
+    /// the host paints per room, and its submit crossing as the `composer`
+    /// intent rather than a guest request.
+    #[test]
+    fn the_staged_chat_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("chat_composer"));
+        guest.redraw(&None);
+        let general = crate::backend::ChatChannel {
+            id: "channel-a".into(),
+            name: "general".into(),
+            ..Default::default()
+        };
+        let ops = crate::backend::ChatChannel {
+            id: "channel-b".into(),
+            name: "ops".into(),
+            ..Default::default()
+        };
+        let rooms = [
+            crate::backend::ChatSidebarRow {
+                channel: general,
+                unread: false,
+            },
+            crate::backend::ChatSidebarRow {
+                channel: ops,
+                unread: true,
+            },
+        ];
+        let messages = [crate::backend::ChatMessage {
+            id: "m1".into(),
+            view_key: 1,
+            seq: 1,
+            author: "mallard".into(),
+            meta: "h 84,912".into(),
+            body: "first light".into(),
+            blocks: crate::backend::paragraph_blocks("first light"),
+            show_author: true,
+            initial: "M".into(),
+            avatar_kind: "human".into(),
+            height: 84_912,
+            time: 84_912,
+            rev: 1,
+            ..Default::default()
+        }];
+        let props = ChatProps {
+            dark: false,
+            endpoint: "http://127.0.0.1:1",
+            network_name: "testnet",
+            network_chain_id: "testnet#abcd",
+            status: "Live",
+            block_height: 84_912,
+            search_phase: "idle",
+            search_query: "",
+            search_hits: &[],
+            rooms: &rooms,
+            dm_rows: &[],
+            channel_create_open: false,
+            connected: true,
+            loading: false,
+            busy: false,
+            active_channel: "channel-a",
+            active_dm_peer: "",
+            active_dm: &crate::backend::DmPeer::default(),
+            active_channel_name: "general",
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            channel_members: &[],
+            post_refusal: "",
+            huddle_joined: false,
+            huddle_channel: "",
+            huddle_channel_name: "",
+            huddle_joined_at: 0,
+            huddle_now: 0,
+            call_muted: false,
+            messages: &messages,
+            has_older_history: false,
+            history_view: false,
+            at_live_tail: true,
+            history_loading: false,
+            unread_boundary: 0,
+            unread_marker_seq: 0,
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            message_action: "toolbar",
+            channel_settings_open: false,
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: &[],
+            thread_selected_seq: 0,
+            thread_selected_rev: 0,
+            thread_message_action: "toolbar",
+            thread_has_more: false,
+            thread_next_reply_seq: 0,
+            thread_loading: false,
+            copy_anchor_seq: 0,
+            copy_head_seq: 0,
+            copy_surface: "nowhere",
+            sent_serial: 0,
+        };
+        let props = Some(serde_json::to_vec(&props).expect("props encode"));
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["testnet", "general", "ops", "first light"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["chat_composer"]);
+
+        guest.deliver(Output::Activate(button_message(&guest, "ops")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "choose_channel".into(),
+                detail: r#"{"id":"channel-b"}"#.into(),
+            }]
+        );
+
+        // a submit in the host's composer is the `composer` intent, and an
+        // edit there never reaches the guest
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Record {
+                name: "composer".into(),
+                fields: vec![
+                    ("kind".into(), wire::SurfaceValue::Str("message".into())),
+                    ("body".into(), wire::SurfaceValue::Str("hello".into())),
+                    ("id".into(), wire::SurfaceValue::Str("message-1".into())),
+                ],
+            },
+        });
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Unit,
+        });
+        assert!(guest.pending.is_empty());
+        assert_eq!(guest.intents.len(), 1);
+        assert_eq!(guest.intents[0].kind, "composer");
+        assert!(guest.intents[0].detail.contains(r#""body":"hello""#));
+        assert!(guest.fault.is_none());
+    }
+
     /// The bundled Explorer view through the host: the ledger, then a
     /// search that leaves as an intent and lands back as props.
     #[test]

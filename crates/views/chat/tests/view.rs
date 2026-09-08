@@ -74,6 +74,18 @@ fn encoded(props: &ChatProps) -> Vec<u8> {
     serde_json::to_vec(props).expect("props encode")
 }
 
+/// A native tick of this screen walks a deep tree; libtest's 2 MiB thread
+/// is at the edge of it in a debug build, so every test runs on its own
+/// roomier stack (the wasm guest is built for release).
+fn on_a_deep_stack(test: fn()) {
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(test)
+        .expect("the test thread spawns")
+        .join()
+        .expect("the test thread finishes");
+}
+
 /// Boot and push the facts; returns the subscription id and the frame.
 fn shown(props: &ChatProps) -> (u64, Frame) {
     boot_native();
@@ -114,113 +126,119 @@ fn surfaces(node: &Node, out: &mut Vec<(String, String)>) {
 
 #[test]
 fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_room_leaves_as_a_choice() {
-    let (_, frame) = shown(&facts());
-    for expected in [
-        "testnet",
-        "h 84,912",
-        "general",
-        "ops",
-        "first light",
-        "second wind",
-    ] {
-        assert!(
-            has_text(&frame, expected),
-            "missing {expected:?} in {:?}",
-            texts(&frame)
-        );
-    }
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(press(&frame, "ops"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "chat.choose_channel");
-    assert_eq!(
-        serde_json::from_slice::<Channel>(&intent.payload).expect("decodes"),
-        Channel {
-            id: "channel-b".into()
+    on_a_deep_stack(|| {
+        let (_, frame) = shown(&facts());
+        for expected in [
+            "testnet",
+            "h 84,912",
+            "general",
+            "ops",
+            "first light",
+            "second wind",
+        ] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?} in {:?}",
+                texts(&frame)
+            );
         }
-    );
+        assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+        let frame = tick_native(press(&frame, "ops"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.choose_channel");
+        assert_eq!(
+            serde_json::from_slice::<Channel>(&intent.payload).expect("decodes"),
+            Channel {
+                id: "channel-b".into()
+            }
+        );
+    });
 }
 
 #[test]
 fn a_search_leaves_as_the_typed_query_and_the_composer_is_the_rooms_slot() {
-    let (subscription, frame) = shown(&facts());
-    let mut slots = Vec::new();
-    surfaces(frame.root.as_ref().expect("a tree"), &mut slots);
-    assert_eq!(
-        slots,
-        [(
-            "chat_composer".to_owned(),
-            "http://127.0.0.1:1\u{1f}channel-a".to_owned()
-        )]
-    );
-    let frame = tick_native(type_into(&frame, "Search…", "  light  "));
-    assert!(frame.requests.is_empty(), "typing runs no handler");
-    let frame = tick_native(submit(&frame, "Search…"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "chat.search");
-    assert_eq!(
-        serde_json::from_slice::<Query>(&intent.payload).expect("decodes"),
-        Query {
-            query: "light".into()
-        }
-    );
-    // an open thread seats the rail's own composer beside the room's
-    let threaded = ChatProps {
-        active_thread_seq: 1,
-        thread_messages: vec![message(1, "first light")],
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&threaded))]);
-    let mut slots = Vec::new();
-    surfaces(frame.root.as_ref().expect("a tree"), &mut slots);
-    assert_eq!(
-        slots
-            .iter()
-            .map(|(_, scope)| scope.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "http://127.0.0.1:1\u{1f}channel-a",
-            "http://127.0.0.1:1\u{1f}channel-a#1"
-        ]
-    );
+    on_a_deep_stack(|| {
+        let (subscription, frame) = shown(&facts());
+        let mut slots = Vec::new();
+        surfaces(frame.root.as_ref().expect("a tree"), &mut slots);
+        assert_eq!(
+            slots,
+            [(
+                "chat_composer".to_owned(),
+                "http://127.0.0.1:1\u{1f}channel-a".to_owned()
+            )]
+        );
+        let frame = tick_native(type_into(&frame, "Search…", "  light  "));
+        assert!(frame.requests.is_empty(), "typing runs no handler");
+        let frame = tick_native(submit(&frame, "Search…"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.search");
+        assert_eq!(
+            serde_json::from_slice::<Query>(&intent.payload).expect("decodes"),
+            Query {
+                query: "light".into()
+            }
+        );
+        // an open thread seats the rail's own composer beside the room's
+        let threaded = ChatProps {
+            active_thread_seq: 1,
+            thread_messages: vec![message(1, "first light")],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&threaded))]);
+        let mut slots = Vec::new();
+        surfaces(frame.root.as_ref().expect("a tree"), &mut slots);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|(_, scope)| scope.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "http://127.0.0.1:1\u{1f}channel-a",
+                "http://127.0.0.1:1\u{1f}channel-a#1"
+            ]
+        );
+    });
 }
 
 #[test]
 fn an_edit_is_seeded_from_the_message_and_leaves_as_the_edited_text() {
-    let (subscription, _) = shown(&facts());
-    // the host opened the menu on message 2 (the ⋯ press went through it)
-    let menu = ChatProps {
-        selected_message_seq: 2,
-        selected_message_rev: 1,
-        message_action: "more".into(),
-        ..facts()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&menu))]);
-    let frame = tick_native(press(&frame, "Edit message"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "chat.begin_edit");
-    assert_eq!(
-        serde_json::from_slice::<Selection>(&intent.payload).expect("decodes"),
-        Selection {
-            seq: 2,
-            body: String::new(),
-            rev: 1
-        }
-    );
-    // the host seats the edit; the field carries the body the view seeded
-    let editing = ChatProps {
-        message_action: "editing".into(),
-        ..menu
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&editing))]);
-    let frame = tick_native(type_into(&frame, "Edit message", "second wind, revised"));
-    let frame = tick_native(submit(&frame, "Edit message"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "chat.edit");
-    assert_eq!(
-        serde_json::from_slice::<Text>(&intent.payload).expect("decodes"),
-        Text {
-            text: "second wind, revised".into()
-        }
-    );
+    on_a_deep_stack(|| {
+        let (subscription, _) = shown(&facts());
+        // the host opened the menu on message 2 (the ⋯ press went through it)
+        let menu = ChatProps {
+            selected_message_seq: 2,
+            selected_message_rev: 1,
+            message_action: "more".into(),
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&menu))]);
+        let frame = tick_native(press(&frame, "Edit message"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.begin_edit");
+        assert_eq!(
+            serde_json::from_slice::<Selection>(&intent.payload).expect("decodes"),
+            Selection {
+                seq: 2,
+                body: String::new(),
+                rev: 1
+            }
+        );
+        // the host seats the edit; the field carries the body the view seeded
+        let editing = ChatProps {
+            message_action: "editing".into(),
+            ..menu
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&editing))]);
+        let frame = tick_native(type_into(&frame, "Edit message", "second wind, revised"));
+        let frame = tick_native(submit(&frame, "Edit message"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.edit");
+        assert_eq!(
+            serde_json::from_slice::<Text>(&intent.payload).expect("decodes"),
+            Text {
+                text: "second wind, revised".into()
+            }
+        );
+    });
 }
