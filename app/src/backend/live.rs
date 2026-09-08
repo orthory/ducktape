@@ -79,6 +79,8 @@ pub async fn connect(
     }
     let result = async {
         let rpc = rpc_client(&rpc)?;
+        // the node the module-owned views load their deployments from
+        crate::module_view::connected(&rpc);
         load_workspace(&rpc, None, None, generation).await
     }
     .await;
