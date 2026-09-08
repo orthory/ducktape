@@ -393,14 +393,6 @@ fn role_is_default(role: &ModelRole) -> bool {
 }
 
 impl ModelRecord {
-    /// The capability gate for preparing actions and opening sinks. Empty caps
-    /// deny every request; peer calls require a positive budget. Forge/tool/
-    /// secret use exact membership; duckfs uses path-PREFIX containment (a
-    /// prefix grants itself and any child path, but never a sibling that merely
-    /// shares a textual prefix — `src` does not grant `srcx`); pages use exact
-    /// membership with the literal `"*"` entry granting every page (ids are
-    /// opaque — never a prefix). budget
-    /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     /// whether this agent holds `action`: by name, or through the [`EVERY`]
     /// grant. THE grant predicate, shared by every lane that admits an
     /// operation.
@@ -410,6 +402,14 @@ impl ModelRecord {
             .any(|granted| granted == action || granted == EVERY)
     }
 
+    /// The capability gate for preparing actions and opening sinks. Empty caps
+    /// deny every request; peer calls require a positive budget. Tool and
+    /// secret use exact membership; forge repos and pages use exact
+    /// membership with the literal [`EVERY`] entry granting every one (ids
+    /// are opaque — never a prefix); duckfs uses path-PREFIX containment (a
+    /// prefix grants itself and any child path, but never a sibling that
+    /// merely shares a textual prefix — `src` does not grant `srcx`). budget
+    /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     pub fn permits(&self, req: &CapRequest) -> bool {
         let c = &self.caps;
         let has = |v: &[String], x: &str| v.iter().any(|s| s == x);
@@ -533,7 +533,6 @@ impl ResourceCaps {
             values.dedup();
             values
         }
-
 
         Self {
             forge_read: every_or_exact(&forge_readable(self), &forge_readable(other)),
