@@ -1504,6 +1504,30 @@ impl Host {
         self.module_factory = Some(factory);
     }
 
+    /// Re-establish the committed clock at a boundary this host reached WITHOUT
+    /// applying a block: a checkpoint reopen, or a statesync install.
+    ///
+    /// Replay needs no call — it re-applies blocks through [`Host::apply_block`]
+    /// and the watermark advances with them. These two paths jump straight to a
+    /// boundary, so without this a node that restarted at height 40 000 answers
+    /// [`Host::query_as`] with `consensus_time = 0` until its next block
+    /// commits, and every eligibility question that compares against that clock
+    /// reads as "nothing has expired yet" — fail-open, in the window right
+    /// after a restart.
+    ///
+    /// The CALLER supplies `consensus_time` because the unit is the lane's, not
+    /// this type's: it is the height on the validator lane (what recovery's own
+    /// `BlockContext` uses) and wall-clock millis on the single-writer sim lane.
+    /// A manifest carries the height, so a caller on the validator lane passes
+    /// it for both.
+    ///
+    /// Sets rather than maxes: the state and the clock move together, so a
+    /// resident that re-syncs backward to an older boundary must not keep a
+    /// clock from state it no longer holds.
+    pub fn restore_committed(&mut self, height: u64, consensus_time: u64) {
+        self.committed = (height, consensus_time);
+    }
+
     /// register a module under its own [`Module::id`]. genesis-time wiring.
     pub fn register(&mut self, module: Box<dyn Module>) {
         self.registry.insert(module.id(), module);
