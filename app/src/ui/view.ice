@@ -517,36 +517,12 @@ view
         // handler below signs — the guest sees no key and no endpoint.
         governance:
           extern governance_view(dark, connected, members_is_admin(members_rows), gov_answered, gov_voting, gov_rows) #governance -> governance_view_event _
+        // Node is a MODULE-OWNED VIEW too: the facts the app holds go in as
+        // props; the tab, the log filter and a clipboard copy come back as
+        // intents. The live log ring stays native — the view leaves a slot
+        // the app paints from `node_log_timeline` (module_view.rs).
         node:
-          NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
-            with
-              node_key
-              node_data_dir
-              members_rows
-              status
-              loading
-              node_tab
-              module_rows
-              node_height
-              node_checkpoint
-              node_last_finalized
-              node_reachable_label
-              node_quorum_label
-              node_version
-              node_root_hash
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-              node_phase_since
-              node_sync_retries
-              node_sync_failures
-              node_sync_last_error
-              node_peers
-            events
-              select_node_tab -> select_node_tab _
-              open_node_modules -> open_node_modules
-              node_log_filter_changed -> node_log_filter_changed _
-              copy_to_clipboard -> copy_to_clipboard _ _
-            activity_log:
-              extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
+          extern node_view(dark, connected, members_is_admin(members_rows), member_tier(members_rows), status, loading, module_rows, node_key, node_data_dir, node_height, node_checkpoint, node_last_finalized, node_reachable_label, node_quorum_label, node_version, node_root_hash, sync_label(node_phase, node_sync_applied, node_sync_target), node_phase_since, node_sync_retries, node_sync_failures, node_sync_last_error, node_peers, wall_now, node_log_timeline, connected_rpc) #node -> node_view_event _
         settings:
           SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
             with

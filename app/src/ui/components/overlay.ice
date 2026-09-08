@@ -332,37 +332,3 @@ component Eyebrow(label:str, note:str)
 // signal elsewhere is `PulseDot`. Reviving the ring costs a `spin = 1.0`
 // driver alongside `pulse` in handlers/lifecycle.ice plus one canvas; until
 // that driver exists, the honest marker is the static one.
-
-// One NETWORK stat card: a mono caps label over the machine reading, with an
-// optional unit suffix (`ms`) beside it.
-component StatCard(label:str, value:str, note:str)
-  box #root
-    with
-      w=fill
-      px=13.0
-      py=11.0
-      bg=surface
-      border=card_line
-      border-w=1.0
-      r=10.0
-    col w=fill gap=3.0
-      text label
-        with
-          size=9.0
-          wrap=none
-          font=code_semibold
-          @text-label
-      row gap=4.0 align=center
-        text value
-          with
-            size=14.0
-            wrap=none
-            font=code_semibold
-            @text-primary
-        if note != ""
-          text note
-            with
-              size=11.0
-              wrap=none
-              font=code_medium
-              @text-meta

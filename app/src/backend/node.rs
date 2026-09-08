@@ -178,10 +178,12 @@ pub fn node_log_timeline_apply(
     state
 }
 
-pub fn node_log_timeline<'a>(
-    state: &'a NodeLogTimelineState,
-    source: &'a str,
-) -> iced::Element<'a, NodeLogTimelineEvent> {
+/// The ring as the Node tab's slot paints it — owned, because the slot is a
+/// host surface that outlives the call that drew it.
+pub fn node_log_timeline(
+    state: NodeLogTimelineState,
+    source: String,
+) -> iced::Element<'static, NodeLogTimelineEvent> {
     use iced::widget::{Space, button, column, container, row, text};
     use iced::{Border, Color, Font, Length};
     use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
@@ -247,7 +249,7 @@ pub fn node_log_timeline<'a>(
         (true, true) => "Waiting for the node's log ring…",
         (true, false) => "No lines match this filter.",
     };
-    let timeline: iced::Element<'_, NodeLogTimelineEvent> = log_timeline(
+    let timeline: iced::Element<'static, NodeLogTimelineEvent> = log_timeline(
         &state.timeline,
         &state.visible,
         node_log_timeline_config(),
@@ -735,7 +737,7 @@ pub fn optional_number(value: Option<i64>) -> String {
 /// every peer and call it theirs. `role` is the standing the peers view does
 /// carry (`validator` / `resident`), absent on a lane that cannot read the
 /// valset — and absent renders as nothing, which is the honest answer.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PeerRow {
     pub key: String,
     pub role: String,
@@ -912,7 +914,7 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
 /// verification badge, an install count and a catalog description exist in no
 /// module, no index and no manifest. This is the INSTALLED/RUNTIME truth —
 /// what is registered, at which code, with which swap pending.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ModuleRow {
     pub id: String,
     /// `workspace` | `developer` | `automation` | `system` — the presentation

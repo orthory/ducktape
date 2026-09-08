@@ -4,12 +4,21 @@
 on node_log_line(line)
   node_log_timeline = node_log_timeline_push(node_log_timeline, line)
 
-on node_log_filter_changed(next)
-  node_log_filter = next
-  node_log_timeline = node_log_timeline_filter(node_log_timeline, next)
-
-on node_log_timeline_changed(event)
-  node_log_timeline = node_log_timeline_apply(node_log_timeline, event)
+on node_view_event(event)
+  match node_intent(event)
+    NodeIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
+    NodeIntent.tab
+      node_tab = node_event_tab(event)
+      return if node_tab != NodeTab.modules || !connected
+      run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
+    NodeIntent.log_filter
+      node_log_filter = event_text(event, "filter")
+      node_log_timeline = node_log_timeline_filter(node_log_timeline, node_log_filter)
+    NodeIntent.log_timeline
+      node_log_timeline = node_log_timeline_drain(node_log_timeline)
 
 on peers_loaded(next)
   return if next.generation != node_peers_generation
@@ -95,9 +104,6 @@ on node_peers_pushed(next)
 
 // Overview | Permissions | Activity | Modules on the Node rail surface. The
 // log stream subscribes only while its tab is visible.
-on select_node_tab(tab)
-  node_tab = tab
-
 on settings_loaded(next)
   return if next.generation != settings_generation
   node_data_dir = next.data_dir
@@ -188,11 +194,6 @@ on toast_tick
 
 // The Modules tab picks its own seat AND fetches its own reading — a tab whose
 // list is only filled by a refresh somewhere else opens empty on first click.
-on open_node_modules
-  node_tab = NodeTab.modules
-  return if !connected
-  run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
-
 on modules_loaded(next)
   module_rows = next.rows
   error = ""

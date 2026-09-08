@@ -170,6 +170,152 @@ fn detail(event: &ModuleViewEvent) -> Option<serde_json::Value> {
     serde_json::from_str(&event.detail).ok()
 }
 
+// ---------- the node seat ----------
+
+/// The Node tab: the facts the app holds, drawn by the `node` view. Its
+/// intents come back as `copy` (`text`, `label`), `tab` (`tab`) and
+/// `log_filter` (`filter`); the native log ring's own events come back as
+/// `log_timeline`, drained by [`node_log_timeline_drain`].
+///
+/// The timeline and its source are stashed for the surface the view leaves
+/// a slot for: the host paints the app-held ring there, on its own clock.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn node_view(
+    dark: bool,
+    connected: bool,
+    admin: bool,
+    tier: &str,
+    status: &str,
+    loading: bool,
+    module_rows: &[crate::backend::ModuleRow],
+    node_key: &str,
+    node_data_dir: &str,
+    node_height: i64,
+    node_checkpoint: i64,
+    node_last_finalized: i64,
+    node_reachable_label: &str,
+    node_quorum_label: &str,
+    node_version: &str,
+    node_root_hash: &str,
+    sync_line: &str,
+    node_phase_since: i64,
+    node_sync_retries: i64,
+    node_sync_failures: i64,
+    node_sync_last_error: &str,
+    node_peers: &[crate::backend::PeerRow],
+    wall_now: i64,
+    timeline: &crate::backend::NodeLogTimelineState,
+    source: &str,
+) -> Element<'static, ModuleViewEvent> {
+    node_timeline().lock().expect("node timeline").shown =
+        Some((timeline.clone(), source.to_owned()));
+    let props = serde_json::json!({
+        "node_key": node_key,
+        "node_data_dir": node_data_dir,
+        "tier": tier,
+        "admin": admin,
+        "status": status,
+        "loading": loading,
+        "module_rows": module_rows,
+        "node_height": node_height,
+        "node_checkpoint": node_checkpoint,
+        "node_last_finalized": node_last_finalized,
+        "node_reachable_label": node_reachable_label,
+        "node_quorum_label": node_quorum_label,
+        "node_version": node_version,
+        "node_root_hash": node_root_hash,
+        "sync_line": sync_line,
+        "node_phase_since": node_phase_since,
+        "node_sync_retries": node_sync_retries,
+        "node_sync_failures": node_sync_failures,
+        "node_sync_last_error": node_sync_last_error,
+        "node_peers": node_peers,
+        "wall_now": wall_now,
+        "connected": connected,
+        "dark": dark,
+    });
+    module_view("node", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn node_intent(event: &ModuleViewEvent) -> crate::NodeIntent {
+    match event.kind.as_str() {
+        "tab" => crate::NodeIntent::Tab,
+        "log_filter" => crate::NodeIntent::LogFilter,
+        "log_timeline" => crate::NodeIntent::LogTimeline,
+        _ => crate::NodeIntent::Copy,
+    }
+}
+
+/// The tab a `tab` intent names; a name the screen has no tab for is the
+/// overview.
+pub fn node_event_tab(event: &ModuleViewEvent) -> crate::NodeTab {
+    match event_text(event, "tab").as_str() {
+        "permissions" => crate::NodeTab::Permissions,
+        "activity" => crate::NodeTab::Activity,
+        "modules" => crate::NodeTab::Modules,
+        _ => crate::NodeTab::Overview,
+    }
+}
+
+/// Applies what the reader did in the native log ring since the last drain
+/// — a scroll, a selection, a return to the tail — to the timeline the app
+/// holds, in the order it happened.
+pub fn node_log_timeline_drain(
+    mut state: crate::backend::NodeLogTimelineState,
+) -> crate::backend::NodeLogTimelineState {
+    let events = std::mem::take(&mut node_timeline().lock().expect("node timeline").events);
+    for event in events {
+        state = crate::backend::node_log_timeline_apply(state, event);
+    }
+    state
+}
+
+/// The native log ring behind the node view's slot: the timeline the app
+/// last drew the tab with, and what the reader did in it since the app
+/// last drained. One per process, like the view it belongs to.
+#[derive(Default)]
+struct NodeTimeline {
+    shown: Option<(crate::backend::NodeLogTimelineState, String)>,
+    events: Vec<crate::backend::NodeLogTimelineEvent>,
+}
+
+fn node_timeline() -> &'static Mutex<NodeTimeline> {
+    static TIMELINE: OnceLock<Mutex<NodeTimeline>> = OnceLock::new();
+    TIMELINE.get_or_init(Mutex::default)
+}
+
+/// The surfaces a module's view may leave slots for. The node view's
+/// `node_log_timeline` is the app's own ring, painted from the timeline the
+/// tab was last drawn with; what the reader does in it is queued for
+/// [`node_log_timeline_drain`], and the guest — which declared the slot as
+/// `-> unit` — hears only that something happened.
+fn surfaces_of(module: &str) -> Surfaces {
+    let mut surfaces = Surfaces::default();
+    if module == "node" {
+        surfaces.insert(
+            "node_log_timeline".into(),
+            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
+                let shown = node_timeline().lock().expect("node timeline").shown.clone();
+                let Some((timeline, source)) = shown else {
+                    return widget::Space::new().into();
+                };
+                crate::backend::node_log_timeline(timeline, source).map(|event| {
+                    node_timeline()
+                        .lock()
+                        .expect("node timeline")
+                        .events
+                        .push(event);
+                    wire::SurfaceValue::Unit
+                })
+            }),
+        );
+    }
+    surfaces
+}
+
 /// The operations a view may ask of the app, by module. An intent outside
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
@@ -177,6 +323,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "governance" => &["vote", "execute"],
         "members" => &["copy", "agent_status", "propose"],
         "agents" => &[],
+        "node" => &["copy", "tab", "log_filter"],
         _ => &[],
     }
 }
@@ -441,7 +588,7 @@ impl Guest {
             ticks: 0,
             inputs: Inputs::default(),
             pictures: Pictures::default(),
-            surfaces: Surfaces::default(),
+            surfaces: surfaces_of(module),
             props_subscription: None,
             props_sent: None,
             intents: Vec::new(),
@@ -470,8 +617,17 @@ impl Guest {
     }
 
     /// What the user did to the tree, as the widgets report it: recorded
-    /// host-side (an input's text) and queued for the guest's next tick.
+    /// host-side (an input's text) and queued for the guest's next tick. A
+    /// host surface's event is the app's, not the guest's: it was queued
+    /// where the surface keeps it, and the app is told to drain it.
     fn deliver(&mut self, output: Output) {
+        if let Output::Surface { .. } = output {
+            self.intents.push(ModuleViewEvent {
+                kind: "log_timeline".into(),
+                detail: String::new(),
+            });
+            return;
+        }
         self.inputs.apply(output, &mut self.pending);
     }
 
@@ -1142,6 +1298,90 @@ mod tests {
             );
         }
         assert!(guest.intents.is_empty());
+        assert!(guest.fault.is_none());
+    }
+
+    /// Every host surface in the guest's tree, by name.
+    fn surface_names(guest: &Guest) -> Vec<String> {
+        fn walk(node: &wire::Node, out: &mut Vec<String>) {
+            if let wire::Node::Surface { name, .. } = node {
+                out.push(name.clone());
+            }
+            for child in node.children() {
+                walk(child, out);
+            }
+        }
+        let mut names = Vec::new();
+        if let Some(root) = &guest.frame.root {
+            walk(root, &mut names);
+        }
+        names
+    }
+
+    /// The bundled Node view through the host: offline plate, then the
+    /// facts; the Activity tab asks for its tab as an intent and leaves the
+    /// log ring's slot to the host's own surface, whose events come back as
+    /// the drain intent rather than going to the guest.
+    #[test]
+    fn the_staged_node_view_boots_takes_the_facts_and_leaves_the_log_ring_to_the_host() {
+        let Some(staged) = staged("node") else {
+            return;
+        };
+        let mut guest = Guest::load_from("node", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("node_log_timeline"));
+        guest.redraw(&None);
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "node_key": "ab12cd34", "node_data_dir": "/var/ducktape/demo",
+                "tier": "validator", "admin": true, "status": "Live", "loading": false,
+                "module_rows": [], "node_height": 84912, "node_checkpoint": 84900,
+                "node_last_finalized": 1700000000, "node_reachable_label": "3",
+                "node_quorum_label": "3", "node_version": "0.4.2", "node_root_hash": "c0ffee",
+                "sync_line": "live", "node_phase_since": 1700000000, "node_sync_retries": 0,
+                "node_sync_failures": 0, "node_sync_last_error": "", "node_peers": [],
+                "wall_now": 1700000030, "connected": true, "dark": false
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["This node", "ab12cd34", "h 84,912", "0.4.2"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert!(surface_names(&guest).is_empty());
+
+        guest.deliver(Output::Activate(button_message(&guest, "Node activity")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "tab".into(),
+                detail: r#"{"tab":"activity"}"#.into(),
+            }]
+        );
+        assert_eq!(surface_names(&guest), ["node_log_timeline"]);
+
+        // what the reader does in the host's ring never reaches the guest
+        guest.deliver(Output::Surface {
+            handler: None,
+            value: wire::SurfaceValue::Unit,
+        });
+        assert!(guest.pending.is_empty());
+        assert_eq!(
+            guest.intents,
+            [ModuleViewEvent {
+                kind: "log_timeline".into(),
+                detail: String::new(),
+            }]
+        );
         assert!(guest.fault.is_none());
     }
 
