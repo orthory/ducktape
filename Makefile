@@ -132,13 +132,6 @@ coordinator-smoke:
 # branch holding the same rev minus the example members, which had to be rebased
 # and pushed on every pin bump and broke `make app` with a bare git exit 128
 # every time someone forgot.
-#
-# The build directory is keyed by the rev too, INSIDE the install root. Cargo
-# treats every checkout under its git cache as immutable and skips the mtime
-# check on its sources, and it hashes a git package's outputs without the
-# revision, so a build directory shared across revs hands the next rev the
-# previous rev's binary as "fresh" — a cargo-ice that parses the wrong
-# language, filed under the right rev. One root per rev, garbage with it.
 ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' app/Cargo.toml | head -n1)
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
@@ -349,17 +342,17 @@ test: wasm-modules-check wasm-embed-check
 ## rebuild every wasm guest into its artifact and refresh EVERY committed copy
 ## in one sweep (the canonical artifact in the module's own directory, which
 ## the build stages into the founding set, + the kernel test fixtures), so the
-## copies can never drift apart. the componentizer is the `wit-component`
-## crate guest-builder links (pinned in bin/guest-builder/Cargo.toml); the
-## wasm32 target uses rust-toolchain.toml. every guest is built ALONE, out of the platform
-## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
-## pushed first; each module's guest.lock records the revision and the
+## copies can never drift apart. the componentizer is the `wit-component` crate
+## guest-builder links (pinned in bin/guest-builder/Cargo.toml); the wasm32
+## target uses rust-toolchain.toml. every guest is built ALONE, out of the
+## platform repository at this checkout's HEAD (bin/guest-builder), so HEAD must
+## be pushed first; each module's guest.lock records the revision and the
 ## registry versions its artifact came from and seeds its next build, so a
-## crates.io publish never moves the bytes, and a revision that changes none
-## of what a module compiles leaves its bytes as they are. component bytes
-## ARE toolchain-dependent: a rebuild on a different rustc may legitimately
-## differ from the committed bytes — move the channel and the whole set
-## together. `wasm-modules-check` guards the copies' mutual consistency,
+## crates.io publish never moves the bytes, and a revision that changes none of
+## what a module compiles leaves its bytes as they are. component bytes ARE
+## toolchain-dependent: a rebuild on a different rustc may legitimately differ
+## from the committed bytes — move the channel and the whole set together.
+## `wasm-modules-check` guards the copies' mutual consistency,
 ## `wasm-rebuild-check` every artifact against a rebuild of its source, and
 ## `wasm-repro-check` that nothing builder-local reaches the bytes.
 #

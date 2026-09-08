@@ -241,15 +241,15 @@ fn parse_args() -> Result<Args, String> {
     parse_build_args(argv).map(Args::Build)
 }
 
-fn parse_componentize_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
+fn parse_componentize_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut core = None;
     let mut out = None;
-    let mut argv = argv;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--out" => {
                 out = Some(PathBuf::from(
-                    argv.next().ok_or_else(|| format!("--out needs a value\n{USAGE}"))?,
+                    argv.next()
+                        .ok_or_else(|| format!("--out needs a value\n{USAGE}"))?,
                 ));
             }
             flag if flag.starts_with("--") => {
@@ -270,14 +270,13 @@ fn parse_componentize_args(argv: impl Iterator<Item = String>) -> Result<Args, S
     Ok(Args::Componentize { core, out })
 }
 
-fn parse_build_args(argv: impl Iterator<Item = String>) -> Result<BuildArgs, String> {
+fn parse_build_args(mut argv: impl Iterator<Item = String>) -> Result<BuildArgs, String> {
     let mut module_dir = None;
     let mut kind = GuestKind::Component;
     let mut rev = None;
     let mut out = None;
     let mut scratch = None;
 
-    let mut argv = argv;
     while let Some(arg) = argv.next() {
         let flag_value = |argv: &mut dyn Iterator<Item = String>| {
             argv.next()
