@@ -87,6 +87,19 @@ ordering arm.
 
 ## Quick Start
 
+Prerequisites: `rustup` (the pinned toolchain and its wasm32 target install
+themselves on the first build), a C compiler, and on Linux `pkg-config`,
+`libclang-dev` and `libasound2-dev`:
+
+```sh
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev   # Debian/Ubuntu
+xcode-select --install                                                    # macOS
+```
+
+`make` checks for them up front and prints that line when one is missing.
+`wasm-tools` and `cargo-ice` are pinned and installed under `target/` by the
+recipes that need them — nothing to install by hand.
+
 Run the workspace tests:
 
 ```sh
@@ -111,7 +124,8 @@ cargo test -p node-bin --test network_joiner_full
 
 Run everything the repo can verify locally (the wasm-artifact drift gate, the
 rust workspace including the e2e suites, the consensus sim-feature suite, and a
-build of the noded + simnode binaries the test harnesses stage):
+build of the noded + simnode binaries the test harnesses stage; two scripted
+checks want `node` and `bun` and skip with a notice without them):
 
 ```sh
 make test
@@ -128,11 +142,11 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ### Build wasm module components (guest-builder)
 
-Prerequisite: `cargo install wasm-tools --locked --version 1.253.0` — the
-componentizer is pinned like the rust channel (a different one writes different
-component bytes; `guest-builder` refuses any other). The wasm32 target is not one of them
-— `rust-toolchain.toml` lists it, so rustup installs it with the pinned
-channel.
+The componentizer, `wasm-tools`, is pinned like the rust channel (a different
+one writes different component bytes; `guest-builder` refuses any other):
+`make wasm-modules` installs the pinned version under `target/` on first use.
+The wasm32 target needs nothing either — `rust-toolchain.toml` lists it, so
+rustup installs it with the pinned channel.
 
 Day to day you don't invoke the tool — `make wasm-modules` rebuilds every
 module component (and refreshes the kernel test fixtures), and
@@ -231,8 +245,10 @@ Also runnable:
   (see the operator path above and `docs/deploy/coordinator.md`).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
-  `app/README.md` states which node it dials and which key it signs with.
+  Pages, its UI declared in `app/src/ui/*.ice`. `make views && cargo run -p
+  ducktape-app` (the tabs are wasm views the app loads from `target/views`;
+  without them every tab says so); `app/README.md` states which node it
+  dials and which key it signs with.
 
 Seed a local "demo" network preloaded with sample data — chat channels and
 messages, a tasks board, pages, a registered agent, an inbox note, an

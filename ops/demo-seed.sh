@@ -55,8 +55,8 @@ DEV_ADVERTISED="${DEV_ADVERTISED:-127.0.0.1}"
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v bun     >/dev/null || die "bun is required"
-command -v curl    >/dev/null || die "curl is required"
+command -v bun     >/dev/null || die "bun is required: curl -fsSL https://bun.sh/install | bash"
+command -v curl    >/dev/null || die "curl is required (apt install curl / brew install curl)"
 
 # ── 1. node binary ─────────────────────────────────────────────
 NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
