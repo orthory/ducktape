@@ -1033,7 +1033,6 @@ pub fn copy_range_after_press(
     surface: crate::CopySurface,
     seq: i64,
     pressed_in: crate::CopySurface,
-    extending: bool,
 ) -> CopyRange {
     let settled = seq > 0;
     if !settled {
@@ -1043,7 +1042,7 @@ pub fn copy_range_after_press(
             surface: crate::CopySurface::Nowhere,
         };
     }
-    let anchored = extending && anchor > 0 && surface == pressed_in;
+    let anchored = anchor > 0 && surface == pressed_in;
     CopyRange {
         anchor: if anchored { anchor } else { seq },
         head: seq,

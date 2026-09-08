@@ -1055,41 +1055,34 @@ fn a_deleted_row_inside_the_range_contributes_nothing() {
     assert_eq!(copy_range_toast(&rows, 1, 1), "Message copied");
 }
 
-/// SHIFT KEEPS THE ANCHOR, A PLAIN CLICK MOVES IT. This is the whole gesture.
+/// A SHIFT-PRESS STARTS A RANGE OR MOVES ITS FAR END. The handler refuses a
+/// plain press before this runs, so every press here is a ⇧-press.
 #[test]
-fn shift_extends_and_a_plain_click_starts_over() {
+fn a_shift_press_starts_a_range_and_the_next_one_widens_it() {
     use crate::CopySurface::{Nowhere, Thread, Timeline};
-    let started = copy_range_after_press(0, Nowhere, 2, Timeline, false);
+    let started = copy_range_after_press(0, Nowhere, 2, Timeline);
     assert_eq!(
         (started.anchor, started.head),
         (2, 2),
-        "a click is a range of one"
+        "the first ⇧-press is a range of one"
     );
 
-    let widened = copy_range_after_press(2, Timeline, 5, Timeline, true);
+    let widened = copy_range_after_press(2, Timeline, 5, Timeline);
     assert_eq!(
         (widened.anchor, widened.head),
         (2, 5),
-        "⇧ moves the far end"
+        "the next ⇧-press moves the far end"
     );
 
-    let restarted = copy_range_after_press(2, Timeline, 5, Timeline, false);
+    // a ⇧-press in the other list starts over there: a range never spans both
+    let elsewhere = copy_range_after_press(2, Timeline, 7, Thread);
     assert_eq!(
-        (restarted.anchor, restarted.head),
-        (5, 5),
-        "no ⇧ starts over"
+        (elsewhere.anchor, elsewhere.head, elsewhere.surface),
+        (7, 7, Thread)
     );
 
-    // ⇧ with nothing open is a plain click: there is no anchor to keep.
-    let nothing_to_extend = copy_range_after_press(0, Nowhere, 5, Timeline, true);
-    assert_eq!((nothing_to_extend.anchor, nothing_to_extend.head), (5, 5));
-
-    // AND A RANGE NEVER SPANS THE TWO SURFACES. A ⇧-click in the rail while a
-    // range is open in the stream starts a fresh one in the rail, because the
-    // rows between them are not a run of anything.
-    let crossed = copy_range_after_press(2, Timeline, 7, Thread, true);
-    assert_eq!((crossed.anchor, crossed.head), (7, 7));
-    assert_eq!(crossed.surface, Thread);
+    let nowhere = copy_range_after_press(2, Timeline, 0, Timeline);
+    assert_eq!((nowhere.anchor, nowhere.head, nowhere.surface), (0, 0, Nowhere));
 }
 
 /// A ROW LIGHTS UP ONLY FOR A RANGE DRAWN WHERE IT LIVES. A reply and a

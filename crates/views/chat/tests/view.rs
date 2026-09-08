@@ -242,3 +242,80 @@ fn an_edit_is_seeded_from_the_message_and_leaves_as_the_edited_text() {
         );
     });
 }
+
+/// What the host will lay out: the frame after the wire's own bounds.
+fn through_the_wire(mut frame: Frame) -> Frame {
+    ui_lang_guest::wire::sanitize(&mut frame);
+    frame
+}
+
+#[test]
+fn the_more_button_opens_the_menu_and_the_heart_opens_the_grid() {
+    on_a_deep_stack(|| {
+        let (subscription, frame) = shown(&facts());
+        let frame = tick_native(press(&frame, "More message actions"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.message_actions");
+        assert_eq!(
+            serde_json::from_slice::<Selection>(&intent.payload).expect("decodes"),
+            Selection {
+                seq: 1,
+                body: "first light".into(),
+                rev: 1
+            }
+        );
+        let menu = ChatProps {
+            selected_message_seq: 1,
+            selected_message_rev: 1,
+            message_action: "more".into(),
+            ..facts()
+        };
+        let frame = through_the_wire(tick_native(vec![item(subscription, &encoded(&menu))]));
+        for expected in ["Manage reactions", "Reply in thread", "Edit message"] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?} in {:?}",
+                texts(&frame)
+            );
+        }
+        let frame = tick_native(press(&frame, "Manage reactions"));
+        assert_eq!(one_intent(&frame).kind, "chat.message_reactions");
+        let grid = ChatProps {
+            message_action: "reactions".into(),
+            ..menu
+        };
+        let frame = through_the_wire(tick_native(vec![item(subscription, &encoded(&grid))]));
+        assert!(has_text(&frame, "🦆"), "{:?}", texts(&frame));
+        let frame = tick_native(press(&frame, "🦆"));
+        assert_eq!(one_intent(&frame).kind, "chat.reaction_submit");
+    });
+}
+
+#[test]
+fn a_copy_range_is_one_bar_above_the_timeline_and_a_plain_press_is_only_a_press() {
+    on_a_deep_stack(|| {
+        let (subscription, frame) = shown(&facts());
+        let ranged = ChatProps {
+            copy_anchor_seq: 1,
+            copy_head_seq: 2,
+            copy_surface: "timeline".into(),
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&ranged))]);
+        let shown = texts(&frame);
+        let at = |needle: &str| {
+            shown
+                .iter()
+                .position(|text| text == needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {shown:?}"))
+        };
+        assert!(
+            at("2 messages selected") < at("first light"),
+            "the bar reads above the messages: {shown:?}"
+        );
+        assert!(at("Copy") < at("first light") && at("Clear") < at("first light"));
+        assert!(!has_text(&frame, "⇧-click another message to extend"));
+        let frame = tick_native(press(&frame, "Clear"));
+        assert_eq!(one_intent(&frame).kind, "chat.clear_range");
+    });
+}

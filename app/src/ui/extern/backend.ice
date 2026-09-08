@@ -126,7 +126,7 @@ extern crate::backend
   pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
   pure copy_range_label(count:i64) -> str
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
-  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
+  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface) -> CopyRange
   pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
