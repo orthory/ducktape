@@ -3050,7 +3050,7 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn event(kind: &str, detail: &str) -> ModuleViewEvent {
@@ -3948,8 +3948,10 @@ mod tests {
     }
 
     /// The connection is one per process: the tests that move it take
-    /// turns, so one's node is not another's.
-    async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
+    /// turns, so one's node is not another's — including the round trip
+    /// over a real node in `backend::tests::wire`, whose connect reloads
+    /// every seat here from a node that runs none of these modules.
+    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         TURN.get_or_init(|| tokio::sync::Mutex::new(()))
