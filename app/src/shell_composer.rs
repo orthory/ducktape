@@ -93,7 +93,15 @@ impl Composer {
     /// before the port, shape for shape.
     fn build<'a>(&'a self, document: &'a Content) -> Element<'a, ComposerEvent> {
         let empty = document.text().trim().is_empty();
-        let editor = rich_composer(document, self.hint.clone(), self.disabled, 40.0, 150.0, 8.0);
+        let editor = rich_composer(
+            document,
+            self.hint.clone(),
+            self.disabled,
+            false,
+            40.0,
+            150.0,
+            8.0,
+        );
         // Regular weight, deliberately — see the note on the message toolbar
         // in components/chat.ice: a semibold string label sends every
         // non-ASCII glyph down cosmic-text's walk-every-face fallback path.

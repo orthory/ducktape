@@ -9,3 +9,9 @@ state
   gov_voting = ""
   agents_rows:[AgentRow] = []
   agents_generation:i64 = 0
+  // what the network announces and what a grant may name — the editor's
+  // pick lists
+  agents_capabilities:[str] = []
+  agents_actions:[str] = []
+  // one per committed agent write: the view re-seeds its drafts on the bump
+  agents_committed:i64 = 0

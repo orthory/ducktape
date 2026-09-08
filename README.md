@@ -142,11 +142,11 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ### Build wasm module components (guest-builder)
 
-The componentizer, `wasm-tools`, is pinned like the rust channel (a different
-one writes different component bytes; `guest-builder` refuses any other):
-`make wasm-modules` installs the pinned version under `target/` on first use.
-The wasm32 target needs nothing either — `rust-toolchain.toml` lists it, so
-rustup installs it with the pinned channel.
+No prerequisite beyond the toolchain: the componentizer is the `wit-component`
+crate `guest-builder` links, pinned in `bin/guest-builder/Cargo.toml` like the
+rust channel (a different one writes different component bytes). The wasm32
+target is in `rust-toolchain.toml`, so rustup installs it with the pinned
+channel.
 
 Day to day you don't invoke the tool — `make wasm-modules` rebuilds every
 module component (and refreshes the kernel test fixtures), and
@@ -180,7 +180,7 @@ For the tool to accept a module it must declare the port contract: a
 shape). `crates/modules/apps/tasks` is the reference; the full wiring runbook
 is `skills/module-dev/SKILL.md`. A module authored in its own repository needs
 no tool at all: it is a cdylib crate pinning `ducktape-module-sdk` by git
-revision, built with cargo and `wasm-tools` — the recipe is in
+revision, built with cargo and `guest-builder componentize` — the recipe is in
 `docs/records/architecture/wasm-module-authoring.md`.
 
 ## Run a node

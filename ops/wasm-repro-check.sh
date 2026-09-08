@@ -16,7 +16,7 @@
 # host-path scan catches it, while a scratch path leaking into the bytes is
 # caught only by the comparison.
 #
-# Needs the wasm32-unknown-unknown target, wasm-tools and a pushed HEAD, so it
+# Needs the wasm32-unknown-unknown target and a pushed HEAD, so it
 # is NOT part of `make test`; `make wasm-modules-check` carries the cheap
 # host-path half.
 set -euo pipefail

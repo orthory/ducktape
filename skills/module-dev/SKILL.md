@@ -54,7 +54,7 @@ The CLI stages bytes, it never builds them: the component still comes from
 `make wasm-modules` / `guest-builder` (§2). A module written outside this
 tree needs none of that: it is a cdylib crate pinning `ducktape-module-sdk`
 (`crates/module-sdk`) by git revision, built with `cargo build --target
-wasm32-unknown-unknown --release` and `wasm-tools component new`, then handed
+wasm32-unknown-unknown --release` and `guest-builder componentize`, then handed
 to `module register` — the manifest and recipe are in
 `docs/records/architecture/wasm-module-authoring.md` ("Out-of-tree modules").
 Experiments that shouldn't pay the genesis cost live unwired in `crates/labs`.
@@ -195,6 +195,6 @@ make wasm-rebuild-check                                   # 7. every guest match
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Building a guest before pushing | guest-builder reads the module out of the repository at HEAD: an unpushed HEAD fails to fetch, an uncommitted edit is refused. Commit, push, then build |
-| Moving the rust channel — or `wasm-tools` — for one guest | bytes depend on BOTH pins (`rust-toolchain.toml` and `WASM_TOOLS_VERSION` in `bin/guest-builder`, which refuses any other componentizer); moving either rebuilds the whole set (`make wasm-modules`) and commits it as one change |
+| Moving the rust channel — or the componentizer — for one guest | bytes depend on BOTH pins (`rust-toolchain.toml` and the `wit-component` pin in `bin/guest-builder/Cargo.toml`, which the builder links); moving either rebuilds the whole set (`make wasm-modules`) and commits it as one change |
 | Touching `crates/module-sdk/src/lib.rs` without a rebuild | panic locations carry line numbers and every guest expands the SDK's macros, so even a comment line above them moves the set; `make wasm-rebuild-check` names the stale ones |
 | Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |

@@ -213,6 +213,7 @@ on workspace_connected(next)
   huddle_channel = huddle.channel
   huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
+  composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, active_channel), channel_members)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
@@ -308,6 +309,7 @@ on live_updated(next)
       thread_message_action = folded_chat.thread_message_action
       thread_edit_draft = folded_chat.thread_edit_draft
       channel_members = folded_chat.channel_members
+      composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, active_channel), channel_members)
       channel_reads = folded_chat.channel_reads
       rooms = folded_chat.rooms
       dm_rows = folded_chat.dm_rows
