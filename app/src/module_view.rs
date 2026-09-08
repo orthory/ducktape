@@ -4398,7 +4398,7 @@ pub(crate) mod tests {
     /// Inspect the guest frame before the host sanitizer, not its already
     /// sanitized held tree. Resync prevents patch application hiding a loss.
     fn assert_display_projection_survives_wire(
-        module: &str,
+        module: &'static str,
         props: &[u8],
         expected: &str,
         actions: &[&str],
