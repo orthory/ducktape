@@ -108,9 +108,9 @@ pub struct HubState {
 }
 
 /// A picked network's keystore: its wallet rows, why the listing is empty when
-/// it FAILED rather than being empty, and whether there is a keystore at all —
-/// an endpoint this device holds no workspace for (a remote) has none, and
-/// opens read-only.
+/// it FAILED rather than being empty, and whether the keystore could be
+/// NAMED at all — a remote whose node never answered which network it serves
+/// has no keystore to open, and the pick stays where it is with that error.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WalletList {
     pub wallets: Vec<WalletInfo>,
@@ -120,10 +120,13 @@ pub struct WalletList {
 
 /// Which step a picked network's keystore sends the launch window to, as the
 /// discriminant the handler branches on once: rows are the unlock surface, an
-/// empty keystore mints the device key, no keystore opens read-only.
+/// empty keystore mints the device key, and a keystore that could not be named
+/// (the remote never answered) keeps the pick on screen with its error. There
+/// is no silent read-only door: every way into the console goes past a key,
+/// and "Continue read-only" is a button the person presses.
 pub fn wallet_door(list: &WalletList) -> crate::WalletDoor {
     match (list.keystore, list.wallets.is_empty()) {
-        (false, _) => crate::WalletDoor::ReadOnly,
+        (false, _) => crate::WalletDoor::Unreached,
         (true, true) => crate::WalletDoor::Password,
         (true, false) => crate::WalletDoor::Wallets,
     }
@@ -405,14 +408,7 @@ fn wallet_rows(rpc: &str) -> Result<WalletList, String> {
             keystore: true,
         });
     }
-    let Some((_, workspace)) = workspace_at(rpc) else {
-        return Ok(WalletList {
-            wallets: Vec::new(),
-            error: String::new(),
-            keystore: false,
-        });
-    };
-    let listed = keystore::wallet::list(&workspace)?;
+    let listed = keystore::wallet::list(&keystore_root(rpc)?)?;
     Ok(WalletList {
         wallets: listed
             .into_iter()
@@ -433,7 +429,7 @@ fn wallet_rows(rpc: &str) -> Result<WalletList, String> {
 fn wallet_key_path(rpc: &str, name: &str) -> Result<PathBuf, String> {
     match (env_user_key(), name) {
         (Some(path), ENV_WALLET) => Ok(path),
-        (_, name) => keystore_key_path(&workspace_for(rpc)?, name),
+        (_, name) => keystore_key_path(&keystore_root(rpc)?, name),
     }
 }
 
@@ -443,7 +439,7 @@ fn active_or_env_wallet(rpc: &str) -> Result<String, String> {
     if env_key_override() {
         return Ok(ENV_WALLET.to_string());
     }
-    let name = active_wallet_name(&workspace_for(rpc)?);
+    let name = active_wallet_name(&keystore_root(rpc)?);
     if name.is_empty() {
         return Err("no active wallet — pick one in the launch window".to_string());
     }
@@ -461,10 +457,24 @@ pub async fn hub_state() -> HubState {
 /// The picked network's keystore, read the moment a network is picked. Also
 /// what settles the session's identity for that network: the active wallet's
 /// pubkey, read without a password, so the console knows who it is about to
-/// sign as before — and without — an unlock. A network with no keystore, or
-/// none active, is an identity of nobody. The read is a directory listing,
-/// never a subprocess: nothing on the key path execs anything.
+/// sign as before — and without — an unlock. A network with no active wallet
+/// is an identity of nobody. The read is a directory listing, never a
+/// subprocess: nothing on the key path execs anything.
+///
+/// A REMOTE's keystore is named by the network it serves, so its node is
+/// asked first (`/v1/status`); a node that cannot be reached, or serves no
+/// chain yet, has no keystore to open and the launch window stays on the pick
+/// with that error. A workspace on this device names its own keystore and is
+/// not asked.
 pub async fn load_wallets(rpc: String) -> WalletList {
+    if let Err(cause) = name_remote_keystore(&rpc).await {
+        set_local_user_key(None).await;
+        return WalletList {
+            wallets: Vec::new(),
+            error: user_error(cause),
+            keystore: false,
+        };
+    }
     let list = match wallet_rows(&rpc) {
         Ok(list) => list,
         Err(cause) => {
@@ -487,6 +497,26 @@ pub async fn load_wallets(rpc: String) -> WalletList {
         .and_then(|path| pubkey_of_key_file(&path));
     set_local_user_key(identity).await;
     list
+}
+
+/// Learn which network a remote endpoint serves, so its keystore has a name
+/// ([`keystore_root`]). A workspace on this device, or the key override, needs
+/// no asking. The status read is the only network round trip on the key path.
+async fn name_remote_keystore(rpc: &str) -> Result<(), String> {
+    let names_itself = env_user_key().is_some() || workspace_at(rpc).is_some();
+    if names_itself {
+        return Ok(());
+    }
+    let status = rpc_client(rpc)?
+        .status_json()
+        .await
+        .map_err(|error| error.to_string())?;
+    let chain_id = super::node::node_facts(&status).chain_id;
+    if chain_id.is_empty() {
+        return Err("this node serves no network yet, so there is no identity to hold for it".into());
+    }
+    note_remote_chain(rpc, &chain_id);
+    Ok(())
 }
 
 /// Merge one probe answer into the list by row id.
@@ -624,7 +654,7 @@ async fn in_the_keystore<T: Send + 'static>(
 pub async fn create_device_key(rpc: String, password: String) -> Result<String, AppError> {
     async {
         require_password(&password)?;
-        let workspace = workspace_for(&rpc)?;
+        let workspace = keystore_root(&rpc)?;
         let base = device_key_name();
         let candidates =
             std::iter::once(base.clone()).chain((2..10).map(|n| format!("{base}-{n}")));
@@ -790,7 +820,7 @@ pub async fn confirm_recovery_phrase(
     let (name, words) = confirmed_phrase(&answer).map_err(app_error)?;
     let password = Zeroizing::new(password);
     let pubkey = async {
-        let workspace = workspace_for(&rpc)?;
+        let workspace = keystore_root(&rpc)?;
         let sealing = {
             let (workspace, name, password) = (workspace.clone(), name.clone(), password.clone());
             in_the_keystore(move || keystore::wallet::import(&workspace, &name, &words, &password))
@@ -829,7 +859,7 @@ pub async fn restore_user_key(
     password: String,
 ) -> Result<String, AppError> {
     async {
-        let workspace = workspace_for(&rpc)?;
+        let workspace = keystore_root(&rpc)?;
         let normalized = Zeroizing::new(
             words
                 .expose()
@@ -886,7 +916,7 @@ async fn activate_wallet(rpc: &str, name: &str) -> Result<(), String> {
     if env_key_override() && name == ENV_WALLET {
         return Ok(());
     }
-    keystore::wallet::activate(&workspace_for(rpc)?, name)
+    keystore::wallet::activate(&keystore_root(rpc)?, name)
 }
 
 /// The console's Settings re-unlock, which knows a password and nothing else:
@@ -999,8 +1029,9 @@ mod tests {
     }
 
     /// A picked network's keystore decides the next step: rows unlock, an
-    /// empty keystore mints, and no keystore at all (a remote) opens
-    /// read-only — whatever rows it claims.
+    /// empty keystore mints, and a keystore that could not be named (the
+    /// remote never answered) keeps the pick on screen — whatever rows it
+    /// claims. No door opens the console read-only on its own.
     #[test]
     fn the_wallet_door_follows_the_picked_keystore() {
         assert!(matches!(
@@ -1012,9 +1043,40 @@ mod tests {
             crate::WalletDoor::Password
         ));
         assert!(matches!(
-            wallet_door(&wallet_list(vec![], String::new(), false)),
-            crate::WalletDoor::ReadOnly
+            wallet_door(&wallet_list(vec![], "unreachable".into(), false)),
+            crate::WalletDoor::Unreached
         ));
+    }
+
+    /// A REMOTE HAS A KEYSTORE. An endpoint this device holds no workspace
+    /// for used to have none — the door dropped it into the console read-only
+    /// with no way to create or unlock a key. Its keystore is named by the
+    /// network the node says it serves, under the ducktape home, and until
+    /// the node has said so the root is a refusal rather than a guess.
+    #[test]
+    fn a_remote_keystore_is_named_by_its_chain_id_once_the_node_has_answered() {
+        let rpc = "http://203.0.113.9:18844";
+        assert!(
+            keystore_root(rpc).is_err(),
+            "an unreached remote names no keystore"
+        );
+        note_remote_chain(rpc, "team#c0ffee");
+        let home = tempfile::tempdir().unwrap();
+        let root = remote_keystore_root(home.path(), "team#c0ffee").unwrap();
+        assert_eq!(root, home.path().join("remotes").join("team#c0ffee"));
+        assert!(
+            keystore_root(rpc).unwrap().ends_with("remotes/team#c0ffee"),
+            "the named remote resolves under the ducktape home"
+        );
+        // and the keystore verbs work on it like on a workspace: nothing yet.
+        assert!(keystore::wallet::list(&root).unwrap().is_empty());
+        // a path separator in a chain id is made inert, never a directory walk.
+        let root = remote_keystore_root(home.path(), "a/b#1").unwrap();
+        assert_eq!(root.file_name().unwrap(), "a-b#1");
+        assert!(remote_keystore_root(home.path(), "..").is_err());
+        // a node serving no chain records nothing.
+        note_remote_chain("http://203.0.113.11:1", "");
+        assert!(keystore_root("http://203.0.113.11:1").is_err());
     }
 
     /// A FIXED phrase — never a minted one, so nothing here can leak a real
