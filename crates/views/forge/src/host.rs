@@ -189,6 +189,11 @@ pub struct ForgeProps {
     pub file_phase: String,
     pub drafts_cleared: i64,
     pub drafts_scope: String,
+    /// The note composer's scope (the item's discussion channel) and
+    /// whether a note may leave right now — the composer itself is the
+    /// host's (`forge_composer`), so no words ever cross.
+    pub note_scope: String,
+    pub note_blocked: bool,
 }
 
 /// The facts now, and again on every change the host sees.

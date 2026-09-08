@@ -52,7 +52,6 @@ state
   forge_merge_conflicts:[str] = []
   forge_discussion:[ChatMessage] = []
   forge_discussion_members:[ChatMember] = []
-  forge_discussion_editor:editor = ""
   forge_discussion_pending = ""
   forge_generation:i64 = 0
   // THE CODE BROWSE: the open directory's listing, pinned to the commit the

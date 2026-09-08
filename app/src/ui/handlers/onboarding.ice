@@ -535,7 +535,6 @@ on console_opened(id)
   forge_discussion = []
   forge_discussion_members = []
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the

@@ -64,10 +64,10 @@ A view may also hand data to a
 host surface that reads it: Forge's code browse leaves slots for the
 decoded picture, the document-aware Markdown reader and the highlighted
 code reader, each painted by the app from the arguments the view passes,
-and the reader's links come back to the view's own handler. What cannot
-cross the wire stays native beside the view: Forge's discussion note
-composer edits an editor the app holds, so the app docks it under the view
-while an item is open.
+and the reader's links come back to the view's own handler. Forge's
+discussion note composer is the chat composer as a host surface
+(`forge_composer`) over the item's channel, so a note's words stay in the
+app and only its send crosses.
 A view whose screen needs a widget
 the tree wire does not carry leaves that widget to the host too: the Chat
 view declares `chat_composer` as a host surface per room and per thread,

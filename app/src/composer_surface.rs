@@ -100,6 +100,7 @@ pub fn provider() -> Surface {
         };
         Element::new(Composer {
             document: document(scope),
+            scope: scope.clone(),
             kind: kind.clone(),
             compact: *compact,
             hint: hint.clone(),
@@ -111,7 +112,9 @@ pub fn provider() -> Surface {
 }
 
 /// The intent a surface event is, if it is one: a submit crosses as a
-/// `composer` record; an edit is the surface's own business and is not.
+/// `composer` record — with the scope it was written in, so the handler
+/// that takes it later can tell a box the reader has since left from the
+/// one on screen; an edit is the surface's own business and is not.
 pub fn intent(value: &Value) -> Option<crate::module_view::ModuleViewEvent> {
     let Value::Record { name, fields } = value else {
         return None;
@@ -126,6 +129,7 @@ pub fn intent(value: &Value) -> Option<crate::module_view::ModuleViewEvent> {
         })
     };
     let detail = serde_json::json!({
+        "scope": field("scope")?,
         "kind": field("kind")?,
         "body": field("body")?,
         "id": field("id")?,
@@ -149,6 +153,7 @@ pub(crate) enum Interaction {
 
 struct Composer {
     document: Shared,
+    scope: String,
     kind: String,
     compact: bool,
     hint: String,
@@ -179,6 +184,7 @@ impl Composer {
                 Some(Value::Record {
                     name: "composer".into(),
                     fields: vec![
+                        ("scope".into(), Value::Str(self.scope.clone())),
                         ("kind".into(), Value::Str(self.kind.clone())),
                         ("body".into(), Value::Str(body)),
                         (
@@ -648,6 +654,7 @@ pub(crate) mod testing {
     ) -> Option<Value> {
         let composer = Composer {
             document: document(scope),
+            scope: scope.into(),
             kind: kind.into(),
             compact: false,
             hint: String::new(),
@@ -689,6 +696,7 @@ mod tests {
         let value = Value::Record {
             name: "composer".into(),
             fields: vec![
+                ("scope".into(), Value::Str("net\u{1f}room-a#4".into())),
                 ("kind".into(), Value::Str("reply".into())),
                 ("body".into(), Value::Str("hi".into())),
                 ("id".into(), Value::Str("reply-1".into())),
@@ -697,6 +705,7 @@ mod tests {
         let event = intent(&value).expect("a submit");
         assert_eq!(event.kind, "composer");
         let detail: serde_json::Value = serde_json::from_str(&event.detail).expect("json");
+        assert_eq!(detail["scope"], "net\u{1f}room-a#4");
         assert_eq!(detail["kind"], "reply");
         assert_eq!(detail["body"], "hi");
         assert_eq!(detail["id"], "reply-1");

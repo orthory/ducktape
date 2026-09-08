@@ -64,6 +64,9 @@ on forge_view_event(event)
       flow
         from done event_text(event, "url")
         done -> open_message_link _
+    ForgeIntent.composer
+      let scope = event_text(event, "scope")
+      run every duck_echo_str(event_text(event, "body")) -> forge_composer_event(scope, _) | external_url_failed _
     ForgeIntent.copy
       toast = event_text(event, "label")
       toast_age = 0
@@ -102,6 +105,10 @@ on forge_open_repo(name)
   forge_items = []
   forge_item_number = 0
   forge_item_phase = ForgePhase.idle
+  // THE PREVIOUS ITEM'S CHANNEL RETIRES HERE, not when the next item lands:
+  // a note submitted for it that is still crossing the wire must find no
+  // box on screen to post into, and go back to its own.
+  forge_item_channel = ""
   forge_item_diff = ""
   forge_generation = forge_generation + 1
   forge_tab = ForgeTab.code
@@ -238,6 +245,8 @@ on forge_open_item(number)
   forge_linked_note = none
   error = ""
   forge_item_phase = ForgePhase.loading
+  // the previous item's channel retires now (see forge_open_repo)
+  forge_item_channel = ""
   forge_review_verdict = ForgeReviewVerdict.comment
   // A staged comment anchors to THIS item's diff. Carrying one across items
   // would post it against a patch it was never written about — and the
@@ -249,7 +258,6 @@ on forge_open_item(number)
   forge_discussion = []
   forge_discussion_members = []
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   forge_generation = forge_generation + 1
   run replace lane=forge_item load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_item_failed _
 
@@ -351,21 +359,36 @@ on forge_merge_failed(started_rpc, started_repo, started_number, cause)
   return if started_rpc != connected_rpc || started_repo != forge_repo || started_number != forge_item_number
   error = cause.message
 
-on forge_composer_event(event)
-  forge_discussion_editor = apply_composer_event(forge_discussion_editor, event)
-  return if !composer_submits(event)
-  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
-  forge_discussion_pending = fresh_operation_id("forge-note")
-  run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
+// The note's words live in the host's composer (`forge_composer`, the chat
+// composer over the item's channel on this network as its scope); a send
+// arrives here as the trimmed body and the scope it was written in. The
+// composer cleared itself before it emitted, so a body the gate refuses —
+// or one written for an item or a network the reader has since left — goes
+// back to THAT box, never to the item on screen, and a failed send too.
+//
+// THE SEND CARRIES ITS OWN IDENTITY on both routes — the box it left from
+// and its operation id — because the state fields move under it: opening
+// another item clears `forge_discussion_pending` and a newer note may be
+// in flight by the time this one answers. So a failure restores into the
+// scope IT captured, and only the completion whose id is still the pending
+// one clears the flag; a stale answer never clears a newer note's.
+on forge_composer_event(scope, body)
+  match submit_verdict(loading, connected, forge_item_channel, forge_discussion_pending, forge_item_number > 0 && forge_item_phase == ForgePhase.ready, scope, composer_scope(connected_rpc, forge_item_channel))
+    SubmitVerdict.refused
+      composer_stashed = chat_composer_unsent(scope, body, false)
+    SubmitVerdict.admitted
+      let op = fresh_operation_id("forge-note")
+      forge_discussion_pending = op
+      run every send_message(connected_rpc, password, forge_item_channel, op, trim(body), forge_discussion_members) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)
 
-on forge_note_sent(next)
-  return if next.channel_id != forge_item_channel
+on forge_note_sent(op, next)
+  return if op != forge_discussion_pending
   forge_discussion_pending = ""
-  forge_discussion_editor = editor("")
   error = ""
 
-on forge_note_failed(cause)
-  return if cause.scope_id != forge_item_channel
+on forge_note_failed(scope, op, cause)
+  composer_stashed = chat_composer_unsent(scope, cause.body, cause.committed)
+  return if op != forge_discussion_pending
   forge_discussion_pending = ""
   error = cause.message
 
