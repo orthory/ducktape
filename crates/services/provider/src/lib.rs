@@ -208,6 +208,7 @@ pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 // the duckfs read cap applied to a reply: shared by this crate's read lane and
 // `bin/node`'s MCP read tools, so the two gate identically.
 pub mod duckfs_cap;
+mod egress_proxy;
 mod read_lane;
 mod spec;
 mod variants;
@@ -285,6 +286,47 @@ impl PartialEq for RunCancellation {
 
 impl Eq for RunCancellation {}
 
+/// This node's operator credential as a run's node lane lends it. Read fresh
+/// on every use, because the node re-mints it each boot; never handed to the
+/// guest — the lane attaches it only to a forge push the run's committed
+/// grant admits, so a push proves itself with the node's authority rather
+/// than with a signing key the guest never holds.
+#[derive(Clone)]
+pub struct OperatorCredential {
+    header: &'static str,
+    read: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
+
+impl OperatorCredential {
+    /// `header` is the request header the node's operator routes read the
+    /// credential from; `read` answers its current value, or `None` when this
+    /// node has none to lend.
+    pub fn new(header: &'static str, read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        Self {
+            header,
+            read: Arc::new(read),
+        }
+    }
+
+    /// the header name the credential travels under.
+    pub fn header_name(&self) -> &'static str {
+        self.header
+    }
+
+    /// the credential as of now.
+    pub fn value(&self) -> Option<String> {
+        (self.read)()
+    }
+}
+
+impl std::fmt::Debug for OperatorCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorCredential")
+            .field("header", &self.header)
+            .finish_non_exhaustive()
+    }
+}
+
 /// per-run, host-local context riding beside the prompt: which agent is
 /// running. populated by the worker from the run envelope; a run with no agent
 /// identity uses [`RunContext::default`]. NEVER consensus data — providers only
@@ -341,6 +383,10 @@ pub struct RunContext {
     /// consensus data; the resolver builds it host-side from committed state
     /// before the provider spawns.
     pub airlock: Option<broker::AirlockConfig>,
+    /// this node's operator credential for the run's node lane to lend to an
+    /// admitted forge push. `None` (an embedder with no node behind it) refuses
+    /// every push at the lane. Never consensus data, never guest env.
+    pub operator_credential: Option<OperatorCredential>,
 }
 
 /// which child stream produced one live output line.
@@ -732,7 +778,7 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
         stdio: GuestStdio,
-    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo, Option<read_lane::ReadLane>), String> {
+    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo, GuestLanes), String> {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
@@ -754,7 +800,15 @@ impl CliProvider {
         // listener: this binds it and repoints `DUCKTAPE_NODE` at it, so what
         // gets tunnelled below is the lane's port. It lives exactly as long as
         // the returned value, which the run holds beside its VM.
-        let read_lane = read_lane::ReadLane::start(&mut envs, ctx.agent_id.clone()).await?;
+        let read_lane = read_lane::ReadLane::start(
+            &mut envs,
+            ctx.agent_id.clone(),
+            ctx.operator_credential.clone(),
+        )
+        .await?;
+        // the run's way off this host: an egress proxy on its own tunnel,
+        // named to the guest through the proxy env every http client reads.
+        let egress = egress_proxy::EgressProxy::start(&mut envs).await?;
         // wired HERE, before the env is translated and frozen into the
         // manifest — the name is the warning: it rewrites `envs`.
         let tunnel_ports = wire_guest_tunnels(
@@ -878,7 +932,14 @@ impl CliProvider {
         run_scratch.disarm();
         socket_scratch.disarm();
         let (vm, io) = booted;
-        Ok((vm, io, read_lane))
+        Ok((
+            vm,
+            io,
+            GuestLanes {
+                _read_lane: read_lane,
+                _egress: egress,
+            },
+        ))
     }
 
     /// the env carried into a sandbox.
@@ -1742,7 +1803,13 @@ impl Drop for ContextGuard {
 /// (`noded::signed_req`), and a run's env carries neither. The forge's
 /// `git-receive-pack` takes the same two proofs in git's own shapes — a
 /// `git push --signed` certificate or that operator credential in a header —
-/// and a guest can present neither.
+/// and a guest can present neither ITSELF: the lane presents the operator
+/// credential on the guest's behalf, and only for a push the run's committed
+/// `forge_push` cap admits (a fetch needs `forge_read`).
+///
+/// Off the host altogether, the guest has one more tunnel: its egress proxy
+/// ([`egress_proxy`]), named through `HTTP_PROXY`/`HTTPS_PROXY`, which dials
+/// the network for it and refuses to dial this host.
 ///
 /// **In reach, on purpose:** the MODULE-BOUND mutations — `/v1/submit`, the
 /// duckfs writes, the object facade's PUT/DELETE, `POST /v1/fs/workspaces` and
@@ -1760,8 +1827,14 @@ fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str
     if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
         ports.extend(url_port(run_action));
     }
-    // three distinct listeners on one host, so three distinct ports: nothing to
-    // dedup, and a duplicate would be a bug upstream rather than a collision to
+    if let Some((_, proxy)) = envs
+        .iter()
+        .find(|(key, _)| key == egress_proxy::HTTPS_PROXY_ENV)
+    {
+        ports.extend(url_port(proxy));
+    }
+    // distinct listeners on one host, so distinct ports: nothing to dedup,
+    // and a duplicate would be a bug upstream rather than a collision to
     // absorb here.
     ports.extend(aim_node_at_guest(envs));
     ports
@@ -2412,7 +2485,9 @@ impl Drop for LiveChild {
 /// identically.
 enum RunControl {
     Local(LiveChild),
-    MicroVm(MicroVmHandle),
+    /// boxed: the handle carries the VM, its io pump and the guest's tunnels,
+    /// and a run holds exactly one of these.
+    MicroVm(Box<MicroVmHandle>),
 }
 
 /// a running microVM: the VMM child, the guest's exit channel, the background
@@ -2428,9 +2503,17 @@ struct MicroVmHandle {
     pump: Option<tokio::task::JoinHandle<()>>,
     /// the HOST directory the run's workspace image is walked back into.
     workdir: PathBuf,
-    /// held for the VM's lifetime: the run's cap-checked node read lane. It is
-    /// the guest's `DUCKTAPE_NODE`, so it must not outlive the guest.
+    /// held for the VM's lifetime: the guest's node lane and egress proxy,
+    /// which must not outlive the guest they answer.
+    _lanes: GuestLanes,
+}
+
+/// the host ends of a guest's tunnels that this crate itself terminates: the
+/// cap-checked node lane behind `DUCKTAPE_NODE`, and the egress proxy behind
+/// `HTTPS_PROXY`. Each lives exactly as long as the run holding it.
+pub(crate) struct GuestLanes {
     _read_lane: Option<read_lane::ReadLane>,
+    _egress: egress_proxy::EgressProxy,
 }
 
 impl RunControl {
@@ -2499,8 +2582,8 @@ impl RunControl {
         match self {
             RunControl::Local(_) => Ok(()),
             RunControl::MicroVm(handle) => {
-                let workdir = handle.workdir.clone();
-                handle.vm.collect(&workdir).await
+                let handle = *handle;
+                handle.vm.collect(&handle.workdir).await
             }
         }
     }
@@ -2630,20 +2713,20 @@ impl CliProvider {
             RunControl,
         ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io, read_lane) = self
+            let (vm, io, lanes) = self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
                 .await?;
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
                 Box::new(io.stderr),
-                RunControl::MicroVm(MicroVmHandle {
+                RunControl::MicroVm(Box::new(MicroVmHandle {
                     vm,
                     exit: Some(io.exit),
                     pump: Some(io.pump),
                     workdir: workdir.to_path_buf(),
-                    _read_lane: read_lane,
-                }),
+                    _lanes: lanes,
+                })),
             )
         } else {
             let mut command = self.prepared_command(args, workdir, ctx, &auth)?;
@@ -5373,6 +5456,7 @@ printf '%s\n' "$PATH"
             limits: BTreeMap::new(),
             context_doc: None,
             airlock: None,
+            operator_credential: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();

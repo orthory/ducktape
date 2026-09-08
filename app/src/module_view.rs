@@ -134,11 +134,13 @@ pub fn members_view(
 /// The Agents tab: the register as the app has it, drawn by the `agents`
 /// view — every record whole, the capability tags the network announces,
 /// the action vocabulary, and the signing account (`account`, its decimal
-/// number) so the view offers the editor to a record's controller. Its
-/// intents come back as `status` (`agent_id`, `paused`), `save` and
-/// `register` (both the whole draft record as JSON, `AgentDraft`). Every
-/// committed write bumps `committed`, which tells the view its drafts were
-/// consumed.
+/// number) so the view offers the editor to a record's controller; beside
+/// it the run tracker, every run off the runs journal and the journal of
+/// the one the reader opened. Its intents come back as `status`
+/// (`agent_id`, `paused`), `save` and `register` (both the whole draft
+/// record as JSON, `AgentDraft`), and `open_run` (`run_id`, "" to close).
+/// Every committed write bumps `committed`, which tells the view its drafts
+/// were consumed.
 #[allow(clippy::too_many_arguments)]
 pub fn agents_view(
     dark: bool,
@@ -147,11 +149,15 @@ pub fn agents_view(
     account: &str,
     committed: i64,
     rows: &[crate::backend::AgentRow],
+    runs: &[crate::backend::RunRow],
+    journal: &crate::backend::RunJournal,
     capabilities: &[String],
     actions: &[String],
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "rows": rows,
+        "runs": runs,
+        "journal": journal,
         "capabilities": capabilities,
         "actions": actions,
         "account": account,
@@ -167,6 +173,7 @@ pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
         "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
+        "open_run" => crate::AgentsIntent::OpenRun,
         _ => crate::AgentsIntent::Status,
     }
 }

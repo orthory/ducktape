@@ -200,6 +200,7 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
             PageMsg::CreatePage {
                 page_id: "old-opener-page".into(),
                 title: "Old opener".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -213,6 +214,7 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
             PageMsg::CreatePage {
                 page_id: "old-editor-page".into(),
                 title: "Old editor".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -269,6 +271,7 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
             PageMsg::CreatePage {
                 page_id: "account-page".into(),
                 title: "Account page".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -399,8 +402,8 @@ fn compiled_thread_resolution_authenticates_queued_program_accounts() {
         for account in [3, 4] {
             p.identity(Origin::Module("resolution-executor".into()), identity::IdentityMsg::CreateProgram { name: format!("program-{account}"), controller: 1, request: account }).await;
         }
-        p.page(signed(&bob), PageMsg::CreatePage { page_id: "human-page".into(), title: "Human".into() }).await;
-        let created = p.program_call(3, PageMsg::CreatePage { page_id: "program-page".into(), title: "Program".into() }).await;
+        p.page(signed(&bob), PageMsg::CreatePage { page_id: "human-page".into(), title: "Human".into(), blocks: Vec::new(), }).await;
+        let created = p.program_call(3, PageMsg::CreatePage { page_id: "program-page".into(), title: "Program".into(), blocks: Vec::new(), }).await;
         assert_eq!(created.disposition, host::CallDisposition::Applied);
         p.page(signed(&bob), thread_comment("program-editor", "program-page")).await;
         let opened = p.program_call(3, thread_comment("program-opener", "human-page")).await;
@@ -644,6 +647,7 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 },
             ),
             (
@@ -898,6 +902,7 @@ fn rejections_match_and_leave_no_trace() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 }),
             )
             .await
@@ -1086,6 +1091,7 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
+                    blocks: Vec::new(),
                 }),
             ),
             (

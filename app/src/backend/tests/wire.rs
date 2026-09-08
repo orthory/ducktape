@@ -477,6 +477,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         pages::encode_msg(&PageMsg::CreatePage {
             page_id: "welcome".into(),
             title: "Welcome".into(),
+            blocks: Vec::new(),
         }),
     )
     .await;

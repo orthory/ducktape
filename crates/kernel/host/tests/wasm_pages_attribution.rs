@@ -389,6 +389,7 @@ async fn exercise_many_mentions(host: &mut Host) {
         PageMsg::CreatePage {
             page_id: "home".into(),
             title: "Home".into(),
+            blocks: Vec::new(),
         },
         PageMsg::InsertBlock {
             parent: "home".into(),

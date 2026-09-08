@@ -52,6 +52,10 @@ impl Ctx for BudgetCtx<'_, '_> {
     fn set_output(&mut self, bytes: Vec<u8>) {
         self.inner.set_output(bytes);
     }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        self.inner.set_assigned(bytes);
+    }
 }
 
 impl RunsModule {
@@ -187,18 +191,22 @@ impl Module for RunsModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // Receipt facts live only between an effect's preparation and its
-        // staging inside one execute; nothing carries across ops.
+        // Receipt facts and journal facts live only inside one execute;
+        // nothing carries across ops.
         self.prepared_receipts.borrow_mut().clear();
+        self.journal.clear();
         // The one visible origin dispatch. Each arm delegates once to a
         // budgeted handler whose stack-owned ledger spans that whole execute.
-        match self.execute_kind(&ctx.env().origin) {
+        let applied = match self.execute_kind(&ctx.env().origin) {
             ExecuteKind::Result => self.execute_result(ctx, &msg.payload).await,
             ExecuteKind::Jobs => self.execute_jobs(ctx, &msg.payload).await,
             ExecuteKind::Saga => self.drop_saga_callback(ctx),
             ExecuteKind::Chat => self.drop_chat_follow_up(ctx),
             ExecuteKind::Admin => self.execute_admin(ctx, msg).await,
-        }
+        };
+        applied?;
+        self.stamp_journal(ctx);
+        Ok(())
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
@@ -280,7 +288,10 @@ impl Module for RunsModule {
     }
 
     async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &sdk::Ack) -> Result<(), Error> {
-        self.acknowledge_action(ctx, ack).await
+        self.journal.clear();
+        self.acknowledge_action(ctx, ack).await?;
+        self.stamp_journal(ctx);
+        Ok(())
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {

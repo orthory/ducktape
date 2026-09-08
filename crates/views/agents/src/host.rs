@@ -53,9 +53,61 @@ pub struct AgentRow {
     pub skills: Vec<AgentSkill>,
 }
 
+/// One run of an agent — a dispatch and what became of it — as the app
+/// read it off the runs journal. Every stamp is pre-rendered: the view
+/// owns no clock and no chain height.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRow {
+    pub run_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    /// what the run answers: a channel message, a job, or a calling run
+    pub origin: String,
+    /// `dispatched`, `running`, `accepted`, `rejected` or `failed`
+    pub state: String,
+    /// the dispatch height, rendered
+    pub dispatched: String,
+    /// the settlement height, rendered; "" while the run is in flight
+    pub settled: String,
+    pub attempt: i64,
+    /// the executing node's key, abbreviated; "" before a session opened
+    pub holder: String,
+    pub actions: i64,
+    pub degraded: bool,
+    /// the failure excerpt of a failed run
+    pub reason: String,
+    pub output_ref: String,
+    /// 0 when the run opened no PR
+    pub pr_number: i64,
+}
+
+/// One journal entry of the run the reader opened.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntry {
+    /// the commit height, rendered
+    pub height: String,
+    /// the fact's kind: `dispatched`, `session opened`, `acted`, `settled`,
+    /// `result action refused`, `pr linked`
+    pub kind: String,
+    pub summary: String,
+}
+
+/// The journal of one run, as the app last read it. `run_id` names the run
+/// it belongs to, so a journal that arrives after the reader moved on is
+/// told apart from the one they are looking at.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunJournal {
+    pub run_id: String,
+    pub entries: Vec<JournalEntry>,
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsProps {
     pub rows: Vec<AgentRow>,
+    /// every agent's runs, newest dispatch first
+    pub runs: Vec<RunRow>,
+    /// the journal of the run the app has open for the reader
+    pub journal: RunJournal,
     /// every capability tag a node on the network announces
     pub capabilities: Vec<String>,
     /// the action vocabulary a grant draws from
@@ -88,6 +140,35 @@ pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     let working = rows.iter().filter(|row| row.live).count();
     let noun = if rows.len() == 1 { "agent" } else { "agents" };
     format!("{} {noun} · {working} working", rows.len())
+}
+
+/// `12 runs · 2 in flight` — the Runs panel's machine subtitle.
+pub fn runs_summary(runs: &[RunRow]) -> String {
+    if runs.is_empty() {
+        return String::new();
+    }
+    let in_flight = runs
+        .iter()
+        .filter(|run| run.state == "dispatched" || run.state == "running")
+        .count();
+    let noun = if runs.len() == 1 { "run" } else { "runs" };
+    format!("{} {noun} · {in_flight} in flight", runs.len())
+}
+
+/// The run listed under `run_id`; an empty row when the list has none.
+pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
+    runs.iter()
+        .find(|run| run.run_id == run_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn empty_journal() -> RunJournal {
+    RunJournal::default()
+}
+
+pub fn empty_run() -> RunRow {
+    RunRow::default()
 }
 
 /// How many grants a record carries: every cap list, and the budget once
@@ -367,6 +448,22 @@ pub struct Draft {
     pub allowed_actions: Vec<String>,
     pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
+}
+
+/// The run the reader opened, whose journal the app is asked to read; an
+/// empty id closes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRun {
+    pub run_id: String,
+}
+
+pub fn open_run(run_id: &str) -> bool {
+    notify(
+        "agents.open_run",
+        &OpenRun {
+            run_id: run_id.into(),
+        },
+    )
 }
 
 pub fn status(agent_id: &str, paused: bool) -> bool {

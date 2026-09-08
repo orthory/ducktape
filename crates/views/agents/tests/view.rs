@@ -2,7 +2,10 @@
 //! an editor for its controller and as a reading for everyone else, and the
 //! only things that leave are the writes the reader asked for.
 
-use agents_view::host::{AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, Status};
+use agents_view::host::{
+    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, OpenRun, RunJournal,
+    RunRow, Status,
+};
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, texts, toggle, type_into};
 use ui_lang_guest::wire::{Frame, Request};
@@ -50,9 +53,40 @@ fn agent(name: &str, status: &str, live: bool) -> AgentRow {
     }
 }
 
+fn run(run_id: &str, agent: &str, state: &str) -> RunRow {
+    RunRow {
+        run_id: run_id.into(),
+        agent_id: agent.to_lowercase(),
+        agent_name: agent.into(),
+        origin: "#general · msg 12".into(),
+        state: state.into(),
+        dispatched: "h 84,912".into(),
+        settled: String::new(),
+        attempt: 0,
+        holder: "ab12cd34ef56ab12…".into(),
+        actions: 2,
+        degraded: false,
+        reason: String::new(),
+        output_ref: String::new(),
+        pr_number: 0,
+    }
+}
+
 fn register(rows: Vec<AgentRow>, account: &str, committed: i64) -> Vec<u8> {
+    register_with_runs(rows, Vec::new(), RunJournal::default(), account, committed)
+}
+
+fn register_with_runs(
+    rows: Vec<AgentRow>,
+    runs: Vec<RunRow>,
+    journal: RunJournal,
+    account: &str,
+    committed: i64,
+) -> Vec<u8> {
     serde_json::to_vec(&AgentsProps {
         rows,
+        runs,
+        journal,
         capabilities: vec!["claude".into(), "codex".into()],
         actions: vec!["chat.post".into(), "tasks.create".into()],
         account: account.into(),
@@ -254,4 +288,101 @@ fn a_committed_write_reseeds_the_open_record_from_its_fresh_row() {
     let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
     assert_eq!(draft.display_name, "Renamed Bot");
     assert_eq!(draft.allowed_actions, ["chat.post"], "the unsaved tick was consumed");
+}
+
+#[test]
+fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
+    let mut failed = run("chat\x1fgeneral\x1f9\x1freviewer", "Reviewer", "failed");
+    failed.reason = "worker exploded".into();
+    failed.settled = "h 84,920".into();
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_runs(
+            vec![agent("Reviewer", "active", true)],
+            vec![running.clone(), failed.clone()],
+            RunJournal::default(),
+            "7",
+            0,
+        ),
+    )]);
+    // the registry is the first panel; the tracker is one press away
+    assert!(!has_text(&frame, "#general · msg 12"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Runs"));
+    for expected in ["2 runs · 1 in flight", "#general · msg 12", "running", "failed", "h 84,912"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+
+    // opening a run asks the app for its journal, by run id
+    let frame = tick_native(press(&frame, &failed.run_id));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "agents.open_run");
+    assert_eq!(
+        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
+        OpenRun {
+            run_id: failed.run_id.clone()
+        }
+    );
+    assert!(has_text(&frame, "Reading the journal…"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
+
+    // the journal lands under the open run's id and reads fact by fact
+    let journal = RunJournal {
+        run_id: failed.run_id.clone(),
+        entries: vec![
+            JournalEntry {
+                height: "h 84,912".into(),
+                kind: "dispatched".into(),
+                summary: "for reviewer from #general · msg 9".into(),
+            },
+            JournalEntry {
+                height: "h 84,920".into(),
+                kind: "settled".into(),
+                summary: "failed: worker exploded".into(),
+            },
+        ],
+    };
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_runs(
+            vec![agent("Reviewer", "active", true)],
+            vec![running, failed.clone()],
+            journal,
+            "7",
+            0,
+        ),
+    )]);
+    assert!(!has_text(&frame, "Reading the journal…"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "for reviewer from #general · msg 9"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "failed: worker exploded"), "{:?}", texts(&frame));
+
+    // closing tells the app to stop reading it
+    let frame = tick_native(press(&frame, "Close journal"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "agents.open_run");
+    assert_eq!(
+        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
+        OpenRun {
+            run_id: String::new()
+        }
+    );
+    assert!(!has_text(&frame, "for reviewer from #general · msg 9"), "{:?}", texts(&frame));
+}
+
+#[test]
+fn the_every_action_grant_implies_each_action_and_saves_as_the_star() {
+    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+    let frame = tick_native(press(&frame, "Reviewer Bot"));
+    let frame = tick_native(toggle(&frame, "every action (*)", true));
+    let frame = tick_native(press(&frame, "Save agent"));
+    let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
+    assert_eq!(draft.allowed_actions, ["*", "chat.post"]);
 }

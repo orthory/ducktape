@@ -1157,6 +1157,8 @@ pub struct AgentRow {
 pub struct AgentsData {
     pub generation: i64,
     pub agents: Vec<AgentRow>,
+    /// every run the journal lists, newest dispatch first — the tracker
+    pub runs: Vec<RunRow>,
     /// Every capability tag a node on this network announces — what a
     /// record's `capability` can be dispatched on today.
     pub capabilities: Vec<String>,
@@ -1180,10 +1182,11 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
         let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
             return Err("the runs module returned the wrong model roster reply".into());
         };
-        let (accounts, working, capabilities) = tokio::join!(
+        let (accounts, working, capabilities, recent) = tokio::join!(
             read_accounts(&client),
             agents_with_a_run_in_flight(&client),
-            announced_capabilities(&client)
+            announced_capabilities(&client),
+            recent_runs(&client)
         );
         let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
@@ -1221,9 +1224,22 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // the tracker names agents the way the register does. A node whose
+        // runs journal cannot answer (no mapper installed, a fold still
+        // catching up) lists no runs rather than losing the register.
+        let names_by_id: BTreeMap<String, String> = agents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.name.clone()))
+            .collect();
+        let runs = recent
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| run_row(run, &names_by_id))
+            .collect();
         Ok(AgentsData {
             generation,
             agents,
+            runs,
             capabilities,
             actions: runs::KNOWN_ACTIONS
                 .iter()
@@ -1280,62 +1296,249 @@ pub fn any_agent_active(rows: &[AgentRow]) -> bool {
     rows.iter().any(|row| row.live)
 }
 
-/// One agent run indexed by workspace search.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One run of an agent — a dispatch and what became of it — read off the
+/// runs journal (`runs::index`), every stamp rendered for the register the
+/// Agents view draws: the view owns no clock and no chain height.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct RunRow {
     pub run_id: String,
     pub agent_id: String,
-    pub outcome: String,
-    /// A consensus counter (the creation block), NOT a unix stamp — render it
-    /// with `height_ago`/`height_label_short`, never with `relative_time`.
-    pub created_at: i64,
+    pub agent_name: String,
+    /// what the run answers: a channel message, a job, or a calling run
+    pub origin: String,
+    /// `dispatched`, `running`, `accepted`, `rejected` or `failed`
+    pub state: String,
+    /// the dispatch height, rendered — a consensus counter, never a clock
+    pub dispatched: String,
+    /// the settlement height, rendered; "" while the run is in flight
+    pub settled: String,
+    pub attempt: i64,
+    /// the executing node's key, abbreviated; "" before a session opened
+    pub holder: String,
+    pub actions: i64,
+    pub degraded: bool,
+    /// the failure excerpt of a failed run
+    pub reason: String,
+    pub output_ref: String,
+    /// 0 when the run opened no PR
+    pub pr_number: i64,
 }
 
-/// Pending runs first, then the delivered ring newest-first. Two queries because
-/// the runs module keeps in-flight correlation and settled history separate.
+/// One journal entry of the run the reader opened.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+pub struct JournalEntry {
+    /// the commit height, rendered
+    pub height: String,
+    pub kind: String,
+    pub summary: String,
+}
+
+/// The journal of one run, keyed by the run it belongs to so a read that
+/// lands after the reader moved on is told apart from the open one.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct RunJournal {
+    pub run_id: String,
+    pub entries: Vec<JournalEntry>,
+}
+
+pub fn empty_run_journal() -> RunJournal {
+    RunJournal::default()
+}
+
+/// What a run answers, in the tracker's words.
+fn run_origin(
+    channel_id: &str,
+    anchor_seq: u64,
+    job_id: &Option<String>,
+    delegation_id: &Option<String>,
+) -> String {
+    if let Some(job_id) = job_id {
+        return format!("job {job_id}");
+    }
+    if let Some(delegation_id) = delegation_id {
+        return format!("called by a run · {delegation_id}");
+    }
+    format!("#{channel_id} · msg {anchor_seq}")
+}
+
+fn outcome_word(outcome: runs::RunOutcome) -> &'static str {
+    match outcome {
+        runs::RunOutcome::ResultAccepted => "accepted",
+        runs::RunOutcome::ActionRejected => "rejected",
+        runs::RunOutcome::Failed => "failed",
+    }
+}
+
+fn height_i64(height: u64) -> i64 {
+    i64::try_from(height).unwrap_or(i64::MAX)
+}
+
+/// The tracker's row for one journal run; `names` maps agent ids to the
+/// display names the register carries, and an agent the register does not
+/// list is named by its id.
+fn run_row(run: runs::index::RunView, names: &BTreeMap<String, String>) -> RunRow {
+    let agent_name = names
+        .get(&run.agent_id)
+        .cloned()
+        .unwrap_or_else(|| run.agent_id.clone());
+    let origin = run_origin(
+        &run.channel_id,
+        run.anchor_seq,
+        &run.job_id,
+        &run.delegation_id,
+    );
+    let mut row = RunRow {
+        run_id: run.run_id,
+        agent_id: run.agent_id,
+        agent_name,
+        origin,
+        state: "dispatched".into(),
+        dispatched: height_label_short(height_i64(run.dispatched.height)),
+        settled: String::new(),
+        attempt: 0,
+        holder: String::new(),
+        actions: height_i64(run.actions),
+        degraded: false,
+        reason: String::new(),
+        output_ref: String::new(),
+        pr_number: run.pr_number.map_or(0, height_i64),
+    };
+    match run.state {
+        runs::index::RunState::Dispatched => {}
+        runs::index::RunState::Running { attempt, holder } => {
+            row.state = "running".into();
+            row.attempt = i64::from(attempt);
+            row.holder = short_pubkey(&holder);
+        }
+        runs::index::RunState::Settled {
+            outcome,
+            reason,
+            degraded,
+            executing_node,
+            output_ref,
+            at,
+        } => {
+            row.state = outcome_word(outcome).into();
+            row.settled = height_label_short(height_i64(at.height));
+            row.holder = short_pubkey(&executing_node);
+            row.degraded = degraded;
+            row.reason = reason.unwrap_or_default();
+            row.output_ref = output_ref.unwrap_or_default();
+        }
+    }
+    row
+}
+
+/// One journal fact in the tracker's words: its kind, and a one-line
+/// summary of what the module committed.
+fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
+    let (kind, summary) = match row.fact {
+        runs::RunFact::Dispatched {
+            agent_id,
+            channel_id,
+            anchor_seq,
+            job_id,
+            delegation_id,
+            ..
+        } => (
+            "dispatched",
+            format!(
+                "for {agent_id} from {}",
+                run_origin(&channel_id, anchor_seq, &job_id, &delegation_id)
+            ),
+        ),
+        runs::RunFact::SessionOpened { attempt, holder } => (
+            "session opened",
+            format!("on {} · attempt {attempt}", short_pubkey(&holder)),
+        ),
+        runs::RunFact::Acted {
+            request_id,
+            operation,
+        } => ("acted", format!("{operation} · {request_id}")),
+        runs::RunFact::Settled {
+            outcome,
+            reason,
+            degraded,
+            executing_node,
+            output_ref,
+            pr_number,
+        } => {
+            let mut parts = vec![outcome_word(outcome).to_string()];
+            if degraded {
+                parts.push("degraded".into());
+            }
+            parts.extend(reason);
+            if executing_node != "unknown" {
+                parts.push(format!("on {}", short_pubkey(&executing_node)));
+            }
+            parts.extend(output_ref);
+            parts.extend(pr_number.map(|number| format!("PR #{number}")));
+            ("settled", parts.join(" · "))
+        }
+        runs::RunFact::ResultActionRefused { request_id } => ("result action refused", request_id),
+        runs::RunFact::PrLinked { number } => ("pr linked", format!("PR #{number}")),
+    };
+    JournalEntry {
+        height: height_label_short(height_i64(row.height)),
+        kind: kind.into(),
+        summary,
+    }
+}
+
+/// Every run the journal lists, newest dispatch first.
+async fn recent_runs(client: &RpcClient) -> Result<Vec<runs::index::RunView>, String> {
+    let reply: runs::index::RunsViewReply = client
+        .view(
+            "runs",
+            &runs::index::RunsViewQuery::Recent {
+                agent_id: None,
+                limit: None,
+            },
+        )
+        .await?;
+    let runs::index::RunsViewReply::Runs(runs) = reply else {
+        return Err("the runs journal returned the wrong reply to a recent-runs read".into());
+    };
+    Ok(runs)
+}
+
+/// The tracker's rows, for the workspace search: agents named by id.
 pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
     async {
         let client = rpc_client(&rpc)?;
-        // Two independent reads of one module, awaited one after the other. On a
-        // cold `runs` module the first touch measured 54 s on this box, so the
-        // serial pair was two ceilings deep for no ordering reason.
-        let ask_pending = serde_json::json!("pending_runs");
-        let ask_recent = serde_json::json!("recent_runs");
-        let (pending, recent) = tokio::join!(
-            client.query::<_, serde_json::Value>("runs", &ask_pending),
-            client.query::<_, serde_json::Value>("runs", &ask_recent),
-        );
-        let pending = pending?;
-        let recent = recent?;
-        let mut runs: Vec<RunRow> = pending["pending_runs"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let runs = recent_runs(&client).await?;
+        Ok(runs
             .into_iter()
-            .map(|record| RunRow {
-                run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                outcome: "running".into(),
-                created_at: record["created_at"].as_i64().unwrap_or(0),
-            })
-            .collect();
-        runs.extend(
-            recent["recent_runs"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|record| {
-                    let outcome = tagged_name(&record["outcome"]);
-                    RunRow {
-                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                        agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                        created_at: record["created_at"].as_i64().unwrap_or(0),
-                        outcome,
-                    }
-                }),
-        );
-        Ok(runs)
+            .map(|run| run_row(run, &BTreeMap::new()))
+            .collect())
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// The journal of one run, fact by fact. An empty id is the reader closing
+/// the journal: nothing is read and the empty journal comes back at once.
+pub async fn load_run_journal(rpc: String, run_id: String) -> Result<RunJournal, AppError> {
+    async {
+        if run_id.is_empty() {
+            return Ok(RunJournal::default());
+        }
+        let client = rpc_client(&rpc)?;
+        let reply: runs::index::RunsViewReply = client
+            .view(
+                "runs",
+                &runs::index::RunsViewQuery::Run {
+                    run_id: run_id.clone(),
+                },
+            )
+            .await?;
+        let runs::index::RunsViewReply::Run(detail) = reply else {
+            return Err("the runs journal returned the wrong reply to a run read".into());
+        };
+        let entries = detail
+            .map(|detail| detail.journal.into_iter().map(journal_entry).collect())
+            .unwrap_or_default();
+        Ok(RunJournal { run_id, entries })
     }
     .await
     .map_err(app_error)

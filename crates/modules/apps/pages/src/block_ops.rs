@@ -1,5 +1,5 @@
 use super::{
-    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, PageError, PageMsg, Pages,
+    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, NewBlock, PageError, PageMsg, Pages,
     id_is_index_safe, to_page_err,
 };
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
@@ -19,6 +19,55 @@ fn idx_after(children: &[String], after: &Option<String>) -> Result<usize, PageE
 }
 
 impl Pages {
+    /// stage `block` as a new child of `parent` at sibling index `at`, on
+    /// behalf of `authority`'s actor. the caller has already settled the
+    /// parent's edit right and depth and stores the parent afterwards; this
+    /// owns what is true of the child alone: its id is bounded, index-safe
+    /// and absent from the WHOLE store (global uniqueness is what makes a
+    /// bare block id addressable without page context), its marks fit its
+    /// text, and a `Page` kind opens a subpage in the enumeration index.
+    pub(super) async fn place_block(
+        &mut self,
+        parent: &mut Block,
+        at: usize,
+        block: NewBlock,
+        authority: &super::Authority,
+    ) -> Result<(), PageError> {
+        if block.id.len() > MAX_BLOCK_ID_BYTES || !id_is_index_safe(&block.id) {
+            return Err(PageError::IdTooLarge);
+        }
+        if self
+            .load_block(&block.id)
+            .await
+            .map_err(to_page_err)?
+            .is_some()
+        {
+            return Err(PageError::DuplicateBlock);
+        }
+        let marks = validate_marks(&block.text, block.marks)?;
+        parent.children.insert(at, block.id.clone());
+        let creates_page = block.kind == BlockKind::Page;
+        let page = if creates_page {
+            block.id.clone()
+        } else {
+            parent.page.clone()
+        };
+        if creates_page {
+            self.index_add(&block.id, Some(parent.page.clone())).await?;
+        }
+        self.store_block(&Block {
+            author: authority.actor.clone(),
+            id: block.id,
+            parent: Some(parent.id.clone()),
+            page,
+            kind: block.kind,
+            text: block.text,
+            marks,
+            checked: false,
+            children: Vec::new(),
+        })
+    }
+
     pub(super) async fn apply_block_op(
         &mut self,
         msg: PageMsg,
@@ -30,21 +79,6 @@ impl Pages {
                 after,
                 block,
             } => {
-                if block.id.len() > MAX_BLOCK_ID_BYTES || !id_is_index_safe(&block.id) {
-                    return Err(PageError::IdTooLarge);
-                }
-                // global uniqueness: the id must be absent from the WHOLE
-                // store, not just this page — that is what makes a bare block
-                // id addressable (and referenceable) without page context.
-                if self
-                    .load_block(&block.id)
-                    .await
-                    .map_err(to_page_err)?
-                    .is_some()
-                {
-                    return Err(PageError::DuplicateBlock);
-                }
-                let marks = validate_marks(&block.text, block.marks)?;
                 let mut parent_blk = self
                     .require_block(&parent, PageError::ParentNotFound)
                     .await?;
@@ -56,28 +90,8 @@ impl Pages {
                 if parent_depth >= MAX_PAGE_DEPTH {
                     return Err(PageError::PageTooDeep);
                 }
-                parent_blk.children.insert(i, block.id.clone());
-                let creates_page = block.kind == BlockKind::Page;
-                let page = if creates_page {
-                    block.id.clone()
-                } else {
-                    parent_blk.page.clone()
-                };
-                if creates_page {
-                    self.index_add(&block.id, Some(parent_blk.page.clone()))
-                        .await?;
-                }
-                self.store_block(&Block {
-                    author: authority.actor.clone(),
-                    id: block.id,
-                    parent: Some(parent_blk.id.clone()),
-                    page,
-                    kind: block.kind,
-                    text: block.text,
-                    marks,
-                    checked: false,
-                    children: Vec::new(),
-                })?;
+                self.place_block(&mut parent_blk, i, block, authority)
+                    .await?;
                 self.store_block(&parent_blk)
             }
             PageMsg::UpdateText {

@@ -261,11 +261,13 @@ enum RosterIntent
   propose
 
 // what the Agents view asks of the app: an agent's paused state, a record
-// rewritten from the editor's draft, or a new agent registered from one
+// rewritten from the editor's draft, a new agent registered from one, or
+// the journal of a run the reader opened
 enum AgentsIntent
   status
   save
   register
+  open_run
 
 // what the Node view asks of the app: a clipboard write, the tab it is on,
 // the log filter, or the native log ring reporting what the reader did

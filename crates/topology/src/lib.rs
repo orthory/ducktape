@@ -85,7 +85,7 @@ const MODULES: &[ModuleSpec] = &[
     wasm("kv"),
     wasm("modules"),
     wasm_indexed("pages"),
-    wasm("runs"),
+    wasm_indexed("runs"),
     wasm_indexed("saga"),
     wasm_indexed("tasks"),
     wasm("valset"),
@@ -301,7 +301,7 @@ mod tests {
         let ids = TOPOLOGY.index_guest_ids(PRODUCTION);
         assert_eq!(
             sorted(&ids),
-            sorted(&["chat", "inbox", "pages", "saga", "tasks"])
+            sorted(&["chat", "inbox", "pages", "runs", "saga", "tasks"])
         );
     }
 }

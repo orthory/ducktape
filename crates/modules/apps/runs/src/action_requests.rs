@@ -436,9 +436,21 @@ impl RunsModule {
         let result_action_rejected =
             matches!(request.scope, RequestScope::Result) && target_rejected;
         if result_action_rejected {
-            self.pending_action_rejections
-                .insert(request.view.run_id.clone());
+            self.record_result_action_refused(request);
         }
+    }
+
+    /// the one writer of a result-action refusal: the run's ring outcome
+    /// and its journal move together.
+    fn record_result_action_refused(&mut self, request: &ActionRequest) {
+        self.pending_action_rejections
+            .insert(request.view.run_id.clone());
+        self.record(
+            &request.view.run_id,
+            crate::RunFact::ResultActionRefused {
+                request_id: request.view.request_id.clone(),
+            },
+        );
     }
 
     /// The program supplies decoded output, but only dispatch's authenticated
@@ -490,6 +502,12 @@ impl RunsModule {
         }
         self.pending_pr_links
             .insert(request.view.run_id.clone(), opened.number);
+        self.record(
+            &request.view.run_id,
+            crate::RunFact::PrLinked {
+                number: opened.number,
+            },
+        );
         Ok(())
     }
 
@@ -511,8 +529,7 @@ impl RunsModule {
         request.view.status = ActionStatus::Rejected { reason };
         self.stage_action_marker(&request).await?;
         if matches!(request.scope, RequestScope::Result) {
-            self.pending_action_rejections
-                .insert(request.view.run_id.clone());
+            self.record_result_action_refused(&request);
         }
         Ok(())
     }

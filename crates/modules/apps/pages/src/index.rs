@@ -312,6 +312,56 @@ fn put_row(out: &mut Writes, row: &PageBlockRow) -> Result<(), Fail> {
     Ok(())
 }
 
+/// mirror one new child block under `parent` at sibling index `at`: its row
+/// and postings, a subpage's page-list entry when its kind is `Page`, and
+/// the parent's child order. the caller stores the parent row afterwards.
+/// marks that do not fit the text leave the block out, exactly as the
+/// canonical insert refuses them (a refused op never reaches the feed, so
+/// this only guards a mirror against bytes the canonical lane never took).
+fn place_child_row(
+    out: &mut Writes,
+    parent: &mut PageBlockRow,
+    at: usize,
+    block: crate::NewBlock,
+    actor: &crate::Party,
+    op: &OpRow,
+) -> Result<(), Fail> {
+    let page_id = if block.kind == BlockKind::Page {
+        put_page(
+            out,
+            &PageRow {
+                id: block.id.clone(),
+                title: block.text.clone(),
+                parent: Some(parent.page_id.clone()),
+            },
+        )?;
+        block.id.clone()
+    } else {
+        parent.page_id.clone()
+    };
+    // the canonical insert normalizes the client's marks against the
+    // block's own text before storing them; same call, same result.
+    let Ok(marks) = validate_marks(&block.text, block.marks) else {
+        return Ok(());
+    };
+    let row = PageBlockRow {
+        author: actor.clone(),
+        block_id: block.id.clone(),
+        page_id,
+        parent: Some(parent.block_id.clone()),
+        kind: block.kind,
+        text: block.text,
+        marks,
+        checked: false,
+        children: Vec::new(),
+        height: op.height,
+        time: op.time,
+    };
+    put_row_and_toks(out, &row)?;
+    parent.children.insert(at, block.id);
+    Ok(())
+}
+
 /// stage a row plus one posting per token, so every write path produces
 /// byte-identical entries.
 fn put_row_and_toks(out: &mut Writes, row: &PageBlockRow) -> Result<(), Fail> {
@@ -499,9 +549,13 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         .actor;
     let mut out = Writes::new();
     match msg {
-        PageMsg::CreatePage { page_id, title } => {
+        PageMsg::CreatePage {
+            page_id,
+            title,
+            blocks,
+        } => {
             // idempotence mirror: re-creating an existing page is a no-op
-            // that changes neither the title nor the parent.
+            // that changes neither the title, the body, nor the parent.
             if read_row(read, &page_id)?.is_some() {
                 return Ok(out);
             }
@@ -513,7 +567,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     parent: None,
                 },
             )?;
-            let row = PageBlockRow {
+            let mut page_row = PageBlockRow {
                 author: actor.clone(),
                 page_id: page_id.clone(),
                 block_id: page_id,
@@ -526,7 +580,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 height: op.height,
                 time: op.time,
             };
-            put_row_and_toks(&mut out, &row)?;
+            // the body in document order, each block after the one before.
+            for (at, block) in blocks.into_iter().enumerate() {
+                place_child_row(&mut out, &mut page_row, at, block, &actor, op)?;
+            }
+            put_row_and_toks(&mut out, &page_row)?;
         }
         PageMsg::InsertBlock {
             parent,
@@ -538,40 +596,8 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut parent_row) = read_row(read, &parent)? else {
                 return Ok(out);
             };
-            let page_id = if block.kind == BlockKind::Page {
-                put_page(
-                    &mut out,
-                    &PageRow {
-                        id: block.id.clone(),
-                        title: block.text.clone(),
-                        parent: Some(parent_row.page_id.clone()),
-                    },
-                )?;
-                block.id.clone()
-            } else {
-                parent_row.page_id.clone()
-            };
-            // the canonical insert normalizes the client's marks against the
-            // block's own text before storing them; same call, same result.
-            let Ok(marks) = validate_marks(&block.text, block.marks) else {
-                return Ok(out);
-            };
-            let row = PageBlockRow {
-                author: actor.clone(),
-                block_id: block.id.clone(),
-                page_id,
-                parent: Some(parent.clone()),
-                kind: block.kind,
-                text: block.text,
-                marks,
-                checked: false,
-                children: Vec::new(),
-                height: op.height,
-                time: op.time,
-            };
-            put_row_and_toks(&mut out, &row)?;
             let at = insert_index(&parent_row.children, after.as_deref());
-            parent_row.children.insert(at, block.id);
+            place_child_row(&mut out, &mut parent_row, at, block, &actor, op)?;
             put_row(&mut out, &parent_row)?;
         }
         PageMsg::UpdateText {
@@ -1088,6 +1114,7 @@ mod tests {
             None => PageMsg::CreatePage {
                 page_id: id.into(),
                 title: title.into(),
+                blocks: Vec::new(),
             },
             // a foldered page is a Page-kind block inserted under its parent.
             Some(parent) => PageMsg::InsertBlock {
@@ -1160,6 +1187,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "roadmap draft".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "quarter goals"),
                 insert("b1", "b2", "nested milestone detail"),
@@ -1180,6 +1208,7 @@ mod tests {
             &[PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "usurper".into(),
+                blocks: Vec::new(),
             }],
         );
         assert!(search(&map, serde_json::json!({"search": {"text": "usurper"}})).is_empty());
@@ -1199,6 +1228,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "root".into(),
                     title: "root document".into(),
+                    blocks: Vec::new(),
                 },
                 PageMsg::InsertBlock {
                     parent: "root".into(),
@@ -1241,6 +1271,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "toggle section"),
                 insert("b1", "b2", "hidden inner text"),
@@ -1273,6 +1304,7 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "first"),
                 insert("p1", "b2", "second"),
@@ -1318,10 +1350,12 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "alpha".into(),
+                    blocks: Vec::new(),
                 },
                 PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "beta".into(),
+                    blocks: Vec::new(),
                 },
                 insert("p1", "b1", "shared term"),
                 insert("p2", "b2", "shared term"),

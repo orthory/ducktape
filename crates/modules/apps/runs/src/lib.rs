@@ -9,13 +9,23 @@ pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
 
 mod interface;
 pub use interface::*;
+// the derived-tier run journal: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
+pub mod index;
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 
 // the module-owned action catalog: the envelope the host carries, the typed
 // operations it decodes to, and the views discovery answers.
 mod catalog;
 pub use catalog::{
-    ActionEnvelope, ContentPart, Grant, LaneKind, OP_AGENT_CALL, OP_REPLY, OperationView,
-    catalog, content_blocks, operation_view, validate_request_id,
+    ActionEnvelope, ContentPart, Grant, LaneKind, OP_AGENT_CALL, OP_REACT, OP_REPLY, OP_UNREACT,
+    OperationView, catalog, content_blocks, operation_view, validate_request_id,
 };
 
 // dispatch payload composition: the structured run envelope.
@@ -527,6 +537,10 @@ pub struct RunsModule {
     /// keyed by its message digest, so the proposal staged for that message
     /// records which operation produced it. Transient: never committed state.
     prepared_receipts: RefCell<BTreeMap<[u8; 32], action_requests::ReceiptMeta>>,
+    /// the lifecycle facts the current op has committed, stamped onto the op
+    /// once it applies ([`RunsModule::stamp_journal`]). Transient: never
+    /// committed state, cleared at every op's start.
+    journal: Vec<RunEvent>,
 }
 
 impl RunsModule {
@@ -602,7 +616,43 @@ impl RunsModule {
             pending_pr_links: BTreeMap::new(),
             pending_action_rejections: BTreeSet::new(),
             prepared_receipts: RefCell::new(BTreeMap::new()),
+            journal: Vec::new(),
         }
+    }
+
+    /// commit one lifecycle fact about `run_id` to the current op's journal.
+    fn record(&mut self, run_id: &str, fact: RunFact) {
+        self.journal.push(RunEvent {
+            run_id: run_id.to_string(),
+            fact,
+        });
+    }
+
+    /// the one settle writer: a terminal run enters the delivered-runs ring
+    /// and its journal in the same step, so the two can never disagree.
+    fn record_settled(&mut self, record: RunRecord, reason: Option<String>) {
+        self.record(
+            &record.run_id,
+            RunFact::Settled {
+                outcome: record.outcome,
+                reason,
+                degraded: record.degraded,
+                executing_node: record.executing_node.clone(),
+                output_ref: record.output_ref.clone(),
+                pr_number: record.pr_number,
+            },
+        );
+        self.pending_history.push(record);
+    }
+
+    /// stamp the facts the applying op committed onto its trace, as the
+    /// assigned stamp the derived tier folds. an op that moved no run
+    /// stamps nothing.
+    fn stamp_journal(&mut self, ctx: &mut dyn Ctx) {
+        if self.journal.is_empty() {
+            return;
+        }
+        ctx.set_assigned(encode_assigned(&std::mem::take(&mut self.journal)));
     }
 
     /// Emit one prepared effect and remember its receipt facts for the

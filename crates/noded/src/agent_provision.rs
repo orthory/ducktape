@@ -45,6 +45,7 @@ use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use runs::is_skill_mount_name;
 
 use crate::node_link::NodeLink;
+use provider_host::OperatorCredential;
 
 mod duckfs;
 mod forge;
@@ -287,6 +288,17 @@ fn run_env(
     if let Some(agent) = &spec.agent {
         env.insert("DUCKTAPE_RUN_AGENT".into(), agent.agent_id.clone());
         env.insert("DUCKTAPE_RUN_ID".into(), agent.run_id.clone());
+        // the AUTHOR of anything the run commits is the agent, on every lane:
+        // a forge checkout's commits and a push the run makes itself from a
+        // duckfs workspace attribute the same way.
+        env.insert(
+            "GIT_AUTHOR_NAME".into(),
+            forge::sanitize_display_name(&agent.display_name),
+        );
+        env.insert(
+            "GIT_AUTHOR_EMAIL".into(),
+            forge::agent_email(&agent.agent_id),
+        );
     }
     if let Some(session) = session {
         env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
@@ -296,6 +308,15 @@ fn run_env(
         );
     }
     env
+}
+
+/// this node's operator credential as a run's node lane lends it: a fresh
+/// read of `admin.token` per use, because the node re-mints it every boot.
+fn operator_credential(node: &NodeLink) -> OperatorCredential {
+    let node = node.clone();
+    OperatorCredential::new(crate::admin::ADMIN_TOKEN_HEADER, move || {
+        node.operator_token()
+    })
 }
 
 /// the file every skill document is read from, inside its mount — the

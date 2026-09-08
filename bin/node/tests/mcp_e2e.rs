@@ -22,15 +22,9 @@ use commonware_cryptography::Signer as _;
 use serde_json::json;
 use support::{AGENT_ID, Harness, OWNER, content, payload};
 
-/// every action the registry knows — the "fully trusted agent" grant.
-const ALL_ACTIONS: &[&str] = &[
-    "chat.post",
-    "chat.post_message",
-    "tasks.create",
-    "tasks.update_status",
-    "pages.comment",
-    "pages.set_checked",
-];
+/// every action the registry knows — the "fully trusted agent" grant, spelled
+/// out so `whoami` lists each one by name.
+const ALL_ACTIONS: &[&str] = &runs::KNOWN_ACTIONS;
 
 #[test]
 fn whoami_reports_the_committed_grant() {

@@ -97,8 +97,22 @@ on agents_loaded(next)
   return if next.generation != agents_generation
   agents_answered = true
   agents_rows = next.agents
+  agents_runs = next.runs
   agents_capabilities = next.capabilities
   agents_actions = next.actions
+  // the open journal follows the register: the op that moved the register
+  // may have moved the open run too
+  return if empty(agents_open_run)
+  run replace lane=agent_journal load_run_journal(connected_rpc, agents_open_run) -> agent_journal_loaded _ | agent_journal_failed _
+
+// The journal read answers for the run it was asked about; a read that
+// lands after the reader opened another run, or closed it, is dropped.
+on agent_journal_loaded(next)
+  return if next.run_id != agents_open_run
+  agents_journal = next
+
+on agent_journal_failed(cause)
+  error = cause.message
 
 on agents_failed(cause)
   return if cause.generation != agents_generation
@@ -190,6 +204,10 @@ on agents_view_event(event)
       run every save_agent(connected_rpc, password, event.detail) -> agent_status_set _ | mutation_failed _
     AgentsIntent.register
       run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.open_run
+      agents_open_run = event_text(event, "run_id")
+      agents_journal = empty_run_journal()
+      run replace lane=agent_journal load_run_journal(connected_rpc, agents_open_run) -> agent_journal_loaded _ | agent_journal_failed _
 
 // Every committed agent write lands here: pause, resume, save, register. The
 // pause payload is the DESIRED state and it is named for the backend

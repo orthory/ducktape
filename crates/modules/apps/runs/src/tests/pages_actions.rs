@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED};
+use crate::{ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED};
 use pages::PageMsg;
 
 fn page_trigger_thread() -> pages::ThreadView {
@@ -544,4 +544,132 @@ fn task_actions_keep_their_all_or_nothing_lane() {
         RunOutcome::Failed,
         "the task lane still fails the run"
     );
+}
+
+// ---- pages.post: a page published whole ----------------------------------------
+
+fn report_post() -> ActionEnvelope {
+    page_post(
+        "  Report  ",
+        serde_json::json!([
+            {"type": "text", "text": "summary"},
+            {"type": "text", "text": "   "},
+            {"type": "code", "text": "fn main() {}", "lang": "rust"}
+        ]),
+    )
+}
+
+#[test]
+fn a_page_post_publishes_a_titled_page_with_its_body_under_the_every_page_cap() {
+    let (mut m, registry, run_id) =
+        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_POST], &["*"]);
+    let mut ctx = delivery_ctx(&registry);
+    deliver(&mut m, &mut ctx, &run_id, vec![report_post()]);
+
+    assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts");
+    let msgs = ctx.page_msgs();
+    let page_id = format!("agent/{}/page/0", dispatch_id_for(&run_id));
+    assert!(pages::id_is_index_safe(&page_id));
+    // the page and its body in ONE create: the blank part is dropped, the
+    // title trimmed, and every block id minted under the page.
+    assert_eq!(
+        msgs,
+        vec![PageMsg::CreatePage {
+            page_id: page_id.clone(),
+            title: "Report".into(),
+            blocks: vec![
+                pages::NewBlock {
+                    id: format!("{page_id}/b0"),
+                    kind: pages::BlockKind::Paragraph,
+                    text: "summary".into(),
+                    marks: Vec::new(),
+                },
+                pages::NewBlock {
+                    id: format!("{page_id}/b1"),
+                    kind: pages::BlockKind::Code,
+                    text: "fn main() {}".into(),
+                    marks: Vec::new(),
+                },
+            ],
+        }]
+    );
+    assert_delivered(&mut m, &run_id);
+}
+
+#[test]
+fn a_page_post_needs_its_grant_the_every_page_cap_and_a_bounded_title() {
+    let long_title = "t".repeat(pages::MAX_PAGE_TITLE_LEN + 1);
+    let body = serde_json::json!([{"type": "text", "text": "body"}]);
+    for (actions, caps, action, needle) in [
+        (
+            vec![ACTION_CHAT_POST],
+            vec!["*"],
+            report_post(),
+            "not allowed to pages.post",
+        ),
+        (
+            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
+            vec!["p1"],
+            report_post(),
+            "lacks pages_write for agent/",
+        ),
+        (
+            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
+            vec!["*"],
+            page_post("   ", body.clone()),
+            "requires a non-empty title",
+        ),
+        (
+            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
+            vec!["*"],
+            page_post(long_title.as_str(), body.clone()),
+            "pages' cap",
+        ),
+    ] {
+        let (mut m, registry, run_id) = awaiting_pages_run(&actions, &caps);
+        let mut ctx = delivery_ctx(&registry);
+        deliver(&mut m, &mut ctx, &run_id, vec![action]);
+        assert!(ctx.page_msgs().is_empty(), "the refused post emits nothing");
+        assert!(
+            ctx.notes().iter().any(|n| n.contains(needle)),
+            "expected {needle:?} in {:?}",
+            ctx.notes()
+        );
+        assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts");
+        assert_delivered(&mut m, &run_id);
+    }
+}
+
+#[test]
+fn same_block_page_cap_degrades_the_overflow_page_post_without_aborting() {
+    // the module holds (cap - 1) COMMITTED pages; the run posts two. the
+    // committed-only probe is blind to the first post's staged page, so
+    // without same-block accounting both would emit and the second create
+    // would abort the delivery block (TooManyPages).
+    let (mut m, registry, run_id) =
+        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_POST], &["*"]);
+    let mut ctx = delivery_ctx(&registry);
+    // delivery_ctx already holds "p1".
+    for index in 1..pages::MAX_PAGES - 1 {
+        ctx = ctx.with_page(&format!("filler-{index}"), Vec::new());
+    }
+    let body = serde_json::json!([{"type": "text", "text": "a"}]);
+    deliver(
+        &mut m,
+        &mut ctx,
+        &run_id,
+        vec![
+            page_post("First", body.clone()),
+            page_post("Second", body),
+        ],
+    );
+    let msgs = ctx.page_msgs();
+    assert_eq!(msgs.len(), 1, "only the first page fits: {msgs:?}");
+    assert!(matches!(&msgs[0], PageMsg::CreatePage { title, .. } if title == "First"));
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("pages is full")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert_delivered(&mut m, &run_id);
 }

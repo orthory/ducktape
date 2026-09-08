@@ -91,6 +91,8 @@ struct CaptureCtx {
     msgs: Vec<Msg>,
     #[allow(dead_code)]
     events: Vec<Event>,
+    /// the op's assigned stamp: the run journal the module committed.
+    assigned: Vec<u8>,
 }
 impl CaptureCtx {
     fn new() -> Self {
@@ -125,7 +127,16 @@ impl CaptureCtx {
             files_content: BTreeMap::new(),
             msgs: Vec::new(),
             events: Vec::new(),
+            assigned: Vec::new(),
         }
+    }
+
+    /// the run journal the last op stamped; empty when it moved no run.
+    fn journal(&self) -> Vec<RunEvent> {
+        if self.assigned.is_empty() {
+            return Vec::new();
+        }
+        decode_assigned(&self.assigned).expect("a runs stamp decodes")
     }
     fn at(mut self, view: u64) -> Self {
         self.env.height = view;
@@ -726,6 +737,9 @@ impl Ctx for CaptureCtx {
                         count as u64,
                     )))
                 }
+                pages::PageQuery::PageCount => Ok(pages::encode_reply(
+                    &pages::PageReply::PageCount(self.pages.len() as u64),
+                )),
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
                 saga::SagaQuery::Get { saga_id } => {
@@ -742,6 +756,9 @@ impl Ctx for CaptureCtx {
     }
     fn emit_event(&mut self, ev: Event) {
         self.events.push(ev);
+    }
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        self.assigned = bytes;
     }
 }
 
@@ -1213,6 +1230,14 @@ fn reply(text: impl Into<String>) -> ActionEnvelope {
     envelope(crate::OP_REPLY, None, text_content(text))
 }
 
+fn react(emoji: impl Into<String>) -> ActionEnvelope {
+    envelope(crate::OP_REACT, None, serde_json::json!({"emoji": emoji.into()}))
+}
+
+fn unreact(emoji: impl Into<String>) -> ActionEnvelope {
+    envelope(crate::OP_UNREACT, None, serde_json::json!({"emoji": emoji.into()}))
+}
+
 fn post_message(channel_id: impl Into<String>, text: impl Into<String>, thread: Option<u64>) -> ActionEnvelope {
     let mut target = serde_json::json!({"channel_id": channel_id.into()});
     if let Some(root) = thread {
@@ -1234,6 +1259,14 @@ fn page_thread_comment(thread_id: impl Into<String>, text: impl Into<String>) ->
         crate::ACTION_PAGES_COMMENT,
         Some(serde_json::json!({"thread_id": thread_id.into()})),
         text_content(text),
+    )
+}
+
+fn page_post(title: impl Into<String>, content: serde_json::Value) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_PAGES_POST,
+        None,
+        serde_json::json!({"title": title.into(), "content": content}),
     )
 }
 

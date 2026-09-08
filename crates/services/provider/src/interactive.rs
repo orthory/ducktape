@@ -114,10 +114,10 @@ pub struct InteractiveSession {
     /// (another account's, since #843) will mount.
     _broker: Option<RunBroker>,
     _config_home: Option<RunHome>,
-    /// this session's cap-checked node read lane — the guest's `DUCKTAPE_NODE`,
-    /// so it dies with the session. `None` for the operator's local
-    /// vendor-login pty run, which is not a guest and gets no tunnel.
-    _read_lane: Option<crate::read_lane::ReadLane>,
+    /// this session's guest tunnels the crate terminates (its node lane, its
+    /// egress proxy), which die with the session. `None` for the operator's
+    /// local vendor-login pty run, which is not a guest and gets no tunnel.
+    _lanes: Option<crate::GuestLanes>,
 }
 
 impl InteractiveSession {
@@ -132,7 +132,7 @@ impl InteractiveSession {
         workdir: std::path::PathBuf,
         broker: Option<RunBroker>,
         config_home: Option<RunHome>,
-        read_lane: Option<crate::read_lane::ReadLane>,
+        lanes: crate::GuestLanes,
     ) -> Self {
         let microvm::TerminalIo {
             output,
@@ -160,7 +160,7 @@ impl InteractiveSession {
             })),
             _broker: broker,
             _config_home: config_home,
-            _read_lane: read_lane,
+            _lanes: Some(lanes),
         }
     }
 
@@ -203,7 +203,7 @@ impl InteractiveSession {
             })),
             _broker: broker,
             _config_home: config_home,
-            _read_lane: None,
+            _lanes: None,
         })
     }
 
@@ -443,7 +443,7 @@ impl CliProvider {
 
         match &self.backend {
             SandboxBackend::MicroVm { .. } => {
-                let (vm, io, read_lane) = self
+                let (vm, io, lanes) = self
                     .microvm_boot(&args, &workdir, ctx, &auth, crate::GuestStdio::Pty)
                     .await?;
                 Ok(InteractiveSession::from_microvm(
@@ -452,7 +452,7 @@ impl CliProvider {
                     workdir,
                     broker,
                     home,
-                    read_lane,
+                    lanes,
                 ))
             }
             #[cfg(any(test, feature = "testkit"))]

@@ -19,7 +19,11 @@ impl Pages {
         // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
         // storage touch — keeps a block/comment write from ever clobbering them.
         let named: Vec<&str> = match &msg {
-            PageMsg::CreatePage { page_id, .. } => vec![page_id.as_str()],
+            PageMsg::CreatePage {
+                page_id, blocks, ..
+            } => std::iter::once(page_id.as_str())
+                .chain(blocks.iter().map(|b| b.id.as_str()))
+                .collect(),
             PageMsg::InsertBlock { parent, block, .. } => vec![parent.as_str(), block.id.as_str()],
             PageMsg::UpdateText { block_id, .. }
             | PageMsg::SetSpanMark { block_id, .. }

@@ -141,8 +141,7 @@ submit runs "$(jq -nc --argjson account "$MODEL_ACCOUNT" '{
   configure_model:{operation:{register_model:{
     account:$account, agent_id:"dogfood", display_name:"Dogfood Duck",
     capability:"<your provider tag>",
-    allowed_actions:["chat.post","chat.post_message","tasks.create","tasks.update_status",
-                     "pages.comment","pages.set_checked","modules.update"],
+    allowed_actions:["*"],
     caps:{forge_read:["ducktape"],forge_push:["ducktape"],pages_write:["*"],
           duckfs_read:["/shared/skills"]},
     skills:[{name:"dogfood",source_prefix:"/shared/skills/dogfood",load:"always"}]
@@ -159,9 +158,11 @@ selection above fails if the controller has several Dogfood Duck accounts.
 
 ConfigureModel wraps runs::ModelMsg from
 crates/modules/apps/runs/src/model.rs. The current program account or its
-live identity controller can update the record. Forge caps name exact repos;
-pages_write names exact page ids, with "*" permitting all page ids at the
-runs validation layer. Source modules still enforce their own ownership.
+live identity controller can update the record. allowed_actions names exact
+catalog actions (runs::KNOWN_ACTIONS), with "*" granting every action the
+catalog knows now or later. Forge caps name exact repos and pages_write exact
+page ids, each with "*" permitting all of them at the runs validation layer.
+Source modules still enforce their own ownership.
 A skill without source_snapshot follows the committed library head; supply
 a snapshot id to pin it. The app's Agents view lists the resulting model,
 its grants and its controller.

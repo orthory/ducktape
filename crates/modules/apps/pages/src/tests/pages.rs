@@ -20,12 +20,68 @@ fn create_page_is_idempotent_and_preserves_the_title() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "stale title".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
         let page = get_page(&p, "p1").await.unwrap();
         assert_eq!(ids(&page), ["p1", "b1", "b2", "b3"]);
         assert_eq!(page[0].text, "renamed");
+    });
+}
+
+/// A create carries its body: the blocks land as the page's children in
+/// document order, a `Page` block among them opens a subpage, and one bad
+/// block refuses the whole page — it exists whole or not at all.
+#[test]
+fn create_page_stages_its_body_whole_or_not_at_all() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        apply_commit(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "report".into(),
+                title: "Report".into(),
+                blocks: vec![
+                    para("r1", "summary"),
+                    nb("r2", BlockKind::Code, "fn main() {}"),
+                    page("appendix", "Appendix"),
+                ],
+            },
+        )
+        .await;
+        let report = get_page(&p, "report").await.unwrap();
+        assert_eq!(ids(&report), ["report", "r1", "r2", "appendix"]);
+        assert_eq!(report[2].kind, BlockKind::Code);
+        assert_eq!(report[3].page, "appendix");
+        assert_eq!(get_page(&p, "appendix").await.unwrap().len(), 1);
+        // a body naming an id the store already holds refuses the create,
+        // and nothing of the page survives the abort.
+        apply_expect_err(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "partial".into(),
+                title: "Partial".into(),
+                blocks: vec![para("fresh", "fine"), para("r1", "taken")],
+            },
+            "duplicate block id",
+        )
+        .await;
+        assert!(get_page(&p, "partial").await.is_none());
+        assert!(get_block(&p, "fresh").await.is_none());
+        // re-creating with a different body is the same no-op as re-creating
+        // with a different title.
+        apply_commit(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "report".into(),
+                title: "Stale".into(),
+                blocks: vec![para("r9", "late")],
+            },
+        )
+        .await;
+        assert_eq!(ids(&get_page(&p, "report").await.unwrap()), ["report", "r1", "r2", "appendix"]);
+        assert!(get_block(&p, "r9").await.is_none());
     });
 }
 
@@ -39,6 +95,7 @@ fn page_query_replies_stop_before_the_rpc_client_limit() {
             &PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -92,6 +149,7 @@ fn reserved_index_id_is_rejected() {
             &PageMsg::CreatePage {
                 page_id: PAGE_INDEX_KEY.into(),
                 title: "clobber".into(),
+                blocks: Vec::new(),
             },
             "reserved block id",
         )
@@ -164,6 +222,7 @@ fn moving_page_blocks_renests_and_rejects_cycles() {
                 &PageMsg::CreatePage {
                     page_id: id.into(),
                     title: id.into(),
+                    blocks: Vec::new(),
                 },
             )
             .await;
@@ -262,6 +321,7 @@ fn removing_page_block_removes_its_entire_nested_subtree() {
             &PageMsg::CreatePage {
                 page_id: "grand".into(),
                 title: "G".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -320,6 +380,7 @@ fn block_ops_are_gated_to_the_page_author() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "alice's page".into(),
+                blocks: Vec::new(),
             },
             user("alice"),
         )
@@ -419,6 +480,7 @@ fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
             &PageMsg::CreatePage {
                 page_id: "alice-page".into(),
                 title: "alice".into(),
+                blocks: Vec::new(),
             },
             user("alice"),
         )
@@ -428,6 +490,7 @@ fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
             &PageMsg::CreatePage {
                 page_id: "mallory-page".into(),
                 title: "mallory".into(),
+                blocks: Vec::new(),
             },
             user("mallory"),
         )
@@ -461,6 +524,7 @@ fn oversized_page_id_is_rejected_before_staging() {
             &PageMsg::CreatePage {
                 page_id: long_id,
                 title: "t".into(),
+                blocks: Vec::new(),
             },
             user("alice"),
             "id or target too large",
@@ -484,6 +548,7 @@ fn the_max_pages_plus_one_th_create_page_is_refused() {
                 &PageMsg::CreatePage {
                     page_id: format!("page-{i:06}"),
                     title: String::new(),
+                    blocks: Vec::new(),
                 },
                 user("alice"),
             )
@@ -495,6 +560,7 @@ fn the_max_pages_plus_one_th_create_page_is_refused() {
             &PageMsg::CreatePage {
                 page_id: "one-too-many".into(),
                 title: String::new(),
+                blocks: Vec::new(),
             },
             user("alice"),
             "too many pages",

@@ -21,9 +21,17 @@ extern crate::host
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
   AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
-  AgentsProps(rows:[AgentRow], capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool)
+  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  JournalEntry(height:str, kind:str, summary:str)
+  RunJournal(run_id:str, entries:[JournalEntry])
+  AgentsProps(rows:[AgentRow], runs:[RunRow], journal:RunJournal, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
+  pure runs_summary(runs:&[RunRow]) -> str
+  pure run_named(runs:&[RunRow], run_id:&str) -> RunRow
+  pure empty_journal() -> RunJournal
+  pure empty_run() -> RunRow
+  pure open_run(run_id:&str) -> bool
   pure cap_count(caps:&AgentCaps) -> i64
   pure skill_count(skills:&[AgentSkill]) -> i64
   pure row_named(rows:&[AgentRow], id:&str) -> AgentRow
@@ -57,6 +65,14 @@ extern crate::host
 state
   active_palette:palette[AppTheme] = AppTheme.app
   rows:[AgentRow] = []
+  runs:[RunRow] = []
+  journal:RunJournal = empty_journal()
+  // which panel the reader is on: the registry, or the runs tracker
+  panel = "registry"
+  // the run open in the tracker, by run id; "" is none — and its row, as
+  // the register last listed it
+  open_run = ""
+  open_row:RunRow = empty_run()
   capabilities:[str] = []
   actions:[str] = []
   account = ""
@@ -101,6 +117,9 @@ on mount
 // row is now the truth.
 on props_changed(next)
   rows = next.rows
+  runs = next.runs
+  journal = next.journal
+  open_row = run_named(runs, open_run)
   capabilities = next.capabilities
   actions = next.actions
   account = next.account
@@ -168,6 +187,24 @@ on close_editor
   selected = ""
   creating = false
 
+on show_registry
+  panel = "registry"
+
+on show_runs
+  panel = "runs"
+
+// Open a run: the app is asked for its journal, which arrives as the next
+// register under this run's id.
+on open_run_row(run_id)
+  open_run = run_id
+  open_row = run_named(runs, run_id)
+  sent = open_run(run_id)
+
+on close_run
+  open_run = ""
+  open_row = empty_run()
+  sent = open_run("")
+
 on pick_capability_option(value)
   draft_capability = some(value)
 
@@ -232,15 +269,43 @@ view
               size=16.0
               @text-primary
               @font-semibold
-          text agents_summary(connected, rows) #meta
-            with
-              size=12.0
-              @text-hint
-              @font-mono
+          if panel == "registry"
+            text agents_summary(connected, rows) #meta
+              with
+                size=12.0
+                @text-hint
+                @font-mono
+          if panel == "runs"
+            text runs_summary(runs) #runs-meta
+              with
+                size=12.0
+                @text-hint
+                @font-mono
           space w=fill
+          // the two panels: the registry (who may act) and the runs tracker
+          // (what they did) — one screen, because a run is a registry entry
+          // in motion
+          if connected
+            button -> show_registry
+              with
+                label="Registry"
+                h=28.0
+                p=5.0
+                disabled=(panel == "registry")
+                @outline_action
+              text "Registry" size=12.0
+          if connected
+            button -> show_runs
+              with
+                label="Runs"
+                h=28.0
+                p=5.0
+                disabled=(panel == "runs")
+                @outline_action
+              text "Runs" size=12.0
           // registering needs an account to control the new agent; a device
           // without one is offered nothing rather than a refusal later
-          if connected && !empty(account)
+          if connected && !empty(account) && panel == "registry"
             button -> open_new
               with
                 label="New agent"
@@ -310,7 +375,312 @@ view
               with
                 size=12.5
                 @text-caption
-      if connected && empty(rows) && answered && !creating
+      if connected && panel == "runs"
+        row w=fill h=fill
+          if empty(runs)
+            box
+              with
+                w=fill
+                h=fill
+                p=22.0
+              box #no-runs
+                with
+                  w=fill
+                  p=30.0
+                  align-x=center
+                  border=border
+                  border-w=1.0
+                  r=12.0
+                text "No runs yet — every dispatch of an agent lands here with its journal."
+                  with
+                    size=13.0
+                    @text-meta
+          if !empty(runs)
+            scroll #runs-body
+              with
+                dir=vertical
+                w=fill
+                h=fill
+              col
+                with
+                  w=fill
+                  p=18.0
+                  gap=11.0
+                // A run row: who ran, what it answered, where it stands and
+                // how far it got. The row opens its journal; its accessible
+                // name is the run id.
+                for run in runs
+                  col w=fill
+                    button -> open_run_row(run.run_id)
+                      with
+                        label=run.run_id
+                        w=fill
+                        p=0.0
+                      box
+                        with
+                          w=fill
+                          pl=14.0
+                          pr=14.0
+                          pt=11.0
+                          pb=11.0
+                        row
+                          with
+                            w=fill
+                            gap=13.0
+                            align=center
+                          col w=fill gap=3.0
+                            row
+                              with
+                                w=fill
+                                gap=8.0
+                                align=center
+                              text run.agent_name
+                                with
+                                  size=13.5
+                                  @text-fg
+                                  @font-semibold
+                              text run.origin
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            row
+                              with
+                                w=fill
+                                gap=5.0
+                                align=center
+                              text run.dispatched
+                                with
+                                  size=10.5
+                                  @text-hint
+                                  @font-mono
+                              text "·"
+                                with
+                                  size=10.5
+                                  @text-hint
+                                  @font-mono
+                              text run.actions
+                                with
+                                  size=10.5
+                                  @text-meta
+                                  @font-mono
+                                  @font-medium
+                              text "actions"
+                                with
+                                  size=10.5
+                                  @text-meta
+                                  @font-mono
+                                  @font-medium
+                              if !empty(run.holder)
+                                text "· on"
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if !empty(run.holder)
+                                text run.holder
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if run.pr_number > 0
+                                text "· PR #"
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if run.pr_number > 0
+                                text run.pr_number
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                          // Standing, in the journal's own words: in flight
+                          // on a warning plate, accepted on a success one,
+                          // refused or failed on a danger one.
+                          if run.state == "dispatched" || run.state == "running"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=warning_bg
+                                border=warning_line
+                                border-w=1.0
+                                r=6.0
+                              row gap=5.0 align=center
+                                box
+                                  with
+                                    w=5.0
+                                    h=5.0
+                                    bg=warning_dot
+                                    r=2.5
+                                  space w=1.0 h=1.0
+                                text run.state
+                                  with
+                                    size=9.0
+                                    @text-warning
+                                    @font-mono
+                                    @font-semibold
+                          if run.state == "accepted"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=success_bg
+                                border=success_line
+                                border-w=1.0
+                                r=6.0
+                              row gap=5.0 align=center
+                                box
+                                  with
+                                    w=5.0
+                                    h=5.0
+                                    bg=success_dot
+                                    r=2.5
+                                  space w=1.0 h=1.0
+                                text run.state
+                                  with
+                                    size=9.0
+                                    @text-success
+                                    @font-mono
+                                    @font-semibold
+                          if run.state == "rejected" || run.state == "failed"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=danger_bg
+                                border=danger_line
+                                border-w=1.0
+                                r=6.0
+                              text run.state
+                                with
+                                  size=9.0
+                                  @text-danger
+                                  @font-mono
+                                  @font-semibold
+                      active bg=bg
+                      hovered bg=row_hover
+                    box
+                      with
+                        w=fill
+                        h=1.0
+                        bg=muted_bg
+                      space w=1.0 h=1.0
+          // THE JOURNAL: the open run's lifecycle, fact by fact, beside the
+          // list. Read-only — a run is history the moment it is written.
+          if !empty(open_run)
+            box #journal
+              with
+                w=400.0
+                h=fill
+                bg=surface
+                border=border
+                border-w=1.0
+              scroll
+                with
+                  dir=vertical
+                  w=fill
+                  h=fill
+                col
+                  with
+                    w=fill
+                    p=18.0
+                    gap=12.0
+                  row
+                    with
+                      w=fill
+                      gap=10.0
+                      align=center
+                    text open_row.agent_name
+                      with
+                        size=14.0
+                        @text-fg
+                        @font-semibold
+                    text open_row.state
+                      with
+                        size=11.0
+                        @text-meta
+                        @font-mono
+                    space w=fill
+                    button -> close_run
+                      with
+                        label="Close journal"
+                        w=24.0
+                        h=24.0
+                        p=0.0
+                      text "×" size=16.0 @text-meta
+                  text open_row.origin
+                    with
+                      w=fill
+                      size=11.0
+                      @text-meta
+                      @font-mono
+                  text open_run
+                    with
+                      w=fill
+                      size=10.0
+                      @text-hint
+                      @font-mono
+                  if !empty(open_row.reason)
+                    box
+                      with
+                        w=fill
+                        px=12.0
+                        py=9.0
+                        bg=danger_bg
+                        border=danger_line
+                        border-w=1.0
+                        r=8.0
+                      text open_row.reason
+                        with
+                          w=fill
+                          size=12.0
+                          @text-danger
+                  if !empty(open_row.output_ref)
+                    text open_row.output_ref
+                      with
+                        w=fill
+                        size=11.0
+                        @text-meta
+                        @font-mono
+                  text "Journal"
+                    with
+                      size=12.5
+                      @text-fg
+                      @font-semibold
+                  if journal.run_id != open_run
+                    text "Reading the journal…"
+                      with
+                        size=12.0
+                        @text-caption
+                  if journal.run_id == open_run && empty(journal.entries)
+                    text "This run's journal has no entries yet — the fold may still be catching up to the chain."
+                      with
+                        w=fill
+                        size=12.0
+                        @text-caption
+                  if journal.run_id == open_run
+                    for entry in journal.entries
+                      row w=fill gap=8.0
+                        text entry.height
+                          with
+                            size=10.5
+                            @text-hint
+                            @font-mono
+                        col w=fill gap=2.0
+                          text entry.kind
+                            with
+                              size=11.0
+                              @text-fg
+                              @font-mono
+                              @font-semibold
+                          text entry.summary
+                            with
+                              w=fill
+                              size=12.0
+                              @text-meta
+      if connected && panel == "registry" && empty(rows) && answered && !creating
         box
           with
             w=fill
@@ -328,7 +698,7 @@ view
               with
                 size=13.0
                 @text-meta
-      if connected && (!empty(rows) || creating)
+      if connected && panel == "registry" && (!empty(rows) || creating)
         row w=fill h=fill
           if !empty(rows)
             scroll #agents-body
@@ -710,8 +1080,12 @@ view
                         w=fill
                         size=11.0
                         @text-caption
+                    // "*" is every action the catalog knows today and every
+                    // one added later; the registry keeps it as the whole
+                    // grant, so the individual ticks read as implied.
+                    checkbox "every action (*)" #action-every checked=has(draft_actions, "*") disabled=!can_edit -> toggle_action("*", _)
                     for action in actions
-                      checkbox action #action(action) checked=has(draft_actions, action) disabled=!can_edit -> toggle_action(action, _)
+                      checkbox action #action(action) checked=(has(draft_actions, action) || has(draft_actions, "*")) disabled=(!can_edit || has(draft_actions, "*")) -> toggle_action(action, _)
                   // Resource caps: exact repos, duckfs prefixes, page ids ("*"
                   // is every page), tool ids, vault refs, and the peer-call
                   // budget.
