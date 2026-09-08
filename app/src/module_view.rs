@@ -3975,7 +3975,7 @@ mod tests {
     }
 
     fn files_facts() -> Option<Vec<u8>> {
-        let props = Some(
+        Some(
         serde_json::to_vec(&serde_json::json!({
             "path": "/shared", "listed": true,
             "entries": [
@@ -3995,12 +3995,11 @@ mod tests {
             "dark": false, "write_refusal": "", "writes": 0
         }))
         .expect("props encode"),
-    );
-        props
+    )
     }
 
     fn pages_facts() -> Option<Vec<u8>> {
-        let props = Some(
+        Some(
             serde_json::to_vec(&serde_json::json!({
                 "dark": false, "connected": true, "loading": false, "busy": false,
                 "page_link": "duck://pages/alpha",
@@ -4021,12 +4020,11 @@ mod tests {
                 "seed_rev": 0, "page_seed": "", "comment_seed": ""
             }))
             .expect("props encode"),
-        );
-        props
+        )
     }
 
     fn forge_facts() -> Option<Vec<u8>> {
-        let props = Some(
+        Some(
             br#"{
           "dark": false, "connected": true, "org": "duckhouse", "about": "",
           "tier": "validator", "network_chain_id": "mynet#d0cdf950",
@@ -4052,8 +4050,7 @@ mod tests {
           "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": ""
         }"#
             .to_vec(),
-        );
-        props
+        )
     }
 
     fn chat_facts() -> Option<Vec<u8>> {
@@ -4148,8 +4145,7 @@ mod tests {
             copy_surface: "nowhere",
             sent_serial: 0,
         };
-        let props = Some(serde_json::to_vec(&props).expect("props encode"));
-        props
+        Some(serde_json::to_vec(&props).expect("props encode"))
     }
 
     /// The facts a module's host pushes, and one word of them the tree
@@ -4253,12 +4249,17 @@ mod tests {
             };
             // and the same deployment again is nothing to do
             join_all(deployments_checked().await);
-            let locked = mounted.lock().expect("module view lock");
-            assert_eq!(
-                (locked.generation, locked.hash),
-                (generation, Some(b.hash())),
-                "{module}"
-            );
+            {
+                let locked = mounted.lock().expect("module view lock");
+                assert_eq!(
+                    (locked.generation, locked.hash),
+                    (generation, Some(b.hash())),
+                    "{module}"
+                );
+            }
+            // the seat is given back: the next module's node, and the
+            // other deployment tests, know nothing of this one
+            registry().lock().expect("module views").remove(module);
         }
     }
 
@@ -4343,7 +4344,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("forge");
+        let mounted = fresh("forge");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4386,7 +4387,7 @@ mod tests {
         let removed = module_artifact::ModuleArtifact::component(vec![9, 9, 9]);
         let node = FakeDeployment::serving("pages", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("pages");
+        let mounted = fresh("pages");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
@@ -4420,7 +4421,7 @@ mod tests {
         );
         let node = FakeDeployment::serving("files", &a);
         let client = fake_node(node.clone()).await;
-        let mounted = mounted("files");
+        let mounted = fresh("files");
         join_all(connected(&client));
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
