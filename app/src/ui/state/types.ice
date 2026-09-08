@@ -262,6 +262,34 @@ enum SettingsIntent
   dark
   notifications
 
+// What the pages view asks of the app, one per act the screen offers.
+// The drafts are the view's: a create carries its title, a search its
+// query, a post its text, and the acts that abandon the rail's comment
+// carry it for the recovered-drafts plate.
+enum PagesIntent
+  toggle_create
+  create
+  choose
+  search
+  clear_search
+  arm_delete
+  disarm_delete
+  delete
+  close_tab
+  open_hit
+  use_draft
+  discard_draft
+  edited
+  toggle_comments
+  close_comments
+  open_thread
+  resolve
+  more_threads
+  close_thread
+  more_comments
+  post
+  copy
+
 enum MutationPhase
   idle
   recovering

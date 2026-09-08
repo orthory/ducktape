@@ -2351,6 +2351,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pages-view"
+version = "0.1.0"
+dependencies = [
+ "design",
+ "iced",
+ "serde",
+ "serde_json",
+ "ui-lang",
+ "ui-lang-build",
+ "ui-lang-guest",
+ "ui-lang-runtime",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
