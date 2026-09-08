@@ -25,6 +25,8 @@ extern crate::module_view
   pure explorer_intent(event:&ModuleViewEvent) -> ExplorerIntent
   component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, settings_open_tabs:i64, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
   pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
+  component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64) -> ModuleViewEvent
+  pure files_intent(event:&ModuleViewEvent) -> FilesIntent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
   // Chat is a module-owned view: the screen's facts go in — the mutation
   // lock as `busy`, the enums by name — and every act comes back as an

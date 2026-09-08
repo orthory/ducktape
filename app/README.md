@@ -22,9 +22,9 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer, Settings and Chat tabs are
-not native: each is an Ice application under `crates/views` (`governance`,
-`members`, `agents`, `node`, `explorer`, `settings`, `chat`) compiled
+The Approvals, Members, Agents, Node, Explorer, Settings, Chat and Files tabs
+are not native: each is an Ice application under `crates/views` (`governance`,
+`members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as

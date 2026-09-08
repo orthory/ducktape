@@ -1,11 +1,7 @@
-// THE TWO STORAGE SCREENS: what this workspace has stored under duckfs, and
-// everything it has recorded anywhere. Files is the three-pane duckfs browser
-// plus the write bar; Explorer is workspace search over the block ledger it
-// falls back to.
-//
-// See `screens/roster.ice` for the screen contract: shared readings arrive as
-// props, interaction-local state stays here, and only application effects leave
-// as named events.
+// THE FILES SCREEN: the three-pane duckfs browser plus the write bar, as the
+// desktop app drew it natively (screens/storage.ice before the port). Shared
+// readings arrive as props, interaction-local state stays here, and only
+// application effects leave as named events the view root turns into intents.
 
 component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
   lifetime retained
@@ -14,7 +10,6 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     fs_open_dir(str)
     fs_open_file(str)
     fs_open_parent()
-    fs_new_name_changed(str)
     fs_mkdir_submit()
     fs_new_file_submit()
     fs_arm_delete(str)
@@ -75,7 +70,6 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         input "" #fs-new <-> new_name
           with
             label="New entry name"
-            change=emit(fs_new_name_changed, _)
             hint="new name…"
             disabled=loading
             w=160.0

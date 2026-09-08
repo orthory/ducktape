@@ -86,7 +86,11 @@ fn read_artifact(
     let index = index
         .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
         .transpose()?;
-    Ok(module_artifact::ModuleArtifact { component, index })
+    Ok(module_artifact::ModuleArtifact {
+        component,
+        index,
+        view: None,
+    })
 }
 
 fn cmd_pack(args: PackArgs) -> CommandResult {
