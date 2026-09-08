@@ -700,16 +700,22 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
 /// a new generation, so an answer the previous node is still composing
 /// lands nowhere. Returns the loads it started, for a test to wait on.
 pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
-    // the client and its revision move as one, and the lock is let go
+    // THE REGISTRY LOCK FIRST: a connection change and the restart of the
+    // views under it are one step. Two callers — `backend::connect` runs on
+    // the executor's threads, and two connects can overlap — otherwise
+    // interleave into loads asked of one node under the other's revision,
+    // every one of which dies at install, and the views stay "Loading".
+    let registry = registry().lock().expect("module views");
+    // the client and its revision move as one, and their lock is let go
     // before any view is touched: a load installs under it (see
-    // `spawn_load`), and takes the view's own lock inside it.
+    // `spawn_load`), and takes the view's own lock inside it. Lock order,
+    // everywhere: registry, then connection, then a view.
     let snapshot = {
         let mut connection = connection().lock().expect("views rpc");
         connection.rev += 1;
         connection.client = Some(client.clone());
         connection.clone()
     };
-    let registry = registry().lock().expect("module views");
     registry
         .iter()
         .filter_map(|(module, mounted)| {
