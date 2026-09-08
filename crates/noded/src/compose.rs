@@ -16,6 +16,15 @@ use sdk::{MerkleStore, Module, StateRoot};
 use sha2::Digest as _;
 use wasm_host::{Backing, CompiledModule, Shape, WasmModule};
 
+mod view_abi {
+    macro_rules! bindings {
+        ($wit:literal) => {
+            wasmtime::component::bindgen!({ inline: $wit, world: "view" });
+        };
+    }
+    ui_lang_wire::with_view_wit!(bindings);
+}
+
 /// a boxed, non-`Send` future (the host and every store are `!Send`).
 pub type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
 
@@ -336,10 +345,11 @@ pub async fn wasm_module(
     Ok(module)
 }
 
-/// Readiness covers the whole deployment, including the optional mapper —
-/// `IndexStore::validate_guest` refuses exactly what its eventual
-/// `converge`/install would, so a mapper that is Loadable here activates
-/// cleanly, never failing every validator's converge at the swap height.
+/// Readiness covers consensus code, the optional mapper, and the optional view.
+/// Mapper validation matches its eventual index install. View validation checks
+/// strict metadata and the canonical Ice ABI without instantiating or executing
+/// the view. Unknown imports follow the desktop host's trap policy; static
+/// acceptance does not guarantee that instantiation, init, or boot will succeed.
 pub fn validate_deployment(
     id: &str,
     bytes: &[u8],
@@ -355,6 +365,26 @@ pub fn validate_deployment(
             .validate_guest(mapper)
             .map_err(|error| error.to_string())?;
     }
+    if let Some(view) = artifact.view {
+        validate_view(view.component)?;
+    }
+    Ok(())
+}
+
+fn validate_view(bytes: &[u8]) -> Result<(), String> {
+    ui_lang_wire::manifest::read_manifest(bytes)
+        .ok_or_else(|| "invalid Ice view manifest".to_string())?;
+    let engine = wasmtime::Engine::default();
+    let component = wasmtime::component::Component::from_binary(&engine, bytes)
+        .map_err(|error| format!("invalid Ice view component: {error:#}"))?;
+    let mut linker = wasmtime::component::Linker::<()>::new(&engine);
+    linker
+        .define_unknown_imports_as_traps(&component)
+        .map_err(|error| format!("invalid Ice view imports: {error:#}"))?;
+    let pre = linker
+        .instantiate_pre(&component)
+        .map_err(|error| format!("invalid Ice view imports: {error:#}"))?;
+    view_abi::ViewPre::new(pre).map_err(|error| format!("invalid Ice view ABI: {error:#}"))?;
     Ok(())
 }
 

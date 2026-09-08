@@ -369,7 +369,9 @@ impl Client {
         };
         sign(method, path, body)
             .into_iter()
-            .fold(request, |request, (name, value)| request.header(name, value))
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
     }
 
     /// Canonical origin without a trailing slash.
@@ -554,6 +556,28 @@ impl Client {
         }
         let reply: Stored = decode_json(response).await?;
         Ok(reply.digest)
+    }
+
+    /// Fetch a blob by digest, bounding both declared and streamed response bytes.
+    /// The caller verifies the returned bytes against the expected digest.
+    pub async fn get_blob(&self, digest: &[u8; 32], limit: usize) -> Result<Vec<u8>> {
+        use std::fmt::Write as _;
+
+        let mut path = String::from("v1/files/blob/");
+        for byte in digest {
+            write!(&mut path, "{byte:02x}").expect("writing to a string succeeds");
+        }
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blob get failed: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::new(format!("RPC blob get returned {status}")));
+        }
+        read_bounded(response, limit).await
     }
 
     /// Read the peers standing (`GET /v1/peers`), the node's own JSON view.

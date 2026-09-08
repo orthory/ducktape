@@ -25,6 +25,10 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
+# Static Ice view readiness; no graphics or guest execution.
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "677e154590aa39e436e2d1aab6453c1435134f66", features = ["manifest"] }
+wasmtime.workspace = true
+
 node-work = { workspace = true }
 # Committed-block receipt notifications for interactive program actions.
 tokio-tungstenite = "0.24"
@@ -140,6 +144,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 topology = { workspace = true }
 
 [dev-dependencies]
+wat = "1"
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
