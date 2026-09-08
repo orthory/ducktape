@@ -1,7 +1,7 @@
 use super::*;
 
 /// One files-browser row.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct FsEntry {
     /// Session-stable identity for keyed rendering.
     pub key: i64,
@@ -37,39 +37,8 @@ pub fn fs_directories(entries: &[FsEntry]) -> Vec<FsEntry> {
         .collect()
 }
 
-/// What is under this crumb, counted. Ice cannot filter a list by field, so the
-/// crumb bar's two counts are pure folds over the listing it is already drawn
-/// beside — never a second `files_ls`.
-pub fn fs_dir_count(entries: &[FsEntry]) -> i64 {
-    count_i64(entries.iter().filter(|entry| entry.kind == "dir").count())
-}
-
-/// Everything that is not a directory. `files_ls` publishes one `kind` per row
-/// and the browser draws exactly two shapes, so the complement IS the file
-/// count — no third bucket can hide here.
-pub fn fs_file_count(entries: &[FsEntry]) -> i64 {
-    count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
-}
-
-/// `12 files · 3 dirs` — the crumb bar's own subtitle, and "" whenever the rows
-/// on hand are not this path's. A listing nobody fetched folds to
-/// `0 files · 0 dirs`, which reads as "this path is empty" when the truth is
-/// "nobody asked"; a listing fetched for the directory you just LEFT folds to
-/// that directory's tally, printed under the new one's name. Same rule as the
-/// register subtitles in backend/shell.rs: say nothing rather than something
-/// false.
-pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> String {
-    if !connected || !listed || entries.is_empty() {
-        return String::new();
-    }
-    let file_count = fs_file_count(entries);
-    let files = plural(file_count, "file", "files");
-    let dirs = plural(fs_dir_count(entries), "dir", "dirs");
-    format!("{files} · {dirs}")
-}
-
 /// One committed duckfs snapshot.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct FsSnapshot {
     pub id: String,
     pub short_id: String,
@@ -171,19 +140,6 @@ fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
             }
         })
         .collect()
-}
-
-/// `412 KB` — a byte count in the unit a person reads.
-pub fn size_label(bytes: i64) -> String {
-    const KB: i64 = 1_024;
-    const MB: i64 = 1_024 * KB;
-    const GB: i64 = 1_024 * MB;
-    match bytes {
-        size if size < KB => format!("{size} B"),
-        size if size < MB => format!("{} KB", size / KB),
-        size if size < GB => format!("{:.1} MB", size as f64 / MB as f64),
-        size => format!("{:.1} GB", size as f64 / GB as f64),
-    }
 }
 
 /// Read a file for the preview pane. A picture (by path — `picture_path`)
@@ -525,7 +481,7 @@ pub async fn files_upload(
 }
 
 /// The Added/Removed/Modified leaves between a snapshot and the head.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct FsDiffEntry {
     pub path: String,
     pub kind: String,

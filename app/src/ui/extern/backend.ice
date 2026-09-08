@@ -251,7 +251,6 @@ extern crate::backend
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:&[FsEntry]) -> [FsEntry]
-  pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
   pure files_write_gate(dir:str, me:str) -> str
@@ -265,7 +264,6 @@ extern crate::backend
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
-  pure size_label(bytes:i64) -> str
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str

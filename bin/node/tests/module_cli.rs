@@ -204,6 +204,7 @@ fn register_carries_a_mapper_and_update_can_remove_it() {
         "/../../crates/modules/apps/pages/index.wasm"
     );
     let artifact = module_artifact::ModuleArtifact {
+        view: None,
         component: std::fs::read(&component).unwrap(),
         index: Some(std::fs::read(mapper).unwrap()),
     };

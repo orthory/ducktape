@@ -23,10 +23,9 @@
 // The artifact's file-row `note` is omitted for the same reason: its only home
 // would be `EntryInfo.meta`, which no writer populates today.
 //
-// Nothing here reaches an app handler directly. Every navigation leaves as a
-// named component event carrying the path, and the screen that mounts the row
-// decides where it lands; the event names match the handlers the Files screen
-// routes them to (`fs_open_dir`, `fs_open_file`) so the wiring reads as identity.
+// Nothing here reaches the app directly. Every navigation leaves as a named
+// component event carrying the path, the screen forwards it, and the view root
+// turns it into the intent the app signs (`files.open_dir`, `files.open_file`).
 
 // One directory in the whole-tree sidebar. The indent is the artifact's own
 // ladder — 11px, then 14px per level of depth — so the tree reads as a tree
@@ -107,10 +106,9 @@ component FsTreeFace(name:str, depth:f64, dimmed:bool)
 // The crumb bar over the object table: where you are, what is here, and who is
 // allowed to write under it.
 //
-// MOUNTED at the head of the Files arm in view.ice, replacing
-// `ScreenHeader title="Files" meta=fs_path` and wired `fs_open_dir ->
-// fs_open_dir _`. `path` is `fs_path`; `meta` is `fs_counts_summary`
-// (backend/storage.rs), a pure fold over the already-resident `fs_entries` —
+// MOUNTED at the head of the Files screen. `path` is the app's `fs_path`;
+// `meta` is `fs_counts_summary` (host.rs, the app's own fold repeated), a
+// pure fold over the listing already on screen —
 // Ice cannot filter a list by field, and a second listing call to count what is
 // already on screen would be a lie waiting to go stale.
 //

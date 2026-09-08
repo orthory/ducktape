@@ -509,6 +509,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             )
             .unwrap();
             let indexed = source.add(ModuleArtifact {
+                view: None,
                 component: pages.clone(),
                 index: Some(mapper),
             });

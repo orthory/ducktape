@@ -37,33 +37,8 @@ fn the_rail_seats_collaboration_and_node_operations_separately() {
     );
 }
 
-/// The three folds the mounted surfaces are drawn from — the crumb bar's
-/// counts, the blob gutter, and the roster the popped panel keeps.
-#[test]
-fn the_crumb_counts_split_the_listing_in_two() {
-    let entries = ["dir", "file", "file"]
-        .into_iter()
-        .enumerate()
-        .map(|(key, kind)| FsEntry {
-            key: key as i64,
-            path: format!("/shared/{kind}"),
-            name: kind.into(),
-            kind: kind.into(),
-            size: 0,
-            object: String::new(),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(fs_dir_count(&entries), 1);
-    assert_eq!(fs_file_count(&entries), 2);
-    assert_eq!(
-        fs_dir_count(&entries) + fs_file_count(&entries),
-        3,
-        "every row lands in exactly one bucket"
-    );
-    assert_eq!(fs_dir_count(&[]), 0);
-    assert_eq!(fs_file_count(&[]), 0);
-}
-
+/// The two folds the mounted surfaces are drawn from — the blob gutter,
+/// and the roster the popped panel keeps.
 #[test]
 fn the_selected_fs_entry_resolves_or_blanks() {
     let selected = FsEntry {
