@@ -402,6 +402,7 @@ enum ChatIntent
   thread_edit
   thread_delete
   load_thread
+  cancel_run
   composer
 
 enum MutationPhase

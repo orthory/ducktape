@@ -44,6 +44,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
+  invalidate lane=live_agents
   // PARK HER UNSENT WORDS before the room identity moves. Both composers belong
   // to the room/thread being left; message windows are deliberately not kept.
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
@@ -56,6 +57,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the "did my click land?" void #1059 removed from the pickers, still live on
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
+  live_agents = []
+  stream replace lane=live_agents chat_live_agents(connected_rpc, channel_id) -> live_agents_event _
   active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
@@ -139,6 +142,7 @@ on choose_channel(id)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
+  invalidate lane=live_agents
   // PARK HER UNSENT WORDS while `active_channel` still names the room being
   // left. Message windows are deliberately not retained across navigation.
   active_dm_peer = ""
@@ -154,6 +158,8 @@ on choose_channel(id)
   // The switch is visible NOW: the clicked room takes the header and sidebar
   // highlight, then paints an empty loading state until its root window lands.
   active_channel = id
+  live_agents = []
+  stream replace lane=live_agents chat_live_agents(connected_rpc, id) -> live_agents_event _
   active_channel_name = next_channel.name
   // BOTH GATE FACTS RIDE THE CLICK. `post_refusal` is recomputed here, and
   // computing it from the room she LEFT is how a public channel came up
@@ -225,6 +231,7 @@ on choose_dm(peer_key)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
+  invalidate lane=live_agents
   invalidate lane=chat_load
   // PARK HER UNSENT WORDS before moving to the DM. Message windows are not
   // retained; every room paints the same bounded, authoritative root window.
@@ -254,6 +261,8 @@ on choose_dm(peer_key)
   let next_channel = channel_switch_facts(channel_reads, channels, active_channel, dm_room, unread_boundary, active_channel_name)
   unread_boundary = next_channel.unread_boundary
   active_channel = dm_room
+  live_agents = []
+  stream replace lane=live_agents chat_live_agents(connected_rpc, dm_room) -> live_agents_event _
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
@@ -789,6 +798,12 @@ on channel_created(next)
   error = ""
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
+
+on live_agents_event(next)
+  live_agents = next.rows
+
+on live_cancel_acked(_ok)
+  error = ""
 
 on chat_acked(_result)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
@@ -1567,6 +1582,8 @@ on chat_view_event(event)
       flow
         from done true
         done -> load_more_thread()
+    ChatIntent.cancel_run
+      run every cancel_agent_run(connected_rpc, password, event_text(event, "run_id")) -> live_cancel_acked _ | mutation_failed _
     ChatIntent.composer
       let kind = chat_event_kind(event)
       let id = event_text(event, "id")

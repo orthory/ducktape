@@ -1116,3 +1116,77 @@ component SkeletonRow()
           bg=subtle
           r=4.0
         space w=1.0 h=1.0
+
+// AN AGENT RUN IN FLIGHT under the message that summoned it: the plate, the
+// status, the steps it has taken and a Stop. It is drawn from the host's live
+// row, never from a chain message; the committed reply takes its place.
+component LiveAgentCard(live:LiveAgentRow)
+  emits
+    cancel_run(str)
+  col
+    with
+      w=fill
+      gap=4.0
+      pl=37.0
+      pr=7.0
+      py=4.0
+    row
+      with
+        w=fill
+        gap=6.0
+        align=center
+      text live.agent
+        with
+          size=12.0
+          wrap=none
+          font=code_medium
+          @text-fg
+      box
+        with
+          px=5.0
+          py=2.0
+          bg=primary
+          r=4.0
+        text "AGENT"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-primary_fg
+      text live.status
+        with
+          size=11.0
+          wrap=none
+          @text-muted
+      button "Stop" -> emit(cancel_run, live.run_id)
+        with
+          h=22.0
+          p=4.0
+          @secondary_action
+    for act in live.activity
+      row
+        with
+          gap=5.0
+          align=center
+        if act.done
+          text "✓"
+            with
+              size=11.0
+              wrap=none
+              @text-muted
+        if !act.done
+          text "…"
+            with
+              size=11.0
+              wrap=none
+              @text-muted
+        text act.label
+          with
+            size=11.0
+            wrap=none
+            @text-muted
+    if !empty(live.answer_preview)
+      text live.answer_preview
+        with
+          size=12.5
+          @text-fg

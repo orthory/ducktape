@@ -1092,6 +1092,7 @@ struct ChatProps<'a> {
     copy_head_seq: i64,
     copy_surface: &'static str,
     sent_serial: i64,
+    live_agents: &'a [crate::backend::LiveAgentRow],
 }
 
 /// The Chat tab: the room list, the stream, the rail and the drawer as the
@@ -1157,6 +1158,7 @@ pub fn chat_view(
     copy_head_seq: i64,
     copy_surface: crate::CopySurface,
     sent_serial: i64,
+    live_agents: &[crate::backend::LiveAgentRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = ChatProps {
         dark,
@@ -1212,6 +1214,7 @@ pub fn chat_view(
         copy_head_seq,
         copy_surface: copy_surface_name(copy_surface),
         sent_serial,
+        live_agents,
     };
     module_view("chat", serde_json::to_vec(&props).expect("props encode"))
 }
@@ -1287,6 +1290,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "thread_edit" => Intent::ThreadEdit,
         "thread_delete" => Intent::ThreadDelete,
         "load_thread" => Intent::LoadThread,
+        "cancel_run" => Intent::CancelRun,
         "composer" => Intent::Composer,
         _ => Intent::ClearSelection,
     }
@@ -1637,6 +1641,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "thread_edit",
             "thread_delete",
             "load_thread",
+            "cancel_run",
         ],
         "forge" => &[
             "open_repo",

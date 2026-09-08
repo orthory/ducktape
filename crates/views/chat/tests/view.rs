@@ -3,7 +3,8 @@
 //! are slots the host paints, keyed by the room and the thread.
 
 use chat_view::host::{
-    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, Query, Selection, Text,
+    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, LiveActivity,
+    LiveAgentRow, Query, RunId, Selection, Text,
 };
 use chat_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
@@ -241,4 +242,94 @@ fn an_edit_is_seeded_from_the_message_and_leaves_as_the_edited_text() {
             }
         );
     });
+}
+
+fn live_run(anchor_seq: i64) -> LiveAgentRow {
+    LiveAgentRow {
+        anchor_seq,
+        run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
+        dispatch: "d1".into(),
+        agent: "ferris".into(),
+        status: "Reading the repo".into(),
+        activity: vec![
+            LiveActivity {
+                label: "Command: cargo test".into(),
+                done: true,
+            },
+            LiveActivity {
+                label: "Reasoning".into(),
+                done: false,
+            },
+        ],
+        ..LiveAgentRow::default()
+    }
+}
+
+#[test]
+fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
+    let props = ChatProps {
+        live_agents: vec![live_run(2)],
+        ..facts()
+    };
+    let (_, frame) = shown(&props);
+    for expected in ["ferris", "AGENT", "Reading the repo", "Command: cargo test"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    let frame = tick_native(press(&frame, "Stop"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(intent.kind, "chat.cancel_run");
+    assert_eq!(
+        serde_json::from_slice::<RunId>(&intent.payload).expect("decodes"),
+        RunId {
+            run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into()
+        }
+    );
+}
+
+#[test]
+fn the_committed_reply_replaces_the_live_row() {
+    let props = ChatProps {
+        live_agents: vec![live_run(2)],
+        ..facts()
+    };
+    let (subscription, frame) = shown(&props);
+    assert!(has_text(&frame, "Reading the repo"));
+    // the run left the pending set as its reply landed: the row goes, the
+    // reply stays
+    let mut reply = message(3, "here is the answer");
+    reply.author = "ferris".into();
+    reply.avatar_kind = "agent".into();
+    let landed = ChatProps {
+        messages: vec![message(1, "first"), message(2, "second"), reply],
+        live_agents: Vec::new(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&landed))]);
+    assert!(!has_text(&frame, "Reading the repo"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Stop"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "here is the answer"));
+    assert!(has_text(&frame, "AGENT"), "the reply wears the agent plate");
+}
+
+#[test]
+fn a_failed_run_shows_its_terminal_state() {
+    let mut failed = live_run(2);
+    failed.status = "the node event stream closed".into();
+    failed.activity.clear();
+    let props = ChatProps {
+        live_agents: vec![failed],
+        ..facts()
+    };
+    let (_, frame) = shown(&props);
+    assert!(
+        has_text(&frame, "the node event stream closed"),
+        "{:?}",
+        texts(&frame)
+    );
 }

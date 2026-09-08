@@ -169,6 +169,30 @@ pub struct ChatProps {
     pub copy_head_seq: i64,
     pub copy_surface: String,
     pub sent_serial: i64,
+    /// The agent runs anchored in this room, live while they run; the
+    /// committed reply takes a row's place.
+    pub live_agents: Vec<LiveAgentRow>,
+}
+
+/// One step of a running agent: what it is doing, and whether it finished.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveActivity {
+    pub label: String,
+    pub done: bool,
+}
+
+/// An agent run in flight under its anchor message.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct LiveAgentRow {
+    pub anchor_seq: i64,
+    pub thread_root: i64,
+    pub run_id: String,
+    pub dispatch: String,
+    pub agent: String,
+    pub status: String,
+    pub activity: Vec<LiveActivity>,
+    pub answer_preview: String,
+    pub elapsed_ms: i64,
 }
 
 /// One item of the facts subscription: the facts, or why not.
@@ -304,6 +328,12 @@ pub struct Reaction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seq {
     pub seq: i64,
+}
+
+/// The run a Stop names.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunId {
+    pub run_id: String,
 }
 
 /// The message-menu openers: which message, its body and its revision.
@@ -453,6 +483,10 @@ pub fn send_remove_reaction(seq: i64, emoji: &str) -> bool {
 
 pub fn send_open_thread(seq: i64) -> bool {
     notify("chat.open_thread", &Seq { seq })
+}
+
+pub fn send_cancel_run(run_id: &str) -> bool {
+    notify("chat.cancel_run", &RunId { run_id: run_id.into() })
 }
 
 fn selection(operation: &str, seq: i64, body: &str, rev: i64) -> bool {

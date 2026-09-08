@@ -20,8 +20,9 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
+    cancel_run(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -107,6 +108,13 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
                 open_message_actions
                 open_message_link
                 press_message
+      // THE RUN THIS MESSAGE ANCHORED, live under it while it runs; the
+      // committed reply takes the row's place.
+      keyed live in live_agents by=live.anchor_seq
+        if live.anchor_seq == message.seq
+          LiveAgentCard live=live
+            forward
+              cancel_run
 
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
@@ -204,9 +212,10 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveAgentRow], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
+    cancel_run(str)
     press_message(i64, CopySurface)
     clear_copy_range()
     copy_selected_messages()
@@ -844,10 +853,11 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                           // the quiet rows always did: the reaction handlers
                           // keep refusing while loading; the openers never
                           // did.
-                          lazy messages by active_channel, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_messages
+                          lazy messages by active_channel, live_agents, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_messages
                             MessageTimeline
                               with
                                 messages=cached_messages
+                                live_agents
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
@@ -855,6 +865,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                 copy_head_seq
                                 copy_surface
                               forward
+                                cancel_run
                                 add_reaction_at
                                 remove_reaction_at
                                 open_thread_for
@@ -1762,6 +1773,13 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             open_thread_message_reactions
                             open_message_link
                             press_message
+                      // THE RUN ANCHORED IN THIS THREAD, live at the foot of
+                      // the rail until its reply lands.
+                      keyed live in live_agents by=live.anchor_seq
+                        if live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
+                          LiveAgentCard live=live
+                            forward
+                              cancel_run
                       if thread_has_more && thread_next_reply_seq > 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with
