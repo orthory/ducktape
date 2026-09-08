@@ -49,14 +49,15 @@ prereqs:
 all: prereqs
 	$(CARGO) build $(LOCKED) --workspace
 
-## the app dev loop: seed the "demo" localnet if it does not exist yet
-## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
-## serving, start the local compute/agent/airlock services, sync ducktape's own
-## repo into that node's forge (dogfood-forge — non-fatal when origin is
-## unreachable), then run the desktop app against it in the foreground. Ctrl-C
-## quits the app and leaves the node and services running; `make dev-clear`
-## stops that background runtime without deleting its state, while
-## `make demo-clear` removes the workspace entirely.
+## the app dev loop: found the "demo" localnet anew (stopping and clearing
+## what a previous lap left) from the modules, index guests and views this
+## build staged, start its node and the local compute/agent/airlock services,
+## sync ducktape's own repo into that node's forge (dogfood-forge — non-fatal
+## when origin is unreachable), then run the desktop app against it in the
+## foreground. Ctrl-C quits the app and leaves the node and services up for
+## `cargo run -p ducktape-app`; the next `make dev` replaces them.
+## `make dev-clear` stops that background runtime without deleting its state,
+## while `make demo-clear` removes the workspace entirely.
 dev: views
 	@bash ops/dev.sh
 
@@ -73,8 +74,9 @@ dev-clear:
 ## once `make dev` starts the compute service it replies in chat and opens a
 ## pull request from a microVM, no model credential needed), jobs, an
 ## automation rule — plus TWO gateway web-app routes: a
-## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
-## "demo" workspace in ~/.ducktape and makes it active. Builds ducktape if needed
+## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Stops and
+## replaces any previous "demo" workspace in ~/.ducktape (demo-clear) and makes
+## the new one active. Builds ducktape if needed
 ## (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed:
 	@bash ops/demo-seed.sh
@@ -312,10 +314,11 @@ test: wasm-modules-check wasm-embed-check
 # Skips with a notice where there is no node, like the bun line below.
 	@if command -v node >/dev/null; then node ops/auth-page/test.mjs; \
 	else echo "[test] skipped ops/auth-page/test.mjs — node (nodejs) is not installed" >&2; fi
-# demo-clear's refusal line against a stub admin surface: the reason token it
-# prints has to be the node's own, not one invented in the script. Needs `bun`
-# (so does demo-clear itself); the script skips with a notice where there is
-# none, like the podman lines above.
+# demo-clear's refusal line against a stub admin surface (the reason token it
+# prints has to be the node's own, not one invented in the script) and its
+# process sweep (only the workspace's ducktape node and services, never a
+# bystander naming the path). Needs `bun` (so does demo-clear itself); the
+# script skips with a notice where there is none, like the podman lines above.
 	bash ops/demo-clear-test.sh
 # the #[ignore]d tests are ignored ONLY because they must not share a process
 # with the parallel suite — they still have to run. `absolute_configs_resolve_
