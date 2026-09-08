@@ -184,6 +184,9 @@ The generated network uses a 500 ms idle block cadence. `--after 600` in a
 module ceremony means 600 committed blocks after governance executes it,
 nominally five idle minutes, not 600 seconds or a wall-clock guarantee. Allow
 additional time for voting, artifact fan-out and the client observations.
+When a minimum five-minute separation is required, wait at least 300 measured
+seconds after the preceding phase is fully verified before proposing the next
+phase, and retain its block lead. Record both timestamps and activation heights.
 
 ### Preparing the actual view ceremony
 
@@ -258,6 +261,11 @@ URLs, the five owners' actual full artifact hashes and activation heights,
 logs and actual PNGs for view A, view B, asset color change, missing asset, and
 verified view removal. Static readiness/ABI validation and the local
 three-process consensus smoke do not prove Proxmox deployment or Mac rendering.
+A Linux headless app capture can verify the real guest/host loading and rendered
+pixels, but is separate from a physical Mac app/window test. Label the client
+platform in evidence and keep any unexecuted platform check explicit. Confirm
+that each PNG depicts its reported module and visible marker after layout and
+redraw; a correct swap log beside a stale capture is not visual swap evidence.
 
 Offline command/ownership and heartbeat checks (no SSH/Proxmox access):
 
