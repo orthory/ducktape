@@ -231,9 +231,15 @@ mod tests {
     #[test]
     fn the_collab_plane_never_touches_the_pty_plane() {
         let source = include_str!("collab_cli.rs");
-        // the doc comment above names these on purpose; strip the prose so the
-        // lint reads CODE, not the explanation of itself.
-        let code: String = source
+        // Scan the SHIPPING half only, and strip its prose. Both cuts are
+        // load-bearing: the doc comments name the pty plane on purpose to
+        // explain why it is absent, and this test's own banned-word list is
+        // code — scanning it would make the lint match itself and fail always.
+        let shipping = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("this file has a test module");
+        let code: String = shipping
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
