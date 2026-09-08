@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{AgentAction, DelegationRequest, ModelRecord, ReplyBlock, ResourceCaps};
+use crate::{ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps};
 use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -88,8 +88,8 @@ pub struct RunRecord {
 
 // ---- run-scoped agent calls -------------------------------------------------
 
-/// Maximum caller-chosen idempotency-key size for one agent call.
-pub const MAX_DELEGATION_REQUEST_ID_BYTES: usize = 64;
+/// Maximum caller-chosen idempotency-key size for one action or agent call.
+pub const MAX_REQUEST_ID_BYTES: usize = 64;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -261,7 +261,7 @@ pub enum RunsMsg {
         /// agent's tool server — never the node key, which can sign anything.
         session_key: Vec<u8>,
     },
-    /// one agent action, applied MID-RUN, signed by the bound session key.
+    /// One catalog operation, invoked MID-RUN, signed by the bound session key.
     ///
     /// the origin must BE that session key. a frame's origin is its VERIFIED
     /// public key (`node::decode_frame` binds `(origin, seq, target, payload)`,
@@ -269,23 +269,22 @@ pub enum RunsMsg {
     /// is authorship consensus can trust — unlike the frameless `/v1/submit`
     /// lane, whose caller-supplied origin `bin/node` discards outright.
     ///
-    /// the action is then validated against the SAME `allowed_actions` + caps
-    /// the response path validates, by the same code: the tool plane must never
-    /// become a second, wider permission vocabulary.
+    /// the envelope is decoded against the module-owned catalog and validated
+    /// against the SAME `allowed_actions` + caps the response path validates,
+    /// by the same code: the tool plane must never become a second, wider
+    /// permission vocabulary. `request_id` names the logical invocation within
+    /// the run: an exact retry answers the same receipt, a reuse with different
+    /// bytes is refused.
     AgentAction {
         run_id: String,
-        action: AgentAction,
+        request_id: String,
+        action: ActionEnvelope,
     },
     /// Start one peer agent call while the caller is still running. The bound
     /// session key authorizes the request; `subagent_budget` bounds concurrent
     /// live calls across the root tree, and the callee executes with caller ∩
     /// callee authority.
     ExecuteDelegation {
-        run_id: String,
-        request_id: String,
-        request: DelegationRequest,
-    },
-    DelegateRun {
         run_id: String,
         request_id: String,
         request: DelegationRequest,
@@ -395,6 +394,12 @@ pub enum RunsQuery {
     Model {
         query: crate::ModelQuery,
     },
+    /// The module-owned action catalog, optionally narrowed to operation
+    /// names starting with `filter`.
+    Catalog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
     /// Stored proposal data, without querying its program's status.
     ActionPlan {
         request_id: String,
@@ -432,6 +437,7 @@ pub enum RunsReply {
     NodeWork(Option<node_work::Directive>),
     ModuleUpdate(Option<ModuleUpdateView>),
     Model(crate::ModelReply),
+    Catalog(Vec<OperationView>),
     ActionRequest(Option<ActionRequestView>),
     PendingRuns(Vec<PendingRun>),
     RecentRuns(Vec<RunRecord>),
@@ -537,20 +543,24 @@ pub struct ActionRequestView {
     pub account: sdk::AccountNumber,
     pub generation: u64,
     pub run_id: String,
+    /// The catalog operation this proposal invokes. A module-authored effect
+    /// carries its label instead: `reply` for the run's own reply, the target
+    /// module's id for an effect no operation prepared (the forge sink).
+    pub operation: String,
+    /// The deterministic result the operation prepared (ids it minted, the
+    /// destination it resolved); meaningful once `status` is completed.
+    pub result: serde_json::Value,
+    /// The module that executes the prepared message.
     pub target: String,
     pub payload: serde_json::Value,
     pub status: ActionStatus,
 }
 
-/// A caller knows its session slot before admission and can await this exact receipt.
-pub fn action_request_id(run_id: &str, slot: u32) -> String {
-    format!("session/{}/{slot}", crate::dispatch_id_for(run_id))
-}
-
-/// Stable correlation for a named peer call, including an exact retry.
-pub fn delegation_action_id(run_id: &str, request_id: &str) -> String {
+/// The receipt id of one live invocation. A caller knows it before admission
+/// and awaits exactly this receipt; an exact retry resolves to the same id.
+pub fn action_request_id(run_id: &str, request_id: &str) -> String {
     format!(
-        "delegate/{}/{}",
+        "action/{}/{}",
         crate::dispatch_id_for(run_id),
         crate::dispatch_id_for(request_id)
     )

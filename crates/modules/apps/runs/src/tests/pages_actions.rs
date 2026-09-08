@@ -158,17 +158,14 @@ fn delivery_ctx(registry: &Registry) -> CaptureCtx {
         .with_page("p1", page_blocks("p1", "Spec"))
 }
 
-fn comment_effect(target: &str) -> Vec<AgentAction> {
-    vec![AgentAction::AddPageComment {
-        target: target.into(),
-        body: "looks good".into(),
-    }]
+fn comment_effect(target: &str) -> Vec<ActionEnvelope> {
+    vec![page_comment(target, "looks good")]
 }
 
 /// deliver a run whose prose carries `actions` — the production path feeding
 /// the pages lane (the oracle never lifts an effects facet; the pages actions
 /// arrive as the model's prose-parsed actions). "done" is the chat reply.
-fn deliver(m: &mut RunsModule, ctx: &mut CaptureCtx, run_id: &str, actions: Vec<AgentAction>) {
+fn deliver(m: &mut RunsModule, ctx: &mut CaptureCtx, run_id: &str, actions: Vec<ActionEnvelope>) {
     let prose = String::from_utf8(response_json(&["done"], actions)).expect("utf-8");
     exec(
         m,
@@ -297,18 +294,9 @@ fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
         &mut ctx,
         &run_id,
         vec![
-            AgentAction::AddPageComment {
-                target: "ghost".into(),
-                body: "hi".into(),
-            },
-            AgentAction::AddPageComment {
-                target: "b-p".into(),
-                body: "".into(),
-            },
-            AgentAction::SetPageChecked {
-                block: "b-t".into(),
-                checked: true,
-            },
+            page_comment("ghost", "hi"),
+            page_comment("b-p", ""),
+            set_page_checked("b-t", true),
         ],
     );
 
@@ -326,7 +314,7 @@ fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
         "{notes:?}"
     );
     assert!(
-        notes.iter().any(|n| n.contains("comment body is empty")),
+        notes.iter().any(|n| n.contains("non-empty text")),
         "{notes:?}"
     );
     assert_delivered(&mut m, &run_id);
@@ -342,14 +330,8 @@ fn set_checked_requires_a_todo_block_and_carries_no_attribution() {
         &mut ctx,
         &run_id,
         vec![
-            AgentAction::SetPageChecked {
-                block: "b-p".into(),
-                checked: true,
-            },
-            AgentAction::SetPageChecked {
-                block: "b-t".into(),
-                checked: true,
-            },
+            set_page_checked("b-p", true),
+            set_page_checked("b-t", true),
         ],
     );
 
@@ -381,15 +363,15 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
     for (ctx, needle) in [
         (
             delivery_ctx(&registry).with_taken_page_id(&format!("agent/{rid}/thread/0")),
-            "thread id already taken",
+            "thread belongs to another target",
         ),
         (
             delivery_ctx(&registry).with_taken_page_id(&format!("agent/{rid}/comment/0")),
-            "comment id already taken",
+            "reply id already taken",
         ),
         (
             delivery_ctx(&registry).with_crowded_page_target("b-p"),
-            "already holds",
+            "target is full",
         ),
     ] {
         let mut m2 = {
@@ -427,14 +409,8 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
         &mut ctx,
         &run_id,
         vec![
-            AgentAction::AddPageComment {
-                target: "b-p".into(),
-                body: "first".into(),
-            },
-            AgentAction::AddPageComment {
-                target: "b-p".into(),
-                body: "second".into(),
-            },
+            page_comment("b-p", "first"),
+            page_comment("b-p", "second"),
         ],
     );
 
@@ -442,7 +418,7 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
     assert_eq!(msgs.len(), 1, "only the first comment fits: {msgs:?}");
     assert!(matches!(&msgs[0], PageMsg::AddComment { text, .. } if text == "first"));
     assert!(
-        ctx.notes().iter().any(|n| n.contains("already holds")),
+        ctx.notes().iter().any(|n| n.contains("target is full")),
         "the overflow comment leaves a cap breadcrumb: {:?}",
         ctx.notes()
     );
@@ -527,7 +503,7 @@ fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
     assert!(
         ctx.notes()
             .iter()
-            .any(|n| n.contains("no pages module wired")),
+            .any(|n| n.contains("pages module is not configured")),
         "{:?}",
         ctx.notes()
     );
@@ -548,15 +524,9 @@ fn task_actions_keep_their_all_or_nothing_lane() {
         &mut ctx,
         &run_id,
         vec![
-            AgentAction::AddPageComment {
-                target: "b-p".into(),
-                body: "hi".into(),
-            },
+            page_comment("b-p", "hi"),
             // tasks.create was never granted — the strict lane fails the run.
-            AgentAction::CreateTask {
-                task_id: "t9".into(),
-                title: "nope".into(),
-            },
+            create_task("t9", "nope"),
         ],
     );
     assert!(

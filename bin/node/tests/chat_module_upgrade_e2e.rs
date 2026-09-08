@@ -86,7 +86,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
     let response = serde_json::json!({
         "reply_blocks": [{"kind":"paragraph", "text":"Replacement committed; deployment requested."}],
         "commit_message": "Update hello to count by one hundred",
-        "actions": [{"update_module": {
+        "actions": [{"operation": "modules.update", "input": {
             "module_id":"hello", "artifact":"hello.module",
             "code_hash":expected_hash, "after":AFTER.parse::<u64>().unwrap(),
         }}],

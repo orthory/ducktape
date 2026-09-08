@@ -107,11 +107,15 @@ impl RunsModule {
                 effects.inner.emit_msg(message);
                 continue;
             }
+            let prepared = super::action_requests::Prepared {
+                receipt: self.take_prepared_receipt(&message),
+                message,
+            };
             self.stage_action_request(
                 &entry,
                 format!("result/{}/{index}", super::dispatch_id_for(&entry.run_id)),
                 super::action_requests::RequestScope::Result,
-                message,
+                prepared,
             )
             .await?;
         }
@@ -183,6 +187,9 @@ impl Module for RunsModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        // Receipt facts live only between an effect's preparation and its
+        // staging inside one execute; nothing carries across ops.
+        self.prepared_receipts.borrow_mut().clear();
         // The one visible origin dispatch. Each arm delegates once to a
         // budgeted handler whose stack-owned ledger spans that whole execute.
         match self.execute_kind(&ctx.env().origin) {
@@ -197,6 +204,9 @@ impl Module for RunsModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
+            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(
+                crate::catalog(filter.as_deref()),
+            ))),
             RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
                 self.next_module_update().await?,
             ))),

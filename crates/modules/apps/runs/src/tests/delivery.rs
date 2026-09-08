@@ -22,16 +22,10 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             Ok(response(
                 &["on it"],
                 vec![
-                    AgentAction::CreateTask {
-                        task_id: "t1".into(),
-                        title: "ship it".into(),
-                    },
+                    create_task("t1", "ship it"),
                     // updating a task created earlier in this SAME response
                     // is valid — tasks applies the follow-ups in order.
-                    AgentAction::UpdateTaskStatus {
-                        task_id: "t1".into(),
-                        status: "in_progress".into(),
-                    },
+                    update_task_status("t1", "in_progress"),
                 ],
             )),
         ),
@@ -124,10 +118,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             "task already exists: t0",
             response(
                 &["ok"],
-                vec![AgentAction::CreateTask {
-                    task_id: "t0".into(),
-                    title: "dup of a committed task".into(),
-                }],
+                vec![create_task("t0", "dup of a committed task")],
             ),
         ),
         (
@@ -135,14 +126,8 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             response(
                 &["ok"],
                 vec![
-                    AgentAction::CreateTask {
-                        task_id: "fresh".into(),
-                        title: "one".into(),
-                    },
-                    AgentAction::CreateTask {
-                        task_id: "fresh".into(),
-                        title: "two".into(),
-                    },
+                    create_task("fresh", "one"),
+                    create_task("fresh", "two"),
                 ],
             ),
         ),
@@ -150,30 +135,21 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
             "unknown task: ghost",
             response(
                 &["ok"],
-                vec![AgentAction::UpdateTaskStatus {
-                    task_id: "ghost".into(),
-                    status: "done".into(),
-                }],
+                vec![update_task_status("ghost", "done")],
             ),
         ),
         (
             "unknown task status",
             response(
                 &["ok"],
-                vec![AgentAction::UpdateTaskStatus {
-                    task_id: "t0".into(),
-                    status: "shipped".into(),
-                }],
+                vec![update_task_status("t0", "shipped")],
             ),
         ),
         (
-            "non-empty task_id",
+            "task_id must be non-empty",
             response(
                 &["ok"],
-                vec![AgentAction::CreateTask {
-                    task_id: String::new(),
-                    title: "x".into(),
-                }],
+                vec![create_task(String::new(), "x")],
             ),
         ),
     ];
@@ -270,10 +246,7 @@ fn a_task_id_tasks_would_reject_fails_the_run_not_the_op() {
                 &run_id,
                 Ok(response(
                     &["ok"],
-                    vec![AgentAction::CreateTask {
-                        task_id,
-                        title: "rejected at tasks".into(),
-                    }],
+                    vec![create_task(task_id, "rejected at tasks")],
                 )),
             ),
         )
@@ -323,10 +296,7 @@ fn a_task_id_at_the_cap_still_emits() {
             &run_id,
             Ok(response(
                 &["on it"],
-                vec![AgentAction::CreateTask {
-                    task_id: task_id.clone(),
-                    title: "at the cap".into(),
-                }],
+                vec![create_task(task_id.clone(), "at the cap")],
             )),
         ),
     )
@@ -383,10 +353,7 @@ fn oversized_actions_fail_the_run_deterministically() {
         .with_transcript("general", transcript(2));
     let huge = response(
         &[],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "x".repeat(MAX_ACTIONS_BYTES),
-        }],
+        vec![create_task("t1", "x".repeat(MAX_ACTIONS_BYTES))],
     );
     exec(&mut m, &mut ctx, &result_event(&run_id, Ok(huge))).unwrap();
     commit(&mut m);
@@ -423,10 +390,7 @@ fn an_over_cap_action_set_is_refused_not_truncated() {
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
     let actions = (0..over_cap)
-        .map(|n| AgentAction::CreateTask {
-            task_id: format!("t{n}"),
-            title: format!("task {n}"),
-        })
+        .map(|n| create_task(format!("t{n}"), format!("task {n}")))
         .collect();
     exec(
         &mut m,
@@ -567,7 +531,7 @@ fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
 #[test]
 fn a_fenced_response_retains_reply_blocks_and_actions() {
     // Parsing preserves both facets; delivery resolves the source.
-    let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
+    let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"operation\":\"tasks.create\",\"input\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
     let parsed = agent_response_from_text(raw);
     assert!(
         parsed.reply_blocks[0].text == "noise",
@@ -596,11 +560,7 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
             &run_id,
             Ok(response(
                 &["done"],
-                vec![AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "progress: halfway".into(),
-                    thread: None,
-                }],
+                vec![post_message("general", "progress: halfway", None)],
             )),
         ),
     )
@@ -644,11 +604,7 @@ fn post_message_without_its_own_grant_fails_the_run() {
             &run_id,
             Ok(response(
                 &["done"],
-                vec![AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "sneaking in".into(),
-                    thread: None,
-                }],
+                vec![post_message("general", "sneaking in", None)],
             )),
         ),
     )
@@ -687,11 +643,7 @@ fn a_post_message_action_decodes_and_threads() {
         .with_transcript("general", transcript(2));
     let prose = String::from_utf8(response_json(
         &["done"],
-        vec![AgentAction::PostMessage {
-            channel_id: "general".into(),
-            text: "threaded update".into(),
-            thread: Some(1),
-        }],
+        vec![post_message("general", "threaded update", Some(1))],
     ))
     .unwrap();
     exec(

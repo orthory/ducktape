@@ -64,33 +64,46 @@ work. Duplicate manual model/channel/anchor requests claim one run.
 
 The compute service receives a committed work payload and returns an oracle
 result. A host-owned ephemeral signer authenticates that run's interactive
-AgentAction or DelegateRun requests against its session, lease and grant.
-It is never an identity key of the program account. The scoped HTTP endpoint
-subscribes before admission and waits for the actual target receipt. Each
-execution attempt binds a fresh public key under its lease holder's node key.
-The private key stays on that host; the guest receives a scoped endpoint token.
-A retry replaces the binding and retains the run's action counter. Terminal
-sagas and changed attempts refuse old keys and unclaimed proposals. A target
-call already authorized by the program can finish and retain its receipt. An
-attributed run whose binding fails does not start its provider.
+`RunsMsg::AgentAction` requests against its session, lease and grant. It is
+never an identity key of the program account. The scoped HTTP endpoint
+subscribes before admission and waits for the actual target receipt, which it
+returns to the caller. Each execution attempt binds a fresh public key under
+its lease holder's node key. The private key stays on that host; the guest
+receives a scoped endpoint token. A retry replaces the binding and retains the
+run's action counter. Terminal sagas and changed attempts refuse old keys and
+unclaimed proposals. A target call already authorized by the program can
+finish and retain its receipt. An attributed run whose binding fails does not
+start its provider.
 
-`ducktape_reply(text, destination?)` proposes `AgentAction::Reply`. Without a
-destination, Runs resolves it from committed source context: the original chat
-thread, the Pages comment thread, a shared reply thread on the mentioned block,
-or the job discussion. Live, final and failure replies use the same resolver
-and execute as the program account. Pages reply validation reads thread metadata
-without loading the discussion bodies. An action-only final response keeps its
-actions without inventing another source reply.
+Every agent write is one envelope: `operation`, an optional `target`, an
+`input`, and the caller's `request_id`. The MCP server exposes it as
+`ducktape_action` and forwards it opaque; `ducktape_actions` lists the catalog
+and `ducktape_receipt` reads a receipt back. Runs owns the catalog
+(`RunsQuery::Catalog`): each operation's name, target and input schemas, result
+schema, required grant (a fixed action, the source-resolved reply grant, or a
+resource cap) and the lanes it admits (live through the session signer, final
+through the response's `actions`, or both). The same envelopes ride the final
+response, so adding an operation to the module needs no change to the executor
+or the tool binary. `request_id` is idempotent per run: the same bytes under
+the same id answer with the existing receipt, different bytes are refused, and
+the receipt id is `runs::action_request_id(run_id, request_id)`. Every
+proposal is pinned to its operation's `schema_digest`; the program's claim
+refuses a proposal whose operation schema changed under it.
 
-The host forwards the destination object without decoding a modality enum.
-Runs owns its schema, resolution and permission checks, so a module can add a
-destination without changing the executor or the tool binary. The current
-module accepts `chat` (channel_id, optional thread), `page`
-(target), `page_thread` (thread_id), or `job` (job_id). Source chat replies require
-`chat.post`; explicit chat destinations require `chat.post_message`. Pages
-replies require `pages.comment` and the owning page in `pages_write`. Job replies
-require `jobs.comment`. Existing task, Pages and DuckFS tools let the model choose
-other writes within its grants. A destination never supplies the author.
+`reply` is a catalog operation with no target. Runs resolves its destination
+from committed source context: the original chat thread, the Pages comment
+thread, a shared reply thread on the mentioned block, or the job discussion.
+Live, final and failure replies use the same resolver and execute as the
+program account. Pages reply validation reads thread metadata without loading
+the discussion bodies. An action-only final response keeps its actions without
+inventing another source reply. Explicit destinations are their own
+operations: `chat.post_message` (channel_id, optional thread), `pages.comment`
+(target or thread_id) and `jobs.comment` (job_id). Source chat replies require
+`chat.post`; `chat.post_message` requires its own grant. Pages comments require
+`pages.comment` and the owning page in `pages_write`. Job comments require
+`jobs.comment`. `tasks.create`, `tasks.update_status`, `pages.set_checked`,
+`duckfs.write_text`, `modules.update` (final only) and `agent.call` (live only)
+complete the catalog. A destination never supplies the author.
 
 The job board stores bounded, immutable comments with their authenticated actor
 and commit height, and exposes them through its point read and index. Comments

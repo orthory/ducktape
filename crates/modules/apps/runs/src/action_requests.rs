@@ -17,6 +17,69 @@ pub(super) enum RequestScope {
     Result,
 }
 
+/// A catalog invocation's identity: the schema the operation had when the
+/// proposal was admitted, and the envelope bytes the caller's request_id is
+/// bound to. A module-authored effect (the run's own reply, the forge sink)
+/// has none.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Invocation {
+    pub schema_digest: String,
+    pub envelope_digest: [u8; 32],
+}
+
+/// The receipt facts a prepared effect records beside its target message.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReceiptMeta {
+    pub operation: String,
+    pub result: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<Invocation>,
+}
+
+impl ReceiptMeta {
+    /// A module-authored effect: labelled, no result, no schema pin.
+    pub fn effect(label: impl Into<String>) -> Self {
+        Self {
+            operation: label.into(),
+            result: serde_json::Value::Null,
+            invocation: None,
+        }
+    }
+}
+
+/// One prepared effect: the exact message the program executes and the
+/// receipt facts recorded beside it.
+#[derive(Debug, Clone)]
+pub(super) struct Prepared {
+    pub message: Msg,
+    pub receipt: ReceiptMeta,
+}
+
+impl Prepared {
+    pub fn new(message: Msg, operation: &str, result: serde_json::Value) -> Self {
+        Self {
+            message,
+            receipt: ReceiptMeta {
+                operation: operation.into(),
+                result,
+                invocation: None,
+            },
+        }
+    }
+}
+
+/// The key a prepared effect is remembered under until its message is staged
+/// as a proposal: the exact target and payload bytes the program will execute.
+pub(super) fn message_digest(message: &Msg) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(message.target.as_bytes());
+    digest.update([0]);
+    digest.update(&message.payload);
+    digest.finalize().into()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ActionRequest {
@@ -27,6 +90,9 @@ pub(super) struct ActionRequest {
     pub scope: RequestScope,
     pub model_id: String,
     pub grant: RunAuthority,
+    /// `Some` for a catalog invocation; the claim re-checks the schema pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<Invocation>,
 }
 
 /// Program calls encode every JSON object's keys in sorted order. The
@@ -164,6 +230,23 @@ impl RunsModule {
         }
     }
 
+    /// A proposal executes only under the operation schema it was admitted
+    /// with: a module swap that changed the operation cannot reinterpret a
+    /// queued payload as different work.
+    fn request_schema_pinned(&self, request: &ActionRequest) -> Result<(), Error> {
+        let Some(invocation) = &request.invocation else {
+            return Ok(());
+        };
+        let current = crate::operation_view(&request.view.operation)
+            .map(|view| view.schema_digest);
+        if current.as_deref() != Some(invocation.schema_digest.as_str()) {
+            return Err(Error::Module(
+                "operation schema changed since this action was proposed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn request_call(&self, ctx: &dyn Ctx, request: &ActionRequest) -> Result<CallId, Error> {
         let Origin::Program(account) = ctx.env().origin else {
             return Err(Error::Module(
@@ -199,6 +282,7 @@ impl RunsModule {
         };
         let call = self.request_call(ctx, &request)?;
         self.request_authority(ctx, &request).await?;
+        self.request_schema_pinned(&request)?;
         let bytes = ctx
             .query(
                 &self.attribution,

@@ -1,6 +1,6 @@
 use super::{
     AgentSession, BTreeMap, DelegationState, DelegationStatus, Digest, Error,
-    MAX_ACTIONS_PER_SESSION, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_PER_RUN,
+    MAX_ACTIONS_PER_SESSION, MAX_DELEGATIONS_PER_RUN, MAX_REQUEST_ID_BYTES,
     PendingState, RUN_KEY_SEPARATOR, RunAuthority, RunOrigin, SESSION_KEY_LEN, Sha256, StateRoot,
     WireSink, delegation_id_for, dispatch_id_for,
 };
@@ -300,7 +300,7 @@ fn validate_decoded_delegations(
             return Err("snapshot delegation id does not match its caller request".into());
         }
         if view.request_id.is_empty()
-            || view.request_id.len() > MAX_DELEGATION_REQUEST_ID_BYTES
+            || view.request_id.len() > MAX_REQUEST_ID_BYTES
             || contains_run_separator(&view.request_id)
         {
             return Err("snapshot delegation request id is invalid".into());
