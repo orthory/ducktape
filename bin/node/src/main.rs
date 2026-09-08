@@ -61,6 +61,7 @@ mod cli;
 mod cli_args;
 mod code_plane;
 mod collab_cli;
+mod collab_keys;
 mod compute;
 mod config;
 mod constants;

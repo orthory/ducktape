@@ -68,6 +68,24 @@ pub(crate) struct CollabArgs {
 pub(crate) enum CollabCmd {
     /// read protected module state AS your key, over the authenticated lane
     Query(QueryArgs),
+    /// this device's scoped service key for one binding: mint it if absent,
+    /// then print its PUBLIC half for the `Bind` that authorizes it
+    Key(KeyArgs),
+}
+
+/// Names one binding — the pair the module keys a `Binding` on.
+#[derive(Debug, clap::Args)]
+pub(crate) struct KeyArgs {
+    /// the conversation this attachment will receive
+    #[arg(long, value_name = "ID")]
+    conversation: String,
+    /// the participant this device is attaching for
+    #[arg(long, value_name = "ID")]
+    participant: String,
+    /// print the key only if it already exists, never mint one — for checking
+    /// whether this device holds the binding at all
+    #[arg(long)]
+    existing_only: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -91,7 +109,39 @@ pub(crate) fn run(args: CollabArgs) -> CollabResult {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     match cmd {
         CollabCmd::Query(query) => cmd_query(query, &ctx, trust_node, &mut stdin),
+        CollabCmd::Key(key) => cmd_key(key, &ctx),
     }
+}
+
+/// `collab key --conversation <id> --participant <id>` — the scoped service key
+/// this device signs that binding's delivery receipts with.
+///
+/// Prints the PUBLIC half, because that is the only part anything else needs:
+/// it goes into the `Bind` op the OWNER signs, and the owner's signature is
+/// what authorizes this key. The private half never leaves the workspace and is
+/// never printed — a key echoed into a terminal is a key in a scrollback
+/// buffer, a screen share and a shell history.
+///
+/// Minting is the default and is idempotent: attaching is a re-runnable
+/// operation, and a second attach must present the same key or the committed
+/// binding would name one nothing holds.
+fn cmd_key(args: KeyArgs, ctx: &VerbCtx) -> CollabResult {
+    let workspace = ctx.addr.workspace()?;
+    let binding = crate::collab_keys::BindingRef {
+        conversation: &args.conversation,
+        participant: &args.participant,
+    };
+    let key = match args.existing_only {
+        true => crate::collab_keys::load(&workspace, binding)?.ok_or_else(|| {
+            format!(
+                "this device holds no binding for participant {} in conversation {}",
+                args.participant, args.conversation
+            )
+        })?,
+        false => crate::collab_keys::ensure(&workspace, binding)?,
+    };
+    println!("{}", crate::collab_keys::public_hex(&key));
+    Ok(())
 }
 
 /// `collab query --target <module> '<json>'` — one authenticated read.
@@ -139,9 +189,31 @@ mod tests {
             "collaboration",
             r#"{"conversation":{"conversation_id":"c1"}}"#,
         ]);
-        let CollabCmd::Query(args) = parsed.cmd;
+        let CollabCmd::Query(args) = parsed.cmd else {
+            panic!("query parses to the query verb");
+        };
         assert_eq!(args.target, "collaboration");
         assert!(args.query.contains("conversation_id"));
+    }
+
+    #[test]
+    fn a_key_verb_names_the_binding_it_belongs_to() {
+        let parsed = Harness::parse_from([
+            "collab",
+            "key",
+            "--conversation",
+            "c1",
+            "--participant",
+            "p1",
+        ]);
+        let CollabCmd::Key(args) = parsed.cmd else {
+            panic!("key parses to the key verb");
+        };
+        assert_eq!((args.conversation.as_str(), args.participant.as_str()), ("c1", "p1"));
+        assert!(
+            !args.existing_only,
+            "minting is the default: attaching is the common case"
+        );
     }
 
     /// The messaging plane must never be routed through the pty plane.
