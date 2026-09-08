@@ -221,7 +221,8 @@ pub use interactive::InteractiveSession;
 pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
 pub use spec::{
-    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource, SpecSet,
+    BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, ReleaseSource,
+    SpecSet,
 };
 
 /// canonical label-safe identity for the node executing a provider run.
@@ -301,7 +302,10 @@ impl OperatorCredential {
     /// `header` is the request header the node's operator routes read the
     /// credential from; `read` answers its current value, or `None` when this
     /// node has none to lend.
-    pub fn new(header: &'static str, read: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+    pub fn new(
+        header: &'static str,
+        read: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             header,
             read: Arc::new(read),
@@ -5846,6 +5850,121 @@ format = "text"
             std::fs::read_to_string(workdir.join("sandbox-marker.txt")).unwrap(),
             "hardware-prompt",
             "the sandbox must sync its writable workspace back to the host"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// one of this host's off-loopback addresses, or `None` when it has none:
+    /// the route a connected UDP socket picks (connecting sends nothing) names
+    /// the address the kernel would speak from.
+    fn off_loopback_address() -> Option<std::net::Ipv4Addr> {
+        let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        // TEST-NET-1: a destination that exists only to pick the route.
+        probe.connect("192.0.2.1:9").ok()?;
+        match probe.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(ip) if egress_proxy::off_host(std::net::IpAddr::V4(ip)) => {
+                Some(ip)
+            }
+            _ => None,
+        }
+    }
+
+    /// LIVE: the guest's way off this host is the egress proxy on its own
+    /// tunnel. A responder bound on one of this host's off-loopback addresses
+    /// (which the proxy admits) answers a guest `curl` through `$HTTPS_PROXY`
+    /// twice — absolute-form, then through CONNECT — and the link-local
+    /// metadata address is refused, because the proxy never dials this host
+    /// or anything beside it. The guest has no network device: every byte of this went over
+    /// the vsock tunnel `wire_guest_tunnels` opened for the proxy.
+    ///
+    /// `#[ignore]`: needs `/dev/kvm`, the guest artifacts, and an off-loopback
+    /// address on this host.
+    ///   DUCKTAPE_GUEST_DIR=… cargo test -p provider-host --lib -- --ignored \
+    ///     --nocapture firecracker_egress
+    #[tokio::test]
+    #[ignore = "live: needs /dev/kvm, a built guest rootfs and an off-loopback address"]
+    async fn firecracker_egress_proxy_relays_off_host_and_refuses_this_host() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let backend = firecracker_backend_with(executors_of("firecracker-egress-bin", &["sh"]));
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
+            return;
+        }
+        let Some(lan) = off_loopback_address() else {
+            eprintln!("skipping: this host has no off-loopback address");
+            return;
+        };
+        let responder = tokio::net::TcpListener::bind((lan, 0))
+            .await
+            .expect("bind the responder on an off-loopback address");
+        let port = responder.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = responder.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4096];
+                    let _ = stream.read(&mut head).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\negress-ok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let root = scratch("firecracker-egress");
+        let workdir = root.join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+        // the three legs: absolute-form through the proxy, CONNECT through the
+        // proxy (`-p`), and the link-local metadata address beside this host,
+        // which the proxy refuses. (The host's own loopback is not a leg: the
+        // proxy names it in NO_PROXY so the guest's node lane and broker stay
+        // direct, and curl honours that by not asking the proxy at all.)
+        let script = format!(
+            "cat >/dev/null; \
+             a=$(curl -s --proxy $HTTPS_PROXY http://{lan}:{port}/); \
+             b=$(curl -s -p --proxy $HTTPS_PROXY http://{lan}:{port}/); \
+             c=$(curl -s -o /dev/null -w %{{http_code}} --proxy $HTTPS_PROXY http://169.254.169.254/); \
+             printf %s_%s_%s $a $b $c"
+        );
+        let spec = CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "egress-smoke"
+[detect]
+bin = "sh"
+[invoke]
+args = ["-c", "{script}"]
+prompt = "stdin"
+[output]
+format = "text"
+"#
+            ),
+            "test",
+        )
+        .unwrap();
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/bin/sh"), backend);
+        let ctx = RunContext {
+            workdir_override: Some(workdir),
+            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            executing_node: Some(execution_node_id(b"egress-smoke")),
+            ..RunContext::default()
+        };
+
+        let answer = provider
+            .run("egress-prompt", &ctx)
+            .await
+            .expect("real sandbox provider cycle");
+        eprintln!("--- microVM egress answer: {answer:?} ---");
+        assert_eq!(
+            answer, "egress-ok_egress-ok_403",
+            "absolute-form and CONNECT reach the off-host responder; link-local is refused"
         );
         std::fs::remove_dir_all(root).ok();
     }

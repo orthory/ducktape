@@ -80,7 +80,10 @@ fn create_page_stages_its_body_whole_or_not_at_all() {
             },
         )
         .await;
-        assert_eq!(ids(&get_page(&p, "report").await.unwrap()), ["report", "r1", "r2", "appendix"]);
+        assert_eq!(
+            ids(&get_page(&p, "report").await.unwrap()),
+            ["report", "r1", "r2", "appendix"]
+        );
         assert!(get_block(&p, "r9").await.is_none());
     });
 }

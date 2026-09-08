@@ -582,6 +582,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
             caps: backend::AgentCaps::default(),
             skills: Vec::new(),
         }],
+        runs: Vec::new(),
         capabilities: Vec::new(),
         actions: Vec::new(),
     }));

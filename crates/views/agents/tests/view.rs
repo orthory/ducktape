@@ -3,8 +3,8 @@
 //! only things that leave are the writes the reader asked for.
 
 use agents_view::host::{
-    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, OpenRun, RunJournal,
-    RunRow, Status,
+    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, OpenRun, RunJournal, RunRow,
+    Status,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, texts, toggle, type_into};
@@ -310,9 +310,19 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         ),
     )]);
     // the registry is the first panel; the tracker is one press away
-    assert!(!has_text(&frame, "#general · msg 12"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "#general · msg 12"),
+        "{:?}",
+        texts(&frame)
+    );
     let frame = tick_native(press(&frame, "Runs"));
-    for expected in ["2 runs · 1 in flight", "#general · msg 12", "running", "failed", "h 84,912"] {
+    for expected in [
+        "2 runs · 1 in flight",
+        "#general · msg 12",
+        "running",
+        "failed",
+        "h 84,912",
+    ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
@@ -331,7 +341,11 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             run_id: failed.run_id.clone()
         }
     );
-    assert!(has_text(&frame, "Reading the journal…"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "Reading the journal…"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
 
     // the journal lands under the open run's id and reads fact by fact
@@ -360,9 +374,21 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             0,
         ),
     )]);
-    assert!(!has_text(&frame, "Reading the journal…"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "for reviewer from #general · msg 9"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "failed: worker exploded"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "Reading the journal…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, "for reviewer from #general · msg 9"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, "failed: worker exploded"),
+        "{:?}",
+        texts(&frame)
+    );
 
     // closing tells the app to stop reading it
     let frame = tick_native(press(&frame, "Close journal"));
@@ -374,7 +400,11 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             run_id: String::new()
         }
     );
-    assert!(!has_text(&frame, "for reviewer from #general · msg 9"), "{:?}", texts(&frame));
+    assert!(
+        !has_text(&frame, "for reviewer from #general · msg 9"),
+        "{:?}",
+        texts(&frame)
+    );
 }
 
 #[test]

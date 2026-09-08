@@ -709,11 +709,16 @@ impl Ctx for CaptureCtx {
                 }
                 pages::PageQuery::CommentThreadHead { thread_id } => {
                     let view = self.page_threads.get(&thread_id).cloned().or_else(|| {
-                        self.taken_page_ids.contains(&thread_id).then(|| dummy_thread_view(&thread_id))
+                        self.taken_page_ids
+                            .contains(&thread_id)
+                            .then(|| dummy_thread_view(&thread_id))
                     });
-                    Ok(pages::encode_reply(&pages::PageReply::CommentThreadHead(view.map(|view| pages::CommentThreadHead {
-                        target: view.thread.target, comment_count: view.thread.comment_ids.len() as u64,
-                    }))))
+                    Ok(pages::encode_reply(&pages::PageReply::CommentThreadHead(
+                        view.map(|view| pages::CommentThreadHead {
+                            target: view.thread.target,
+                            comment_count: view.thread.comment_ids.len() as u64,
+                        }),
+                    )))
                 }
                 pages::PageQuery::CommentThread { thread_id } => {
                     Ok(pages::encode_reply(&pages::PageReply::CommentThread(
@@ -1218,7 +1223,11 @@ fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaVi
 // the operations tests submit, built the way an agent builds them: an
 // operation name, an optional target, an input — never a typed variant.
 
-fn envelope(operation: &str, target: Option<serde_json::Value>, input: serde_json::Value) -> ActionEnvelope {
+fn envelope(
+    operation: &str,
+    target: Option<serde_json::Value>,
+    input: serde_json::Value,
+) -> ActionEnvelope {
     ActionEnvelope::new(operation, target, input)
 }
 
@@ -1231,14 +1240,26 @@ fn reply(text: impl Into<String>) -> ActionEnvelope {
 }
 
 fn react(emoji: impl Into<String>) -> ActionEnvelope {
-    envelope(crate::OP_REACT, None, serde_json::json!({"emoji": emoji.into()}))
+    envelope(
+        crate::OP_REACT,
+        None,
+        serde_json::json!({"emoji": emoji.into()}),
+    )
 }
 
 fn unreact(emoji: impl Into<String>) -> ActionEnvelope {
-    envelope(crate::OP_UNREACT, None, serde_json::json!({"emoji": emoji.into()}))
+    envelope(
+        crate::OP_UNREACT,
+        None,
+        serde_json::json!({"emoji": emoji.into()}),
+    )
 }
 
-fn post_message(channel_id: impl Into<String>, text: impl Into<String>, thread: Option<u64>) -> ActionEnvelope {
+fn post_message(
+    channel_id: impl Into<String>,
+    text: impl Into<String>,
+    thread: Option<u64>,
+) -> ActionEnvelope {
     let mut target = serde_json::json!({"channel_id": channel_id.into()});
     if let Some(root) = thread {
         target["thread"] = root.into();
@@ -1302,7 +1323,11 @@ fn update_task_status(task_id: impl Into<String>, status: impl Into<String>) -> 
     )
 }
 
-fn duckfs_write_text(path: impl Into<String>, text: impl Into<String>, base_snapshot: Option<String>) -> ActionEnvelope {
+fn duckfs_write_text(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    base_snapshot: Option<String>,
+) -> ActionEnvelope {
     let mut input = serde_json::json!({"text": text.into()});
     if let Some(base) = base_snapshot {
         input["base_snapshot"] = base.into();

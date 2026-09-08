@@ -37,12 +37,17 @@ type Admission = fn(IpAddr) -> bool;
 /// the production policy: nothing on this host, nothing link-local.
 pub(crate) fn off_host(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_broadcast()),
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_broadcast())
+        }
         IpAddr::V6(v6) => {
             let mapped_v4_on_host = v6
                 .to_ipv4_mapped()
                 .is_some_and(|v4| !off_host(IpAddr::V4(v4)));
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || mapped_v4_on_host)
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || mapped_v4_on_host)
         }
     }
 }
@@ -195,9 +200,7 @@ async fn relay_http(
     };
     let mut rewritten = format!("{method} {path} {version}\r\n");
     for line in head.iter().skip(1) {
-        let hop_by_hop = line
-            .to_ascii_lowercase()
-            .starts_with("proxy-connection:");
+        let hop_by_hop = line.to_ascii_lowercase().starts_with("proxy-connection:");
         if !hop_by_hop {
             rewritten.push_str(line);
             rewritten.push_str("\r\n");
@@ -345,13 +348,20 @@ mod tests {
         client
             .get_mut()
             .write_all(
-                format!("CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "CONNECT 127.0.0.1:{upstream} HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
-        assert_eq!(status_line(&mut client).await, "HTTP/1.1 200 Connection Established");
-        read_head(&mut client).await.expect("the established head ends");
+        assert_eq!(
+            status_line(&mut client).await,
+            "HTTP/1.1 200 Connection Established"
+        );
+        read_head(&mut client)
+            .await
+            .expect("the established head ends");
         client.get_mut().write_all(b"quack").await.unwrap();
         let mut echoed = [0u8; 5];
         client.read_exact(&mut echoed).await.unwrap();
@@ -409,11 +419,26 @@ mod tests {
 
     #[test]
     fn the_policy_refuses_this_host_and_link_local_and_admits_the_network() {
-        let refused = ["127.0.0.1", "127.9.9.9", "0.0.0.0", "169.254.169.254", "::1", "::", "fe80::1", "::ffff:127.0.0.1"];
+        let refused = [
+            "127.0.0.1",
+            "127.9.9.9",
+            "0.0.0.0",
+            "169.254.169.254",
+            "::1",
+            "::",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ];
         for ip in refused {
             assert!(!off_host(ip.parse().unwrap()), "{ip}");
         }
-        let admitted = ["8.8.8.8", "140.82.112.3", "10.0.0.7", "192.168.1.20", "2606:4700::1111"];
+        let admitted = [
+            "8.8.8.8",
+            "140.82.112.3",
+            "10.0.0.7",
+            "192.168.1.20",
+            "2606:4700::1111",
+        ];
         for ip in admitted {
             assert!(off_host(ip.parse().unwrap()), "{ip}");
         }
@@ -432,6 +457,10 @@ mod tests {
             let value = envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
             assert_eq!(value, Some(NO_PROXY), "{key}");
         }
-        assert_eq!(envs.iter().filter(|(k, _)| k == "HTTP_PROXY").count(), 1, "replaced, not duplicated");
+        assert_eq!(
+            envs.iter().filter(|(k, _)| k == "HTTP_PROXY").count(),
+            1,
+            "replaced, not duplicated"
+        );
     }
 }

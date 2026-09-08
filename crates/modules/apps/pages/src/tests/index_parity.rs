@@ -191,7 +191,9 @@ fn the_two_lanes_answer_the_same_preorder_for_a_nested_document() {
         let walked = assert_lanes_agree(&p, &map, "root", 0).await;
         assert_eq!(
             walked,
-            ["root", "b2", "b3", "b1", "c1", "c2", "sub", "a1", "born", "a2"]
+            [
+                "root", "b2", "b3", "b1", "c1", "c2", "sub", "a1", "born", "a2"
+            ]
         );
         assert_eq!(assert_lanes_agree(&p, &map, "sub", 0).await, ["sub", "s1"]);
         assert_eq!(assert_lanes_agree(&p, &map, "born", 0).await, ["born"]);

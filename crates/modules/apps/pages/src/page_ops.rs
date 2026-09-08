@@ -42,8 +42,7 @@ impl Pages {
                         // appended after the one before it. a fresh root is
                         // at depth zero, so no nesting bound can bind here.
                         for (at, block) in blocks.into_iter().enumerate() {
-                            self.place_block(&mut page, at, block, authority)
-                                .await?;
+                            self.place_block(&mut page, at, block, authority).await?;
                         }
                         self.store_block(&page)
                     }

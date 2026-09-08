@@ -658,10 +658,7 @@ fn same_block_page_cap_degrades_the_overflow_page_post_without_aborting() {
         &mut m,
         &mut ctx,
         &run_id,
-        vec![
-            page_post("First", body.clone()),
-            page_post("Second", body),
-        ],
+        vec![page_post("First", body.clone()), page_post("Second", body)],
     );
     let msgs = ctx.page_msgs();
     assert_eq!(msgs.len(), 1, "only the first page fits: {msgs:?}");

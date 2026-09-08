@@ -9,10 +9,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT,
-    ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED,
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES,
-    MAX_REQUEST_ID_BYTES,
+    ACTION_CHAT_POST_MESSAGE, ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE,
+    ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES,
     ModuleUpdateSpec, ReplyBlock,
 };
 
@@ -764,9 +763,10 @@ impl Operation {
     /// (`agent.call`).
     pub(crate) fn fixed_grant(&self) -> Option<&'static str> {
         match self {
-            Self::Reply { .. } | Self::React { .. } | Self::Unreact { .. } | Self::AgentCall { .. } => {
-                None
-            }
+            Self::Reply { .. }
+            | Self::React { .. }
+            | Self::Unreact { .. }
+            | Self::AgentCall { .. } => None,
             other => Some(other.name()),
         }
     }
@@ -955,7 +955,11 @@ mod tests {
             .collect();
         assert_eq!(
             pages,
-            [ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_PAGES_POST]
+            [
+                ACTION_PAGES_COMMENT,
+                ACTION_PAGES_SET_CHECKED,
+                ACTION_PAGES_POST
+            ]
         );
         assert!(catalog(Some("nothing.")).is_empty());
     }

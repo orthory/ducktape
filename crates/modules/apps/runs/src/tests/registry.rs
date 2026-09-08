@@ -180,7 +180,10 @@ fn the_every_id_cap_grants_every_repo_and_page_and_narrows_to_the_peer() {
         ..Default::default()
     };
     let narrowed = pusher.caps.intersection(&listed);
-    assert_eq!(narrowed.forge_push, vec!["app".to_string(), "lib".to_string()]);
+    assert_eq!(
+        narrowed.forge_push,
+        vec!["app".to_string(), "lib".to_string()]
+    );
     assert_eq!(
         narrowed.forge_read,
         vec!["app".to_string(), "docs".to_string(), "lib".to_string()],

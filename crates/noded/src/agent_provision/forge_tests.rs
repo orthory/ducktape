@@ -874,7 +874,6 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_git_ignores_agent_installed_hooks_and_filters() {
-
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed

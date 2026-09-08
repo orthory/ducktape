@@ -336,8 +336,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     if op.assigned.is_empty() {
         return Ok(out);
     }
-    let journal =
-        decode_assigned(&op.assigned).map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?;
+    let journal = decode_assigned(&op.assigned).map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?;
     let mut touched = Touched::new();
     for (n, event) in journal.iter().enumerate() {
         fold_fact(read, &mut touched, &mut out, op, n, event)?;
@@ -489,7 +488,13 @@ mod tests {
         fold(&mut map, &op(1, 0, &[event(RUN, dispatched("bot", 2))]));
         let run = &recent(&map, None)[0];
         assert_eq!(run.state, RunState::Dispatched);
-        assert_eq!(run.dispatched, Stamp { height: 1, time: 10 });
+        assert_eq!(
+            run.dispatched,
+            Stamp {
+                height: 1,
+                time: 10
+            }
+        );
         assert_eq!(run.dispatch_id, dispatch_id_for(RUN));
 
         fold(
@@ -532,13 +537,22 @@ mod tests {
         );
         assert_eq!(run.actions, 2);
 
-        fold(&mut map, &op(4, 0, &[event(RUN, settled(RunOutcome::ResultAccepted))]));
+        fold(
+            &mut map,
+            &op(4, 0, &[event(RUN, settled(RunOutcome::ResultAccepted))]),
+        );
         let known = detail(&map, RUN).expect("the run is known");
         let RunState::Settled { outcome, at, .. } = &known.run.state else {
             panic!("settled: {:?}", known.run.state);
         };
         assert_eq!(*outcome, RunOutcome::ResultAccepted);
-        assert_eq!(*at, Stamp { height: 4, time: 40 });
+        assert_eq!(
+            *at,
+            Stamp {
+                height: 4,
+                time: 40
+            }
+        );
         let facts: Vec<(u64, &str)> = known
             .journal
             .iter()
@@ -583,7 +597,10 @@ mod tests {
                 ],
             ),
         );
-        let ids: Vec<String> = recent(&map, None).into_iter().map(|run| run.run_id).collect();
+        let ids: Vec<String> = recent(&map, None)
+            .into_iter()
+            .map(|run| run.run_id)
+            .collect();
         assert_eq!(ids, ["chat\x1fgeneral\x1f3\x1fbot", OTHER, RUN]);
         let bots: Vec<String> = recent(&map, Some("bot"))
             .into_iter()
@@ -597,8 +614,14 @@ mod tests {
     fn a_settled_run_takes_its_pr_link_and_a_result_action_refusal() {
         let mut map = Map::new();
         fold(&mut map, &op(1, 0, &[event(RUN, dispatched("bot", 2))]));
-        fold(&mut map, &op(2, 0, &[event(RUN, settled(RunOutcome::ResultAccepted))]));
-        fold(&mut map, &op(3, 0, &[event(RUN, RunFact::PrLinked { number: 12 })]));
+        fold(
+            &mut map,
+            &op(2, 0, &[event(RUN, settled(RunOutcome::ResultAccepted))]),
+        );
+        fold(
+            &mut map,
+            &op(3, 0, &[event(RUN, RunFact::PrLinked { number: 12 })]),
+        );
         let run = &recent(&map, None)[0];
         assert_eq!(run.pr_number, Some(12));
         fold(
@@ -628,7 +651,10 @@ mod tests {
         );
         // a failure is never upgraded by a refusal
         fold(&mut map, &op(5, 0, &[event(OTHER, dispatched("duck", 3))]));
-        fold(&mut map, &op(6, 0, &[event(OTHER, settled(RunOutcome::Failed))]));
+        fold(
+            &mut map,
+            &op(6, 0, &[event(OTHER, settled(RunOutcome::Failed))]),
+        );
         fold(
             &mut map,
             &op(
@@ -657,7 +683,10 @@ mod tests {
         let mut map = Map::new();
         assert!(fold_op(&op(1, 0, &[]), &map).unwrap().is_empty());
         // installed after the dispatch: the journal row lands, no run row
-        fold(&mut map, &op(2, 0, &[event(RUN, settled(RunOutcome::Failed))]));
+        fold(
+            &mut map,
+            &op(2, 0, &[event(RUN, settled(RunOutcome::Failed))]),
+        );
         assert!(recent(&map, None).is_empty());
         assert_eq!(detail(&map, RUN), None);
         assert_eq!(journal_of(&map, &dispatch_id_for(RUN)).unwrap().len(), 1);

@@ -22,19 +22,19 @@ use super::*;
 #[tokio::test(flavor = "current_thread")]
 async fn a_workspace_search_reaches_its_six_sources_together() {
     let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
-    let rpc = node_that_answers_only_a_full_fan_out(9, &[], watch.clone()).await;
+    let rpc = node_that_answers_only_a_full_fan_out(8, &[], watch.clone()).await;
 
     let results = search_workspace(rpc, "needle".into()).await;
 
     assert_eq!(
         watch.lock().expect("stub watch").overlapped,
         [
-            "chat", "files", "forge", "pages", "runs", "runs", "tasks", "tasks", "tasks"
+            "chat", "files", "forge", "pages", "runs", "tasks", "tasks", "tasks"
         ],
         "every round trip a workspace search opens with must be in flight at \
          once — anything missing here waited on another request's reply. The \
-         repeats are the legs that read more than one thing: tasks walks three \
-         status pages, runs reads pending and recent."
+         repeats are the leg that reads more than one thing: tasks walks three \
+         status pages."
     );
     // Every lane answered, so nothing is held back.
     assert_eq!(results.partial, "");
@@ -94,7 +94,7 @@ async fn a_search_that_lost_a_source_says_which_one() {
             "tasks" => &["tasks"],
             _ => &["runs"],
         };
-        let rpc = node_that_answers_only_a_full_fan_out(9, leg_alone, Default::default()).await;
+        let rpc = node_that_answers_only_a_full_fan_out(8, leg_alone, Default::default()).await;
 
         let results = search_workspace(rpc, "needle".into()).await;
 
@@ -139,7 +139,7 @@ async fn a_search_that_lost_a_source_says_which_one() {
     // count of 0 means nothing matched, never no loader". Two at once is the
     // case the PR body's own headline scenario describes.
     let rpc =
-        node_that_answers_only_a_full_fan_out(9, &["chat", "pages"], Default::default()).await;
+        node_that_answers_only_a_full_fan_out(8, &["chat", "pages"], Default::default()).await;
     let results = search_workspace(rpc, "needle".into()).await;
     assert_eq!(
         results.partial, "Messages, Pages did not answer — these results are incomplete.",

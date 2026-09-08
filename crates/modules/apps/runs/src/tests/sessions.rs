@@ -1206,9 +1206,17 @@ fn live_reactions_mark_the_anchor_message_with_only_the_reply_grant() {
 #[test]
 fn a_reaction_needs_the_reply_grant_a_chat_source_and_a_bounded_emoji() {
     for (grants, emoji, expected) in [
-        (vec![ACTION_CHAT_POST_MESSAGE], "👀", "not allowed to chat.post"),
+        (
+            vec![ACTION_CHAT_POST_MESSAGE],
+            "👀",
+            "not allowed to chat.post",
+        ),
         (vec![ACTION_CHAT_POST], "", "requires an emoji"),
-        (vec![ACTION_CHAT_POST], "🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆", "chat's cap"),
+        (
+            vec![ACTION_CHAT_POST],
+            "🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆",
+            "chat's cap",
+        ),
     ] {
         let (mut m, registry, run) = with_open_session(&grants, &[]);
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
@@ -1552,7 +1560,12 @@ fn a_live_page_post_mints_its_page_under_the_action_slot() {
         with_open_session(&[ACTION_CHAT_POST, crate::ACTION_PAGES_POST], &["*"]);
     let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
     let content = serde_json::json!([{"type": "text", "text": "notes"}]);
-    exec(&mut m, &mut ctx, &act_as(&run, "pub", page_post("Notes", content))).unwrap();
+    exec(
+        &mut m,
+        &mut ctx,
+        &act_as(&run, "pub", page_post("Notes", content)),
+    )
+    .unwrap();
     let page_id = format!("agent/{}/page/s0", dispatch_id_for(&run));
     let msgs = ctx.page_msgs();
     assert!(
@@ -1641,7 +1654,12 @@ fn every_lifecycle_op_stamps_the_facts_it_committed_and_nothing_else() {
         .with_dispatch_origin()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
-    exec(&mut m, &mut ctx, &result_event(&run, Err("worker  exploded".into()))).unwrap();
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run, Err("worker  exploded".into())),
+    )
+    .unwrap();
     assert_eq!(
         ctx.journal(),
         vec![RunEvent {

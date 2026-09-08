@@ -396,11 +396,7 @@ impl Lane {
 
     /// [`Self::forward`], carrying `proof` — the operator header an admitted
     /// push presents — in place of anything the guest sent under that name.
-    async fn forward_as(
-        &self,
-        req: Request,
-        proof: Option<(HeaderName, HeaderValue)>,
-    ) -> Response {
+    async fn forward_as(&self, req: Request, proof: Option<(HeaderName, HeaderValue)>) -> Response {
         let (parts, body) = req.into_parts();
         let path_and_query = parts
             .uri
@@ -524,7 +520,9 @@ mod tests {
     /// the credential a test node lends, under the header name the real node
     /// reads; `None` is a node with nothing to lend.
     fn operator(token: Option<&'static str>) -> Option<OperatorCredential> {
-        token.map(|token| OperatorCredential::new("x-test-operator", move || Some(token.to_string())))
+        token.map(|token| {
+            OperatorCredential::new("x-test-operator", move || Some(token.to_string()))
+        })
     }
 
     /// what the stand-in forge routes answer: the service they were asked
@@ -555,8 +553,14 @@ mod tests {
                 }),
             )
             .route("/forge/{repo}/info/refs", axum::routing::get(forge_echo))
-            .route("/forge/{repo}/git-upload-pack", axum::routing::post(forge_echo))
-            .route("/forge/{repo}/git-receive-pack", axum::routing::post(forge_echo))
+            .route(
+                "/forge/{repo}/git-upload-pack",
+                axum::routing::post(forge_echo),
+            )
+            .route(
+                "/forge/{repo}/git-receive-pack",
+                axum::routing::post(forge_echo),
+            )
             .route(
                 "/v1/status",
                 axum::routing::get(|| async { axum::Json(json!({"ok": true})) }),
@@ -721,9 +725,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_fetch_needs_forge_read_and_a_push_needs_forge_push() {
-        let (_lane, base) = lane_with(forge_capped_record(&["docs"], &[]), operator(Some("t"))).await;
+        let (_lane, base) =
+            lane_with(forge_capped_record(&["docs"], &[]), operator(Some("t"))).await;
         let fetches = [
-            (reqwest::Method::GET, "/forge/docs/info/refs?service=git-upload-pack"),
+            (
+                reqwest::Method::GET,
+                "/forge/docs/info/refs?service=git-upload-pack",
+            ),
             (reqwest::Method::POST, "/forge/docs/git-upload-pack"),
         ];
         for (method, path) in fetches {
@@ -732,9 +740,15 @@ mod tests {
             assert_eq!(body["operator"], Value::Null, "a fetch lends no credential");
         }
         let refused = [
-            (reqwest::Method::GET, "/forge/docs/info/refs?service=git-receive-pack"),
+            (
+                reqwest::Method::GET,
+                "/forge/docs/info/refs?service=git-receive-pack",
+            ),
             (reqwest::Method::POST, "/forge/docs/git-receive-pack"),
-            (reqwest::Method::GET, "/forge/other/info/refs?service=git-upload-pack"),
+            (
+                reqwest::Method::GET,
+                "/forge/other/info/refs?service=git-upload-pack",
+            ),
             (reqwest::Method::POST, "/forge/other/git-upload-pack"),
             // no service named, or a path that is not a transport endpoint
             (reqwest::Method::GET, "/forge/docs/info/refs"),
@@ -748,8 +762,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_admitted_push_carries_the_operator_credential_the_guest_never_holds() {
-        let (_lane, base) =
-            lane_with(forge_capped_record(&[], &["app"]), operator(Some("node-secret"))).await;
+        let (_lane, base) = lane_with(
+            forge_capped_record(&[], &["app"]),
+            operator(Some("node-secret")),
+        )
+        .await;
         let (status, body) = send(
             &base,
             reqwest::Method::POST,
@@ -778,13 +795,23 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["operator"], Value::Null, "a guest's claim is dropped on every route");
+        assert_eq!(
+            body["operator"],
+            Value::Null,
+            "a guest's claim is dropped on every route"
+        );
     }
 
     #[tokio::test]
     async fn a_push_on_a_node_with_no_credential_to_lend_is_refused() {
         let (_lane, base) = lane_with(forge_capped_record(&[], &["app"]), None).await;
-        let (status, _) = send(&base, reqwest::Method::POST, "/forge/app/git-receive-pack", &[]).await;
+        let (status, _) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-receive-pack",
+            &[],
+        )
+        .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 

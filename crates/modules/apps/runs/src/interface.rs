@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::{ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps};
+use crate::{
+    ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps,
+};
 use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -130,13 +132,9 @@ pub enum RunFact {
         pr_number: Option<u64>,
     },
     /// a settled run's result action was refused by its program or target.
-    ResultActionRefused {
-        request_id: String,
-    },
+    ResultActionRefused { request_id: String },
     /// the forge PR a settled run's sink opened or updated was authenticated.
-    PrLinked {
-        number: u64,
-    },
+    PrLinked { number: u64 },
 }
 
 /// one journal entry: the run a fact is about.
