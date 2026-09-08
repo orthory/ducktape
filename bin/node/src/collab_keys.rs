@@ -222,9 +222,10 @@ mod tests {
         let dir = workspace();
         let hostile = binding("../../../etc/passwd", "../../root/.ssh/id_ed25519");
         let path = key_path(dir.path(), hostile);
+        let key_dir = dir.path().join(DIR);
         assert_eq!(
             path.parent(),
-            Some(dir.path().join(DIR).as_path()),
+            Some(key_dir.as_path()),
             "every key lands in the key directory: {}",
             path.display()
         );
