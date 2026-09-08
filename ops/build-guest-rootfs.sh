@@ -5,7 +5,8 @@
 #   ops/build-guest-rootfs.sh                 # -> ~/.ducktape/guest
 #   OUT=~/guest ops/build-guest-rootfs.sh     # anywhere writable
 #   ROOTFS_SETUP=/path/to/setup.sh ops/build-guest-rootfs.sh [setup arguments]
-#     Linux installs the repository's pinned Rust and wasm-tools by default
+#     Linux installs the repository's pinned Rust and the wasm-tools CLI of
+#     its componentizer's release by default
 #     (requires Bubblewrap). ROOTFS_SETUP replaces that setup; an empty value
 #     builds only the base image. Arguments are passed to a custom hook.
 #
@@ -45,7 +46,10 @@ WORK="${WORK:-$OUT/.build}"
 if [[ -z "${ROOTFS_SETUP+x}" && "$(uname -s)" == "Linux" ]]; then
   ROOTFS_SETUP="$HERE/ops/guest-rust-tools.sh"
   RUST_CHANNEL="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$HERE/rust-toolchain.toml")"
-  set -- "$RUST_CHANNEL" "$(cat "$HERE/wasm-tools.version")"
+  # the componentizer's release: `wasm-tools 1.x.y` ships with the
+  # `wit-component 0.x.y` guest-builder pins, and writes the same bytes.
+  WASM_TOOLS_VERSION="1.$(sed -n 's/^wit-component = "=0\.\([0-9.]*\)".*/\1/p' "$HERE/bin/guest-builder/Cargo.toml")"
+  set -- "$RUST_CHANNEL" "$WASM_TOOLS_VERSION"
 fi
 if [[ -n "${ROOTFS_SETUP:-}" ]]; then
   command -v bwrap >/dev/null || { echo "guest setup requires bubblewrap" >&2; exit 1; }

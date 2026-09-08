@@ -53,9 +53,6 @@ jobs:
           # pinned channel and its targets; -vV is the evidence of which.
           rustc -vV
 
-      - name: install wasm-tools
-        run: cargo install wasm-tools --locked --version "$(cat wasm-tools.version)"
-
       - name: build the identity guest via guest-builder (no C toolchain)
         run: |
           cargo run -p guest-builder -- crates/modules/system/identity \
@@ -65,10 +62,11 @@ jobs:
             "$RUNNER_TEMP/identity.component.wasm"
 
       - name: assert blst dead-stripped
+        # symbol names sit in the module as plain text (the name section,
+        # imports, exports), so a byte scan of the core module sees every
+        # reference the text form would.
         run: |
-          wasm-tools print \
-            "$RUNNER_TEMP/identity-guest/target/wasm32-unknown-unknown/release/identity_component.wasm" \
-            > "$RUNNER_TEMP/identity_wasm.wat"
-          count=$(grep -c blst "$RUNNER_TEMP/identity_wasm.wat" || true)
+          count=$(grep -ac blst \
+            "$RUNNER_TEMP/identity-guest/target/wasm32-unknown-unknown/release/identity_component.wasm" || true)
           echo "blst symbol refs in module: $count"
           test "$count" -eq 0

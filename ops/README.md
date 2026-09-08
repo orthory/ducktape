@@ -37,8 +37,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 ## Sandbox (microVM) hosts
 
 - `build-guest-rootfs.sh` — builds the shared kernel and rootfs for Firecracker
-  (Linux) or vz (macOS). Linux installs the pinned Rust and wasm-tools through
-  `guest-rust-tools.sh` by default; `ROOTFS_SETUP` selects a custom setup.
+  (Linux) or vz (macOS). Linux installs the pinned Rust and the `wasm-tools`
+  CLI of the componentizer's release through `guest-rust-tools.sh` by
+  default; `ROOTFS_SETUP` selects a custom setup.
 - `macos-preflight.sh` — checks a macOS host for everything the vz backend
   needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
   target, the entitled `bin/duck-vz-shim` on PATH, the guest kernel + rootfs)
@@ -93,7 +94,7 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
   twice, in two scratch directories, and asserts the bytes are identical and
   carry no host path, so a committed artifact never depends on the builder's
-  `/home/...`. Needs the wasm32 target, `wasm-tools` and a pushed HEAD.
+  `/home/...`. Needs the wasm32 target and a pushed HEAD.
 - `make wasm-rebuild-check` — the other reproducibility gate, a Makefile target
   with no script here: it rebuilds every committed guest (each `component.wasm`
   and `index.wasm`) out of the repository at HEAD, seeded from its committed
