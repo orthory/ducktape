@@ -667,7 +667,7 @@ fn joining_a_huddle_opens_the_call_window() {
         "the call window stopped floating: {huddle_window}"
     );
     // AND THE CONSOLE SAYS THE CALL IS LIVE whether or not that window is up.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         chat.contains("if huddle_joined && huddle_channel == active_channel"),
         "the LIVE pill stopped drawing for the channel's own call"
@@ -698,7 +698,7 @@ fn joining_a_huddle_opens_the_call_window() {
 /// how you raise it.
 #[test]
 fn the_chat_header_carries_no_second_huddle_surface() {
-    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         !screen.contains("HuddleElsewhere"),
         "the dock names the huddle's room on every screen — the header chip          was the same sentence twice"
@@ -966,7 +966,7 @@ fn the_two_counts_that_printed_a_zero_now_say_nothing() {
     // sits under `if !empty(channel_members)` and its comment says why
     // ("`· 0 added` on every normal channel is noise"). A file-wide negative
     // would flag that one too, which is how this assertion first failed.
-    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     let eyebrow = chat
         .split("Eyebrow label=\"MEMBERS\"")
         .nth(1)
@@ -1033,7 +1033,8 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         );
     }
 
-    let chat = component(SCREENS.as_str(), "ChatScreen");
+    let chat_screen = include_str!("../../../crates/views/chat/src/ui/chat.ice");
+    let chat = component(chat_screen, "ChatScreen");
     let chat_state = local_state(chat);
     for field in [
         "message_action_focus = \"\"",
@@ -1140,10 +1141,9 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for local in ["pending_message_id", "pending_reply_id", "pending_id"] {
         assert!(!root_state.contains(local), "root state holds `{local}`");
     }
-    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
     assert!(
-        chat_components.contains("fresh_operation_id(composer_op_prefix("),
-        "the composer mints its own operation id as it emits"
+        include_str!("../composer_surface.rs").contains("crate::backend::fresh_operation_id("),
+        "the composer surface mints its own operation id as it publishes"
     );
     assert!(
         chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id)"),

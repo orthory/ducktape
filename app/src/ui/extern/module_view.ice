@@ -28,7 +28,35 @@ extern crate::module_view
   component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64) -> ModuleViewEvent
   pure files_intent(event:&ModuleViewEvent) -> FilesIntent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
+  // the Shell tab: the app's agent picks and the run it is watching, drawn
+  // by the `shell` view; the composer, the terminal and the answer Markdown
+  // are host surfaces, and a send arrives as the `send` intent
+  component shell_view(dark:bool, connected:bool, surface:ShellSurface, setup_open:bool, identity_options:&[str], identity:&str, provider:&str, credential:&str, host_node_options:&[str], host_node:&str, credentials_loading:bool, terminal:&AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:&str, terminal_error:&str, entries:&[AgentChatEntry], activity:&[AgentActivity], chat_busy:bool, chat_status:&str, chat_detail:&str, live:&str, saga_id:&str, detached_saga:&str) -> ModuleViewEvent
+  pure shell_intent(event:&ModuleViewEvent) -> ShellIntent
+  pure shell_event_surface(event:&ModuleViewEvent) -> ShellSurface
+  // empties the host-side composer (a new chat, a workspace reset)
+  sync shell_composer_clear() -> bool
   // the document itself stays here: the fold stashes the buffer for the
   // `page_document` surface the view leaves a slot for
   component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, doc_tabs:&[str], blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_editor:&editor, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent
   pure pages_intent(event:&ModuleViewEvent) -> PagesIntent
+  // The Forge tab: the register the app holds and the item it has open,
+  // the code browse's listing and file, and the discussion — the note
+  // composer is the app's own, docked under the view (view.ice).
+  component forge_view(dark:bool, connected:bool, org:&str, about:&str, tier:&str, network_chain_id:&str, connected_rpc:&str, repos:&[ForgeRepo], list_phase:ForgePhase, open_repo:&str, repo_menu:bool, repo_phase:ForgePhase, branches:&[str], tab:ForgeTab, items:&[ForgeItem], item_number:i64, item_phase:ForgePhase, item_kind:&str, item_title:&str, item_state:&str, item_author:&str, item_branches:&str, item_body:&str, item_blocks:&[ChatBlock], files_changed:i64, additions:i64, deletions:i64, diff:&str, diff_truncated:bool, merge_oid:&str, source_oid:&str, approvals:i64, change_requests:i64, reviews:&[ForgeReview], merge_conflicts:&[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, review_busy:bool, staged_comments:&[ForgeDraftComment], discussion:&[ChatMessage], linked_note:ChatMessage?, landed_seq:i64, landed_tick:i64, tree_path:&str, tree_rev:&str, tree_entries:&[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:ForgeTreePhase, file_path:&str, file_text:&str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:&str, file_header:&str, file_phase:ForgeFilePhase, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
+  pure forge_intent(event:&ModuleViewEvent) -> ForgeIntent
+  pure forge_event_tab(event:&ModuleViewEvent) -> ForgeTab
+  pure forge_event_verdict(event:&ModuleViewEvent) -> ForgeReviewVerdict
+  pure event_number(event:&ModuleViewEvent, field:&str) -> i64
+  // Chat is a module-owned view: the screen's facts go in — the mutation
+  // lock as `busy`, the enums by name — and every act comes back as an
+  // intent; the two composers are host surfaces (`chat_composer`), whose
+  // submit arrives as the `composer` intent. `chat_composer_unsent` hands a
+  // refused or failed body back to the composer it came from.
+  component chat_view(dark:bool, endpoint:&str, network_name:&str, network_chain_id:&str, status:&str, block_height:i64, search_phase:SearchPhase, search_query:&str, search_hits:&[ChatSearchHit], rooms:&[ChatSidebarRow], dm_rows:&[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:&str, active_dm_peer:&str, active_dm:&DmPeer, active_channel_name:&str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:&[ChatMember], post_refusal:&str, huddle_joined:bool, huddle_channel:&str, huddle_channel_name:&str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:&[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:&[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface, sent_serial:i64) -> ModuleViewEvent
+  pure chat_intent(event:&ModuleViewEvent) -> ChatIntent
+  pure chat_event_surface(event:&ModuleViewEvent) -> CopySurface
+  pure chat_event_kind(event:&ModuleViewEvent) -> ComposerKind
+  pure event_int(event:&ModuleViewEvent, field:&str) -> i64
+  pure event_num(event:&ModuleViewEvent, field:&str) -> f64
+  sync chat_composer_unsent(scope:&str, text:&str, committed:bool) -> bool

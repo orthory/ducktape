@@ -502,7 +502,7 @@ pub fn mark_channel_read(
 
 /// One channel row with the unread decision already attached. Ice externs take
 /// lists by value, so a view-time lookup cloned the unread list once per row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ChatSidebarRow {
     pub channel: ChatChannel,
     pub unread: bool,
@@ -562,7 +562,7 @@ pub fn chat_sidebar_rooms(
 }
 
 /// One DIRECT row with the unread decision already attached.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct DmSidebarRow {
     pub peer: DmPeer,
     pub unread: bool,

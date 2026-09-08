@@ -1769,7 +1769,7 @@ pub async fn create_channel(
 /// (`dm_channel_id(me, key)`), computed once at load time rather than at
 /// every render. The prepared DIRECT projection uses it to attach the row's
 /// scalar unread reading when channels or read cursors move.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct DmPeer {
     pub key: String,
     pub name: String,

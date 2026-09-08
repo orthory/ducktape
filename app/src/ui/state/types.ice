@@ -207,6 +207,40 @@ enum ForgeReviewVerdict
   approve
   request_changes
 
+// The code browse's two reads — the directory listing and the file — as the
+// app tracks them for the Forge view.
+enum ForgeTreePhase
+  loading
+  ready
+  failed
+
+enum ForgeFilePhase
+  idle
+  loading
+  ready
+  failed
+
+// what the Forge view asks of the app: one variant per act the screen
+// offers, each carrying only what the reader picked or typed (a repo, an
+// item, a directory or file, a review body, a line comment) — the review
+// and comment drafts themselves are the view's
+enum ForgeIntent
+  open_repo
+  close_repo
+  toggle_repo_menu
+  tab
+  open_item
+  close_item
+  merge
+  review_pick
+  review_submit
+  comment_stage
+  comment_drop
+  tree
+  blob
+  open_link
+  copy
+
 // What a `governance` module view asks of the app: the two writes the
 // Approvals screen makes, routed to the handlers that sign them.
 enum GovIntent
@@ -239,6 +273,22 @@ enum ExplorerIntent
 // what the Settings view asks of the app: one variant per act the screen
 // offers, each carrying only what the reader typed (a name, a key, a ticket,
 // the key password) — the drafts themselves are the view's
+// what the shell view asks of the app — `crate::module_view::shell_intent`
+enum ShellIntent
+  surface
+  setup
+  identity
+  host_node
+  refresh
+  terminal_start
+  terminal_stop
+  send
+  reset
+  detach
+  reopen
+  discard
+  open_link
+
 // what the Files view asks of the app: one variant per act the browser
 // offers, from a navigation to a write
 enum FilesIntent
@@ -305,6 +355,53 @@ enum PagesIntent
   more_comments
   post
   copy
+// what the Chat view asks of the app: one variant per act the screen offers,
+// each carrying only what the reader chose or typed — the drafts are the view's
+enum ChatIntent
+  search
+  clear_search
+  open_hit
+  toggle_create
+  choose_channel
+  choose_dm
+  toggle_settings
+  show_huddle
+  leave_huddle
+  join_huddle
+  load_history
+  scrolled
+  open_link
+  copy
+  copy_link
+  add_reaction
+  remove_reaction
+  open_thread
+  message_actions
+  message_reactions
+  begin_edit
+  arm_delete
+  clear_selection
+  press
+  clear_range
+  copy_range
+  reaction_submit
+  edit
+  delete
+  rename
+  archive
+  unarchive
+  add_member
+  remove_member
+  close_thread
+  thread_actions
+  thread_reactions
+  thread_begin_edit
+  thread_arm_delete
+  thread_clear_selection
+  thread_edit
+  thread_delete
+  load_thread
+  composer
 
 enum MutationPhase
   idle

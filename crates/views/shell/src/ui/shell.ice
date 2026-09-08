@@ -16,7 +16,7 @@
 // the next prompt), its failure belongs to the turn (not to a banner over the
 // whole transcript), and leaving it is "stop watching", never "cancel".
 
-component ShellSurfaceButton(label:str, value:ShellSurface, selected:bool, live:bool) -> ShellSurface
+component ShellSurfaceButton(label:str, value:str, selected:bool, live:bool) -> str
   col #root
     if selected
       button -> emit(value)
@@ -232,10 +232,10 @@ component ShellAnswer(entry:AgentChatEntry, dark:bool)
     row gap=8.0 align=center
       AgentAvatar
         with
-          initials=agent_provider_initial(entry.provider)
+          initials=entry.provider_initial
           plate=24.0
           ink=10.0
-      text agent_provider_label(entry.provider)
+      text entry.provider_label
         with
           size=11.5
           font=display
@@ -261,10 +261,10 @@ component ShellDetached(entry:AgentChatEntry, open:bool, connected:bool)
     row gap=8.0 align=center
       AgentAvatar
         with
-          initials=agent_provider_initial(entry.provider)
+          initials=entry.provider_initial
           plate=24.0
           ink=10.0
-      text agent_provider_label(entry.provider)
+      text entry.provider_label
         with
           size=11.5
           font=display
@@ -296,7 +296,7 @@ component ShellDetached(entry:AgentChatEntry, open:bool, connected:bool)
               w=fill
               gap=8.0
               align=center
-            text agent_run_label(entry.saga_id)
+            text entry.run_label
               with
                 size=10.5
                 font=code
@@ -307,7 +307,7 @@ component ShellDetached(entry:AgentChatEntry, open:bool, connected:bool)
     if !empty(entry.steps)
       ShellSteps entry=entry open=open -> emit(toggle_steps, _)
 
-component ShellWelcome(provider:str, host_node:str)
+component ShellWelcome(provider_initial:str, task_blurb:str)
   col #root
     with
       w=fill
@@ -316,7 +316,7 @@ component ShellWelcome(provider:str, host_node:str)
       align=center
     AgentAvatar
       with
-        initials=agent_provider_initial(provider)
+        initials=provider_initial
         plate=46.0
         ink=18.0
     text "What should the agent do?"
@@ -325,7 +325,7 @@ component ShellWelcome(provider:str, host_node:str)
         font=display
         @text-primary
     box max-w=520.0
-      text agent_task_blurb(host_node)
+      text task_blurb
         with
           size=12.5
           line-h=1.5
@@ -335,7 +335,7 @@ component ShellWelcome(provider:str, host_node:str)
 // NO CREDENTIAL IS NOT AN EMPTY LIST, it is one instruction. The screen used to
 // answer it with a welcome mat and two suggestion chips that filled a composer
 // whose send button could never light up.
-component ShellNoCredential(provider:str)
+component ShellNoCredential(register_hint:str)
   col #root
     with
       w=fill
@@ -362,22 +362,21 @@ component ShellNoCredential(provider:str)
         border=border
         border-w=1.0
         r=8.0
-      text agent_register_hint(provider)
+      text register_hint
         with
           size=11.0
           font=code
           @text-warning
 
-component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[str], identity:str, provider:str, credential:str, host_node_options:[str], host_node:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, saga_id:str, steps_open:i64, detached_saga:str, connected:bool, dark:bool)
+component ShellScreen(surface:str, setup_open:bool, identity_options:[str], identity:str, provider_initial:str, credential:str, host_node_options:[str], host_node:str, credentials_loading:bool, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], chat_busy:bool, chat_status:str, chat_detail:str, live:str, saga_id:str, steps_open:i64, detached_saga:str, run_line:str, grant_note:str, terminal_note:str, composer_hint:str, task_blurb:str, register_hint:str, connected:bool, dark:bool)
   emits
-    shell_surface_changed(ShellSurface)
+    shell_surface_changed(str)
     shell_setup_toggled()
     shell_identity_changed(str)
     shell_host_node_changed(str)
     shell_credentials_refresh()
     shell_terminal_start()
     shell_terminal_stop()
-    shell_composer_event(ComposerEvent)
     shell_chat_reset()
     shell_chat_detach()
     shell_chat_reopen()
@@ -413,7 +412,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                 font=display
                 @text-primary
           row gap=5.0 align=center
-            text agent_run_line(identity, host_node) size=11.5 @text-caption
+            text run_line size=11.5 @text-caption
             ShellSetupToggle #setup-toggle open=setup_open
               forward
                 shell_setup_toggled
@@ -428,14 +427,14 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             ShellSurfaceButton #tasks-surface -> emit(shell_surface_changed, _)
               with
                 label="Tasks"
-                value=ShellSurface.tasks
-                selected=(surface == ShellSurface.tasks)
+                value="tasks"
+                selected=(surface == "tasks")
                 live=chat_busy
             ShellSurfaceButton #terminal-surface -> emit(shell_surface_changed, _)
               with
                 label="Terminal"
-                value=ShellSurface.terminal
-                selected=(surface == ShellSurface.terminal)
+                value="terminal"
+                selected=(surface == "terminal")
                 live=terminal_running
     box
       with
@@ -505,7 +504,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     r=3.0
                   space w=1.0 h=1.0
                 text "Reading registered credentials and announcing peers…" size=10.5 @text-meta
-            if !empty(agent_host_grant_note(host_node, credential))
+            if !empty(grant_note)
               row gap=7.0 align=center
                 box
                   with
@@ -514,7 +513,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     bg=warning_dot
                     r=3.0
                   space w=1.0 h=1.0
-                text agent_host_grant_note(host_node, credential) size=10.5 @text-meta
+                text grant_note size=10.5 @text-meta
         box
           with
             w=fill
@@ -534,7 +533,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             title="Not connected"
             description="Click the network name in the titlebar to pick or reconnect a network."
 
-    if connected && surface == ShellSurface.terminal
+    if connected && surface == "terminal"
       col w=fill h=fill
         box
           with
@@ -576,7 +575,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     size=12.5
                     font=medium
                     @text-fg
-              text agent_terminal_note(provider, credential) size=10.5 @text-meta
+              text terminal_note size=10.5 @text-meta
             if !terminal_running
               button "Open session" -> emit(shell_terminal_start)
                 with
@@ -609,7 +608,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
               p=6.0
             col w=fill h=fill
               if terminal_running
-                extern agent_terminal_surface(terminal) #terminal
+                extern agent_terminal_surface() #terminal
               if !terminal_running
                 col
                   with
@@ -629,7 +628,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                       @text-muted
                   space w=1.0 h=fill
 
-    if connected && surface == ShellSurface.tasks
+    if connected && surface == "tasks"
       col w=fill h=fill
         scroll #transcript
           with
@@ -645,10 +644,10 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             box w=fill max-w=780.0
               col w=fill gap=20.0
                 if empty(entries) && !chat_busy && empty(credential)
-                  ShellNoCredential #no-credential provider=provider
+                  ShellNoCredential #no-credential register_hint=register_hint
                 if empty(entries) && !chat_busy && !empty(credential)
-                  ShellWelcome #welcome provider=provider host_node=host_node
-                keyed entry in entries by=entry.id #entries
+                  ShellWelcome #welcome provider_initial=provider_initial task_blurb=task_blurb
+                keyed entry in entries by=entry.id
                   with
                     w=fill
                     gap=20.0
@@ -679,7 +678,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     // whole transcript, and keying on it would re-parse
                     // every answer on one click.
                     if entry.role != "user" && entry.status != "detached"
-                      lazy entry by entry.body, entry.provider, entry.status, dark as settled
+                      lazy entry by entry.body, entry.provider_label, entry.status, dark as settled
                         ShellAnswer entry=settled dark=dark
                           events
                             open_link -> emit(shell_open_link, _)
@@ -715,7 +714,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                             text chat_detail size=10.5 @text-meta
                         if !empty(saga_id)
                           button "Stop watching" @ghost_action -> emit(shell_chat_detach)
-                      keyed row in activity by=row.id #activity w=fill gap=8.0
+                      keyed row in activity by=row.id w=fill gap=8.0
                         lazy row as settled
                           ShellActivityRow row=settled
                   if chat_busy
@@ -747,26 +746,10 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     border=border
                     border-w=1.0
                     r=15.0
-                  row
-                    with
-                      w=fill
-                      gap=6.0
-                      align=center
-                    extern rich_composer(draft, agent_composer_hint(provider), (!connected || chat_busy || empty(credential) || !empty(detached_saga)), 40.0, 150.0, 8.0) #draft -> emit(shell_composer_event, _)
-                    button #send -> emit(shell_composer_event, composer_submit_event())
-                      with
-                        label="Send"
-                        disabled=(!connected || chat_busy || empty(credential) || !empty(detached_saga) || empty(trim(editor_text(draft))))
-                        w=32.0
-                        h=32.0
-                      // Regular weight, deliberately — see the note on the
-                      // message toolbar in components/chat.ice: a semibold
-                      // string label sends every non-ASCII glyph down
-                      // cosmic-text's walk-every-face fallback path.
-                      text "↑" size=12.5 font=ui
-                      active bg=primary text=primary_fg r=16.0
-                      hovered bg=primary_hover text=primary_fg r=16.0
-                      disabled bg=disabled text=disabled_fg r=16.0
+                  // THE WORDS NEVER CROSS THE WIRE: the editor and its send
+                  // button are the host's surface, and a send reaches the
+                  // app as the host's own intent.
+                  extern shell_composer(composer_hint, (!connected || chat_busy || empty(credential) || !empty(detached_saga))) #draft
                 // A DISABLED SEND SAYS WHY. The three reasons it can be off are
                 // three different things to do next, and the operator used to
                 // get a grey circle for all of them.

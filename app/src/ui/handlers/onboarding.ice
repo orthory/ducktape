@@ -405,14 +405,13 @@ on console_opened(id)
   shell_terminal_error = ""
   shell_chat_entries = []
   shell_chat_activity = []
-  shell_chat_draft = editor("")
+  shell_draft_cleared = shell_composer_clear()
   shell_chat_busy = false
   shell_chat_status = ""
   shell_chat_detail = ""
   shell_chat_live = ""
   shell_chat_saga = ""
   shell_detached_saga = ""
-  shell_steps_open = 0
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
@@ -431,8 +430,6 @@ on console_opened(id)
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
-  channel_name_draft = ""
-  member_key_draft = ""
   channel_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
@@ -452,7 +449,6 @@ on console_opened(id)
   invalidate lane=live_thread
   thread_loading = false
   pending_channel = ""
-  chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
@@ -520,12 +516,21 @@ on console_opened(id)
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_item_channel = ""
-  forge_review_draft = ""
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
   forge_comment_staged = []
+  forge_drafts_cleared = forge_drafts_cleared + 1
+  forge_drafts_scope = "item"
+  forge_tree_path = ""
+  forge_tree_rev = ""
+  forge_tree_entries = []
+  forge_tree_born = false
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_note = ""
+  forge_opened_dir = ""
+  forge_opened_rev = ""
+  forge_file_phase = ForgeFilePhase.idle
   forge_merge_conflicts = []
   forge_discussion = []
   forge_discussion_members = []

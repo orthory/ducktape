@@ -108,14 +108,72 @@ on shell_terminal_failed(cause)
   shell_terminal_running = false
   shell_terminal_error = cause.message
 
-on shell_composer_event(event)
-  shell_chat_draft = apply_composer_event(shell_chat_draft, event)
-  return if !composer_submits(event)
+// THE VIEW'S INTENTS. The screen is the `shell` module view
+// (`crate::module_view::shell_view`); what the reader does in it arrives
+// here, and the handlers below keep their bodies — an arm routes to one
+// through a flow, since a handler cannot call another. A send carries the
+// trimmed body the host's own composer surface held: the words never crossed
+// the wire to the view.
+on shell_view_event(event)
+  match shell_intent(event)
+    ShellIntent.surface
+      flow
+        from done shell_event_surface(event)
+        done -> shell_surface_changed _
+    ShellIntent.setup
+      flow
+        from done true
+        done -> shell_setup_toggled()
+    ShellIntent.identity
+      flow
+        from done event_text(event, "value")
+        done -> shell_identity_changed _
+    ShellIntent.host_node
+      flow
+        from done event_text(event, "value")
+        done -> shell_host_node_changed _
+    ShellIntent.refresh
+      flow
+        from done true
+        done -> shell_credentials_refresh()
+    ShellIntent.terminal_start
+      flow
+        from done true
+        done -> shell_terminal_start()
+    ShellIntent.terminal_stop
+      flow
+        from done true
+        done -> shell_terminal_stop()
+    ShellIntent.send
+      flow
+        from done event_text(event, "body")
+        done -> shell_chat_send _
+    ShellIntent.reset
+      flow
+        from done true
+        done -> shell_chat_reset()
+    ShellIntent.detach
+      flow
+        from done true
+        done -> shell_chat_detach()
+    ShellIntent.reopen
+      flow
+        from done true
+        done -> shell_chat_reopen()
+    ShellIntent.discard
+      flow
+        from done true
+        done -> shell_chat_discard()
+    ShellIntent.open_link
+      flow
+        from done event_text(event, "url")
+        done -> open_message_link _
+
+on shell_chat_send(body)
   return if !connected || shell_chat_busy || empty(shell_credential) || !empty(shell_detached_saga)
-  return if empty(trim(editor_text(shell_chat_draft)))
-  let prompt = trim(editor_text(shell_chat_draft))
+  return if empty(trim(body))
+  let prompt = trim(body)
   shell_chat_entries = agent_chat_push_user(shell_chat_entries, prompt, shell_provider)
-  shell_chat_draft = editor("")
   shell_chat_activity = []
   shell_chat_live = ""
   shell_chat_saga = ""
@@ -123,10 +181,7 @@ on shell_composer_event(event)
   shell_chat_detail = "Preparing the durable run"
   shell_chat_busy = true
   shell_setup_open = false
-  parallel
-    stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_host_node_key, shell_chat_entries) -> shell_chat_event _
-    // The transcript is `anchor-y=end`, where relative 0.0 is the tail.
-    task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
+  stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_host_node_key, shell_chat_entries) -> shell_chat_event _
 
 // One pure reducer per field keeps this event handler flat. A progress event
 // cannot accidentally settle the answer, and a terminal event folds the live
@@ -140,7 +195,6 @@ on shell_chat_event(next)
   shell_chat_live = agent_event_live(shell_chat_live, next)
   shell_chat_entries = agent_event_entries(shell_chat_entries, next, shell_provider, shell_chat_saga, shell_chat_activity)
   shell_chat_busy = agent_event_busy(next)
-  task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
 
 // STOP WATCHING, NOT STOP RUNNING — and the difference is the whole point of a
 // durable run. The saga keeps executing, retries and commits whether or not
@@ -176,18 +230,14 @@ on shell_chat_discard
   shell_detached_saga = ""
   shell_chat_saga = ""
 
-on shell_chat_steps_toggled(id)
-  shell_steps_open = keep_i64(shell_steps_open == id, 0, id)
-
 on shell_chat_reset
   return if shell_chat_busy
   invalidate lane=shell_chat
   shell_chat_entries = []
   shell_chat_activity = []
-  shell_chat_draft = editor("")
+  shell_draft_cleared = shell_composer_clear()
   shell_chat_status = ""
   shell_chat_detail = ""
   shell_chat_live = ""
   shell_chat_saga = ""
   shell_detached_saga = ""
-  shell_steps_open = 0
