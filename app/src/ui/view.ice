@@ -398,48 +398,13 @@ view
               resolve_thread_submit -> resolve_thread_submit _
               copy_to_clipboard -> copy_to_clipboard _ _
 
+        // Files is a MODULE-OWNED VIEW: the listing, the preview, the
+        // history and the write refusal go in as props; every navigation
+        // and every write comes back as an intent the handler signs. Whether
+        // the rows on hand describe the path in the crumb (`listed`) is
+        // computed here, once.
         files:
-          FilesScreen new_name<->fs_new_name draft<->fs_editor
-            with
-              path=fs_path
-              // Do the rows on hand describe the path in the crumb? Every
-              // reading of `entries` on that screen is gated on this.
-              listed=(fs_listed_path == fs_path)
-              entries=fs_entries
-              directories=fs_directories(fs_entries)
-              connected
-              loading=fs_loading
-              preview_path=fs_preview_path
-              preview_entry=fs_preview_entry
-              delete_target=fs_delete_target
-              diff_from=fs_diff_from
-              diff=fs_diff
-              history=fs_history
-              preview_truncated=fs_preview_truncated
-              preview_binary=fs_preview_binary
-              editing=fs_editing
-              preview_text=fs_preview_text
-              preview_picture=fs_preview_picture
-              preview_width=fs_preview_width
-              preview_height=fs_preview_height
-              write_refusal=files_write_gate(fs_path, settings_user_key)
-              dark
-            events
-              open_message_link -> open_message_link _
-              fs_open_dir -> fs_open_dir _
-              fs_open_file -> fs_open_file _
-              fs_open_parent -> fs_open_parent
-              fs_new_name_changed -> fs_new_name_changed _
-              fs_mkdir_submit -> fs_mkdir_submit
-              fs_new_file_submit -> fs_new_file_submit
-              fs_arm_delete -> fs_arm_delete _
-              fs_disarm_delete -> fs_disarm_delete
-              fs_delete_submit -> fs_delete_submit
-              fs_close_diff -> fs_close_diff
-              fs_show_diff -> fs_show_diff _
-              fs_begin_edit -> fs_begin_edit
-              fs_cancel_edit -> fs_cancel_edit
-              fs_save_edit -> fs_save_edit
+          extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes) #files -> files_view_event _
         members:
           extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
         agents:
