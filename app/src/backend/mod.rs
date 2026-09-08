@@ -405,6 +405,8 @@ mod search;
 mod shell;
 mod storage;
 mod style;
+mod view_artifact;
+pub mod view_source;
 
 pub use agent::*;
 pub use bell::*;
