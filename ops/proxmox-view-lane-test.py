@@ -189,6 +189,48 @@ class LaneGuardTests(unittest.TestCase):
                     lane.rollout(args, record)
                 upload.assert_not_called()
 
+    def test_partial_start_requires_reset_before_changed_founding_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "ducktape"
+            binary.write_bytes(b"binary")
+            modules = root / "modules"
+            modules.mkdir()
+            component = modules / "chat.component.wasm"
+            component.write_bytes(b"founding A")
+            args = SimpleNamespace(host="test", record=root / "lane.json", binary=binary,
+                                   modules=modules, revision="ab" * 20, ui_revision="cd" * 20,
+                                   reason="first rollout")
+            record = {"owner": "ducktape-view-lane-test", "host": "test", "nodes": [
+                {"id": i, "name": f"dt-view-{i}"} for i in [801, 802, 803]
+            ]}
+            started = []
+
+            def remote(host, *command):
+                if "enable" in command:
+                    if command[2] == 802:
+                        raise ValueError("second node failed to start")
+                    started.append(command[2])
+                return ""
+
+            with patch.object(lane, "live_addresses", return_value=["192.0.2.11", "192.0.2.12", "192.0.2.13"]), \
+                 patch.object(lane, "remote_stage", return_value="/var/tmp/test-stage") as stage, \
+                 patch.object(lane, "remote", remote), patch.object(lane, "send_file") as upload:
+                with self.assertRaisesRegex(ValueError, "second node failed"):
+                    lane.rollout(args, record)
+                self.assertEqual(started, [801])
+                persisted = json.loads(args.record.read_text())
+                self.assertNotIn("release", persisted)
+                self.assertIn("pending_release", persisted)
+                component.write_bytes(b"different founding B")
+                stage.reset_mock()
+                upload.reset_mock()
+                with patch.object(lane, "remote", return_value=""):
+                    with self.assertRaisesRegex(ValueError, "founding files changed.*reset-network"):
+                        lane.rollout(args, persisted)
+                stage.assert_not_called()
+                upload.assert_not_called()
+
     def test_three_node_rollout_validates_every_release_before_stopping(self):
         for fail_validation in [None, "checksum", "runtime"]:
             with self.subTest(fail_validation=fail_validation), tempfile.TemporaryDirectory() as directory:

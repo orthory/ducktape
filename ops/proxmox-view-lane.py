@@ -203,11 +203,13 @@ def rollout(args, record):
     with tempfile.TemporaryDirectory() as directory:
         archive = Path(directory) / "release.tar"
         manifest = package_release(args.binary, args.modules, args.revision, args.ui_revision, archive)
-        previous = record.get("release")
-        if previous is not None:
+        new_founding = {name: digest for name, digest in manifest["files"].items()
+                       if name.startswith("modules/")}
+        for key in ("release", "pending_release"):
+            previous = record.get(key)
+            if previous is None:
+                continue
             old_founding = {name: digest for name, digest in previous["files"].items()
-                           if name.startswith("modules/")}
-            new_founding = {name: digest for name, digest in manifest["files"].items()
                            if name.startswith("modules/")}
             if old_founding != new_founding:
                 raise ValueError("founding files changed; run reset-network before rollout")

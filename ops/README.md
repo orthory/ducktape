@@ -129,7 +129,9 @@ online for consensus progress.
 
 The dev configuration recomputes genesis from founding files on every boot.
 A changed `modules/` hash set is therefore refused while an existing release
-record remains; complete `reset-network` before rolling out those files. A live
+or pending release record remains; complete `reset-network` before rolling out
+those files. A partial start can initialize a node before rollout fails, so both
+records constrain retries. A live
 view replacement uses the module ceremony, not a changed founding directory.
 
 For a breaking schema/ABI/state change, archive diagnostics and run
