@@ -1142,7 +1142,7 @@ fn the_surface_picks_the_list_the_copy_reads() {
 #[test]
 fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
     use crate::CopySurface::{Nowhere, Timeline};
-    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline, false);
+    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline);
     assert_eq!(
         (cleared.anchor, cleared.head),
         (0, 0),
@@ -1150,7 +1150,7 @@ fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
     );
     assert_eq!(cleared.surface, Nowhere);
 
-    let dropped = copy_range_after_press(2, Timeline, -3, Timeline, true);
+    let dropped = copy_range_after_press(2, Timeline, -3, Timeline);
     assert_eq!(
         (dropped.anchor, dropped.head),
         (0, 0),

@@ -1823,7 +1823,7 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
 /// slot without one — with no props pushed.
 pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
-    let (content, rev, generation) = {
+    let (content, rev, generation, alive) = {
         let mut locked = mounted.lock().expect("module view lock");
         let generation = locked.generation;
         match &mut locked.slot {
@@ -1834,13 +1834,19 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
                 ));
             }
             Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation),
+            Slot::Ready(guest) => (
+                guest.render(),
+                guest.frame_rev,
+                generation,
+                guest.alive.clone(),
+            ),
         }
     };
     Element::new(ModuleView {
         mounted,
         generation,
         rev,
+        alive,
         content,
     })
 }
@@ -3020,6 +3026,12 @@ fn first_line(error: &wasmtime::Error) -> String {
         .to_string()
 }
 
+#[path = "module_view/input.rs"]
+mod input;
+#[cfg(test)]
+#[path = "module_view/input_tests.rs"]
+mod input_tests;
+
 // ---------- the widget ----------
 
 /// The tree the guest last sent, rendered with the app's own widgets and
@@ -3033,6 +3045,7 @@ struct ModuleView {
     generation: u64,
     /// The frame `content` was rendered from.
     rev: u64,
+    alive: Arc<()>,
     content: Element<'static, Output, iced::Theme, iced::Renderer>,
 }
 
@@ -3135,7 +3148,9 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             }
             Slot::Failed(_) | Slot::Empty => return,
         };
-        let outputs = if *generation == self.generation {
+        let same_instance =
+            *generation == self.generation && Arc::ptr_eq(&guest.alive, &self.alive);
+        let outputs = if same_instance {
             outputs
         } else {
             // a tree of an earlier load: its messages index nothing here
@@ -3147,6 +3162,17 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             for output in outputs {
                 guest.deliver(output);
             }
+            shell.request_redraw();
+        }
+        if same_instance
+            && let Event::Mouse(event) = event
+            && input::mouse(
+                guest,
+                *event,
+                layout.bounds().position(),
+                shell.is_event_captured(),
+            )
+        {
             shell.request_redraw();
         }
         let Event::Window(window::Event::RedrawRequested(_)) = event else {
@@ -3162,6 +3188,7 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         // rebuilt only by its own messages, and a guest's tick is not one.
         if guest.frame_rev != self.rev {
             self.rev = guest.frame_rev;
+            self.alive = guest.alive.clone();
             self.content = guest.render();
             tree.diff(self.content.as_widget());
             shell.invalidate_layout();
@@ -3205,10 +3232,31 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, ModuleViewEvent, iced::Theme, iced::Renderer>> {
-        // An overlay's messages would be the guest's too; the tree carries
-        // no widget that opens one.
-        let _ = (tree, layout, renderer, viewport, translation);
-        None
+        let alive = {
+            let mounted = self.mounted.lock().expect("module view lock");
+            let Slot::Ready(guest) = &mounted.slot else {
+                return None;
+            };
+            if mounted.generation != self.generation
+                || guest.frame_rev != self.rev
+                || !Arc::ptr_eq(&guest.alive, &self.alive)
+            {
+                return None;
+            }
+            guest.alive.clone()
+        };
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
+            .map(|content| {
+                input::overlay(
+                    content,
+                    self.mounted.clone(),
+                    self.generation,
+                    alive,
+                    layout.bounds().position() + translation,
+                )
+            })
     }
 }
 
@@ -4266,7 +4314,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn chat_facts() -> Option<Vec<u8>> {
+    pub(super) fn chat_facts() -> Option<Vec<u8>> {
         chat_facts_with(&[first_light()], &[])
     }
 
