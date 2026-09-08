@@ -1737,7 +1737,11 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
         let generation = locked.generation;
         match &mut locked.slot {
             Slot::Loading => return notice("Loading the view…"),
-            Slot::Empty => return notice("This module ships no view."),
+            Slot::Empty => {
+                return notice(&format!(
+                    "This network has no {module} view yet. An admin activates a {module} deployment that ships one."
+                ));
+            }
             Slot::Failed(reason) => return notice(reason),
             Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation),
         }
