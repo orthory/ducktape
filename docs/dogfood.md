@@ -29,7 +29,8 @@ commentary in the app, with run outcomes available through the query API.
   (`docs/records/specs/capability-spec.md`); `make demo-seed` stages one
   there, `quack-test.toml`, a script-backed test provider run by the guest
   shell `sh` in the executor directory, and registers the demo's Quackbot
-  against it.
+  against it with forge read and push on the seeded `playground` repo and on
+  `ducktape`.
 - **Provider authentication on the executing service.** Codex uses
   `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
   `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.claude/.credentials.json`. Installing an
