@@ -40,8 +40,10 @@ dev-clear:
 	@bash ops/dev-clear.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
-## messages, a tasks board, pages, a registered agent (with a live @mention run),
-## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
+## messages, a tasks board, pages, a registered TEST agent (a script-backed
+## provider staged as a capability spec, so its seeded @mention run completes
+## once `make dev` starts the compute service — no model credential needed),
+## jobs, an automation rule — plus TWO gateway web-app routes: a
 ## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
 ## "demo" workspace in ~/.ducktape and makes it active. Builds ducktape if needed
 ## (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
