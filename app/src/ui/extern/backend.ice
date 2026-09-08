@@ -230,8 +230,6 @@ extern crate::backend
   pure duck_page_link(page:str, chain_id:str) -> str
   pure duck_channel_link(channel:str, chain_id:str) -> str
   pure duck_channel_message_link(channel:str, seq:i64, chain_id:str) -> str
-  pure duck_forge_item_link(repo:str, number:i64, chain_id:str) -> str
-  pure duck_forge_repo_link(repo:str, chain_id:str) -> str
   pure startup_duck_url() -> str
   pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
   pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
@@ -356,9 +354,8 @@ extern crate::backend
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
   pure forge_comment_cap_reached(staged:&[ForgeDraftComment]) -> bool
   pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
-  pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
+  pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure forge_parent(path:str) -> str
   pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
@@ -367,19 +364,11 @@ extern crate::backend
   pure forge_live_hit(kind:LiveKind, module:str) -> bool
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  pure forge_push_command(rpc:&str) -> str
-  pure diff_lines(diff:&str) -> [DiffLine]
   component forge_code(source:str, path:str, dark:bool) -> unit
   pure markdown_path(path:&str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
-  pure binary_note(text:&str) -> str
   component picture(surface:str, path:str) -> unit
-  pure filter_forge_items(items:&[ForgeItem], tab:ForgeTab) -> [ForgeItem]
-  pure forge_open_count(items:&[ForgeItem], kind:&str) -> i64
-  pure forge_merge_note(merge_oid:&str, branches:&str) -> str
-  pure verdict_label(verdict:&str) -> str
-  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:&str) -> str
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError

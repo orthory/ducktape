@@ -172,10 +172,6 @@ fn materialize_composers(app: &mut Ducktape) {
     app.console_win = Some(window);
     app.shell_tab = ShellTab::Chat;
     let _ = app.__view(window);
-    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
-    for message in boots {
-        let _ = app.__update(message);
-    }
 }
 
 /// The instance whose scope names BOTH the mount and this key. Retained
@@ -183,16 +179,13 @@ fn materialize_composers(app: &mut Ducktape) {
 /// promise — so a scope lookup has to say which room it means, exactly as the
 /// mount does.
 fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String> {
-    // THIS APP'S OWN WINDOW, and no other's. The sighting side-channel a
-    // freshly rendered instance is found through is a THREAD-local, so a
-    // sibling test that rendered the same room on the same test thread has a
-    // scope with the same mount and the same key — differing only in the
-    // window the render was for. Reading that one back finds no state and the
-    // assertion fails in a full run while passing alone.
-    let window = format!("/{:?}/", app.console_win?);
+    // The scope carries no window: with no `lifetime mounted` component in
+    // the app, rendered ids are unqualified (the checker's E172 rule), so a
+    // sibling test that rendered the same room on the same test thread names
+    // the same scope — and reads the same retained instance back.
     app.__ice_test_scopes_chat_composer()
         .into_iter()
-        .find(|scope| scope.contains(&window) && scope.contains(mount) && scope.contains(key))
+        .find(|scope| scope.contains(mount) && scope.contains(key))
 }
 
 /// The stream composer of the room the app is in, materializing it if needed.

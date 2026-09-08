@@ -142,7 +142,7 @@ on global_key_pressed(event)
   palette_page_hits = []
   palette_search_phase = SearchPhase.idle
   return if !palette_open
-  task widget focus #workspace-tabs/overlays/palette-input window=window_target(console_win)
+  task widget focus #workspace-tabs/overlays/palette-input
 
 on palette_changed(next)
   invalidate lane=palette_search

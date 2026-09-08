@@ -315,71 +315,43 @@ view
           // this route; the extern needs one and the roster handler is the
           // honest destination
           extern agents_view(dark, connected, agents_answered, agents_rows) #agents -> members_view_event _
+        // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
+        // the code browse's listing and file, and the discussion go in as
+        // props; every act comes back as an intent the handler signs. The
+        // note composer is the app's own, docked under the view while an
+        // item is open — the editor it edits cannot cross the wire.
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
-            with
-              org=network_name
-              about=account_bio
-              network_chain_id
-              connected_rpc
-              tier=member_tier(members_rows)
-              repos=forge_repos
-              list_phase=forge_list_phase
-              open_repo=forge_repo
-              repo_menu=forge_repo_menu
-              repo_phase=forge_repo_phase
-              branches=forge_branches
-              tab=forge_tab
-              items=forge_items
-              forge_item_number
-              item_phase=forge_item_phase
-              forge_item_kind
-              forge_item_title
-              forge_item_state
-              forge_item_author
-              forge_item_branches
-              forge_item_body
-              forge_item_blocks
-              forge_item_files_changed
-              forge_item_additions
-              forge_item_deletions
-              forge_item_diff
-              forge_item_diff_truncated
-              forge_item_merge_oid
-              forge_item_source_oid
-              forge_item_channel
-              forge_item_approvals
-              forge_item_change_requests
-              forge_item_reviews
-              merge_conflicts=forge_merge_conflicts
-              merge_busy=forge_merge_busy
-              review_verdict=forge_review_verdict
-              review_busy=forge_review_busy
-              comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
-              staged_comments=forge_comment_staged
-              discussion=forge_discussion
-              discussion_pending=forge_discussion_pending
-              linked_note=forge_linked_note
-              connected
-              loading
-              dark
-            events
-              forge_open_repo -> forge_open_repo _
-              forge_close_repo -> forge_close_repo
-              forge_toggle_repo_menu -> forge_toggle_repo_menu
-              select_forge_tab -> select_forge_tab _
-              forge_open_item -> forge_open_item _
-              forge_close_item -> forge_close_item
-              forge_merge_submit -> forge_merge_submit
-              forge_review_pick -> forge_review_pick _
-              forge_review_submit -> forge_review_submit
-              forge_comment_open -> forge_comment_open _ _ _
-              forge_comment_stage -> forge_comment_stage
-              forge_comment_cancel -> forge_comment_cancel
-              forge_comment_drop -> forge_comment_drop _
-              note_composer_event -> forge_composer_event _
-              open_message_link -> open_message_link _
-              copy_to_clipboard -> copy_to_clipboard _ _
+          col w=fill h=fill
+            extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_repos, forge_list_phase, forge_repo, forge_repo_menu, forge_repo_phase, forge_branches, forge_tab, forge_items, forge_item_number, forge_item_phase, forge_item_kind, forge_item_title, forge_item_state, forge_item_author, forge_item_branches, forge_item_body, forge_item_blocks, forge_item_files_changed, forge_item_additions, forge_item_deletions, forge_item_diff, forge_item_diff_truncated, forge_item_merge_oid, forge_item_source_oid, forge_item_approvals, forge_item_change_requests, forge_item_reviews, forge_merge_conflicts, forge_merge_busy, forge_review_verdict, forge_review_busy, forge_comment_staged, forge_discussion, forge_linked_note, forge_landed_seq, forge_landed_tick, forge_tree_path, forge_tree_rev, forge_tree_entries, forge_tree_born, forge_tree_truncated, forge_tree_phase, forge_file_path, forge_file_text, forge_file_binary, forge_file_truncated, forge_file_picture, forge_file_width, forge_file_height, forge_file_note, forge_file_header(forge_opened_dir, forge_opened_rev, forge_tree_path, forge_tree_rev, forge_file_path), forge_file_phase, forge_drafts_cleared, forge_drafts_scope) #forge -> forge_view_event _
+            if connected && forge_item_number > 0 && forge_item_phase == ForgePhase.ready
+              box
+                with
+                  w=fill
+                  pl=18.0
+                  pr=18.0
+                  pt=8.0
+                  pb=12.0
+                flex
+                  with
+                    w=fill
+                    gap=8.0
+                    items=end
+                  box
+                    with
+                      w=fill
+                      bg=surface
+                      border=card_line
+                      border-w=1.0
+                      r=8.0
+                      clip=true
+                    extern rich_composer(forge_discussion_editor, "Write a note…", (loading || !connected || empty(forge_item_channel)), 38.0, 120.0, 6.0) #forge-note -> forge_composer_event _
+                  button "Send" -> forge_composer_event(composer_submit_event())
+                    with
+                      disabled=(loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor))))
+                      w=60.0
+                      h=28.0
+                      p=6.0
+                      @primary_action
         // Approvals is a MODULE-OWNED VIEW: the register the app holds goes
         // in as props, and what the reader does comes back as an intent the
         // handler below signs — the guest sees no key and no endpoint.
