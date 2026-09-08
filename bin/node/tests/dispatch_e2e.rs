@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
-use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
+use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 use runs::{ACTION_CHAT_POST, ModelMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply};
@@ -136,41 +136,16 @@ impl ScriptProvider {
         }
     }
 
-    /// the env pairs that make node `idx` provide this tag: the operator dir
-    /// override plus its installed executor directory. Combine multiple providers
-    /// on one node by pointing them at the SAME spec dir... this fixture
-    /// keeps one dir per provider, so a node carries exactly one.
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (
-                "DUCKTAPE_EXECUTOR_DIR".into(),
-                self.executors.display().to_string(),
-            ),
-        ]
+    /// what a node's workspace holds to provide this tag: the spec dir plus
+    /// the executor directory. Combine multiple providers on one node by
+    /// pointing them at the SAME spec dir... this fixture keeps one dir per
+    /// provider, so a node carries exactly one.
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
-}
-
-/// Empty operator specs and executors keep this node out of provider discovery,
-/// regardless of which CLIs the operator has installed elsewhere.
-fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
-    let empty = root.join(name).join("specs");
-    std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let executors = root.join(name).join("executors");
-    std::fs::create_dir_all(&executors).expect("empty executor dir");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            empty.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            executors.display().to_string(),
-        ),
-    ]
 }
 
 /// boot the 3-validator cluster and wait for genesis agreement, liveness, and
@@ -483,9 +458,11 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // any (the grant); the compute daemon needs both, and refuses to boot
     // without the table. Appended LAST — nothing may follow a toml table header.
     cluster.extra_toml.extend(sandbox_toml());
-    cluster.env[0] = hermetic_env(fixtures.path(), "node0");
-    cluster.env[1] = text_provider.env();
-    cluster.env[2] = json_provider.env();
+    // an EMPTY stage keeps node 0 out of provider discovery, whatever this
+    // box has installed elsewhere.
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(text_provider.sandbox());
+    cluster.sandbox[2] = Some(json_provider.sandbox());
     boot(&mut cluster);
 
     // both hosts announce their discovered set on boot; the registry maps
@@ -659,9 +636,9 @@ fn announced_capable_nodes_race_accept_and_execute_once() {
             _ => line,
         })
         .collect();
-    cluster.env[0] = hermetic_env(fixtures.path(), "node0");
-    cluster.env[1] = racer_one.env();
-    cluster.env[2] = racer_two.env();
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.sandbox[1] = Some(racer_one.sandbox());
+    cluster.sandbox[2] = Some(racer_two.sandbox());
     boot_validators(&mut cluster);
     // A service restart can pick up increased capacity before its validator
     // restarts. Keep that real distinction stable throughout the claim race:

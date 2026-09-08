@@ -221,7 +221,7 @@ any member key of that account may sign. The operator token is NOT accepted
 and NOT a fallback there; mint a per-request PoP with a member key instead:
 
 ```
-ducktape user sign-admin --key "$DUCK/keys/<wallet>.key" \
+ducktape user sign-admin --key "$DUCK/<chain-id>/keys/<wallet>.key" \
   --method POST --path /v1/admin/shutdown --node-key "$NODE_KEY"
 # one json line {"key","ts","sig"} -> x-ducktape-admin-key / -ts / -sig
 ```

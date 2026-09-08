@@ -4,8 +4,8 @@
 //! and the first thing to run when bringing the backend up on a new OS.
 //!
 //!   cargo run -p sandbox-host --example vm_smoke -- \
-//!       --kernel ~/.ducktape/guest/vmlinux \
-//!       --rootfs ~/.ducktape/guest/rootfs.ext4 \
+//!       --kernel <workspace>/guest/vmlinux \
+//!       --rootfs <workspace>/guest/rootfs.ext4 \
 //!       [--vmm firecracker|vz]
 //!
 //! `--vmm` defaults to this OS's flavor (vz on macOS, Firecracker elsewhere).

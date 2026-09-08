@@ -87,14 +87,14 @@ pub(crate) fn bind_listener(
     })
 }
 
-/// the operator's active wallet PUBLIC key, if this host has a keystore — the
-/// key whose account owns the admin namespace. Read without a password (the
-/// key file carries its pubkey in the clear); a host with no wallet, or one
-/// whose keystore cannot be read, boots operator-gated instead of refusing to
-/// boot. Not the user's node: the wallet is per operator, shared by the CLI
-/// and the app.
-pub(crate) fn operator_wallet_key() -> Option<Vec<u8>> {
-    let path = keystore::wallet::active_user_key().ok()?;
+/// the operator's active wallet PUBLIC key, if this workspace has a keystore —
+/// the key whose account owns the admin namespace. Read without a password
+/// (the key file carries its pubkey in the clear); a workspace with no wallet,
+/// or one whose keystore cannot be read, boots operator-gated instead of
+/// refusing to boot. Per workspace, shared by the CLI and the app: a wallet
+/// is an identity ON this network.
+pub(crate) fn operator_wallet_key(workspace: &std::path::Path) -> Option<Vec<u8>> {
+    let path = keystore::wallet::active_user_key(workspace).ok()?;
     let key = keystore::userkey::read_user_key_file(&path).ok()?;
     Some(key.pubkey)
 }
@@ -222,7 +222,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // surface.
         .with_admin(noded::AdminConfig {
             node_key: Some(node_key.clone()),
-            owner_key: operator_wallet_key(),
+            owner_key: operator_wallet_key(workspace),
             ..admin
         });
     let http_handle = if gateway_enabled {

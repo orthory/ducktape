@@ -131,7 +131,7 @@ fn serve_until(
         // member publish a record naming this node as its publisher, so a label
         // alone would let a stranger's record — with an audience and method set
         // they wrote themselves — reach this lender's loopback API.
-        let account = route_account(&node).await?;
+        let account = route_account(&node, &workspace).await?;
         run(instance, storage, node, account, workspace, stop).await
     })
 }
@@ -229,9 +229,9 @@ async fn run(
 /// operator's ACTIVE WALLET key is on, read from committed identity state. The
 /// same account [`crate::gateway_routes`]'s `gateway bind` records, so an
 /// operator-typed bind and this self-registration consent to the same pair.
-async fn route_account(node: &NodeLink) -> Result<u64, String> {
-    let key = crate::boot::surfaces::operator_wallet_key()
-        .ok_or("no active wallet on this host — `ducktape wallet create` first")?;
+async fn route_account(node: &NodeLink, workspace: &Path) -> Result<u64, String> {
+    let key = crate::boot::surfaces::operator_wallet_key(workspace)
+        .ok_or("no active wallet in this workspace — `ducktape wallet new <name>` first")?;
     account_of_key(node, &key).await?.ok_or_else(|| {
         "the active wallet key is on no account — `ducktape account create` first".to_string()
     })

@@ -252,8 +252,8 @@ Also runnable:
 
 Seed a local "demo" network preloaded with sample data — chat channels and
 messages, a tasks board, pages, a registered agent, an inbox note, an
-automation rule, plus gateway web-app routes — registered as a "demo"
-workspace under `~/.ducktape`:
+automation rule, plus gateway web-app routes — founded as a "demo" workspace
+under `~/.ducktape`, with its own guest images and shell executor:
 
 ```sh
 make demo-seed

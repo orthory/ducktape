@@ -65,7 +65,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame};
+use common::{
+    Cluster, SandboxStage, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 
 // The attested-gateway helpers below (an in-process testkit-minted TEE quote,
@@ -691,40 +693,14 @@ impl ScriptProvider {
         }
     }
 
-    /// the env that makes a node provide the tag: the operator spec dir plus the
+    /// what a node's workspace holds to provide the tag: the spec dir plus the
     /// executor directory containing the shell mounted into the guest.
-    fn env(&self) -> Vec<(String, String)> {
-        vec![
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                self.spec_dir.display().to_string(),
-            ),
-            (
-                "DUCKTAPE_EXECUTOR_DIR".into(),
-                self.executors.display().to_string(),
-            ),
-        ]
+    fn sandbox(&self) -> SandboxStage {
+        SandboxStage {
+            capabilities: Some(self.spec_dir.clone()),
+            executors: Some(self.executors.clone()),
+        }
     }
-}
-
-/// No executor or operator spec on the credential owner: only the other node
-/// may discover the scheduled-run provider.
-fn no_provider_env(root: &Path, name: &str) -> Vec<(String, String)> {
-    let dir = root.join(name);
-    let specs = dir.join("specs");
-    let executors = dir.join("executors");
-    std::fs::create_dir_all(&specs).expect("empty spec directory");
-    std::fs::create_dir_all(&executors).expect("empty executor directory");
-    vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            specs.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            executors.display().to_string(),
-        ),
-    ]
 }
 
 // ===========================================================================
@@ -756,7 +732,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
     cluster.compute_grant = Some(vec![]);
-    cluster.env[0] = provider.env();
+    cluster.sandbox[0] = Some(provider.sandbox());
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", CONVERGE);
     cluster.wait_marker(0, "converged root_hash=", CONVERGE);
@@ -932,22 +908,21 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     let owner_key_file = owner_storage.join("owner.key");
     let (_, owner) = keystore::userkey::mint_user_key(&owner_key_file, "scheduled-lender-password")
         .expect("mint the lender operator's encrypted wallet");
-    cluster.env[0] = [
-        no_provider_env(fixtures.path(), "node0"),
-        vec![
-            (
-                "DUCKTAPE_USER_KEY".into(),
-                owner_key_file.display().to_string(),
-            ),
-            ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
-            (
-                "DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(),
-                format!("{upstream}/oauth/token"),
-            ),
-        ],
-    ]
-    .concat();
-    cluster.env[1] = provider.env();
+    // no executor or spec on the credential owner: only the other node may
+    // discover the scheduled-run provider.
+    cluster.sandbox[0] = Some(SandboxStage::default());
+    cluster.env[0] = vec![
+        (
+            "DUCKTAPE_USER_KEY".into(),
+            owner_key_file.display().to_string(),
+        ),
+        ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
+        (
+            "DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(),
+            format!("{upstream}/oauth/token"),
+        ),
+    ];
+    cluster.sandbox[1] = Some(provider.sandbox());
 
     for index in 0..2 {
         cluster.spawn(index);

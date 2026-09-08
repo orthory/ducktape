@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # make dev-clear — stop the background node and services left by `make dev`.
 #
-# This is the non-destructive twin of demo-clear: it preserves the workspace,
-# registry entry, module state, wallets, and airlock credential store. It also
+# This is the non-destructive twin of demo-clear: it preserves the workspace —
+# its module state, wallets, guest, executors and airlock credential store. It also
 # leaves the foreground desktop app and the separate `make demo-app` server
 # alone. Every process is selected by BOTH its ducktape node/service command
 # shape and this exact workspace path before it may receive a signal.
@@ -16,7 +16,7 @@ case "$ID" in
     ;;
 esac
 DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
-WSDIR="$DUCK/workspaces/$ID"
+WSDIR="$DUCK/$ID"
 
 log(){ printf '\033[36m[dev-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }

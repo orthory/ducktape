@@ -1,7 +1,8 @@
-//! `node init` without `--dir` materializes the workspace in the registry
-//! (`$DUCKTAPE_HOME/workspaces/<chain-id>/`), where `node list` and the
-//! `-n/--network <chain-id>` selector find it. pure-CLI: no node is booted,
-//! no socket is bound — `DUCKTAPE_HOME` points every run at a temp registry.
+//! `node init` without `--dir` materializes the workspace under the ducktape
+//! home (`$DUCKTAPE_HOME/<chain-id>/`), where `node list` and the
+//! `-n/--network <chain-id>` selector find it: the home's directories ARE the
+//! list of networks on this box. pure-CLI: no node is booted, no socket is
+//! bound — `DUCKTAPE_HOME` points every run at a temp home.
 
 // `node init` composes a founding set into the workspace genesis. Nothing
 // here names one: the `ducktape` binary under test finds the set `cargo build`
@@ -33,13 +34,13 @@ fn init(home: &Path, name: &str) -> String {
 }
 
 #[test]
-fn init_defaults_into_the_registry_and_n_selects_it() {
+fn init_defaults_into_the_home_and_n_selects_it() {
     let home = tempfile::tempdir().expect("tempdir");
     let chain_id = init(home.path(), "regnet");
     assert!(chain_id.starts_with("regnet#"), "chain id: {chain_id:?}");
 
-    // the workspace landed under the registry, named by the chain id.
-    let dir = home.path().join("workspaces").join(&chain_id);
+    // the workspace landed under the home, named by the chain id.
+    let dir = home.path().join(&chain_id);
     for file in ["node.toml", "network.toml", "identity.key"] {
         assert!(dir.join(file).is_file(), "missing {file} in {dir:?}");
     }
@@ -53,8 +54,8 @@ fn init_defaults_into_the_registry_and_n_selects_it() {
         "list output: {listing:?}"
     );
 
-    // the run selector resolves through the registry: a bogus chain id is a
-    // loud miss (proof the `-n` path scanned the registry, without booting).
+    // the run selector scans the home: a bogus chain id is a loud miss (proof
+    // the `-n` path scanned it, without booting).
     let out = ducktape(home.path(), &["run", "-n", "no-such-net"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr).to_string();
@@ -62,7 +63,7 @@ fn init_defaults_into_the_registry_and_n_selects_it() {
 }
 
 #[test]
-fn same_name_founds_two_distinct_registry_workspaces() {
+fn same_name_founds_two_distinct_workspaces() {
     let home = tempfile::tempdir().expect("tempdir");
     let first = init(home.path(), "kitchen");
     let second = init(home.path(), "kitchen");
@@ -91,7 +92,7 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
         String::from_utf8_lossy(&out.stderr)
     );
     let chain_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let workspace = home.join("workspaces").join(&chain_id);
+    let workspace = home.join(&chain_id);
     let toml = std::fs::read_to_string(workspace.join("node.toml"))
         .expect("read generated node.toml");
     (toml, workspace)
@@ -163,10 +164,11 @@ fn detection_follows_the_host(path_dir: &Path) {
         );
         return;
     }
-    let kernel = home.path().join("guest").join("vmlinux");
+    // the table says HOW, never WHERE: the images are the workspace's own
+    // (`<workspace>/guest`), so a config carries no path to drift.
     assert!(
-        toml.contains(&format!("kernel = \"{}\"", kernel.display())),
-        "a live table names this run's own guest dir:\n{toml}"
+        !toml.contains("kernel =") && !toml.contains("rootfs ="),
+        "a live table names no image path:\n{toml}"
     );
 }
 
@@ -201,20 +203,20 @@ fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
         .expect("run ducktape")
 }
 
-/// ONE registered workspace means there is nothing to disambiguate, and every
+/// ONE workspace on the box means there is nothing to disambiguate, and every
 /// family must agree about that — `node run` and `node status` always did,
 /// while `service`, `user account-init` and `user cred` each demanded
 /// `-n/--network` on a machine with exactly one network on it. That is the
 /// difference between `ducktape service list` and
 /// `ducktape service list -n 'mynet#d0cdf950'` for every command in a session.
 ///
-/// Driven as a REAL subprocess against a real registry, because the bug this
-/// pins is not in the ladder: it is a family resolving the registry's
+/// Driven as a REAL subprocess against a real home, because the bug this
+/// pins is not in the ladder: it is a family resolving the listing's
 /// `(chain-id, node.toml-path)` pair and using the PATH where a DIRECTORY was
 /// meant. A unit test of the ladder cannot see that; `service list` answering
 /// `read ".../node.toml/services.toml": Not a directory` can.
 #[test]
-fn one_registered_workspace_needs_no_selector_in_any_family() {
+fn one_workspace_needs_no_selector_in_any_family() {
     let home = tempfile::tempdir().expect("tempdir");
     let chain_id = init(home.path(), "solonet");
 
@@ -256,7 +258,7 @@ fn one_registered_workspace_needs_no_selector_in_any_family() {
     assert!(!out.status.success(), "two workspaces must not be guessed at");
     assert!(
         stderr.contains(&chain_id) && stderr.contains(&second),
-        "an ambiguous registry names its candidates: {stderr}"
+        "an ambiguous home names its candidates: {stderr}"
     );
     assert!(stderr.contains("-n"), "and the flag that picks one: {stderr}");
 }

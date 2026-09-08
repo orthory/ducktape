@@ -2,23 +2,23 @@
 //! The screen was a single `grid min-cell=420.0` of eight cards: the width
 //! decided which column a group landed in, so identity, the keys that speak
 //! for it and the seat that signs with them could be three columns apart, and
-//! `Forget this network` was the last card of a scroll whose only way in was
-//! the wheel. Every group belongs to exactly one named pane now, the strip is
-//! the only way to pick one, and a new pane fails the build until it is both
-//! reachable and routed.
+//! the identity key's seat was the last card of a scroll whose only way in
+//! was the wheel. Every group belongs to exactly one named pane now, the
+//! strip is the only way to pick one, and a new pane fails the build until it
+//! is both reachable and routed.
 
 // Settings ships as a module-owned view; its screen is the guest's.
 const SETTINGS: &str = include_str!("../../../crates/views/settings/src/ui/settings.ice");
 
 /// The panes, in the order the strip offers them. General first because it is
-/// the one nothing has to be true for; danger last because it is the one act
-/// this screen cannot take back.
-const PANES: [&str; 5] = ["general", "network", "account", "security", "danger"];
+/// the one nothing has to be true for; security last because it is the one
+/// that holds a key.
+const PANES: [&str; 4] = ["general", "network", "account", "security"];
 
 /// Every authored group, and the pane that owns it. The pairing is the whole
 /// of the redesign: a group in two panes is a group that drifted, and a group
 /// in none is a group nobody can reach.
-const GROUPS: [(&str, &str); 8] = [
+const GROUPS: [(&str, &str); 7] = [
     ("APPEARANCE", "general"),
     ("NOTIFICATIONS", "general"),
     ("THIS DEVICE", "general"),
@@ -26,7 +26,6 @@ const GROUPS: [(&str, &str); 8] = [
     ("YOUR IDENTITY", "account"),
     ("ACCOUNT KEYS", "account"),
     ("IDENTITY KEY", "security"),
-    ("DANGER ZONE", "danger"),
 ];
 
 /// The pane each line carrying `needle` is authored under. An arm header is
@@ -54,8 +53,6 @@ fn panes_holding(needle: &str) -> Vec<String> {
 #[test]
 fn every_group_is_authored_under_exactly_one_pane() {
     for (group, pane) in GROUPS {
-        // DANGER ZONE wears the one warmed eyebrow in the console, so it is a
-        // bare `text`, not a `GroupLabel` — both spell the group's name.
         let holding = panes_holding(&format!("\"{group}\""));
         assert_eq!(
             holding,

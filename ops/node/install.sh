@@ -62,7 +62,11 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 
 DUCK_HOME=/var/lib/ducktape
-# the founding set `make install-node` stages beside the installed binary
+# the founding set, installed as PROGRAM data beside the binary's own prefix,
+# never under the home: the home holds one directory per network and nothing
+# else. The unit's DUCKTAPE_MODULES_DIR points the binary at it.
+MODULES_DIR=/usr/local/lib/ducktape/modules
+# the founding set `make install-node` stages beside the built binary
 # (what `workspace_config::modules_dir()` resolves for that binary).
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 MODULES_SRC="${DUCKTAPE_MODULES_DIR:-$CARGO_BIN/modules}"
@@ -82,17 +86,17 @@ sudo_run install -d -o ducktape -g ducktape -m 0700 "$DUCK_HOME"
 # reads the netstack guest out of at boot (the unit's DUCKTAPE_MODULES_DIR):
 # every <id>.component.wasm, every <id>.index.wasm, netstack.component.wasm.
 log "3/6 founding set"
-sudo_run install -d -o ducktape -g ducktape "$DUCK_HOME/modules"
+sudo_run install -d -m 0755 "$MODULES_DIR"
 if [ "$DRY_RUN" = 1 ]; then
-  run bash -c "sudo cp '$MODULES_SRC'/*.wasm '$DUCK_HOME/modules/'"
+  run bash -c "sudo cp '$MODULES_SRC'/*.wasm '$MODULES_DIR/'"
 else
   shopt -s nullglob
   wasm_files=("$MODULES_SRC"/*.wasm)
   shopt -u nullglob
   [ "${#wasm_files[@]}" -gt 0 ] || die "no .wasm files in $MODULES_SRC (make install-node should have staged them)"
-  sudo cp "${wasm_files[@]}" "$DUCK_HOME/modules/"
+  sudo cp "${wasm_files[@]}" "$MODULES_DIR/"
 fi
-sudo_run chown -R ducktape:ducktape "$DUCK_HOME/modules"
+sudo_run chmod -R a+rX "$MODULES_DIR"
 
 log "4/6 systemd units + log rotation"
 sudo_run cp "$SCRIPT_DIR/ducktape-node@.service" "$SCRIPT_DIR/ducktape-service@.service" /etc/systemd/system/
@@ -102,7 +106,7 @@ sudo_run systemctl daemon-reload
 log "5/6 founding or joining the network as the service user"
 DT=(sudo -u ducktape env "DUCKTAPE_HOME=$DUCK_HOME" /usr/local/bin/ducktape)
 case "$MODE" in
-  init) run "${DT[@]}" node init --name "$WORKSPACE" --modules "$DUCK_HOME/modules" "${INIT_ARGS[@]}" ;;
+  init) run "${DT[@]}" node init --name "$WORKSPACE" --modules "$MODULES_DIR" "${INIT_ARGS[@]}" ;;
   join)
     if [ -n "$GENESIS" ]; then
       run "${DT[@]}" node join "$INVITE" --genesis "$GENESIS"

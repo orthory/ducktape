@@ -24,9 +24,9 @@ _ducktape() {
     local account_key=(list approve add join remove)
     local account_flags=(--node -n --network --key --auth-page --no-browser --name --eth --number --pubkey --scheme --passkey --ssh --label --ticket --avatar --bio)
     local wallet_verbs=(new import list use help)
-    local wallet_flags=(--json)
+    local wallet_flags=(--config --workspace -n --network --json)
     local gateway_verbs=(bind unbind list help)
-    local gateway_flags=(--workspace -n --network --label --port --account)
+    local gateway_flags=(--config --workspace -n --network --label --port --account)
     local fs_verbs=(ls cat stat history diff checkout status commit pin unpin help)
     local fs_flags=(-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key --trust-node)
     local service_verbs=(run list enable disable status help)
@@ -36,7 +36,7 @@ _ducktape() {
     local agent_verbs=(pty model-program sched install cancel reassign help)
     local agent_flags=(-n --network --node --key --host-node --cred --cpu --mem --attempt)
     local module_verbs=(pack update register status help)
-    local module_flags=(--index --out --after --config -n --network --json)
+    local module_flags=(--index --view --assets --out --after --config -n --network --json)
 
     if (( CURRENT == 2 )); then
         compadd -- $families

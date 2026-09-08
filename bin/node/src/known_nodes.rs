@@ -1,5 +1,8 @@
-//! Trust-on-first-use pin: `<duck>/keys/known-nodes`, `<http-base> <hex-key>`
-//! one per line, 0600 like every other file under `keys/`.
+//! Trust-on-first-use pin: `known-nodes` BESIDE the signing key
+//! (`<workspace>/keys/known-nodes` for a keystore wallet), `<http-base>
+//! <hex-key>` one per line, 0600 like every other file under `keys/`. A pin
+//! is what one signing identity has trusted: the key that signs against a
+//! url is the key whose pins say what that url is.
 //!
 //! This is the fallback half of node-identity pinning
 //! ([`crate::node_http::pinned_node_key`]): a target the operator's OWN
@@ -9,20 +12,20 @@
 //! or the caller is refusing to sign against whatever the dialled endpoint
 //! claims today. Only `--trust-node` may overwrite an existing pin (#1824).
 //!
-//! Every function here takes `duck: &Path` explicitly, the way
-//! `keystore::wallet` does everywhere except its one env-reading entry point
-//! — a test then drives it against a temp dir with no `$DUCKTAPE_HOME`
-//! mutation, and no risk of a test writing into an operator's real keystore.
+//! Every function here takes the keys directory explicitly, the way
+//! `keystore::wallet` takes its workspace — a test then drives it against a
+//! temp dir with no env mutation, and no risk of a test writing into an
+//! operator's real keystore.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-fn path(duck: &Path) -> PathBuf {
-    keystore::wallet::keys_dir(duck).join("known-nodes")
+fn path(keys: &Path) -> PathBuf {
+    keys.join("known-nodes")
 }
 
-fn load(duck: &Path) -> Result<BTreeMap<String, String>, String> {
-    let path = path(duck);
+fn load(keys: &Path) -> Result<BTreeMap<String, String>, String> {
+    let path = path(keys);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -37,8 +40,8 @@ fn load(duck: &Path) -> Result<BTreeMap<String, String>, String> {
 
 /// Born 0600, rewritten whole — the file holds at most a few hundred lines of
 /// url/key pairs, never a hot path.
-fn save(duck: &Path, entries: &BTreeMap<String, String>) -> Result<(), String> {
-    let path = path(duck);
+fn save(keys: &Path, entries: &BTreeMap<String, String>) -> Result<(), String> {
+    let path = path(keys);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
@@ -61,18 +64,18 @@ fn save(duck: &Path, entries: &BTreeMap<String, String>) -> Result<(), String> {
 }
 
 /// this url's pinned key, if any has been trusted yet.
-pub(crate) fn pinned(duck: &Path, base: &str) -> Result<Option<Vec<u8>>, String> {
-    match load(duck)?.get(base) {
+pub(crate) fn pinned(keys: &Path, base: &str) -> Result<Option<Vec<u8>>, String> {
+    match load(keys)?.get(base) {
         Some(hex) => Ok(Some(duckfs_core::unhex(hex)?)),
         None => Ok(None),
     }
 }
 
 /// trust `key` for `base`, overwriting whatever (if anything) was pinned.
-pub(crate) fn trust(duck: &Path, base: &str, key: &[u8]) -> Result<(), String> {
-    let mut entries = load(duck)?;
+pub(crate) fn trust(keys: &Path, base: &str, key: &[u8]) -> Result<(), String> {
+    let mut entries = load(keys)?;
     entries.insert(base.to_string(), duckfs_core::to_hex(key));
-    save(duck, &entries)
+    save(keys, &entries)
 }
 
 #[cfg(test)]
@@ -81,32 +84,32 @@ mod tests {
 
     #[test]
     fn unpinned_then_pinned_roundtrips_and_updates_0600() {
-        let duck = tempfile::TempDir::new().unwrap();
-        let duck = duck.path();
+        let keys = tempfile::TempDir::new().unwrap();
+        let keys = keys.path();
 
-        assert_eq!(pinned(duck, "http://node.example:8843").unwrap(), None);
-        trust(duck, "http://node.example:8843", &[0xab; 32]).unwrap();
+        assert_eq!(pinned(keys, "http://node.example:8843").unwrap(), None);
+        trust(keys, "http://node.example:8843", &[0xab; 32]).unwrap();
         assert_eq!(
-            pinned(duck, "http://node.example:8843").unwrap(),
+            pinned(keys, "http://node.example:8843").unwrap(),
             Some(vec![0xab; 32])
         );
         // a second url leaves the first alone.
-        trust(duck, "http://other:8843", &[0xcd; 32]).unwrap();
+        trust(keys, "http://other:8843", &[0xcd; 32]).unwrap();
         assert_eq!(
-            pinned(duck, "http://node.example:8843").unwrap(),
+            pinned(keys, "http://node.example:8843").unwrap(),
             Some(vec![0xab; 32])
         );
         // re-trusting overwrites in place.
-        trust(duck, "http://node.example:8843", &[0xef; 32]).unwrap();
+        trust(keys, "http://node.example:8843", &[0xef; 32]).unwrap();
         assert_eq!(
-            pinned(duck, "http://node.example:8843").unwrap(),
+            pinned(keys, "http://node.example:8843").unwrap(),
             Some(vec![0xef; 32])
         );
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(path(duck)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(path(keys)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }

@@ -12,7 +12,6 @@ enum SettingsPane
   network
   account
   security
-  danger
 
 component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
   emits
@@ -33,7 +32,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     account_login_submit()
     copy_to_clipboard(str, str)
     settings_clear_tabs()
-    forget_workspace_submit()
     set_appearance_light()
     set_appearance_dark()
     set_desktop_notifications(bool)
@@ -134,22 +132,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   label="Security"
                   count=0
                   active=(settings_pane == SettingsPane.security)
-            active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-            hovered bg=row_hover text=fg
-            pressed bg=elevated text=fg
-          button #settings-danger-tab -> pick_pane(SettingsPane.danger)
-            with
-              w=shrink
-              label="Danger zone"
-              checked=(settings_pane == SettingsPane.danger)
-              p=0.0
-              @ghost_action
-            box px=15.0 py=0.0
-              TabLabel
-                with
-                  label="Danger zone"
-                  count=0
-                  active=(settings_pane == SettingsPane.danger)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
@@ -895,50 +877,3 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                               h=28.0
                               p=6.0
                               @secondary_action
-        // A PLACE YOU GO. The forget is the one act here that cannot be taken
-        // back from this screen, so it is not something a reader scrolls past
-        // on the way to the theme switch.
-        SettingsPane.danger
-          col w=fill gap=18.0
-            col w=fill gap=9.0
-              // The one warmed eyebrow in the console: #c79a8a, not the #bdbbb1
-              // every other group label wears.
-              text "DANGER ZONE"
-                with
-                  size=9.0
-                  wrap=none
-                  font=code_semibold
-                  @text-danger_label
-              box
-                with
-                  w=fill
-                  p=15.0
-                  bg=danger_zone_bg
-                  border=danger_zone_line
-                  border-w=1.0
-                  r=11.0
-                row
-                  with
-                    w=fill
-                    gap=13.0
-                    align=center
-                  col w=fill gap=2.0
-                    text "Forget this network"
-                      with
-                        size=12.5
-                        wrap=none
-                        font=medium
-                        @text-accent_fg
-                    text "Drops this network from THIS DEVICE's list and returns to the network picker. A running node stays running, nothing on the network changes, and no key is destroyed."
-                      with
-                        size=10.5
-                        @text-meta
-                  button "Forget network" -> emit(forget_workspace_submit)
-                    with
-                      disabled=(!connected || busy)
-                      h=32.0
-                      p=8.0
-                      @icon_action
-                    active bg=danger_solid text=brand_fg border=danger_solid border-w=1.0 r=8.0
-                    hovered bg=danger_solid_hover text=brand_fg border=danger_solid_hover
-                    pressed bg=danger_solid_hover text=brand_fg

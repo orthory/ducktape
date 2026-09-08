@@ -149,4 +149,4 @@ bootout_if_loaded
 launchctl bootstrap "$DOMAIN" "$PLIST"
 
 log "done — 'launchctl print $DOMAIN/$LABEL' for its state, 'ducktape node status' once it serves"
-log "logs: $LOG_DIR/node.err.log and $DUCK_HOME/workspaces/<chain-id>/daemon.log"
+log "logs: $LOG_DIR/node.err.log and $DUCK_HOME/<chain-id>/daemon.log"

@@ -62,7 +62,7 @@ dev: views
 	@bash ops/dev.sh
 
 ## stop the demo node and compute/agent/airlock services left by `make dev`.
-## Preserves the workspace, registry entry, module state, wallets, and
+## Preserves the workspace: its module state, wallets, guest, executors and
 ## credentials. The foreground app and `make demo-app` are not killed.
 dev-clear:
 	@bash ops/dev-clear.sh
@@ -75,9 +75,9 @@ dev-clear:
 ## pull request from a microVM, no model credential needed), jobs, an
 ## automation rule — plus TWO gateway web-app routes: a
 ## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Stops and
-## replaces any previous "demo" workspace in ~/.ducktape (demo-clear) and makes
-## the new one active. Builds ducktape if needed
-## (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+## replaces any previous "demo" workspace under ~/.ducktape (demo-clear), and
+## builds the workspace's own guest images and shell executor. Builds ducktape
+## if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed:
 	@bash ops/demo-seed.sh
 
@@ -88,8 +88,8 @@ demo-app:
 	@bash ops/demo-app.sh
 
 ## remove the seeded "demo" workspace: stop its node (cmdline-verified pid
-## sweep, graceful /v1/shutdown first), delete ~/.ducktape/workspaces/demo, and
-## drop it from the registry — other workspaces untouched. See ops/demo-clear.sh.
+## sweep, graceful /v1/shutdown first) and delete ~/.ducktape/demo — the whole
+## network; other workspaces untouched. See ops/demo-clear.sh.
 demo-clear:
 	@bash ops/demo-clear.sh
 

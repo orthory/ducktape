@@ -95,7 +95,12 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
     // child of this process spawned kill_on_drop, so a death that ran no code
     // still takes its guests with it.
 
-    let providers = agent_service::discover(&node_key, backend, &grant.display_id())?;
+    let providers = agent_service::discover(
+        &node_key,
+        &workspace_config::capability_dir(&service.workspace),
+        backend,
+        &grant.display_id(),
+    )?;
     let offered = providers.capabilities().len();
 
     let (events, event_rx) = tokio::sync::mpsc::channel(link::EVENT_LANE);

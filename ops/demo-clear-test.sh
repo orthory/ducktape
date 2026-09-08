@@ -19,20 +19,20 @@
 # home and a workspace id no human uses, so the only state it can delete is its
 # own. Both roots are pinned: demo-clear.sh resolves $DUCKTAPE_HOME first, so
 # isolating $HOME alone would let an ambient override aim the real script at the
-# operator's own registry — and this gate would go red on a box that exports it.
+# operator's own home — and this gate would go red on a box that exports it.
 set -uo pipefail
 
 OPS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# demo-clear.sh refuses to run without bun, so a box without it has nothing to
-# test here — skip with a notice rather than failing the whole `make test` gate,
-# the way its podman lines are tolerant of a host that has no podman.
+# the stub admin surface below is a bun server, so a box without bun has
+# nothing to test here — skip with a notice rather than failing the whole
+# `make test` gate.
 command -v bun >/dev/null || { printf '[demo-clear-test] skipped — bun is not installed\n' >&2; exit 0; }
 
 ID="demo-clear-selftest"
 REASON="demo_clear_selftest_9f21"
 ERROR="the stub refused; only the response body knows why"
 TMP="$(mktemp -d)"
-WS="$TMP/.ducktape/workspaces/$ID"
+WS="$TMP/.ducktape/$ID"
 # run_case is always called inside a command substitution, so a variable it sets
 # never reaches this shell — the stub's pid goes through a file the trap reads.
 # Nothing leaks on the normal path (run_case reaps its own stub); this is for a
@@ -73,20 +73,19 @@ stop_stub(){
   rm -f "$TMP/stub.pid"
 }
 
-# demo-clear finds the port in the registry.
+# demo-clear reads http_listen out of the workspace's node.toml.
 run_case(){
   local port out
   port="$(start_stub "$1" "$2")"
-  printf '{"active":"%s","workspaces":[{"id":"%s","ports":{"http":%s}}]}\n' "$ID" "$ID" "$port" \
-    > "$TMP/.ducktape/registry.json"
+  printf 'http_listen = "127.0.0.1:%s"\n' "$port" > "$WS/node.toml"
   out="$(HOME="$TMP" DUCKTAPE_HOME="$TMP/.ducktape" DEMO_WORKSPACE_ID="$ID" \
     bash "$OPS/demo-clear.sh" 2>&1)"
   stop_stub
   printf '%s\n' "$out"
 }
 
-# dev-clear reads http_listen out of the workspace's node.toml instead, and only
-# reaches the shutdown call when its sweep finds a live `ducktape … node run …`
+# dev-clear reads the same http_listen, and only reaches the shutdown call
+# when its sweep finds a live `ducktape … node run …`
 # process for THIS workspace — so the case stands one up: a copy of /bin/sh
 # named `ducktape` (the sweep matches on comm=, which a shebang script cannot
 # fake) parked on a sleep with that command shape. dev-clear kills it, which is
@@ -116,8 +115,7 @@ run_dev_case(){
 run_sweep_case(){
   local port fake service bystander
   port="$(start_stub 404 '')"
-  printf '{"active":"%s","workspaces":[{"id":"%s","ports":{"http":%s}}]}\n' "$ID" "$ID" "$port" \
-    > "$TMP/.ducktape/registry.json"
+  printf 'http_listen = "127.0.0.1:%s"\n' "$port" > "$WS/node.toml"
   fake="$TMP/ducktape"
   cp /bin/sh "$fake"
   "$fake" -c 'sleep 10; :' service run airlock --enable --workspace "$WS" &

@@ -5,10 +5,34 @@ import os from "node:os";
 import path from "node:path";
 
 // the operator root every other reader resolves ($DUCKTAPE_HOME when set,
-// else ~/.ducktape) — a node under an override keeps its registry and this
-// script's remembered url there, not in $HOME.
+// else ~/.ducktape): the home holds one directory per workspace and nothing
+// else, so this script's own remembered url lives with the user's other tool
+// state (XDG state dir), never under the home.
 const duckHome = process.env.DUCKTAPE_HOME || path.join(os.homedir(), ".ducktape");
-const stateFile = path.join(duckHome, "agent-system-url");
+const stateDir = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+const stateFile = path.join(stateDir, "ducktape", "agent-system-url");
+
+// the workspaces under the home: every directory holding a network.toml —
+// the listing `ducktape node list` and the app read.
+const workspaces = () => {
+  try {
+    return fs
+      .readdirSync(duckHome)
+      .map((name) => path.join(duckHome, name))
+      .filter((dir) => fs.existsSync(path.join(dir, "network.toml")) && fs.existsSync(path.join(dir, "node.toml")));
+  } catch {
+    return [];
+  }
+};
+// the port a workspace's node serves its app surface on, from its node.toml.
+const httpPort = (dir) => {
+  try {
+    const listen = fs.readFileSync(path.join(dir, "node.toml"), "utf8").match(/^\s*http_listen\s*=\s*"([^"]*)"/m)?.[1];
+    return listen ? listen.split(":").pop() : null;
+  } catch {
+    return null;
+  }
+};
 const usage = `usage: ops/agent-system <command> [args]
 
   use URL                         remember one local node
@@ -82,18 +106,12 @@ const rememberedUrl = () => {
   try {
     return fs.readFileSync(stateFile, "utf8").trim();
   } catch {
-    // Fall through to the active desktop workspace.
+    // Fall through to the one workspace on the box.
   }
-  try {
-    const registry = JSON.parse(
-      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
-    );
-    const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
-    if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;
-  } catch {
-    // Fall through to the explicit-selection error.
-  }
-  die("no node selected; run `ops/agent-system use URL` or start an active workspace");
+  const [only, second] = workspaces();
+  const port = only && !second ? httpPort(only) : null;
+  if (port) return `http://127.0.0.1:${port}`;
+  die("no node selected; run `ops/agent-system use URL` or keep exactly one workspace under the ducktape home");
 };
 
 // Resolved on first use, so a verb that needs no node (`use`, `help`, `cgroup`)
@@ -110,19 +128,15 @@ let operator;
 const operatorToken = () => {
   if (operator !== undefined) return operator;
   operator = null;
+  const port = nodeUrl().split(":").pop();
+  const served = workspaces().find((dir) => httpPort(dir) === port);
   try {
-    const registry = JSON.parse(
-      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
-    );
-    const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
-    if (active?.ports?.http && nodeUrl().endsWith(`:${active.ports.http}`)) {
-      const token = fs
-        .readFileSync(path.join(duckHome, "workspaces", active.id, "admin.token"), "utf8")
-        .trim();
+    if (served) {
+      const token = fs.readFileSync(path.join(served, "admin.token"), "utf8").trim();
       if (token) operator = token;
     }
   } catch {
-    // no registry, no workspace dir, no credential — reads still work.
+    // no workspace behind the url, no credential — reads still work.
   }
   return operator;
 };

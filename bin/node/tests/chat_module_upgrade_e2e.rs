@@ -112,20 +112,14 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         .extra_toml
         .push("primary_coordinator = \"none\"".into());
     cluster.extra_toml.extend(common::sandbox_toml());
-    cluster.env[0] = vec![
-        (
-            "DUCKTAPE_CAPABILITY_DIR".into(),
-            specs.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_EXECUTOR_DIR".into(),
-            executors.display().to_string(),
-        ),
-        (
-            "DUCKTAPE_AGENT_RUNS_ROOT".into(),
-            fixtures.path().join("runs").display().to_string(),
-        ),
-    ];
+    cluster.sandbox[0] = Some(common::SandboxStage {
+        capabilities: Some(specs),
+        executors: Some(executors),
+    });
+    cluster.env[0] = vec![(
+        "DUCKTAPE_AGENT_RUNS_ROOT".into(),
+        fixtures.path().join("runs").display().to_string(),
+    )];
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", FINALIZE);
     cluster.wait_compute_marker(0, "compute daemon serving", ACTIVATE);

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cli_args::WorkspaceArgs;
 use crate::config;
 
 pub const FILE_NAME: &str = "gateway-routes.json";
@@ -212,31 +213,6 @@ pub(crate) enum GatewayCmd {
     List(WorkspaceArgs),
 }
 
-/// which workspace's `gateway-routes.json` a verb edits: an explicit
-/// `--workspace` wins, else `-n/--network` resolves through the registry.
-#[derive(Debug, clap::Args)]
-pub(crate) struct WorkspaceArgs {
-    /// explicit workspace dir (wins over -n)
-    #[arg(long, value_name = "DIR")]
-    workspace: Option<PathBuf>,
-    /// a registered workspace's chain id (`ducktape node list`)
-    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
-    network: Option<String>,
-}
-
-impl WorkspaceArgs {
-    fn dir(&self) -> Result<PathBuf, String> {
-        if let Some(dir) = &self.workspace {
-            return Ok(dir.clone());
-        }
-        if let Some(needle) = &self.network {
-            let (dir, _http) = config::resolve_network(needle)?;
-            return Ok(dir);
-        }
-        Err("gateway route command needs --workspace <dir> or -n/--network <id>".into())
-    }
-}
-
 /// route addressing: `--label api` names a subdomain route, absent = apex.
 #[derive(Debug, clap::Args)]
 pub(crate) struct RouteArgs {
@@ -301,8 +277,8 @@ fn bind(args: BindArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// (account, label) pair — see [`LocalRoute::account`] — so the account has to
 /// come from the operator, never from the request.
 fn consenting_account(workspace: &Path) -> Result<u64, Box<dyn std::error::Error>> {
-    let key = crate::boot::surfaces::operator_wallet_key()
-        .ok_or("no active wallet on this host — `ducktape wallet create` first")?;
+    let key = crate::boot::surfaces::operator_wallet_key(workspace)
+        .ok_or("no active wallet in this workspace — `ducktape wallet new <name>` first")?;
     let base = config::http_base_in(workspace)?;
     Ok(crate::account_cli::own_account(&base, &key)?.number)
 }
@@ -472,6 +448,7 @@ mod tests {
         RouteArgs {
             label: label.map(String::from),
             workspace: WorkspaceArgs {
+                config: None,
                 workspace: Some(dir.to_path_buf()),
                 network: network.map(String::from),
             },

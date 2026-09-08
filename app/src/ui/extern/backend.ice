@@ -145,18 +145,28 @@ extern crate::backend
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
   HubProbe(id:str, live:bool, height:i64)
   WalletInfo(name:str, pubkey:str, state:str, active:bool)
-  HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
+  HubState(networks:[HubNetwork], preselect:str)
   hub_state() -> HubState
+  // THE PICKED NETWORK'S KEYSTORE. A wallet is an identity on one network,
+  // kept in that network's workspace, so the rows are loaded on the pick —
+  // and the load settles the session's identity to that workspace's active
+  // wallet (read without a password). `keystore` is false for an endpoint
+  // this device holds no workspace for: a remote, read-only.
+  WalletList(wallets:[WalletInfo], error:str, keystore:bool)
+  load_wallets(rpc:str) -> WalletList
+  pure wallet_door(list:&WalletList) -> WalletDoor
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
   pure network_run_hint(row:&HubNetwork) -> str
   pure hub_entry_step(wallets:[WalletInfo]) -> HubStep
   pure preselect_wallet(wallets:[WalletInfo]) -> str
-  pure refreshed_wallet_selection(wallets:[WalletInfo], current:str, preselect:str) -> str
   pure short_pubkey(pubkey:&str) -> str
-  pure active_wallet_label(name:&str) -> str
+  pure wallet_caption(network:&str) -> str
+  pure password_caption(network:&str) -> str
   pure wallet_info(name:str, pubkey:str, state:str, active:bool) -> WalletInfo
+  pure wallet_list(wallets:[WalletInfo], error:str, keystore:bool) -> WalletList
   pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
+  pure selected_network_name(networks:[HubNetwork], id:str) -> str
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
@@ -188,19 +198,18 @@ extern crate::backend
   // makes the bend safe: `hub_step` changes on every entry to these two steps,
   // so the view re-runs them. Never put either behind a `derived` — that would
   // cache an empty grid for the life of the frame cache.
-  create_device_key(password:str) -> str ! AppError
+  create_device_key(rpc:str, password:str) -> str ! AppError
   PhraseRow(left_number:str, left_word:str, right_number:str, right_word:str)
   pure phrase_rows() -> [PhraseRow]
   pure phrase_rows_of(words:&str) -> [PhraseRow]
   pure recovery_prompt() -> str
-  confirm_recovery_phrase(answer:str, password:str) -> str ! AppError
-  restore_user_key(name:str, words:secret, password:str) -> str ! AppError
-  unlock_wallet(name:str, password:str) -> str ! AppError
-  unlock_user_key(password:str) -> str ! AppError
+  confirm_recovery_phrase(rpc:str, answer:str, password:str) -> str ! AppError
+  restore_user_key(rpc:str, name:str, words:secret, password:str) -> str ! AppError
+  unlock_wallet(rpc:str, name:str, password:str) -> str ! AppError
+  unlock_user_key(rpc:str, password:str) -> str ! AppError
   lock_signer() -> bool
   remember_network(rpc:str) -> bool
-  forget_network(id:str, kind:str) -> bool
-  restore_hidden_networks() -> bool
+  forget_network(id:str) -> bool
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
@@ -300,7 +309,6 @@ extern crate::backend
   // seam for the "no account" reading Ice cannot construct itself.
   chain_id_of(rpc:str) -> str ! AppError
   pure account_data_none(generation:i64) -> AccountData
-  pure pick_gate(password:&str) -> PickGate
   pure account_probe(found:bool) -> AccountProbe
   set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
   create_account(rpc:str, password:str, name:str) -> bool ! AppError
@@ -331,7 +339,6 @@ extern crate::backend
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
-  forget_workspace(rpc:str) -> bool ! AppError
   ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])

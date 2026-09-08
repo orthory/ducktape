@@ -34,8 +34,7 @@ component Brand()
 
 // The chain chip left of the network name — a 15px ink plate with the mark.
 // The chip is the way BACK: clicking the network's name returns to the
-// launch window's picker without forgetting anything — the non-destructive
-// sibling of Danger Zone's forget.
+// launch window's picker; the session ends with the network it was on.
 component NetworkChip(name:str)
   emits
     switch_network

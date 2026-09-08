@@ -6,12 +6,14 @@
 //! `PATH` worked for as long as nobody built an image on a Mac — where the
 //! vendor's installer produces a Mach-O binary the guest cannot exec at all.
 //!
-//! So the binary is acquired deliberately, into `~/.ducktape/executors`, and
-//! the node derives the guest's copy from whatever is there
-//! (`sandbox_host::executor_image`). This verb owns that directory, the pinned
-//! versions, and the one approved way to fill it.
+//! So the binary is acquired deliberately, into the WORKSPACE's `executors/`
+//! directory — per network, like every other file a node runs with: two
+//! networks on one machine lend two independent sets, and a throwaway network
+//! takes its CLIs with it when it goes — and the node derives the guest's copy
+//! from whatever is there (`sandbox_host::executor_image`). This verb owns that
+//! directory, the pinned versions, and the one approved way to fill it.
 //!
-//! TWO RULES IT EXISTS TO KEEP:
+//! THREE RULES IT EXISTS TO KEEP:
 //!
 //! 1. NOTHING IS FETCHED WITHOUT THE OPERATOR ASKING FOR IT. Bare
 //!    `agent install` shows what is missing and what installing it would
@@ -21,6 +23,12 @@
 //!    published beside an artifact proves only that the download was not
 //!    corrupted in flight — it comes from the same place the artifact does.
 //!    The expected hash lives here, where changing it is a reviewed diff.
+//! 3. WHAT WAS INSTALLED IS WRITTEN DOWN. A receipt beside the directory
+//!    (`<workspace>/executors.toml`) records, per provider, the release this
+//!    verb installed and the sha256 of the bytes it wrote. That is what lets a
+//!    pin bump show up as `BUMP` on the next `agent install` instead of a
+//!    silent `ok` over stale bytes, and what keeps the operator's own build
+//!    from ever being offered for replacement unasked.
 //!
 //! WHY THE HASH MATTERS MORE THAN USUAL: this executable runs inside the
 //! sandbox that holds the operator's provider credential. The sandbox is what
@@ -28,10 +36,11 @@
 //! it.
 //!
 //! The operator does not have to use this verb at all — dropping their own
-//! Linux build into the directory is equally valid, and the image builder's
-//! ELF check stays for exactly that case. This is a convenience with a
-//! receipt, not a gate.
+//! Linux build into the directory is equally valid (it reports as `own`), and
+//! the image builder's ELF check stays for exactly that case. This is a
+//! convenience with a receipt, not a gate.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -53,7 +62,8 @@ const CLAUDE_VERSION: &str = "2.1.231";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InstallArgs {
-    /// which CLIs to install (omitted = a checklist of what is missing)
+    /// which CLIs to install (omitted = a checklist of what is missing or
+    /// behind this build's pin)
     #[arg(value_name = "NAME")]
     providers: Vec<ProviderArg>,
 }
@@ -175,41 +185,95 @@ fn download_dir(executors: &Path) -> PathBuf {
     executors.with_extension("download")
 }
 
-pub(crate) fn run(args: InstallArgs) -> InstallResult {
-    let arch = GuestArch::host()?;
-    let dir = workspace_config::executor_dir()?;
-    print_status(&dir, arch);
+// ---- the receipts -----------------------------------------------------------
 
-    // Named providers are the operator's explicit ask — already the approval a
-    // checklist would collect, so it is not collected twice.
-    if !args.providers.is_empty() {
-        return install_all(&args.providers, &dir, arch);
-    }
-
-    let missing: Vec<ProviderArg> = ALL
-        .into_iter()
-        .filter(|p| !is_installed(*p, &dir, arch))
-        .collect();
-    if missing.is_empty() {
-        println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
-        return Ok(());
-    }
-    let chosen = choose(&missing, arch)?;
-    if chosen.is_empty() {
-        return Ok(());
-    }
-    install_all(&chosen, &dir, arch)
+/// What this verb installed, per provider — `<workspace>/executors.toml`,
+/// beside the directory it describes for the same reason the staging dir is:
+/// the directory's whole contents become the guest image.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Receipts {
+    #[serde(flatten)]
+    providers: BTreeMap<String, Receipt>,
 }
 
-/// Every file a provider's download installs is present and executable.
-/// A partial install reports as missing rather than as present: codex without
-/// its Code Mode companion is a codex that dies at startup inside the guest.
-fn is_installed(provider: ProviderArg, dir: &Path, arch: GuestArch) -> bool {
-    provider
-        .download(arch)
-        .files()
-        .iter()
-        .all(|f| is_executable(&dir.join(f)))
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Receipt {
+    /// the pinned release the download carried
+    version: String,
+    /// sha256 of the installed primary binary (`<executors>/<provider>`) —
+    /// the bytes this verb wrote, so a file the operator has since replaced
+    /// reads as their own build rather than as this receipt's
+    sha256: String,
+}
+
+impl Receipts {
+    fn path(executors: &Path) -> PathBuf {
+        executors.with_extension("toml")
+    }
+
+    fn load(executors: &Path) -> Result<Self, String> {
+        let path = Self::path(executors);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
+        };
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    fn save(&self, executors: &Path) -> Result<(), String> {
+        let path = Self::path(executors);
+        let text = toml::to_string(self).map_err(|e| format!("encode {}: {e}", path.display()))?;
+        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// What the directory holds for one provider, measured against this build's
+/// pin and the receipts.
+#[derive(Debug, PartialEq, Eq)]
+enum Installed {
+    /// no complete, executable set of the provider's files
+    Missing,
+    /// installed by this verb, at this build's pin
+    Pinned { sha256: String },
+    /// installed by this verb at an earlier pin: the bump the checklist offers
+    Superseded { installed: String },
+    /// executable bytes this verb did not write, or wrote and the operator has
+    /// since replaced — their own Linux build. Never offered; replaced only by
+    /// naming it (`agent install <name>`).
+    Foreign { sha256: String },
+}
+
+impl Installed {
+    /// what the checklist proposes: absent, or behind this build's pin.
+    fn is_offered(&self) -> bool {
+        matches!(self, Self::Missing | Self::Superseded { .. })
+    }
+}
+
+fn installed(provider: ProviderArg, dir: &Path, arch: GuestArch, receipts: &Receipts) -> Installed {
+    let download = provider.download(arch);
+    // A partial install reports as missing rather than as present: codex
+    // without its Code Mode companion is a codex that dies at startup inside
+    // the guest.
+    let every_file_executable = download.files().iter().all(|f| is_executable(&dir.join(f)));
+    if !every_file_executable {
+        return Installed::Missing;
+    }
+    let sha256 = sha256_file(&dir.join(provider.token())).unwrap_or_else(|_| "?".into());
+    let Some(receipt) = receipts.providers.get(provider.token()) else {
+        return Installed::Foreign { sha256 };
+    };
+    let bytes_are_the_receipts = sha256 == receipt.sha256;
+    if !bytes_are_the_receipts {
+        return Installed::Foreign { sha256 };
+    }
+    if receipt.version == download.version {
+        return Installed::Pinned { sha256 };
+    }
+    Installed::Superseded {
+        installed: receipt.version.clone(),
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -219,54 +283,98 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// What is here, and — for what is not — exactly what installing it would
-/// download. This IS the proposal the checklist below then asks approval for,
-/// so it names the vendor url and the sha256 this build expects, in full.
-fn print_status(dir: &Path, arch: GuestArch) {
+pub(crate) fn run(args: InstallArgs, workspace: &Path) -> InstallResult {
+    let arch = GuestArch::host()?;
+    let dir = workspace_config::executor_dir(workspace);
+    let receipts = Receipts::load(&dir)?;
+    let survey: Vec<(ProviderArg, Installed)> = ALL
+        .into_iter()
+        .map(|provider| (provider, installed(provider, &dir, arch, &receipts)))
+        .collect();
+    print_status(&dir, arch, &survey);
+
+    // Named providers are the operator's explicit ask — already the approval a
+    // checklist would collect, so it is not collected twice.
+    if !args.providers.is_empty() {
+        return install_all(&args.providers, &dir, arch);
+    }
+
+    let offered: Vec<ProviderArg> = survey
+        .iter()
+        .filter(|(_, state)| state.is_offered())
+        .map(|(provider, _)| *provider)
+        .collect();
+    if offered.is_empty() {
+        println!("\nnothing to install. `ducktape agent install <name>` reinstalls one.");
+        return Ok(());
+    }
+    let chosen = choose(&offered, arch)?;
+    if chosen.is_empty() {
+        return Ok(());
+    }
+    install_all(&chosen, &dir, arch)
+}
+
+/// What is here, and — for what is not, or is behind the pin — exactly what
+/// installing it would download. This IS the proposal the checklist below then
+/// asks approval for, so it names the vendor url and the sha256 this build
+/// expects, in full.
+fn print_status(dir: &Path, arch: GuestArch, survey: &[(ProviderArg, Installed)]) {
     println!(
         "guest executors ({}, guest arch {})",
         dir.display(),
         arch.rust_triple_arch()
     );
-    for provider in ALL {
+    for (provider, state) in survey {
         let name = provider.token();
         let download = provider.download(arch);
-        if !is_installed(provider, dir, arch) {
-            println!("  MISS    {name:<8} {}", download.version);
-            println!("          {}", download.url);
-            println!("          sha256 {}", download.sha256);
-            continue;
+        match state {
+            Installed::Missing => {
+                println!("  MISS    {name:<8} {}", download.version);
+                println!("          {}", download.url);
+                println!("          sha256 {}", download.sha256);
+            }
+            Installed::Superseded { installed } => {
+                println!("  BUMP    {name:<8} {installed} -> {}", download.version);
+                println!("          {}", download.url);
+                println!("          sha256 {}", download.sha256);
+            }
+            // the hash of what is actually installed, so the image's contents
+            // stay attributable to a download without unpacking the image.
+            Installed::Pinned { sha256 } => println!(
+                "  ok      {name:<8} {} sha256:{}…",
+                download.version,
+                &sha256[..16.min(sha256.len())]
+            ),
+            Installed::Foreign { sha256 } => println!(
+                "  own     {name:<8} sha256:{}… (not installed by this verb; \
+                 `ducktape agent install {name}` replaces it)",
+                &sha256[..16.min(sha256.len())]
+            ),
         }
-        // the hash of what is actually installed, so the image's contents stay
-        // attributable to a download without unpacking the image.
-        let installed = sha256_file(&dir.join(name)).unwrap_or_else(|_| "?".into());
-        println!(
-            "  ok      {name:<8} sha256:{}…",
-            &installed[..16.min(installed.len())]
-        );
     }
 }
 
 /// The checklist — the approval step for the downloads [`print_status`] just
 /// proposed. Off a terminal there is nobody to approve, so it prints the
 /// commands and installs nothing.
-fn choose(missing: &[ProviderArg], arch: GuestArch) -> Result<Vec<ProviderArg>, String> {
+fn choose(offered: &[ProviderArg], arch: GuestArch) -> Result<Vec<ProviderArg>, String> {
     if !std::io::stdin().is_terminal() {
         println!("\nnot a terminal — install what you want with:");
-        for provider in missing {
+        for provider in offered {
             println!("  ducktape agent install {}", provider.token());
         }
         return Ok(Vec::new());
     }
 
     println!();
-    let items: Vec<String> = missing
+    let items: Vec<String> = offered
         .iter()
         .map(|p| format!("{:<8} {}", p.token(), p.download(arch).version))
         .collect();
     let picked = dialoguer::MultiSelect::new()
         .with_prompt(
-            "agent CLIs to install into this host's guest image (space toggles, enter confirms)",
+            "agent CLIs to install into this workspace's guest image (space toggles, enter confirms)",
         )
         .items(&items)
         .interact_opt()
@@ -274,13 +382,20 @@ fn choose(missing: &[ProviderArg], arch: GuestArch) -> Result<Vec<ProviderArg>, 
     let Some(picked) = picked else {
         return Ok(Vec::new());
     };
-    Ok(picked.into_iter().map(|i| missing[i]).collect())
+    Ok(picked.into_iter().map(|i| offered[i]).collect())
 }
 
 fn install_all(providers: &[ProviderArg], dir: &Path, arch: GuestArch) -> InstallResult {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let mut receipts = Receipts::load(dir)?;
     for provider in providers {
-        install_one(*provider, dir, arch)?;
+        let receipt = install_one(*provider, dir, arch)?;
+        receipts
+            .providers
+            .insert(provider.token().to_string(), receipt);
+        // saved per install, so a second download failing does not lose the
+        // first one's receipt.
+        receipts.save(dir)?;
     }
     // Nothing else to do: the node derives the guest's copy from this directory
     // and rebuilds it whenever the directory has moved on, so the next run
@@ -288,7 +403,11 @@ fn install_all(providers: &[ProviderArg], dir: &Path, arch: GuestArch) -> Instal
     Ok(())
 }
 
-fn install_one(provider: ProviderArg, dir: &Path, arch: GuestArch) -> InstallResult {
+fn install_one(
+    provider: ProviderArg,
+    dir: &Path,
+    arch: GuestArch,
+) -> Result<Receipt, Box<dyn std::error::Error>> {
     let download = provider.download(arch);
     println!(
         "\n{} {} <- {}",
@@ -311,7 +430,10 @@ fn install_one(provider: ProviderArg, dir: &Path, arch: GuestArch) -> InstallRes
     // lives in the executors directory, and 200+ MB of tarball does not.
     let _ = std::fs::remove_file(&artifact);
     println!("  installed {} -> {}", provider.token(), dir.display());
-    Ok(())
+    Ok(Receipt {
+        version: download.version.to_string(),
+        sha256: sha256_file(&dir.join(provider.token()))?,
+    })
 }
 
 /// Download to `dest` unless it is already there, then verify — a cached file
@@ -496,6 +618,13 @@ fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dt-exec-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// The meter's only real arithmetic is the fill, and it has to hold at both
     /// ends and on a server that sends no `Content-Length` — the bar is drawn
     /// against a quarter-gigabyte download nobody can otherwise tell from a
@@ -554,24 +683,90 @@ mod tests {
     }
 
     /// codex is useless in the guest without its Code Mode companion, so a
-    /// directory holding only `codex` must report as missing, not installed.
+    /// directory holding only `codex` must report as missing, not installed —
+    /// and a complete set nobody wrote a receipt for is the operator's own.
     #[test]
     fn a_partial_install_reports_as_missing() {
-        let dir = std::env::temp_dir().join(format!("dt-exec-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("partial");
         let arch = GuestArch::Aarch64;
+        let receipts = Receipts::default();
 
         install_file(&std::env::current_exe().unwrap(), &dir.join("codex")).unwrap();
-        assert!(!is_installed(ProviderArg::Codex, &dir, arch));
+        assert_eq!(
+            installed(ProviderArg::Codex, &dir, arch, &receipts),
+            Installed::Missing
+        );
         install_file(
             &std::env::current_exe().unwrap(),
             &dir.join("codex-code-mode-host"),
         )
         .unwrap();
-        assert!(is_installed(ProviderArg::Codex, &dir, arch));
+        assert!(matches!(
+            installed(ProviderArg::Codex, &dir, arch, &receipts),
+            Installed::Foreign { .. }
+        ));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The receipt is what tells a pin from a bump from the operator's own
+    /// build: the same bytes read as `ok` under a receipt at this build's
+    /// version, as `BUMP` under an older one, and as `own` under a receipt
+    /// whose hash the file no longer matches — the operator replaced it, and a
+    /// checklist that offered to replace THAT back would be doing the one
+    /// thing this verb exists not to do.
+    #[test]
+    fn a_receipt_tells_a_pin_from_a_bump_from_the_operators_own_build() {
+        let workspace = scratch("receipts");
+        let dir = workspace_config::executor_dir(&workspace);
+        std::fs::create_dir_all(&dir).unwrap();
+        let arch = GuestArch::X86_64;
+        install_file(&std::env::current_exe().unwrap(), &dir.join("claude")).unwrap();
+        let sha256 = sha256_file(&dir.join("claude")).unwrap();
+
+        let mut receipts = Receipts::default();
+        receipts.providers.insert(
+            "claude".into(),
+            Receipt {
+                version: CLAUDE_VERSION.into(),
+                sha256: sha256.clone(),
+            },
+        );
+        assert_eq!(
+            installed(ProviderArg::Claude, &dir, arch, &receipts),
+            Installed::Pinned {
+                sha256: sha256.clone()
+            }
+        );
+
+        receipts.providers.get_mut("claude").unwrap().version = "0.0.1".into();
+        assert_eq!(
+            installed(ProviderArg::Claude, &dir, arch, &receipts),
+            Installed::Superseded {
+                installed: "0.0.1".into()
+            }
+        );
+        assert!(installed(ProviderArg::Claude, &dir, arch, &receipts).is_offered());
+
+        receipts.providers.get_mut("claude").unwrap().sha256 = "0".repeat(64);
+        let own = installed(ProviderArg::Claude, &dir, arch, &receipts);
+        assert_eq!(own, Installed::Foreign { sha256 });
+        assert!(!own.is_offered());
+
+        // the receipts round-trip through the file beside the directory.
+        receipts.save(&dir).unwrap();
+        assert_eq!(Receipts::path(&dir), workspace.join("executors.toml"));
+        let reloaded = Receipts::load(&dir).unwrap();
+        assert_eq!(reloaded.providers, receipts.providers);
+        // and an absent file is simply no receipts.
+        assert!(
+            Receipts::load(&scratch("no-receipts").join("executors"))
+                .unwrap()
+                .providers
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(&workspace).unwrap();
     }
 
     /// The verify gate: an unexpected hash deletes the file and refuses. This
@@ -579,9 +774,7 @@ mod tests {
     /// present `dest` skips the download.
     #[test]
     fn a_mismatched_download_is_deleted_and_refused() {
-        let dir = std::env::temp_dir().join(format!("dt-exec-fetch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("fetch");
         let dest = dir.join("artifact");
         std::fs::write(&dest, b"not what the pin says").unwrap();
 

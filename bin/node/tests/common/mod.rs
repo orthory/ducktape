@@ -446,10 +446,15 @@ pub struct Cluster {
     /// claim capability-gated work. `None` = no grant at all.
     pub compute_grant: Option<Vec<String>>,
     /// extra environment variables for node `idx`'s process, index-aligned
-    /// with `peer_ids` (what gives each node its own capability-provider
-    /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
-    /// empty per node by default; set before spawn — a respawn re-applies.
+    /// with `peer_ids` (a spec's `detect.env` override, a runs root, a log
+    /// filter). empty per node by default; set before spawn — a respawn
+    /// re-applies.
     pub env: Vec<Vec<(String, String)>>,
+    /// node `idx`'s compute-plane files, index-aligned with `peer_ids`:
+    /// `Some` stages them under the node's WORKSPACE on every spawn, the way
+    /// `services.toml` is — a node booting a `[sandbox]` table needs at least
+    /// the guest images there; `None` stages nothing. set before spawn.
+    pub sandbox: Vec<Option<SandboxStage>>,
     /// declared BEFORE `dir` so drop order kills + reaps every child first —
     /// removing the tempdir under live processes races their qmdb/journal
     /// writes and silently leaks the subtree.
@@ -1120,6 +1125,7 @@ impl Cluster {
             service_kinds: peer_ids.iter().map(|_| Vec::new()).collect(),
             services: peer_ids.iter().map(|_| Vec::new()).collect(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
+            sandbox: peer_ids.iter().map(|_| None).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
         }
@@ -1138,7 +1144,30 @@ impl Cluster {
         let path = self.dir.path().join(format!("node{id}.toml"));
         std::fs::write(&path, self.config_toml(idx, self.dir.path())).expect("write node config");
         self.write_service_grants(idx);
+        self.stage_sandbox(idx);
         path
+    }
+
+    /// stage node `idx`'s compute-plane files under its workspace
+    /// ([`Cluster::sandbox`]): the box's guest build linked in as `guest/`,
+    /// and the node's own capability specs and executors — each an EMPTY
+    /// directory when the stage names none, so the node discovers nothing
+    /// whatever this box has installed elsewhere.
+    fn stage_sandbox(&self, idx: usize) {
+        let Some(stage) = &self.sandbox[idx] else {
+            return;
+        };
+        let workspace = self.workspace(idx);
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        stage_slot(&workspace_config::guest_dir(&workspace), Some(&guest_dir()));
+        stage_slot(
+            &workspace_config::capability_dir(&workspace),
+            stage.capabilities.as_deref(),
+        );
+        stage_slot(
+            &workspace_config::executor_dir(&workspace),
+            stage.executors.as_deref(),
+        );
     }
 
     /// the node.toml body [`Cluster::config_path`] writes, rooted at `root`
@@ -1511,10 +1540,12 @@ impl Cluster {
         self.invite_ports.push(ports[3]);
         self.rpc_ports.push(ports[1]);
         self.http_ports.push(ports[2]);
-        // keep `advertised`/`env` index-aligned with the extended index space
-        // so a later `config_path(joiner_idx)` / `spawn` never panics.
+        // keep `advertised`/`env`/`sandbox` index-aligned with the extended
+        // index space so a later `config_path(joiner_idx)` / `spawn` never
+        // panics.
         self.advertised.push(None);
         self.env.push(Vec::new());
+        self.sandbox.push(None);
         self.nodes.push(Some(joiner));
         self.peer_ids.len() - 1
     }
@@ -1973,32 +2004,44 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 // how one of them ended up gating on a runtime's version string while the other
 // gated on the product's own predicate.
 
+/// What a node's WORKSPACE holds for its compute plane. The guest images are
+/// the box's one build ([`guest_dir`]), linked in as `<workspace>/guest`; the
+/// capability specs and the executors are the node's own, and `None` for
+/// either stages an EMPTY directory — a hermetic node, which discovers
+/// nothing whatever this box has installed elsewhere. [`Cluster::sandbox`]
+/// stages one per node.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxStage {
+    pub capabilities: Option<PathBuf>,
+    pub executors: Option<PathBuf>,
+}
+
+/// `slot` becomes a link to `target`, or an empty directory without one —
+/// replacing whatever the previous spawn staged there.
+fn stage_slot(slot: &Path, target: Option<&Path>) {
+    let _ = std::fs::remove_dir_all(slot);
+    match target {
+        Some(target) => std::os::unix::fs::symlink(target, slot).expect("stage a workspace link"),
+        None => std::fs::create_dir_all(slot).expect("stage an empty workspace dir"),
+    }
+}
+
 /// the `[sandbox]` table a cluster node boots with. Appended LAST to
 /// [`Cluster::extra_toml`] — nothing may follow a toml table header.
 ///
 /// It says only HOW a run is isolated. WHETHER this node runs any is
 /// [`Cluster::compute_grant`]; the daemon needs both, and refuses to boot
-/// without the table.
-///
-/// Every node in a cluster names the SAME two images, and that is now free
-/// rather than expensive: the guest kernel and rootfs are read-only and shared,
-/// so N nodes attach one copy. The container backend gave each daemon its own
-/// graph root, which meant a three-node cluster pulled its image three times
-/// into three empty stores on every run — the reason that helper took an image
-/// argument and defaulted to the smallest one that could work.
+/// without the table. WHICH images it boots is the workspace's own
+/// `guest/` — [`Cluster::sandbox`] stages it — so the table names no path.
 ///
 /// The runtime is the platform's own hypervisor flavor — the same choice
-/// [`guest_backend`] probes with — so the daemon this table boots is the one
-/// the capability gate just proved can run.
+/// [`unsandboxable_host`] probes with — so the daemon this table boots is the
+/// one the capability gate just proved can run.
 pub fn sandbox_toml() -> Vec<String> {
-    let dir =
-        std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| guest_dir().display().to_string());
     let runtime = provider_host::Vmm::platform_default().config_token();
     vec![
         "[sandbox]".into(),
         format!("runtime = {runtime:?}"),
-        format!("kernel = {:?}", format!("{dir}/vmlinux")),
-        format!("rootfs = {:?}", format!("{dir}/rootfs.ext4")),
         "cores = 0".into(),
         "mem_gb = 0".into(),
     ]
@@ -2015,48 +2058,86 @@ pub fn sandbox_toml() -> Vec<String> {
 /// on the weaker question runs anyway and FAILS instead of skipping. Gating on
 /// `probe()` means a suite skips when, and only when, a real node would refuse
 /// to serve compute.
+///
+/// The images are the box's one guest build, named by `DUCKTAPE_GUEST_DIR`:
+/// a node keeps its own copy under its workspace, and a lane links every
+/// node's at that build. Unset, no lane can sandbox.
 pub fn unsandboxable_host() -> Option<String> {
-    guest_backend().probe().err()
+    let Some(guest) = guest_dir_env() else {
+        return Some(
+            "DUCKTAPE_GUEST_DIR is unset: point it at a guest build (ops/build-guest-rootfs.sh)"
+                .into(),
+        );
+    };
+    let backend = provider_host::SandboxBackend::MicroVm {
+        vmm: provider_host::Vmm::platform_default(),
+        kernel: guest.join("vmlinux"),
+        rootfs: guest.join("rootfs.ext4"),
+        // the probe reads the images and the host, never the executors: what
+        // a node's runs can exec is staged per node (`SandboxStage`).
+        executors: PathBuf::new(),
+    };
+    backend.probe().err()
 }
 
-/// the backend an e2e node is configured with: the guest artifacts
-/// `ops/build-guest-rootfs.sh` produces, overridable for a box that keeps them
-/// somewhere else.
-pub fn guest_backend() -> provider_host::SandboxBackend {
-    let vmm = provider_host::Vmm::platform_default();
-    let dir = std::env::var("DUCKTAPE_GUEST_DIR").map_or_else(|_| guest_dir(), PathBuf::from);
-    provider_host::SandboxBackend::MicroVm {
-        vmm,
-        kernel: dir.join("vmlinux"),
-        rootfs: dir.join("rootfs.ext4"),
-        // the operator's own installed CLIs, exactly as a real node resolves
-        // them: an e2e run execs what this box actually has.
-        executors: workspace_config::executor_dir().expect("executor dir"),
-    }
+/// the box's guest build (`DUCKTAPE_GUEST_DIR`): the one `vmlinux` +
+/// `rootfs.ext4` a sandboxed lane links into each node's workspace, where an
+/// operator's `node sandbox` builds them outright.
+pub fn guest_dir_env() -> Option<PathBuf> {
+    std::env::var_os("DUCKTAPE_GUEST_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
-/// where the guest artifacts live by default — the same answer
-/// `workspace-config::default_guest_dir` gives `node init`.
-pub fn guest_dir() -> std::path::PathBuf {
-    workspace_config::default_guest_dir().expect("guest dir")
+/// [`guest_dir_env`] past the gate: [`skip_unless_sandboxed`] admits no lane
+/// without it.
+pub fn guest_dir() -> PathBuf {
+    guest_dir_env().expect("DUCKTAPE_GUEST_DIR: the sandbox gate admits no lane without it")
 }
 
-/// Install only the real Linux shell used by the scripted provider fixture.
-/// MicroVM discovery reads this directory; host-path detect overrides are
-/// intentionally ignored by the production loader.
-pub fn script_executor_dir(root: &std::path::Path) -> PathBuf {
+/// the executors a LIVE lane runs — the box's own `ducktape agent install`
+/// output, named by `DUCKTAPE_EXECUTOR_DIR`. Only a lane that execs a real
+/// agent CLI reads this; a scripted fixture lifts its shell out of the guest
+/// ([`script_executor_dir`]).
+pub fn installed_executor_dir() -> PathBuf {
+    std::env::var_os("DUCKTAPE_EXECUTOR_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .expect("DUCKTAPE_EXECUTOR_DIR: a live lane execs the box's installed agent CLIs")
+}
+
+/// Install only the real Linux shell the scripted provider fixtures run as
+/// `sh`: the guest's own `dash`, lifted out of its rootfs — an executor runs
+/// INSIDE the guest, and the host's shell links a libc the guest need not
+/// carry. MicroVM discovery reads this directory; host-path detect overrides
+/// are intentionally ignored by the production loader.
+pub fn script_executor_dir(root: &Path) -> PathBuf {
     let dir = root.join("executors");
     std::fs::create_dir_all(&dir).expect("fixture executors dir");
-    let shell = workspace_config::executor_dir()
-        .expect("installed executor dir")
-        .join("sh");
-    std::fs::copy(&shell, dir.join("sh")).unwrap_or_else(|error| {
-        panic!(
-            "install a guest-compatible Linux sh at {}: {error}",
-            shell.display()
-        )
-    });
+    guest_binary("/usr/bin/dash", &dir.join("sh"));
     dir
+}
+
+/// copy one file out of the guest rootfs to `dest`, mode and all — how a
+/// fixture gets a binary the guest can exec. `debugfs` answers a missing
+/// path with a message and a clean exit, hence the file check.
+pub fn guest_binary(path_in_guest: &str, dest: &Path) {
+    let rootfs = guest_dir().join("rootfs.ext4");
+    let debugfs =
+        sandbox_host::find_system_tool("debugfs").expect("debugfs: the sandbox gate probed it");
+    let out = Command::new(debugfs)
+        .arg("-R")
+        .arg(format!("dump -p {path_in_guest} {}", dest.display()))
+        .arg(&rootfs)
+        .output()
+        .expect("run debugfs");
+    let lifted = out.status.success() && dest.is_file();
+    assert!(
+        lifted,
+        "lift {path_in_guest} out of {}:\n{}",
+        rootfs.display(),
+        command_output(&out)
+    );
 }
 
 /// `Some(())` = this test cannot run here and the caller must return; `None` =
