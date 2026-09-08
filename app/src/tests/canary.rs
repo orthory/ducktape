@@ -377,8 +377,8 @@ fn the_canary_captures_every_transition_of_a_deployment() {
     // each step once the runner has captured the one before
     for (count, artifact) in [&b, &b_prime, &removed].into_iter().enumerate() {
         let until = Instant::now() + Duration::from_secs(60);
-        // the log, and one PNG per capture so far
-        while std::fs::read_dir(&out).map_or(0, |dir| dir.count()) < count + 2 {
+        // one PNG per capture so far (a .txt sits beside each, and the log)
+        while !out.is_dir() || pngs(&out).len() < count + 1 {
             assert!(Instant::now() < until, "capture {} never came", count + 1);
             std::thread::sleep(Duration::from_millis(100));
         }
