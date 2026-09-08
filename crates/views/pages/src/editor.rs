@@ -643,10 +643,22 @@ impl History {
         }
     }
 
-    /// The host applied a step from `before`: record it. A `Native` step is
-    /// grouped by this policy; an explicit `NewGroup` / `ExtendPrevious` is
-    /// taken as stated; `Undo` / `Redo` already moved the stacks.
-    pub fn commit(&mut self, before: &Doc, history: EditorHistoryEffect, input_time_ms: u64) {
+    /// The host applied a step from `before` to `after`: record it. A
+    /// `Native` step is grouped by this policy; an explicit `NewGroup` /
+    /// `ExtendPrevious` is taken as stated; `Undo` / `Redo` already moved
+    /// the stacks. A commit that left the text alone — a `Noop` ack, a
+    /// caret observation — is no step: it neither opens a group nor
+    /// clears the redo lane.
+    pub fn commit(
+        &mut self,
+        before: &Doc,
+        after: &Doc,
+        history: EditorHistoryEffect,
+        input_time_ms: u64,
+    ) {
+        if before.text == after.text {
+            return;
+        }
         let effect = match history {
             EditorHistoryEffect::Native => self.group_effect(input_time_ms),
             EditorHistoryEffect::Undo | EditorHistoryEffect::Redo => return,
