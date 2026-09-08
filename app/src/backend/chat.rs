@@ -361,12 +361,15 @@ pub async fn join_huddle(
         let node = public_key(&status.public_key, "node public key")?;
         // Proof of possession: THIS node signs the join under its own key —
         // never asserted by the joiner — so the roster can only ever name a
-        // node that agreed to route this user's media (issue #1792).
-        let user = local_user_key()
-            .await
-            .ok_or_else(|| "no local user key to join a huddle as".to_string())?;
-        let (_, node_proof_hex) = rpc
-            .huddle_node_proof(&channel_id, &hex_encode(&user))
+        // node that agreed to route this user's media (issue #1792). The mint
+        // is a SIGNED request: the node binds the key that signed it, which
+        // is what lets a device join through a node it does not host — no
+        // operator token, just the person's own account key.
+        let signed = rpc
+            .clone()
+            .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
+        let (_, node_proof_hex) = signed
+            .huddle_node_proof(&channel_id)
             .await
             .map_err(|error| error.to_string())?;
         let node_proof = hex_decode(&node_proof_hex)
