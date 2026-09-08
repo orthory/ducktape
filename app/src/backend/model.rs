@@ -1018,16 +1018,10 @@ pub fn copy_range_rows(
     }
 }
 
-/// Where a click lands the range. A plain click starts a new one-message range
-/// here; a shift-click keeps the anchor and moves the far end — the gesture
-/// every list in every desktop app already answers. A shift-click in the OTHER
-/// surface starts fresh rather than drawing a range across both.
-///
-/// A PENDING ROW IS NOT AN END. A message still in flight carries a negative
-/// seq (`chat::client` numbers pending rows down from -1), and a range with one
-/// at either end covers no rows at all: the bar — which holds the only Clear
-/// button — would vanish while the ⌘C route, armed on the anchor, stayed armed
-/// with nothing to disarm it. So a press on one clears the range instead.
+/// Extend a shift-selected range within one surface, starting a new range if
+/// there is no anchor in that surface. The handler routes plain clicks separately.
+/// Pending rows have negative sequence numbers and clear the range so its copy
+/// shortcut cannot remain armed without a visible Clear button.
 pub fn copy_range_after_press(
     anchor: i64,
     surface: crate::CopySurface,

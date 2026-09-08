@@ -305,7 +305,7 @@ fn the_more_button_opens_the_menu_and_the_heart_opens_the_grid() {
 }
 
 #[test]
-fn a_copy_range_is_one_bar_above_the_timeline_and_a_plain_press_is_only_a_press() {
+fn a_copy_range_stays_above_the_scroller_and_clear_routes_to_the_host() {
     on_a_deep_stack(|| {
         let (subscription, _) = shown(&facts());
         let ranged = ChatProps {

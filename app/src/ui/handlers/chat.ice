@@ -1345,7 +1345,7 @@ on thread_reply_sent(next)
 // `MessageCard`) — a drag that followed the cursor from row to row would need
 // an enter route and a full rebuild per row crossed, which is the per-hover
 // round trip `DiffRow` refuses by name. So the gesture is the one every
-// desktop list already answers: click an end, shift-click the other.
+// desktop list already answers: shift-click an end, then shift-click the other.
 // ============================================================================
 
 // A press on a message's prose, in either surface. Plain, it is only a press

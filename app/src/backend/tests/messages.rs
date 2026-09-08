@@ -1146,7 +1146,7 @@ fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
     assert_eq!(
         (cleared.anchor, cleared.head),
         (0, 0),
-        "a plain click on one"
+        "a pending row cannot begin a range"
     );
     assert_eq!(cleared.surface, Nowhere);
 
