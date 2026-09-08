@@ -145,7 +145,9 @@ fn thread_messages_mirror_the_main_action_system() {
     // `in_range` is the fourth reading, and it is a reading and not a second
     // selection: a reply inside the copy range wears the lighter plate, while
     // `selected` still means the deep-link target and nothing else.
-    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)"));
+    assert!(
+        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)")
+    );
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("../ui/screens/chat.ice"));

@@ -44,7 +44,7 @@ pub struct ChatChannel {
     pub head_seq: i64,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ChatReaction {
     pub emoji: String,
     pub count: i64,
@@ -254,7 +254,7 @@ impl<'a> ChatReader<'a> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ChatMessage {
     pub id: String,
     /// Numeric identity for Ice's keyed virtual timeline. The language cannot
@@ -405,7 +405,7 @@ fn next_message_view_key() -> i64 {
 /// `quote` | `divider`. Plain paragraphs/quotes carry their exact text in
 /// `text` (`rich=false`); formatted ones carry run-level `spans` the view's
 /// single rich-text paragraph renders (`rich=true`).
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ChatBlock {
     pub kind: String,
     pub text: String,
@@ -421,7 +421,7 @@ pub struct ChatBlock {
 /// arm choice has to be data — the view emits every arm for every run and an
 /// empty span draws no glyphs. A run landing in two fields renders twice; a
 /// run landing in none vanishes ([`span_arm`] owns the decision).
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
+#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ChatSpan {
     pub mention: String,
     pub link_text: String,

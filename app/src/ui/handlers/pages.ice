@@ -144,7 +144,7 @@ on create_page_submit
 on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
-  task widget focus #workspace-tabs/content/pages/new-page window=window_target(console_win)
+  task widget focus #workspace-tabs/content/pages/new-page
 
 on arm_page_delete
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)

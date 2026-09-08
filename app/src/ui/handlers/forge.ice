@@ -1,6 +1,73 @@
 // FORGE — repos, the tracker, one item with its reviews, its merge and its
 // discussion. The list/repo/item loaders key on `forge_generation`; the
 // replace-lane discussion and code reads carry their semantic scope instead.
+//
+// The screen is the `forge` MODULE VIEW (crates/views/forge): everything
+// below is reached from `forge_view_event`, one intent per act, and the
+// facts go back as props (view.ice). The review body and the line comment
+// being written are the view's; the app hears them on submit and reports
+// which drafts an op consumed through `forge_drafts_cleared`.
+
+// EVERY INTENT THE VIEW SENDS lands here, and the handler that signs the
+// act stays where it was: a shared handler is reached through a flow, an
+// act with nothing shared is signed in its arm.
+on forge_view_event(event)
+  match forge_intent(event)
+    ForgeIntent.open_repo
+      flow
+        from done event_text(event, "name")
+        done -> forge_open_repo _
+    ForgeIntent.close_repo
+      flow
+        from done true
+        done -> forge_close_repo()
+    ForgeIntent.toggle_repo_menu
+      forge_repo_menu = !forge_repo_menu
+    ForgeIntent.tab
+      flow
+        from done forge_event_tab(event)
+        done -> select_forge_tab _
+    ForgeIntent.open_item
+      flow
+        from done event_number(event, "number")
+        done -> forge_open_item _
+    ForgeIntent.close_item
+      flow
+        from done true
+        done -> forge_close_item()
+    ForgeIntent.merge
+      flow
+        from done true
+        done -> forge_merge_submit()
+    ForgeIntent.review_pick
+      forge_review_verdict = forge_event_verdict(event)
+    ForgeIntent.review_submit
+      flow
+        from done event_text(event, "body")
+        done -> forge_review_submit _
+    // `stage_forge_comment` is the authority on what is stageable and on
+    // replacing the comment already at this anchor; the view keeps the
+    // obviously empty case off the wire.
+    ForgeIntent.comment_stage
+      forge_comment_staged = stage_forge_comment(forge_comment_staged, event_text(event, "path"), event_text(event, "line"), event_text(event, "side"), event_text(event, "body"))
+    ForgeIntent.comment_drop
+      forge_comment_staged = drop_forge_comment(forge_comment_staged, event_text(event, "anchor"))
+    ForgeIntent.tree
+      flow
+        from done event_text(event, "path")
+        done -> forge_open_dir _
+    ForgeIntent.blob
+      flow
+        from done event_text(event, "path")
+        done -> forge_open_blob _
+    ForgeIntent.open_link
+      flow
+        from done event_text(event, "url")
+        done -> open_message_link _
+    ForgeIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
 
 // The committed namespace is the whole repo-card answer: name and head. Code
 // Browsing queries only the requested listing/blob; merge fetches the selected
@@ -37,11 +104,26 @@ on forge_open_repo(name)
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_generation = forge_generation + 1
-  // The Code tab's content is ForgeCodeBrowser component state now: keying
-  // the instance on the repo makes this open a FRESH instance, whose boot
-  // reads the root listing itself — no tree seeding left to do here.
   forge_tab = ForgeTab.code
-  run replace lane=forge_repo load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_repo_failed _
+  // THE CODE BROWSE STARTS AT THE ROOT: the root listing answers with the
+  // exact commit every nested read is then pinned to. The previous repo's
+  // listing and file go before the read is issued.
+  invalidate lane=forge_blob
+  forge_tree_path = ""
+  forge_tree_rev = ""
+  forge_tree_entries = []
+  forge_tree_born = false
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_note = ""
+  forge_opened_dir = ""
+  forge_opened_rev = ""
+  forge_file_phase = ForgeFilePhase.idle
+  parallel
+    run replace lane=forge_repo load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_repo_failed _
+    run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, "", "") -> forge_tree_loaded _ | forge_tree_failed _
 
 on forge_repo_loaded(next)
   return if next.generation != forge_generation
@@ -50,8 +132,11 @@ on forge_repo_loaded(next)
   forge_branches = next.branches
   forge_items = next.items
   // A deep link's second step: the repo is open, now its item or its file.
-  // The file goes to the code browser itself — only it knows the tree
-  // revision the reader's header gates on.
+  // A `duck://forge/<repo>/blob/<path>[@<rev>]` link first moves the tree
+  // to the file's directory — pinned to `@rev` when the link names one,
+  // else wherever the root listing lands — and `forge_tree_loaded` opens
+  // the parked file under that tree's revision. One path whether or not a
+  // tree had landed yet.
   match forge_focus_kind(forge_focus_number, forge_focus_path)
     ForgeFocus.idle
       return if true
@@ -60,16 +145,89 @@ on forge_repo_loaded(next)
       forge_focus_number = 0
       run every duck_echo_i64(number) -> forge_open_item _ | external_url_failed _
     ForgeFocus.blob
-      let path = forge_focus_path
       let rev = forge_focus_rev
-      forge_focus_path = ""
       forge_focus_rev = ""
-      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, network_chain_id, path, rev) at forge_repo
+      forge_tree_path = forge_parent(forge_focus_path)
+      forge_tree_rev = keep_str(!empty(rev), rev, forge_tree_rev)
+      forge_tree_entries = []
+      forge_tree_truncated = false
+      forge_tree_phase = ForgeTreePhase.loading
+      run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, forge_tree_rev, forge_tree_path) -> forge_tree_loaded _ | forge_tree_failed _
 
 on forge_repo_failed(cause)
   return if cause.generation != forge_generation
   forge_repo_phase = ForgePhase.failed
   error = cause.message
+
+// A DIRECTORY ROW: the listing moves, pinned to the tree's commit. The
+// file opened in the previous directory is retired by the move itself —
+// `forge_file_header` names it only while the tree stands where it was
+// opened.
+on forge_open_dir(path)
+  return if !connected || empty(forge_repo)
+  forge_tree_path = path
+  forge_tree_entries = []
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, forge_tree_rev, path) -> forge_tree_loaded _ | forge_tree_failed _
+
+// A listing answers for one repo, one directory and — once the root has
+// pinned it — one commit; a superseded read landing late paints nothing.
+on forge_tree_loaded(next)
+  return if next.repo != forge_repo || next.path != forge_tree_path
+  return if !empty(forge_tree_rev) && next.rev != forge_tree_rev
+  forge_tree_rev = next.rev
+  forge_tree_born = next.born
+  forge_tree_entries = next.entries
+  forge_tree_truncated = next.truncated
+  forge_tree_phase = ForgeTreePhase.ready
+  // A deep link's file opens under the tree it moved to, and only then.
+  return if empty(forge_focus_path)
+  let path = forge_focus_path
+  forge_focus_path = ""
+  flow
+    from done path
+    done -> forge_open_blob _
+
+on forge_tree_failed(cause)
+  forge_tree_phase = ForgeTreePhase.failed
+
+// A FILE ROW. The read is pinned to the tree's commit and remembers the
+// directory and revision it was opened under, so the view can retire the
+// preview when either moves. The previous file's flags must not describe
+// the one in flight: a stale `binary` would brand the next blob "not text"
+// until its load settles. `network_chain_id` reaches the blob's reader: a
+// Markdown blob's inline pictures are duck:// addresses too, and one naming
+// another network must not draw THIS network's blob of the same name.
+on forge_open_blob(path)
+  return if !connected || empty(forge_repo)
+  forge_opened_dir = forge_tree_path
+  forge_opened_rev = forge_tree_rev
+  forge_file_path = path
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
+  forge_file_picture = false
+  forge_file_note = ""
+  forge_file_phase = ForgeFilePhase.loading
+  run replace lane=forge_blob forge_blob(connected_rpc, forge_repo, forge_tree_rev, path, network_chain_id) -> forge_blob_loaded _ | forge_blob_failed _
+
+// A BLOB ANSWERS FOR ONE FILE: a completion naming another path is a
+// superseded read landing late, and painting it would put one file's
+// source under another file's header.
+on forge_blob_loaded(next)
+  return if next.repo != forge_repo || next.path != forge_file_path
+  forge_file_text = next.text
+  forge_file_binary = next.binary
+  forge_file_truncated = next.truncated
+  forge_file_picture = next.picture
+  forge_file_width = next.width
+  forge_file_height = next.height
+  forge_file_phase = ForgeFilePhase.ready
+
+on forge_blob_failed(cause)
+  forge_file_phase = ForgeFilePhase.failed
+  forge_file_note = cause.message
 
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
@@ -81,14 +239,12 @@ on forge_open_item(number)
   error = ""
   forge_item_phase = ForgePhase.loading
   forge_review_verdict = ForgeReviewVerdict.comment
-  forge_review_draft = ""
   // A staged comment anchors to THIS item's diff. Carrying one across items
-  // would post it against a patch it was never written about.
+  // would post it against a patch it was never written about — and the
+  // view's review body and line comment go with it.
   forge_comment_staged = []
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
+  forge_drafts_cleared = forge_drafts_cleared + 1
+  forge_drafts_scope = "item"
   forge_merge_conflicts = []
   forge_discussion = []
   forge_discussion_members = []
@@ -135,68 +291,38 @@ on forge_discussion_loaded(next)
   forge_discussion = next.messages
   forge_discussion_members = next.members
   // A deep link's `#seq` lands here, once: the note is picked out of the list and
-  // the item's page scrolls to that row — by its key in the Discussion's
-  // keyed column, landing on the row's measured top (a seq the list does not
-  // hold scrolls nowhere; the linked-note card above the list still shows it).
+  // the view scrolls the item's page to that row — by its key in the
+  // Discussion's keyed column, on the landing the tick counts (a seq the
+  // list does not hold scrolls nowhere; the linked-note card above the list
+  // still shows it).
   return if forge_focus_seq == 0
   let landed = forge_focus_seq
   forge_linked_note = linked_note(forge_discussion, landed)
   forge_focus_seq = 0
-  task widget scroll-to-key #workspace-tabs/content/forge/item-detail landed window=window_target(console_win)
+  forge_landed_seq = landed
+  forge_landed_tick = forge_landed_tick + 1
 
 on forge_discussion_failed(cause)
   error = cause.message
 
-on forge_review_pick(verdict)
-  forge_review_verdict = verdict
-
-// Clicking a diff gutter PICKS the line — it does not stage anything yet. The
-// picked anchor is what the composer writes against, and picking a second line
-// simply moves it, so a mis-click costs nothing.
-on forge_comment_open(path, line, side)
-  return if empty(path)
-  forge_comment_path = path
-  forge_comment_line = line
-  forge_comment_side = side
-
-on forge_comment_cancel
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
-
-// `stage_forge_comment` is the authority on what is stageable and on replacing
-// the comment already at this anchor; the guard here only keeps the obviously
-// empty case off the call.
-on forge_comment_stage
-  return if empty(forge_comment_path) || empty(forge_comment_draft)
-  forge_comment_staged = stage_forge_comment(forge_comment_staged, forge_comment_path, forge_comment_line, forge_comment_side, forge_comment_draft)
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
-
-on forge_comment_drop(anchor)
-  forge_comment_staged = drop_forge_comment(forge_comment_staged, anchor)
-
-on forge_review_submit
+// The body is what the reader typed in the view; the staged comments ride
+// with it, and the verdict is the one picked.
+on forge_review_submit(body)
   return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
   forge_review_busy = true
-  run every submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted(connected_rpc, forge_repo, forge_item_number, _) | forge_review_failed(connected_rpc, forge_repo, forge_item_number, _)
+  run every submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, body, forge_item_source_oid, forge_comment_staged) -> forge_review_submitted(connected_rpc, forge_repo, forge_item_number, _) | forge_review_failed(connected_rpc, forge_repo, forge_item_number, _)
 
 // The staged comments went out INSIDE this review, so they are cleared with the
-// body. A failure keeps them — the whole submit is one transaction, and losing
-// a page of written comments to a transient RPC error is not recoverable.
+// body: the view is told its review draft and line comment were consumed. A
+// failure keeps them — the whole submit is one transaction, and losing a page
+// of written comments to a transient RPC error is not recoverable.
 on forge_review_submitted(started_rpc, started_repo, started_number, _result)
   forge_review_busy = false
   return if started_rpc != connected_rpc || started_repo != forge_repo || started_number != forge_item_number
-  forge_review_draft = ""
   forge_review_verdict = ForgeReviewVerdict.comment
   forge_comment_staged = []
-  forge_comment_path = ""
-  forge_comment_line = ""
-  forge_comment_side = ""
-  forge_comment_draft = ""
+  forge_drafts_cleared = forge_drafts_cleared + 1
+  forge_drafts_scope = "review"
   error = ""
 
 on forge_review_failed(started_rpc, started_repo, started_number, cause)
@@ -262,11 +388,13 @@ on forge_refreshed(next)
   // A staged comment anchors into ONE patch. These read the source head BEFORE
   // it is reassigned below, so a branch that moved under an open composer takes
   // its comments with it instead of being submitted as if they were written
-  // against the new diff.
+  // against the new diff — and the line comment being written in the view
+  // goes the same way.
+  let branch_moved = forge_branch_moved(next.item_loaded, next.item.source_oid, forge_item_source_oid)
   error = staged_comment_drop_note(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_staged, error)
   forge_comment_staged = keep_staged_comments(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_staged)
-  forge_comment_path = keep_comment_text(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_path)
-  forge_comment_draft = keep_comment_text(next.item_loaded, next.item.source_oid, forge_item_source_oid, forge_comment_draft)
+  forge_drafts_cleared = keep_i64(branch_moved, forge_drafts_cleared + 1, forge_drafts_cleared)
+  forge_drafts_scope = keep_str(branch_moved, "comment", forge_drafts_scope)
   forge_item_source_oid = keep_str(next.item_loaded, next.item.source_oid, forge_item_source_oid)
   forge_item_target_oid = keep_str(next.item_loaded, next.item.target_oid, forge_item_target_oid)
   forge_item_merge_oid = keep_str(next.item_loaded, next.item.merge_oid, forge_item_merge_oid)
@@ -288,8 +416,22 @@ on forge_close_repo
   invalidate lane=forge_repo
   invalidate lane=forge_item
   invalidate lane=forge_discussion
+  invalidate lane=forge_tree
+  invalidate lane=forge_blob
   forge_generation = forge_generation + 1
   forge_repo = ""
+  forge_tree_path = ""
+  forge_tree_rev = ""
+  forge_tree_entries = []
+  forge_tree_born = false
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_note = ""
+  forge_opened_dir = ""
+  forge_opened_rev = ""
+  forge_file_phase = ForgeFilePhase.idle
   forge_repo_phase = ForgePhase.idle
   forge_branches = []
   forge_items = []
@@ -302,9 +444,6 @@ on forge_close_repo
   forge_discussion_members = []
   forge_discussion_pending = ""
   forge_merge_conflicts = []
-
-on forge_toggle_repo_menu
-  forge_repo_menu = !forge_repo_menu
 
 on forge_close_item
   // Same retirement as the close above: cancel the scoped work and bump the
@@ -323,8 +462,5 @@ on forge_close_item
   forge_discussion_pending = ""
   forge_merge_conflicts = []
 
-// The whole code browse — root listing, directory navigation, the file
-// reader — is ForgeCodeBrowser component state: leaving the tab prunes it,
-// re-entering remounts a fresh instance whose boot re-reads the root.
 on select_forge_tab(tab)
   forge_tab = tab

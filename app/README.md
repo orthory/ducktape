@@ -22,9 +22,9 @@ active wallet is a refusal, not a guess — pick one in the launch window.
 
 ## Module-owned views
 
-The Approvals, Members, Agents, Node, Explorer and Settings tabs are not
-native: each is an Ice application under `crates/views` (`governance`,
-`members`, `agents`, `node`, `explorer`, `settings`) compiled
+The Approvals, Members, Agents, Node, Explorer, Settings and Forge tabs are
+not native: each is an Ice application under `crates/views` (`governance`,
+`members`, `agents`, `node`, `explorer`, `settings`, `forge`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -49,7 +49,14 @@ the Explorer's workspace search is run by the app on the view's behalf. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
-tells the view which drafts it consumed. The
+tells the view which drafts it consumed. A view may also hand data to a
+host surface that reads it: Forge's code browse leaves slots for the
+decoded picture, the document-aware Markdown reader and the highlighted
+code reader, each painted by the app from the arguments the view passes,
+and the reader's links come back to the view's own handler. What cannot
+cross the wire stays native beside the view: Forge's discussion note
+composer edits an editor the app holds, so the app docks it under the view
+while an item is open. The
 views workspace pins the same `ducktape-ui` rev as this crate; `make views`
 refuses when they differ.
 

@@ -704,13 +704,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 
     assert_eq!(
         screens,
-        [
-            "ChatScreen",
-            "FilesScreen",
-            "ForgeScreen",
-            "PagesScreen",
-            "ShellScreen",
-        ],
+        ["ChatScreen", "FilesScreen", "PagesScreen", "ShellScreen",],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
     );
@@ -757,7 +751,8 @@ fn a_disconnected_screen_stands_its_registers_down_too() {
 
     for source in [
         include_str!("../ui/screens/storage.ice"),
-        include_str!("../ui/screens/forge.ice"),
+        // the Forge screen is the Forge view's, held to the same rule
+        include_str!("../../../crates/views/forge/src/ui/forge.ice"),
     ] {
         for chunk in source.split("\ncomponent ").skip(1) {
             let name = chunk.split('(').next().unwrap_or("").trim();

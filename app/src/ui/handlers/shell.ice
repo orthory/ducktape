@@ -126,7 +126,7 @@ on shell_composer_event(event)
   parallel
     stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_host_node_key, shell_chat_entries) -> shell_chat_event _
     // The transcript is `anchor-y=end`, where relative 0.0 is the tail.
-    task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
+    task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0
 
 // One pure reducer per field keeps this event handler flat. A progress event
 // cannot accidentally settle the answer, and a terminal event folds the live
@@ -140,7 +140,7 @@ on shell_chat_event(next)
   shell_chat_live = agent_event_live(shell_chat_live, next)
   shell_chat_entries = agent_event_entries(shell_chat_entries, next, shell_provider, shell_chat_saga, shell_chat_activity)
   shell_chat_busy = agent_event_busy(next)
-  task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
+  task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0
 
 // STOP WATCHING, NOT STOP RUNNING — and the difference is the whole point of a
 // durable run. The saga keeps executing, retries and commits whether or not

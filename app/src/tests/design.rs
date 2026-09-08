@@ -251,7 +251,6 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/components/chat.ice"),
         include_str!("../ui/components/dm.ice"),
         include_str!("../ui/components/files.ice"),
-        include_str!("../ui/components/forge.ice"),
         include_str!("../ui/components/huddle.ice"),
         include_str!("../ui/components/icon.ice"),
         include_str!("../ui/components/kit.ice"),
@@ -448,7 +447,8 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // the forge note keeps its own compact geometry on the screen.
     let chat_components = inlined(include_str!("../ui/components/chat.ice"));
     assert_eq!(chat_components.matches(", 44.0, 150.0, 10.0) #").count(), 1);
-    assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
+    // the forge note is the app's, docked under the module view
+    assert!(inlined(include_str!("../ui/view.ice")).contains(", 38.0, 120.0, 6.0) #forge-note"));
     assert!(chat_components.contains("button \"Send\" disabled="));
     assert!(chat_components.contains(
         "h=29.0 @primary_action @px-12px @py-7px -> composer_event(composer_submit_event(), blocked, kind)"
@@ -634,7 +634,10 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     let chat_screen = inlined(include_str!("../ui/screens/chat.ice"));
     let pages = inlined(include_str!("../ui/components/pages.ice"));
     let kit = inlined(include_str!("../ui/components/kit.ice"));
-    let forge = inlined(include_str!("../ui/components/forge.ice"));
+    // the forge components are the Forge view's now, held to the same tokens
+    let forge = inlined(include_str!(
+        "../../../crates/views/forge/src/ui/components.ice"
+    ));
 
     assert_recipe_owns_states("screens", &SCREENS, "@primary_action");
     assert_recipe_owns_states("screens", &SCREENS, "@danger_action");
@@ -728,7 +731,10 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         6
     );
 
-    assert!(SCREENS.contains("StatusBadge label=forge_item_state"));
+    assert!(
+        inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice"))
+            .contains("StatusBadge label=forge_item_state")
+    );
     // the explorer's is the guest's: the Explorer is a module-owned view
     assert!(
         inlined(include_str!(
@@ -862,8 +868,10 @@ fn ice_sources_hold_to_the_design_system() {
             inlined(include_str!("../ui/components/files.ice")),
         ),
         (
-            "forge.ice",
-            inlined(include_str!("../ui/components/forge.ice")),
+            "forge/components.ice",
+            inlined(include_str!(
+                "../../../crates/views/forge/src/ui/components.ice"
+            )),
         ),
         (
             "huddle.ice",
@@ -1204,7 +1212,9 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/chat.ice",
         "ui/components/dm.ice",
         "ui/components/files.ice",
-        "ui/components/forge.ice",
+        "../../crates/views/forge/src/ui/components.ice",
+        "../../crates/views/forge/src/ui/kit.ice",
+        "../../crates/views/forge/src/ui/app.ice",
         "ui/components/huddle.ice",
         "ui/components/icon.ice",
         "ui/components/kit.ice",
@@ -1214,7 +1224,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/patterns.ice",
         "ui/components/shell.ice",
         "ui/screens/chat.ice",
-        "ui/screens/forge.ice",
+        "../../crates/views/forge/src/ui/forge.ice",
         // The Approvals, Members, Agents and Node screens ship as
         // module-owned views; their sources are held to the same conventions
         // as the native ones.
@@ -1267,11 +1277,11 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/chat.ice",
             "ui/components/dm.ice",
             "ui/components/files.ice",
-            "ui/components/forge.ice",
+            "../../crates/views/forge/src/ui/components.ice",
             "ui/components/onboarding.ice",
             "ui/components/pages.ice",
             "ui/components/shell.ice",
-            "ui/screens/forge.ice",
+            "../../crates/views/forge/src/ui/forge.ice",
             "../../crates/views/node/src/ui/node.ice",
             "../../crates/views/explorer/src/ui/app.ice",
             "ui/screens/shell.ice",
@@ -1403,9 +1413,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("screens/chat.ice", "for member in channel_members"),
         ("screens/pages.ice", "for page in pages"),
         ("screens/pages.ice", "for child in subpage_blocks(blocks)"),
-        ("screens/forge.ice", "for repo in repos"),
-        ("screens/forge.ice", "for entry in tree_entries"),
-        ("screens/forge.ice", "for review in forge_item_reviews"),
         ("components/huddle.ice", "for tile in rows"),
         ("components/onboarding.ice", "for row in networks"),
         // The keystore's wallets: how many identities this DEVICE holds, and
@@ -1416,7 +1423,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // cannot change while it is up.
         ("components/onboarding.ice", "for pair in rows"),
         ("components/onboarding.ice", "for step in steps"),
-        ("components/forge.ice", "for item in items"),
         // 2. WITHIN ONE ROW — one message's blocks and reactions, one
         //    proposal's quorum dots, the nav bar. Bounded by the row that
         //    contains them, and the chat ones already sit inside the stream's
@@ -1425,8 +1431,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // and a review comment each hand it ONE body's blocks.
         ("components/chat.ice", "for block in blocks"),
         ("components/chat.ice", "for reaction in message.reactions"),
-        // One review's inline comments, bounded by the review that holds them.
-        ("components/forge.ice", "for comment in review.comments"),
         (
             "components/shell.ice",
             "for item in shell_nav(tab, approvals, agent_live)",

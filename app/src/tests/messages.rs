@@ -399,9 +399,11 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // rows the reader is dragging over and leave every cached row behind it
     // untinted. Everything else about the key is unchanged: the range is three
     // scalars, not a list, so a cached row still reads nothing expensive.
-    assert!(timeline.1.contains(
-        "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
-    ));
+    assert!(
+        timeline.1.contains(
+            "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+        )
+    );
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -541,9 +543,7 @@ fn message_actions_require_explicit_intent() {
 /// window fold runs — so a test never hand-writes the reader's label.
 fn seat_reader(byte: u8) -> String {
     let key = vec![byte; 32];
-    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(
-        key.clone(),
-    )));
+    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(key.clone())));
     backend::author_display(
         &format!("user:{}", backend::hex_encode(&key)),
         &backend::names(),
