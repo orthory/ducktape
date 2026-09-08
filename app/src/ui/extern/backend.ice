@@ -148,10 +148,12 @@ extern crate::backend
   HubState(networks:[HubNetwork], preselect:str)
   hub_state() -> HubState
   // THE PICKED NETWORK'S KEYSTORE. A wallet is an identity on one network,
-  // kept in that network's workspace, so the rows are loaded on the pick —
-  // and the load settles the session's identity to that workspace's active
-  // wallet (read without a password). `keystore` is false for an endpoint
-  // this device holds no workspace for: a remote, read-only.
+  // kept in that network's keystore on this device (the node's workspace
+  // when this device hosts it, else a per-chain directory under the ducktape
+  // home), so the rows are loaded on the pick — and the load settles the
+  // session's identity to that keystore's active wallet (read without a
+  // password). `keystore` is false only when a remote's node never answered
+  // which network it serves, so no keystore could be named.
   WalletList(wallets:[WalletInfo], error:str, keystore:bool)
   load_wallets(rpc:str) -> WalletList
   pure wallet_door(list:&WalletList) -> WalletDoor
