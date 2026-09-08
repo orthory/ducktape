@@ -183,30 +183,33 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
 /// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
 /// runs no handler at all: only `trim(query) == sent_query` can retire the
 /// plate, and the captured string is the only thing that can carry the
-/// comparison. Read off the component's own source because its state is
-/// instance-local and its draft is written by the input widget, not by a
-/// handler the harness could dispatch.
+/// comparison. The Explorer is a module-owned view now: the arm is the
+/// guest's, and the capture is the app's, in the handler that runs the
+/// search on the view's behalf.
 #[test]
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
-    let explorer = inlined(include_str!("../ui/screens/storage.ice"));
-    let submit = ice_handler_body(&explorer, "explorer_search_submit");
-    // CAPTURED AT SUBMIT, AND SENT FROM THE CAPTURE — passing `trim(query)` to
-    // the call a second time would let the string asked about and the string
-    // spoken for drift apart in a later edit.
+    let guest = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
+    let app = inlined(include_str!("../ui/handlers/overlays.ice"));
+    let search = ice_handler_body(&app, "explorer_view_event");
+    // CAPTURED AT THE SEND, AND SENT FROM THE CAPTURE — passing the intent's
+    // text to the call a second time would let the string asked about and the
+    // string spoken for drift apart in a later edit.
     assert!(
-        submit.contains("sent_query = trim(query)"),
-        "the submit must capture the query it sends"
+        search.contains("explorer_sent_query = event_text(event, \"query\")"),
+        "the search must capture the query it sends"
     );
     assert!(
-        submit.contains(
-            "run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _"
+        search.contains(
+            "run replace lane=workspace_search search_workspace(connected_rpc, explorer_sent_query) -> explorer_results_loaded _"
         ),
         "the search must be sent for the captured string itself"
     );
     // THE ARM. A flag could never carry this: `searching` is down and the hits
     // are empty for a zero-hit answer no matter what is in the box.
     assert!(
-        explorer.contains(
+        guest.contains(
             "if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)"
         ),
         "the zero-hit plate must be keyed on the query that was sent"
@@ -214,7 +217,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
     // query whose box has been emptied.
     assert!(
-        ice_handler_body(&explorer, "clear_explorer_search").contains("sent_query = \"\""),
+        search.contains("explorer_sent_query = \"\""),
         "clearing the box must take the standing answer with it"
     );
 }
@@ -330,7 +333,9 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
             "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
         ),
         (
-            inlined(include_str!("../ui/screens/storage.ice")),
+            inlined(include_str!(
+                "../../../crates/views/explorer/src/ui/app.ice"
+            )),
             "search_answer_stands(sent_query, query, searching)",
         ),
     ] {
@@ -355,7 +360,7 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
     const PAIRED: [(&str, &str); 3] = [
         ("page_search_hits", "page_search_query"),
         ("chat_search_hits", "chat_search_query"),
-        ("hits", "sent_query"),
+        ("explorer_hits", "explorer_sent_query"),
     ];
     let mut walked = 0;
     for (path, source) in ice_sources() {
@@ -388,89 +393,32 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
     );
 }
 
-/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM, and the
-/// explorer's search state is the one search state exempt from every app-level
-/// reset: `ExplorerScreen` is `lifetime retained`, so no reconnect and no
-/// network switch reaches inside it. What keeps a reply issued on one network
-/// from rendering as another's is the identity in its INSTANCE KEY —
-/// `#explorer(connected_rpc)` — which the run inherits as its scope at send
-/// time and the reply carries back. Switching networks renders a different
-/// instance, and the answer in flight lands on the one that asked for it.
-///
-/// The key is therefore load-bearing, not decoration: dropped, both networks
-/// share one instance and a cross-network answer renders as the new network's.
+/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM. The Explorer's
+/// search state is app state (the view is module-owned and sees no endpoint),
+/// so the connect that lands a workspace — a reconnect or a switch — must drop
+/// the standing answer and the search in flight with the ledger it re-bumps,
+/// or a reply issued on one network renders as another's. A tab switch is
+/// not that: it reloads the ledger and leaves the answer standing, as the
+/// retained native screen did.
 #[test]
-fn an_explorer_answer_lands_on_the_network_that_asked_for_it() {
-    let (mut app, _) = Ducktape::__boot();
-    let console = iced::window::Id::unique();
-    app.console_win = Some(console);
-    app.connected = true;
-    app.loading = false;
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Explorer));
-
-    // A render materializes the instance the mount's key names — this app's own
-    // window and no other's, since the sighting channel is thread-local and a
-    // sibling test on the same thread renders the same mount.
-    let mounted = |app: &mut Ducktape| -> Vec<String> {
-        let _ = app.__view(console);
-        let window = format!("/{console:?}/");
-        app.__ice_test_scopes_explorer_screen()
-            .into_iter()
-            .filter(|scope| scope.contains(&window))
-            .collect()
-    };
-
-    app.connected_rpc = "http://one".into();
-    let one = mounted(&mut app);
-    assert_eq!(one.len(), 1, "one network, one explorer instance");
-    app.connected_rpc = "http://two".into();
-    let both = mounted(&mut app);
-    assert_eq!(
-        both.len(),
-        2,
-        "the explorer instance must be keyed by the network it is reading — one \
-         instance shared across networks is exactly what lets an answer sent on \
-         the first render as the second's"
-    );
-    let first = one[0].clone();
-    let second = both
-        .iter()
-        .find(|scope| **scope != first)
-        .expect("the second network's instance")
-        .clone();
-
-    // THE REPLY IN FLIGHT, delivered to the scope its send captured — the app
-    // is on the second network by now.
-    let _ = app.__update(
-        Ducktape::__ice_test_message_explorer_screen_explorer_results_loaded(
-            first.clone(),
-            backend::ExplorerResults {
-                hits: vec![backend::ExplorerHit {
-                    kind: "page".into(),
-                    code: "pg".into(),
-                    title: "Old".into(),
-                    snippet: "stale".into(),
-                    meta: String::new(),
-                    target: "page".into(),
-                }],
-                kinds: Vec::new(),
-                partial: String::new(),
-            },
-        ),
-    );
-    assert_eq!(
-        app.__ice_test_state_explorer_screen(&first)
-            .expect("the first network's instance answers")
-            .hits
-            .len(),
-        1,
-        "the answer belongs to the network that asked for it"
-    );
-    assert!(
-        app.__ice_test_state_explorer_screen(&second)
-            .is_none_or(|state| state.hits.is_empty()),
-        "a cross-network answer must not render as the new network's"
-    );
+fn a_workspace_connect_drops_the_explorer_answer_with_the_ledger() {
+    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
+    let connect = ice_handler_body(&lifecycle, "workspace_connected");
+    assert!(connect.contains("explorer_generation = explorer_generation + 1"));
+    for line in [
+        "invalidate lane=workspace_search",
+        "explorer_hits = []",
+        "explorer_kinds = []",
+        "explorer_partial = \"\"",
+        "explorer_searching = false",
+        "explorer_sent_query = \"\"",
+    ] {
+        assert!(
+            connect.contains(line),
+            "a connect that leaves the answer standing shows one network's \
+             answer over another's: `{line}`"
+        );
+    }
 }
 
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
@@ -759,7 +707,6 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
         screens,
         [
             "ChatScreen",
-            "ExplorerScreen",
             "FilesScreen",
             "ForgeScreen",
             "PagesScreen",

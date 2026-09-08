@@ -144,16 +144,16 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
 fn the_explorer_is_handed_the_live_head_and_the_phase() {
     let view = inlined(include_str!("../ui/view.ice"));
     let explorer = view
-        .split_once("ExplorerScreen")
+        .split_once("extern explorer_view(")
         .expect("the explorer mounts here")
         .1;
-    let explorer = explorer.split_once("events").expect("props end").0;
+    let explorer = explorer.split_once(" #explorer").expect("props end").0;
     assert!(
-        explorer.contains("head=block_height"),
+        explorer.contains("block_height"),
         "the explorer must draw the live register, not the newest row of its own window"
     );
     assert!(
-        explorer.contains("sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)"),
+        explorer.contains("sync_label(node_phase, node_sync_applied, node_sync_target)"),
         "a head that is not advancing and a node still catching up are different \
          facts, and the second one needs saying"
     );
@@ -1005,32 +1005,29 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .collect()
     }
 
-    let explorer = component(SCREENS.as_str(), "ExplorerScreen");
-    let explorer_state = local_state(explorer);
-    for field in [
-        "query = \"\"",
-        "kind = \"all\"",
-        "hits:[ExplorerHit] = []",
-        "kinds:[KindCount] = []",
-        "partial = \"\"",
-        "searching = false",
-        "selected:i64 = 0",
-    ] {
+    // The Explorer is a module-owned view: the draft, the kind filter and the
+    // selected block are the guest's own state, and the app holds only the
+    // answer to the search it runs on the guest's behalf.
+    let explorer = include_str!("../../../crates/views/explorer/src/ui/app.ice");
+    let explorer_state = explorer
+        .split_once("\nstate\n")
+        .expect("the guest's state block")
+        .1;
+    for field in ["query = \"\"", "kind = \"all\"", "selected:i64 = 0"] {
         assert!(
-            explorer_state.contains(&field),
-            "ExplorerScreen owns `{field}`"
+            explorer_state.contains(field),
+            "the explorer view owns `{field}`"
         );
     }
     for handler in [
-        "on explorer_search_submit(rpc, online)",
-        "on explorer_results_loaded(next)",
+        "on search_submit",
         "on clear_explorer_search",
         "on pick_explorer_kind(next)",
         "on select_explorer_block(height)",
     ] {
         assert!(
             explorer.contains(handler),
-            "ExplorerScreen owns `{handler}`"
+            "the explorer view owns `{handler}`"
         );
     }
 
@@ -1075,13 +1072,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for field in [
         "members_filter",
         "members_selected",
-        "explorer_query",
-        "explorer_kind",
-        "explorer_hits",
-        "explorer_kinds",
-        "explorer_partial",
-        "explorer_searching",
-        "explorer_selected",
         "message_action_focus",
         "chat_pointer_y",
         "chat_height",
@@ -1111,8 +1101,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     for route in [
         "pick_members_filter ->",
         "open_member ->",
-        "explorer_search_submit ->",
-        "clear_explorer_search ->",
         "pick_explorer_kind ->",
         "select_explorer_block ->",
         "fs_toggle_history ->",
@@ -1239,13 +1227,16 @@ fn the_explorer_names_what_it_shows() {
         "every count in the trace names what it counts"
     );
 
-    let explorer = SCREENS
-        .split_once("component ExplorerScreen(")
-        .expect("the Explorer screen exists")
-        .1;
+    // The Explorer is a module-owned view: its screen is the guest's source,
+    // and the answer to its search lands in the app's handler.
+    let guest = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
+    let explorer = guest.split_once("\nview\n").expect("the guest's view").1;
     let explorer = explorer
         .split_once("\ncomponent ")
         .map_or(explorer, |(body, _)| body);
+    let answers = inlined(include_str!("../ui/handlers/overlays.ice"));
 
     // ONE SET, ONE NAME. The subtitle and the "No blocks yet" plate describe
     // the same list and had drifted — only the plate knew the list is filtered.
@@ -1339,28 +1330,30 @@ fn the_explorer_names_what_it_shows() {
     // CALLS IT AN ANSWER. `partial` is the field this rule was written for:
     // without it the strip's kinds and the hit count are still rendered, so the
     // screen goes back to presenting whatever survived as the whole truth.
-    let loaded = explorer
-        .split_once("on explorer_results_loaded(next)")
-        .expect("the Explorer's results handler")
-        .1
-        .split_once("\n  on ")
-        .expect("the next handler closes it")
-        .0;
+    let loaded = ice_handler_body(&answers, "explorer_results_loaded");
     // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
     // the hits and the strip; a `partial` left standing keeps naming a source
     // that failed to answer a query the reader has since cleared or replaced.
-    let resets = ["on explorer_search_submit", "on clear_explorer_search"].map(|opener| {
-        explorer
+    let intents = ice_handler_body(&answers, "explorer_view_event");
+    let resets = ["ExplorerIntent.search", "ExplorerIntent.clear"].map(|opener| {
+        intents
             .split_once(opener)
             .unwrap_or_else(|| panic!("`{opener}` is where it was"))
             .1
-            .split_once("\n  on ")
-            .expect("the next handler closes it")
-            .0
+            .split_once("\n    ExplorerIntent.")
+            .map_or_else(
+                || intents.split_once(opener).expect("the arm").1,
+                |(arm, _)| arm,
+            )
     });
-    for (field, cleared) in [("hits", "[]"), ("kinds", "[]"), ("partial", r#""""#)] {
+    for (field, cleared) in [
+        ("explorer_hits", "[]"),
+        ("explorer_kinds", "[]"),
+        ("explorer_partial", r#""""#),
+    ] {
+        let answered = field.trim_start_matches("explorer_");
         assert!(
-            loaded.contains(&format!("{field} = next.{field}")),
+            loaded.contains(&format!("{field} = next.{answered}")),
             "`{field}` comes back from the search and nothing lands it in \
              the screen's local state"
         );
@@ -1387,7 +1380,10 @@ fn the_explorer_names_what_it_shows() {
 /// both-arms-identical bug in a new coat.
 #[test]
 fn the_explorer_marks_the_block_row_whose_detail_is_open() {
-    let source = inlined(include_str!("../ui/screens/storage.ice"));
+    // the Explorer is a module-owned view; the row is the guest's
+    let source = inlined(include_str!(
+        "../../../crates/views/explorer/src/ui/app.ice"
+    ));
     let row = source
         .split("component ExplorerBlockRow")
         .nth(1)
@@ -1518,10 +1514,10 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     let files = storage
         .split_once("component FilesScreen(")
         .expect("the screen")
-        .1
+        .1;
+    let files = files
         .split_once("\ncomponent ")
-        .expect("the screen ends")
-        .0;
+        .map_or(files, |(body, _)| body);
     assert!(
         files.contains("listed:bool"),
         "the screen is handed the fact"
@@ -1556,10 +1552,10 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
     let files = storage
         .split_once("component FilesScreen(")
         .expect("the screen")
-        .1
+        .1;
+    let files = files
         .split_once("\ncomponent ")
-        .expect("the screen ends")
-        .0;
+        .map_or(files, |(body, _)| body);
     assert!(
         files.contains("lazy preview_text by preview_text, preview_path, dark as cached_source"),
         "the reader's memo boundary is the mount's lazy"

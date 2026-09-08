@@ -579,19 +579,11 @@ view
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
               set_desktop_notifications -> set_desktop_notifications _
+        // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
+        // the last search go in as props; a refresh, a search, its clearing
+        // and a copy come back as intents the handler acts on.
         explorer:
-          ExplorerScreen #explorer(connected_rpc)
-            with
-              connected_rpc
-              connected
-              loading=explorer_loading
-              blocks=explorer_blocks
-              ops=explorer_ops
-              head=block_height
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-            events
-              refresh_explorer -> refresh_explorer
-              copy_to_clipboard -> copy_to_clipboard _ _
+          extern explorer_view(dark, connected, explorer_loading, explorer_blocks, explorer_ops, block_height, sync_label(node_phase, node_sync_applied, node_sync_target), explorer_hits, explorer_kinds, explorer_partial, explorer_searching, explorer_sent_query) #explorer -> explorer_view_event _
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

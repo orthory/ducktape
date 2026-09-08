@@ -1,7 +1,7 @@
 use super::*;
 
 /// One explorer block row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ExplorerBlock {
     pub height: i64,
     pub hash: String,
@@ -10,7 +10,7 @@ pub struct ExplorerBlock {
 }
 
 /// One applied (or rejected) op inside an explorer block.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ExplorerOp {
     pub height: i64,
     pub proposer: String,

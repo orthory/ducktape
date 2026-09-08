@@ -18,6 +18,45 @@ on explorer_failed(cause)
   explorer_loading = false
   error = cause.message
 
+// THE EXPLORER IS A MODULE-OWNED VIEW: the ledger goes in as props, and what
+// the reader does comes back as an intent. A search is run here, on the
+// view's behalf — the guest sees no endpoint — and answered through the
+// props; `explorer_sent_query` is captured at the send and sent from the
+// capture, so the string asked about and the string the zero-hit plate
+// speaks for cannot drift apart.
+on explorer_view_event(event)
+  match explorer_intent(event)
+    ExplorerIntent.refresh
+      return if !connected || explorer_loading
+      explorer_generation = explorer_generation + 1
+      explorer_loading = true
+      run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+    ExplorerIntent.copy
+      toast = event_text(event, "label")
+      toast_age = 0
+      task clipboard write event_text(event, "text")
+    ExplorerIntent.search
+      return if !connected || explorer_searching || empty(event_text(event, "query"))
+      explorer_searching = true
+      explorer_hits = []
+      explorer_kinds = []
+      explorer_partial = ""
+      explorer_sent_query = event_text(event, "query")
+      run replace lane=workspace_search search_workspace(connected_rpc, explorer_sent_query) -> explorer_results_loaded _
+    ExplorerIntent.clear
+      invalidate lane=workspace_search
+      explorer_hits = []
+      explorer_kinds = []
+      explorer_partial = ""
+      explorer_searching = false
+      explorer_sent_query = ""
+
+on explorer_results_loaded(next)
+  explorer_hits = next.hits
+  explorer_kinds = next.kinds
+  explorer_partial = next.partial
+  explorer_searching = false
+
 on close_palette
   invalidate lane=palette_search
   // The invalidate dropped the reply that would have moved the phase — park

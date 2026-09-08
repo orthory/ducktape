@@ -21,3 +21,5 @@ extern crate::module_view
   // what the reader did in the native log ring since the last drain,
   // applied to the timeline the app holds
   pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
+  component explorer_view(dark:bool, connected:bool, loading:bool, blocks:&[ExplorerBlock], ops:&[ExplorerOp], head:i64, sync_line:&str, hits:&[ExplorerHit], kinds:&[KindCount], partial:&str, searching:bool, sent_query:&str) -> ModuleViewEvent
+  pure explorer_intent(event:&ModuleViewEvent) -> ExplorerIntent

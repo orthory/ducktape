@@ -261,28 +261,6 @@ component EmptyPlate(message:str)
       r=12.0
     text message size=13.0 @text-meta
 
-// The screen-level heading pair used by the padded screens (Approvals,
-// Settings, Explorer) that have no 56px header bar.
-component ScreenTitle(title:str, detail:str)
-  col #root w=fill gap=3.0
-    text title
-      with
-        size=16.0
-        wrap=none
-        font=display
-        @text-primary
-    if detail != ""
-      box w=fill max-w=620.0
-        text detail
-          with
-            size=12.5
-            line-h=1.5
-            @text-caption
-
-// One alert: a severity dot, the title, the source that raised it, the body,
-// and the block it landed in. Unread rows sit on a warmer plate than read ones
-// AND pulse; a read row keeps the same severity colour, held still. `height` is
-// a BLOCK, so it prints as one — this chain publishes no wall clock.
 component BellRow(item:BellItem)
   col #root w=fill
     if item.read

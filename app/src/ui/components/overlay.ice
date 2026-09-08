@@ -251,60 +251,6 @@ component TabLabel(label:str, count:i64, active:bool)
           bg=transparent
         space w=1.0 h=1.0
 
-// A filter chip with its matched count: the Explorer kind strip and the
-// members All/Humans/Agents/Validators strip. Selected inverts to ink.
-component FilterChip(label:str, count:i64, selected:bool)
-  col #root
-    if selected
-      box
-        with
-          px=11.0
-          py=6.0
-          bg=primary
-          border=primary
-          border-w=1.0
-          r=8.0
-        row gap=6.0 align=center
-          text label
-            with
-              size=12.0
-              wrap=none
-              font=display
-              @text-primary_fg
-          text count
-            with
-              size=10.0
-              wrap=none
-              font=code_semibold
-              @text-meta
-    if !selected
-      box
-        with
-          px=11.0
-          py=6.0
-          bg=surface
-          border=border
-          border-w=1.0
-          r=8.0
-        row gap=6.0 align=center
-          text label
-            with
-              size=12.0
-              wrap=none
-              font=display
-              @text-secondary_fg
-          text count
-            with
-              size=10.0
-              wrap=none
-              font=code_semibold
-              @text-label
-
-// The 9px mono section label, with the artifact's optional trailing note
-// (`needs quorum to change`) hung beside it.
-// NOTE: the artifact sets letter-spacing .1em on this label and iced exposes
-// none. The per-glyph row that would fake it needs a chars-splitting helper in
-// backend.rs, which this file does not own — it renders tight until that lands.
 component Eyebrow(label:str, note:str)
   row #root gap=8.0 align=center
     text label

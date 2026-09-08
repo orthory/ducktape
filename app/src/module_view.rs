@@ -273,6 +273,59 @@ pub fn node_log_timeline_drain(
     state
 }
 
+// ---------- the explorer seat ----------
+
+/// The Explorer tab: the ledger and the answer to the last workspace search
+/// as the app holds them, drawn by the `explorer` view. Its intents come
+/// back as `refresh`, `copy` (`text`, `label`), `search` (`query`) and
+/// `clear`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn explorer_view(
+    dark: bool,
+    connected: bool,
+    loading: bool,
+    blocks: &[crate::backend::ExplorerBlock],
+    ops: &[crate::backend::ExplorerOp],
+    head: i64,
+    sync_line: &str,
+    hits: &[crate::backend::ExplorerHit],
+    kinds: &[crate::backend::KindCount],
+    partial: &str,
+    searching: bool,
+    sent_query: &str,
+) -> Element<'static, ModuleViewEvent> {
+    let props = serde_json::json!({
+        "connected": connected,
+        "loading": loading,
+        "dark": dark,
+        "blocks": blocks,
+        "ops": ops,
+        "head": head,
+        "sync_line": sync_line,
+        "hits": hits,
+        "kinds": kinds,
+        "partial": partial,
+        "searching": searching,
+        "sent_query": sent_query,
+    });
+    module_view(
+        "explorer",
+        serde_json::to_vec(&props).expect("props encode"),
+    )
+}
+
+pub fn explorer_intent(event: &ModuleViewEvent) -> crate::ExplorerIntent {
+    match event.kind.as_str() {
+        "refresh" => crate::ExplorerIntent::Refresh,
+        "search" => crate::ExplorerIntent::Search,
+        "clear" => crate::ExplorerIntent::Clear,
+        _ => crate::ExplorerIntent::Copy,
+    }
+}
+
 /// The native log ring behind the node view's slot: the timeline the app
 /// last drew the tab with, and what the reader did in it since the app
 /// last drained. One per process, like the view it belongs to.
@@ -324,6 +377,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "members" => &["copy", "agent_status", "propose"],
         "agents" => &[],
         "node" => &["copy", "tab", "log_filter"],
+        "explorer" => &["refresh", "copy", "search", "clear"],
         _ => &[],
     }
 }
@@ -1380,6 +1434,47 @@ mod tests {
             [ModuleViewEvent {
                 kind: "log_timeline".into(),
                 detail: String::new(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Explorer view through the host: the ledger, then a
+    /// search that leaves as an intent and lands back as props.
+    #[test]
+    fn the_staged_explorer_view_boots_takes_the_ledger_and_asks_for_a_search() {
+        let Some(staged) = staged("explorer") else {
+            return;
+        };
+        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "connected": true, "loading": false, "dark": false,
+                "blocks": [{"height": 84912, "hash": "9f3e", "commit": "c0ffee", "op_count": 1}],
+                "ops": [{"height": 84912, "proposer": "val-1", "target": "chat",
+                         "disposition": "applied", "op_hash": "ab12cd34", "payload": "post",
+                         "trace": "chat · 1 msg"}],
+                "head": 84912, "sync_line": "live",
+                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["Explorer", "h 84,912"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        guest.deliver(Output::Activate(button_message(&guest, "Refresh")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "refresh".into(),
+                detail: "null".into(),
             }]
         );
         assert!(guest.fault.is_none());

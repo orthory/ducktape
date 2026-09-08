@@ -552,10 +552,7 @@ test password_screen_read_only_escape_contract
   preset ui_launch
   viewport 480 680
   mount
-    PasswordScreen #pw
-      with
-        busy=false
-        error="the keystore listing is unreadable"
+    PasswordScreen #pw busy=false error="the keystore listing is unreadable"
       events
         password_submit -> password_submit _
         go_restore -> go_restore
@@ -1090,49 +1087,6 @@ test settings_keyboard_scroll_contract
   dispatch toggle_bell
   key page-down
   expect body.scroll_y > 30.0
-
-preset ui_explorer
-  state
-    shell_tab = ShellTab.explorer
-    connected = true
-    connected_rpc = "http://127.0.0.1:1"
-    loading = false
-    mutation_phase = MutationPhase.idle
-    error = ""
-
-// A PARTIAL ANSWER SAYS SO. Port 1 on loopback cannot hold an unprivileged
-// listener, so all six search legs refuse immediately and deterministically.
-// Drive the component through its own input and handler instead of seeding its
-// now-private state through an app preset.
-test explorer_partial_banner_contract
-  preset ui_explorer
-  viewport 1120 720
-  mount
-    ExplorerScreen #explorer
-      with
-        connected_rpc
-        connected
-        loading
-        blocks=explorer_blocks
-        ops=explorer_ops
-        head=block_height
-        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-      events
-        refresh_explorer -> refresh_explorer
-        copy_to_clipboard -> copy_to_clipboard _ _
-  target query = #explorer/explorer-search
-  target clear = #explorer/explorer-clear
-  target banner = #explorer/explorer-partial
-  target plate = #explorer/explorer-nothing-matched/root
-  click query
-  type "needle"
-  key enter
-  expect exists banner
-  expect missing plate
-  click clear
-  expect query.value == ""
-  expect missing banner
-  expect missing plate
 
 preset ui_chat_stream
   state
@@ -1709,4 +1663,3 @@ test the_quit_chord_route_is_armed_only_while_command_is_held
   expect cmd_held
   modifiers
   expect !cmd_held
-
