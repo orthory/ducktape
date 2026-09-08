@@ -1,0 +1,8 @@
+Test-only Ice surface component, copied from the actual app-store surface fixture bundle.
+Source: byeongsu-hong/ducktape-ui 677e154590aa39e436e2d1aab6453c1435134f66
+Package: app-store-surface-fixture
+Build: cargo ice bundle --manifest-path examples/app-store/Cargo.toml -p app-store-surface-fixture --target wasm32-unknown-unknown --out target/view-contract-fixtures
+Output filename: app_store_surface_fixture.wasm
+SHA-256: 21831955519db0dd9711ac8669d6c79be84d8b02d8f42e8861e14903c5180e42
+Regenerate with the source revision above, copy the output to ice-view.component.wasm, and update this digest.
+This fixture is read from disk by tests; production binaries do not embed it.
