@@ -4,11 +4,11 @@
 // network list.
 //
 // THE NETWORK COMES FIRST. A wallet is an identity ON a network, kept in that
-// network's workspace (`<workspace>/keys/`), so there is nothing to unlock
-// until a network is picked: the pick loads THAT workspace's keystore
-// (`load_wallets`), and its rows decide whether the next screen unlocks one,
-// mints the device key, or — for an endpoint this device holds no workspace
-// for — opens read-only.
+// network's keystore on this device (`<workspace>/keys/` when this device
+// hosts the node, `<ducktape home>/remotes/<chain id>/keys/` when it only
+// reaches it), so there is nothing to unlock until a network is picked: the
+// pick loads THAT keystore (`load_wallets`), and its rows decide whether the
+// next screen unlocks one or mints the device key.
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
 // is `ducktape node init` on the node, where the coordinator and the rest of the
@@ -176,10 +176,11 @@ on login_failed(cause)
 on pick_network(id)
   hub_selected = id
 
-// A NETWORK PICK LOADS ITS KEYSTORE. The picked workspace's wallets decide
-// the next step (`wallets_loaded`): rows are the unlock surface, an empty
-// keystore mints the device key, and an endpoint this device holds no
-// workspace for (a remote) has no keystore at all and opens read-only. The
+// A NETWORK PICK LOADS ITS KEYSTORE. The picked network's wallets decide the
+// next step (`wallets_loaded`): rows are the unlock surface, an empty keystore
+// mints the device key. A remote has its keystore too (by chain id, under the
+// ducktape home), so the same two screens open for it; only a remote whose
+// node cannot say which network it serves stays here with the error. The
 // account probe comes AFTER the wallet, not before: which account to look for
 // depends on which key signs. A previous pick's password names a wallet on
 // another network, so it goes. The wallet screens name the network they are
@@ -210,7 +211,9 @@ on connect_remote_submit(endpoint)
 // The picked network's keystore, and the door it opens. A keystore that could
 // not be READ is not a keystore that is EMPTY: the error rides the same answer
 // and lands on the create screen's own plate, where "Continue read-only" is
-// the way past it.
+// the way past it. A keystore that could not be NAMED — a remote whose node
+// never answered which network it serves — is neither: the pick stays on
+// screen with the error, and nothing opens.
 on wallets_loaded(list)
   let door = wallet_door(list)
   mutation_phase = MutationPhase.idle
@@ -222,8 +225,8 @@ on wallets_loaded(list)
       hub_step = HubStep.wallets
     WalletDoor.password
       hub_step = HubStep.password
-    WalletDoor.read_only
-      task window open console -> console_opened _
+    WalletDoor.unreached
+      hub_step = hub_step
 
 on chain_named(id)
   hub_chain_id = id
