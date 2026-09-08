@@ -1038,38 +1038,6 @@ fn probe_unchanged_build(
     build.median_allocations()
 }
 
-/// One drawn console frame as raw RGBA — settle first (a state change may make
-/// the anchored scroll republish its viewport), then build, update, draw, and
-/// screenshot, exactly the runtime's own paint order.
-fn drawn_frame(
-    app: &mut Ducktape,
-    window: iced::window::Id,
-    renderer: &mut iced::Renderer,
-    cache: user_interface::Cache,
-) -> (user_interface::Cache, Vec<u8>) {
-    use iced::advanced::renderer::Headless as _;
-    use iced::theme::Base as _;
-    let theme = Theme::Dark;
-    let base = theme.base();
-    let cache = warm_settled("the repaint probe", app, window, WINDOW, renderer, cache);
-    let mut ui = UserInterface::build(app.__view(window), WINDOW, cache, renderer);
-    ui.draw(
-        renderer,
-        &theme,
-        &renderer::Style {
-            text_color: base.text_color,
-        },
-        mouse::Cursor::Unavailable,
-    );
-    let cache = ui.into_cache();
-    let physical = Size {
-        width: WINDOW.width as u32,
-        height: WINDOW.height as u32,
-    };
-    let pixels = renderer.screenshot(physical, 1.0, base.background_color);
-    (cache, pixels)
-}
-
 /// A settled optimistic row keeps the identity already mounted in the keyed
 /// virtual timeline the view draws it in. Replacing its client identity with
 /// the canonical sequence used to wedge the main stream while the unkeyed
