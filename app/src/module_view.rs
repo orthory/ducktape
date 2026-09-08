@@ -449,6 +449,98 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
     }
 }
 
+// ---------- the files seat ----------
+
+/// The Files tab: one directory's listing, the preview open in it, the
+/// snapshot history and the module's write rule, drawn by the `files` view.
+/// Its intents come back one per act (`files_intent`): a navigation carries
+/// a `path`, a write the `name` the reader typed or the `text` of the body
+/// they edited — the drafts are the view's, and `writes` moving tells it a
+/// committed write consumed one. The picture viewer, the highlighted reader
+/// and the Markdown document are host surfaces (`surfaces_of("files")`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the screen's facts one by one"
+)]
+pub fn files_view(
+    dark: bool,
+    connected: bool,
+    path: &str,
+    listed: bool,
+    entries: &[crate::backend::FsEntry],
+    loading: bool,
+    preview_path: &str,
+    preview_entry: &crate::backend::FsEntry,
+    delete_target: &str,
+    diff_from: &str,
+    diff: &[crate::backend::FsDiffEntry],
+    history: &[crate::backend::FsSnapshot],
+    preview_truncated: bool,
+    preview_binary: bool,
+    preview_picture: bool,
+    preview_width: i64,
+    preview_height: i64,
+    preview_text: &str,
+    write_refusal: &str,
+    writes: i64,
+) -> Element<'static, ModuleViewEvent> {
+    let props = serde_json::json!({
+        "path": path,
+        "listed": listed,
+        "entries": entries,
+        "directories": crate::backend::fs_directories(entries),
+        "connected": connected,
+        "loading": loading,
+        "preview_path": preview_path,
+        "preview_entry": preview_entry,
+        "delete_target": delete_target,
+        "diff_from": diff_from,
+        "diff": diff,
+        "history": history,
+        "preview_truncated": preview_truncated,
+        "preview_binary": preview_binary,
+        "preview_picture": preview_picture,
+        "preview_width": preview_width,
+        "preview_height": preview_height,
+        "preview_text": preview_text,
+        "dark": dark,
+        "write_refusal": write_refusal,
+        "writes": writes,
+    });
+    module_view("files", serde_json::to_vec(&props).expect("props encode"))
+}
+
+pub fn files_intent(event: &ModuleViewEvent) -> crate::FilesIntent {
+    use crate::FilesIntent as Intent;
+    match event.kind.as_str() {
+        "open_dir" => Intent::OpenDir,
+        "open_file" => Intent::OpenFile,
+        "open_parent" => Intent::OpenParent,
+        "mkdir" => Intent::Mkdir,
+        "new_file" => Intent::NewFile,
+        "arm_delete" => Intent::ArmDelete,
+        "delete" => Intent::Delete,
+        "save" => Intent::Save,
+        "show_diff" => Intent::ShowDiff,
+        "close_diff" => Intent::CloseDiff,
+        "open_link" => Intent::OpenLink,
+        _ => Intent::DisarmDelete,
+    }
+}
+
+/// The string argument at `index` of a surface's args; "" when the guest
+/// sent something else.
+fn surface_str(args: &[wire::SurfaceValue], index: usize) -> String {
+    match args.get(index) {
+        Some(wire::SurfaceValue::Str(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+fn surface_bool(args: &[wire::SurfaceValue], index: usize) -> bool {
+    matches!(args.get(index), Some(wire::SurfaceValue::Bool(true)))
+}
+
 /// The native log ring behind the node view's slot: the timeline the app
 /// last drew the tab with, and what the reader did in it since the app
 /// last drained. One per process, like the view it belongs to.
@@ -467,9 +559,39 @@ fn node_timeline() -> &'static Mutex<NodeTimeline> {
 /// `node_log_timeline` is the app's own ring, painted from the timeline the
 /// tab was last drawn with; what the reader does in it is queued for
 /// [`node_log_timeline_drain`], and the guest — which declared the slot as
-/// `-> unit` — hears only that something happened.
+/// `-> unit` — hears only that something happened. The files view's three
+/// are the preview's readers: the picture viewer over the Files surface's
+/// store, the highlighted code reader, and the Markdown document, whose
+/// activated link goes back to the guest's own handler as a string.
 fn surfaces_of(module: &str) -> Surfaces {
     let mut surfaces = Surfaces::default();
+    if module == "files" {
+        surfaces.insert(
+            "picture".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                crate::backend::picture(surface_str(args, 0), surface_str(args, 1))
+                    .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "forge_code".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                crate::backend::forge_code(
+                    surface_str(args, 0),
+                    surface_str(args, 1),
+                    surface_bool(args, 2),
+                )
+                .map(|()| wire::SurfaceValue::Unit)
+            }),
+        );
+        surfaces.insert(
+            "agent_markdown".into(),
+            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
+                crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
+                    .map(wire::SurfaceValue::Str)
+            }),
+        );
+    }
     if module == "node" {
         surfaces.insert(
             "node_log_timeline".into(),
@@ -501,6 +623,20 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "agents" => &[],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
+        "files" => &[
+            "open_dir",
+            "open_file",
+            "open_parent",
+            "mkdir",
+            "new_file",
+            "arm_delete",
+            "disarm_delete",
+            "delete",
+            "save",
+            "show_diff",
+            "close_diff",
+            "open_link",
+        ],
         "settings" => &[
             "tab",
             "reconnect",
@@ -818,10 +954,12 @@ impl Guest {
 
     /// What the user did to the tree, as the widgets report it: recorded
     /// host-side (an input's text) and queued for the guest's next tick. A
-    /// host surface's event is the app's, not the guest's: it was queued
-    /// where the surface keeps it, and the app is told to drain it.
+    /// host surface the guest routed (`-> handler _`) reaches that handler
+    /// with the value the surface produced; one it left unrouted is the
+    /// app's own ring, whose event was queued where the surface keeps it,
+    /// and the app is told to drain it.
     fn deliver(&mut self, output: Output) {
-        if let Output::Surface { .. } = output {
+        if let Output::Surface { handler: None, .. } = output {
             self.intents.push(ModuleViewEvent {
                 kind: "log_timeline".into(),
                 detail: String::new(),
@@ -1304,15 +1442,40 @@ mod tests {
         texts
     }
 
-    /// The message index the button labelled `name` would send.
+    /// The key and input-handler index of the input whose placeholder is
+    /// `hint`.
+    fn input_named(guest: &Guest, hint: &str) -> (String, u32) {
+        let mut root = guest.frame.root.clone().expect("a tree");
+        let mut found = None;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::Input {
+                key,
+                placeholder,
+                on_input,
+                ..
+            } = node
+                && placeholder == hint
+            {
+                found = Some((key.clone(), *on_input));
+            }
+        });
+        found.expect("an input with that placeholder")
+    }
+
+    /// The message index the button labelled `name` — by its `label=`, or
+    /// by the text it shows — would send.
     fn button_message(guest: &Guest, name: &str) -> u32 {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut message = None;
         root.for_each_mut(&mut |node| {
             if let wire::Node::Button {
-                label, on_press, ..
+                label,
+                content,
+                on_press,
+                ..
             } = node
-                && label.as_deref() == Some(name)
+                && (label.as_deref() == Some(name)
+                    || matches!(content, wire::ButtonContent::Label(text) if text == name))
             {
                 message = *on_press;
             }
@@ -1673,6 +1836,93 @@ mod tests {
             [ModuleViewEvent {
                 kind: "copy".into(),
                 detail: r#"{"text":"42","label":"Number copied"}"#.into(),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// The bundled Files view through the host: the listing, a typed name
+    /// that leaves as a `mkdir` intent, the three preview surfaces in the
+    /// guest's tree, and a link the Markdown reader activates coming back
+    /// through the guest's own route as an `open_link` intent.
+    #[test]
+    fn the_staged_files_view_boots_takes_the_listing_and_routes_a_link_through_its_surface() {
+        let Some(staged) = staged("files") else {
+            return;
+        };
+        let mut guest = Guest::load_from("files", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "path": "/shared", "listed": true,
+                "entries": [
+                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"},
+                    {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"}
+                ],
+                "directories": [
+                    {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
+                ],
+                "connected": true, "loading": false,
+                "preview_path": "/shared/README.md",
+                "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
+                "delete_target": "", "diff_from": "", "diff": [], "history": [],
+                "preview_truncated": false, "preview_binary": false, "preview_picture": false,
+                "preview_width": 0, "preview_height": 0,
+                "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+                "dark": false, "write_refusal": "", "writes": 0
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["duckfs", "/shared", "1 file · 1 dir", "README.md", "1 KB"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        assert_eq!(surface_names(&guest), ["agent_markdown"]);
+        assert!(guest.surfaces.contains_key("agent_markdown"));
+        assert!(guest.surfaces.contains_key("forge_code"));
+        assert!(guest.surfaces.contains_key("picture"));
+
+        // the Markdown reader's link goes back through the guest's route
+        let mut route = None;
+        if let Some(root) = &guest.frame.root {
+            root.clone().for_each_mut(&mut |node| {
+                if let wire::Node::Surface { on_event, .. } = node {
+                    route = *on_event;
+                }
+            });
+        }
+        guest.deliver(Output::Surface {
+            handler: route,
+            value: wire::SurfaceValue::Str("https://duck.example/x".into()),
+        });
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "open_link".into(),
+                detail: r#"{"url":"https://duck.example/x"}"#.into(),
+            }]
+        );
+
+        // a typed name leaves trimmed, as a mkdir under the crumb
+        let (key, handler) = input_named(&guest, "new name…");
+        guest.deliver(Output::Edit {
+            key,
+            handler,
+            text: "  reports  ".into(),
+        });
+        guest.redraw(&props);
+        guest.deliver(Output::Activate(button_message(&guest, "+ Folder")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "mkdir".into(),
+                detail: r#"{"name":"reports"}"#.into(),
             }]
         );
         assert!(guest.fault.is_none());
