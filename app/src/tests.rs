@@ -3,6 +3,7 @@
 // exactly as they did when this mod lived inline in main.rs.
 use super::*;
 
+mod canary;
 mod connection;
 mod design;
 mod font_fallback;

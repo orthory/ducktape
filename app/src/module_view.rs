@@ -2081,6 +2081,70 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
         reason = %if reason.is_empty() { "-" } else { reason },
         "view_source"
     );
+    #[cfg(test)]
+    {
+        let line = format!(
+            "module={module} hash={} state={state} gen={generation} reason={}",
+            hash.map_or_else(|| "-".to_owned(), |hash| crate::backend::hex_encode(hash)),
+            if reason.is_empty() { "-" } else { reason }
+        );
+        canary::TAPS
+            .lock()
+            .expect("view_source taps")
+            .retain(|tap| tap.send(line.clone()).is_ok());
+    }
+}
+
+/// What the canary runner (`tests::canary`) needs of this registry: the
+/// `view_source` lines as they are logged, the module-owned views mounted
+/// without an app around them, and the hash a slot answers for.
+#[cfg(test)]
+pub(crate) mod canary {
+    use std::sync::{Mutex, mpsc};
+
+    pub(crate) use super::tests::connection_turn;
+
+    pub(crate) static TAPS: Mutex<Vec<mpsc::Sender<String>>> = Mutex::new(Vec::new());
+
+    pub(crate) fn tap() -> mpsc::Receiver<String> {
+        let (sender, receiver) = mpsc::channel();
+        TAPS.lock().expect("view_source taps").push(sender);
+        receiver
+    }
+
+    pub(crate) fn mount_module_owned() {
+        for module in crate::backend::view_source::MODULE_OWNED {
+            super::mounted(module);
+        }
+    }
+
+    pub(crate) fn seated_hash(module: &'static str) -> Option<[u8; 32]> {
+        super::mounted(module)
+            .lock()
+            .expect("module view lock")
+            .hash
+    }
+
+    /// Every text in the view's tree, or none where no tree is drawn yet.
+    pub(crate) fn texts(module: &'static str) -> Vec<String> {
+        let mut texts = Vec::new();
+        let root = match &super::mounted(module)
+            .lock()
+            .expect("module view lock")
+            .slot
+        {
+            super::Slot::Ready(guest) => guest.frame.root.clone(),
+            _ => None,
+        };
+        if let Some(mut root) = root {
+            root.for_each_mut(&mut |node| {
+                if let super::wire::Node::Text { content, .. } = node {
+                    texts.push(content.clone());
+                }
+            });
+        }
+        texts
+    }
 }
 
 /// Where the staged views are: `$DUCKTAPE_VIEWS_DIR`, else `views/` beside
