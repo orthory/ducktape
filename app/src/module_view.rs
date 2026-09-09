@@ -5350,12 +5350,78 @@ pub(crate) mod tests {
     /// turns, so one's node is not another's — including the round trip
     /// over a real node in `backend::tests::wire`, whose connect reloads
     /// every seat here from a node that runs none of these modules.
-    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn connection_turn_lock() -> &'static tokio::sync::Mutex<()> {
+        static TURN: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         TURN.get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
+    }
+
+    fn reset_connection_turn() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        // Retire intentionally busy/failed seats left by the previous test.
+        // Keep revisions monotonic so detached old loads remain stale.
+        let mut registry = registry().lock().expect("module views");
+        let mut connection = connection().lock().expect("views rpc");
+        registry.clear();
+        connection.client = None;
+        connection.rev += 1;
+    }
+
+    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
+        let turn = connection_turn_lock().lock().await;
+        reset_connection_turn();
+        turn
+    }
+
+    /// Hold this outside allocation measurement until the render thread joins.
+    pub(crate) fn blocking_connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
+        let turn = connection_turn_lock().blocking_lock();
+        reset_connection_turn();
+        turn
+    }
+
+    #[test]
+    fn connection_turn_excludes_renderers_and_retires_the_previous_busy_guest() {
+        let turn = blocking_connection_turn();
+        let staged = staged("chat").expect("build the actual Chat guest");
+        let mut guest = Guest::load_from("chat", &staged).expect("actual Chat guest");
+        guest.pending.push(wire::Event::Resync);
+        let seat = Arc::new(Mutex::new(Mounted {
+            slot: Slot::Ready(Box::new(guest)),
+            props: Some(b"previous test props".to_vec()),
+            generation: 9,
+            hash: Some([7; 32]),
+            in_flight: false,
+            wanted: None,
+            waiting_since: None,
+            replacement: Replacement::Preserve,
+            retry: None,
+        }));
+        registry().lock().unwrap().insert("chat", seat.clone());
+        let revision = connection().lock().unwrap().rev;
+        std::thread::spawn(|| {
+            assert!(
+                connection_turn_lock().try_lock().is_err(),
+                "a renderer cannot enter while a deployment owns the seats"
+            );
+        })
+        .join()
+        .unwrap();
+        drop(turn);
+        let _next = blocking_connection_turn();
+        assert!(
+            registry().lock().unwrap().is_empty(),
+            "the next test must not inherit a pending guest or its props/assets"
+        );
+        assert!(connection().lock().unwrap().rev > revision);
+        let locked = seat.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("old seat")
+        };
+        assert_eq!(
+            guest.pending.len(),
+            1,
+            "retirement must not edit the old guest"
+        );
     }
 
     /// The seat of `module` as no test has touched it: the registry is one
