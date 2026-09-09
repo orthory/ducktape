@@ -3321,8 +3321,12 @@ pub(crate) mod tests {
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert_eq!(intents_of("agents"), ["status", "save", "register"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 43);
+        assert_eq!(chat.len(), 44);
         assert!(chat.contains(&"choose_channel"));
+        assert!(
+            chat.contains(&"cancel_run"),
+            "stopping an anchored agent run is an act the screen offers"
+        );
         assert!(
             !chat.contains(&"composer"),
             "a submit reaches the app only through the composer surface it was typed in"
@@ -3406,6 +3410,26 @@ pub(crate) mod tests {
             }
         });
         message.expect("an enabled button")
+    }
+
+    /// Whether a button showing `name` is on the frame at all.
+    ///
+    /// A BUTTON'S LABEL IS NOT A TEXT NODE, so `texts()` never contains it and
+    /// asserting over that list says nothing about a button either way — an
+    /// `any(== "Stop")` fails on a button that is plainly there, and the
+    /// `!any(== "Stop")` twin passes whether it is there or not.
+    fn button_shown(guest: &Guest, name: &str) -> bool {
+        let mut root = guest.frame.root.clone().expect("a tree");
+        let mut found = false;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::Button { label, content, .. } = node
+                && (label.as_deref() == Some(name)
+                    || matches!(content, wire::ButtonContent::Label(text) if text == name))
+            {
+                found = true;
+            }
+        });
+        found
     }
 
     /// The bundled component, end to end through the host: it boots on the
@@ -4610,7 +4634,7 @@ pub(crate) mod tests {
         guest.redraw(&None);
         guest.redraw(&facts);
         assert!(
-            texts(&guest).iter().any(|text| text == "Stop"),
+            button_shown(&guest, "Stop"),
             "no way to stop the run (fault {:?}): {:?}",
             guest.fault,
             texts(&guest)
@@ -4644,12 +4668,14 @@ pub(crate) mod tests {
         let settled = [messages[0].clone(), messages[1].clone(), reply];
         guest.redraw(&chat_facts_in("channel-a", &settled, &[], &[]));
         let shown = texts(&guest);
-        for gone in ["Stop", "Reading the repo"] {
-            assert!(
-                !shown.iter().any(|text| text == gone),
-                "the settled run left {gone:?} behind: {shown:?}"
-            );
-        }
+        assert!(
+            !button_shown(&guest, "Stop"),
+            "the settled run left its Stop behind: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Reading the repo"),
+            "the settled run left its status behind: {shown:?}"
+        );
         assert!(
             shown
                 .iter()
