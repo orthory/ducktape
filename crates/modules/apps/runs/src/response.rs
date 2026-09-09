@@ -252,6 +252,34 @@ fn task_status(name: &str) -> Option<TaskStatus> {
     }
 }
 
+/// the catalog spelling of a collaboration message kind. The `enum` list in
+/// the `collaboration.send` input schema is this map's domain; the two move
+/// together or the schema advertises a kind the composer refuses.
+fn message_kind(name: &str) -> Option<collaboration::MessageKind> {
+    match name {
+        "notice" => Some(collaboration::MessageKind::Notice),
+        "question" => Some(collaboration::MessageKind::Question),
+        "task_request" => Some(collaboration::MessageKind::TaskRequest),
+        "task_update" => Some(collaboration::MessageKind::TaskUpdate),
+        "result" => Some(collaboration::MessageKind::Result),
+        _ => None,
+    }
+}
+
+/// the delivery states a bound service may REPORT. Deliberately narrower than
+/// `DeliveryState`: `stored` is the network's own admission fact and `expired`
+/// is the deadline's, so neither is a service's to claim.
+fn reported_state(name: &str) -> Option<collaboration::DeliveryState> {
+    match name {
+        "queued" => Some(collaboration::DeliveryState::Queued),
+        "adapter_accepted" => Some(collaboration::DeliveryState::AdapterAccepted),
+        "held" => Some(collaboration::DeliveryState::Held),
+        "refused" => Some(collaboration::DeliveryState::Refused),
+        "delivery_unknown" => Some(collaboration::DeliveryState::DeliveryUnknown),
+        _ => None,
+    }
+}
+
 /// whether the registry granted this agent an action name.
 pub(super) fn allows(agent: &ModelRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
@@ -923,6 +951,16 @@ impl RunsModule {
                     instruction,
                     skills,
                 } => validate_agent_call(&agent, entry, agent_id, instruction, skills)?,
+                // the composable half only. WHO may act as this participant is
+                // not decided here and cannot be: the binding is judged against
+                // the `Origin::Program(account)` the effect arrives under, which
+                // exists only after the account's program claims this proposal.
+                // Probing collaboration from here would ask under the
+                // SUBMITTER's origin and answer about the wrong principal.
+                Operation::CollaborationSend { .. }
+                | Operation::CollaborationAcknowledge { .. } => {
+                    self.collaboration_msg(operation)?;
+                }
                 Operation::PagesComment { .. }
                 | Operation::PagesSetChecked { .. }
                 | Operation::DuckfsWriteText { .. } => {
@@ -1819,9 +1857,111 @@ impl RunsModule {
             | Operation::PagesSetChecked { .. }
             | Operation::DuckfsWriteText { .. }
             | Operation::ModulesUpdate(_)
+            | Operation::CollaborationSend { .. }
+            | Operation::CollaborationAcknowledge { .. }
             | Operation::AgentCall { .. } => {
                 unreachable!("only conversational operations reach this lane")
             }
+        }
+    }
+
+    /// One `collaboration.*` operation as the exact message the account's
+    /// program will execute, or the reason it cannot be composed.
+    ///
+    /// This composes bytes; it does not authorize them. The message carries no
+    /// actor field — collaboration reads the acting principal off
+    /// `Origin::Program(account)`, and admits the op only if the participant's
+    /// OWNER bound that account to that conversation under a live credential.
+    /// So the model's grant and the human's binding must BOTH hold: this
+    /// module can withhold the action, and it can never confer it.
+    pub(super) fn collaboration_msg(&self, operation: &Operation) -> Result<Prepared, String> {
+        let Some(target) = self.collaboration.clone() else {
+            return Err(format!(
+                "{} needs a collaboration module, and this network wires none",
+                operation.name()
+            ));
+        };
+        // every op is bound to THIS network by name, so a signed or replayed
+        // payload cannot be re-submitted on another one.
+        let request = |op| collaboration::Request::new(self.chain_id.clone(), op);
+        match operation {
+            Operation::CollaborationSend {
+                conversation_id,
+                participant_id,
+                credential,
+                sequence,
+                recipient_participant_id,
+                kind,
+                body,
+                expires_at,
+                reply_to,
+            } => {
+                let kind = message_kind(kind)
+                    .ok_or_else(|| format!("unknown message kind: {kind}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target,
+                        payload: collaboration::encode_msg(&request(
+                            collaboration::CollaborationMsg::Send(collaboration::SendRequest {
+                                conversation_id: conversation_id.clone(),
+                                sender_participant_id: participant_id.clone(),
+                                message_id: collaboration::MessageId {
+                                    generation: *credential,
+                                    sequence: *sequence,
+                                },
+                                recipient_participant_id: recipient_participant_id.clone(),
+                                kind,
+                                reply_to: *reply_to,
+                                // the catalog exposes neither a task attempt
+                                // nor references: a run that needs one names it
+                                // in the body until the operation grows a
+                                // schema for it.
+                                task: None,
+                                body: body.clone(),
+                                references: Vec::new(),
+                                expires_at: *expires_at,
+                            }),
+                        )),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "credential": credential,
+                        "sequence": sequence,
+                    }),
+                ))
+            }
+            Operation::CollaborationAcknowledge {
+                conversation_id,
+                credential,
+                seq,
+                state,
+                reason,
+            } => {
+                let delivery = reported_state(state)
+                    .ok_or_else(|| format!("unknown delivery state: {state}"))?;
+                Ok(Prepared::new(
+                    Msg {
+                        target,
+                        payload: collaboration::encode_msg(&request(
+                            collaboration::CollaborationMsg::Acknowledge {
+                                conversation_id: conversation_id.clone(),
+                                seq: *seq,
+                                binding_credential: *credential,
+                                state: delivery,
+                                reason: reason.clone(),
+                            },
+                        )),
+                    },
+                    operation.name(),
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "seq": seq,
+                        "state": state,
+                    }),
+                ))
+            }
+            other => unreachable!("{} is not a collaboration operation", other.name()),
         }
     }
 

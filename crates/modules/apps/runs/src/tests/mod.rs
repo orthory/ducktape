@@ -351,6 +351,15 @@ impl CaptureCtx {
             .map(|m| pages::decode_msg(&m.payload).expect("pages msg"))
             .collect()
     }
+    /// decoded collaboration msgs emitted this dispatch, each with the network
+    /// its request is bound to — the binding is half the payload's meaning.
+    fn collaboration_msgs(&self) -> Vec<collaboration::Request> {
+        self.msgs
+            .iter()
+            .filter(|m| m.target == "collaboration")
+            .map(|m| collaboration::decode_msg(&m.payload).expect("collaboration msg"))
+            .collect()
+    }
     /// decoded files msgs emitted this dispatch.
     fn files_msgs(&self) -> Vec<FilesMsg> {
         self.msgs
@@ -1289,6 +1298,7 @@ fn agent_call(agent_id: impl Into<String>, instruction: impl Into<String>) -> Ac
     )
 }
 
+mod collaboration_actions;
 mod composition;
 mod delivery;
 mod facets;

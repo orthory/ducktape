@@ -33,6 +33,11 @@ borsh = { workspace = true }
 # workspace's own deps are the same paths, and feature unification keeps
 # native binaries (which enable the default `native` features) whole.
 chat = { path = "../chat", default-features = false }
+# the collaboration wire types the two `collaboration.*` operations compose.
+# ONLY the wire surface crosses this edge: the authority check stays in that
+# module, where the program origin the effect arrives under is the one it
+# judges.
+collaboration = { workspace = true }
 saga = { path = "../../system/saga", default-features = false }
 attribution = { workspace = true }
 dispatch = { workspace = true }
