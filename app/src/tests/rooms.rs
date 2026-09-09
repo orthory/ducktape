@@ -1161,3 +1161,121 @@ fn another_members_dm_is_not_a_channel_of_mine() {
         "no derived DM id is a CHANNELS row — not mine, and not theirs"
     );
 }
+
+/// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
+/// pending set, and the reading is stamped with the connection it was taken over
+/// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
+/// would assign its emptiness and blank the cards the current connection just
+/// installed, until the next two-second poll put them back.
+///
+/// Pinned as statements, not as a substring: the comment above that handler
+/// NAMES the blanking it refuses to do, and a `contains` over the arm would read
+/// the prose as the code.
+#[test]
+fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
+    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
+    let arm = chat
+        .split_once("on live_agents_event(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("it ends")
+        .0;
+    let statements: Vec<&str> = arm
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && !line.is_empty())
+        .collect();
+    assert_eq!(
+        statements,
+        [
+            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)",
+            "live_agents = next.rows",
+        ],
+        "the guard RETURNS, and it stands before the only assignment"
+    );
+
+    // ALL FOUR IDENTITIES REACH THE LANE, or the guard above cannot ask. The
+    // endpoint is the weakest of them: a workspace switch brings the node back
+    // on the same loopback port, which is the same trap `live_resynced` names
+    // `chain_left_behind`. The seat is the one that does not move with the
+    // connection at all — see the seams pinned below.
+    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
+    let lane: Vec<&str> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run chat_live_agents("))
+        .collect();
+    assert_eq!(
+        lane,
+        [
+            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _"
+        ],
+        "one lane, for the node, keyed on the whole connection AND the seat"
+    );
+
+    // EVERY SEAM THAT MOVES THE SEAT WRITES `signer_key`, or the lane is keyed
+    // on a lie. A Settings unlock and lock change what this device may read and
+    // bump NO `connect_generation` (`node.ice` SettingsIntent.unlock/.lock), so
+    // a missed seam here is a device that never recovers from a lock — or one
+    // that keeps the previous key's output after a switch.
+    let node = inlined(include_str!("../ui/handlers/node.ice"));
+    let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
+    for (file, source, seam) in [
+        // seated: the handler that fires when a key is opened carries its pubkey
+        ("node.ice", &node, "on settings_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on phrase_confirmed(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_restored(pubkey)"),
+    ] {
+        let arm = source
+            .split_once(seam)
+            .unwrap_or_else(|| panic!("{file} must still carry `{seam}`"))
+            .1
+            .split_once("\non ")
+            .expect("the handler ends")
+            .0;
+        assert!(
+            arm.contains("signer_key = pubkey"),
+            "{file}: `{seam}` seats a key without naming it — the live agent \
+             lane keys on `signer_key`"
+        );
+        // AND DROPS THE ROWS IN THE SAME ARM. Re-keying the lane only fences
+        // what arrives next, and the new lane's first notice waits on a `runs`
+        // query — so a seam that moves the seat without clearing leaves the
+        // previous key's private output on screen for as long as that query
+        // takes, or forever if it never answers.
+        assert!(
+            arm.contains("live_agents = []"),
+            "{file}: `{seam}` moves the seat and leaves the previous key's rows \
+             on screen until a fresh notice arrives"
+        );
+    }
+    // and the teardown clears it, in the arm that retires the signer.
+    let lock = node
+        .split_once("SettingsIntent.lock")
+        .expect("the Lock intent")
+        .1
+        .split_once("    SettingsIntent.")
+        .expect("the next intent")
+        .0;
+    assert!(
+        lock.contains("signer_key = \"\"")
+            && lock.contains("live_agents = []")
+            && lock.contains("lock_signer()"),
+        "node.ice: the arm that retires the signer must clear `signer_key` and \
+         the rows it could read: {lock}"
+    );
+    assert!(
+        onboarding.contains("signer_key = \"\""),
+        "onboarding.ice: leaving a network must clear the seat it was taken in"
+    );
+
+    // AND NO ROOM OWES IT ANYTHING. Eight handlers move `active_channel`; the
+    // room is chosen in `encode_chat_props`, so none of them may carry a
+    // per-room launch or teardown for this lane.
+    assert!(
+        !chat.contains("lane=live_agents"),
+        "a per-room lane is back, and five of the eight movers will forget it"
+    );
+}

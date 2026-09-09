@@ -3,7 +3,8 @@
 //! are slots the host paints, keyed by the room and the thread.
 
 use chat_view::host::{
-    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, Query, Selection, Text,
+    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, LiveActivity,
+    LiveAgentRow, Query, RunId, Selection, Text,
 };
 use chat_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
@@ -438,5 +439,266 @@ fn a_thread_selection_does_not_add_a_second_bar_to_the_channel() {
             1
         );
         node_ending(&frame, "/thread-selection/root");
+    });
+}
+
+fn live_run(anchor_seq: i64) -> LiveAgentRow {
+    LiveAgentRow {
+        anchor_seq,
+        run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
+        agent: "ferris".into(),
+        status: "Reading the repo".into(),
+        activity: vec![
+            LiveActivity {
+                label: "Command: cargo test".into(),
+                done: true,
+            },
+            LiveActivity {
+                label: "Reasoning".into(),
+                done: false,
+            },
+        ],
+        ..LiveAgentRow::default()
+    }
+}
+
+/// THE MEMO MUST SEE THE RUN MOVE. The stream's rows are drawn inside the
+/// timeline's `lazy`, and a `by` key list takes the lazied value OUT of the
+/// memo's hash — what keys it is the REVISION of the state the value reads. So
+/// the runs have to ride a state field the memo reads (`host::Timeline`): fold
+/// them into `live_agents` alone and the second reading below is a cache hit
+/// with the card still on its first status, for the whole run.
+///
+/// Only `live_agents` differs between the two readings here. That is the point.
+#[test]
+fn a_run_in_flight_repaints_as_it_works() {
+    on_a_deep_stack(|| {
+        let mut starting = live_run(2);
+        starting.status = "Starting".into();
+        starting.activity.clear();
+        let props = ChatProps {
+            live_agents: vec![starting],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&props);
+        assert!(has_text(&frame, "Starting"), "{:?}", texts(&frame));
+
+        let moved_on = ChatProps {
+            live_agents: vec![live_run(2)],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&moved_on))]);
+        for expected in ["Reading the repo", "Command: cargo test", "Reasoning"] {
+            assert!(
+                has_text(&frame, expected),
+                "the run's progress never reached the frame: missing {expected:?} in {:?}",
+                texts(&frame)
+            );
+        }
+        assert!(
+            !has_text(&frame, "Starting"),
+            "the memo served a stale card: {:?}",
+            texts(&frame)
+        );
+    });
+}
+
+#[test]
+fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
+    on_a_deep_stack(|| {
+        let props = ChatProps {
+            live_agents: vec![live_run(2)],
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
+        for expected in ["ferris", "AGENT", "Reading the repo", "Command: cargo test"] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?} in {:?}",
+                texts(&frame)
+            );
+        }
+        let frame = tick_native(press(&frame, "Stop"));
+        let [intent] = frame.requests.as_slice() else {
+            panic!("one intent, got {:?}", frame.requests);
+        };
+        assert_eq!(intent.kind, "chat.cancel_run");
+        assert_eq!(
+            serde_json::from_slice::<RunId>(&intent.payload).expect("decodes"),
+            RunId {
+                run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into()
+            }
+        );
+    });
+}
+
+/// How many cards for this run are on the frame. The status is per-card, so
+/// counting it counts cards.
+fn cards(frame: &Frame) -> usize {
+    texts(frame)
+        .iter()
+        .filter(|text| *text == "Reading the repo")
+        .count()
+}
+
+/// ONE RUN, ONE CARD, whichever surface is in front of the reader.
+///
+/// The stream draws a card under the anchor and the rail draws one at its foot.
+/// With the run's OWN thread open both were true at once — two cards and two
+/// Stops for one run. The rail owns it while the rail is on screen; the stream
+/// takes it back when it is not.
+///
+/// The settings case is the one a seq-only suppression gets wrong: the drawer
+/// replaces the rail while `active_thread_seq` still stands, so "a thread is
+/// open" would have hidden BOTH cards and left the run with no Stop at all.
+#[test]
+fn one_run_draws_exactly_one_card_whichever_surface_owns_it() {
+    on_a_deep_stack(|| {
+        let run = live_run(2);
+        let closed = ChatProps {
+            live_agents: vec![run.clone()],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&closed);
+        assert_eq!(cards(&frame), 1, "the stream draws it: {:?}", texts(&frame));
+        assert!(has_text(&frame, "ferris"));
+
+        // THE RAIL OPENS ON THE RUN'S OWN THREAD. Its card moves; it does not
+        // multiply.
+        let mut root = message(2, "second wind");
+        root.reply_count = 1;
+        let railed = ChatProps {
+            active_thread_seq: 2,
+            thread_messages: vec![root.clone()],
+            live_agents: vec![run.clone()],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&railed))]);
+        assert_eq!(
+            cards(&frame),
+            1,
+            "the rail has it AND the stream still drew one: {:?}",
+            texts(&frame)
+        );
+        // the Stop still routes, and there is exactly one of it
+        let frame = tick_native(press(&frame, "Stop"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.cancel_run");
+        assert_eq!(
+            serde_json::from_slice::<RunId>(&intent.payload).expect("decodes"),
+            RunId {
+                run_id: run.run_id.clone()
+            },
+            "the same run the stream's card would have stopped"
+        );
+
+        // THE SETTINGS DRAWER REPLACES THE RAIL while the thread stays open.
+        // The card belongs to the stream again — suppressing on the seq alone
+        // would leave the reader no card and no Stop.
+        let drawered = ChatProps {
+            active_thread_seq: 2,
+            channel_settings_open: true,
+            thread_messages: vec![root],
+            live_agents: vec![run],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&drawered))]);
+        assert_eq!(
+            cards(&frame),
+            1,
+            "the drawer hid the rail and took the card with it: {:?}",
+            texts(&frame)
+        );
+
+        // AND BACK TO THE STREAM when the rail closes.
+        let frame = tick_native(vec![item(subscription, &encoded(&closed))]);
+        assert_eq!(cards(&frame), 1, "{:?}", texts(&frame));
+    });
+}
+
+/// The anchor decides WHERE, and a run summoned inside a thread belongs to the
+/// rail: its anchor is a reply, which the stream never draws, so the stream
+/// must stay clean and the rail must claim it through `thread_root`.
+#[test]
+fn a_run_anchored_in_a_thread_draws_in_the_rail_and_not_in_the_stream() {
+    on_a_deep_stack(|| {
+        let mut in_thread = live_run(7);
+        in_thread.thread_root = 2;
+        in_thread.status = "Answering in the thread".into();
+        let mut root = message(2, "second wind");
+        root.reply_count = 1;
+        let mut reply = message(7, "and what about the rail");
+        reply.thread_seq = 2;
+        let props = ChatProps {
+            active_thread_seq: 2,
+            thread_messages: vec![root, reply],
+            live_agents: vec![in_thread.clone()],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&props);
+        assert!(
+            has_text(&frame, "Answering in the thread"),
+            "the rail did not claim the run: {:?}",
+            texts(&frame)
+        );
+
+        // THE SAME RUN, NO RAIL OPEN: its anchor is a reply, so no message in
+        // the stream carries its seq and nothing of it is drawn.
+        let closed = ChatProps {
+            live_agents: vec![in_thread],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&closed))]);
+        assert!(
+            !has_text(&frame, "Answering in the thread"),
+            "a reply's run leaked into the stream: {:?}",
+            texts(&frame)
+        );
+    });
+}
+
+#[test]
+fn the_committed_reply_replaces_the_live_row() {
+    on_a_deep_stack(|| {
+        let props = ChatProps {
+            live_agents: vec![live_run(2)],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&props);
+        assert!(has_text(&frame, "Reading the repo"));
+        // the run left the pending set as its reply landed: the row goes, the
+        // reply stays
+        let mut reply = message(3, "here is the answer");
+        reply.author = "ferris".into();
+        reply.avatar_kind = "agent".into();
+        let landed = ChatProps {
+            messages: vec![message(1, "first"), message(2, "second"), reply],
+            live_agents: Vec::new(),
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&landed))]);
+        assert!(!has_text(&frame, "Reading the repo"), "{:?}", texts(&frame));
+        assert!(!has_text(&frame, "Stop"), "{:?}", texts(&frame));
+        assert!(has_text(&frame, "here is the answer"));
+        assert!(has_text(&frame, "AGENT"), "the reply wears the agent plate");
+    });
+}
+
+#[test]
+fn a_failed_run_shows_its_terminal_state() {
+    on_a_deep_stack(|| {
+        let mut failed = live_run(2);
+        failed.status = "the node event stream closed".into();
+        failed.activity.clear();
+        let props = ChatProps {
+            live_agents: vec![failed],
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
+        assert!(
+            has_text(&frame, "the node event stream closed"),
+            "{:?}",
+            texts(&frame)
+        );
     });
 }

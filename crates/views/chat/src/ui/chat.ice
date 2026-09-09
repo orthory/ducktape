@@ -20,8 +20,9 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], rail_shown:bool, active_thread_seq:i64, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
+    cancel_run(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -107,6 +108,24 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
                 open_message_actions
                 open_message_link
                 press_message
+      // THE RUN THIS MESSAGE ANCHORED, live under it while it runs; the
+      // committed reply takes the row's place.
+      //
+      // A PLAIN `for`, NOT `keyed`. The card holds no state to follow, and
+      // this loop sits INSIDE the row loop — a `keyed live ... by=anchor_seq`
+      // here mints the same key once per message on screen, so a single run
+      // turned into one duplicate-keyed scope per visible row.
+      //
+      // AND NOT WHEN THE RAIL HAS IT. With the run's own thread open, the
+      // anchor match here and the rail's match below were both true: two cards
+      // and two Stops for one run. `rail_owns_run` is the one rule both
+      // surfaces read, so the card moves to the rail and comes back when it
+      // closes.
+      for live in live_agents
+        if live.anchor_seq == message.seq && !rail_owns_run(live, rail_shown, active_thread_seq)
+          LiveAgentCard live=live
+            forward
+              cancel_run
 
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
@@ -198,9 +217,10 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveAgentRow], timeline:Timeline, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
+    cancel_run(str)
     press_message(i64, CopySurface)
     clear_copy_range()
     copy_selected_messages()
@@ -597,10 +617,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                   // huddle window itself rides every room and every screen,
                   // with faces, a clock and a way in.
                   if huddle_joined && huddle_channel == active_channel
-                    HuddleLivePill
-                      with
-                        elapsed=mmss(huddle_now - huddle_joined_at)
-                        muted=call_muted
+                    HuddleLivePill elapsed=mmss(huddle_now - huddle_joined_at) muted=call_muted
                       forward
                         show_huddle
                         leave_huddle_here
@@ -846,10 +863,20 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           // the quiet rows always did: the reaction handlers
                           // keep refusing while loading; the openers never
                           // did.
-                          lazy messages by active_channel, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_messages
+                          // `active_thread_seq` AND `channel_settings_open` are
+                          // memo keys because the stream's own card now depends
+                          // on both: opening the rail on a run's thread moves
+                          // that card out of here, and the settings drawer
+                          // hiding the rail moves it back. Leave either out and
+                          // the cached frame keeps the card the other surface is
+                          // also drawing.
+                          lazy timeline by active_channel, active_thread_seq, channel_settings_open, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_timeline
                             MessageTimeline
                               with
-                                messages=cached_messages
+                                messages=cached_timeline.messages
+                                live_agents=cached_timeline.live_agents
+                                rail_shown=(active_thread_seq > 0 && !channel_settings_open)
+                                active_thread_seq
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
@@ -857,6 +884,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                 copy_head_seq
                                 copy_surface
                               forward
+                                cancel_run
                                 add_reaction_at
                                 remove_reaction_at
                                 open_thread_for
@@ -905,7 +933,13 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                 with
                                   w=200.0
                                   p=5.0
-                                  bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                                  bg=elevated
+                                  border=border
+                                  border-w=1.0
+                                  r=10.0
+                                  shadow=shadow_popover
+                                  shadow-y=8.0
+                                  shadow-blur=24.0
                                 col w=fill gap=1.0
                                   // LIVE, SO THE PRESS REACHES THE REFUSAL. A
                                   // disabled row is pixel-identical to a live
@@ -1103,7 +1137,16 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               // the message's own reaction chips, which
                               // already toggle off for `reacted_by_me`. Esc
                               // and the backdrop dismiss — no × row.
-                              box p=8.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                              box
+                                with
+                                  p=8.0
+                                  bg=elevated
+                                  border=border
+                                  border-w=1.0
+                                  r=10.0
+                                  shadow=shadow_popover
+                                  shadow-y=8.0
+                                  shadow-blur=24.0
                                 flex
                                   with
                                     w=234.0
@@ -1144,7 +1187,13 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               with
                                 w=fill
                                 p=3.0
-                                bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                                bg=elevated
+                                border=border
+                                border-w=1.0
+                                r=10.0
+                                shadow=shadow_popover
+                                shadow-y=8.0
+                                shadow-blur=24.0
                               row
                                 with
                                   w=fill
@@ -1207,7 +1256,16 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                   line-h=1.0
                                 active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                                 focused bg=transparent border=transparent value=transparent border-w=0.0
-                              box p=3.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                              box
+                                with
+                                  p=3.0
+                                  bg=elevated
+                                  border=border
+                                  border-w=1.0
+                                  r=10.0
+                                  shadow=shadow_popover
+                                  shadow-y=8.0
+                                  shadow-blur=24.0
                                 row gap=5.0 align=center
                                   text "Delete this message?" size=12.5 @text-muted
                                   button "Delete" -> emit(delete_message_submit)
@@ -1555,10 +1613,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow
-                            with
-                              member=member
-                              disabled=(busy)
+                          ChatMemberRow member=member disabled=(busy)
                             forward
                               remove_channel_member_submit
               box
@@ -1761,6 +1816,16 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                             open_thread_message_reactions
                             open_message_link
                             press_message
+                      // THE RUN ANCHORED IN THIS THREAD, live at the foot of
+                      // the rail until its reply lands. A run summoned by the
+                      // root reads `anchor_seq`; one summoned by a reply reads
+                      // `thread_root`, because its answer posts into the same
+                      // thread the reply lives in.
+                      for live in live_agents
+                        if run_in_thread(live, active_thread_seq)
+                          LiveAgentCard live=live
+                            forward
+                              cancel_run
                       if thread_has_more && thread_next_reply_seq > 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with
@@ -1851,7 +1916,13 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                             with
                               w=200.0
                               p=5.0
-                              bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                              bg=elevated
+                              border=border
+                              border-w=1.0
+                              r=10.0
+                              shadow=shadow_popover
+                              shadow-y=8.0
+                              shadow-blur=24.0
                             col w=fill gap=1.0
                               // Live for the same reason as the stream's twin.
                               button -> emit(open_thread_message_reactions, thread_selected_seq, thread_edit_draft, thread_selected_rev)
@@ -2005,7 +2076,16 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                             focused bg=transparent border=transparent value=transparent border-w=0.0
                           // Same ADD grid as the stream picker — removal is
                           // the reply's own reaction chips.
-                          box p=8.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                          box
+                            with
+                              p=8.0
+                              bg=elevated
+                              border=border
+                              border-w=1.0
+                              r=10.0
+                              shadow=shadow_popover
+                              shadow-y=8.0
+                              shadow-blur=24.0
                             flex
                               with
                                 w=234.0
@@ -2042,7 +2122,13 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                           with
                             w=fill
                             p=3.0
-                            bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                            bg=elevated
+                            border=border
+                            border-w=1.0
+                            r=10.0
+                            shadow=shadow_popover
+                            shadow-y=8.0
+                            shadow-blur=24.0
                           row
                             with
                               w=fill
@@ -2101,7 +2187,16 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                               line-h=1.0
                             active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                             focused bg=transparent border=transparent value=transparent border-w=0.0
-                          box p=3.0 bg=elevated border=border border-w=1.0 r=10.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0
+                          box
+                            with
+                              p=3.0
+                              bg=elevated
+                              border=border
+                              border-w=1.0
+                              r=10.0
+                              shadow=shadow_popover
+                              shadow-y=8.0
+                              shadow-blur=24.0
                             row gap=5.0 align=center
                               text "Delete this message?" size=12.5 @text-muted
                               button "Delete" -> emit(delete_thread_message_submit)

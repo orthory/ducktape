@@ -912,3 +912,38 @@ test the_quit_chord_route_is_armed_only_while_command_is_held
   expect cmd_held
   modifiers
   expect !cmd_held
+
+// A RUN'S PRIVATE OUTPUT IS ON SCREEN, UNDER THE KEY THAT MAY READ IT. The row
+// carries a status line folded out of that run's stdout, which on a device that
+// does not host the node is readable only because THIS key created the run.
+preset ui_live_run_seated
+  state
+    connected = true
+    connected_rpc = "http://127.0.0.1:8844"
+    network_chain_id = "testnet#abcd"
+    connect_generation = 7
+    signer_key = "aa11"
+    shell_tab = ShellTab.chat
+    live_agents = [live_agent_row("channel-a", 2, "chat:2:agent-1", "Chief Duck", "Reading the repo")]
+
+// THE SEAT MOVED, SO THE ROWS GO — NOW, not when the re-keyed lane next speaks.
+//
+// Re-keying the subscription on `signer_key` only fences what arrives NEXT, and
+// the new lane's first notice waits on a `runs` query: a node that is slow,
+// unreachable, or refusing the new key leaves the PREVIOUS key's output on
+// screen for as long as that takes. Nothing in these two scenarios delivers a
+// notice — that is the point. The clearing is the handler's own act.
+test an_unlock_in_place_drops_the_previous_keys_live_rows
+  preset ui_live_run_seated
+  expect !empty(live_agents)
+  dispatch settings_unlocked("bb22")
+  expect signer_key == "bb22"
+  expect empty(live_agents)
+
+test locking_the_seat_takes_the_private_output_with_it
+  preset ui_live_run_seated
+  expect !empty(live_agents)
+  dispatch settings_view_event(view_event("lock", ""))
+  expect empty(signer_key)
+  expect empty(password)
+  expect empty(live_agents)
