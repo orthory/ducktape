@@ -223,7 +223,11 @@ fn the_branch_selector_opens_and_a_pick_names_the_branch_to_the_host() {
         .into_iter()
         .filter(|text| text == "1111" || text == "2222")
         .collect();
-    assert_eq!(rows, ["1111", "2222"], "each row names the commit its head stands on");
+    assert_eq!(
+        rows,
+        ["1111", "2222"],
+        "each row names the commit its head stands on"
+    );
     let frame = tick_native(press(&frame, "Browse branch feature"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "forge.branch");
