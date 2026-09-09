@@ -376,15 +376,16 @@ extern crate::backend
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   ForgeRepo(name:str, head:str)
+  ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
-  ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
+  ForgeRepoData(generation:i64, repo:str, branches:[ForgeBranch], items:[ForgeItem])
   ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])
   ForgeReview(author:str, author_name:str, verdict:str, body:str, blocks:[ChatBlock], commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
   ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, blocks:[ChatBlock], author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
   ForgeDiscussionData(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
-  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
+  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[ForgeBranch], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
@@ -402,6 +403,8 @@ extern crate::backend
   pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
   pure forge_parent(path:str) -> str
+  pure forge_branch_head(branches:&[ForgeBranch], name:&str) -> str
+  pure forge_tree_branch(branches:&[ForgeBranch], picked:&str, rev:&str) -> str
   pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
@@ -523,7 +526,7 @@ extern crate::backend
   pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
   pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
   pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
-  pure keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
+  pure keep_branches(loaded:bool, next:[ForgeBranch], current:[ForgeBranch]) -> [ForgeBranch]
   pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
   pure keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
   pure keep_chat_blocks(loaded:bool, next:[ChatBlock], current:[ChatBlock]) -> [ChatBlock]

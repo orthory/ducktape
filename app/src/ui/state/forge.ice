@@ -12,7 +12,7 @@ state
   forge_focus_seq:i64 = 0
   forge_linked_note:ChatMessage? = none
   forge_repo_phase:ForgePhase = ForgePhase.idle
-  forge_branches:[str] = []
+  forge_branches:[ForgeBranch] = []
   forge_items:[ForgeItem] = []
   forge_item_number:i64 = 0
   forge_item_phase:ForgePhase = ForgePhase.idle
@@ -78,3 +78,8 @@ state
 
   forge_tab:ForgeTab = ForgeTab.code
   forge_repo_menu = false
+  // THE BRANCH SELECTOR: the switcher's open state, and the branch the reader
+  // picked ("" until a pick) — the browse itself stays pinned to a commit
+  // (`forge_tree_rev`); the pick re-roots it at that branch's head.
+  forge_branch_menu = false
+  forge_tree_branch = ""
