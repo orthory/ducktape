@@ -96,7 +96,10 @@ pub enum Command {
     /// line a replay cannot be admitted upstream in the first place. This
     /// field is the module's `Conversation::floor_seq`, and it is what turns a
     /// bounded tracking table from a permanent refusal into a working one.
-    MsgRetain { conversation: String, floor_seq: u64 },
+    MsgRetain {
+        conversation: String,
+        floor_seq: u64,
+    },
 }
 
 /// everything the daemon needs to spawn one session. The node has already
@@ -427,9 +430,9 @@ pub enum Refusal {
 /// either consumer: the id is this protocol's, so its validity rule is too.
 pub fn valid_session(session: &str) -> bool {
     session.len() == 16
-        && session
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        && session.bytes().all(|byte| {
+            byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
+        })
 }
 
 impl Refusal {
@@ -533,9 +536,9 @@ mod tests {
         // walk out of the workdir root may pass.
         for bad in [
             "",
-            "0123456789abcde",       // short
-            "0123456789abcdef0",     // long
-            "0123456789ABCDEF",      // upper
+            "0123456789abcde",   // short
+            "0123456789abcdef0", // long
+            "0123456789ABCDEF",  // upper
             "../../etc/passwd",
             "0123456789abcde/",
         ] {

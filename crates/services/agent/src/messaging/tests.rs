@@ -56,15 +56,27 @@ fn stub_codex(dir: &Path, exit_code: i32) -> PathBuf {
     stub(dir, &format!("exit {exit_code}\n"))
 }
 
-/// the same stub, but it does not return until `gate` — a fifo — is opened for
-/// writing and closed. That gives a test a real HOLD: one message is inside a
-/// provider and the ones behind it are waiting, with no sleep anywhere.
+/// the same stub, but its FIRST invocation does not return until `gate` — a
+/// fifo — is opened for writing and closed. That gives a test a real HOLD: one
+/// message is inside a provider and the ones behind it are waiting, with no
+/// sleep anywhere.
+///
+/// The gate is SPENT once used, and that is not a detail. A stub that holds
+/// every invocation strands the whole test binary the moment a mutation makes
+/// a second message reach it — which is how a failing assertion turns into a
+/// hung build that says nothing. Held once, the second offer returns
+/// immediately and the test fails by name.
 fn stub_codex_holding(dir: &Path, gate: &Path) -> PathBuf {
     std::process::Command::new("mkfifo")
         .arg(gate)
         .status()
         .expect("mkfifo runs");
-    stub(dir, &format!("read _ < {}\nexit 0\n", quoted(gate)))
+    let gate = quoted(gate);
+    let spent = quoted(&dir.join("gate.spent"));
+    stub(
+        dir,
+        &format!("if [ -p {gate} ]; then read _ < {gate}; mv {gate} {spent}; fi\nexit 0\n"),
+    )
 }
 
 /// write an executable stub that records its argv, then runs `tail`.
@@ -98,7 +110,10 @@ fn stub(dir: &Path, tail: &str) -> PathBuf {
 /// case is how a stub silently becomes a syntax error again.
 fn quoted(path: &Path) -> String {
     let text = path.to_str().expect("a scratch path is utf-8");
-    assert!(!text.contains('\''), "a scratch path may not be quoted: {text}");
+    assert!(
+        !text.contains('\''),
+        "a scratch path may not be quoted: {text}"
+    );
     format!("'{text}'")
 }
 
@@ -202,11 +217,13 @@ async fn binding_a_named_device_reports_what_that_session_can_do() {
     plane.dispatch(Messaging::Bind(bind(1))).await;
 
     let events = drained(&mut rx);
-    let [wire::Event::MsgBound {
-        generation,
-        capabilities,
-        ..
-    }] = events.as_slice()
+    let [
+        wire::Event::MsgBound {
+            generation,
+            capabilities,
+            ..
+        },
+    ] = events.as_slice()
     else {
         panic!("a bind answers with exactly one bound event: {events:?}");
     };
@@ -448,10 +465,7 @@ async fn an_expired_message_is_never_offered_to_a_provider() {
 
     // waited for, not drained: the expiry is decided on the binding's lane, so
     // the second receipt is the lane having got to it.
-    let reported = [
-        next_delivery(&mut rx).await,
-        next_delivery(&mut rx).await,
-    ];
+    let reported = [next_delivery(&mut rx).await, next_delivery(&mut rx).await];
     assert_eq!(
         reported,
         [
@@ -682,13 +696,21 @@ async fn a_bindings_messages_reach_its_provider_in_order() {
     let order: Vec<usize> = seen
         .iter()
         .map(|line| {
-            ["conversation-sequence: 7", "conversation-sequence: 8", "conversation-sequence: 9"]
-                .iter()
-                .position(|marker| line.contains(marker))
-                .unwrap_or_else(|| panic!("an invocation named no sequence: {line}"))
+            [
+                "conversation-sequence: 7",
+                "conversation-sequence: 8",
+                "conversation-sequence: 9",
+            ]
+            .iter()
+            .position(|marker| line.contains(marker))
+            .unwrap_or_else(|| panic!("an invocation named no sequence: {line}"))
         })
         .collect();
-    assert_eq!(order, vec![0, 1, 2], "deliveries reached the provider out of order");
+    assert_eq!(
+        order,
+        vec![0, 1, 2],
+        "deliveries reached the provider out of order"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -716,7 +738,10 @@ async fn the_provider_receives_the_wrapped_message_and_no_local_detail() {
     let seen = invocations(&dir).join("\n");
     assert!(seen.contains("--thread thread-abc"), "{seen}");
     assert!(seen.contains("from-participant: p-sender"), "{seen}");
-    assert!(seen.contains("does the review cover the migration?"), "{seen}");
+    assert!(
+        seen.contains("does the review cover the migration?"),
+        "{seen}"
+    );
     assert!(seen.contains("peer-supplied content"), "{seen}");
     for leak in ["/run/user", "cc-socks", "peerToken", ".sock"] {
         assert!(!seen.contains(leak), "the provider was told {leak}: {seen}");
@@ -769,11 +794,7 @@ async fn a_deadline_that_passes_while_queued_expires_the_message() {
     let _ = drained(&mut rx);
 
     // the network's clock has moved on since this message was admitted.
-    plane
-        .dispatch(Messaging::Time {
-            network_now: 5_000,
-        })
-        .await;
+    plane.dispatch(Messaging::Time { network_now: 5_000 }).await;
     plane.dispatch(Messaging::Deliver(deliver(7, 1))).await; // expires_at 2_000
 
     assert_eq!(next_delivery(&mut rx).await.0, State::Queued);
@@ -915,16 +936,8 @@ async fn the_agreed_clock_never_moves_backwards() {
         },
     );
     let (plane, _rx) = plane(&dir, attachments).await;
-    plane
-        .dispatch(Messaging::Time {
-            network_now: 5_000,
-        })
-        .await;
-    plane
-        .dispatch(Messaging::Time {
-            network_now: 1_000,
-        })
-        .await;
+    plane.dispatch(Messaging::Time { network_now: 5_000 }).await;
+    plane.dispatch(Messaging::Time { network_now: 1_000 }).await;
     assert_eq!(plane.network_now(0), 5_000);
     let _ = std::fs::remove_dir_all(&dir);
 }

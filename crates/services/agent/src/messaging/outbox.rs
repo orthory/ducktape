@@ -99,7 +99,10 @@ pub enum Admission {
     /// and offers NOTHING to a provider — re-offering an accepted or unknown
     /// instruction is exactly the duplicate execution the retry contract
     /// exists to prevent.
-    Duplicate { state: State, reason: Option<String> },
+    Duplicate {
+        state: State,
+        reason: Option<String>,
+    },
     /// seen before under this id, with different bytes. Refused: one id names
     /// one message, and a second body under it is not a retry.
     Conflict,
@@ -131,7 +134,10 @@ enum Record {
     /// `MsgDeliver` for a sequence below the floor would then admit `Fresh`
     /// after a restart and be offered to a provider a second time. The floor
     /// outlives the records it retires.
-    Floor { conversation: String, floor_seq: u64 },
+    Floor {
+        conversation: String,
+        floor_seq: u64,
+    },
     /// this daemon has taken durable ownership of the item. Written and synced
     /// BEFORE the node is told `Queued`, so queue ownership is never claimed
     /// on the strength of memory alone.
@@ -293,10 +299,7 @@ impl Outbox {
     /// Returns the recovered entries alongside the handle: a caller that skips
     /// them is a caller that lost the crash boundary, so they are not
     /// available any other way.
-    pub async fn open(
-        dir: &Path,
-        network: &str,
-    ) -> Result<(Self, BTreeMap<Key, Entry>), String> {
+    pub async fn open(dir: &Path, network: &str) -> Result<(Self, BTreeMap<Key, Entry>), String> {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|error| format!("create outbox dir: {error}"))?;
@@ -675,7 +678,11 @@ impl Outbox {
         // the file this handle pointed at is gone; failing to pick up the new
         // one leaves appends going nowhere visible, which is exactly the
         // state nothing may be offered from.
-        let file = match tokio::fs::OpenOptions::new().append(true).open(&self.path).await {
+        let file = match tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .await
+        {
             Ok(file) => file,
             Err(error) => return Err(journal.poison(format!("reopen compacted outbox: {error}"))),
         };
@@ -706,8 +713,15 @@ impl Outbox {
     /// this process died right now, recovery would say exactly this.
     pub async fn attempting(&self, key: &Key) -> Result<(), String> {
         let mut journal = self.journal.lock().await;
-        journal.append(&Record::Attempting { key: key.clone() }).await?;
-        remember(&mut journal.state, key, State::DeliveryUnknown, Some("in_flight"));
+        journal
+            .append(&Record::Attempting { key: key.clone() })
+            .await?;
+        remember(
+            &mut journal.state,
+            key,
+            State::DeliveryUnknown,
+            Some("in_flight"),
+        );
         Ok(())
     }
 
@@ -817,12 +831,7 @@ async fn install(directory: &Path) -> Result<(), String> {
 }
 
 /// publish a transition into the live map, after it is durable.
-fn remember(
-    state: &mut BTreeMap<Key, Entry>,
-    key: &Key,
-    to: State,
-    reason: Option<&str>,
-) {
+fn remember(state: &mut BTreeMap<Key, Entry>, key: &Key, to: State, reason: Option<&str>) {
     if let Some(entry) = state.get_mut(key) {
         entry.state = to;
         entry.reason = reason.map(str::to_string);
@@ -1248,7 +1257,9 @@ mod tests {
         drop(outbox);
 
         let refused = Outbox::open(&dir, "some-other-network@bbbb").await;
-        let error = refused.err().expect("another network's journal is not ours");
+        let error = refused
+            .err()
+            .expect("another network's journal is not ours");
         assert!(error.contains("different network"), "{error}");
 
         // and our own still opens, with its record intact.
@@ -1338,10 +1349,16 @@ mod tests {
             .await
             .expect("settled");
         // 8: below the floor, but nobody knows whether a model read it.
-        outbox.admit(&key(8), &entry_with("digest-bbbb")).await.expect("admits");
+        outbox
+            .admit(&key(8), &entry_with("digest-bbbb"))
+            .await
+            .expect("admits");
         outbox.attempting(&key(8)).await.expect("attempting");
         // 9: settled, but the network still retains it.
-        outbox.admit(&key(9), &entry_with("digest-cccc")).await.expect("admits");
+        outbox
+            .admit(&key(9), &entry_with("digest-cccc"))
+            .await
+            .expect("admits");
         outbox
             .settled(&key(9), State::Refused, Some("queue_refused"))
             .await
@@ -1560,14 +1577,16 @@ mod tests {
             .iter()
             .filter(|admission| **admission == Admission::Fresh)
             .count();
-        assert_eq!(fresh, 1, "exactly one admission may own the item: {outcomes:?}");
+        assert_eq!(
+            fresh, 1,
+            "exactly one admission may own the item: {outcomes:?}"
+        );
 
         // and whatever the duplicate was told is what is actually on the disk.
         drop(outbox);
         let (_reopened, recovered) = Outbox::open(&dir, NETWORK).await.expect("reopens");
         assert_eq!(recovered[&key(7)].state, State::Queued);
-        let journal =
-            std::fs::read_to_string(dir.join("outbox.jsonl")).expect("the journal");
+        let journal = std::fs::read_to_string(dir.join("outbox.jsonl")).expect("the journal");
         assert_eq!(
             journal.matches(r#""r":"queued""#).count(),
             1,

@@ -210,7 +210,10 @@ impl ClaudeInbox {
 
     /// offer one message to the session's inbox.
     pub async fn offer(&self, offer: &Offer<'_>) -> Outcome {
-        let correlation = format!("{}.{}", offer.message_id.generation, offer.message_id.sequence);
+        let correlation = format!(
+            "{}.{}",
+            offer.message_id.generation, offer.message_id.sequence
+        );
         // registered BEFORE the write: a verdict can come back the moment the
         // recipient reads the line, and a waiter installed afterwards would
         // race it and read silence.
@@ -421,9 +424,8 @@ async fn write_frames(socket: &Path, frames: &[String]) -> Result<(), WriteFaile
 /// process is not a Claude session and does not present itself as one.
 pub struct Receipts {
     address: PathBuf,
-    waiting: std::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<Status>>,
-    >,
+    waiting:
+        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Status>>>,
     /// the pids this daemon has bound a session to.
     ///
     /// A unix socket in a shared directory is reachable by anything running as
@@ -575,8 +577,8 @@ impl Receipts {
         // bounded on both axes: a line is a small object, and a peer that
         // sends more than a verdict per outstanding delivery has stopped
         // making sense.
-        let mut lines = BufReader::new(stream.take(MAX_RECEIPT_LINE * MAX_RECEIPT_LINES as u64))
-            .lines();
+        let mut lines =
+            BufReader::new(stream.take(MAX_RECEIPT_LINE * MAX_RECEIPT_LINES as u64)).lines();
         let mut seen = 0usize;
         while let Ok(Some(line)) = lines.next_line().await {
             seen += 1;
@@ -754,7 +756,10 @@ mod tests {
             "status": "held",
             "orig_msg_id": "2.1",
         });
-        assert_eq!(Status::parse(&held), Some(("2.1".to_string(), Status::Held)));
+        assert_eq!(
+            Status::parse(&held),
+            Some(("2.1".to_string(), Status::Held))
+        );
 
         let dropped = serde_json::json!({
             "type": "control",
@@ -801,7 +806,10 @@ mod tests {
             "{:?}",
             attached("sess-abc", Path::new("/run/user/1000/cc-socks/4242.sock"))
         );
-        assert!(rendered.contains("4242"), "the pid is diagnosable: {rendered}");
+        assert!(
+            rendered.contains("4242"),
+            "the pid is diagnosable: {rendered}"
+        );
         assert!(!rendered.contains("s3cr3t"), "token leaked: {rendered}");
         assert!(!rendered.contains("cc-socks"), "socket leaked: {rendered}");
     }
@@ -969,11 +977,7 @@ mod tests {
         // rather than a wait for one.
         receipts.serve(ours).await;
         assert!(
-            receipts
-                .waiting
-                .lock()
-                .expect("lock")
-                .contains_key("2.1"),
+            receipts.waiting.lock().expect("lock").contains_key("2.1"),
             "an untrusted verdict must not resolve a waiter"
         );
 

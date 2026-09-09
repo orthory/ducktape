@@ -167,7 +167,10 @@ mod tests {
             "reference: commit ducktape deadbeef",
             "does the review cover the migration?",
         ] {
-            assert!(text.contains(named), "the wrapper must state {named}:\n{text}");
+            assert!(
+                text.contains(named),
+                "the wrapper must state {named}:\n{text}"
+            );
         }
     }
 

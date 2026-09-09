@@ -561,23 +561,15 @@ impl Deliveries {
                 if let Some(receipts) = &self.0.receipts {
                     receipts.trust(attached.pid);
                 }
-                Adapter::Claude(claude::ClaudeInbox::new(
-                    attached,
-                    self.0.receipts.clone(),
-                ))
+                Adapter::Claude(claude::ClaudeInbox::new(attached, self.0.receipts.clone()))
             }
-            Target::CodexThread { thread_id } => {
-                Adapter::CodexQueue(codex::CodexQueue::new(
-                    thread_id.clone(),
-                    self.0.codex.clone(),
-                ))
-            }
-            Target::CodexManaged { thread_id } => {
-                Adapter::CodexManaged(codex::CodexAppServer::new(
-                    thread_id.clone(),
-                    self.app_server().await?,
-                ))
-            }
+            Target::CodexThread { thread_id } => Adapter::CodexQueue(codex::CodexQueue::new(
+                thread_id.clone(),
+                self.0.codex.clone(),
+            )),
+            Target::CodexManaged { thread_id } => Adapter::CodexManaged(
+                codex::CodexAppServer::new(thread_id.clone(), self.app_server().await?),
+            ),
         };
         Ok(Arc::new(adapter))
     }
@@ -893,10 +885,7 @@ impl Deliveries {
 
     /// the binding's generation and lane, if this device holds the one the
     /// delivery names.
-    fn lane_for(
-        &self,
-        deliver: &wire::Deliver,
-    ) -> Option<(u64, mpsc::Sender<Box<wire::Deliver>>)> {
+    fn lane_for(&self, deliver: &wire::Deliver) -> Option<(u64, mpsc::Sender<Box<wire::Deliver>>)> {
         let key = BindingKey {
             conversation: deliver.conversation.clone(),
             participant: deliver.participant.clone(),
@@ -986,9 +975,14 @@ pub enum Messaging {
     /// largest variant on every lane it rides.
     Deliver(Box<wire::Deliver>),
     /// the agreed network clock has advanced.
-    Time { network_now: u64 },
+    Time {
+        network_now: u64,
+    },
     /// a conversation's retention floor has advanced.
-    Retain { conversation: String, floor_seq: u64 },
+    Retain {
+        conversation: String,
+        floor_seq: u64,
+    },
 }
 
 /// route one command to its plane.
