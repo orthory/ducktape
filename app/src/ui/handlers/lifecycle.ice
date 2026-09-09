@@ -46,6 +46,7 @@ on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
   fs_generation = fs_generation + 1
   fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
   fs_preview_base = ""
   fs_write_pending = ""
@@ -1043,6 +1044,29 @@ subscribe
   // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
   // gate is the budget: leaving the tab stops the encode at the source.
   run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _
+  // THE AGENT RUNS IN FLIGHT, for the NODE rather than for a room. A room
+  // switch is not a lifecycle event at all — `encode_chat_props` picks this
+  // room's rows out of the node's set on the way to the view — so the only
+  // thing this lane is anchored to is the CONNECTION.
+  //
+  // ALL THREE IDENTITIES RIDE IN, because the endpoint is not one. A workspace
+  // switch brings the node back on the same loopback port (`live_resynced`
+  // calls the same trap `chain_left_behind`), so `connected_rpc` alone would
+  // have kept a reading of the chain she left. The subscription is keyed on its
+  // arguments, so a chain change or a reconnect tears the old reading down; the
+  // reading carries them back out, so one still in flight is refused by
+  // `live_agents_stale` instead of overwriting the new connection's rows.
+  //
+  // Gated on `connected` ALONE, not on the chat tab: a run she started and
+  // walked away from must still be running under its anchor when she comes
+  // back, and the poll is one bounded `runs` read every two seconds.
+  // KEYED ON THE SEAT TOO (`signer_key`). A remote device's entitlement to a
+  // run's output IS its seated key, and a Settings unlock or lock moves that
+  // seat in place — no endpoint, chain or connect attempt changes with it. Left
+  // out, a device that unlocked after connecting would say "progress
+  // unavailable" for the life of the connection, and a key SWITCH would leave
+  // the previous key's reading on screen.
+  run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick

@@ -790,6 +790,29 @@ on channel_created(next)
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
+// EVERY PENDING RUN THIS NODE HOLDS, not this room's. Which of them reach the
+// screen is decided once, in `encode_chat_props`, against the room on screen
+// when the frame is built — so no handler that moves `active_channel` owes this
+// lane anything, and none of them can forget.
+//
+// THE CONNECTION IS THE ONE THING THE FOLD STILL HAS TO ASK. Room ids are not
+// unique across networks, so `general` on the connection she left would
+// otherwise have drawn its runs under `general` on the one she is on — and the
+// endpoint alone does not settle it, because a workspace switch brings the node
+// back on the same port (see `live_resynced`'s `chain_left_behind`).
+//
+// REFUSED, NOT ASSIGNED. The guard is a `return`, like every other generation
+// guard in this file, because a stale reading's emptiness is not a fact about
+// the connection she IS on: folding it in would have blanked the cards the
+// current reading installed a moment ago, until the next two-second poll put
+// them back.
+on live_agents_event(next)
+  return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)
+  live_agents = next.rows
+
+on live_cancel_acked(_ok)
+  error = ""
+
 on chat_acked(_result)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
   selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, true)
@@ -1571,6 +1594,8 @@ on chat_view_event(event)
       flow
         from done true
         done -> load_more_thread()
+    ChatIntent.cancel_run
+      run every cancel_agent_run(connected_rpc, password, event_text(event, "run_id")) -> live_cancel_acked _ | mutation_failed _
     ChatIntent.composer
       let kind = chat_event_kind(event)
       let id = event_text(event, "id")
