@@ -63,6 +63,8 @@ fn open(messages: Vec<MessagingMessage>) -> MessagingProps {
             present: true,
             device: "laptop".into(),
             credential: "4".into(),
+            principal: "service_key".into(),
+            principal_account: String::new(),
             detached: false,
         },
         messages,
@@ -417,7 +419,11 @@ fn opening_a_conversation_names_the_participant_and_conversation_the_reader_type
 fn the_panel_discloses_the_binding_the_roster_and_the_networks_visibility() {
     let (_, frame) = opened(open(vec![message(7, "queued")]));
     assert!(
-        has_text(&frame, "Bound to laptop under credential 4."),
+        has_text(
+            &frame,
+            "Bound to laptop under credential 4, authorizing a scoped service key on that device \
+             (the key itself is a credential this view never reads back)."
+        ),
         "{:?}",
         texts(&frame)
     );
@@ -438,6 +444,56 @@ fn the_panel_discloses_the_binding_the_roster_and_the_networks_visibility() {
     // the page is shown against the conversation's own tip: no silent tail
     assert!(
         has_text(&frame, "1 shown · sequences 7–7 of 12"),
+        "{:?}",
+        texts(&frame)
+    );
+}
+
+/// WHO holds the binding is its own disclosure. A device label says which
+/// machine; it cannot say that an agent PROGRAM is the thing authorized to send
+/// as this participant, and that is the fact a person needs. The unresolved
+/// case is stated, never assumed benign.
+#[test]
+fn the_binding_names_the_kind_of_principal_it_authorizes() {
+    let program = |account: &str| MessagingBinding {
+        present: true,
+        device: "node-3".into(),
+        credential: "9".into(),
+        principal: "program".into(),
+        principal_account: account.into(),
+        detached: false,
+    };
+    let attached = MessagingProps {
+        binding: program("41"),
+        ..open(vec![message(7, "queued")])
+    };
+    let (_, frame) = opened(attached);
+    assert!(
+        has_text(
+            &frame,
+            "Bound to node-3 under credential 9, authorizing agent program account 41 over the \
+             call lane."
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // THE COUNTEREXAMPLE: a principal the app could not resolve must not read
+    // like the ordinary case. It says so instead.
+    let unknown = MessagingProps {
+        binding: MessagingBinding {
+            principal: String::new(),
+            ..program("")
+        },
+        ..open(vec![message(7, "queued")])
+    };
+    let (_, frame) = opened(unknown);
+    assert!(
+        has_text(
+            &frame,
+            "Bound to node-3 under credential 9, authorizing a principal this view could not \
+             identify."
+        ),
         "{:?}",
         texts(&frame)
     );

@@ -3498,7 +3498,6 @@ dependencies = [
  "inbox",
  "jpeg-encoder",
  "keystore",
- "libc",
  "media-service",
  "module-artifact",
  "node",

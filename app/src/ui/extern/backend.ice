@@ -54,7 +54,7 @@ extern crate::backend
   // endpoint and chain they ran under: neither is installed after the app has
   // moved to another network, participant or conversation.
   MessagingSeat(participant:str, role:str, you:bool)
-  MessagingBinding(present:bool, device:str, credential:str, detached:bool)
+  MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
   MessagingView(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, answered:bool, visibility:str)
   MessagingSend(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, refusal:str)

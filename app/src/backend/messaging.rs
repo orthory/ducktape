@@ -31,9 +31,10 @@
 use super::*;
 use collaboration::{
     BindingView, CollaborationMsg, CollaborationQuery, CollaborationReply, Conversation,
-    DenyReason, EventPage, Message, MessageId, MessageKind, Participant, ProtectedRead, Receipt,
-    Reference, Role, SendRequest, SendState,
+    DenyReason, EventPage, Message, MessageId, MessageKind, Participant, PrincipalView,
+    ProtectedRead, Receipt, Reference, Role, SendRequest, SendState,
 };
+use sdk::genesis_config::TimeUnit;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -100,6 +101,13 @@ pub struct MessagingBinding {
     pub present: bool,
     pub device: String,
     pub credential: String,
+    /// WHO the binding authorizes, as the module reports it: `service_key` for
+    /// a local adapter's owner-issued scoped key (reported by SHAPE — the key
+    /// itself is a credential nobody reads back), or `program` for an agent
+    /// reaching the module over the call lane.
+    pub principal: String,
+    /// the bound program's account number, decimal; "" for a service key
+    pub principal_account: String,
     pub detached: bool,
 }
 
@@ -678,10 +686,21 @@ fn binding_view(binding: Option<&BindingView>) -> MessagingBinding {
     let Some(binding) = binding else {
         return MessagingBinding::default();
     };
+    // THE PRINCIPAL IS THE DISCLOSURE, NOT A KEY. `PrincipalView::ServiceKey`
+    // carries no bytes by construction, so there is nothing here to leak; a
+    // program account is a public number and is named, because "an agent
+    // program is attached to this participant" is exactly what a person
+    // reading the panel needs to know and cannot infer from the device label.
+    let (principal, principal_account) = match binding.principal {
+        PrincipalView::ServiceKey => ("service_key", String::new()),
+        PrincipalView::Program(account) => ("program", account.to_string()),
+    };
     MessagingBinding {
         present: true,
         device: binding.device.clone(),
         credential: binding.credential.to_string(),
+        principal: principal.to_owned(),
+        principal_account,
         detached: binding.detached,
     }
 }
@@ -812,7 +831,16 @@ async fn submit_message(
     // arrives is ambiguous, and the only safe retry is the SAME id over the
     // SAME bytes — which is only possible if they were durable first.
     outbox.stage(&record.id, &request)?;
-    let payload = collaboration::encode_msg(&CollaborationMsg::Send(request.clone()));
+    // THE NETWORK RIDES IN THE PAYLOAD THE SIGNATURE COVERS. A submitted
+    // frame's preimage binds no chain id, so the same signed bytes would be
+    // valid on every network this key may submit to; `Request` is what stops a
+    // send authorized here from replaying there. `network` is the chain id
+    // `reader_client` already read back off `/v1/status` and refused to accept
+    // empty, so this is the verified one, not the one the caller hoped for.
+    let payload = collaboration::encode_msg(&collaboration::Request::new(
+        network.clone(),
+        CollaborationMsg::Send(request.clone()),
+    ));
     match signed_write(&client, COLLABORATION, payload, password).await {
         Ok(_) => outbox.settle(&record.id, request.message_id),
         // LEFT PENDING ON PURPOSE. A refusal we can read and an answer that
@@ -922,19 +950,18 @@ async fn deadline(client: &RpcClient) -> Result<u64, String> {
     let now = status["consensus_time"]
         .as_u64()
         .ok_or("this node's status carries no consensus_time")?;
-    let ttl = match status["consensus_time_unit"].as_str() {
-        // the height lane counts BLOCKS; one block is one second only while
-        // the chain heartbeats at that rate, so this mapping is nominal
-        Some("height") => DELIVERY_TTL_SECS,
-        Some("millis") => DELIVERY_TTL_SECS.saturating_mul(1_000),
-        _ => {
-            return Err(
-                "this node's status names no consensus_time_unit — an unnamed unit \
-                        cannot be scaled into"
-                    .into(),
-            );
-        }
-    };
+    let named = status["consensus_time_unit"].as_str().ok_or(
+        "this node's status names no consensus_time_unit — an unnamed unit cannot be \
+                scaled into",
+    )?;
+    // THE UNIT IS THE MODULE'S OWN, DECODED BY THE MODULE'S OWN CODE. The
+    // tokens the status reports are the genesis parameter's canonical bytes, so
+    // this app reads them with `TimeUnit::decode` rather than keeping a second
+    // table of them here to drift from the one the network agreed on.
+    let unit = TimeUnit::decode(named.as_bytes()).map_err(|error| error.to_string())?;
+    let ttl = DELIVERY_TTL_SECS
+        .saturating_mul(unit.per_second())
+        .min(collaboration::max_delivery_ttl(unit));
     now.checked_add(ttl)
         .ok_or_else(|| "this network's clock is past the end of a delivery deadline".to_string())
 }
@@ -984,11 +1011,20 @@ async fn allocate_sequence(
             false => high = middle,
         }
     }
-    let floor = outbox
-        .high_water(&record.id, generation)
-        .checked_add(1)
-        .ok_or(SEQUENCE_EXHAUSTED)?;
-    Ok(low.max(floor))
+    next_sequence(low, outbox.high_water(&record.id, generation))
+}
+
+/// The sequence to send under: the first one the NETWORK says is free, never
+/// below one this device has already staged.
+///
+/// The floor is a floor and not the answer — a lost or restored outbox is
+/// exactly the case where the local mark is behind the network — and it is
+/// `checked_add`ed because `u64::MAX` has no successor. Wrapping to 0 there
+/// would hand out a sequence that is certainly taken, which is the module's
+/// refusal at best and a collision to reason about at worst.
+fn next_sequence(first_free: u64, high_water: u64) -> Result<u64, String> {
+    let floor = high_water.checked_add(1).ok_or(SEQUENCE_EXHAUSTED)?;
+    Ok(first_free.max(floor))
 }
 
 /// Whether one sequence is spoken for: admitted, or pruned below the replay
@@ -1038,14 +1074,14 @@ const MAX_OUTBOX_MARKS: usize = 256;
 
 /// Take the outbox's exclusive advisory lock, or refuse.
 ///
-/// Non-blocking on purpose: this runs on the async executor, a blocking
-/// `flock` would park the whole runtime behind another process's send, and
+/// `File::try_lock` is std's own, so this needs no `unsafe` and no Unix-only
+/// path. Non-blocking on purpose: this runs on the async executor, a blocking
+/// lock would park the whole runtime behind another process's send, and
 /// "another window is sending as this device — try again" is a true sentence a
 /// person can act on. The lock is a SEPARATE file because the outbox itself is
 /// replaced by rename, which would hand the next opener a lock on an unlinked
-/// inode.
+/// inode. The OS releases it when the holder is dropped or the process dies.
 fn lock_exclusive(path: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::unix::io::AsRawFd as _;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1057,26 +1093,34 @@ fn lock_exclusive(path: &std::path::Path) -> Result<std::fs::File, String> {
                 path.display()
             )
         })?;
-    // SAFETY: a live fd this function owns, and an operation that only takes an
-    // advisory lock on it.
-    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if taken != 0 {
-        let error = std::io::Error::last_os_error();
-        let busy = matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-        );
-        return Err(match busy {
-            true => "another window or device process is sending as this device right now — \
-                     wait for it to finish and send again"
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(
+            "another window or device process is sending as this device right now — wait for it \
+             to finish and send again"
                 .to_owned(),
-            false => format!(
-                "this device's outbox could not be locked ({error}); nothing is sent \
-                              while its state is unknown"
-            ),
-        });
+        ),
+        Err(std::fs::TryLockError::Error(error)) => Err(format!(
+            "this device's outbox could not be locked ({error}); nothing is sent while its state \
+             is unknown"
+        )),
     }
-    Ok(file)
+}
+
+/// The outbox's bytes, reading at most one past the ceiling.
+///
+/// `fs::read` would allocate the WHOLE file first and only then be told it was
+/// too big, which makes the bound a report rather than a limit — a 4 GiB file
+/// in the state directory would be resident before anything refused it. The
+/// extra byte is what distinguishes "exactly at the ceiling" from "more than
+/// this app will read".
+fn read_capped(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_OUTBOX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The outbox's bytes as state, or the reason this device will not send.
@@ -1196,7 +1240,7 @@ impl Outbox {
         })?;
         let path = directory.join(format!("outbox-{}.json", &digest[..16]));
         let lock = lock_exclusive(&path.with_extension("lock"))?;
-        let state = match std::fs::read(&path) {
+        let state = match read_capped(&path) {
             Ok(bytes) => read_outbox(&bytes, network, &path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => OutboxFile {
                 chain_id: network.to_owned(),
@@ -1399,6 +1443,17 @@ impl Outbox {
             .ok_or("the messaging outbox has no directory")?;
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(&self.state).map_err(|error| error.to_string())?;
+        // THE WRITER OBEYS THE READER'S CEILING. A file this app persists past
+        // it is one the next `open` refuses — which would wedge every send on
+        // this network behind a file only this app wrote. Refusing the write
+        // instead leaves the previous outbox intact and readable.
+        if bytes.len() > MAX_OUTBOX_BYTES {
+            return Err(format!(
+                "this device's outbox would be {} bytes, past the {MAX_OUTBOX_BYTES} it can read \
+                 back — the previous one is kept and nothing is sent",
+                bytes.len()
+            ));
+        }
         let temporary = self.path.with_extension("json.new");
         {
             use std::io::Write as _;
@@ -1881,6 +1936,73 @@ mod tests {
         // and the lock is released with the file, so the next opener gets it
         drop(first);
         lock_exclusive(&path).expect("released with its holder");
+    }
+
+    /// The ceiling is a LIMIT, not a report. `fs::read` would have the whole
+    /// file resident before anything refused it, so a huge file in the state
+    /// directory would be paid for and then rejected.
+    #[test]
+    fn an_oversized_outbox_is_never_read_whole() {
+        let directory = tempfile::tempdir().expect("a temporary state directory");
+        let path = directory.path().join("outbox.json");
+        std::fs::write(&path, vec![b'x'; MAX_OUTBOX_BYTES + 4096]).expect("a fat file");
+        let bytes = read_capped(&path).expect("the read itself succeeds");
+        assert_eq!(
+            bytes.len(),
+            MAX_OUTBOX_BYTES + 1,
+            "one byte past the ceiling is all it takes to know it was exceeded"
+        );
+        let refused = read_outbox(&bytes, "duck-1", &path).expect_err("and it is refused");
+        assert!(refused.contains("past the"), "{refused}");
+
+        // a file AT the ceiling reads whole, so the bound is not off by one
+        std::fs::write(&path, vec![b'x'; MAX_OUTBOX_BYTES]).expect("a file at the line");
+        assert_eq!(read_capped(&path).expect("read").len(), MAX_OUTBOX_BYTES);
+    }
+
+    /// The writer obeys the reader's ceiling, or it persists an outbox the next
+    /// `open` refuses — which wedges every send on this network behind a file
+    /// only this app wrote. The previous outbox is left intact.
+    #[test]
+    fn the_writer_refuses_an_outbox_it_could_not_read_back() {
+        let directory = tempfile::tempdir().expect("a temporary state directory");
+        let mut outbox = held(
+            &directory,
+            OutboxFile {
+                chain_id: "duck-1".into(),
+                ..OutboxFile::default()
+            },
+        );
+        outbox
+            .stage("claude-a", &request(1, "small", 90_000))
+            .expect("a small one is written");
+        let previous = std::fs::read(&outbox.path).expect("written");
+
+        outbox.state.pending.push(Pending {
+            participant: "claude-a".into(),
+            request: request(2, &"x".repeat(MAX_OUTBOX_BYTES), 90_000),
+        });
+        let refused = outbox
+            .write()
+            .expect_err("an unreadable outbox is not written");
+        assert!(refused.contains("past the"), "{refused}");
+        assert_eq!(
+            std::fs::read(&outbox.path).expect("still there"),
+            previous,
+            "the previous outbox is intact, not half-replaced"
+        );
+    }
+
+    /// `u64::MAX` has no successor. Wrapping the floor to 0 would hand out a
+    /// sequence that is certainly taken.
+    #[test]
+    fn a_full_sequence_space_refuses_rather_than_wrapping() {
+        assert_eq!(next_sequence(1, 0).expect("a fresh credential"), 1);
+        // the local mark is a FLOOR: it raises a network answer, never lowers it
+        assert_eq!(next_sequence(3, 9).expect("staged past the network"), 10);
+        assert_eq!(next_sequence(30, 9).expect("network is ahead"), 30);
+        let refused = next_sequence(1, u64::MAX).expect_err("a full space has no next sequence");
+        assert_eq!(refused, SEQUENCE_EXHAUSTED);
     }
 
     /// The staged entry survives a settle of a DIFFERENT id, and leaves on its

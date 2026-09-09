@@ -160,6 +160,44 @@ pub fn agents_view(
     messaging_send_error: &str,
     messaging_sent: i64,
 ) -> Element<'static, ModuleViewEvent> {
+    module_view(
+        "agents",
+        agents_props(
+            dark,
+            connected,
+            answered,
+            account,
+            committed,
+            rows,
+            capabilities,
+            actions,
+            messaging,
+            messaging_loading,
+            messaging_sending,
+            messaging_send_error,
+            messaging_sent,
+        ),
+    )
+}
+
+/// The exact bytes [`agents_view`] pushes — named so a test can assert what
+/// this app SENDS rather than a shape it wrote out by hand beside it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agents_props(
+    dark: bool,
+    connected: bool,
+    answered: bool,
+    account: &str,
+    committed: i64,
+    rows: &[crate::backend::AgentRow],
+    capabilities: &[String],
+    actions: &[String],
+    messaging: &crate::backend::MessagingView,
+    messaging_loading: bool,
+    messaging_sending: bool,
+    messaging_send_error: &str,
+    messaging_sent: i64,
+) -> Vec<u8> {
     let mut panel = serde_json::to_value(messaging).expect("the messaging panel encodes");
     if let Some(panel) = panel.as_object_mut() {
         // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
@@ -185,7 +223,7 @@ pub fn agents_view(
         "dark": dark,
         "messaging": panel,
     });
-    module_view("agents", serde_json::to_vec(&props).expect("props encode"))
+    serde_json::to_vec(&props).expect("props encode")
 }
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
@@ -3362,6 +3400,30 @@ pub(crate) mod tests {
         found.expect("an input with that placeholder")
     }
 
+    /// The select-handler index of the pick list keyed `key`, and the index of
+    /// `option` in the list it is showing.
+    fn pick_option(guest: &Guest, key: &str, option: &str) -> (u32, u32) {
+        let mut root = guest.frame.root.clone().expect("a tree");
+        let mut found = None;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::PickList {
+                key: node_key,
+                options,
+                on_select,
+                ..
+            } = node
+                && node_key.ends_with(key)
+            {
+                let at = options
+                    .iter()
+                    .position(|shown| shown == option)
+                    .unwrap_or_else(|| panic!("{option:?} is not among {options:?}"));
+                found = Some((*on_select, at as u32));
+            }
+        });
+        found.expect("a pick list with that key")
+    }
+
     /// The message index the button labelled `name` — by its `label=`, or
     /// by the text it shows — would send.
     fn button_message(guest: &Guest, name: &str) -> u32 {
@@ -3579,6 +3641,146 @@ pub(crate) mod tests {
             );
         }
         assert!(guest.intents.is_empty());
+        assert!(guest.fault.is_none());
+    }
+
+    /// The BUNDLED Agents view's messages pane, end to end through the host:
+    /// the real `agents_view.wasm`, the real props encoder, the real intent
+    /// decoder. The guest tests assert the pane's own arithmetic; this asserts
+    /// that the bytes this app actually sends draw it and that a press comes
+    /// back as an intent `agents_intent` routes.
+    #[test]
+    fn the_staged_agents_view_draws_the_messages_pane_and_sends_what_was_typed() {
+        let Some(staged) = staged("agents") else {
+            return;
+        };
+        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
+        // the props the app ENCODES, not a hand-written shape: `agents_view`
+        // strips `rpc`/`link`/`account`/`op` and inserts the transient facts,
+        // so an encoder that leaked one or dropped a field fails here.
+        let reading = crate::backend::MessagingView {
+            rpc: "http://127.0.0.1:8844".into(),
+            network: "duck-1".into(),
+            link: 3,
+            account: "7".into(),
+            op: 5,
+            participant: "claude-a".into(),
+            conversation: "standup".into(),
+            topic: "release review".into(),
+            roster: vec![
+                crate::backend::MessagingSeat {
+                    participant: "claude-a".into(),
+                    role: "member".into(),
+                    you: true,
+                },
+                crate::backend::MessagingSeat {
+                    participant: "codex-b".into(),
+                    role: "member".into(),
+                    you: false,
+                },
+            ],
+            binding: crate::backend::MessagingBinding {
+                present: true,
+                device: "laptop".into(),
+                credential: "4".into(),
+                principal: "program".into(),
+                principal_account: "41".into(),
+                detached: false,
+            },
+            messages: vec![crate::backend::MessagingMessage {
+                seq: 7,
+                sender: "codex-b".into(),
+                recipient: "claude-a".into(),
+                kind: "question".into(),
+                body: "does the review cover the migration?".into(),
+                body_bytes: 36,
+                shown_bytes: 36,
+                delivery: "adapter_accepted".into(),
+                expires_at: 90_000,
+                admitted_at: 41,
+                ..Default::default()
+            }],
+            may_read: true,
+            may_send: true,
+            next_seq: 12,
+            page_size: 24,
+            undelivered: 1,
+            queued_bytes: 512,
+            max_body_bytes: 16 * 1024,
+            answered: true,
+            visibility: "Committed state on this network is replicated in plaintext.".into(),
+            ..Default::default()
+        };
+        let props = Some(agents_props(
+            false, true, true, "7", 0, &[], &[], &[], &reading, false, false, "", 0,
+        ));
+        guest.redraw(&props);
+
+        // THE PANE IS BEHIND ITS OWN TAB: the register is what a reader lands
+        // on, and nothing about messages is drawn until they ask for it.
+        assert!(
+            !texts(&guest).iter().any(|text| text.contains("standup")),
+            "the messages pane drew itself without being opened: {:?}",
+            texts(&guest)
+        );
+        guest.deliver(Output::Activate(button_message(&guest, "Show agent messages")));
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in [
+            "ACCEPTED",
+            "Bound to laptop under credential 4, authorizing agent program account 41 over the \
+             call lane.",
+            "1 undelivered · 512 bytes queued",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} in {shown:?}"
+            );
+        }
+        // acceptance is not work, said in the guest's own words over the wire
+        assert!(
+            shown.iter().any(|text| text.contains(
+                "not that the model read it, understood it, acted on it, or claimed a task"
+            )),
+            "{shown:?}"
+        );
+        // and the app's own bookkeeping never crossed
+        for leaked in ["http://127.0.0.1:8844", "5", "3"] {
+            assert!(
+                !shown.iter().any(|text| text == leaked),
+                "the props encoder leaked {leaked:?}: {shown:?}"
+            );
+        }
+
+        let (key, handler) = input_named(&guest, "what to send…");
+        guest.deliver(Output::Edit {
+            key,
+            handler,
+            text: "  yes — and the rollback  ".into(),
+        });
+        guest.redraw(&props);
+        let (handler, index) = pick_option(&guest, "recipient", "codex-b");
+        guest.deliver(Output::Select { handler, index });
+        guest.redraw(&props);
+        guest.deliver(Output::Activate(button_message(&guest, "Send message")));
+        guest.redraw(&props);
+        let intents = std::mem::take(&mut guest.intents);
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert_eq!(intents[0].kind, "messaging_send");
+        // THE BODY CROSSES EXACTLY AS TYPED — surrounding spaces and all. The
+        // network refuses an over-length body; this app does not quietly cut
+        // one down to fit, and it does not trim one on the way out either.
+        let detail: serde_json::Value =
+            serde_json::from_str(&intents[0].detail).expect("the intent is json");
+        assert_eq!(detail["body"], "  yes — and the rollback  ");
+        assert_eq!(detail["recipient"], "codex-b");
+        assert_eq!(detail["reply_to"], 0);
+        assert_eq!(detail["kind"], "notice");
+        // and the host routes what came back
+        assert!(matches!(
+            agents_intent(&intents[0]),
+            crate::AgentsIntent::MessagingSend
+        ));
         assert!(guest.fault.is_none());
     }
 

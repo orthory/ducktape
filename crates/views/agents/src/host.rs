@@ -74,6 +74,14 @@ pub struct MessagingBinding {
     pub device: String,
     /// the binding's credential number, decimal
     pub credential: String,
+    /// `service_key` (a local adapter's owner-issued scoped key, reported by
+    /// SHAPE — the key itself is never read back) or `program` (an agent
+    /// program reaching the module over the call lane). "" when unbound.
+    #[serde(default)]
+    pub principal: String,
+    /// the bound program's account number, decimal; "" for a service key
+    #[serde(default)]
+    pub principal_account: String,
     pub detached: bool,
 }
 
@@ -725,7 +733,32 @@ pub fn binding_note(binding: &MessagingBinding) -> String {
              send nor acknowledge."
         );
     }
-    format!("Bound to {device} under credential {credential}.")
+    format!(
+        "Bound to {device} under credential {credential}, authorizing {}.",
+        principal_note(binding)
+    )
+}
+
+/// WHO the binding authorizes, spelled out. A device label says which machine;
+/// this says which kind of principal may act under the credential, which is a
+/// different question and the one that matters — an agent PROGRAM attached to
+/// this participant is not the same disclosure as a person's local adapter,
+/// and the label cannot tell them apart.
+pub fn principal_note(binding: &MessagingBinding) -> String {
+    match binding.principal.as_str() {
+        "service_key" => {
+            "a scoped service key on that device (the key itself is a credential this view never \
+             reads back)"
+                .to_owned()
+        }
+        "program" => format!(
+            "agent program account {} over the call lane",
+            binding.principal_account
+        ),
+        // the app leaves this empty only when it could not resolve the record;
+        // an unnamed principal is stated as unknown, never assumed benign
+        _ => "a principal this view could not identify".to_owned(),
+    }
 }
 
 pub fn mailbox_note(undelivered: i64, queued_bytes: i64) -> String {
