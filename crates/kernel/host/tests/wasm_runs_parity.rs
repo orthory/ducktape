@@ -1617,3 +1617,63 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         assert!(job.result.unwrap().ok);
     });
 }
+
+#[test]
+fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
+    let directory = tempfile::tempdir().unwrap();
+    deterministic::Runner::default().start(|context| async move {
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(
+            2,
+            "quackbot",
+            &[ACTION_CHAT_POST, runs::ACTION_COLLABORATION_SEND],
+        )
+        .await;
+        pair.submit(alice(), plain_post("general", "anchor")).await;
+        pair.submit(alice(), request("quackbot", "general", 1))
+            .await;
+        pair.drain().await;
+        let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        pair.accept(&run).await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            runs_op(&RunsMsg::OpenAgentSession {
+                attempt: 0,
+                run_id: run.clone(),
+                session_key: SESSION_KEY.to_vec(),
+            }),
+        )
+        .await;
+        pair.submit(
+            Origin::External(SESSION_KEY.to_vec()),
+            runs_op(&RunsMsg::AgentAction {
+                run_id: run.clone(),
+                request_id: "task-update".into(),
+                action: ActionEnvelope::new(
+                    runs::ACTION_COLLABORATION_SEND,
+                    Some(serde_json::json!({"conversation_id":"review", "participant_id":"alice"})),
+                    serde_json::json!({"credential":7,"sequence":3,"recipient_participant_id":"bob",
+                    "kind":"task_update","body":"progress","expires_at":900,
+                    "task":{"id":"review-task","expected_attempt":7}}),
+                ),
+            }),
+        )
+        .await;
+        let receipt = pair
+            .action(&runs::action_request_id(&run, "task-update"))
+            .await;
+        assert_eq!(receipt.target, "collaboration");
+        let request: collaboration::Request = serde_json::from_value(receipt.payload).unwrap();
+        let collaboration::CollaborationMsg::Send(send) = request.op else {
+            panic!("expected Send")
+        };
+        assert_eq!(send.kind, collaboration::MessageKind::TaskUpdate);
+        assert_eq!(
+            send.task,
+            Some(collaboration::TaskRef {
+                id: "review-task".into(),
+                expected_attempt: 7
+            })
+        );
+    });
+}

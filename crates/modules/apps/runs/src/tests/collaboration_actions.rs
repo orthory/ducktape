@@ -117,6 +117,28 @@ fn a_granted_send_prepares_one_network_bound_message_naming_no_actor() {
 }
 
 #[test]
+fn a_task_update_preserves_the_typed_attempt_reference() {
+    let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_SEND]);
+    let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
+    let mut action = send(3);
+    action.input["kind"] = serde_json::json!("task_update");
+    action.input["task"] = serde_json::json!({"id": "review-task", "expected_attempt": 7});
+    exec(&mut m, &mut ctx, &act(&run_id, action)).unwrap();
+    let msgs = ctx.collaboration_msgs();
+    let CollaborationMsg::Send(request) = &msgs[0].op else {
+        panic!("expected Send")
+    };
+    assert_eq!(request.kind, MessageKind::TaskUpdate);
+    assert_eq!(
+        request.task,
+        Some(collaboration::TaskRef {
+            id: "review-task".into(),
+            expected_attempt: 7
+        })
+    );
+}
+
+#[test]
 fn an_acknowledge_reports_a_state_under_the_binding_credential() {
     let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_ACKNOWLEDGE]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));

@@ -364,7 +364,8 @@ fn specs() -> Vec<Spec> {
                     "kind": {"type": "string", "enum": ["notice", "question", "task_request", "task_update", "result"]},
                     "body": {"type": "string"},
                     "expires_at": {"type": "integer", "description": "ABSOLUTE consensus time; the network's unit, not seconds."},
-                    "reply_to": {"type": ["integer", "null"], "description": "Conversation sequence this answers."}
+                    "reply_to": {"type": ["integer", "null"], "description": "Conversation sequence this answers."},
+                    "task": {"type": ["object", "null"], "properties": {"id": {"type": "string"}, "expected_attempt": {"type": "integer", "minimum": 0}}, "required": ["id", "expected_attempt"], "additionalProperties": false, "description": "Current task attempt; required for task_update."}
                 }),
                 &["credential", "sequence", "recipient_participant_id", "kind", "body", "expires_at"],
             ),
@@ -503,6 +504,7 @@ pub(crate) enum Operation {
         body: String,
         expires_at: u64,
         reply_to: Option<u64>,
+        task: Option<collaboration::TaskRef>,
     },
     CollaborationAcknowledge {
         conversation_id: String,
@@ -555,6 +557,8 @@ struct CollaborationSendInput {
     expires_at: u64,
     #[serde(default)]
     reply_to: Option<u64>,
+    #[serde(default)]
+    task: Option<collaboration::TaskRef>,
 }
 
 #[derive(Deserialize)]
@@ -759,6 +763,7 @@ impl Operation {
                     body: input.body,
                     expires_at: input.expires_at,
                     reply_to: input.reply_to,
+                    task: input.task,
                 })
             }
             ACTION_COLLABORATION_ACKNOWLEDGE => {

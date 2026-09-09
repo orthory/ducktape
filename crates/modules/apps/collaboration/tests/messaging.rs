@@ -1381,3 +1381,48 @@ fn eligibility_refuses_a_replay_and_tells_nothing_about_another_mailbox() {
         );
     });
 }
+
+#[test]
+fn a_revoked_owner_keeps_history_but_cannot_authorize_new_delivery() {
+    block_on(async {
+        let (mut module, _alice_key, bob_key, seq) = one_message().await;
+        let mut bob = at(6, Origin::External(bob_key));
+        ok(&mut module, &mut bob, bind("c1", "bob", key(20), 0)).await;
+        ok(
+            &mut module,
+            &mut bob,
+            CollaborationMsg::RevokeParticipant {
+                participant_id: "bob".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read(
+                &module,
+                &bob,
+                "bob",
+                None,
+                ProtectedRead::Receipt {
+                    conversation_id: "c1".into(),
+                    seq
+                }
+            )
+            .await,
+            CollaborationReply::Receipt(Some(_))
+        ));
+        assert_eq!(
+            read(
+                &module,
+                &bob,
+                "bob",
+                None,
+                ProtectedRead::DeliveryEligibility {
+                    conversation_id: "c1".into(),
+                    seq
+                }
+            )
+            .await,
+            CollaborationReply::Denied(collaboration::DenyReason::NotPermitted)
+        );
+    });
+}

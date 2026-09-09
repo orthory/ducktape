@@ -596,3 +596,72 @@ fn the_same_refusals_reject_identically_and_leave_no_trace() {
         }
     });
 }
+
+#[test]
+fn revoked_owner_history_is_readable_but_new_delivery_is_denied_on_both_runtimes() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut native = Lane::new(&context, "native_revoked", false).await;
+        let mut wasm = Lane::new(&context, "wasm_revoked", true).await;
+        for (index, (signer, op)) in accepted().into_iter().enumerate() {
+            let height = index as u64 + 1;
+            native
+                .host
+                .submit_at(block(signer, height), op.clone())
+                .await
+                .unwrap();
+            wasm.host
+                .submit_at(block(signer, height), op)
+                .await
+                .unwrap();
+        }
+        let op = msg(CollaborationMsg::RevokeParticipant {
+            participant_id: "bob".into(),
+        });
+        native
+            .host
+            .submit_at(block(2, 20), op.clone())
+            .await
+            .unwrap();
+        wasm.host.submit_at(block(2, 20), op).await.unwrap();
+        assert_eq!(native.root(), wasm.root());
+        for (index, read) in [
+            ProtectedRead::Receipt {
+                conversation_id: "c1".into(),
+                seq: FIRST_MESSAGE_SEQ + 1,
+            },
+            ProtectedRead::DeliveryEligibility {
+                conversation_id: "c1".into(),
+                seq: FIRST_MESSAGE_SEQ + 1,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let history = matches!(read, ProtectedRead::Receipt { .. });
+            let request = encode_query(&CollaborationQuery::Read {
+                participant_id: "bob".into(),
+                via: None,
+                read,
+            });
+            let n = native
+                .authenticated_read(2, 21 + index as u64, request.clone())
+                .await;
+            let w = wasm.authenticated_read(2, 21 + index as u64, request).await;
+            assert_eq!(n, w);
+            let reply = collaboration::decode_reply(&n).unwrap();
+            if history {
+                assert!(matches!(
+                    reply,
+                    collaboration::CollaborationReply::Receipt(Some(_))
+                ));
+            } else {
+                assert_eq!(
+                    reply,
+                    collaboration::CollaborationReply::Denied(
+                        collaboration::DenyReason::NotPermitted
+                    )
+                );
+            }
+        }
+    });
+}

@@ -1895,6 +1895,7 @@ impl RunsModule {
                 body,
                 expires_at,
                 reply_to,
+                task,
             } => {
                 let kind = message_kind(kind)
                     .ok_or_else(|| format!("unknown message kind: {kind}"))?;
@@ -1912,11 +1913,7 @@ impl RunsModule {
                                 recipient_participant_id: recipient_participant_id.clone(),
                                 kind,
                                 reply_to: *reply_to,
-                                // the catalog exposes neither a task attempt
-                                // nor references: a run that needs one names it
-                                // in the body until the operation grows a
-                                // schema for it.
-                                task: None,
+                                task: task.clone(),
                                 body: body.clone(),
                                 references: Vec::new(),
                                 expires_at: *expires_at,

@@ -123,7 +123,7 @@ pub const PRODUCTION: &[&str] = &[
     "collaboration",
 ];
 
-/// the DEFAULT set (15) simnode and the noded daemon compose at genesis —
+/// the DEFAULT set (16) simnode and the noded daemon compose at genesis —
 /// `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base` against noded.
 /// Changing it means changing the daemon.
 pub const SIM_BASE: &[&str] = &[
@@ -140,6 +140,7 @@ pub const SIM_BASE: &[&str] = &[
     "automations",
     "agent",
     "runs",
+    "collaboration",
     "pages",
     "forge",
     "files",
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn selections_pin_to_todays_sets() {
         assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
-        assert_eq!(SIM_BASE.len(), 15, "sim_base is the default 15-module set");
+        assert_eq!(SIM_BASE.len(), 16, "sim_base is the default 16-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
 
         // exact membership (sorted — registration order is not consensus-relevant)
@@ -222,6 +223,7 @@ mod tests {
                 "automations",
                 "capability",
                 "chat",
+                "collaboration",
                 "dispatch",
                 "files",
                 "forge",
