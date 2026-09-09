@@ -964,6 +964,9 @@ fn bell_renders_attribution_relation_and_change_actor() {
         detail: "Please review the launch checklist.".into(),
         ..BellPresentation::default()
     };
-    assert_eq!(bell_presentation(&item, &[context.clone()]), context);
+    assert_eq!(
+        bell_presentation(&item, std::slice::from_ref(&context)),
+        context
+    );
     assert_eq!(bell_worst_severity(&[item]), "info");
 }
