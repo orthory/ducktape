@@ -262,13 +262,26 @@ const COLLABORATION: &str = "collaboration";
 /// becomes the op's `Origin::External`, and the module admits or refuses it.
 /// This CLI pre-checks nothing — a second gate here could only drift from the
 /// one that decides, and the module's refusal reaches the operator verbatim.
+///
+/// The op travels inside a [`collaboration::Request`] naming the NETWORK it is
+/// for, and that name is inside the signed payload. This is what actually binds
+/// a collaboration op to one chain: the frame envelope carries no chain id
+/// (`user_frame` signs `signer ‖ seq ‖ target ‖ payload`), so without the field
+/// a frame minted here would verify byte-identically on another network. The
+/// module refuses a `network` that is not the one it was composed with, and
+/// refuses two empty ids rather than matching them.
+///
+/// `network` therefore comes from [`agreed_network`] — checked non-blank AND
+/// checked against the node being dialled — never from the local file alone.
 fn submit(
     base: &str,
     signer: &commonware_cryptography::ed25519::PrivateKey,
-    msg: &collaboration::CollaborationMsg,
+    network: &str,
+    op: collaboration::CollaborationMsg,
 ) -> CollabResult {
+    let request = collaboration::Request::new(network, op);
     let frame =
-        crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(msg));
+        crate::userkey_cli::user_frame(signer, COLLABORATION, collaboration::encode_msg(&request));
     let height = crate::node_http::submit_frame(base, &frame)?;
     println!("{height}");
     Ok(())
@@ -388,20 +401,25 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
         participant: &args.participant,
     };
     let service = crate::collab_keys::ensure(&workspace, binding)?;
-    let service_key = commonware_cryptography::Signer::public_key(&service)
-        .as_ref()
-        .to_vec();
+    // a scoped SERVICE KEY, not a program account: this device holds a private
+    // half, which is what lets it sign its own sends and receipts later.
+    let principal = collaboration::BoundPrincipal::ServiceKey(
+        commonware_cryptography::Signer::public_key(&service)
+            .as_ref()
+            .to_vec(),
+    );
 
     // the OWNER signs: a scoped credential cannot authorize itself.
     let owner = crate::userkey_cli::load_user_signer(&ctx.key_path()?, stdin)?;
     submit(
         &base,
         &owner,
-        &collaboration::CollaborationMsg::Bind {
+        &network,
+        collaboration::CollaborationMsg::Bind {
             conversation_id: args.conversation,
             participant_id: args.participant,
             device: args.device,
-            service_key,
+            principal,
             expected_credential: args.expect,
         },
     )
@@ -416,7 +434,8 @@ fn cmd_send(args: SendArgs, ctx: &VerbCtx) -> CollabResult {
     submit(
         &base,
         &service,
-        &collaboration::CollaborationMsg::Send(collaboration::SendRequest {
+        &network,
+        collaboration::CollaborationMsg::Send(collaboration::SendRequest {
             conversation_id: args.conversation,
             sender_participant_id: args.participant,
             message_id: collaboration::MessageId {
@@ -442,7 +461,8 @@ fn cmd_ack(args: AckArgs, ctx: &VerbCtx) -> CollabResult {
     submit(
         &base,
         &service,
-        &collaboration::CollaborationMsg::Acknowledge {
+        &network,
+        collaboration::CollaborationMsg::Acknowledge {
             conversation_id: args.conversation,
             seq: args.seq,
             binding_credential: args.credential,
@@ -927,12 +947,73 @@ mod tests {
             participant: "p1",
         };
         let scoped = crate::collab_keys::ensure(workspace.path(), binding).expect("mints");
-        let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(1234);
+        let owner = <commonware_cryptography::ed25519::PrivateKey as commonware_cryptography::Signer>::from_seed(1234);
         assert_ne!(
             crate::collab_keys::public_hex(&scoped),
             crate::collab_keys::public_hex(&owner),
             "the scoped key must never be the owner's"
         );
+    }
+
+    /// The NETWORK travels inside the signed payload, not merely beside it.
+    ///
+    /// This is what actually binds a collaboration op to one chain. The frame
+    /// envelope carries no chain id — `user_frame` signs
+    /// `signer ‖ seq ‖ target ‖ payload` — so a frame minted here would verify
+    /// byte-identically on another network if the id were not IN the payload.
+    /// Decoding the frame the way a node does and reading the network back off
+    /// the op is the only way to prove it is covered by the signature.
+    #[test]
+    fn the_signed_payload_carries_the_network_for_owner_and_service_ops() {
+        let signer = <commonware_cryptography::ed25519::PrivateKey as commonware_cryptography::Signer>::from_seed(7);
+        let network = "ducktape#a1b2c3d4";
+
+        // one owner-signed op and one service-signed op: root's requirement is
+        // that BOTH bind the chain id, not just the owner's.
+        let owner_op = collaboration::CollaborationMsg::Bind {
+            conversation_id: "c1".into(),
+            participant_id: "p1".into(),
+            device: "laptop".into(),
+            principal: collaboration::BoundPrincipal::ServiceKey(vec![9; 32]),
+            expected_credential: 0,
+        };
+        let service_op = collaboration::CollaborationMsg::Acknowledge {
+            conversation_id: "c1".into(),
+            seq: 1,
+            binding_credential: 3,
+            state: collaboration::DeliveryState::Queued,
+            reason: None,
+        };
+
+        for op in [owner_op, service_op] {
+            let request = collaboration::Request::new(network, op);
+            let frame = crate::userkey_cli::user_frame(
+                &signer,
+                COLLABORATION,
+                collaboration::encode_msg(&request),
+            );
+            // exactly what the node does with the bytes before the module sees
+            // them: verify the signature, then decode the payload.
+            let (origin, msg) = node::decode_frame(&frame).expect("the frame verifies");
+            assert_eq!(
+                origin,
+                sdk::Origin::External(
+                    commonware_cryptography::Signer::public_key(&signer)
+                        .as_ref()
+                        .to_vec()
+                )
+            );
+            assert_eq!(msg.target, COLLABORATION);
+            let decoded = collaboration::decode_msg(&msg.payload).expect("the op decodes");
+            assert_eq!(
+                decoded.network, network,
+                "the network must be inside the signed payload"
+            );
+            assert!(
+                !decoded.network.is_empty(),
+                "a blank network would collapse every chain into one"
+            );
+        }
     }
 
     /// The states a bound service may report are exactly the ones it can
