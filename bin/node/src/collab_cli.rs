@@ -274,32 +274,90 @@ fn submit(
     Ok(())
 }
 
-/// This binding's scoped service key, or a refusal naming the attach that would
-/// create it. Never mints: `send` and `ack` act AS an existing binding, and
-/// minting one here would sign with a key no committed `Bind` has authorized —
-/// producing an op the module refuses, from a CLI that looked like it worked.
 /// The network a workspace belongs to, off its own `network.toml`.
 ///
 /// A scoped key is fenced by this (`collab_keys`' header says why: a submit
 /// frame carries no chain id, so one key shared across two networks would make
 /// a send replayable between them). Read from the workspace rather than from
-/// `/v1/status` on purpose — it is the same answer, but it needs no node
-/// running, so `collab key` still prints on a stopped node, and a proxy
-/// standing in for one cannot change which key gets signed with.
+/// `/v1/status` — the same answer, but it needs no node running, so `collab key`
+/// still prints against a stopped node.
+///
+/// **An empty chain id is refused, never used as a namespace.** `chain_id` is
+/// empty on a daemon that serves no chain (simnode, the embedded local daemon),
+/// and an empty fence is not a fence: every such workspace would share one key
+/// per id pair, which is the collision the fence exists to prevent. A workspace
+/// with no network identity has no binding to hold a key for, so refusing is
+/// also the honest answer.
 fn chain_id(workspace: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
     let path = workspace.join("network.toml");
-    Ok(crate::config::NetworkDescriptor::load(&path)?.chain_id)
+    let named = crate::config::NetworkDescriptor::load(&path)?.chain_id;
+    if named.is_empty() {
+        return Err(format!(
+            "{} names an empty chain_id — this workspace has no network identity to \
+             scope a collaboration key to",
+            path.display()
+        )
+        .into());
+    }
+    Ok(named)
 }
 
+/// The network to act on, agreed by BOTH the workspace and the node being
+/// dialled — for every verb that submits.
+///
+/// The local file alone is not enough. It says which network this device holds
+/// keys for; it does not say which network the node on the other end of `--url`
+/// belongs to. Point a workspace at another network's node and the local read
+/// still succeeds, so `attach` would submit an owner-signed `Bind` naming a key
+/// scoped to a network that node is not on, and `send` would sign a message
+/// under a credential the receiving network never issued. Both fail confusingly
+/// at the module, after a write went out.
+///
+/// So the two are compared before anything is signed, and a mismatch names both
+/// sides. A node reporting no chain id at all is refused for the same reason an
+/// empty local one is: nothing to agree with.
+fn agreed_network(
+    base: &str,
+    workspace: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let local = chain_id(workspace)?;
+    let status =
+        crate::node_http::get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
+    let remote = status["chain_id"].as_str().unwrap_or_default();
+    if remote.is_empty() {
+        return Err(format!(
+            "the node at {base} serves no chain (empty chain_id), so it cannot carry a \
+             collaboration binding on {local}"
+        )
+        .into());
+    }
+    if remote != local {
+        return Err(format!(
+            "this workspace belongs to {local} but the node at {base} is on {remote} — \
+             refusing to sign for a network this device holds no binding on"
+        )
+        .into());
+    }
+    Ok(local)
+}
+
+/// This binding's scoped service key, or a refusal naming the attach that would
+/// create it. Never mints: `send` and `ack` act AS an existing binding, and
+/// minting one here would sign with a key no committed `Bind` has authorized —
+/// producing an op the module refuses, from a CLI that looked like it worked.
+///
+/// Takes the network the caller already agreed with the node
+/// ([`agreed_network`]) rather than re-reading the workspace, so a verb cannot
+/// load a key under one network and submit it to another.
 fn scoped_key(
     ctx: &VerbCtx,
+    network: &str,
     conversation: &str,
     participant: &str,
 ) -> Result<commonware_cryptography::ed25519::PrivateKey, Box<dyn std::error::Error>> {
     let workspace = ctx.addr.workspace()?;
-    let network = chain_id(&workspace)?;
     let binding = crate::collab_keys::BindingRef {
-        network: &network,
+        network,
         conversation,
         participant,
     };
@@ -321,7 +379,9 @@ fn scoped_key(
 fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> CollabResult {
     let base = ctx.http_base()?;
     let workspace = ctx.addr.workspace()?;
-    let network = chain_id(&workspace)?;
+    // agreed BEFORE the key is minted: a key minted for a network this node is
+    // not on would be named by an owner-signed `Bind` that network never sees.
+    let network = agreed_network(&base, &workspace)?;
     let binding = crate::collab_keys::BindingRef {
         network: &network,
         conversation: &args.conversation,
@@ -350,7 +410,8 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
 /// `collab send` — signed by the scoped key, so no wallet password is needed.
 fn cmd_send(args: SendArgs, ctx: &VerbCtx) -> CollabResult {
     let base = ctx.http_base()?;
-    let service = scoped_key(ctx, &args.conversation, &args.participant)?;
+    let network = agreed_network(&base, &ctx.addr.workspace()?)?;
+    let service = scoped_key(ctx, &network, &args.conversation, &args.participant)?;
     let expires_at = deadline(&base, args.ttl_secs)?;
     submit(
         &base,
@@ -376,7 +437,8 @@ fn cmd_send(args: SendArgs, ctx: &VerbCtx) -> CollabResult {
 /// `collab ack` — the bound service reports what its provider did.
 fn cmd_ack(args: AckArgs, ctx: &VerbCtx) -> CollabResult {
     let base = ctx.http_base()?;
-    let service = scoped_key(ctx, &args.conversation, &args.participant)?;
+    let network = agreed_network(&base, &ctx.addr.workspace()?)?;
+    let service = scoped_key(ctx, &network, &args.conversation, &args.participant)?;
     submit(
         &base,
         &service,
@@ -498,6 +560,11 @@ impl From<AckState> for collaboration::DeliveryState {
 /// Minting is the default and is idempotent: attaching is a re-runnable
 /// operation, and a second attach must present the same key or the committed
 /// binding would name one nothing holds.
+///
+/// The only verb that reads the network LOCALLY, because it is the only one
+/// that submits nothing: it dials no node, so there is no remote identity to
+/// agree with, and it stays usable while the node is stopped. Every verb that
+/// signs goes through [`agreed_network`] instead.
 fn cmd_key(args: KeyArgs, ctx: &VerbCtx) -> CollabResult {
     let workspace = ctx.addr.workspace()?;
     let network = chain_id(&workspace)?;
@@ -706,6 +773,76 @@ mod tests {
     /// in. Guessing wrong turns a 24 h intent into 86 seconds.
     ///
     /// This is the mutation guard for that decision: restoring the old
+    /// Write a workspace whose `network.toml` names `chain_id`.
+    ///
+    /// The descriptor is written as TOML rather than built as a struct so the
+    /// test exercises the real `NetworkDescriptor::load` parse, which is what
+    /// the CLI runs. Every field without a serde default is present; the
+    /// block time clears `MIN_BLOCK_TIME_MS`, which `from_toml` enforces.
+    fn workspace_on(chain_id: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let descriptor = format!(
+            "chain_id = \"{chain_id}\"\n\
+             validators = []\n\
+             genesis = \"\"\n\
+             block_time_ms = 1000\n\
+             modules = []\n"
+        );
+        std::fs::write(dir.path().join("network.toml"), descriptor).expect("write the descriptor");
+        dir
+    }
+
+    /// An empty chain id must never become the namespace.
+    ///
+    /// It is empty on a daemon that serves no chain (simnode, the embedded
+    /// local daemon). An empty fence is not a fence — every such workspace
+    /// would share one key per id pair, which is exactly the collision the
+    /// fence exists to prevent.
+    #[test]
+    fn an_empty_chain_id_is_refused_rather_than_used_as_a_namespace() {
+        let dir = workspace_on("");
+        let refusal = chain_id(dir.path()).expect_err("an empty chain id must refuse");
+        assert!(
+            refusal.to_string().contains("empty chain_id"),
+            "the refusal must say what is wrong: {refusal}"
+        );
+
+        let named = workspace_on("ducktape#a1b2c3d4");
+        assert_eq!(
+            chain_id(named.path()).expect("a named chain id loads"),
+            "ducktape#a1b2c3d4"
+        );
+    }
+
+    /// The workspace says which network this device holds keys for. It does NOT
+    /// say which network the node behind `--url` is on. Signing before checking
+    /// would submit an owner `Bind` — or a message under a credential — to a
+    /// network that never issued it, and the write would already be out before
+    /// the module refused it.
+    #[test]
+    fn signing_verbs_refuse_a_node_on_another_network() {
+        let dir = workspace_on("ducktape#aaaa1111");
+
+        let (base, server) = status_once(r#"{"chain_id":"ducktape#aaaa1111"}"#);
+        let agreed = agreed_network(&base, dir.path()).expect("the two agree");
+        assert_eq!(agreed, "ducktape#aaaa1111");
+        server.join().expect("server");
+
+        let (base, server) = status_once(r#"{"chain_id":"ducktape#bbbb2222"}"#);
+        let refusal = agreed_network(&base, dir.path()).expect_err("a mismatch must refuse");
+        let names_both = refusal.to_string().contains("ducktape#aaaa1111")
+            && refusal.to_string().contains("ducktape#bbbb2222");
+        assert!(names_both, "the refusal must name both sides: {refusal}");
+        server.join().expect("server");
+
+        // a node serving no chain has nothing to agree with, and must not be
+        // read as "matches whatever the workspace says".
+        let (base, server) = status_once(r#"{"chain_id":""}"#);
+        let refusal = agreed_network(&base, dir.path()).expect_err("no chain must refuse");
+        assert!(refusal.to_string().contains("serves no chain"), "{refusal}");
+        server.join().expect("server");
+    }
+
     /// `unwrap_or_default()` makes the second half pass a deadline back.
     #[test]
     fn a_status_that_names_no_time_unit_is_refused_rather_than_guessed() {

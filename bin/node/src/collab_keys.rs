@@ -16,11 +16,17 @@
 //!
 //! ## the trust model is the workspace, not the port
 //!
-//! The key is 32 bytes, hex, mode 0600, under the node's workspace — the same
-//! shape and the same boundary as `service-link.token` and `admin.token`
+//! The key is 32 bytes, hex, under the node's workspace — the same shape and
+//! the same boundary as `service-link.token` and `admin.token`
 //! (`noded::services`). "Can read the node's own workspace" is the whole claim.
 //! A sandbox guest reaching the node's listener through its vsock tunnel holds
 //! no workspace and so holds no key.
+//!
+//! On unix it is mode 0600 from creation. **On a non-unix host it is not
+//! permission-restricted at all** — `OpenOptionsExt::mode` is a unix API with
+//! no portable equivalent — so there the directory's ACLs are the only guard.
+//! Stated rather than glossed: the two hosts do not offer the same protection,
+//! and `publish_owner_only`'s non-unix arm says so at the code.
 //!
 //! Unlike those two, a service key **persists across boots**: its public half is
 //! committed on-chain in the binding, so re-minting it at boot would silently
@@ -46,13 +52,31 @@
 //! file's own doc calls the namespace) — immutable per network and readable
 //! with no node running.
 //!
-//! ## the filename is a digest
+//! ## the filename is a digest over a LENGTH-PREFIXED tuple
 //!
-//! A conversation id and a participant id are module-defined strings; core puts
-//! no charset on them. Rather than constrain core's id space or hand-roll an
-//! escaping rule, the file is named by
-//! `sha256(chain_id ‖ 0x1f ‖ conversation ‖ 0x1f ‖ participant)` — no id can
-//! walk out of the directory, and nothing here has to be listed by name.
+//! A conversation id and a participant id are module-defined strings, and core
+//! constrains them by length alone — `registry::check_id` accepts any bytes
+//! that are non-empty and within `MAX_ID_BYTES`. So an id may contain ANY byte,
+//! including whatever this file might pick as a separator.
+//!
+//! That rules out delimiter framing. A digest over `network ‖ 0x1f ‖
+//! conversation ‖ 0x1f ‖ participant` collides on ids core accepts:
+//! `("n", "a\x1fb", "c")` and `("n", "a", "b\x1fc")` are different bindings
+//! that hash the same bytes, so two bindings would share one key — and a
+//! session scoped to one conversation could sign the other's receipts.
+//!
+//! The digest is therefore over a length-prefixed tuple under a domain string:
+//!
+//! ```text
+//! sha256( DOMAIN ‖ len_be(network) ‖ network
+//!                ‖ len_be(conversation) ‖ conversation
+//!                ‖ len_be(participant) ‖ participant )
+//! ```
+//!
+//! A length prefix is unambiguous whatever the content, so no id can be spelled
+//! to impersonate another tuple. The domain separates this digest from every
+//! other sha256 in the tree. No id can walk out of the directory, and nothing
+//! here has to be listed by name.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -74,17 +98,26 @@ pub(crate) struct BindingRef<'a> {
     pub(crate) participant: &'a str,
 }
 
+/// Domain separation for [`BindingRef::file_name`]: this digest names a scoped
+/// service key and must never coincide with another sha256 over the same parts.
+const KEY_FILE_DOMAIN: &str = "ducktape-collab-service-key-v1";
+
 impl BindingRef<'_> {
-    /// the digest that names this binding's key file. `0x1f` separated so no
-    /// shift of a boundary between the three parts can collide — `("ab", "c")`
-    /// with `("a", "bc")`, or a chain id ending in a conversation id's prefix.
+    /// the digest that names this binding's key file.
+    ///
+    /// LENGTH-PREFIXED, not delimiter-separated: core accepts any bytes inside
+    /// an id (`registry::check_id` checks length alone), so any separator this
+    /// picked could appear in an id and let two different bindings hash
+    /// identically. A length prefix cannot be spelled by content.
     fn file_name(&self) -> String {
         let mut hasher = sha2::Sha256::new();
-        hasher.update(self.network.as_bytes());
-        hasher.update([0x1f]);
-        hasher.update(self.conversation.as_bytes());
-        hasher.update([0x1f]);
-        hasher.update(self.participant.as_bytes());
+        hasher.update(KEY_FILE_DOMAIN.as_bytes());
+        for part in [self.network, self.conversation, self.participant] {
+            // u64 big-endian: fixed width, so the prefix itself never has to be
+            // parsed out of the stream to know where a part begins.
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
         hasher
             .finalize()
             .iter()
@@ -136,12 +169,11 @@ pub(crate) fn load(
     Ok(Some(key))
 }
 
-/// Mint a fresh service key for this binding, 0600.
+/// Mint a fresh service key for this binding.
 ///
-/// `create_new` is the whole concurrency story: two `collab attach` runs racing
-/// on one binding cannot both mint, because the loser's create fails and it
-/// reads the winner's key instead of overwriting it. Overwriting would strand
-/// the on-chain binding on a public key nothing holds any more.
+/// Two runs racing on one binding cannot both mint: the loser's publish fails
+/// with `AlreadyExists` and it reads the winner's key instead of overwriting it.
+/// Overwriting would strand the on-chain binding on a public key nothing holds.
 fn mint(
     workspace: &std::path::Path,
     binding: BindingRef<'_>,
@@ -150,7 +182,7 @@ fn mint(
     std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     let path = key_path(workspace, binding);
     let seed = noded::services::new_secret();
-    match write_owner_only(&path, &seed) {
+    match publish_owner_only(&dir, &path, &seed) {
         Ok(()) => {}
         // lost the race: the winner's key is the binding's key.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -164,27 +196,107 @@ fn mint(
         .map_err(|_| "a fresh 32-byte secret is not a valid ed25519 key".to_string())
 }
 
-/// Create 0600 from the start — a world-readable window, however short, is what
-/// this file exists to avoid. `create_new` so an existing key is never clobbered.
+/// Publish a secret at `path`: COMPLETE, durable, atomic, and never clobbering.
+///
+/// All four properties are load-bearing, and `create_new` + `write_all` gave
+/// only the last one:
+///
+/// - **Complete.** Creating the final path and then writing it leaves a window
+///   where the file EXISTS and is empty or half-written. A concurrent `ensure`
+///   reads it in that window and gets a truncated key — or, worse, `load`
+///   errors on a "corrupt" key that is merely unfinished. The secret is written
+///   to a temp name and only ever appears at `path` complete.
+/// - **Durable.** `attach` submits an owner-signed `Bind` naming this key's
+///   public half. If the machine loses power after that op commits but before
+///   the bytes reach the platter, the network holds a binding whose key this
+///   device no longer has — unrecoverable without a fresh `Bind`. So the data
+///   is fsynced BEFORE it is published, and the directory entry is fsynced
+///   after, because an unsynced directory can lose the link itself.
+/// - **Atomic and non-clobbering together.** `rename` is atomic but replaces,
+///   which would silently rotate a key an on-chain binding already names.
+///   `hard_link` is atomic and fails with `AlreadyExists` instead — the same
+///   refusal `create_new` gave, so the race path above is unchanged.
+///
+/// The temp file is created in the SAME directory so the link cannot cross a
+/// filesystem, and 0600 from the start so there is no world-readable window.
 #[cfg(unix)]
-fn write_owner_only(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+fn publish_owner_only(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    secret: &str,
+) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?
-        .write_all(secret.as_bytes())
+
+    let tmp = dir.join(format!(".mint.{}.{}", std::process::id(), file_stem(path)));
+    // a leftover temp from a killed run must not fail this mint forever, and it
+    // is ours by name: same pid, same binding.
+    let _ = std::fs::remove_file(&tmp);
+
+    let published = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(secret.as_bytes())?;
+        // the DATA is durable before any name points at it.
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&tmp, path)
+    })();
+
+    // the temp name is scratch either way: on success `path` is the same inode,
+    // on failure it holds a secret nothing will ever publish.
+    let _ = std::fs::remove_file(&tmp);
+    published?;
+
+    // fsync the DIRECTORY: the bytes are durable but the name that finds them
+    // is not until its parent is synced.
+    std::fs::File::open(dir)?.sync_all()
 }
 
+/// The digest half of a key path, for naming its temp file. Falls back to a
+/// constant rather than panicking — `path` is always `<dir>/<digest>` here.
+#[cfg(unix)]
+fn file_stem(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("key")
+        .to_string()
+}
+
+/// Non-unix publish: complete, durable and non-clobbering, but **NOT
+/// permission-restricted**.
+///
+/// `OpenOptionsExt::mode` is a unix API and there is no portable equivalent, so
+/// this file is protected by the workspace directory's ACLs alone. That is a
+/// weaker claim than the unix path's 0600 and this comment exists so nobody
+/// reads the module header as promising otherwise on such a host.
 #[cfg(not(unix))]
-fn write_owner_only(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, secret.as_bytes()))
+fn publish_owner_only(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    secret: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let tmp = dir.join(format!(".mint.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let published = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(secret.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::hard_link(&tmp, path)
+    })();
+
+    let _ = std::fs::remove_file(&tmp);
+    published
 }
 
 /// The public half — what a `Bind` op carries on-chain as the binding's
@@ -254,6 +366,70 @@ mod tests {
         assert_ne!(
             on_network("net", "a", "p").file_name(),
             on_network("ne", "ta", "p").file_name()
+        );
+    }
+
+    /// A separator INSIDE an id must not let two bindings name one key file.
+    ///
+    /// This is why the digest is length-prefixed rather than delimiter-framed.
+    /// Core constrains an id by length alone (`registry::check_id`: non-empty,
+    /// within `MAX_ID_BYTES`), so every byte is legal inside one — including
+    /// whatever this module might pick as a separator. Under the old
+    /// `‖ 0x1f ‖` framing these two hash identical bytes, and the two bindings
+    /// share a key: a session scoped to one conversation could then sign the
+    /// other's receipts.
+    ///
+    /// Both ids here are ones core ACCEPTS, which is what makes it a real
+    /// collision rather than a theoretical one.
+    #[test]
+    fn a_separator_inside_an_id_cannot_forge_another_binding() {
+        for separator in ['\u{1f}', '\0', '/', ':'] {
+            let left = format!("a{separator}b");
+            let right = format!("b{separator}c");
+            assert_ne!(
+                on_network("n", &left, "c").file_name(),
+                on_network("n", "a", &right).file_name(),
+                "a {separator:?} inside an id collided two bindings"
+            );
+        }
+
+        // and across the network boundary, the same way.
+        assert_ne!(
+            on_network("n\u{1f}a", "b", "c").file_name(),
+            on_network("n", "a\u{1f}b", "c").file_name()
+        );
+    }
+
+    /// The ids core actually accepts are arbitrary bytes within a length cap,
+    /// so the digest must be total over them — no panic, no escaping rule, and
+    /// a distinct name for every distinct tuple.
+    #[test]
+    fn every_id_core_accepts_gets_its_own_name() {
+        let longest = "z".repeat(collaboration::MAX_ID_BYTES);
+        let cases = [
+            on_network("n", "a", "b"),
+            on_network("n", "a", "b "),
+            on_network("n", " a", "b"),
+            on_network("n", "a\u{1f}", "b"),
+            on_network("n", "a", "\u{1f}b"),
+            on_network("n", "🦆", "b"),
+            on_network("n", &longest, "b"),
+            on_network("n", "a", &longest),
+        ];
+        let mut names: Vec<String> = cases.iter().map(BindingRef::file_name).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "two accepted id tuples share a key file"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())),
+            "every name is a hex digest"
         );
     }
 
