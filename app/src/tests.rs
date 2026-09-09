@@ -501,15 +501,12 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the block editor's autosave clock: the stock editor's edits
-            // never pass through a handler, so a dirty buffer is the only
-            // signal there is — and the gate IS the dirty test, so the tick
-            // exists solely while unsaved text needs the node. It costs
-            // nothing at rest and dies the moment the save lands.
-            // the page document's write gate: dirty IS the condition, so the
-            // tick exists only while the buffer has drifted from the node's
-            // text — not a poll, an edit-driven flush.
-            "every 900ms when (connected && !empty(active_page) && page_text != page_saved_text) -> page_autosave_tick",
+            // the page document's write clock: the guest editor's edits never
+            // pass through a handler, so the app mirror cannot know the buffer
+            // is dirty — the tick reads the canonical document while a page is
+            // open on a connected node and its handler makes the dirty/no-op
+            // call. It exists only while a page is open, and no other tick may.
+            "every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick",
         ]
     );
 }

@@ -9,6 +9,14 @@ pub struct ForgeRepo {
     pub head: String,
 }
 
+/// One born branch of the open repo: its short name at the exact commit
+/// its head stood on when the repo slice was read.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct ForgeBranch {
+    pub name: String,
+    pub head: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeData {
     pub generation: i64,
@@ -19,7 +27,7 @@ pub struct ForgeData {
 pub struct ForgeRepoData {
     pub generation: i64,
     pub repo: String,
-    pub branches: Vec<String>,
+    pub branches: Vec<ForgeBranch>,
     pub items: Vec<ForgeItem>,
 }
 
@@ -107,12 +115,14 @@ pub async fn load_forge_repo(
             rpc.query("forge", &refs_query),
             rpc.query("forge", &items_query)
         )?;
-        let branches = refs["refs"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let heads: Vec<forge::RefHead> =
+            serde_json::from_value(refs["refs"].clone()).map_err(|error| error.to_string())?;
+        let branches = heads
             .into_iter()
-            .filter_map(|branch| branch["name"].as_str().map(str::to_string))
+            .map(|head| ForgeBranch {
+                name: head.name,
+                head: head.head,
+            })
             .collect();
         let summaries: Vec<forge::ItemSummary> =
             serde_json::from_value(items["items"].clone()).map_err(|error| error.to_string())?;
@@ -1101,7 +1111,7 @@ pub struct ForgeLiveData {
     pub repos_loaded: bool,
     pub repos: Vec<ForgeRepo>,
     pub repo_loaded: bool,
-    pub branches: Vec<String>,
+    pub branches: Vec<ForgeBranch>,
     pub items: Vec<ForgeItem>,
     pub item_loaded: bool,
     pub item: ForgeItemData,
@@ -2616,8 +2626,49 @@ pub fn keep_forge_repos(
     if loaded { next } else { current }
 }
 
-pub fn keep_branches(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<String> {
+pub fn keep_branches(
+    loaded: bool,
+    next: Vec<ForgeBranch>,
+    current: Vec<ForgeBranch>,
+) -> Vec<ForgeBranch> {
     if loaded { next } else { current }
+}
+
+/// The commit a branch's head stood on when the repo slice was read, or
+/// empty for a name the slice does not hold: a pick of a branch that was
+/// deleted under the open menu asks for nothing.
+pub fn forge_branch_head(branches: &[ForgeBranch], name: &str) -> String {
+    branches
+        .iter()
+        .find(|branch| branch.name == name)
+        .map(|branch| branch.head.clone())
+        .unwrap_or_default()
+}
+
+/// The branch the code browse's pinned commit is the head of. The picked
+/// branch wins while it still stands there, then `dev`, then `main`, then
+/// the first branch at that commit; empty when none does, which is the
+/// truthful reading of a browse pinned to a commit a branch has since
+/// moved past or to a deep link's own `@rev`.
+pub fn forge_tree_branch(branches: &[ForgeBranch], picked: &str, rev: &str) -> String {
+    if rev.is_empty() {
+        return String::new();
+    }
+    let standing_at_rev = |name: &str| {
+        branches
+            .iter()
+            .any(|branch| branch.name == name && branch.head == rev)
+    };
+    let preferred = [picked, "dev", "main"]
+        .into_iter()
+        .find(|name| standing_at_rev(name));
+    let first_at_rev = || {
+        branches
+            .iter()
+            .find(|branch| branch.head == rev)
+            .map(|branch| branch.name.as_str())
+    };
+    preferred.or_else(first_at_rev).unwrap_or_default().to_owned()
 }
 
 pub fn keep_forge_items(

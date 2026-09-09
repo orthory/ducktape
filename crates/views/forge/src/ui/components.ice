@@ -160,16 +160,16 @@ component RepoCard(repo:ForgeRepo)
 
 // ── REPO HEADER ───────────────────────────────────────────────────────────
 
-// `<network> / <repo> ▾` plus the single default-branch pill. This replaces the
-// generic screen header, which occupied the row the artifact gives to the
-// breadcrumb.
+// `<network> / <repo> ▾`. This replaces the generic screen header, which
+// occupied the row the artifact gives to the breadcrumb; the branch the
+// browse is pinned to is the tab row's selector (`BranchPill`), not the
+// crumb's.
 //
 // THE ROW IS CHROME BECAUSE THE CALLER IS THE BUTTON: view.ice mounts the whole
 // crumb inside a `forge_toggle_repo_menu` button, so a nested button here would
 // be a button inside a button. `open` is the switcher's state, which lights the
-// repo name the way the artifact's hover does. `branch` renders only when the
-// caller has a default branch to name.
-component RepoCrumb(org:str, repo:str, branch:str, open:bool)
+// repo name the way the artifact's hover does.
+component RepoCrumb(org:str, repo:str, open:bool)
   row #root
     with
       w=fill
@@ -225,30 +225,143 @@ component RepoCrumb(org:str, repo:str, branch:str, open:bool)
           name="chevron-down"
           tone="ink"
           px=11.0
-    if !empty(branch)
-      box
-        with
-          px=8.0
-          py=3.0
-          bg=surface
-          border=border
-          border-w=1.0
-          r=7.0
-        row gap=5.0 align=center
-          box
-            with
-              w=6.0
-              h=6.0
-              bg=success_dot
-              r=3.0
-            space w=1.0 h=1.0
-          text branch
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-muted
     space w=fill
+
+// The branch selector's pill: the branch glyph, what the browse is pinned
+// to, and the chevron that says it opens. `open` swaps the ink to the
+// accent the way the crumb does.
+component BranchPill(label:str, open:bool)
+  box #root
+    with
+      h=20.0
+      pl=7.0
+      pr=7.0
+      align-y=center
+      bg=surface
+      border=border
+      border-w=1.0
+      r=10.0
+    row gap=5.0 align=center
+      if open
+        Icon
+          with
+            name="branch"
+            tone="accent"
+            px=10.0
+      if !open
+        Icon
+          with
+            name="branch"
+            tone="ink"
+            px=10.0
+      if open
+        text label
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-brand
+      if !open
+        text label
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-meta
+      if open
+        Icon
+          with
+            name="chevron-down"
+            tone="accent"
+            px=9.0
+      if !open
+        Icon
+          with
+            name="chevron-down"
+            tone="ink"
+            px=9.0
+
+// One row of the branch switcher: the branch name, and the commit its head
+// stands on abbreviated, since two branches at one commit read alike by
+// name alone. The same face as the repo switcher's rows.
+component BranchMenuRow(branch:ForgeBranch, active:bool)
+  emits
+    forge_pick_branch(str)
+  col #root w=fill
+    if active
+      button -> emit(forge_pick_branch, branch.name)
+        with
+          label=browse_branch_label(branch.name)
+          description=branch.name
+          checked=active
+          w=fill
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            pl=9.0
+            pr=9.0
+            pt=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            text branch.name
+              with
+                w=fill
+                size=13.0
+                wrap=none
+                font=display
+                @text-primary
+            text rev_label("", branch.head)
+              with
+                size=9.5
+                wrap=none
+                font=code_medium
+                @text-muted
+        active bg=selected_row text=fg border=transparent border-w=1.0 r=8.0
+        hovered bg=selected_row text=fg
+        pressed bg=subtle text=fg
+    if !active
+      button -> emit(forge_pick_branch, branch.name)
+        with
+          label=browse_branch_label(branch.name)
+          description=branch.name
+          checked=active
+          w=fill
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            pl=9.0
+            pr=9.0
+            pt=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            text branch.name
+              with
+                w=fill
+                size=13.0
+                wrap=none
+                font=display
+                @text-primary
+            text rev_label("", branch.head)
+              with
+                size=9.5
+                wrap=none
+                font=code_medium
+                @text-muted
+        active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+        hovered bg=elevated text=fg
+        pressed bg=subtle text=fg
 
 // One row of the 290px repo switcher. The artifact's right-hand `N PR` /
 // `N issue` tallies and its language dot are the same missing wire fields the
