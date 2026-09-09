@@ -55,6 +55,10 @@ const MAX_MODULE_BYTES: u64 = 64 << 20;
 const MAX_FRAME_BYTES: usize = 8 << 20;
 const MAX_REQUESTS_PER_TICK: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+/// A never-valid view may hold its replacement off for this long. Once a
+/// guest publishes a valid tree, neither pending work nor a later trap
+/// authorizes discarding its state.
+const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
 /// How often a tab polls for a component still loading on its thread.
 const LOAD_POLL: Duration = Duration::from_millis(50);
 
@@ -1981,7 +1985,18 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
             if waited_for || active == locked.hash {
                 return None;
             }
+            let Some(replacement) = locked.replacement_after_wait() else {
+                log_source(
+                    module,
+                    active.as_ref(),
+                    "Failed",
+                    locked.generation,
+                    "replacement_waiting",
+                );
+                return None;
+            };
             let generation = locked.start(active);
+            locked.replacement = replacement;
             Some(spawn_load(module, mounted, generation, asked_of.clone()))
         })
         .collect()
@@ -2028,15 +2043,42 @@ struct Mounted {
     /// for it instead of starting over.
     in_flight: bool,
     wanted: Option<[u8; 32]>,
+    /// The seated view has held a replacement off with pending work since
+    /// then; a block that names a deployment for it waits under the same
+    /// generation instead of opening one per block.
+    waiting_since: Option<Instant>,
+    replacement: Replacement,
+}
+
+#[derive(Clone, Copy)]
+enum Replacement {
+    Preserve,
+    RecoverNeverValid,
 }
 
 impl Mounted {
+    fn replacement_after_wait(&mut self) -> Option<Replacement> {
+        let Slot::Ready(old) = &self.slot else {
+            return Some(Replacement::Preserve);
+        };
+        let no_pending_state = old.ticks == 0 || (old.ever_valid_tree && old.settled());
+        if no_pending_state {
+            return Some(Replacement::Preserve);
+        }
+        let since = *self.waiting_since.get_or_insert_with(Instant::now);
+        let never_valid_expired =
+            old.can_recover_without_state() && since.elapsed() >= REPLACEMENT_WAIT;
+        never_valid_expired.then_some(Replacement::RecoverNeverValid)
+    }
+
     /// Opens the next generation for a load after `wanted` (None: whatever
     /// the node holds active), and names it.
     fn start(&mut self, wanted: Option<[u8; 32]>) -> u64 {
         self.generation += 1;
         self.in_flight = true;
         self.wanted = wanted;
+        self.waiting_since = None;
+        self.replacement = Replacement::Preserve;
         self.generation
     }
 }
@@ -2069,6 +2111,8 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 hash: None,
                 in_flight: true,
                 wanted: None,
+                waiting_since: None,
+                replacement: Replacement::Preserve,
             }));
             spawn_load(module, &mounted, 0, snapshot);
             mounted
@@ -2099,7 +2143,13 @@ fn spawn_load(
         if connection.rev != asked_of.rev {
             return;
         }
-        let Mounted { slot, hash, .. } = &mut *locked;
+        let Mounted {
+            slot,
+            hash,
+            replacement,
+            ..
+        } = &mut *locked;
+        let replacement = *replacement;
         match loaded {
             Ok(Loaded::Fresh(guest)) => {
                 *hash = guest.hash;
@@ -2127,7 +2177,13 @@ fn spawn_load(
                     );
                     return;
                 };
-                if !Arc::ptr_eq(&old.alive, &alive) || old.ticks != ticks || !old.settled() {
+                // A never-valid view may have become usable while bytes
+                // were loading. Recheck at installation before dropping it.
+                let still_eligible = match replacement {
+                    Replacement::Preserve => old.ticks == ticks && old.settled(),
+                    Replacement::RecoverNeverValid => old.can_recover_without_state(),
+                };
+                if !Arc::ptr_eq(&old.alive, &alive) || !still_eligible {
                     log_source(
                         module,
                         fresh.hash.as_ref(),
@@ -2151,7 +2207,11 @@ fn spawn_load(
                         _ => {}
                     });
                 }
-                log_source(module, fresh.hash.as_ref(), "Swapped", generation, "");
+                let reason = match replacement {
+                    Replacement::RecoverNeverValid => "recovered_never_valid_view",
+                    Replacement::Preserve => "",
+                };
+                log_source(module, fresh.hash.as_ref(), "Swapped", generation, reason);
                 *hash = fresh.hash;
                 *slot = Slot::Ready(fresh);
             }
@@ -2392,6 +2452,8 @@ struct Guest {
     /// number it has not rendered.
     frame_rev: u64,
     ticks: u64,
+    /// A later patch gap or trap must not erase evidence of authored state.
+    ever_valid_tree: bool,
     /// The live text of every input in the tree — the host's, not the guest's.
     inputs: Inputs,
     /// Every picture the guest has sent, by hash: the bytes cross once.
@@ -2659,13 +2721,14 @@ impl Guest {
             // the instance in the slot, if the deployment is a new one for
             // it: the replacement is seated only against that very
             // instance at that very tick count
-            let against = {
+            let (against, replacement) = {
                 let locked = mounted.lock().expect("module view lock");
-                match &locked.slot {
+                let against = match &locked.slot {
                     Slot::Ready(old) if old.hash == Some(hash) => return Ok(Loaded::Unchanged),
                     Slot::Ready(old) => Some((old.alive.clone(), old.ticks)),
                     _ => None,
-                }
+                };
+                (against, locked.replacement)
             };
             if against.is_some() {
                 timing.path = "swap";
@@ -2679,8 +2742,11 @@ impl Guest {
                 let mut fresh = Self::instantiate(module, &component, &shown)?;
                 fresh.deployed(hash, assets);
                 match against {
-                    // a view drawn carries its state over
-                    Some((_, ticks)) if ticks > 0 => {
+                    // A once-valid view carries its state over. Only an
+                    // explicitly admitted never-valid recovery may initialize.
+                    Some((_, ticks))
+                        if ticks > 0 && matches!(replacement, Replacement::Preserve) =>
+                    {
                         let snapshot = {
                             let mut locked = mounted.lock().expect("module view lock");
                             let Slot::Ready(old) = &mut locked.slot else {
@@ -2820,6 +2886,12 @@ impl Guest {
                 },
             ),
         );
+    }
+
+    /// A trap or temporary missing tree cannot revoke previously accepted
+    /// authored state. Both recovery admission and installation use this fact.
+    fn can_recover_without_state(&self) -> bool {
+        !self.ever_valid_tree
     }
 
     /// Everything this instance was asked to do is done: nothing pending,
@@ -2992,6 +3064,7 @@ impl Guest {
             frame: wire::Frame::default(),
             frame_rev: 0,
             ticks: 0,
+            ever_valid_tree: false,
             inputs: Inputs::default(),
             pictures: Pictures::default(),
             surfaces: surfaces_of(module),
@@ -3191,6 +3264,7 @@ impl Guest {
                     Ok(true) => {
                         self.frame_rev += 1;
                         if let Some(root) = &mut frame.root {
+                            self.ever_valid_tree = true;
                             self.inputs.adopt(root);
                             self.pictures.adopt(root);
                             // The guest remembers its tree without the
@@ -4583,6 +4657,8 @@ pub(crate) mod tests {
                 hash: None,
                 in_flight: true,
                 wanted: None,
+                waiting_since: None,
+                replacement: Replacement::Preserve,
             }));
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
@@ -5560,6 +5636,250 @@ pub(crate) mod tests {
             // other deployment tests, know nothing of this one
             registry().lock().expect("module views").remove(module);
         }
+    }
+
+    /// A valid view with an admitted event it has not consumed yet.
+    fn drawn_then_stuck(mounted: &Arc<Mutex<Mounted>>) -> u64 {
+        let mut locked = mounted.lock().expect("module view lock");
+        let generation = locked.generation;
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of A");
+        };
+        assert!((0..4).any(|_| !guest.redraw(&register())));
+        assert!(guest.settled(), "{:?}", guest.fault);
+        assert!(guest.ever_valid_tree);
+        guest.pending.push(wire::Event::Resync);
+        assert!(!guest.settled());
+        generation
+    }
+
+    /// The host boundary after a tick returned no valid frame. The actual
+    /// staged instance has not published a tree; its next redraw can recover.
+    fn never_valid_pending(mounted: &Arc<Mutex<Mounted>>) -> u64 {
+        let mut locked = mounted.lock().expect("module view lock");
+        let generation = locked.generation;
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of A");
+        };
+        assert_eq!(guest.ticks, 0);
+        assert!(!guest.ever_valid_tree);
+        assert!(guest.frame.root.is_none());
+        guest.ticks = 1;
+        guest.pending.push(wire::Event::Resync);
+        generation
+    }
+
+    /// A block that finds the seated view busy waits under the generation
+    /// it has: one generation per load, not one per block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_that_waits_on_pending_work_keeps_the_generation() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        for _ in 0..3 {
+            join_all(deployments_checked().await);
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(locked.generation, generation, "no load opened");
+            assert_eq!(locked.hash, Some(a.hash()));
+            assert!(locked.waiting_since.is_some(), "the wait is counted");
+        }
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A view that never drew a usable tree and keeps work pending past
+    /// the wait is replaced without its state; the candidate still proves
+    /// its first tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_without_a_tree_is_replaced_once_its_pending_work_outlives_the_wait() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = never_valid_pending(&mounted);
+        node.deploy("governance", &b);
+        // inside the wait: nothing moves
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        // the wait is over
+        mounted.lock().expect("module view lock").waiting_since =
+            Some(Instant::now() - REPLACEMENT_WAIT);
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["b.svg"],
+            "B replaced the stuck view"
+        );
+        let mut locked = mounted.lock().expect("module view lock");
+        assert_eq!(locked.hash, Some(b.hash()));
+        assert_eq!(
+            locked.generation,
+            generation + 1,
+            "one load, one generation"
+        );
+        assert!(locked.waiting_since.is_none());
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of B");
+        };
+        assert!(guest.frame.root.is_some(), "B proved its first tree");
+        assert!(guest.settled(), "{:?}", guest.fault);
+        drop(locked);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A view that has drawn a tree is never replaced under it: its pending
+    /// work may be a reader's, and it waits however long that takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_that_drew_a_tree_keeps_waiting_past_the_wait() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        join_all(deployments_checked().await);
+        mounted.lock().expect("module view lock").waiting_since =
+            Some(Instant::now() - REPLACEMENT_WAIT * 4);
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["a.svg"], "the drawn view stays");
+        let locked = mounted.lock().expect("module view lock");
+        assert_eq!(
+            (locked.generation, locked.hash),
+            (generation, Some(a.hash()))
+        );
+        drop(locked);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A valid view can temporarily lose its rendered tree during resync,
+    /// or trap after an edit. Neither state authorizes throwing its data away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_once_valid_view_keeps_its_state_after_a_patch_gap_or_terminal_fault() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let b = deployment(&component, "b.svg");
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("A")
+            };
+            guest.frame.root = None;
+            locked.waiting_since = Some(Instant::now() - REPLACEMENT_WAIT * 4);
+        }
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "a temporary patch gap must preserve A"
+        );
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("A")
+            };
+            guest.fault = Some("terminal trap after unsaved edits (test)".into());
+        }
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "a later trap must preserve authored state"
+        );
+        assert_eq!(mounted.lock().unwrap().generation, generation);
+        registry().lock().unwrap().remove("governance");
+    }
+
+    /// Once A starts serving a real tree, an already prepared destructive
+    /// recovery must be rejected at the final seat, even without a new block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_never_valid_view_that_recovers_during_candidate_loading_is_not_discarded() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let b = deployment(&component, "b.svg");
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = never_valid_pending(&mounted);
+        mounted.lock().unwrap().waiting_since = Some(Instant::now() - REPLACEMENT_WAIT);
+        node.deploy("governance", &b);
+        let hold = hold_blob(&node);
+        let loads = deployments_checked().await;
+        node.held.notified().await;
+        drawn_then_stuck(&mounted);
+        hold.notify_one();
+        join_all(loads);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "healthy A must not be reset by stale recovery"
+        );
+        let locked = mounted.lock().unwrap();
+        assert_eq!(locked.generation, generation + 1);
+        assert!(!locked.in_flight);
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("A")
+        };
+        assert!(guest.ever_valid_tree);
+        assert!(
+            !guest.pending.is_empty(),
+            "the admitted work remains owned by A"
+        );
+        drop(locked);
+        registry().lock().unwrap().remove("governance");
     }
 
     /// A deployment that moves while its view is prepared is not installed:
