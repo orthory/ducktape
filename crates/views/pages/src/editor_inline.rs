@@ -21,7 +21,9 @@ pub fn inline_marks(line: &str) -> Vec<(Range<usize>, Inline)> {
         // Only these bytes can open the existing grammar. Skip ordinary prose
         // in one scan instead of retrying every delimiter at every character.
         if !matches!(rest.as_bytes()[0], b'*' | b'_' | b'h') {
-            let Some(next) = rest.find(['*', '_', 'h']) else { break; };
+            let Some(next) = rest.find(['*', '_', 'h']) else {
+                break;
+            };
             at += next;
             continue;
         }

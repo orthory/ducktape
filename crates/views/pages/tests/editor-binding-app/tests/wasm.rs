@@ -86,8 +86,11 @@ impl Guest {
 }
 
 fn markdown(blocks: usize, paragraphs: usize) -> String {
-    let paragraph = "A substantial paragraph keeps its complete source and ordinary body text. ".repeat(paragraphs);
-    let block = format!("## Heading\n- [ ] 한글 paragraph with **bold** and _emphasis_.\n  - Nested text and https://example.com/page\n```\nlet value = 42;\n```\n> Quoted paragraph\n{paragraph}\n");
+    let paragraph = "A substantial paragraph keeps its complete source and ordinary body text. "
+        .repeat(paragraphs);
+    let block = format!(
+        "## Heading\n- [ ] 한글 paragraph with **bold** and _emphasis_.\n  - Nested text and https://example.com/page\n```\nlet value = 42;\n```\n> Quoted paragraph\n{paragraph}\n"
+    );
     format!("A large document\n{}", block.repeat(blocks))
 }
 
@@ -181,7 +184,6 @@ fn a_large_markdown_document_keeps_its_actual_wasm_presentation_within_the_host_
     );
 }
 
-
 #[test]
 fn dense_markdown_keeps_all_bytes_and_undo_in_a_disclosed_plain_editor() {
     use wire::editor_document::*;
@@ -189,57 +191,160 @@ fn dense_markdown_keeps_all_bytes_and_undo_in_a_disclosed_plain_editor() {
     let text = markdown(900, 4);
     assert_eq!(text.len(), 404117);
     let (mut guest, frame) = load(&text);
-    assert!(ui_lang_guest::testing::has_text(&frame,
-        "Formatting is unavailable for this document. Your text and undo history are preserved."));
-    let wire::Node::Editor { document: before, options, on_document, .. } =
-        ui_lang_guest::testing::find(&frame, "PagesEditorFixture/document").unwrap() else { panic!("editor") };
+    assert!(ui_lang_guest::testing::has_text(
+        &frame,
+        "Formatting is unavailable for this document. Your text and undo history are preserved."
+    ));
+    let wire::Node::Editor {
+        document: before,
+        options,
+        on_document,
+        ..
+    } = ui_lang_guest::testing::find(&frame, "PagesEditorFixture/document").unwrap()
+    else {
+        panic!("editor")
+    };
     let before = before.clone();
     let binding = options.binding.as_ref().unwrap().as_ref().clone();
     assert!(options.presentation.as_ref().unwrap().spans.is_empty());
-    assert!(options.presentation.as_ref().unwrap().affordances.hits.is_empty());
+    assert!(
+        options
+            .presentation
+            .as_ref()
+            .unwrap()
+            .affordances
+            .hits
+            .is_empty()
+    );
     let document_handler = *on_document;
-    let id = wire::EditorTransactionId { instance: 1, document: before.document.clone(), reset: before.reset,
-        sequence: 1, attempt: 0, text_revision: before.text_revision, revision: before.revision };
+    let id = wire::EditorTransactionId {
+        instance: 1,
+        document: before.document.clone(),
+        reset: before.reset,
+        sequence: 1,
+        attempt: 0,
+        text_revision: before.text_revision,
+        revision: before.revision,
+    };
     let edited = format!("X{text}");
     let mut after = before.clone();
     after.revision += 1;
     after.text_revision += 1;
     after.byte_len += 1;
     after.cursor.position.column = 1;
-    let frame = guest.frame(vec![wire::Event::EditorTransaction { handler: binding.on_event,
-        event: wire::EditorTransactionEvent::Commit { id: id.clone(), origin: None, before: before.clone(), after: after.clone(),
-            patches: editor_changed_span(&text, &edited).unwrap(), kind: wire::EditorEditKind::Insert,
-            history: wire::EditorHistoryEffect::Native, input_time_ms: 1000 } }]);
+    let frame = guest.frame(vec![wire::Event::EditorTransaction {
+        handler: binding.on_event,
+        event: wire::EditorTransactionEvent::Commit {
+            id: id.clone(),
+            origin: None,
+            before: before.clone(),
+            after: after.clone(),
+            patches: editor_changed_span(&text, &edited).unwrap(),
+            kind: wire::EditorEditKind::Insert,
+            history: wire::EditorHistoryEffect::Native,
+            input_time_ms: 1000,
+        },
+    }]);
     let _ = frame;
-    let key = KeyState { key: Key::Character("z".into()), modified_key: Key::Character("z".into()),
-        physical_key: Physical::Unidentified(NativeCode::Unidentified), location: Location::Standard,
-        modifiers: Modifiers { control: true, ..Default::default() } };
+    let key = KeyState {
+        key: Key::Character("z".into()),
+        modified_key: Key::Character("z".into()),
+        physical_key: Physical::Unidentified(NativeCode::Unidentified),
+        location: Location::Standard,
+        modifiers: Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    };
     let input = wire::EditorRequestInput::Key { key, repeat: false };
-    let request_id = wire::EditorTransactionId { sequence: 2, text_revision: after.text_revision, revision: after.revision, ..id };
-    let frame = guest.frame(vec![wire::Event::EditorRequest { handler: binding.on_request,
-        request: wire::EditorRequest { id: request_id.clone(), state: after.clone(), input: input.clone(), input_time_ms: 2000 } }]);
-    let [response] = frame.editor_decisions.as_slice() else { panic!("one Undo decision") };
-    let wire::EditorDecision::Apply { patches, cursor, history } = &response.decision else { panic!("Undo applies") };
+    let request_id = wire::EditorTransactionId {
+        sequence: 2,
+        text_revision: after.text_revision,
+        revision: after.revision,
+        ..id
+    };
+    let frame = guest.frame(vec![wire::Event::EditorRequest {
+        handler: binding.on_request,
+        request: wire::EditorRequest {
+            id: request_id.clone(),
+            state: after.clone(),
+            input: input.clone(),
+            input_time_ms: 2000,
+        },
+    }]);
+    let [response] = frame.editor_decisions.as_slice() else {
+        panic!("one Undo decision")
+    };
+    let wire::EditorDecision::Apply {
+        patches,
+        cursor,
+        history,
+    } = &response.decision
+    else {
+        panic!("Undo applies")
+    };
     assert_eq!(*history, wire::EditorHistoryEffect::Undo);
-    assert_eq!(wire::editor_transaction::patched_editor_text(&edited, patches, *cursor).unwrap(), text);
-    let restored = EditorDocumentRef { revision: after.revision + 1, text_revision: after.text_revision + 1, ..before };
-    guest.frame(vec![wire::Event::EditorTransaction { handler: binding.on_event,
-        event: wire::EditorTransactionEvent::Commit { id: request_id, origin: Some(input), before: after,
-            after: restored.clone(), patches: patches.clone(), kind: wire::EditorEditKind::GuestPatch,
-            history: *history, input_time_ms: 2000 } }]);
-    let transfer_id = EditorTransferId { instance: 1, document: restored.document.clone(), reset: restored.reset, serial: 99, attempt: 0 };
+    assert_eq!(
+        wire::editor_transaction::patched_editor_text(&edited, patches, *cursor).unwrap(),
+        text
+    );
+    let restored = EditorDocumentRef {
+        revision: after.revision + 1,
+        text_revision: after.text_revision + 1,
+        ..before
+    };
+    guest.frame(vec![wire::Event::EditorTransaction {
+        handler: binding.on_event,
+        event: wire::EditorTransactionEvent::Commit {
+            id: request_id,
+            origin: Some(input),
+            before: after,
+            after: restored.clone(),
+            patches: patches.clone(),
+            kind: wire::EditorEditKind::GuestPatch,
+            history: *history,
+            input_time_ms: 2000,
+        },
+    }]);
+    let transfer_id = EditorTransferId {
+        instance: 1,
+        document: restored.document.clone(),
+        reset: restored.reset,
+        serial: 99,
+        attempt: 0,
+    };
     let mut receiver = EditorTransferReceiver::new(transfer_id.clone(), restored.clone()).unwrap();
-    let mut frame = guest.frame(vec![wire::Event::EditorDocument { handler: document_handler,
-        message: EditorDocumentMessage::Request { id: transfer_id, target: restored } }]);
+    let mut frame = guest.frame(vec![wire::Event::EditorDocument {
+        handler: document_handler,
+        message: EditorDocumentMessage::Request {
+            id: transfer_id,
+            target: restored,
+        },
+    }]);
     let mut actual = None;
     for _ in 0..20 {
         for message in frame.editor_documents {
-            let EditorDocumentMessage::Transfer(transfer) = message else { panic!("source transfer") };
-            if let Some(text) = receiver.receive(&transfer).unwrap() { actual = Some(text); }
+            let EditorDocumentMessage::Transfer(transfer) = message else {
+                panic!("source transfer")
+            };
+            if let Some(text) = receiver.receive(&transfer).unwrap() {
+                actual = Some(text);
+            }
         }
-        if actual.is_some() { break; }
+        if actual.is_some() {
+            break;
+        }
         frame = guest.frame(vec![]);
     }
-    assert_eq!(actual.as_deref(), Some(text.as_str()), "all canonical bytes survive editing and Undo");
-    eprintln!("dense markdown bytes={} max_tick_ms={:.3} max_fuel={}", text.len(), guest.max_tick.as_secs_f64()*1000.0, guest.max_fuel);
+    assert_eq!(
+        actual.as_deref(),
+        Some(text.as_str()),
+        "all canonical bytes survive editing and Undo"
+    );
+    eprintln!(
+        "dense markdown bytes={} max_tick_ms={:.3} max_fuel={}",
+        text.len(),
+        guest.max_tick.as_secs_f64() * 1000.0,
+        guest.max_fuel
+    );
 }
