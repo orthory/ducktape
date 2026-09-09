@@ -190,6 +190,48 @@ on agents_view_event(event)
       run every save_agent(connected_rpc, password, event.detail) -> agent_status_set _ | mutation_failed _
     AgentsIntent.register
       run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
+    // THE EXPLICIT ASSOCIATION. The reader named a participant and a
+    // conversation; the app reads them under this device's key on the network
+    // it is connected to. Empty names close the panel, which is the same read
+    // with nothing to read. Opening always lands at the tail.
+    AgentsIntent.messaging_open
+      messaging_participant = event_text(event, "participant")
+      messaging_conversation = event_text(event, "conversation")
+      messaging_send_error = ""
+      messaging_loading = true
+      run replace lane=messaging_load load_messaging(connected_rpc, network_chain_id, event_text(event, "participant"), event_text(event, "conversation"), 0, true) -> messaging_loaded _
+    AgentsIntent.messaging_page
+      messaging_loading = true
+      run replace lane=messaging_load load_messaging(connected_rpc, network_chain_id, messaging_participant, messaging_conversation, event_int(event, "from_seq"), event_flag(event, "newest")) -> messaging_loaded _
+    // The body crosses EXACTLY as it was written: this handler carries it, it
+    // does not trim, shorten or normalize it. Over-length is refused by the
+    // network, and the panel says so with the draft still in the box.
+    AgentsIntent.messaging_send
+      messaging_sending = true
+      messaging_send_error = ""
+      run every send_agent_message(connected_rpc, network_chain_id, messaging_participant, messaging_conversation, event_text(event, "kind"), event_text(event, "recipient"), event_text(event, "body"), event_int(event, "reply_to"), password) -> messaging_send_done _
+
+// ONE READING, INSTALLED ONLY IN ITS OWN SCOPE. The read carries the endpoint
+// and chain it ran against; a network switch, a participant change or another
+// conversation opened while it was in flight makes it an answer about
+// something else, and it is dropped rather than drawn under the new name.
+on messaging_loaded(next)
+  return if !messaging_in_scope(next, connected_rpc, network_chain_id, messaging_participant, messaging_conversation)
+  messaging = next
+  messaging_loading = false
+
+// A SEND'S OUTCOME, IN THE SCOPE IT HAPPENED IN. A refusal keeps the composer's
+// draft and touches nothing else — nothing is appended to the conversation on
+// the way out, so a message appears when the network says it was admitted and
+// not before.
+on messaging_send_done(outcome)
+  return if !messaging_send_in_scope(outcome, connected_rpc, network_chain_id, messaging_participant, messaging_conversation)
+  messaging_sending = false
+  messaging_send_error = outcome.refusal
+  return if !empty(outcome.refusal)
+  messaging_sent = messaging_sent + 1
+  messaging_loading = true
+  run replace lane=messaging_load load_messaging(connected_rpc, network_chain_id, messaging_participant, messaging_conversation, 0, true) -> messaging_loaded _
 
 // Every committed agent write lands here: pause, resume, save, register. The
 // pause payload is the DESIRED state and it is named for the backend

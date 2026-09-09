@@ -49,6 +49,20 @@ extern crate::backend
   pure bell_detail(item:&BellItem) -> str
   pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str) -> BellData ! AppError
+  // THE AGENT-MESSAGING PANEL. One authenticated reading of ONE conversation,
+  // and one send under the participant's owner credential. Both carry the
+  // endpoint and chain they ran under: neither is installed after the app has
+  // moved to another network, participant or conversation.
+  MessagingSeat(participant:str, role:str, you:bool)
+  MessagingBinding(present:bool, device:str, credential:str, detached:bool)
+  MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
+  MessagingView(rpc:str, network:str, participant:str, conversation:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, answered:bool, visibility:str)
+  MessagingSend(rpc:str, network:str, participant:str, conversation:str, refusal:str)
+  pure messaging_none() -> MessagingView
+  pure messaging_in_scope(view:&MessagingView, rpc:&str, network:&str, participant:&str, conversation:&str) -> bool
+  pure messaging_send_in_scope(send:&MessagingSend, rpc:&str, network:&str, participant:&str, conversation:&str) -> bool
+  load_messaging(rpc:str, network:str, participant:str, conversation:str, from_seq:i64, newest:bool) -> MessagingView
+  send_agent_message(rpc:str, network:str, participant:str, conversation:str, kind:str, recipient:str, body:str, reply_to:i64, password:str) -> MessagingSend
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)

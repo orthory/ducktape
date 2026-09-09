@@ -15,3 +15,17 @@ state
   agents_actions:[str] = []
   // one per committed agent write: the view re-seeds its drafts on the bump
   agents_committed:i64 = 0
+  // THE MESSAGING PANEL. `messaging` is one authenticated reading of ONE
+  // conversation — it carries the endpoint and chain it was read from, and
+  // the handler installs it only while the app is still on both. The pair
+  // beside it is what the panel ASKED for, which is what a late answer is
+  // checked against.
+  messaging:MessagingView = messaging_none()
+  messaging_participant = ""
+  messaging_conversation = ""
+  messaging_loading = false
+  messaging_sending = false
+  // the last send's refusal — the composer keeps its draft under it
+  messaging_send_error = ""
+  // one per admitted send: the panel clears the draft it wrote on the bump
+  messaging_sent:i64 = 0

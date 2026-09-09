@@ -139,6 +139,11 @@ pub fn members_view(
 /// `register` (both the whole draft record as JSON, `AgentDraft`). Every
 /// committed write bumps `committed`, which tells the view its drafts were
 /// consumed.
+/// The messaging panel rides in the same props under `messaging`: the app's
+/// authenticated reading of one conversation, plus the three transient facts
+/// the reading itself cannot carry — a load in flight, a send in flight, and
+/// the last send's refusal. The endpoint the reading came from is deliberately
+/// left behind: the guest draws a conversation and has no business with a URL.
 #[allow(clippy::too_many_arguments)]
 pub fn agents_view(
     dark: bool,
@@ -149,7 +154,20 @@ pub fn agents_view(
     rows: &[crate::backend::AgentRow],
     capabilities: &[String],
     actions: &[String],
+    messaging: &crate::backend::MessagingView,
+    messaging_loading: bool,
+    messaging_sending: bool,
+    messaging_send_error: &str,
+    messaging_sent: i64,
 ) -> Element<'static, ModuleViewEvent> {
+    let mut panel = serde_json::to_value(messaging).expect("the messaging panel encodes");
+    if let Some(panel) = panel.as_object_mut() {
+        panel.remove("rpc");
+        panel.insert("loading".into(), messaging_loading.into());
+        panel.insert("sending".into(), messaging_sending.into());
+        panel.insert("send_error".into(), messaging_send_error.into());
+        panel.insert("sent_seq".into(), messaging_sent.into());
+    }
     let props = serde_json::json!({
         "rows": rows,
         "capabilities": capabilities,
@@ -159,6 +177,7 @@ pub fn agents_view(
         "connected": connected,
         "answered": answered,
         "dark": dark,
+        "messaging": panel,
     });
     module_view("agents", serde_json::to_vec(&props).expect("props encode"))
 }
@@ -167,6 +186,9 @@ pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
         "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
+        "messaging_open" => crate::AgentsIntent::MessagingOpen,
+        "messaging_page" => crate::AgentsIntent::MessagingPage,
+        "messaging_send" => crate::AgentsIntent::MessagingSend,
         _ => crate::AgentsIntent::Status,
     }
 }
@@ -1661,7 +1683,14 @@ fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         "governance" => &["vote", "execute"],
         "members" => &["copy", "agent_status", "propose"],
-        "agents" => &["status", "save", "register"],
+        "agents" => &[
+            "status",
+            "save",
+            "register",
+            "messaging_open",
+            "messaging_page",
+            "messaging_send",
+        ],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
         // `send` is deliberately NOT here: a send crosses only from the
@@ -3249,7 +3278,17 @@ pub(crate) mod tests {
     fn only_declared_intents_are_routed() {
         assert_eq!(intents_of("governance"), ["vote", "execute"]);
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
-        assert_eq!(intents_of("agents"), ["status", "save", "register"]);
+        assert_eq!(
+            intents_of("agents"),
+            [
+                "status",
+                "save",
+                "register",
+                "messaging_open",
+                "messaging_page",
+                "messaging_send",
+            ]
+        );
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(chat.contains(&"choose_channel"));
