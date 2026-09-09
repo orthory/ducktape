@@ -196,6 +196,16 @@ def package_release(binary, modules, revision, ui_revision, output):
     return manifest
 
 
+def archive_network_command(root, archive):
+    network = shlex.quote(root + "/network")
+    archive = shlex.quote(archive)
+    # Siblings on the same filesystem: rename, never copy/delete or overwrite.
+    return (f"test -d {network}; test ! -L {network}; "
+            f"test ! -e {archive}; test ! -L {archive}; "
+            f"mv -T -- {network} {archive}; "
+            f"test -d {archive}; test ! -e {network}")
+
+
 def rollout(args, record):
     if not all([args.binary, args.modules, args.revision, args.ui_revision, args.reason]):
         raise ValueError("rollout requires --binary --modules --revision --ui-revision --reason")
@@ -319,28 +329,33 @@ def execute(args):
     if args.action == "rollout":
         rollout(args, record)
     elif args.action == "reset-network":
-        # The local lane record/evidence are outside every CT's network state.
-        # Write intent before mutation so an interrupted reset remains visible.
+        token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
+        archive = ROOT + "/network-archive-" + token
+        backup = args.record.with_name(args.record.name + ".before-reset-" + token)
+        # Preserve the exact release metadata before clearing the active record.
+        with backup.open("x") as output:
+            output.write(json.dumps(record, indent=2) + "\n")
         event = {"time": datetime.now(timezone.utc).isoformat(),
-                 "action": args.action, "reason": args.reason, "lane": record,
-                 "result": "started"}
+                 "action": args.action, "reason": args.reason,
+                 "record_backup": str(backup.resolve()), "archive": archive,
+                 "lane": json.loads(json.dumps(record)), "result": "started"}
         journal = args.record.with_suffix(".events.jsonl")
-        with journal.open("a") as output:
-            output.write(json.dumps(event, sort_keys=True) + "\n")
+        def log(result, **details):
+            with journal.open("a") as output:
+                output.write(json.dumps({**event, "result": result, **details}, sort_keys=True) + "\n")
+        log("started")
         for node in record["nodes"]:
             remote(args.host, "pct", "exec", node["id"], "--", "systemctl", "stop", SERVICE)
         for node in record["nodes"]:
-            # Fixed path below the owner marker. Never accept a caller-supplied
-            # removal path, and never remove/recreate the containers themselves.
-            remote(args.host, "pct", "exec", node["id"], "--", "rm", "-rf", "--", ROOT + "/network")
-        # Genesis is reconstructed from founding files on each dev-shape boot.
-        # Only a completed reset permits a different founding set next time.
+            remote(args.host, "pct", "exec", node["id"], "--", "sh", "-ec",
+                   archive_network_command(ROOT, archive))
+            log("node_archived", container=node["id"])
+        # Only all three verified renames permit a different founding set.
+        # Partial failures retain the old record and each completed archive path.
         record.pop("release", None)
         record.pop("pending_release", None)
         save_record(args.record, record)
-        event["result"] = "network_data_removed"
-        with journal.open("a") as output:
-            output.write(json.dumps(event, sort_keys=True) + "\n")
+        log("network_data_archived")
     elif args.action == "status":
         for node in record["nodes"]:
             status = remote(args.host, "pct", "exec", node["id"], "--",
