@@ -1091,10 +1091,10 @@ subscribe
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
-  // The page document's autosave: the editor's edits never pass through a
-  // handler, so the gate IS the dirty test — the tick only exists while the
-  // buffer has drifted from the last text known written.
-  every 900ms when (connected && !empty(active_page) && page_text != page_saved_text) -> page_autosave_tick
+  // Poll the hydrated page even while the app mirror looks clean: a guest
+  // replacement may preserve edits whose old-instance notification is refused.
+  // The handler reads the canonical document before its dirty/no-op check.
+  every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick
 
 // CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
 // This unregisters the slot the closed window held; on a Mac the daemon goes

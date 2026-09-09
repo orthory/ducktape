@@ -1,14 +1,7 @@
-//! THE PAGE AUTOSAVE GATE'S COST AT REST.
-//!
-//! iced re-evaluates `subscription()` after EVERY update batch, so the
-//! `when` gate on `page_autosave_tick` runs on every keystroke, wheel tick,
-//! `wall_tick` and live push anywhere in the app while a page is open. The
-//! gate compares the buffer's text to the saved baseline; reading that text
-//! must be a borrow of the buffer, never a clone of it — iced's
-//! `Content::clone` is `with_text(&self.text())`, a full cosmic-text re-shape
-//! of the whole document under the global font-system write lock.
-//!
-//! Allocations are asserted; wall-clock is printed only (it measures the box).
+//! Evaluating the active-page timer must not scan, clone, or reshape the
+//! document on every unrelated update. Canonical reconciliation and the dirty
+//! check happen in the timer handler, including when the app mirror is clean.
+//! Allocations are asserted; wall-clock is diagnostic only.
 
 use std::time::Instant;
 
@@ -16,19 +9,11 @@ use super::*;
 
 const LINES: usize = 2_000;
 const SAMPLES: usize = 5;
-/// Measured 2026-08-23 at 2,000 lines, debug build: **2,043** allocations and
-/// ~190 us with the gate reading `editor_text(page_editor)` — one allocation a
-/// line is iced's own `Content::text()` (each `Line` is `Cow::Owned` across the
-/// `RefCell` borrow), the floor for reading the buffer at all. The pre-fix
-/// `page_text(page_editor)` extern took the editor BY VALUE, so the gate
-/// cloned the `Content` first: **104,084** allocations and ~400 ms per
-/// evaluation — on every update batch while a page was open. Two allocations
-/// a line leaves room for the join's growth and the batch; the clone sits
-/// 26x over this ceiling and 51x over the measured floor.
+/// Keep the existing generous ceiling to catch accidental document shaping.
 const GATE_ALLOCATION_CEILING: u64 = 2 * LINES as u64;
 
 #[test]
-fn page_autosave_gate_borrows_the_open_page_instead_of_reshaping_it() {
+fn page_autosave_gate_does_not_scan_or_reshape_the_open_document() {
     let mut app = reading_alpha();
     let lines: Vec<String> = std::iter::once("Alpha".to_owned())
         .chain((0..LINES).map(|index| {

@@ -5973,7 +5973,66 @@ pub(crate) mod tests {
             "refusal replaced the source despite newer canonical typing"
         );
         let mut polled_app = make_app();
-        let _ = polled_app.__update(crate::__DucktapeMessage::PageAutosaveTick);
+        assert_eq!(polled_app.page_text, polled_app.page_saved_text);
+        let recipe_ids = |app: &crate::Ducktape| {
+            use iced_test::runtime::futures::subscription;
+            use std::hash::Hasher as _;
+            let mut ids: Vec<_> = subscription::into_recipes(app.__subscription())
+                .into_iter()
+                .map(|recipe| {
+                    let mut hash = subscription::Hasher::default();
+                    recipe.hash(&mut hash);
+                    hash.finish()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let clean_recipes = recipe_ids(&polled_app);
+        polled_app.page_saved_text.push('!');
+        assert_eq!(
+            clean_recipes,
+            recipe_ids(&polled_app),
+            "clean app mirror removed the canonical reconciliation timer"
+        );
+        polled_app.page_saved_text.pop();
+        // Exercise the real subscription: a direct handler call would hide a
+        // dirty-mirror gate that never polls this preserved canonical edit.
+        let tick = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use iced_test::runtime::futures::{futures::StreamExt, subscription};
+                let streams = subscription::into_recipes(polled_app.__subscription())
+                    .into_iter()
+                    .map(|recipe| {
+                        // Test builds drive `every` from redraw time, not wall time.
+                        let event = subscription::Event::Interaction {
+                            window: iced::window::Id::unique(),
+                            event: iced::Event::Window(iced::window::Event::RedrawRequested(
+                                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                            )),
+                            status: iced::event::Status::Ignored,
+                        };
+                        recipe.stream(Box::pin(
+                            iced_test::runtime::futures::futures::stream::iter([event]),
+                        ))
+                    });
+                let mut messages =
+                    iced_test::runtime::futures::futures::stream::select_all(streams);
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while let Some(message) = messages.next().await {
+                        if matches!(message, crate::__DucktapeMessage::PageAutosaveTick) {
+                            return message;
+                        }
+                    }
+                    panic!("the active page subscription ended before autosave");
+                })
+                .await
+                .expect("clean mirror prevented the real autosave subscription from polling")
+            });
+        let _ = polled_app.__update(tick);
         assert_eq!(
             polled_app.page_text, expected,
             "restored edit never reached autosave without another key"
