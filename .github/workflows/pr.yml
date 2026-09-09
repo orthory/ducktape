@@ -204,9 +204,17 @@ jobs:
   # here, natively — the wasm bundle itself is `make views`, a build step.
   module-views:
     needs: scope
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require a successful scope decision
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          FULL_SUITE: ${{ needs.scope.outputs.full }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          test "$FULL_SUITE" = true || test "$FULL_SUITE" = false
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
