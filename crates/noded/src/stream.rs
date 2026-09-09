@@ -1190,7 +1190,13 @@ impl TopicState {
     }
 }
 
-pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
+/// Serve one ws connection.
+///
+/// `reader_of` is the ONE capability this socket may have been given before it
+/// existed: the dispatch id whose output ring the caller proved it created
+/// ([`admit_run_reader`]). It is set at the upgrade and never changes, so a
+/// connection cannot talk its way into another run's output mid-session.
+pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle, reader_of: Option<String>) {
     let hub = handle.stream_hub();
     let mut block_rx = hub.subscribe_blocks();
     let mut log_rx = hub.log_ring().subscribe();
@@ -1264,7 +1270,8 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                                 handle_agent_event(&handle, attached.is_some(), event);
                             }
                             Ok(msg) => {
-                                let frames = handle_client_msg(&handle, &mut topics, msg);
+                                let frames =
+                                    handle_client_msg(&handle, &mut topics, reader_of.as_deref(), msg);
                                 if !send_frames(&mut socket, frames).await {
                                     return;
                                 }
@@ -1495,6 +1502,7 @@ fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service:
 fn handle_client_msg(
     handle: &NodeHandle,
     topics: &mut BTreeMap<String, TopicState>,
+    reader_of: Option<&str>,
     msg: ClientMsg,
 ) -> Vec<ServerFrame> {
     match msg {
@@ -1502,7 +1510,14 @@ fn handle_client_msg(
             topics: requested,
             resume,
             token,
-        } => subscribe_topics(handle, topics, requested, &resume, token.as_deref()),
+        } => subscribe_topics(
+            handle,
+            topics,
+            requested,
+            &resume,
+            token.as_deref(),
+            reader_of,
+        ),
         ClientMsg::Unsubscribe { topics: requested } => {
             for topic in requested {
                 topics.remove(&topic);
@@ -1808,6 +1823,7 @@ fn subscribe_topics(
     requested: Vec<String>,
     resume: &BTreeMap<String, String>,
     token: Option<&str>,
+    reader_of: Option<&str>,
 ) -> Vec<ServerFrame> {
     // No caller ever legitimately needs more names in ONE message than the
     // connection may ever hold: at most `MAX_TOPICS_PER_CONNECTION` states
@@ -1846,6 +1862,7 @@ fn subscribe_topics(
         match prepare_topic(
             &topic,
             holds_workspace_secret,
+            reader_of,
             resume.get(&topic),
             store.as_ref(),
         ) {
@@ -1937,17 +1954,26 @@ enum Topic<'a> {
 
 /// what a caller must have proved to hold a topic handle.
 ///
-/// Two values and no more: the ws surface has exactly one piece of evidence
-/// about a caller — whether it can read this node's workspace — so a richer
-/// lattice would be names without a mechanism behind them.
+/// Every value here has a MECHANISM behind it — a name without one would be a
+/// lattice pretending to be a gate. The ws surface has two pieces of evidence
+/// about a caller: whether it can read this node's workspace, and, for a run's
+/// output only, whether it signed the upgrade as that run's creator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+enum Admission<'a> {
     /// nothing. The same bytes already leave this node over an HTTP route with
     /// no gate on it, so a check here would refuse an honest client and stop
     /// nobody.
     Public,
     /// this node's own 0600 workspace secret ([`crate::services::LINK_TOKEN_FILE`]).
     Workspace,
+    /// ONE run's output ring: the workspace secret, or an upgrade signed by the
+    /// key that CREATED this dispatch (`?run=<id>`, admitted in
+    /// [`admit_run_reader`] before the socket exists).
+    ///
+    /// The id is carried in the value, not checked against a flag, because the
+    /// capability names one dispatch: a connection admitted for one run must not
+    /// read another's, and a `bool` could not say which.
+    Run(&'a str),
 }
 
 impl<'a> Topic<'a> {
@@ -1996,7 +2022,12 @@ impl<'a> Topic<'a> {
     /// The gated three all carry provider/member bytes with no unauthenticated
     /// HTTP twin at all: a pty's raw output, the command log whose `text`
     /// `crate::term` documents as able to carry secrets, and a run's stdout.
-    fn admission(&self) -> Admission {
+    ///
+    /// A run's stdout is the one of those three a caller can reach WITHOUT the
+    /// workspace, and only for a run it created: a remote app is the device that
+    /// asked for the run, and refusing it the progress of its own work made the
+    /// feature local-only. It is still not public — see [`Admission::Run`].
+    fn admission(self) -> Admission<'a> {
         match self {
             Self::Module(_) => Admission::Public,
             Self::FilesWatch => Admission::Public,
@@ -2004,7 +2035,7 @@ impl<'a> Topic<'a> {
             Self::Metrics => Admission::Public,
             Self::Peers => Admission::Public,
             Self::Status => Admission::Public,
-            Self::RunOutput(_) => Admission::Workspace,
+            Self::RunOutput(id) => Admission::Run(id),
             Self::TermCommand(_) => Admission::Workspace,
             Self::Term(_) => Admission::Workspace,
         }
@@ -2026,6 +2057,12 @@ enum TopicRefusal {
     UnknownModule,
     /// the family is workspace-gated and no matching secret was presented.
     NotAdmitted,
+    /// a run's output ring, asked for by a connection that neither holds the
+    /// workspace nor was admitted as this run's creator. Its own token because
+    /// it sends the caller somewhere else entirely — sign the upgrade — and a
+    /// count of these is a count of remote readers reaching for runs that are
+    /// not theirs.
+    NotThisRunsReader,
 }
 
 impl TopicRefusal {
@@ -2035,13 +2072,14 @@ impl TopicRefusal {
             Self::UnknownFamily => "unknown_topic",
             Self::UnknownModule => "unknown_module",
             Self::NotAdmitted => "topic_not_admitted",
+            Self::NotThisRunsReader => "not_this_runs_reader",
         }
     }
 
     fn code(self) -> StreamErrorCode {
         match self {
             Self::UnknownFamily | Self::UnknownModule => StreamErrorCode::UnknownTopic,
-            Self::NotAdmitted => StreamErrorCode::Forbidden,
+            Self::NotAdmitted | Self::NotThisRunsReader => StreamErrorCode::Forbidden,
         }
     }
 
@@ -2058,6 +2096,11 @@ impl TopicRefusal {
             Self::NotAdmitted => {
                 "this topic requires the node's service-link token — read it from \
                  the workspace and send it as `token` on the subscribe"
+            }
+            Self::NotThisRunsReader => {
+                "a run's output is for the device that hosts this node or the key \
+                 that created the run — present the service-link token, or open \
+                 the socket as `/v1/ws?run=<dispatch>` signed by that key"
             }
         }
     }
@@ -2084,6 +2127,94 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
     }
 }
 
+/// Is `requester` the key that signed this upgrade?
+///
+/// A chat run is created by a SIGNED FRAME the app submits, so the committed
+/// run's `requester` is `Origin::External(<that key>)` — the same bytes
+/// [`crate::signed_req::verify_signed_request`] hands back. The two are compared
+/// directly: no account lookup stands between them, and no authority is
+/// invented. The device that asked for the work may watch it.
+///
+/// NARROWER THAN CANCELLING ON PURPOSE. `runs`'s own rule
+/// (`admin.rs::controlled_dispatch_id`) also lets the agent's program controller
+/// stop a run; that arm needs an in-module `control_model` read this node cannot
+/// make, so it is left out. Leaving it out refuses a reader who could have been
+/// admitted; it admits nobody who could not.
+fn created_by(requester: &sdk::Origin, key: &[u8]) -> bool {
+    matches!(requester, sdk::Origin::External(id) if id == key)
+}
+
+/// Admit a `/v1/ws?run=<dispatch>` upgrade as that run's creator, or answer the
+/// refusal to send instead.
+///
+/// Two steps, in this order, because the cheap one is the one that must not be
+/// skipped: the signature over `GET` + this exact path+query + an empty body
+/// (the data-plane trio, carried as headers so the proof never enters a query
+/// string or a log), then ONE committed `runs` read asking whether the key that
+/// signed it created this dispatch.
+///
+/// Decided BEFORE the socket exists, which is what keeps
+/// [`subscribe_topics`] synchronous: the committed read happens once per
+/// connection, never per subscribe frame.
+pub(crate) async fn admit_run_reader(
+    handle: &NodeHandle,
+    dispatch: &str,
+    headers: &axum::http::HeaderMap,
+    path_and_query: &str,
+) -> Result<(), axum::response::Response> {
+    let key = crate::signed_req::verify_signed_request(
+        handle,
+        &axum::http::Method::GET,
+        path_and_query,
+        headers,
+        b"",
+    )
+    .map_err(|refusal| crate::signed_req::refuse(path_and_query, refusal))?;
+    let pending = pending_runs(handle).await.map_err(|reason| {
+        crate::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &reason)
+    })?;
+    let created = pending
+        .iter()
+        .find(|run| run.dispatch_id == dispatch)
+        .is_some_and(|run| created_by(&run.requester, &key));
+    if !created {
+        // the same sentence the topic refusal carries, for the same reason: it
+        // names what to present and never what this node holds. A run that has
+        // already settled is indistinguishable from one that was never this
+        // caller's — both are "not yours to read", and saying which would
+        // answer a probe about runs the caller may not see.
+        tracing::debug!(
+            target: "ducktape::stream",
+            event = "run_output_upgrade_refused",
+            reason = TopicRefusal::NotThisRunsReader.reason(),
+            "refused a run-output upgrade"
+        );
+        return Err(crate::error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            TopicRefusal::NotThisRunsReader.detail(),
+        ));
+    }
+    Ok(())
+}
+
+/// every run `runs` has pending, as committed state.
+async fn pending_runs(handle: &NodeHandle) -> Result<Vec<runs::PendingRun>, String> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    handle
+        .send(crate::NodeCommand::Query {
+            target: "runs".to_string(),
+            req: runs::encode_query(&runs::RunsQuery::PendingRuns),
+            reply,
+        })
+        .await
+        .map_err(|_| "actor gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "reply dropped".to_string())??;
+    match runs::decode_reply(&bytes)? {
+        runs::RunsReply::PendingRuns(runs) => Ok(runs),
+        _ => Err("unexpected runs reply".to_string()),
+    }
+}
+
 /// Decide one requested topic: admit it (with its start cursor) or refuse it.
 ///
 /// A decide-fn as far as STATE goes — it inserts no handle, mutates nothing, and
@@ -2091,12 +2222,14 @@ fn refuse_topic(topic: &str, refusal: TopicRefusal) -> ServerFrame {
 /// one `debug` line, deliberately kept beside the decision so a refusal cannot
 /// be returned without being counted.
 ///
-/// `holds_workspace_secret` is the connection's ONE proved fact, compared once
-/// per subscribe frame by [`subscribe_topics`].
+/// `holds_workspace_secret` is the connection-wide secret compare, made once per
+/// subscribe frame by [`subscribe_topics`]; `reader_of` is the one dispatch this
+/// connection proved at its upgrade ([`admit_run_reader`]).
 #[allow(clippy::result_large_err)]
 fn prepare_topic(
     topic: &str,
     holds_workspace_secret: bool,
+    reader_of: Option<&str>,
     resume: Option<&String>,
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
@@ -2106,9 +2239,14 @@ fn prepare_topic(
     let admitted = match family.admission() {
         Admission::Public => true,
         Admission::Workspace => holds_workspace_secret,
+        Admission::Run(id) => holds_workspace_secret || reader_of == Some(id),
     };
     if !admitted {
-        return Err(refuse_topic(topic, TopicRefusal::NotAdmitted));
+        let refusal = match family {
+            Topic::RunOutput(_) => TopicRefusal::NotThisRunsReader,
+            _ => TopicRefusal::NotAdmitted,
+        };
+        return Err(refuse_topic(topic, refusal));
     }
     match family {
         Topic::Module(module) => prepare_module(topic, module, resume, store),
@@ -2979,6 +3117,9 @@ mod tests {
     const NO_SECRET: bool = false;
     /// a caller whose presented secret matched.
     const HOLDS_SECRET: bool = true;
+    /// a connection admitted as no run's creator — every caller but a remote
+    /// app watching a run it asked for.
+    const NO_RUN: Option<&str> = None;
     /// the workspace secret a test node mints.
     const TEST_SECRET: &str = "d3adb33fd3adb33fd3adb33fd3adb33f";
 
@@ -3151,7 +3292,7 @@ mod tests {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1})]);
         let (state, lagged) =
-            prepare_topic("module:chat", NO_SECRET, None, Some(&store)).expect("topic");
+            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, Some(&store)).expect("topic");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "op/0000000000000001/ffffffff");
         let mut state = state;
@@ -3171,6 +3312,7 @@ mod tests {
         let (state, lagged) = prepare_topic(
             "module:chat",
             NO_SECRET,
+            NO_RUN,
             Some(&"op/0000000000000005/00000000".to_string()),
             Some(&store),
         )
@@ -3184,7 +3326,7 @@ mod tests {
     #[test]
     fn topic_refusals_are_per_topic() {
         assert!(matches!(
-            prepare_topic("module:chat", NO_SECRET, None, None),
+            prepare_topic("module:chat", NO_SECRET, NO_RUN, None, None),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::Unavailable,
                 ..
@@ -3192,7 +3334,7 @@ mod tests {
         ));
         let (_dir, store) = temp_store(&["chat"]);
         assert!(matches!(
-            prepare_topic("module:nope", NO_SECRET, None, Some(&store)),
+            prepare_topic("module:nope", NO_SECRET, NO_RUN, None, Some(&store)),
             Err(ServerFrame::Error {
                 code: StreamErrorCode::UnknownTopic,
                 ..
@@ -3202,6 +3344,7 @@ mod tests {
             prepare_topic(
                 "logs",
                 NO_SECRET,
+                NO_RUN,
                 Some(&"not-a-seq".to_string()),
                 Some(&store)
             ),
@@ -3411,8 +3554,8 @@ mod tests {
     fn term_topic_subscribes_and_replays_as_event_tagged_chunks() {
         // any session id subscribes (the manager gates who may CREATE one);
         // a fresh subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) =
-            prepare_topic("term:abc", HOLDS_SECRET, None, None).expect("term topic subscribes");
+        let (state, lagged) = prepare_topic("term:abc", HOLDS_SECRET, NO_RUN, None, None)
+            .expect("term topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
 
@@ -3452,7 +3595,7 @@ mod tests {
     fn term_command_topic_subscribes_and_replays_the_ordered_attributed_log() {
         // any session id subscribes to its command log (like `term:`); a fresh
         // subscribe starts at cursor 0 and needs no index store.
-        let (state, lagged) = prepare_topic("term-cmd:abc", HOLDS_SECRET, None, None)
+        let (state, lagged) = prepare_topic("term-cmd:abc", HOLDS_SECRET, NO_RUN, None, None)
             .expect("term-cmd topic subscribes");
         assert!(lagged.is_none());
         assert_eq!(state.cursor(), "0");
@@ -3605,7 +3748,9 @@ mod tests {
             // `GET /v1/peers`, which this change does not touch.
             (Topic::Peers, Admission::Public),
             (Topic::Status, Admission::Public),
-            (Topic::RunOutput("r1"), Admission::Workspace),
+            // the workspace secret OR this run's creator, and the id travels
+            // with the decision so one run's reader is not every run's.
+            (Topic::RunOutput("r1"), Admission::Run("r1")),
             (Topic::TermCommand("s1"), Admission::Workspace),
             (Topic::Term("s1"), Admission::Workspace),
         ];
@@ -3631,7 +3776,7 @@ mod tests {
         for unknown in ["", "term", "logs2", "modules:chat", "files:watch2"] {
             assert_eq!(Topic::parse(unknown), None, "{unknown:?} owns no family");
             assert!(matches!(
-                prepare_topic(unknown, HOLDS_SECRET, None, None),
+                prepare_topic(unknown, HOLDS_SECRET, NO_RUN, None, None),
                 Err(ServerFrame::Error {
                     code: StreamErrorCode::UnknownTopic,
                     ..
@@ -3645,7 +3790,7 @@ mod tests {
     fn gated_families_refuse_a_caller_with_no_workspace_secret() {
         for gated in ["term:s1", "term-cmd:s1", "run-output:r1"] {
             let Err(ServerFrame::Error { code, detail, .. }) =
-                prepare_topic(gated, NO_SECRET, None, None)
+                prepare_topic(gated, NO_SECRET, NO_RUN, None, None)
             else {
                 panic!("{gated} must refuse a caller with no workspace secret");
             };
@@ -3660,11 +3805,171 @@ mod tests {
                 "a refusal must never carry the secret: {detail}"
             );
             // and it admits the same caller once the secret matches.
-            assert!(prepare_topic(gated, HOLDS_SECRET, None, None).is_ok());
+            assert!(prepare_topic(gated, HOLDS_SECRET, NO_RUN, None, None).is_ok());
         }
         // the public families need nothing, on the same call.
-        assert!(prepare_topic("logs", NO_SECRET, None, None).is_ok());
-        assert!(prepare_topic("metrics", NO_SECRET, None, None).is_ok());
+        assert!(prepare_topic("logs", NO_SECRET, NO_RUN, None, None).is_ok());
+        assert!(prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).is_ok());
+    }
+
+    /// THE AUTHORITY RULE, stated over every origin a run can have.
+    ///
+    /// Only an external submitter — a device holding a key — can prove itself
+    /// over a signed upgrade at all. A run a program or the system created has no
+    /// key behind it, so no signature admits one, whatever it signs with.
+    #[test]
+    fn only_the_external_key_that_created_a_run_is_its_reader() {
+        let key = [7u8; 32];
+        assert!(created_by(&sdk::Origin::External(key.to_vec()), &key));
+        assert!(!created_by(&sdk::Origin::External(vec![9u8; 32]), &key));
+        assert!(!created_by(&sdk::Origin::External(Vec::new()), &key));
+        // a truncated prefix of the right key is a different key.
+        assert!(!created_by(
+            &sdk::Origin::External(key[..16].to_vec()),
+            &key
+        ));
+        assert!(!created_by(&sdk::Origin::Program(7), &key));
+        assert!(!created_by(&sdk::Origin::Module("runs".into()), &key));
+        assert!(!created_by(&sdk::Origin::System, &key));
+    }
+
+    /// THE WHOLE REMOTE ADMISSION, END TO END: a real signature over the real
+    /// path, against the committed pending set a real node would answer with.
+    ///
+    /// Four callers, one run. The creator is admitted. Another key, holding a
+    /// signature every bit as valid, is not — which is the point: the proof says
+    /// WHO, and the committed state says whether that who asked for this work. A
+    /// caller with no signature at all never reaches the read, and a dispatch the
+    /// pending set does not name is refused without saying so (a run that settled
+    /// and a run that was never yours are the same answer, or the refusal becomes
+    /// a probe).
+    #[tokio::test]
+    async fn only_the_key_that_created_a_run_is_admitted_to_its_output() {
+        use commonware_cryptography::Signer as _;
+        let creator = commonware_cryptography::ed25519::PrivateKey::from_seed(11);
+        let stranger = commonware_cryptography::ed25519::PrivateKey::from_seed(12);
+        let node_key = vec![0xab; 32];
+        let dispatch = "d".repeat(64);
+
+        let (mut handle, mut commands, _hub) = crate::NodeHandle::channel();
+        handle.admin.node_key = Some(node_key.clone());
+        // the committed answer, as `runs` would give it: one pending run, created
+        // by `creator`.
+        let pending = runs::PendingRun {
+            run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
+            dispatch_id: dispatch.clone(),
+            agent_id: "agent-1".into(),
+            channel_id: "channel-a".into(),
+            anchor_seq: 2,
+            thread_root: None,
+            job_id: None,
+            job_claim_height: 0,
+            requester: sdk::Origin::External(creator.public_key().as_ref().to_vec()),
+            created_at: 0,
+        };
+        let answers = tokio::spawn(async move {
+            while let Some(command) = commands.next().await {
+                let crate::NodeCommand::Query { reply, .. } = command else {
+                    continue;
+                };
+                let _ = reply.send(Ok(runs::encode_reply(&runs::RunsReply::PendingRuns(vec![
+                    pending.clone(),
+                ]))));
+            }
+        });
+
+        let path = format!("/v1/ws?run={dispatch}");
+        let signed = |signer: &commonware_cryptography::ed25519::PrivateKey, path: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            for (name, value) in
+                ::node::signed_req::request_headers(signer, "GET", path, &node_key, b"")
+            {
+                headers.insert(name, value.parse().expect("a header value"));
+            }
+            headers
+        };
+
+        assert!(
+            admit_run_reader(&handle, &dispatch, &signed(&creator, &path), &path)
+                .await
+                .is_ok(),
+            "the key that created the run must be admitted to its output"
+        );
+        for (who, headers, path) in [
+            (
+                "a stranger's valid signature",
+                signed(&stranger, &path),
+                path.clone(),
+            ),
+            (
+                "no signature at all",
+                axum::http::HeaderMap::new(),
+                path.clone(),
+            ),
+            (
+                // the signature covers the path it was minted for, so asking for
+                // another run with it fails the verify, not the authority read.
+                "a signature minted for another run",
+                signed(&creator, "/v1/ws?run=elsewhere"),
+                path.clone(),
+            ),
+        ] {
+            assert!(
+                admit_run_reader(&handle, &dispatch, &headers, &path)
+                    .await
+                    .is_err(),
+                "{who} must be refused"
+            );
+        }
+        // and the creator's own proof does not reach a run the pending set does
+        // not name.
+        let other = "e".repeat(64);
+        let other_path = format!("/v1/ws?run={other}");
+        assert!(
+            admit_run_reader(&handle, &other, &signed(&creator, &other_path), &other_path)
+                .await
+                .is_err(),
+            "a dispatch this node holds no pending run for must be refused"
+        );
+        drop(handle);
+        answers.abort();
+    }
+
+    /// A RUN'S CREATOR READS ITS OWN RUN, AND NOTHING ELSE.
+    ///
+    /// The capability admitted at the upgrade names ONE dispatch. So a remote
+    /// app watching the run it asked for needs no workspace secret — and the
+    /// same connection asking for a second run, or for a pty, is refused exactly
+    /// as a stranger would be. A `bool` here would have handed the first remote
+    /// reader every run on the node.
+    #[test]
+    fn a_runs_creator_reads_that_run_and_no_other_gated_topic() {
+        let mine = Some("dispatch-a");
+        assert!(
+            prepare_topic("run-output:dispatch-a", NO_SECRET, mine, None, None).is_ok(),
+            "the run this connection proved must admit"
+        );
+        for someone_elses in [
+            "run-output:dispatch-b",
+            "run-output:",
+            "term:dispatch-a",
+            "term-cmd:dispatch-a",
+        ] {
+            let Err(ServerFrame::Error { code, .. }) =
+                prepare_topic(someone_elses, NO_SECRET, mine, None, None)
+            else {
+                panic!("{someone_elses} must refuse a connection admitted for dispatch-a");
+            };
+            assert_eq!(code, StreamErrorCode::Forbidden, "{someone_elses}");
+        }
+        // and the refusal sends a remote reader to the proof it can actually
+        // make, rather than to a workspace directory it does not have.
+        let Err(ServerFrame::Error { detail, .. }) =
+            prepare_topic("run-output:dispatch-b", NO_SECRET, mine, None, None)
+        else {
+            unreachable!("refused above");
+        };
+        assert!(detail.contains("?run="), "{detail}");
     }
 
     /// A wrong secret is exactly as good as no secret — the compare is the gate,
@@ -3680,6 +3985,7 @@ mod tests {
                 vec!["term:s1".into()],
                 &BTreeMap::new(),
                 presented,
+                NO_RUN,
             );
             assert!(states.is_empty(), "presented {presented:?} admitted a pty");
         }
@@ -3692,6 +3998,7 @@ mod tests {
             vec!["term:s1".into()],
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert!(states.is_empty(), "a node with no plane admits nobody");
 
@@ -3721,6 +4028,7 @@ mod tests {
                 vec!["term:s1".into()],
                 &BTreeMap::new(),
                 Some(presented),
+                NO_RUN,
             );
             assert!(
                 states.is_empty(),
@@ -3815,6 +4123,7 @@ mod tests {
             vec![crate::term::topic(session)],
             &BTreeMap::new(),
             None,
+            NO_RUN,
         );
         let mut admitted = BTreeMap::new();
         subscribe_topics(
@@ -3823,6 +4132,7 @@ mod tests {
             vec![crate::term::topic(session)],
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         (unadmitted, admitted, refusals)
     }
@@ -3913,6 +4223,7 @@ mod tests {
             at_cap.clone(),
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
         assert!(
@@ -3933,6 +4244,7 @@ mod tests {
             over,
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert_eq!(refused.len(), 1, "one summary refusal, not one per topic");
         assert!(matches!(
@@ -3952,6 +4264,7 @@ mod tests {
             at_cap,
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert!(
             again
@@ -3979,6 +4292,7 @@ mod tests {
             huge,
             &BTreeMap::new(),
             Some(TEST_SECRET),
+            NO_RUN,
         );
         assert_eq!(
             frames.len(),
@@ -4046,6 +4360,7 @@ mod tests {
         let (state, lagged) = prepare_topic(
             "metrics",
             NO_SECRET,
+            NO_RUN,
             Some(&"1752000000000".to_string()),
             None,
         )
@@ -4062,7 +4377,8 @@ mod tests {
         handle
             .status_cell()
             .wire_exposition(|| "ducktape_blocks_total 5\n".to_string());
-        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -4111,7 +4427,7 @@ mod tests {
                 builds: Default::default(),
             });
 
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(!result.drop_topic);
         match &result.frames[..] {
@@ -4200,7 +4516,7 @@ mod tests {
     #[tokio::test]
     async fn peers_catch_up_drops_the_topic_when_no_exposition_is_wired() {
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) = prepare_topic("peers", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_peers("peers", &mut state, &handle).await;
         assert!(result.drop_topic, "an unanswerable topic must be dropped");
         assert!(matches!(
@@ -4272,7 +4588,8 @@ mod tests {
         // no exposition source (an embedder that registers no metrics) — the
         // topic drops with the same `unavailable` shape the http 503 carries.
         let (handle, _cmds, _hub) = crate::NodeHandle::channel();
-        let (mut state, _) = prepare_topic("metrics", NO_SECRET, None, None).expect("topic");
+        let (mut state, _) =
+            prepare_topic("metrics", NO_SECRET, NO_RUN, None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(result.drop_topic);
         assert!(matches!(

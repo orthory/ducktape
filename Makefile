@@ -187,7 +187,7 @@ views: ice-tool $(WASM_TOOLS_BIN)
 
 ## rebuild the committed view sources in two isolated roots and compare bytes
 views-repro-check: ice-tool $(WASM_TOOLS_BIN)
-	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
+	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)" "$(ICE_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
@@ -365,7 +365,8 @@ test: wasm-modules-check wasm-embed-check
 BUILDER_MODULES := \
   crates/examples/directory \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
-  crates/modules/apps/automations crates/modules/apps/runs \
+  crates/modules/apps/automations crates/modules/apps/collaboration \
+  crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
   crates/modules/apps/forge \
   crates/modules/system/attribution crates/modules/system/dispatch \

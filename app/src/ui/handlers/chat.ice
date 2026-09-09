@@ -790,6 +790,29 @@ on channel_created(next)
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
 
+// EVERY PENDING RUN THIS NODE HOLDS, not this room's. Which of them reach the
+// screen is decided once, in `encode_chat_props`, against the room on screen
+// when the frame is built — so no handler that moves `active_channel` owes this
+// lane anything, and none of them can forget.
+//
+// THE CONNECTION IS THE ONE THING THE FOLD STILL HAS TO ASK. Room ids are not
+// unique across networks, so `general` on the connection she left would
+// otherwise have drawn its runs under `general` on the one she is on — and the
+// endpoint alone does not settle it, because a workspace switch brings the node
+// back on the same port (see `live_resynced`'s `chain_left_behind`).
+//
+// REFUSED, NOT ASSIGNED. The guard is a `return`, like every other generation
+// guard in this file, because a stale reading's emptiness is not a fact about
+// the connection she IS on: folding it in would have blanked the cards the
+// current reading installed a moment ago, until the next two-second poll put
+// them back.
+on live_agents_event(next)
+  return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)
+  live_agents = next.rows
+
+on live_cancel_acked(_ok)
+  error = ""
+
 on chat_acked(_result)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
   selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, true)
@@ -1345,16 +1368,20 @@ on thread_reply_sent(next)
 // `MessageCard`) — a drag that followed the cursor from row to row would need
 // an enter route and a full rebuild per row crossed, which is the per-hover
 // round trip `DiffRow` refuses by name. So the gesture is the one every
-// desktop list already answers: click an end, shift-click the other.
+// desktop list already answers: shift-click an end, then shift-click the other.
 // ============================================================================
 
-// A press on a message's prose, in either surface. Plain, it starts a
-// one-message range here; with ⇧ held it keeps the anchor and moves the far
-// end. `shift_held` comes off the modifier stream because a press carries no
-// modifiers of its own, and the surface rides along so a shift-click in the
-// rail cannot draw a range that spans both lists.
+// A press on a message's prose, in either surface. Plain, it is only a press
+// — a reader clicking around a room must not keep lighting a one-message
+// range and its bar. With ⇧ held it starts a range here, or keeps the anchor
+// and moves the far end of the one already open. `shift_held` comes off the
+// modifier stream because a press carries no modifiers of its own (the guest
+// never sees them either), and the surface rides along so a shift-click in
+// the rail cannot draw a range that spans both lists. Esc and the bar's
+// Clear end a range.
 on press_message(seq, surface)
-  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface, shift_held)
+  return if !shift_held
+  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface)
   copy_anchor_seq = range.anchor
   copy_head_seq = range.head
   copy_surface = range.surface
@@ -1567,6 +1594,8 @@ on chat_view_event(event)
       flow
         from done true
         done -> load_more_thread()
+    ChatIntent.cancel_run
+      run every cancel_agent_run(connected_rpc, password, event_text(event, "run_id")) -> live_cancel_acked _ | mutation_failed _
     ChatIntent.composer
       let kind = chat_event_kind(event)
       let id = event_text(event, "id")

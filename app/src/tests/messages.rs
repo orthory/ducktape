@@ -639,3 +639,32 @@ fn a_minted_reply_keeps_the_first_reply_header() {
          continues the run"
     );
 }
+
+/// A PLAIN PRESS IS ONLY A PRESS. Every click on a message's prose used to
+/// light a one-message range and its bar; now a range starts with ⇧ and the
+/// next ⇧-press widens it, so a reader clicking around a room sees no bar.
+#[test]
+fn a_range_starts_with_shift_and_a_plain_press_leaves_it_alone() {
+    let (mut app, _) = Ducktape::__boot();
+    app.messages = vec![message(7, "root", false), message(8, "next", false)];
+
+    let _ = app.__update(__DucktapeMessage::PressMessage(7, CopySurface::Timeline));
+    assert_eq!(
+        (app.copy_anchor_seq, app.copy_head_seq, app.copy_surface),
+        (0, 0, CopySurface::Nowhere),
+        "a plain press draws no range"
+    );
+
+    app.shift_held = true;
+    let _ = app.__update(__DucktapeMessage::PressMessage(7, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 7));
+    let _ = app.__update(__DucktapeMessage::PressMessage(8, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 8));
+
+    // a plain press with a range open keeps it: Esc and Clear end a range
+    app.shift_held = false;
+    let _ = app.__update(__DucktapeMessage::PressMessage(8, CopySurface::Timeline));
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (7, 8));
+    let _ = app.__update(__DucktapeMessage::ClearCopyRange);
+    assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (0, 0));
+}

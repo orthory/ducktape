@@ -65,6 +65,9 @@ extern crate::backend
   AgentActivity(id:i64, title:str, detail:str, status:str)
   AgentChatEntry(id:i64, role:str, body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity], steps_label:str)
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
+  LiveActivity(label:str, done:bool)
+  LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
@@ -126,7 +129,7 @@ extern crate::backend
   pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
   pure copy_range_label(count:i64) -> str
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
-  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
+  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface) -> CopyRange
   pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
@@ -234,7 +237,7 @@ extern crate::backend
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
-  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
+  FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
@@ -257,6 +260,13 @@ extern crate::backend
   files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
   files_remove(rpc:str, password:str, path:str) -> bool ! AppError
   files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError
+  files_save_text(rpc:str, password:str, path:str, base:str, text:str) -> bool ! AppError
+  pure files_network_scope(rpc:str, chain:str) -> str
+  pure files_context(rpc:str, chain:str, connection:i64) -> str
+  FsSaveReply(context:str, namespace:str, request:i64, success:bool, message:str)
+  FsSaveHistory(replies:[FsSaveReply], overflow:str)
+  pure no_fs_save_reply() -> FsSaveHistory
+  pure fs_save_reply(context:str, namespace:str, request:i64, success:bool, message:str, previous:FsSaveHistory) -> FsSaveHistory
   files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   FsDiffEntry(path:str, kind:str)
   FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
@@ -537,6 +547,12 @@ extern crate::backend
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
+  cancel_agent_run(rpc:str, password:str, run_id:str) -> bool ! AppError
+  stream chat_live_agents(rpc:str, chain_id:str, generation:i64, signer_key:str) -> LiveAgentNotice
+  pure live_agents_stale(notice:&LiveAgentNotice, rpc:&str, chain_id:&str, generation:i64, signer_key:&str) -> bool
+  // Test seam: Ice reads extern structs but cannot construct one, so a scenario
+  // that needs a run already on screen has no other way to seat one.
+  pure live_agent_row(channel_id:str, anchor_seq:i64, run_id:str, agent:str, status:str) -> LiveAgentRow
   search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError

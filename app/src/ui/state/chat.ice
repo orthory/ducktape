@@ -30,6 +30,7 @@ state
   active_thread_seq:i64 = 0
   thread_target_seq:i64 = 0
   thread_messages:[ChatMessage] = []
+  live_agents:[LiveAgentRow] = []
   thread_next_reply_seq:i64 = 0
   thread_has_more = false
   thread_loading = false

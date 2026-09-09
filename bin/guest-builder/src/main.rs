@@ -726,8 +726,19 @@ fn remap_flags(scratch: &Path, checkout: &Path) -> String {
 }
 
 fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result<(), String> {
+    let status = build_command(scratch, name, kind, rustflags)
+        .status()
+        .map_err(|e| format!("running cargo build: {e}"))?;
+    if !status.success() {
+        return Err(format!("wasm32 build failed in {}", scratch.display()));
+    }
+    Ok(())
+}
+
+fn build_command(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Command {
     let member = format!("{name}-{}", kind.member());
-    let status = Command::new(cargo())
+    let mut command = Command::new(cargo());
+    command
         // `--locked`: the lock is complete after `pin`, and the bytes are
         // only reproducible if this build changes nothing in it.
         .args([
@@ -739,17 +750,16 @@ fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result
             "-p",
             &member,
         ])
+        // Explicit CLI selection wins over inherited CARGO_TARGET_DIR and
+        // Cargo configuration, matching the artifact lookup below.
+        .arg("--target-dir")
+        .arg("target")
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         // the encoded form wins over the plain one, but an inherited
         // `RUSTFLAGS` would be a confusing dead passenger.
         .env_remove("RUSTFLAGS")
-        .current_dir(scratch)
-        .status()
-        .map_err(|e| format!("running cargo build: {e}"))?;
-    if !status.success() {
-        return Err(format!("wasm32 build failed in {}", scratch.display()));
-    }
-    Ok(())
+        .current_dir(scratch);
+    command
 }
 
 /// the one place every gated artifact is componentized: the linked
@@ -897,6 +907,27 @@ mod tests {
             Path::new("crates/modules/apps/chat"),
         );
         assert!(wrong_place.is_err());
+    }
+
+    #[test]
+    fn build_and_componentization_use_the_same_explicit_target_directory() {
+        for root in [
+            Path::new("/checkout/target/guest-builder/collaboration"),
+            Path::new("relative/scratch"),
+        ] {
+            let command = build_command(root, "collaboration", GuestKind::Component, "");
+            let args: Vec<_> = command.get_args().collect();
+            let index = args
+                .iter()
+                .position(|arg| *arg == "--target-dir")
+                .expect("an inherited CARGO_TARGET_DIR must not redirect compilation");
+            let target = command.get_current_dir().unwrap().join(args[index + 1]);
+            assert_eq!(
+                cdylib_path(root, "collaboration", GuestKind::Component),
+                target.join("wasm32-unknown-unknown/release/collaboration_component.wasm"),
+                "componentization must read the artifact just compiled"
+            );
+        }
     }
 
     fn scratch() -> tempfile::TempDir {

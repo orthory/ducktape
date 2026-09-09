@@ -137,10 +137,15 @@ fn a_search_leaves_as_an_intent_and_its_answer_comes_back_as_props() {
     assert_eq!(intent.kind, "explorer.clear");
 }
 
+/// THE EYE GETS `0x`, THE CLIPBOARD GETS THE KEY. An op hash is the
+/// `GET /v1/files/blob/{op_hash}` key and what every CLI that takes a digest
+/// wants, so the copy carries it bare and whole — a paste that has to be
+/// hand-trimmed first is a copy button that does not work.
 #[test]
-fn an_ops_hash_leaves_as_a_copy() {
+fn an_ops_hash_reads_prefixed_and_copies_bare() {
     let (_, frame) = shown(&ledger());
     let frame = tick_native(press(&frame, "Inspect block"));
+    assert!(has_text(&frame, "0xab12cd34"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "Copy op hash"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -151,6 +156,83 @@ fn an_ops_hash_leaves_as_a_copy() {
         Copy {
             text: "ab12cd34".into(),
             label: "Op hash copied".into()
+        }
+    );
+}
+
+/// EVERY DIGEST, WHOLE AND `0x`-PREFIXED, IN BOTH PLACES IT APPEARS. The list
+/// row carries the block hash in full — not twelve chars and an ellipsis, which
+/// identifies a block to the eye and to nothing else — and the detail names it
+/// beside the commit hash with a copy on each. The copy carries the canonical
+/// bare digest, which is the form anything downstream can be handed.
+#[test]
+fn every_digest_reads_whole_and_hex_prefixed_and_copies_the_bare_key() {
+    let hash = "9f3e".repeat(16);
+    let commit = "c0ffee11".repeat(8);
+    let props = ExplorerProps {
+        blocks: vec![ExplorerBlock {
+            height: 84_912,
+            hash: hash.clone(),
+            commit: commit.clone(),
+            op_count: 1,
+        }],
+        ..ledger()
+    };
+    let (_, frame) = shown(&props);
+    let whole = format!("0x{hash}");
+    assert!(has_text(&frame, &whole), "{:?}", texts(&frame));
+    // and NOTHING on the list is a cut-down version of it — the guard that
+    // fails the moment a landmark form comes back.
+    let abbreviated = texts(&frame)
+        .into_iter()
+        .find(|text| text.starts_with("0x9f3e") && *text != whole);
+    assert!(
+        abbreviated.is_none(),
+        "the list carries the whole hash, not {abbreviated:?}"
+    );
+    let frame = tick_native(press(&frame, "Inspect block"));
+    for expected in [whole, format!("0x{commit}")] {
+        assert!(has_text(&frame, &expected), "{:?}", texts(&frame));
+    }
+    let frame = tick_native(press(&frame, "Copy block hash"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(intent.kind, "explorer.copy");
+    assert_eq!(
+        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        Copy {
+            text: hash,
+            label: "Block hash copied".into()
+        }
+    );
+}
+
+/// `0x` MARKS HEX, SO IT GOES ON NOTHING ELSE. A proposer is a hex key only
+/// for a frame-authored op; `project_root_op` labels the rest `system`,
+/// `module:<id>` or `acct:<account>`, and `0xsystem` names nothing.
+#[test]
+fn a_proposer_that_is_not_a_key_keeps_its_label() {
+    let props = ExplorerProps {
+        ops: vec![ExplorerOp {
+            proposer: "system".into(),
+            ..ledger().ops[0].clone()
+        }],
+        ..ledger()
+    };
+    let (_, frame) = shown(&props);
+    let frame = tick_native(press(&frame, "Inspect block"));
+    assert!(has_text(&frame, "system"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "0xsystem"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Copy proposer"));
+    let [intent] = frame.requests.as_slice() else {
+        panic!("one intent, got {:?}", frame.requests);
+    };
+    assert_eq!(
+        serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
+        Copy {
+            text: "system".into(),
+            label: "Proposer copied".into()
         }
     );
 }

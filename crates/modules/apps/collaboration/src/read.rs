@@ -266,6 +266,11 @@ pub async fn serve(
             if reachable(staged, &reader, &conversation_id).await?.is_none() {
                 return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
             }
+            // Revocation preserves owner history access, never authorization
+            // for a new provider submission under a still-retained binding.
+            if reader.participant.revoked {
+                return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
+            }
             Ok(CollaborationReply::Eligibility(
                 eligibility(staged, ctx, &reader, &conversation_id, seq).await?,
             ))

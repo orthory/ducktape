@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ducktape_rpc::Client;
 use serde::Deserialize;
@@ -156,15 +157,32 @@ pub async fn active_hash(client: &Client, module: &str) -> Result<Option<[u8; 32
         .ok_or_else(|| Error::Status(format!("module {module:?} is not registered")))
 }
 
-/// The module's view as its active deployment ships it.
-pub async fn resolve(client: &Client, module: &str) -> Result<ViewSource, Error> {
-    let Some(hash) = active_hash(client, module).await? else {
+/// How long the node took over each question a resolve asks it.
+#[derive(Default)]
+pub struct Asked {
+    /// the registry (`module_status`)
+    pub status: Duration,
+    /// the artifact blob
+    pub fetch: Duration,
+}
+
+/// The module's view as its active deployment ships it; `asked` takes the
+/// time each question of the node took.
+pub async fn resolve(
+    client: &Client,
+    module: &str,
+    asked: &mut Asked,
+) -> Result<ViewSource, Error> {
+    let started = Instant::now();
+    let active = active_hash(client, module).await;
+    asked.status = started.elapsed();
+    let Some(hash) = active? else {
         return Ok(ViewSource::NotActivated);
     };
-    match view_artifact::load(client, hash)
-        .await
-        .map_err(Error::Artifact)?
-    {
+    let started = Instant::now();
+    let loaded = view_artifact::load(client, hash).await;
+    asked.fetch = started.elapsed();
+    match loaded.map_err(Error::Artifact)? {
         None => Ok(ViewSource::Missing { hash }),
         Some(view) => Ok(ViewSource::Ready {
             hash,
@@ -323,7 +341,9 @@ pub(crate) mod tests {
         let artifact = with_view();
         let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
-            resolve(&client, "files").await.unwrap(),
+            resolve(&client, "files", &mut Asked::default())
+                .await
+                .unwrap(),
             ViewSource::Ready {
                 hash: artifact.hash(),
                 component: vec![4, 5, 6],
@@ -337,7 +357,9 @@ pub(crate) mod tests {
         let artifact = ModuleArtifact::component(vec![1, 2, 3]);
         let client = node(status_of(&artifact.hash()), Some(artifact.clone()), None).await;
         assert_eq!(
-            resolve(&client, "files").await.unwrap(),
+            resolve(&client, "files", &mut Asked::default())
+                .await
+                .unwrap(),
             ViewSource::Missing {
                 hash: artifact.hash()
             }
@@ -348,7 +370,7 @@ pub(crate) mod tests {
     async fn bytes_that_do_not_hash_to_the_active_code_fail() {
         let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert!(matches!(
-            resolve(&client, "files").await,
+            resolve(&client, "files", &mut Asked::default()).await,
             Err(Error::Artifact(view_artifact::Error::HashMismatch))
         ));
     }
@@ -357,7 +379,7 @@ pub(crate) mod tests {
     async fn a_fetch_that_fails_is_an_error() {
         let client = node(status_of(&[7; 32]), None, None).await;
         assert!(matches!(
-            resolve(&client, "files").await,
+            resolve(&client, "files", &mut Asked::default()).await,
             Err(Error::Artifact(view_artifact::Error::Transport(_)))
         ));
     }
@@ -366,7 +388,9 @@ pub(crate) mod tests {
     async fn an_admission_before_its_boundary_is_not_activated() {
         let client = node(status_of(&[7; 32]), Some(with_view()), None).await;
         assert_eq!(
-            resolve(&client, "chat").await.unwrap(),
+            resolve(&client, "chat", &mut Asked::default())
+                .await
+                .unwrap(),
             ViewSource::NotActivated
         );
     }
@@ -400,7 +424,10 @@ pub(crate) mod tests {
         ] {
             let client = node(status, Some(with_view()), None).await;
             assert!(
-                matches!(resolve(&client, "files").await, Err(Error::Status(_))),
+                matches!(
+                    resolve(&client, "files", &mut Asked::default()).await,
+                    Err(Error::Status(_))
+                ),
                 "{case}"
             );
         }

@@ -59,7 +59,13 @@ extern crate::host
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmSidebarRow(peer:DmPeer, unread:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
-  ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64)
+  LiveActivity(label:str, done:bool)
+  LiveAgentRow(anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  // THE TWO LISTS THAT DRAW TOGETHER CROSS THE MEMO BOUNDARY TOGETHER — see
+  // `host::Timeline`. Folding a run's progress into `live_agents` alone leaves
+  // the timeline memo's key unmoved, and the card never repaints.
+  Timeline(messages:[ChatMessage], live_agents:[LiveAgentRow])
+  ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64, live_agents:[LiveAgentRow])
   PropsItem(next:ChatProps, error:str)
   subscription props() -> PropsItem
   pure search_phase_of(name:&str) -> SearchPhase
@@ -85,6 +91,7 @@ extern crate::host
   pure send_add_reaction(seq:i64, emoji:&str) -> bool
   pure send_remove_reaction(seq:i64, emoji:&str) -> bool
   pure send_open_thread(seq:i64) -> bool
+  pure send_cancel_run(run_id:&str) -> bool
   pure send_message_actions(seq:i64, body:&str, rev:i64) -> bool
   pure send_message_reactions(seq:i64, body:&str, rev:i64) -> bool
   pure send_begin_edit(seq:i64, body:&str, rev:i64) -> bool
@@ -115,7 +122,11 @@ extern crate::host
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
+  pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveAgentRow]) -> Timeline
+  pure run_in_thread(live:&LiveAgentRow, active_thread_seq:i64) -> bool
+  pure rail_owns_run(live:&LiveAgentRow, rail_shown:bool, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
+  pure thread_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure reaction_palette() -> [str]
@@ -176,9 +187,15 @@ state
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages:[ChatMessage] = []
+  live_agents:[LiveAgentRow] = []
+  timeline:Timeline = timeline_of([], [])
   thread_selected_seq = 0
   thread_selected_rev = 0
   thread_message_action:MessageAction = MessageAction.toolbar
+  chat_viewport_width = 1280.0
+  thread_width = 330.0
+  thread_dragging = false
+  pointer_x = 0.0
   thread_has_more = false
   thread_next_reply_seq = 0
   thread_loading = false
@@ -204,6 +221,34 @@ state
 // view's state asks for the facts again on its own.
 subscribe
   props() -> props_arrived _
+  mouse moved status=any when active_thread_seq > 0 && !channel_settings_open -> thread_pointer_moved _ _
+  mouse released status=any when thread_dragging -> thread_pointer_released _
+  mouse left status=any when thread_dragging -> cancel_thread_resize
+
+on thread_pointer_moved(x, _y)
+  let delta = pointer_x - x
+  pointer_x = x
+  return if !thread_dragging
+  thread_width = thread_width_after_delta(thread_width, delta, chat_viewport_width)
+
+on chat_viewport_changed(width, _height)
+  chat_viewport_width = width
+  thread_width = thread_width_after_delta(thread_width, 0.0, width)
+
+on start_thread_resize
+  thread_dragging = true
+
+on thread_pointer_released(_button)
+  thread_dragging = false
+
+on cancel_thread_resize
+  thread_dragging = false
+
+on narrow_thread
+  thread_width = thread_width_after_delta(thread_width, -32.0, chat_viewport_width)
+
+on widen_thread
+  thread_width = thread_width_after_delta(thread_width, 32.0, chat_viewport_width)
 
 on props_arrived(item)
   host_error = item.error
@@ -251,8 +296,11 @@ on props_arrived(item)
   message_action = message_action_of(next.message_action)
   channel_settings_open = next.channel_settings_open
   active_thread_seq = next.active_thread_seq
+  thread_dragging = thread_dragging && active_thread_seq > 0 && !next.channel_settings_open
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
+  live_agents = next.live_agents
+  timeline = timeline_of(next.messages, next.live_agents)
   thread_selected_seq = next.thread_selected_seq
   thread_selected_rev = next.thread_selected_rev
   thread_message_action = message_action_of(next.thread_message_action)
@@ -414,6 +462,7 @@ on remove_channel_member_submit(key)
   sent = send_remove_member(key)
 
 on close_thread
+  thread_dragging = false
   thread_edit_draft = ""
   sent = send_close_thread()
 
@@ -422,7 +471,7 @@ on open_thread_message_actions(seq, body, rev)
   thread_edit_draft = body
   sent = send_thread_actions(seq, body, rev)
   sequential
-    task widget focus #chat/thread-action-focus
+    task widget focus #chat/thread-pane/thread-action-focus
     task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
@@ -430,21 +479,21 @@ on open_thread_message_reactions(seq, body, rev)
   thread_edit_draft = body
   sent = send_thread_reactions(seq, body, rev)
   sequential
-    task widget focus #chat/thread-reaction-focus
+    task widget focus #chat/thread-pane/thread-reaction-focus
     task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
   return if seq <= 0
   thread_edit_draft = body
   sent = send_thread_begin_edit(seq, body, rev)
-  task widget focus #chat/thread-edit
+  task widget focus #chat/thread-pane/thread-edit
 
 on arm_thread_message_delete(seq, body, rev)
   return if seq <= 0
   thread_edit_draft = body
   sent = send_thread_arm_delete(seq, body, rev)
   sequential
-    task widget focus #chat/thread-delete-focus
+    task widget focus #chat/thread-pane/thread-delete-focus
     task widget focus-next
 
 on clear_thread_message_selection
@@ -461,101 +510,112 @@ on delete_thread_message_submit
 on load_more_thread
   sent = send_load_thread()
 
+on cancel_run(run_id)
+  sent = send_cancel_run(run_id)
+
 view
-  ChatScreen search_draft<->search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
-    with
-      endpoint
-      network_name
-      network_chain_id
-      status
-      block_height
-      search_phase
-      search_query
-      search_hits
-      rooms
-      dm_rows
-      channel_create_open
-      connected
-      loading
-      busy
-      active_channel
-      active_dm_peer
-      active_dm
-      active_channel_name
-      active_channel_archived
-      active_channel_members_only
-      channel_members
-      post_refusal
-      huddle_joined
-      huddle_channel
-      huddle_channel_name
-      huddle_joined_at
-      huddle_now
-      call_muted
-      messages
-      has_older_history
-      history_view
-      at_live_tail
-      history_loading
-      unread_boundary
-      unread_marker_seq
-      selected_message_seq
-      selected_message_rev
-      message_action
-      channel_settings_open
-      active_thread_seq
-      thread_target_seq
-      thread_messages
-      thread_selected_seq
-      thread_selected_rev
-      thread_message_action
-      thread_has_more
-      thread_next_reply_seq
-      thread_loading
-      copy_anchor_seq
-      copy_head_seq
-      copy_surface
-    events
-      press_message -> press_message _ _
-      clear_copy_range -> clear_copy_range
-      copy_selected_messages -> copy_selected_messages
-      search_chat_submit -> search_chat_submit
-      clear_chat_search -> clear_chat_search
-      open_chat_search_hit -> open_chat_search_hit _ _ _
-      toggle_channel_create -> toggle_channel_create
-      choose_channel -> choose_channel _
-      choose_dm -> choose_dm _
-      toggle_channel_settings -> toggle_channel_settings
-      show_huddle -> show_huddle
-      leave_huddle_here -> leave_huddle_here
-      join_huddle_submit -> join_huddle_submit
-      load_more_history -> load_more_history
-      chat_scrolled -> chat_scrolled _ _ _ _
-      open_message_link -> open_message_link _
-      copy_to_clipboard -> copy_to_clipboard _ _
-      copy_message_link -> copy_message_link _
-      add_reaction_at -> add_reaction_at _ _
-      remove_reaction_at -> remove_reaction_at _ _
-      open_thread_for -> open_thread_for _
-      open_message_actions -> open_message_actions _ _ _
-      open_message_reactions -> open_message_reactions _ _ _
-      begin_message_edit -> begin_message_edit _ _ _
-      arm_message_delete -> arm_message_delete _ _ _
-      clear_message_selection -> clear_message_selection
-      add_reaction_submit -> add_reaction_submit _
-      edit_message_submit -> edit_message_submit
-      delete_message_submit -> delete_message_submit
-      rename_channel_submit -> rename_channel_submit
-      archive_channel_submit -> archive_channel_submit
-      unarchive_channel_submit -> unarchive_channel_submit
-      add_channel_member_submit -> add_channel_member_submit
-      remove_channel_member_submit -> remove_channel_member_submit _
-      close_thread -> close_thread
-      open_thread_message_actions -> open_thread_message_actions _ _ _
-      open_thread_message_reactions -> open_thread_message_reactions _ _ _
-      begin_thread_message_edit -> begin_thread_message_edit _ _ _
-      arm_thread_message_delete -> arm_thread_message_delete _ _ _
-      clear_thread_message_selection -> clear_thread_message_selection
-      edit_thread_message_submit -> edit_thread_message_submit
-      delete_thread_message_submit -> delete_thread_message_submit
-      load_more_thread -> load_more_thread
+  sensor show=chat_viewport_changed resize=chat_viewport_changed
+    ChatScreen search_draft<->search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
+      with
+        thread_width
+        endpoint
+        network_name
+        network_chain_id
+        status
+        block_height
+        search_phase
+        search_query
+        search_hits
+        rooms
+        dm_rows
+        channel_create_open
+        connected
+        loading
+        busy
+        active_channel
+        active_dm_peer
+        active_dm
+        active_channel_name
+        active_channel_archived
+        active_channel_members_only
+        channel_members
+        post_refusal
+        huddle_joined
+        huddle_channel
+        huddle_channel_name
+        huddle_joined_at
+        huddle_now
+        call_muted
+        messages
+        has_older_history
+        history_view
+        at_live_tail
+        history_loading
+        unread_boundary
+        unread_marker_seq
+        selected_message_seq
+        selected_message_rev
+        message_action
+        channel_settings_open
+        active_thread_seq
+        thread_target_seq
+        thread_messages
+        live_agents
+        timeline
+        thread_selected_seq
+        thread_selected_rev
+        thread_message_action
+        thread_has_more
+        thread_next_reply_seq
+        thread_loading
+        copy_anchor_seq
+        copy_head_seq
+        copy_surface
+      events
+        press_message -> press_message _ _
+        clear_copy_range -> clear_copy_range
+        copy_selected_messages -> copy_selected_messages
+        search_chat_submit -> search_chat_submit
+        clear_chat_search -> clear_chat_search
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        toggle_channel_create -> toggle_channel_create
+        choose_channel -> choose_channel _
+        choose_dm -> choose_dm _
+        toggle_channel_settings -> toggle_channel_settings
+        show_huddle -> show_huddle
+        leave_huddle_here -> leave_huddle_here
+        join_huddle_submit -> join_huddle_submit
+        load_more_history -> load_more_history
+        chat_scrolled -> chat_scrolled _ _ _ _
+        open_message_link -> open_message_link _
+        copy_to_clipboard -> copy_to_clipboard _ _
+        copy_message_link -> copy_message_link _
+        add_reaction_at -> add_reaction_at _ _
+        remove_reaction_at -> remove_reaction_at _ _
+        open_thread_for -> open_thread_for _
+        open_message_actions -> open_message_actions _ _ _
+        open_message_reactions -> open_message_reactions _ _ _
+        begin_message_edit -> begin_message_edit _ _ _
+        arm_message_delete -> arm_message_delete _ _ _
+        clear_message_selection -> clear_message_selection
+        add_reaction_submit -> add_reaction_submit _
+        edit_message_submit -> edit_message_submit
+        delete_message_submit -> delete_message_submit
+        rename_channel_submit -> rename_channel_submit
+        archive_channel_submit -> archive_channel_submit
+        unarchive_channel_submit -> unarchive_channel_submit
+        add_channel_member_submit -> add_channel_member_submit
+        remove_channel_member_submit -> remove_channel_member_submit _
+        start_thread_resize -> start_thread_resize
+        narrow_thread -> narrow_thread
+        widen_thread -> widen_thread
+        close_thread -> close_thread
+        open_thread_message_actions -> open_thread_message_actions _ _ _
+        open_thread_message_reactions -> open_thread_message_reactions _ _ _
+        begin_thread_message_edit -> begin_thread_message_edit _ _ _
+        arm_thread_message_delete -> arm_thread_message_delete _ _ _
+        clear_thread_message_selection -> clear_thread_message_selection
+        edit_thread_message_submit -> edit_thread_message_submit
+        delete_thread_message_submit -> delete_thread_message_submit
+        load_more_thread -> load_more_thread
+        cancel_run -> cancel_run _

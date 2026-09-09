@@ -24,12 +24,17 @@ fn expected() -> BTreeMap<String, Shape> {
     const CHAIN_ID: &[&str] = &[sdk::genesis_config::CHAIN_ID];
     const INVITE: &[&str] = &[sdk::genesis_config::INVITE];
     const NONE: &[&str] = &[];
+    const CHAIN_ID_AND_TIME_UNIT: &[&str] =
+        &[sdk::genesis_config::CHAIN_ID, sdk::genesis_config::TIME_UNIT];
     [
         ("acl", shape(Backing::Store, NONE, false)),
         ("agent", shape(Backing::Store, NONE, false)),
         ("automations", shape(Backing::Store, NONE, false)),
         ("capability", shape(Backing::Store, NONE, false)),
         ("chat", shape(Backing::Store, NONE, false)),
+        // the network binding it refuses every op without, and the unit its
+        // delivery deadlines are in.
+        ("collaboration", shape(Backing::Store, CHAIN_ID_AND_TIME_UNIT, false)),
         ("directory", shape(Backing::Map, NONE, false)),
         // committed-only queries: the between-block delivery injection must
         // never observe a same-block staged write.

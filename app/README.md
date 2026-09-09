@@ -56,7 +56,11 @@ the Explorer's workspace search is run by the app on the view's behalf. A
 view keeps its own drafts and hands the app only what the reader submitted:
 Settings' rename, key and ticket fields cross as intents, the signing seat
 crosses in as a flag (the password never leaves the app), and a committed op
-tells the view which drafts it consumed. A view may also leave the host a
+tells the view which drafts it consumed. Files keeps an unsaved text edit with its
+original file and network when navigation changes. Returning to that file
+resumes the same edit; only an explicit discard or that save's successful
+reply clears it. Saving uses the snapshot that supplied the original text,
+so an intervening edit is refused without losing the draft. A view may also leave the host a
 whole editor: the Pages document is the app's own `page_document` (its
 buffer, history and save tick never cross), painted into the view's slot
 from what the tab was last drawn with (`pages/surface.rs`); the view's page,
@@ -74,6 +78,14 @@ and the reader's links come back to the view's own handler. Forge's
 discussion note composer is the chat composer as a host surface
 (`forge_composer`) over the item's channel, so a note's words stay in the
 app and only its send crosses.
+Forge and Files project large read-only text and lists before sending props.
+The display counts omitted rows and labels shortened text; routing identifiers
+are kept intact. If the fixed metadata itself is too large, the view shows a
+bounded explanation instead of a partial, ambiguous browser. Files keeps the
+complete read separately as its editor seed: shortening the preview neither
+marks the read truncated nor disables Edit. These projections budget incoming
+facts, not arbitrary editor or input drafts.
+
 A view whose screen needs a widget
 the tree wire does not carry leaves that widget to the host too: the Chat
 view declares `chat_composer` as a host surface per room and per thread,

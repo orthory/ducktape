@@ -70,8 +70,10 @@ on unlock_submit(pw)
 // console opens only for a key that has an account there; one with none lands
 // on the welcome step. The probe block is inlined wherever a key becomes the
 // session's — a handler cannot call a handler.
-on key_unlocked(_pubkey)
+on key_unlocked(pubkey)
   onboarding_error = ""
+  signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -126,8 +128,10 @@ on confirm_phrase_submit(answer)
 // The key is sealed, seated, and the words are gone from this process. A
 // fresh key has no account on the picked chain yet, which the probe is about
 // to say: the welcome step is where it lands.
-on phrase_confirmed(_pubkey)
+on phrase_confirmed(pubkey)
   onboarding_error = ""
+  signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -160,9 +164,11 @@ on restore_submit(name, pw)
   run every restore_user_key(rpc, name, restore_words, password) -> key_restored _ | login_failed _
 
 // Restored and seated: the same probe an unlock runs.
-on key_restored(_pubkey)
+on key_restored(pubkey)
   restore_words = ""
   onboarding_error = ""
+  signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -360,6 +366,13 @@ on welcome_failed(cause)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  fs_generation = fs_generation + 1
+  fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
+  fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_loading = false
   invalidate lane=ceremony
   invalidate lane=desktop_ceremony
   mutation_phase = MutationPhase.idle
@@ -713,6 +726,13 @@ on onboarding_failed(cause)
 // left, so the signer seat is dropped with it and the next pick unlocks anew.
 on switch_network
   return if mutation_phase != MutationPhase.idle
+  fs_generation = fs_generation + 1
+  fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
+  fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_loading = false
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
   account_busy = account_busy && empty(account_ceremony_phase)
@@ -742,6 +762,9 @@ on onboarding_reopened(id)
   password = ""
   hub_wallets = []
   hub_wallet_selected = ""
+  // the seat goes with the network, and every lane keyed on it re-keys.
+  signer_key = ""
+  live_agents = []
   parallel
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)
