@@ -37,6 +37,13 @@ pub struct InProcDaemon {
     server: Option<JoinHandle<()>>,
     actor: Option<JoinHandle<()>>,
     drain: mpsc::UnboundedSender<oneshot::Sender<Result<BlockSummary, String>>>,
+    /// a spare of the actor's command lane, for [`InProcDaemon::commands`].
+    /// Held rather than minted from a handle clone because the handle itself
+    /// must not outlive `serve`. `Option` for the same reason `actor` is: it is
+    /// DROPPED FIRST in [`Drop`], because a live sender keeps the actor's drain
+    /// loop open and the join below would never return.
+    commands: Option<mpsc::Sender<NodeCommand>>,
+    status: crate::StatusCell,
 }
 
 impl InProcDaemon {
@@ -115,6 +122,12 @@ impl InProcDaemon {
             None => handle,
         };
         let status = handle.status_cell();
+        // taken here, off the ONE handle: `serve` consumes it below and Drop
+        // depends on that being the last one alive.
+        let commands = handle.command_sender();
+        // the cell the actor thread publishes into, kept for the harness's own
+        // readers — the actor's copy moves onto its thread.
+        let published = status.clone();
         status.publish(NodeStatus {
             public_key: node_key
                 .as_deref()
@@ -185,6 +198,8 @@ impl InProcDaemon {
             server: Some(server),
             actor: Some(actor),
             drain,
+            commands: Some(commands),
+            status: published,
         };
         daemon.await_ready();
         daemon
@@ -205,6 +220,27 @@ impl InProcDaemon {
     /// the port the client surface listens on.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// the actor's command lane, for an in-process component that speaks
+    /// [`NodeCommand`] rather than http — the node's own collaboration pump is
+    /// the one that does.
+    ///
+    /// **Every clone must be dropped before this daemon is.** A live sender
+    /// holds the command channel open, and [`Drop`] joins the actor thread —
+    /// which does not return while a sender exists. That is a HANG, not a
+    /// failure. A component that owns one until a lane closes (the pump: close
+    /// its wake lane and await it) is the shape that gets this right.
+    pub fn commands(&self) -> mpsc::Sender<NodeCommand> {
+        self.commands
+            .clone()
+            .expect("the command lane is taken only as this daemon is dropped")
+    }
+
+    /// the status cell the actor publishes into at every committed block — the
+    /// agreed clock as this node last settled it.
+    pub fn status(&self) -> crate::StatusCell {
+        self.status.clone()
     }
 
     /// the http base a CLI's `--node` flag (or `DUCKTAPE_NODE`) takes.
@@ -282,6 +318,10 @@ impl Drop for InProcDaemon {
         // its sole handle drops → the command channel closes → both threads end,
         // so a caller's tempdir (dropped AFTER this) is removed only once the
         // host's qmdb handles are closed.
+        // and the spare of that channel this harness keeps for in-process
+        // components goes FIRST, for the same reason: any sender still alive
+        // holds the actor's drain loop open past both joins below.
+        self.commands.take();
         let _ = nettest::http_status_with(
             self.port,
             "POST",

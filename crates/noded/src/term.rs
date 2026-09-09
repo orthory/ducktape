@@ -837,6 +837,12 @@ struct Bridge {
     /// becoming this node's interactive plane, which is not a capability to hand
     /// out on the strength of dialing loopback.
     link_token: Option<String>,
+    /// where the collaboration receipts go. The daemon's messaging half rides
+    /// the same link as the pty half, but its events belong to the node's
+    /// collaboration pump, which acknowledges them on-chain. `OnceLock` because
+    /// the pump is wired once at boot and never replaced: a second setter would
+    /// be two consumers racing for one receipt.
+    collab: std::sync::OnceLock<mpsc::Sender<wire::Event>>,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
@@ -992,7 +998,21 @@ impl TerminalSessions {
             sessions: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
             link_token,
+            collab: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Route the daemon's collaboration receipts to the node's collaboration
+    /// pump. Until this is called they are dropped with a named reason
+    /// ([`unconsumed`]) — a node can run the pty plane and no collaboration
+    /// plane at all.
+    ///
+    /// Returns whether the lane was taken. A second call is refused rather than
+    /// silently ignored: two consumers of one receipt would each submit an
+    /// `Acknowledge` for it, and the second would be refused on-chain for a
+    /// transition already made — a confusing failure with no local cause.
+    pub fn route_collab_to(&self, lane: mpsc::Sender<wire::Event>) -> bool {
+        self.0.collab.set(lane).is_ok()
     }
 
     // ---- the daemon's attachment ------------------------------------------
@@ -1127,14 +1147,38 @@ impl TerminalSessions {
             wire::Event::TermOutput { session, chunk_b64 } => self.output(&session, chunk_b64),
             wire::Event::TermEnded { session } => self.ended(&session),
             // the collaboration plane's receipts. They ride the same link
-            // because the daemon holds one connection, and they belong to the
-            // node's collaboration half — which is a separate piece of work.
-            // Named rather than swept into a `_` so the day that half lands,
-            // this is a compile error at the exact seam it has to be wired
-            // into, and not three receipts silently going nowhere.
+            // because the daemon holds one connection, but they belong to the
+            // node's collaboration pump, which turns each into an on-chain
+            // `Acknowledge`. Named rather than swept into a `_` so a new
+            // receipt fails the build here.
             collaboration @ (wire::Event::MsgBound { .. }
             | wire::Event::MsgBindRefused { .. }
-            | wire::Event::MsgDelivery { .. }) => unconsumed(&collaboration),
+            | wire::Event::MsgDelivery { .. }) => self.receipt(collaboration),
+        }
+    }
+
+    /// hand one collaboration receipt to the pump.
+    ///
+    /// `try_send` and not `send`: this runs on the ws READ LOOP, which is also
+    /// the only thing draining the daemon's pty output. Awaiting a full pump
+    /// lane here would stall every session's output behind one slow chain
+    /// submission. A full lane drops the receipt with a named reason instead —
+    /// the module holds the authoritative record and the daemon's journal is
+    /// durable, so the pump re-reads the state it missed; what it must never do
+    /// is wedge the terminal plane.
+    fn receipt(&self, event: wire::Event) {
+        let Some(lane) = self.0.collab.get() else {
+            return unconsumed(&event);
+        };
+        if lane.try_send(event).is_err()
+            && let Some(occurrences) = TERM_WARN.hit("collab_lane_full")
+        {
+            tracing::warn!(
+                target: "ducktape::collab",
+                reason = "collab_lane_full",
+                occurrences,
+                "dropped a collaboration receipt: the pump is not keeping up"
+            );
         }
     }
 
@@ -1412,10 +1456,18 @@ impl TerminalSessions {
         .await;
     }
 
-    /// the single writer to the daemon. A missing or closed link drops the
-    /// command with a named reason — never a panic; the session is ending
-    /// anyway, and [`AttachGuard`] is what tells the client so.
-    async fn send(&self, command: wire::Command) {
+    /// THE single writer to the daemon, for both halves of the link.
+    ///
+    /// The pty half has the three wrappers above; the collaboration half builds
+    /// its own frames and calls this, because its five commands carry no session
+    /// id and share no shape worth wrapping. No authority is widened by it being
+    /// public — `close`/`input`/`resize` already reach every pty this node owns.
+    ///
+    /// A missing or closed link drops the command with a named reason — never a
+    /// panic; the session is ending anyway, and [`AttachGuard`] is what tells
+    /// the client so. For the collaboration half a drop is also survivable: the
+    /// module holds the authoritative record and the pump re-reads it.
+    pub async fn send(&self, command: wire::Command) {
         let Some(link) = self.link() else {
             if let Some(occurrences) = TERM_WARN.hit("no_agent_service") {
                 tracing::warn!(
@@ -1547,7 +1599,7 @@ impl TerminalSessions {
     }
 }
 
-/// a collaboration receipt reached a node with no collaboration half yet.
+/// a collaboration receipt reached a node with no collaboration pump wired.
 ///
 /// It is DROPPED, and said so: the daemon's delivery record is durable and the
 /// module holds the authoritative receipt, so nothing is lost by not consuming
