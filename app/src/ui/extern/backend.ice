@@ -604,13 +604,13 @@ extern crate::backend
   // A live resync replaces the buffer ONLY when it is clean and the node's
   // text differs; both read the same decision so buffer and baseline move
   // together.
-  sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
-  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str) -> str
+  sync refreshed_page_buffer(document:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
+  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
   pure saved_baseline(written:bool, canonical:str, submitted:str) -> str
   pure baseline_at_submitted_title(canonical:str, submitted:str) -> str
   pure install_decision(text:str, current_page:str, next_page:str, saved:str, canonical:str) -> bool
-  sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
-  sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
+  sync installed_page_text(document:str, install:bool, canonical:str) -> str
+  sync rolled_back_text(document:str, untouched:bool, canonical:str) -> str
   pure remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
   search_pages(rpc:str, page_id:str, text:str) -> PageSearchData ! AppError
   palette_search(rpc:str, text:str) -> PaletteSearchData ! AppError

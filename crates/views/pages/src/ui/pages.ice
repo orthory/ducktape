@@ -1,34 +1,6 @@
-// PAGES — the whole document surface: the 230px page sidebar, the 50px document
-// header, the doc-tab strip, the writing surface, and the 306px comments rail.
-//
-// A screen is a component like any other, which means it cannot reach app state
-// — every reading it draws arrives as a prop, and every act it offers leaves as
-// a named event that `view.ice` routes back to the handler of the same name.
-//
-// THE CANVAS IS ONE EDITOR. It used to be a stack of blocks where each line was
-// a BUTTON until you clicked it, at which point a per-kind editor was swapped in
-// behind it — so reaching a line cost a click that did nothing but change what
-// the line was made of, and the page carried a `+`/`⋮⋮` gutter cluster, an
-// insert row with a block-type dropdown parked at the right margin, and a `/`
-// menu to pick from a list of kind names. All of that is gone. `page_document`
-// (extern, `crate::pages`) is a single rich editor over the page's markdown:
-// the caret lands where you click, and `# ` IS the block-type menu.
-//
-// WHAT THE DOCUMENT DOES NOT HOLD. Subpage blocks have no markdown spelling and
-// are not prose, so a text diff has no business deciding they were deleted —
-// they are listed under the body as the navigation they are.
-//
-// THREE DRAFTS ARE `bind` PROPS, because the writes are the app's, not this
-// screen's: the sidebar's new-page field, the document search field and the
-// rail's composer all write back to the state their handlers read and clear.
-// `page_document` is bound too — the buffer IS app state, so the save tick can
-// read it.
-//
-// THE TITLE IS LINE 0 OF THAT SAME BUFFER. It is a page property on the wire,
-// not a block, but making it a separate control is what left the document with
-// the very defect the body just lost: you had to CLICK the title to edit it.
-// As line 0 it needs no control at all, and Enter at its end / Backspace at the
-// body's start are ordinary text edits that cross the boundary for free.
+// One document editor owns title line 0 and the Markdown body. The caller
+// supplies its document slot and handles navigation/save intents. Subpage blocks
+// have no Markdown spelling and stay separate navigation below the body.
 component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
@@ -563,7 +535,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 // header. It is never disabled while connected: a page you
                 // can read is a page you can type in. It FILLS the column
                 // and scrolls itself.
-                extern page_document() #document
+                slot document
                 // Subpages: navigation, listed rather than typed.
                 if !empty(subpages)
                   // The 46px inset matches the editor's hover-gutter strip, so

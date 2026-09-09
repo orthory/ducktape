@@ -344,6 +344,7 @@ fn cmd_z_walks_the_history_and_shift_redoes() {
     assert_eq!(undone.text, "Title\nbod");
     // The caret returns to where the group STARTED, not to the origin.
     assert_eq!(undone.cursor, EditorCursor::at(1, 3));
+    history.commit(&typed_doc, &undone, EditorHistoryEffect::Undo, 1);
     let EditorDecision::Apply {
         patches,
         cursor,
@@ -357,6 +358,7 @@ fn cmd_z_walks_the_history_and_shift_redoes() {
     assert_eq!(redone.text, "Title\nbody");
     // …and redo puts it back where the caret sat when Cmd+Z was pressed.
     assert_eq!(redone.cursor, EditorCursor::at(1, 4));
+    history.commit(&undone, &redone, EditorHistoryEffect::Redo, 2);
     assert!(history.redo(&redone).is_none());
 }
 
@@ -387,6 +389,12 @@ fn keystrokes_inside_the_window_coalesce_into_one_step() {
         panic!("applies");
     };
     assert_eq!(apply(&typed("abc", 0, 3), &patches, cursor).text, "a");
+    history.commit(
+        &typed("abc", 0, 3),
+        &typed("a", 0, 1),
+        EditorHistoryEffect::Undo,
+        600,
+    );
     assert!(
         history.undo(&typed("a", 0, 1)).is_none(),
         "one group, one step"
@@ -403,6 +411,12 @@ fn a_fresh_edit_clears_the_redo_lane() {
         0,
     );
     let _ = history.undo(&typed("ab", 0, 2));
+    history.commit(
+        &typed("ab", 0, 2),
+        &typed("a", 0, 1),
+        EditorHistoryEffect::Undo,
+        1,
+    );
     assert_eq!(history.group_effect(100), EditorHistoryEffect::NewGroup);
     history.commit(
         &typed("a", 0, 1),
@@ -441,6 +455,7 @@ fn an_applied_decision_joins_the_open_group_it_named() {
         panic!("applies");
     };
     assert_eq!(apply(&after, &patches, cursor).text, "- one");
+    history.commit(&after, &doc, EditorHistoryEffect::Undo, 201);
     assert!(history.undo(&doc).is_none());
     // Outside the window the decision opens its own group.
     assert_eq!(
@@ -478,6 +493,12 @@ fn a_caret_only_commit_after_undo_keeps_the_redo_lane() {
         0,
     );
     let _ = history.undo(&typed("ab", 0, 2));
+    history.commit(
+        &typed("ab", 0, 2),
+        &typed("a", 0, 1),
+        EditorHistoryEffect::Undo,
+        1,
+    );
     // a Noop ack, then a caret move: same text, other caret
     history.commit(
         &typed("a", 0, 1),
@@ -501,4 +522,39 @@ fn a_caret_only_commit_after_undo_keeps_the_redo_lane() {
         panic!("redo applies");
     };
     assert_eq!(cursor, EditorCursor::at(0, 2));
+}
+
+#[test]
+fn a_cancelled_undo_decision_does_not_consume_its_history_step() {
+    let mut history = History::default();
+    let before = typed("- 한글", 0, 8);
+    let after = typed("- 한글!", 0, 9);
+    history.commit(&before, &after, EditorHistoryEffect::Native, 0);
+    let proposed = history.undo(&after).expect("one undo step");
+    // The host cancelled the proposed transaction; no commit arrived.
+    assert_eq!(history.undo(&after), Some(proposed));
+    assert!(
+        history.redo(&before).is_none(),
+        "an uncommitted undo creates no redo"
+    );
+}
+
+#[test]
+fn moving_a_large_current_document_to_redo_evicts_oldest_history() {
+    let mut history = History::default();
+    let a = typed(&"a".repeat(900 * 1024), 0, 0);
+    let b = typed(&"b".repeat(900 * 1024), 0, 0);
+    let c = typed(&"c".repeat(100 * 1024), 0, 0);
+    let d = typed(&"d".repeat(1024 * 1024), 0, 0);
+    for (before, after) in [(&a, &b), (&b, &c), (&c, &d)] {
+        history.commit(before, after, EditorHistoryEffect::NewGroup, 0);
+    }
+    assert!(history.undo(&d).is_some());
+    history.commit(&d, &c, EditorHistoryEffect::Undo, 1);
+    assert!(history.undo(&c).is_some());
+    history.commit(&c, &b, EditorHistoryEffect::Undo, 2);
+    assert!(
+        history.undo(&b).is_none(),
+        "the oldest 900KiB step must be evicted when the redo snapshot grows the combined history past 2MiB"
+    );
 }

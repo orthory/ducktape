@@ -26,14 +26,14 @@
 use std::ops::Range;
 
 /// A caret or anchor: `column` is a UTF-8 byte offset within `line`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditorPosition {
     pub line: u32,
     pub column: u32,
 }
 
 /// The active caret and, while a range is selected, its fixed anchor.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditorCursor {
     pub position: EditorPosition,
     pub selection: Option<EditorPosition>,
@@ -75,7 +75,7 @@ pub enum EditorDecision {
 }
 
 /// The document as the host reports it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Doc {
     pub text: String,
     pub cursor: EditorCursor,
@@ -99,7 +99,8 @@ pub const MAX_PATCHES: usize = 256;
 const COALESCE_MS: u64 = 750;
 const MAX_STEPS: usize = 200;
 /// Snapshots live inside the guest's own snapshot, which the runtime caps
-/// at 8 MiB for everything; the history takes a quarter of that at most.
+/// at 8 MiB for everything; retained text takes at most 2 MiB, plus the
+/// metadata for at most 200 steps.
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 impl EditorPosition {
@@ -130,16 +131,16 @@ impl Doc {
 
     /// The lines as the editor counts them: a trailing newline is a final
     /// empty line.
-    fn lines(&self) -> Vec<&str> {
+    pub(crate) fn lines(&self) -> Vec<&str> {
         self.text.split('\n').collect()
     }
 
-    fn line(&self, index: usize) -> Option<&str> {
+    pub(crate) fn line(&self, index: usize) -> Option<&str> {
         self.text.split('\n').nth(index)
     }
 
     /// Byte offset of `position` in `text`, clamped to the line.
-    fn offset(&self, position: EditorPosition) -> usize {
+    pub(crate) fn offset(&self, position: EditorPosition) -> usize {
         let mut offset = 0;
         for (index, line) in self.lines().iter().enumerate() {
             if index == position.line as usize {
@@ -150,7 +151,7 @@ impl Doc {
         self.text.len()
     }
 
-    fn position_at(&self, offset: usize) -> EditorPosition {
+    pub(crate) fn position_at(&self, offset: usize) -> EditorPosition {
         let before = &self.text[..offset.min(self.text.len())];
         let line = before.matches('\n').count();
         let column = before.rfind('\n').map_or(offset, |nl| offset - nl - 1);
@@ -622,7 +623,7 @@ fn ordered_digits(trimmed: &str) -> Option<usize> {
 /// desynchronize the way a mis-rebased delta can. The guest's is the ONLY
 /// history: native edits and applied decisions both land here through
 /// [`History::commit`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct History {
     undo: Vec<Doc>,
     redo: Vec<Doc>,
@@ -647,9 +648,10 @@ impl History {
 
     /// The host applied a step from `before` to `after`: record it. A
     /// `Native` step is grouped by this policy; an explicit `NewGroup` /
-    /// `ExtendPrevious` is taken as stated; `Undo` / `Redo` already moved
-    /// the stacks. A commit that left the text alone — a `Noop` ack, a
-    /// caret observation — is no step: it neither opens a group nor
+    /// `ExtendPrevious` is taken as stated; `Undo` / `Redo` move the stacks
+    /// only after the host confirms the requested snapshot. Cancelled decisions
+    /// leave them untouched. A text-preserving native commit or `Noop` ack
+    /// is no step: it neither opens a group nor
     /// clears the redo lane.
     pub fn commit(
         &mut self,
@@ -658,6 +660,24 @@ impl History {
         history: EditorHistoryEffect,
         input_time_ms: u64,
     ) {
+        if matches!(
+            history,
+            EditorHistoryEffect::Undo | EditorHistoryEffect::Redo
+        ) {
+            let (source, destination) = if history == EditorHistoryEffect::Undo {
+                (&mut self.undo, &mut self.redo)
+            } else {
+                (&mut self.redo, &mut self.undo)
+            };
+            if source.last() == Some(after) {
+                self.bytes -= source.pop().expect("confirmed history snapshot").text.len();
+                self.bytes += before.text.len();
+                destination.push(before.clone());
+                self.group_open_until = None;
+                self.trim();
+            }
+            return;
+        }
         if before.text == after.text {
             return;
         }
@@ -666,45 +686,54 @@ impl History {
             EditorHistoryEffect::Undo | EditorHistoryEffect::Redo => return,
             stated => stated,
         };
-        self.group_open_until = Some(input_time_ms + COALESCE_MS);
+        self.group_open_until = Some(input_time_ms.saturating_add(COALESCE_MS));
         if effect == EditorHistoryEffect::ExtendPrevious {
             return;
         }
         self.bytes += before.text.len();
         self.undo.push(before.clone());
         self.bytes -= self.redo.drain(..).map(|doc| doc.text.len()).sum::<usize>();
-        while self.undo.len() > MAX_STEPS || self.bytes > MAX_BYTES {
-            let oldest = self.undo.remove(0);
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.undo.len() + self.redo.len() > MAX_STEPS || self.bytes > MAX_BYTES {
+            let oldest = if self.undo.is_empty() {
+                self.redo.remove(0)
+            } else {
+                self.undo.remove(0)
+            };
             self.bytes -= oldest.text.len();
         }
     }
 
-    /// Restore the newest undo snapshot over `current`, parking `current` on
-    /// the redo stack. `None` when there is nothing to undo.
-    pub fn undo(&mut self, current: &Doc) -> Option<EditorDecision> {
-        let snapshot = self.undo.pop()?;
-        self.bytes -= snapshot.text.len();
-        self.bytes += current.text.len();
-        self.redo.push(current.clone());
-        // The group is closed: the next keystroke opens a fresh undo step.
-        self.group_open_until = None;
-        Some(restore(current, &snapshot, EditorHistoryEffect::Undo))
+    /// Propose the newest undo snapshot. The host's accepted commit moves it
+    /// to the redo stack; merely asking must not consume a cancelled step.
+    pub fn undo(&self, current: &Doc) -> Option<EditorDecision> {
+        Some(restore(
+            current,
+            self.undo.last()?,
+            EditorHistoryEffect::Undo,
+        ))
     }
 
-    /// Inverse of [`History::undo`].
-    pub fn redo(&mut self, current: &Doc) -> Option<EditorDecision> {
-        let snapshot = self.redo.pop()?;
-        self.bytes -= snapshot.text.len();
-        self.bytes += current.text.len();
-        self.undo.push(current.clone());
-        self.group_open_until = None;
-        Some(restore(current, &snapshot, EditorHistoryEffect::Redo))
+    /// Propose the newest redo snapshot, with the same commit-only rule.
+    pub fn redo(&self, current: &Doc) -> Option<EditorDecision> {
+        Some(restore(
+            current,
+            self.redo.last()?,
+            EditorHistoryEffect::Redo,
+        ))
     }
 }
 
 /// The one patch that turns `current`'s text into `snapshot`'s, over the
 /// span that differs.
-fn restore(current: &Doc, snapshot: &Doc, history: EditorHistoryEffect) -> EditorDecision {
+pub(crate) fn restore(
+    current: &Doc,
+    snapshot: &Doc,
+    history: EditorHistoryEffect,
+) -> EditorDecision {
     let (old, new) = (&current.text, &snapshot.text);
     let mut prefix = old
         .bytes()
