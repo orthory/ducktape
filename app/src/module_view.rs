@@ -18,10 +18,10 @@
 
 mod display_budget;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
@@ -29,7 +29,10 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector, widget, window};
 use ui_lang_runtime::view_tree::{self, Inputs, Output, Pictures, Surfaces};
 use ui_lang_wire as wire;
 use wasmtime::component::{Component, Linker, TypedFunc};
-use wasmtime::{Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Cache, CacheConfig, Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits,
+    StoreLimitsBuilder,
+};
 
 /// What a module view asked the app to do: `kind` is the operation
 /// (`vote`, `execute`), `detail` the guest's JSON for it.
@@ -2212,6 +2215,68 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
     }
 }
 
+/// How long each stage of one module-owned load took: `status` and
+/// `fetch` are the node's answers, `compile` is cranelift, `init` the
+/// instance and its `on mount` or restore, `first_frame` the tree a
+/// replacement proves (a fresh view draws its first on the window thread),
+/// `check` the second look at the registry before the seat. `path` is
+/// `tab` for a mount (the tab's first draw), `first` for a load the
+/// connection asked for over an empty slot, `swap` over a view drawn.
+#[derive(Default)]
+struct LoadTiming {
+    path: &'static str,
+    status: Duration,
+    fetch: Duration,
+    compile: Duration,
+    init: Duration,
+    first_frame: Option<Duration>,
+    check: Duration,
+}
+
+impl LoadTiming {
+    /// One `view_load` line per load, every field every time, through the
+    /// same logger and test tap as `view_source`.
+    fn log(&self, module: &str, hash: Option<&[u8; 32]>, started: Instant, state: &str) {
+        let ms = |duration: Duration| duration.as_millis();
+        let hash = hash.map_or_else(|| "-".to_owned(), |hash| crate::backend::hex_encode(hash));
+        let first_frame = self
+            .first_frame
+            .map_or_else(|| "-".to_owned(), |frame| ms(frame).to_string());
+        let total = ms(started.elapsed());
+        tracing::info!(
+            target: "ducktape::app",
+            module,
+            hash = %hash,
+            path = self.path,
+            outcome = state,
+            status_ms = ms(self.status),
+            fetch_ms = ms(self.fetch),
+            compile_ms = ms(self.compile),
+            init_ms = ms(self.init),
+            first_frame_ms = %first_frame,
+            check_ms = ms(self.check),
+            total_ms = total,
+            "view_load"
+        );
+        #[cfg(test)]
+        {
+            let line = format!(
+                "view_load module={module} hash={hash} path={} outcome={state} status_ms={} fetch_ms={} compile_ms={} init_ms={} first_frame_ms={first_frame} check_ms={} total_ms={total}",
+                self.path,
+                ms(self.status),
+                ms(self.fetch),
+                ms(self.compile),
+                ms(self.init),
+                ms(self.check),
+            );
+            canary::TAPS
+                .lock()
+                .expect("view_source taps")
+                .retain(|tap| tap.send(line.clone()).is_ok());
+        }
+    }
+}
+
 /// What the canary runner (`tests::canary`) needs of this registry: the
 /// `view_source` lines as they are logged, the module-owned views mounted
 /// without an app around them, and the hash a slot answers for.
@@ -2359,6 +2424,80 @@ fn hex_short(hash: &[u8; 32]) -> String {
     hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+const COMPILED_VIEW_LIMIT: usize = 16;
+const COMPILED_VIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct ViewCodeCache {
+    entries: VecDeque<CompiledView>,
+}
+
+struct CompiledView {
+    hash: [u8; 32],
+    source_bytes: usize,
+    component: Arc<Component>,
+}
+
+impl ViewCodeCache {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<Component>> {
+        let index = self.entries.iter().position(|entry| &entry.hash == hash)?;
+        let entry = self.entries.remove(index)?;
+        let component = entry.component.clone();
+        self.entries.push_back(entry);
+        Some(component)
+    }
+
+    fn insert(&mut self, entry: CompiledView) {
+        if entry.source_bytes > COMPILED_VIEW_SOURCE_BYTES {
+            return;
+        }
+        let mut bytes: usize = self.entries.iter().map(|entry| entry.source_bytes).sum();
+        loop {
+            let fits = self.entries.len() < COMPILED_VIEW_LIMIT
+                && bytes + entry.source_bytes <= COMPILED_VIEW_SOURCE_BYTES;
+            if fits {
+                break;
+            }
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            bytes -= old.source_bytes;
+        }
+        self.entries.push_back(entry);
+    }
+}
+
+fn compiled_view(bytes: &[u8]) -> Result<Arc<Component>, String> {
+    static CODE: OnceLock<Mutex<ViewCodeCache>> = OnceLock::new();
+    compile_view(engine(), CODE.get_or_init(Mutex::default), bytes)
+}
+
+// Cache code only: every load still creates its own Store, instance and assets.
+// The cache belongs to this one Engine. Compile outside the lock so unrelated
+// views can prepare concurrently; a competing result adopts the existing entry.
+fn compile_view(
+    engine: &Engine,
+    cache: &Mutex<ViewCodeCache>,
+    bytes: &[u8],
+) -> Result<Arc<Component>, String> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes).into();
+    if let Some(component) = cache.lock().expect("view code cache").get(&hash) {
+        return Ok(component);
+    }
+    let component = Arc::new(Component::new(engine, bytes).map_err(|error| error.to_string())?);
+    let mut cache = cache.lock().expect("view code cache");
+    if let Some(existing) = cache.get(&hash) {
+        return Ok(existing);
+    }
+    cache.insert(CompiledView {
+        hash,
+        source_bytes: bytes.len(),
+        component: component.clone(),
+    });
+    Ok(component)
+}
+
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -2371,6 +2510,19 @@ fn engine() -> &'static Engine {
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        match crate::backend::cache_dir() {
+            Ok(directory) => {
+                let mut cache = CacheConfig::new();
+                cache.with_directory(directory.join("view-code"));
+                match Cache::new(cache) {
+                    Ok(cache) => {
+                        config.cache(Some(cache));
+                    }
+                    Err(error) => tracing::warn!(reason = "view_cache_unavailable", %error),
+                }
+            }
+            Err(error) => tracing::warn!(reason = "view_cache_directory_unavailable", %error),
+        }
         let engine = Engine::new(&config).expect("wasmtime engine");
         // The clock every tick's deadline is measured against: one thread
         // for the process, never stopped.
@@ -2429,28 +2581,54 @@ impl Guest {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let source = match runtime.block_on(view_source::resolve(client, module)) {
+        let started = Instant::now();
+        let mut timing = LoadTiming {
+            // the mount is the tab's first draw; a later load is one the
+            // connection asked for, over a view drawn or not
+            path: if generation == 0 { "tab" } else { "first" },
+            ..LoadTiming::default()
+        };
+        let mut asked = view_source::Asked::default();
+        let source = runtime.block_on(view_source::resolve(client, module, &mut asked));
+        timing.status = asked.status;
+        timing.fetch = asked.fetch;
+        let source = match source {
             Ok(source) => source,
             Err(error) => {
                 let reason = error.to_string();
                 logged(None, "Failed", &reason);
+                timing.log(module, None, started, "Failed");
                 return Err(reason);
             }
         };
         let (hash, component, assets) = match source {
             ViewSource::NotActivated => {
                 logged(None, "NotActivated", "");
+                timing.log(module, None, started, "NotActivated");
                 return Err(format!("the {module} module is not activated yet"));
             }
             ViewSource::Missing { hash } => {
                 // a removal answered late, after the code moved on, is not
                 // the current deployment's word
-                if !runtime.block_on(still_active(client, module, hash))? {
+                let checked = Instant::now();
+                let active = runtime.block_on(still_active(client, module, hash));
+                timing.check = checked.elapsed();
+                let active = match active {
+                    Ok(active) => active,
+                    Err(reason) => {
+                        logged(Some(&hash), "Failed", &reason);
+                        timing.log(module, Some(&hash), started, "Failed");
+                        return Err(reason);
+                    }
+                };
+                if !active {
                     let reason = "the active code moved while the view was prepared";
                     logged(Some(&hash), "Failed", reason);
+                    timing.log(module, Some(&hash), started, "Failed");
                     return Err(reason.to_owned());
                 }
                 logged(Some(&hash), "Missing", "");
+                timing.log(module, Some(&hash), started, "Missing");
                 return Ok(Loaded::Empty(hash));
             }
             ViewSource::Ready {
@@ -2472,37 +2650,68 @@ impl Guest {
                     _ => None,
                 }
             };
-            let mut fresh = Self::instantiate(module, &component, &shown)?;
-            fresh.deployed(hash, assets);
-            match against {
-                // a view drawn carries its state over
-                Some((_, ticks)) if ticks > 0 => {
-                    let snapshot = {
-                        let mut locked = mounted.lock().expect("module view lock");
-                        let Slot::Ready(old) = &mut locked.slot else {
-                            return Err("the view left while its replacement was prepared".into());
-                        };
-                        if !old.settled() {
-                            return Err("the view has pending work; its replacement waits".into());
-                        }
-                        old.snapshot()?
-                    };
-                    wire::Snapshot::decode(&snapshot)?;
-                    fresh.restore(&snapshot, &shown)?;
-                    fresh.first_frame(&shown)?;
-                }
-                // one mounted but never ticked has no state worth carrying;
-                // its replacement still proves its first tree before it
-                // takes the slot
-                Some(_) => {
-                    fresh.init(&shown)?;
-                    fresh.first_frame(&shown)?;
-                }
-                None => fresh.init(&shown)?,
+            if against.is_some() {
+                timing.path = "swap";
             }
+            let compiled = Instant::now();
+            let component = Self::compile(&component, &shown);
+            timing.compile = compiled.elapsed();
+            let component = component?;
+            let seated = Instant::now();
+            let prepared = (|| -> Result<Self, String> {
+                let mut fresh = Self::instantiate(module, &component, &shown)?;
+                fresh.deployed(hash, assets);
+                match against {
+                    // a view drawn carries its state over
+                    Some((_, ticks)) if ticks > 0 => {
+                        let snapshot = {
+                            let mut locked = mounted.lock().expect("module view lock");
+                            let Slot::Ready(old) = &mut locked.slot else {
+                                return Err(
+                                    "the view left while its replacement was prepared".into()
+                                );
+                            };
+                            if !old.settled() {
+                                return Err(
+                                    "the view has pending work; its replacement waits".into()
+                                );
+                            }
+                            old.snapshot()?
+                        };
+                        wire::Snapshot::decode(&snapshot)?;
+                        fresh.restore(&snapshot, &shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    // one mounted but never ticked has no state worth carrying;
+                    // its replacement still proves its first tree before it
+                    // takes the slot
+                    Some(_) => {
+                        fresh.init(&shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    None => {
+                        fresh.init(&shown)?;
+                    }
+                }
+                Ok(fresh)
+            })();
+            // Include failed instantiate/restore/init work as well as success.
+            timing.init = seated
+                .elapsed()
+                .saturating_sub(timing.first_frame.unwrap_or_default());
+            let fresh = prepared?;
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
-            if !runtime.block_on(still_active(client, module, hash))? {
+            let checked = Instant::now();
+            let active = runtime.block_on(still_active(client, module, hash));
+            timing.check = checked.elapsed();
+            if !active? {
                 return Err("the active code moved while the view was prepared".into());
             }
             Ok(match against {
@@ -2514,12 +2723,20 @@ impl Guest {
                 None => Loaded::Fresh(Box::new(fresh)),
             })
         })();
-        match &outcome {
-            Ok(Loaded::Fresh(_)) => logged(Some(&hash), "Ready", ""),
+        let state = match &outcome {
+            Ok(Loaded::Fresh(_)) => {
+                logged(Some(&hash), "Ready", "");
+                "Ready"
+            }
+            Ok(Loaded::Unchanged) => "Unchanged",
             // `Swapped` is logged at the seat: the swap can still be refused there
-            Ok(_) => {}
-            Err(reason) => logged(Some(&hash), "Failed", reason),
-        }
+            Ok(_) => "Swap",
+            Err(reason) => {
+                logged(Some(&hash), "Failed", reason);
+                "Failed"
+            }
+        };
+        timing.log(module, Some(&hash), started, state);
         outcome
     }
 
@@ -2668,14 +2885,15 @@ impl Guest {
 
     /// The component instantiated and mounted; `shown` names it in errors.
     fn from_bytes(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
-        let mut guest = Self::instantiate(module, bytes, shown)?;
+        let component = Self::compile(bytes, shown)?;
+        let mut guest = Self::instantiate(module, &component, shown)?;
         guest.init(shown)?;
         Ok(guest)
     }
 
-    /// The component instantiated, its exports bound, nothing run yet: a
-    /// fresh view is `init`ed, a replacement `restore`d.
-    fn instantiate(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
+    /// The component's bytes checked and compiled — the cranelift stage of
+    /// a load, measured on its own.
+    fn compile(bytes: &[u8], shown: &str) -> Result<Arc<Component>, String> {
         if bytes.len() as u64 > MAX_MODULE_BYTES {
             return Err(format!(
                 "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
@@ -2684,9 +2902,17 @@ impl Guest {
         // its preferred size is for placing a new window; the tab embeds
         ui_lang_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
+        compiled_view(bytes).map_err(|error| format!("{shown}: {error}"))
+    }
+
+    /// The component instantiated, its exports bound, nothing run yet: a
+    /// fresh view is `init`ed, a replacement `restore`d.
+    fn instantiate(
+        module: &'static str,
+        component: &Component,
+        shown: &str,
+    ) -> Result<Self, String> {
         let engine = engine();
-        let component =
-            Component::new(engine, bytes).map_err(|error| format!("{shown}: {error}"))?;
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
         // instances — the app, the stub adapters `cargo ice bundle` gave it,
@@ -2723,11 +2949,11 @@ impl Guest {
             )
             .map_err(|error| error.to_string())?;
         linker
-            .define_unknown_imports_as_traps(&component)
+            .define_unknown_imports_as_traps(component)
             .map_err(|error| error.to_string())?;
         arm(&mut store);
         let instance = linker
-            .instantiate(&mut store, &component)
+            .instantiate(&mut store, component)
             .map_err(|error| format!("{shown}: {}", first_line(&error)))?;
         let init = instance
             .get_typed_func::<(bool,), ()>(&mut store, "init")
@@ -3235,6 +3461,103 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // Explicit manual measurement, not a wall-clock performance assertion.
+    // Use a fresh XDG cache directory for cold-cache evidence.
+    #[test]
+    #[ignore = "requires DUCKTAPE_BENCH_VIEW pointing to a matching governance guest"]
+    fn measure_governance_view_code_and_first_tree() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let path =
+            std::env::var_os("DUCKTAPE_BENCH_VIEW").expect("DUCKTAPE_BENCH_VIEW is required");
+        let bytes = std::fs::read(path).expect("read matching governance wasm");
+        let mut config = Config::new();
+        config.cranelift_opt_level(OptLevel::Speed);
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let uncached = Engine::new(&config).unwrap();
+        let before = Instant::now();
+        let baseline = Component::new(&uncached, &bytes).expect("uncached compilation");
+        let baseline_time = before.elapsed();
+        drop(baseline);
+        let before = Instant::now();
+        let cold = Guest::compile(&bytes, "benchmark").unwrap();
+        let cold_time = before.elapsed();
+        let before = Instant::now();
+        let warm = Guest::compile(&bytes, "benchmark").unwrap();
+        let warm_time = before.elapsed();
+        assert!(
+            Arc::ptr_eq(&cold, &warm),
+            "actual guest code must be reused"
+        );
+        let before = Instant::now();
+        let mut first = Guest::instantiate("governance", &warm, "benchmark").unwrap();
+        first.init("benchmark").unwrap();
+        let initialized = before.elapsed();
+        let before = Instant::now();
+        first.redraw(&register());
+        first.redraw(&register());
+        assert!(first.fault.is_none(), "{:?}", first.fault);
+        assert!(
+            texts(&first).iter().any(|text| text == "node-7"),
+            "real register tree: {:?}",
+            texts(&first)
+        );
+        let tree_time = before.elapsed();
+        let second = Guest::from_bytes("governance", &bytes, "benchmark").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.alive, &second.alive),
+            "code reuse must not reuse mutable instances"
+        );
+        assert!(second.frame.root.is_none());
+        tracing::info!(
+            baseline_compile_us = baseline_time.as_micros(),
+            cold_compile_us = cold_time.as_micros(),
+            warm_compile_us = warm_time.as_micros(),
+            instantiate_init_us = initialized.as_micros(),
+            first_tree_us = tree_time.as_micros(),
+            source_bytes = bytes.len(),
+            "view_code_benchmark"
+        );
+    }
+
+    #[test]
+    fn view_code_reuses_identical_bytes_but_not_changed_code() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let first = compile_view(&engine, &cache, b"(component)").unwrap();
+        let repeated = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &repeated),
+            "warm loads must reuse compiled code"
+        );
+        let changed = compile_view(&engine, &cache, b"(component (type (func)))").unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(compile_view(&engine, &cache, b"invalid wasm").is_err());
+        assert_eq!(cache.lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn view_code_evicts_old_entries_and_bounds_retained_source_size() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let oldest = compile_view(&engine, &cache, b"(component)").unwrap();
+        for i in 0..COMPILED_VIEW_LIMIT {
+            let source = format!("(component) ;; entry {i}");
+            compile_view(&engine, &cache, source.as_bytes()).unwrap();
+        }
+        assert_eq!(cache.lock().unwrap().entries.len(), COMPILED_VIEW_LIMIT);
+        let revisited = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(!Arc::ptr_eq(&oldest, &revisited));
+        let mut retained = cache.lock().unwrap();
+        retained.insert(CompiledView {
+            hash: [99; 32],
+            source_bytes: COMPILED_VIEW_SOURCE_BYTES,
+            component: revisited,
+        });
+        assert_eq!(retained.entries.len(), 1);
+        assert_eq!(retained.entries[0].hash, [99; 32]);
+    }
 
     fn event(kind: &str, detail: &str) -> ModuleViewEvent {
         ModuleViewEvent {
@@ -5054,6 +5377,76 @@ pub(crate) mod tests {
         assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["c.svg"]);
+    }
+
+    /// Every module-owned load leaves one `view_load` line naming its path
+    /// and the time of each of its stages — the node's two answers, the
+    /// compile, the instance, the tree a replacement proves, the second
+    /// look at the registry — so where a "Loading" wait goes is read off
+    /// the log, not guessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_load_reports_the_time_of_each_of_its_stages() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged = staged("governance").expect("build the governance guest before this test");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let lines = super::canary::tap();
+        let _mounted = fresh("governance");
+        join_all(connected(&client));
+        node.deploy("governance", &b);
+        join_all(deployments_checked().await);
+
+        let loads: Vec<String> = lines
+            .try_iter()
+            .filter(|line| line.starts_with("view_load module=governance "))
+            .collect();
+        let field = |line: &str, name: &str| -> String {
+            line.split_whitespace()
+                .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("no {name} in {line}"))
+                .to_owned()
+        };
+        let of = |hash: [u8; 32]| -> String {
+            let hash = crate::backend::hex_encode(&hash);
+            loads
+                .iter()
+                .find(|line| field(line, "hash") == hash)
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for {hash} in {loads:?}"))
+        };
+        let (first, swap) = (of(a.hash()), of(b.hash()));
+        assert_eq!(field(&first, "path"), "first");
+        assert_eq!(field(&first, "outcome"), "Ready");
+        assert_eq!(
+            field(&first, "first_frame_ms"),
+            "-",
+            "a fresh view draws its first tree on the window thread"
+        );
+        assert_eq!(field(&swap, "path"), "swap");
+        assert_eq!(field(&swap, "outcome"), "Swap");
+        field(&swap, "first_frame_ms")
+            .parse::<u128>()
+            .expect("the replacement's first frame is timed");
+        for line in [&first, &swap] {
+            let ms = |name: &str| {
+                field(line, name)
+                    .parse::<u128>()
+                    .unwrap_or_else(|_| panic!("{name} in {line}"))
+            };
+            let total = ms("total_ms");
+            let stages = ms("status_ms")
+                + ms("fetch_ms")
+                + ms("compile_ms")
+                + ms("init_ms")
+                + ms("check_ms");
+            assert!(total >= stages, "{line}");
+        }
     }
 
     /// A view mounted but not yet ticked names its instance too: a tick
