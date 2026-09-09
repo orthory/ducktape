@@ -60,6 +60,9 @@ fn register(rows: Vec<AgentRow>, account: &str, committed: i64) -> Vec<u8> {
         connected: true,
         answered: true,
         dark: false,
+        // the messages pane's own tests are `tests/messaging.rs`; the register
+        // draws with nothing open beside it
+        messaging: agents_view::host::MessagingProps::default(),
     })
     .expect("props encode")
 }
