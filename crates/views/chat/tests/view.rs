@@ -334,6 +334,90 @@ fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
     });
 }
 
+/// How many cards for this run are on the frame. The status is per-card, so
+/// counting it counts cards.
+fn cards(frame: &Frame) -> usize {
+    texts(frame)
+        .iter()
+        .filter(|text| *text == "Reading the repo")
+        .count()
+}
+
+/// ONE RUN, ONE CARD, whichever surface is in front of the reader.
+///
+/// The stream draws a card under the anchor and the rail draws one at its foot.
+/// With the run's OWN thread open both were true at once — two cards and two
+/// Stops for one run. The rail owns it while the rail is on screen; the stream
+/// takes it back when it is not.
+///
+/// The settings case is the one a seq-only suppression gets wrong: the drawer
+/// replaces the rail while `active_thread_seq` still stands, so "a thread is
+/// open" would have hidden BOTH cards and left the run with no Stop at all.
+#[test]
+fn one_run_draws_exactly_one_card_whichever_surface_owns_it() {
+    on_a_deep_stack(|| {
+        let run = live_run(2);
+        let closed = ChatProps {
+            live_agents: vec![run.clone()],
+            ..facts()
+        };
+        let (subscription, frame) = shown(&closed);
+        assert_eq!(cards(&frame), 1, "the stream draws it: {:?}", texts(&frame));
+        assert!(has_text(&frame, "ferris"));
+
+        // THE RAIL OPENS ON THE RUN'S OWN THREAD. Its card moves; it does not
+        // multiply.
+        let mut root = message(2, "second wind");
+        root.reply_count = 1;
+        let railed = ChatProps {
+            active_thread_seq: 2,
+            thread_messages: vec![root.clone()],
+            live_agents: vec![run.clone()],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&railed))]);
+        assert_eq!(
+            cards(&frame),
+            1,
+            "the rail has it AND the stream still drew one: {:?}",
+            texts(&frame)
+        );
+        // the Stop still routes, and there is exactly one of it
+        let frame = tick_native(press(&frame, "Stop"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.cancel_run");
+        assert_eq!(
+            serde_json::from_slice::<RunId>(&intent.payload).expect("decodes"),
+            RunId {
+                run_id: run.run_id.clone()
+            },
+            "the same run the stream's card would have stopped"
+        );
+
+        // THE SETTINGS DRAWER REPLACES THE RAIL while the thread stays open.
+        // The card belongs to the stream again — suppressing on the seq alone
+        // would leave the reader no card and no Stop.
+        let drawered = ChatProps {
+            active_thread_seq: 2,
+            channel_settings_open: true,
+            thread_messages: vec![root],
+            live_agents: vec![run],
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&drawered))]);
+        assert_eq!(
+            cards(&frame),
+            1,
+            "the drawer hid the rail and took the card with it: {:?}",
+            texts(&frame)
+        );
+
+        // AND BACK TO THE STREAM when the rail closes.
+        let frame = tick_native(vec![item(subscription, &encoded(&closed))]);
+        assert_eq!(cards(&frame), 1, "{:?}", texts(&frame));
+    });
+}
+
 /// The anchor decides WHERE, and a run summoned inside a thread belongs to the
 /// rail: its anchor is a reply, which the stream never draws, so the stream
 /// must stay clean and the rail must claim it through `thread_root`.

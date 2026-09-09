@@ -123,6 +123,8 @@ extern crate::host
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
   pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveAgentRow]) -> Timeline
+  pure run_in_thread(live:&LiveAgentRow, active_thread_seq:i64) -> bool
+  pure rail_owns_run(live:&LiveAgentRow, rail_shown:bool, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool

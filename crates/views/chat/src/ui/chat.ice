@@ -20,7 +20,7 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], rail_shown:bool, active_thread_seq:i64, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
     cancel_run(str)
     add_reaction_at(i64, str)
@@ -115,8 +115,14 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], un
       // this loop sits INSIDE the row loop — a `keyed live ... by=anchor_seq`
       // here mints the same key once per message on screen, so a single run
       // turned into one duplicate-keyed scope per visible row.
+      //
+      // AND NOT WHEN THE RAIL HAS IT. With the run's own thread open, the
+      // anchor match here and the rail's match below were both true: two cards
+      // and two Stops for one run. `rail_owns_run` is the one rule both
+      // surfaces read, so the card moves to the rail and comes back when it
+      // closes.
       for live in live_agents
-        if live.anchor_seq == message.seq
+        if live.anchor_seq == message.seq && !rail_owns_run(live, rail_shown, active_thread_seq)
           LiveAgentCard live=live
             forward
               cancel_run
@@ -855,11 +861,20 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                           // the quiet rows always did: the reaction handlers
                           // keep refusing while loading; the openers never
                           // did.
-                          lazy timeline by active_channel, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_timeline
+                          // `active_thread_seq` AND `channel_settings_open` are
+                          // memo keys because the stream's own card now depends
+                          // on both: opening the rail on a run's thread moves
+                          // that card out of here, and the settings drawer
+                          // hiding the rail moves it back. Leave either out and
+                          // the cached frame keeps the card the other surface is
+                          // also drawing.
+                          lazy timeline by active_channel, active_thread_seq, channel_settings_open, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_timeline
                             MessageTimeline
                               with
                                 messages=cached_timeline.messages
                                 live_agents=cached_timeline.live_agents
+                                rail_shown=(active_thread_seq > 0 && !channel_settings_open)
+                                active_thread_seq
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
@@ -1808,7 +1823,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                       // `thread_root`, because its answer posts into the same
                       // thread the reply lives in.
                       for live in live_agents
-                        if live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
+                        if run_in_thread(live, active_thread_seq)
                           LiveAgentCard live=live
                             forward
                               cancel_run
