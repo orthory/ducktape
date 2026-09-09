@@ -391,8 +391,9 @@ test password_screen_read_only_escape_contract
 // A NETWORK PICK OPENS THE DOOR ITS KEYSTORE NAMES — the launch window's
 // load-bearing branch. Rows land on the wallet list with the active row
 // picked; an empty keystore lands on the password step, carrying the
-// listing's error. No keystore at all (a remote) opens the console — a
-// window task, not dispatched here.
+// listing's error. A keystore that could not be NAMED (a remote whose node
+// never answered) opens nothing: the step stays where it was and the error
+// shows there. There is no door that opens the console read-only on its own.
 test a_network_pick_opens_the_door_its_keystore_names
   preset ui_pick_probe
   dispatch wallets_loaded(wallet_list([wallet_info("alice", "aabbccddeeff00112233", "encrypted", false), wallet_info("demo", "eeff0011", "encrypted", true)], "", true))
@@ -403,6 +404,11 @@ test a_network_pick_opens_the_door_its_keystore_names
   expect hub_step == HubStep.password
   expect hub_wallet_selected == ""
   expect onboarding_error == "the keystore listing is unreadable"
+  dispatch pick_network("remote")
+  dispatch wallets_loaded(wallet_list([], "this node could not be reached", false))
+  expect hub_step == HubStep.password
+  expect onboarding_error == "this node could not be reached"
+  expect mutation_phase == MutationPhase.idle
 
 // THE PHRASE SCREEN, on a FIXED mnemonic. `phrase_rows_of` is mounted rather
 // than `phrase_rows` on purpose: the live one reads the phrase a real mint is
