@@ -323,13 +323,9 @@ fn restore_composer(scope: &str, blocked: bool) {
     let _ = composer::interact(scope, "message", false, blocked, Interaction::Restore);
 }
 
-fn compose(text: &str) -> iced::widget::text_editor::Content {
-    iced::widget::text_editor::Content::with_text(text)
-}
-
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
-    app.page_editor.text()
+    app.page_text.clone()
 }
 
 fn default_ice_color(name: &str) -> iced::Color {
@@ -513,7 +509,7 @@ fn assert_no_polling(lifecycle: &str) {
             // the page document's write gate: dirty IS the condition, so the
             // tick exists only while the buffer has drifted from the node's
             // text — not a poll, an edit-driven flush.
-            "every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick",
+            "every 900ms when (connected && !empty(active_page) && page_text != page_saved_text) -> page_autosave_tick",
         ]
     );
 }
@@ -566,7 +562,7 @@ fn reading_alpha() -> Ducktape {
     app.active_page_title = "Alpha".into();
     app.active_page_parent = "Root".into();
     app.blocks = vec![page_block("alpha-1", "alpha", "alpha body")];
-    app.page_editor = compose("Alpha\nalpha body");
+    app.page_text = "Alpha\nalpha body".into();
     app.page_saved_text = "Alpha\nalpha body".into();
     app.buffer_page = "alpha".into();
     app

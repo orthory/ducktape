@@ -60,11 +60,10 @@ on pages_view_event(event)
       flow
         from done event_text(event, "draft")
         done -> discard_orphaned_comment_draft _
-    // The host-painted document queued one event per intent; take it and
-    // run the document's one edit route on it.
+    // Recheck the accepted source and instance at the document handler.
     PagesIntent.edited
       flow
-        from done page_document_take()
+        from done event
         done -> page_edited _
     PagesIntent.toggle_comments
       block_comment_draft = event_text(event, "comment_draft")
@@ -215,7 +214,7 @@ on choose_page(id)
   blocks = keep_blocks(page_moved, [], blocks)
   // The buffer and its baseline move together, always — a blank buffer with a
   // stale baseline would read as dirty and the save tick would write it back.
-  page_editor = installed_page_editor(page_editor, page_moved, "")
+  page_text = installed_page_text(page_text, page_moved, "")
   page_saved_text = keep_str(page_moved, "", page_saved_text)
   buffer_page = keep_str(page_moved, "", buffer_page)
   hydration_generation = hydration_generation + 1
@@ -549,12 +548,14 @@ on pages_updated(next)
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_text = installed_page_text(page_text, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   // The buffer now holds THIS page. Unconditional on purpose: the install is
   // refused only when the decision already found the page unchanged.
@@ -595,7 +596,9 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -620,7 +623,7 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_editor = installed_page_editor(page_editor, page_install, page_landing)
+  page_text = installed_page_text(page_text, page_install, page_landing)
   page_saved_text = keep_str(page_install, page_landing, page_saved_text)
   buffer_page = next.active_page
   page_refusal = ""
@@ -677,13 +680,14 @@ on close_doc_tab(id)
     run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
     run replace lane=page_load load_page(connected_rpc, active_page) -> pages_updated _ | failed _
 
-// THE DOCUMENT'S ONE EDIT ROUTE. Every key lands here: `apply_page_action`
-// resolves the list/indent behaviours in the buffer and NOTHING reaches the
-// node — the save tick below is the only write path, which is what keeps
-// typing at buffer speed on a consensus-backed document.
+// Accepted guest edits update the save buffer only after the host resolves
+// their exact canonical reference in the current page and connection.
 on page_edited(event)
-  page_editor = apply_page_event(page_editor, event)
-  caret_comment_target = block_at_line_target(blocks, editor_cursor_line(page_editor))
+  let document = accept_page_document(event, network_chain_id, active_page)
+  return if !document.accepted
+  page_text = document.text
+  page_cursor_line = document.cursor_line
+  caret_comment_target = block_at_line_target(blocks, keep_i64(document.comment_line >= 0, document.comment_line, page_cursor_line))
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""
@@ -691,7 +695,7 @@ on page_edited(event)
   // at its reset value whenever the rail is closed (every close path resets
   // them), so opening is just the flip plus the thread load. A badge press
   // with the rail already open is a no-op.
-  let page_rail_open = page_opens_comments(event) && !block_comments_open && !loading && mutation_phase == MutationPhase.idle && !empty(active_page)
+  let page_rail_open = document.comment_line >= 0 && !block_comments_open && !loading && mutation_phase == MutationPhase.idle && !empty(active_page)
   block_comments_generation = block_comments_generation + keep_i64(page_rail_open, 1, 0)
   block_comments_open = block_comments_open || page_rail_open
   block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
@@ -702,7 +706,7 @@ on page_edited(event)
   // network scope. It never touched the buffer either way. The two runs are
   // exclusive by event kind; each backend treats an empty argument as "not my
   // turn" and answers without side effects.
-  let page_link = page_link_of(event)
+  let page_link = document.link
   return if empty(page_link) && !page_rail_open
   parallel
     run every duck_echo_str(page_link) -> open_message_link _ | external_url_failed _
@@ -714,7 +718,7 @@ on external_url_failed(cause)
   error = cause.message
 
 // THE PAGE SAVES ON A GATED TICK, not per keystroke: the editor's edits land
-// in `page_editor` without passing through a handler on the way to the node,
+// in `page_text` without passing through a handler on the way to the node,
 // so dirtiness is the buffer's drift from `page_saved_text` and the subscribe
 // block's `every` line only exists while that drift does.
 on page_autosave_tick
@@ -729,11 +733,14 @@ on page_autosave_tick
   // had: the page the reader never got to see would be destroyed by the act of
   // failing to open it.
   return if active_page != buffer_page
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  return if !observed.ready
   // One op chain at a time: a multi-op save routinely outlives the 900ms
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
   return if block_autosave_status == AutosaveStatus.saving
-  let text = editor_text(page_editor)
+  let text = page_text
   return if text == page_saved_text
   // An open ``` swallows every line under it when parsed — the save waits
   // for the close instead of writing (or refusing) a half-typed fence, and
@@ -769,8 +776,10 @@ on page_document_saved(next)
   // since the tick submitted. Otherwise the buffer is kept (the newest words
   // must survive), the baseline moves to the node's text, and the still-dirty
   // buffer re-plans on the next tick with the refusal line explaining why.
-  let untouched = editor_text(page_editor) == page_inflight_text
-  page_editor = rolled_back_editor(page_editor, untouched, next.document)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let untouched = observed.ready && page_text == page_inflight_text
+  page_text = rolled_back_text(page_text, untouched, next.document)
   // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
   // round trip, and `untouched` above exists because of it. Adopting her
   // unsaved line 0 here would make the document read clean and retire the very

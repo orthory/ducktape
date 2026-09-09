@@ -46,32 +46,40 @@ pub fn page_document_text(title: String, blocks: Vec<PageBlock>) -> String {
 /// text actually differs. A dirty buffer is the user still typing — dropping
 /// their caret (or their words) to install a remote edit is the worst thing
 /// this surface can do, so a remote change simply waits for the next save.
-pub fn refreshed_page_editor(
-    document: iced::widget::text_editor::Content,
+pub fn refreshed_page_buffer(
+    document: String,
     title: String,
     blocks: Vec<PageBlock>,
     saved: String,
-) -> iced::widget::text_editor::Content {
-    match refreshed_page_text(&document.text(), &title, &blocks, &saved) {
-        Some(canonical) => iced::widget::text_editor::Content::with_text(&canonical),
+    ready: bool,
+) -> String {
+    if !ready {
+        return document;
+    }
+    match refreshed_page_text(&document, &title, &blocks, &saved) {
+        Some(canonical) => {
+            crate::module_view::pages_document::source_changed();
+            canonical
+        }
         None => document,
     }
 }
 
-/// The saved-baseline mirror of [`refreshed_page_editor`] — the SAME decision
+/// The saved-baseline mirror of [`refreshed_page_buffer`] — the SAME decision
 /// on the SAME inputs, so the buffer and its dirty baseline move together.
 ///
-/// Takes the buffer's TEXT (`editor_text(page_editor)` at the call site), not
-/// the editor: a by-value `editor` at the extern boundary is a `Content::clone`,
-/// and iced's clone is `with_text(&self.text())` — a whole second cosmic-text
-/// buffer shaped under a WRITE lock on the process-global font system, per
-/// live delta.
+/// Both projections require a verified source: an uninstalled or replaced
+/// guest must not authorize replacing the app's last known save buffer.
 pub fn refreshed_page_saved(
     text: String,
     title: String,
     blocks: Vec<PageBlock>,
     saved: String,
+    ready: bool,
 ) -> String {
+    if !ready {
+        return saved;
+    }
     refreshed_page_text(&text, &title, &blocks, &saved).unwrap_or(saved)
 }
 
@@ -109,37 +117,19 @@ pub fn install_decision(
     clean && canonical != saved
 }
 
-pub fn installed_page_editor(
-    document: iced::widget::text_editor::Content,
-    install: bool,
-    canonical: String,
-) -> iced::widget::text_editor::Content {
-    match install {
-        true => {
-            // The buffer is another page's now: undoing across the swap would
-            // restore the PREVIOUS page's text here, and a menu opened on it
-            // would hang over unrelated lines.
-            crate::pages::history::reset();
-            crate::pages::menu::close();
-            iced::widget::text_editor::Content::with_text(&canonical)
-        }
-        false => document,
+pub fn installed_page_text(document: String, install: bool, canonical: String) -> String {
+    if install {
+        crate::module_view::pages_document::source_changed();
+        canonical
+    } else {
+        document
     }
 }
 
-/// A refusal rolls the buffer back ONLY when nothing was typed since the tick
-/// submitted — otherwise the rollback would eat the user's newest words along
-/// with the refused edit. A kept buffer stays dirty against the canonical
-/// baseline, so the refusal re-plans (and re-explains) until resolved.
-pub fn rolled_back_editor(
-    document: iced::widget::text_editor::Content,
-    untouched: bool,
-    canonical: String,
-) -> iced::widget::text_editor::Content {
-    match untouched {
-        true => iced::widget::text_editor::Content::with_text(&canonical),
-        false => document,
-    }
+/// A refused save restores its canonical buffer only while the user has not
+/// typed anything newer. A successful replacement establishes a new source.
+pub fn rolled_back_text(document: String, untouched: bool, canonical: String) -> String {
+    installed_page_text(document, untouched, canonical)
 }
 
 /// The dirty baseline after a save settles.

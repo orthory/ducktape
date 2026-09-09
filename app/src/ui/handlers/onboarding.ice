@@ -527,7 +527,8 @@ on console_opened(id)
   pending_block_comment = ""
   commented_block_hits = []
   caret_comment_target = ""
-  page_editor = editor("")
+  page_text = installed_page_text(page_text, true, "")
+  page_cursor_line = 0
   page_saved_text = ""
   buffer_page = ""
   page_inflight_text = ""

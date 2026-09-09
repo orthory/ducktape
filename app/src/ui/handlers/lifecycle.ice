@@ -147,7 +147,8 @@ on reconnect
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_editor = editor("")
+  page_text = installed_page_text(page_text, true, "")
+  page_cursor_line = 0
   page_saved_text = ""
   buffer_page = ""
   page_refusal = ""
@@ -371,8 +372,10 @@ on live_updated(next)
       blocks = apply_page_text(blocks, next.pages)
       block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
       active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-      let folded_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
-      page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+      let observed = current_page_document(network_chain_id, buffer_page, page_text)
+      page_text = observed.text
+      let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+      page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
       page_saved_text = folded_saved
       return if !next.load_pages
       hydration_generation = hydration_generation + 1
@@ -620,8 +623,10 @@ on live_resynced(next)
   // canonical text only replaces the buffer when the editor is CLEAN and the
   // text actually differs — a rebuilt `Content` throws the cursor to the
   // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
-  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let resynced_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+  page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
   page_saved_text = resynced_saved
   // The buffer's own page follows the buffer, and only when this resync
   // actually carried page news AND the buffer moved with it.
@@ -638,7 +643,7 @@ on live_resynced(next)
   // came from the node. Claiming that as the new page's buffer hands
   // `page_autosave_tick` a fabricated document it is willing to write: the
   // page would be overwritten with a blank one it never loaded.
-  let resynced_buffer_is_clean = editor_text(page_editor) == page_saved_text
+  let resynced_buffer_is_clean = page_text == page_saved_text
   buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   // THE RECOVERY'S TERMINAL. `mutation_failed` parks the lock at "recovering"
   // for a write the node COMMITTED and then failed to read back, and launches
@@ -1086,10 +1091,10 @@ subscribe
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
-  // The page document's autosave: the editor's edits never pass through a
-  // handler, so the gate IS the dirty test — the tick only exists while the
-  // buffer has drifted from the last text known written.
-  every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
+  // Poll the hydrated page even while the app mirror looks clean: a guest
+  // replacement may preserve edits whose old-instance notification is refused.
+  // The handler reads the canonical document before its dirty/no-op check.
+  every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick
 
 // CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
 // This unregisters the slot the closed window held; on a Mac the daemon goes

@@ -32,7 +32,8 @@ state
 
   // The document is one editor buffer. Drift from the last saved text is the
   // dirty signal; `buffer_page` names what that buffer actually contains.
-  page_editor:editor = ""
+  page_text = ""
+  page_cursor_line:i64 = 0
   page_saved_text = ""
   buffer_page = ""
   commented_block_hits:[str] = []

@@ -997,7 +997,7 @@ async fn allocate_sequence(
         // here would hand out a sequence that is certainly taken, so the walk
         // refuses instead of overflowing.
         low = high.checked_add(1).ok_or(SEQUENCE_EXHAUSTED)?;
-        high = high.checked_mul(2).unwrap_or(u64::MAX);
+        high = high.saturating_mul(2);
     }
     // narrow onto the first free one in [low, high]
     while low < high {

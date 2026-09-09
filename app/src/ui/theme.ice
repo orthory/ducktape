@@ -19,6 +19,8 @@ recipe icon_action for button
   @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50 focus-visible:border-ring
 
 theme contract AppTheme
+  document_ink
+  document_selection
   bg
   surface
   fg
@@ -149,6 +151,8 @@ theme contract AppTheme
 // Surfaces first, then the lines that separate them, then the ink ramp, then
 // the functional layers.
 palette app for AppTheme
+  document_ink #3a3833
+  document_selection #d4d2ca
   bg         #fdfdfb
   surface    #ffffff
   fg         #2c2b27
@@ -328,6 +332,8 @@ palette app for AppTheme
 // (they were tuned as signals, not surfaces), and every `fg/N` composite in
 // the screens adapts automatically because `fg` itself flips.
 palette app_dark for AppTheme
+  document_ink #d4d2ca
+  document_selection #45443c
   bg         #1b1a16
   surface    #22211d
   fg         #e8e6df

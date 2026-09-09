@@ -60,12 +60,14 @@ tells the view which drafts it consumed. Files keeps an unsaved text edit with i
 original file and network when navigation changes. Returning to that file
 resumes the same edit; only an explicit discard or that save's successful
 reply clears it. Saving uses the snapshot that supplied the original text,
-so an intervening edit is refused without losing the draft. A view may also leave the host a
-whole editor: the Pages document is the app's own `page_document` (its
-buffer, history and save tick never cross), painted into the view's slot
-from what the tab was last drawn with (`pages/surface.rs`); the view's page,
-search and comment drafts leave with the act that reads them, and the app
-hands one back only by moving `seed_rev`.
+so an intervening edit is refused without losing the draft. Pages owns its
+Markdown editor, selection and undo history in the guest. Initial source arrives
+in bounded chunks, and only an accepted canonical revision updates the app's
+save buffer. A replacement preserves that editor and undo history; old-instance
+notifications cannot overwrite it. Presentation that exceeds its bounds uses a
+plain editor with a visible notice, retaining all text and history. Page, search
+and comment drafts leave with the act that reads them; the app hands one back
+only by moving `seed_rev`.
 The Shell view goes further: its
 composer, its terminal and its answer Markdown are host surfaces, so a task's
 words never cross the wire — the host's composer raises the `send` intent

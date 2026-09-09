@@ -172,9 +172,8 @@ on global_key_pressed(event)
   // needed a `composer_focus` discriminant to guess which one was focused.
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press names no move.
-  let pages_ready = connected && shell_tab == ShellTab.pages && !palette_open && !page_delete_armed
   let palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
-  return if empty(escape_key) && palette_key == "none" && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
+  return if empty(escape_key) && palette_key == "none"
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
   thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
@@ -189,7 +188,6 @@ on global_key_pressed(event)
   page_delete_armed = page_delete_armed && escape_key != "page_delete"
   fs_delete_target = keep_str(escape_key == "fs_delete", "", fs_delete_target)
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
-  page_editor = page_history_key(page_editor, page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   invalidate lane=palette_search

@@ -18,6 +18,8 @@
 
 mod display_budget;
 
+pub(crate) mod pages_document;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1038,14 +1040,8 @@ fn shell_terminal() -> &'static Mutex<Option<crate::backend::AgentTerminalSessio
 
 // ---------- the pages seat ----------
 
-/// The Pages tab: the facts the app holds, drawn by the `pages` view. The
-/// document is NOT among them — it is the app's editor, stashed for the
-/// `page_document` surface the view leaves a slot for (`crate::pages::surface`)
-/// and painted there by the host. Its intents come back one per act
-/// (`pages_intent`); the drafts the view holds cross only with the act that
-/// reads them, and `seed_rev` moving tells the view to take `page_draft` /
-/// `block_comment_draft` back as its own (a recovered comment, a refused
-/// post or create handed back).
+/// Pages supplies metadata and a stable source identity. Document bytes use
+/// bounded chunks, and accepted guest edits feed the existing app save buffer.
 #[allow(
     clippy::too_many_arguments,
     reason = "the Ice extern hands the screen's facts one by one"
@@ -1076,7 +1072,8 @@ pub fn pages_view(
     caret_comment_target: &str,
     active_thread_anchor: &str,
     orphaned_comment_drafts: &[String],
-    page_editor: &iced::widget::text_editor::Content,
+    page_text: &str,
+    buffer_page: &str,
     block_comments_open: bool,
     thread_total: i64,
     threads: &[crate::backend::PageCommentThread],
@@ -1088,13 +1085,20 @@ pub fn pages_view(
     comments_loading: bool,
     comments_has_more: bool,
 ) -> Element<'static, ModuleViewEvent> {
-    crate::pages::surface::show(
-        page_editor,
-        dark,
-        loading || !connected,
-        blocks,
-        commented_block_hits,
-    );
+    let source = if loading || active_page.is_empty() || buffer_page != active_page {
+        Ok(Vec::new())
+    } else {
+        pages_document::source(
+            connection().lock().expect("views rpc").rev,
+            network_chain_id,
+            active_page,
+            page_text,
+        )
+    };
+    let (source, source_error) = match source {
+        Ok(source) => (source, String::new()),
+        Err(error) => (Vec::new(), error.to_owned()),
+    };
     let autosave = match autosave {
         crate::AutosaveStatus::Idle => "idle",
         crate::AutosaveStatus::Saving => "saving",
@@ -1106,6 +1110,10 @@ pub fn pages_view(
         .map(|block| serde_json::json!({ "id": block.id, "title": block.text }))
         .collect();
     let props = serde_json::json!({
+        "document_source": source,
+        "document_error": source_error,
+        "comment_marks": crate::pages::comment_marks(blocks, commented_block_hits).into_iter().map(|(line, count)| crate::pages::guest_document::CommentMark { line: line as i64, count: count as i64 }).collect::<Vec<_>>(),
+        "commented_lines": crate::pages::commented_lines(blocks, commented_block_hits),
         "dark": dark,
         "connected": connected,
         "loading": loading,
@@ -1848,9 +1856,6 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
-    if module == "pages" {
-        surfaces.insert("page_document".into(), crate::pages::surface::provider());
-    }
     surfaces
 }
 
@@ -2088,6 +2093,7 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
         let mut connection = connection().lock().expect("views rpc");
         connection.rev += 1;
         connection.client = Some(client.clone());
+        pages_document::source_changed();
         connection.clone()
     };
     registry
@@ -2380,7 +2386,9 @@ fn spawn_load(
         let wanted = *wanted;
         let held_off = retry.take();
         match loaded {
-            Ok(Loaded::Fresh(guest)) => {
+            Ok(Loaded::Fresh(mut guest)) => {
+                guest.installed_generation = Some(generation);
+                guest.report_display_truncation();
                 *hash = guest.hash;
                 *slot = Slot::Ready(guest);
             }
@@ -2423,10 +2431,15 @@ fn spawn_load(
                     return;
                 }
                 fresh.frame_rev = old.frame_rev + 1;
-                fresh.inputs = std::mem::take(&mut old.inputs);
+                if let Some(root) = &fresh.frame.root
+                    && let Err(reason) = fresh.inputs.retain_restored_projections(&old.inputs, root)
+                {
+                    log_source(module, fresh.hash.as_ref(), "Failed", generation, reason);
+                    return;
+                }
+                pages_document::retain_source(old, &mut fresh);
                 fresh.pictures = std::mem::take(&mut old.pictures);
                 if let Some(root) = &mut fresh.frame.root {
-                    fresh.inputs.adopt(root);
                     fresh.pictures.adopt(root);
                     root.for_each_mut(&mut |node| match node {
                         wire::Node::Svg { bytes, .. } => *bytes = None,
@@ -2440,6 +2453,8 @@ fn spawn_load(
                     Replacement::RecoverNeverValid => "recovered_never_valid_view",
                     Replacement::Preserve => "",
                 };
+                fresh.installed_generation = Some(generation);
+                fresh.report_display_truncation();
                 log_source(module, fresh.hash.as_ref(), "Swapped", generation, reason);
                 *hash = fresh.hash;
                 *slot = Slot::Ready(fresh);
@@ -2681,6 +2696,9 @@ struct Guest {
     /// The last frame, its `root` kept across `unchanged` ticks and patched
     /// in place by a frame that carries patches instead of a tree.
     frame: wire::Frame,
+    frame_reports: display_diagnostics::FrameReports,
+    display_diagnostics: display_diagnostics::DisplayDiagnostics,
+    installed_generation: Option<u64>,
     /// Bumped when `frame.root` changes: the widget rebuilds when it sees a
     /// number it has not rendered.
     frame_rev: u64,
@@ -2695,6 +2713,9 @@ struct Guest {
     /// The guest's `<module>.props` subscription, once it asked, and the
     /// props it was last given on it.
     props_subscription: Option<u64>,
+    pages_document: pages_document::Pending,
+    pages_source: pages_document::InstalledSource,
+    pages_instance: Option<String>,
     props_sent: Option<Vec<u8>>,
     /// Separates Files save acknowledgements across fresh guest instances.
     files_save_namespace: Option<String>,
@@ -3136,6 +3157,7 @@ impl Guest {
     fn settled(&self) -> bool {
         self.fault.is_none()
             && self.pending.is_empty()
+            && self.inputs.editor_documents_status() == Ok(true)
             && (self.staged || self.frame.requests.is_empty())
     }
 
@@ -3175,19 +3197,54 @@ impl Guest {
     /// A restored instance's first tick: its whole tree, or it is no
     /// replacement. Its requests wait for the first redraw.
     fn first_frame(&mut self, shown: &str) -> Result<(), String> {
-        self.tick();
-        #[cfg(test)]
-        if tests::FIRST_FRAME_TRAPS.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.fault = Some("the first frame trapped (test)".into());
+        let mut requests = Vec::new();
+        let mut cancels = Vec::new();
+        let limit = wire::editor_document::MAX_EDITOR_DOCUMENTS
+            * (wire::editor_document::MAX_EDITOR_CHUNKS + 3)
+            + 1;
+        for _ in 0..limit {
+            self.tick();
+            #[cfg(test)]
+            if tests::FIRST_FRAME_TRAPS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.fault = Some("the first frame trapped (test)".into());
+            }
+            if let Some(fault) = &self.fault {
+                return Err(format!("{shown}: {fault}"));
+            }
+            if self.frame.root.is_none() {
+                return Err(format!(
+                    "{shown}: the replacement did not publish a complete tree"
+                ));
+            }
+            requests.append(&mut self.frame.requests);
+            cancels.append(&mut self.frame.cancels);
+            if requests.len() > MAX_REQUESTS_PER_TICK || cancels.len() > 2 * MAX_REQUESTS_PER_TICK {
+                return Err(format!(
+                    "{shown}: replacement requests exceed the first-frame budget"
+                ));
+            }
+            if self
+                .inputs
+                .editor_documents_status()
+                .map_err(str::to_owned)?
+                && self.pending.is_empty()
+            {
+                break;
+            }
         }
-        if let Some(fault) = &self.fault {
-            return Err(format!("{shown}: {fault}"));
-        }
-        if self.frame.root.is_none() {
+        if !self
+            .inputs
+            .editor_documents_status()
+            .map_err(str::to_owned)?
+            || !self.pending.is_empty()
+        {
             return Err(format!(
-                "{shown}: the replacement did not publish a complete tree"
+                "{shown}: replacement document transfer did not complete"
             ));
         }
+        requests.retain(|request| !cancels.contains(&request.id));
+        self.frame.requests = requests;
+        self.frame.cancels = cancels;
         self.ticks += 1;
         self.staged = true;
         Ok(())
@@ -3223,7 +3280,9 @@ impl Guest {
         }
         // its preferred size is for placing a new window; the tab embeds
         ui_lang_wire::manifest::read_manifest(bytes)
-            .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
+            .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?
+            .check_wire_protocol()
+            .map_err(|error| format!("{shown}: {error}"))?;
         compiled_view(bytes).map_err(|error| format!("{shown}: {error}"))
     }
 
@@ -3295,6 +3354,9 @@ impl Guest {
             tick,
             pending: Vec::new(),
             frame: wire::Frame::default(),
+            frame_reports: Default::default(),
+            display_diagnostics: Default::default(),
+            installed_generation: None,
             frame_rev: 0,
             ticks: 0,
             ever_valid_tree: false,
@@ -3302,6 +3364,10 @@ impl Guest {
             pictures: Pictures::default(),
             surfaces: surfaces_of(module),
             props_subscription: None,
+            pages_document: None,
+            pages_source: Default::default(),
+            pages_instance: (module == "pages")
+                .then(|| crate::backend::fresh_operation_id("pages-view".into())),
             props_sent: None,
             files_save_namespace: (module == "files")
                 .then(|| crate::backend::fresh_operation_id("files-view".into())),
@@ -3399,12 +3465,16 @@ impl Guest {
             return false;
         }
         self.sync_props(props);
+        pages_document::drive(self);
         if self.staged {
             // a replacement's first tree is already here; only its
             // requests and cancels are still to route
             self.staged = false;
         } else {
-            let quiet = self.ticks > 0 && !self.frame.busy && self.pending.is_empty();
+            let quiet = self.ticks > 0
+                && !self.frame.busy
+                && self.pending.is_empty()
+                && self.inputs.editor_documents_status() != Ok(false);
             if quiet {
                 return false;
             }
@@ -3421,11 +3491,22 @@ impl Guest {
             }
         }
         for id in std::mem::take(&mut self.frame.cancels) {
+            if self
+                .pages_document
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+            {
+                self.pages_document = None;
+            }
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
         }
-        self.fault.is_none() && (self.frame.busy || !self.pending.is_empty())
+        self.fault.is_none()
+            && (self.frame.busy
+                || !self.pending.is_empty()
+                || self.pages_document.is_some()
+                || self.inputs.editor_documents_status() == Ok(false))
     }
 
     /// Routes one request: the props subscription is answered from what the
@@ -3444,11 +3525,14 @@ impl Guest {
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
+            ("pages", "document") if own => pages_document::request(self, id, &payload),
             _ if own && operation == "props" => {
                 self.props_subscription = Some(id);
                 self.props_sent = None;
                 self.sync_props(props);
             }
+            ("pages", "edited") if own => pages_document::emit(self, id, &payload),
+            ("pages", "installed") if own => pages_document::installed(self, &payload),
             _ if declared_intent => self.intents.push(ModuleViewEvent {
                 kind: operation.to_owned(),
                 detail: String::from_utf8_lossy(&payload).into_owned(),
@@ -3478,6 +3562,21 @@ impl Guest {
         });
     }
 
+    fn report_display_truncation(&mut self) {
+        let Some(generation) = self.installed_generation else {
+            return;
+        };
+        for origin in self
+            .display_diagnostics
+            .observe(self.frame_reports)
+            .into_iter()
+            .flatten()
+        {
+            tracing::warn!(target: "ducktape::app", module = self.module, generation,
+                reason = "display_text_truncated", origin, "module view display text truncated");
+        }
+    }
+
     /// One call into the module with the pending events, inside the budget.
     /// A trap ends the view; the widget shows the message in its place.
     fn tick(&mut self) {
@@ -3491,10 +3590,22 @@ impl Guest {
             .map_err(|error| first_line(&error))
             .and_then(|frame| shape(&frame));
         match outcome {
-            Ok(mut frame) => {
-                match merge(&mut self.frame.root, &mut frame) {
-                    Ok(false) => {}
-                    Ok(true) => {
+            Ok((mut frame, mut reports)) => {
+                let inherits = frame.root.is_none();
+                let mut previous = self.frame.root.take();
+                let mut accepted = true;
+                let merged = merge(&mut previous, &mut frame).and_then(|changed| {
+                    if changed.0
+                        && let Some(root) = &frame.root
+                    {
+                        self.inputs.validate_editor_documents(root)?;
+                    }
+                    Ok(changed)
+                });
+                match merged {
+                    Ok((false, _)) => {}
+                    Ok((true, report)) => {
+                        reports.local.merge(report);
                         self.frame_rev += 1;
                         if let Some(root) = &mut frame.root {
                             self.ever_valid_tree = true;
@@ -3511,9 +3622,10 @@ impl Guest {
                             });
                         }
                     }
-                    // The tab is blank for a tick and the guest hears that
-                    // it must send the tree whole.
+                    // Preserve accepted document state while requesting a full tree.
                     Err(refused) => {
+                        accepted = false;
+                        frame.root = previous;
                         tracing::warn!(
                             target: "ducktape::app",
                             module = self.module,
@@ -3525,7 +3637,18 @@ impl Guest {
                         self.pending.push(wire::Event::Resync);
                     }
                 }
+                if accepted {
+                    if inherits {
+                        reports.inherit(self.frame_reports);
+                    }
+                    self.frame_reports = reports;
+                    self.report_display_truncation();
+                    if self.inputs.editor_frame(&frame, &mut self.pending) {
+                        self.frame_rev += 1;
+                    }
+                }
                 self.frame = frame;
+                pages_document::verify_installed(self);
             }
             Err(trap) => {
                 let reason = panic_message(&mut self.store).unwrap_or(trap);
@@ -3546,24 +3669,27 @@ impl Guest {
 /// Brings the tree the host holds into `frame`: an `unchanged` frame takes
 /// it as is, a frame without a tree patches it, a frame with one replaces
 /// it. `Ok(true)` is a tree the widget has to rebuild for.
-fn merge(held: &mut Option<wire::Node>, frame: &mut wire::Frame) -> Result<bool, &'static str> {
+fn merge(
+    held: &mut Option<wire::Node>,
+    frame: &mut wire::Frame,
+) -> Result<(bool, wire::SanitizeReport), &'static str> {
     if frame.unchanged {
         frame.root = held.take();
-        return Ok(false);
+        return Ok((false, Default::default()));
     }
     if frame.root.is_some() {
-        return Ok(true);
+        return Ok((true, Default::default()));
     }
     let patches = std::mem::take(&mut frame.patches);
-    let mut root = held.take().ok_or("no tree to patch")?;
-    wire::apply(&mut root, patches)?;
+    let mut root = held.as_ref().ok_or("no tree to patch")?.clone();
+    let report = wire::apply(&mut root, patches)?;
     frame.root = Some(root);
-    Ok(true)
+    Ok((true, report))
 }
 
 /// What the host is willing to take from one tick's bytes: nothing in here
 /// is trusted — the length, the counts, the tree.
-fn shape(bytes: &[u8]) -> Result<wire::Frame, String> {
+fn shape(bytes: &[u8]) -> Result<(wire::Frame, display_diagnostics::FrameReports), String> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err("frame too large".to_string());
     }
@@ -3575,8 +3701,10 @@ fn shape(bytes: &[u8]) -> Result<wire::Frame, String> {
     if frame.unchanged || frame.root.is_some() {
         frame.patches = Vec::new();
     }
-    wire::sanitize(&mut frame);
-    Ok(frame)
+    let upstream = frame.upstream_sanitization;
+    let local = wire::sanitize(&mut frame).map_err(str::to_owned)?;
+    frame.upstream_sanitization = upstream;
+    Ok((frame, display_diagnostics::FrameReports { local, upstream }))
 }
 
 fn panic_message(store: &mut Store<HostState>) -> Option<String> {
@@ -3598,6 +3726,9 @@ fn first_line(error: &wasmtime::Error) -> String {
         .unwrap_or("trap")
         .to_string()
 }
+
+#[path = "module_view/display_diagnostics.rs"]
+mod display_diagnostics;
 
 #[path = "module_view/input.rs"]
 mod input;
@@ -4109,7 +4240,11 @@ pub(crate) mod tests {
                     });
                     seen.push(format!(
                         "{shown}{}",
-                        if on_press.is_some() { "" } else { " (disabled)" }
+                        if on_press.is_some() {
+                            ""
+                        } else {
+                            " (disabled)"
+                        }
                     ));
                 }
             });
@@ -4592,12 +4727,12 @@ pub(crate) mod tests {
     /// document slot the host paints — what the reader does in it comes back
     /// as the `edited` intent rather than going to the guest.
     #[test]
-    fn the_staged_pages_view_boots_takes_the_facts_and_leaves_the_document_to_the_host() {
+    fn the_staged_pages_view_boots_takes_the_facts_and_owns_the_document() {
         let Some(staged) = staged("pages") else {
             return;
         };
         let mut guest = Guest::load_from("pages", &staged).expect("the view loads");
-        assert!(guest.surfaces.contains_key("page_document"));
+        assert!(!guest.surfaces.contains_key("page_document"));
         guest.redraw(&None);
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
@@ -4613,7 +4748,7 @@ pub(crate) mod tests {
                 "missing {expected:?} in {shown:?}"
             );
         }
-        assert_eq!(surface_names(&guest), ["page_document"]);
+        assert!(surface_names(&guest).is_empty());
 
         guest.deliver(Output::Activate(button_message(&guest, "Beta")));
         guest.redraw(&props);
@@ -4625,19 +4760,6 @@ pub(crate) mod tests {
             }]
         );
 
-        // what the reader does in the host's document never reaches the guest
-        guest.deliver(Output::Surface {
-            handler: None,
-            value: wire::SurfaceValue::Unit,
-        });
-        assert!(guest.pending.is_empty());
-        assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "edited".into(),
-                detail: String::new(),
-            }]
-        );
         assert!(guest.fault.is_none());
     }
 
@@ -4970,21 +5092,14 @@ pub(crate) mod tests {
         guest.redraw(&props(&facts));
         let mut editor = None;
         guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor {
-                key,
-                reset,
-                on_edit: Some(handler),
-                ..
-            } = node
-            {
-                editor = Some((key.clone(), *reset, *handler));
+            if let wire::Node::Editor { key, document, .. } = node {
+                editor = Some((key.clone(), document.reset));
             }
         });
-        let (key, reset, handler) = editor.expect("editable document");
+        let (key, reset) = editor.expect("editable document");
         guest.deliver(Output::EditorAction {
             key,
             reset,
-            handler,
             action: iced::widget::text_editor::Action::Edit(
                 iced::widget::text_editor::Edit::Insert('X'),
             ),
@@ -5015,8 +5130,11 @@ pub(crate) mod tests {
         let draft_text = |guest: &Guest| {
             let mut value = None;
             guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { text, .. } = node {
-                    value = Some(text.clone());
+                if let wire::Node::Editor { key, .. } = node {
+                    value = guest
+                        .inputs
+                        .editor_document(key)
+                        .map(|doc| doc.text().to_owned());
                 }
             });
             value.expect("the retained editor")
@@ -5052,8 +5170,11 @@ pub(crate) mod tests {
         let editor_text = |guest: &Guest| {
             let mut text = None;
             guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { text: value, .. } = node {
-                    text = Some(value.clone());
+                if let wire::Node::Editor { key, .. } = node {
+                    text = guest
+                        .inputs
+                        .editor_document(key)
+                        .map(|doc| doc.text().to_owned());
                 }
             });
             text
@@ -5503,9 +5624,480 @@ pub(crate) mod tests {
     )
     }
 
+    #[test]
+    fn pages_document_source_edit_restore_rejects_the_previous_instance_intent() {
+        let _turn = blocking_connection_turn();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mounted = fresh("pages");
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let paragraph =
+            "A substantial paragraph keeps its complete source and ordinary body text. ".repeat(18);
+        let block = format!(
+            "## Heading\n- [ ] 한글 paragraph with **bold** and _emphasis_.\n  - Nested text and https://example.com/page\n```\nlet value = 42;\n```\n> Quoted paragraph\n{paragraph}\n"
+        );
+        let original = format!("한글 👍🏽\n{}", block.repeat(200));
+        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let settle = |guest: &mut Guest, props: &Option<Vec<u8>>| {
+            for _ in 0..128 {
+                let busy = guest.redraw(props);
+                assert!(guest.fault.is_none(), "{:?}", guest.fault);
+                if !busy && guest.inputs.editor_documents_status() == Ok(true) {
+                    return;
+                }
+            }
+            panic!(
+                "Pages document did not settle: frame busy={} pending={:?} staged={:?} source_pending={} documents={:?} texts={:?}",
+                guest.frame.busy,
+                guest.pending,
+                guest.staged,
+                guest.pages_document.is_some(),
+                guest.inputs.editor_documents_status(),
+                texts(guest)
+            );
+        };
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        settle(&mut guest, &props);
+        let mut keys = Vec::new();
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { key, .. } = node {
+                keys.push(key.clone());
+            }
+        });
+        assert_eq!(keys.len(), 1, "Pages has one canonical document editor");
+        let editor_key = keys.pop().unwrap();
+        let document = guest.inputs.editor_document(&editor_key).unwrap();
+        assert_eq!(
+            document.text(),
+            original,
+            "bounded bootstrap lost source bytes"
+        );
+        drop(document);
+        let mut spans = 0;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { options, .. } = node {
+                spans = options.presentation.as_ref().unwrap().spans.len();
+            }
+        });
+        assert!(
+            spans > 4000,
+            "representative Markdown must stay richly formatted"
+        );
+        assert!(
+            !texts(&guest)
+                .iter()
+                .any(|text| text.starts_with("Formatting is unavailable"))
+        );
+        let before_theme = guest
+            .inputs
+            .editor_document(&editor_key)
+            .unwrap()
+            .reference();
+        facts["dark"] = true.into();
+        facts["commented_lines"] = serde_json::json!([2]);
+        facts["comment_marks"] = serde_json::json!([{"line": 2, "count": 3}]);
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        settle(&mut guest, &props);
+        assert_eq!(
+            guest
+                .inputs
+                .editor_document(&editor_key)
+                .unwrap()
+                .reference(),
+            before_theme
+        );
+        let mut comment_badge = false;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { options, .. } = node {
+                comment_badge = options
+                    .presentation
+                    .as_ref()
+                    .unwrap()
+                    .affordances
+                    .margins
+                    .iter()
+                    .any(|mark| mark.line == 2 && mark.count == 3);
+            }
+        });
+        assert!(
+            comment_badge,
+            "theme/comment props did not rebuild the prepared presentation"
+        );
+        guest.intents.clear();
+        use iced::advanced::renderer::Headless;
+        use iced_test::runtime::{UserInterface, user_interface};
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let size = iced::Size::new(1100.0, 700.0);
+        let mut ui = UserInterface::build(
+            guest.render(),
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        struct EditorBounds<'a>(&'a str, Option<Rectangle>, bool);
+        impl Operation for EditorBounds<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from(self.0.to_owned())) {
+                    self.1 = Some(bounds);
+                    self.2 = state.is_focused();
+                }
+            }
+        }
+        let mut bounds = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut bounds);
+        let bounds = bounds.1.expect("Pages document has native editor bounds");
+        // Click inside the first Korean/emoji line, beyond its left padding.
+        let pointer = mouse::Cursor::Available(iced::Point::new(bounds.x + 88.0, bounds.y + 10.0));
+        let mut outputs = Vec::new();
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            pointer,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut outputs,
+        );
+        let mut clicked_focus = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut clicked_focus);
+        assert!(clicked_focus.2, "pointer did not focus the editor");
+        for output in outputs {
+            guest.deliver(output);
+        }
+        settle(&mut guest, &props);
+        let cursor = guest
+            .inputs
+            .editor_document(&editor_key)
+            .unwrap()
+            .reference()
+            .cursor;
+        assert_eq!(
+            cursor.position.line, 0,
+            "pointer missed the first rendered line"
+        );
+        let insertion = cursor.position.column as usize;
+        assert!(
+            insertion > 0 && insertion <= original.find('\n').unwrap(),
+            "pointer left the caret at the origin or another line"
+        );
+        assert!(original.is_char_boundary(insertion));
+        assert!(cursor.selection.is_none());
+        let mut expected = original.clone();
+        expected.insert(insertion, 'X');
+        guest.intents.clear();
+        // Rebuild after the click: the native caret must survive the guest echo.
+        ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+        let mut rebuilt_focus = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut rebuilt_focus);
+        assert!(rebuilt_focus.2, "guest echo lost native editor focus");
+        let key = |value: &str, modifiers| {
+            Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character(value.into()),
+                modified_key: iced::keyboard::Key::Character(value.into()),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers,
+                text: Some(value.into()),
+                repeat: false,
+            })
+        };
+        let mut outputs = Vec::new();
+        ui.update(
+            &[key("X", iced::keyboard::Modifiers::default())],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut outputs,
+        );
+        // Native redraws replay input queued behind the pointer transaction.
+        // This is the app event loop, not a focus repair or a synthetic edit.
+        for _ in 0..32 {
+            for output in outputs.drain(..) {
+                guest.deliver(output);
+            }
+            settle(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            if !guest.inputs.editor_transactions_pending() {
+                break;
+            }
+            ui.update(
+                &[Event::Window(
+                    window::Event::RedrawRequested(Instant::now()),
+                )],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+        }
+        assert_eq!(
+            guest.inputs.editor_document(&editor_key).unwrap().text(),
+            expected,
+            "native typing did not retain the clicked caret after redraw replay"
+        );
+        let delayed = guest
+            .intents
+            .iter()
+            .find(|event| event.kind == "edited")
+            .unwrap()
+            .clone();
+        mounted.lock().unwrap().slot = Slot::Ready(Box::new(guest));
+        // Hold the edit intent: the app mirror has not observed these words.
+        assert_eq!(
+            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
+            source,
+            "autosave echo must not replace the guest document source"
+        );
+        facts["autosave"] = "Saved just now".into();
+        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let (snapshot, reference) = {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(old) = &mut locked.slot else {
+                unreachable!()
+            };
+            settle(old, &props);
+            assert!(old.settled(), "notification left a pending task");
+            let reference = old.inputs.editor_document(&editor_key).unwrap().reference();
+            (old.snapshot().unwrap(), reference)
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let component = Guest::compile(&bytes, "Pages replacement").unwrap();
+        let mut successor = Guest::instantiate("pages", &component, "Pages replacement").unwrap();
+        successor.restore(&snapshot, "Pages replacement").unwrap();
+        successor.first_frame("Pages replacement").unwrap();
+        assert_eq!(
+            successor
+                .inputs
+                .editor_document(&editor_key)
+                .unwrap()
+                .reference(),
+            reference
+        );
+        assert_eq!(
+            successor
+                .inputs
+                .editor_document(&editor_key)
+                .unwrap()
+                .text(),
+            expected
+        );
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(old) = &locked.slot else {
+                unreachable!()
+            };
+            successor
+                .inputs
+                .retain_restored_projections(&old.inputs, successor.frame.root.as_ref().unwrap())
+                .unwrap();
+            pages_document::retain_source(old, &mut successor);
+            locked.slot = Slot::Ready(Box::new(successor));
+        }
+        let refused =
+            pages_document::accept_page_document(delayed, "network-a".into(), "alpha".into());
+        assert!(
+            !refused.accepted,
+            "same-reference old instance intent was admitted after restore"
+        );
+        assert!(refused.text.is_empty() && refused.link.is_empty());
+        let mut locked = mounted.lock().unwrap();
+        let Slot::Ready(restored) = &mut locked.slot else {
+            unreachable!()
+        };
+        settle(restored, &props);
+        assert_eq!(
+            restored.inputs.editor_document(&editor_key).unwrap().text(),
+            expected
+        );
+        assert!(
+            restored.pages_document.is_none(),
+            "completed source was retransferred after restore"
+        );
+        drop(locked);
+        let make_app = || {
+            let (mut app, _) = crate::Ducktape::__boot();
+            app.connected = true;
+            app.loading = false;
+            app.network_chain_id = "network-a".into();
+            app.active_page = "alpha".into();
+            app.buffer_page = "alpha".into();
+            app.page_text = original.clone();
+            app.page_saved_text = original.clone();
+            app.page_inflight_text = original.clone();
+            app.block_autosave_status = crate::AutosaveStatus::Saving;
+            app
+        };
+        let mut refused_app = make_app();
+        let _ = refused_app.__update(crate::__DucktapeMessage::PageDocumentSaved(
+            crate::backend::DocumentSaveResult {
+                written: false,
+                refusal: "The submitted edit was refused".into(),
+                document: original.clone(),
+                data: crate::backend::PagesData {
+                    pages: Vec::new(),
+                    blocks: Vec::new(),
+                    active_page: "alpha".into(),
+                    active_page_title: "한글 👍🏽".into(),
+                    active_page_parent: String::new(),
+                    comment_thread_total: 0,
+                    commented_block_hits: Vec::new(),
+                },
+            },
+        ));
+        assert_eq!(
+            refused_app.page_text, expected,
+            "late refusal rolled back unobserved canonical typing"
+        );
+        assert_eq!(
+            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
+            source,
+            "refusal replaced the source despite newer canonical typing"
+        );
+        let mut polled_app = make_app();
+        assert_eq!(polled_app.page_text, polled_app.page_saved_text);
+        let recipe_ids = |app: &crate::Ducktape| {
+            use iced_test::runtime::futures::subscription;
+            use std::hash::Hasher as _;
+            let mut ids: Vec<_> = subscription::into_recipes(app.__subscription())
+                .into_iter()
+                .map(|recipe| {
+                    let mut hash = subscription::Hasher::default();
+                    recipe.hash(&mut hash);
+                    hash.finish()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let clean_recipes = recipe_ids(&polled_app);
+        polled_app.page_saved_text.push('!');
+        assert_eq!(
+            clean_recipes,
+            recipe_ids(&polled_app),
+            "clean app mirror removed the canonical reconciliation timer"
+        );
+        polled_app.page_saved_text.pop();
+        // Exercise the real subscription: a direct handler call would hide a
+        // dirty-mirror gate that never polls this preserved canonical edit.
+        let tick = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use iced_test::runtime::futures::{futures::StreamExt, subscription};
+                let streams = subscription::into_recipes(polled_app.__subscription())
+                    .into_iter()
+                    .map(|recipe| {
+                        // Test builds drive `every` from redraw time, not wall time.
+                        let event = subscription::Event::Interaction {
+                            window: iced::window::Id::unique(),
+                            event: iced::Event::Window(iced::window::Event::RedrawRequested(
+                                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                            )),
+                            status: iced::event::Status::Ignored,
+                        };
+                        recipe.stream(Box::pin(
+                            iced_test::runtime::futures::futures::stream::iter([event]),
+                        ))
+                    });
+                let mut messages =
+                    iced_test::runtime::futures::futures::stream::select_all(streams);
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while let Some(message) = messages.next().await {
+                        if matches!(message, crate::__DucktapeMessage::PageAutosaveTick) {
+                            return message;
+                        }
+                    }
+                    panic!("the active page subscription ended before autosave");
+                })
+                .await
+                .expect("clean mirror prevented the real autosave subscription from polling")
+            });
+        let _ = polled_app.__update(tick);
+        assert_eq!(
+            polled_app.page_text, expected,
+            "restored edit never reached autosave without another key"
+        );
+        assert_eq!(
+            polled_app.page_inflight_text, original,
+            "the existing write was replaced"
+        );
+        let mut fresh = Guest::load_from("pages", &path).unwrap();
+        settle(&mut fresh, &props);
+        assert_eq!(
+            fresh.inputs.editor_document(&editor_key).unwrap().text(),
+            expected,
+            "fresh guest bootstrap discarded unsaved edits"
+        );
+        let mut locked = mounted.lock().unwrap();
+        let Slot::Ready(restored) = &mut locked.slot else {
+            unreachable!()
+        };
+        let mut ui = UserInterface::build(restored.render(), size, ui.into_cache(), &mut renderer);
+        let modifiers = if cfg!(target_os = "macos") {
+            iced::keyboard::Modifiers::LOGO
+        } else {
+            iced::keyboard::Modifiers::CTRL
+        };
+        let mut outputs = Vec::new();
+        ui.update(
+            &[key("z", modifiers)],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut outputs,
+        );
+        assert!(
+            !outputs.is_empty(),
+            "restored editor lost focus or its Undo route"
+        );
+        for output in outputs {
+            restored.deliver(output);
+        }
+        settle(restored, &props);
+        assert_eq!(
+            restored.inputs.editor_document(&editor_key).unwrap().text(),
+            original,
+            "native Undo after no-init restore must preserve guest history"
+        );
+        drop(locked);
+        pages_document::source_changed();
+        pages_document::source(connection, "network-a", "alpha", "replacement source").unwrap();
+        let deferred = pages_document::current_page_document(
+            "network-a".into(),
+            "alpha".into(),
+            "new mirror".into(),
+        );
+        assert!(
+            !deferred.ready,
+            "old canonical editor was treated as a newly installed source"
+        );
+        assert_eq!(deferred.text, "new mirror");
+    }
+
     fn pages_facts() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
+                "document_source": [], "document_error": "", "commented_lines": [], "comment_marks": [],
                 "dark": false, "connected": true, "loading": false, "busy": false,
                 "page_link": "duck://pages/alpha",
                 "pages": [
@@ -5726,7 +6318,7 @@ pub(crate) mod tests {
             "{module}: omitted row count is not rendered as a number"
         );
         let mut sanitized = frame.clone();
-        wire::sanitize(&mut sanitized);
+        wire::sanitize(&mut sanitized).expect("valid production editor document");
         assert_eq!(
             frame.root, sanitized.root,
             "{module}: sanitizer changed the production projection"
@@ -5987,8 +6579,11 @@ pub(crate) mod tests {
         let mut root = guest.frame.root.clone().expect("editing tree");
         let mut editor_source = None;
         root.for_each_mut(&mut |node| {
-            if let wire::Node::Editor { text, .. } = node {
-                editor_source = Some(text.clone());
+            if let wire::Node::Editor { key, .. } = node {
+                editor_source = guest
+                    .inputs
+                    .editor_document(key)
+                    .map(|doc| doc.text().to_owned());
             }
         });
         assert_eq!(editor_source.as_deref(), Some(text.as_str()));
@@ -6808,13 +7403,14 @@ pub(crate) mod tests {
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
         join_all(connected(&client));
-        let locked = mounted.lock().unwrap();
-        assert!(
-            matches!(locked.slot, Slot::Failed(_)),
-            "{}",
-            slot_name(&locked.slot)
-        );
-        drop(locked);
+        {
+            let locked = mounted.lock().unwrap();
+            assert!(
+                matches!(locked.slot, Slot::Failed(_)),
+                "{}",
+                slot_name(&locked.slot)
+            );
+        }
 
         // the first block names the candidate the reconnect did not: it is
         // tried once under its own hash, and every block after it is held
@@ -6823,17 +7419,18 @@ pub(crate) mod tests {
         for _ in 0..5 {
             join_all(deployments_checked().await);
         }
-        let locked = mounted.lock().unwrap();
-        assert_eq!(
-            locked.generation, generation,
-            "a failed candidate was loaded again on every block"
-        );
-        assert!(
-            matches!(locked.slot, Slot::Failed(_)),
-            "the failure is still what the tab shows: {}",
-            slot_name(&locked.slot)
-        );
-        drop(locked);
+        {
+            let locked = mounted.lock().unwrap();
+            assert_eq!(
+                locked.generation, generation,
+                "a failed candidate was loaded again on every block"
+            );
+            assert!(
+                matches!(locked.slot, Slot::Failed(_)),
+                "the failure is still what the tab shows: {}",
+                slot_name(&locked.slot)
+            );
+        }
 
         // nothing is suppressed for good: once the gap is up the same
         // candidate is tried again, so a load that failed on the transport
@@ -7062,10 +7659,11 @@ pub(crate) mod tests {
         );
         // once its gap is up the candidate is tried again, and this time
         // its first tree draws
-        let mut locked = mounted.lock().unwrap();
-        let retry = locked.retry.as_mut().expect("B left a hold-off");
-        retry.next = Instant::now();
-        drop(locked);
+        {
+            let mut locked = mounted.lock().unwrap();
+            let retry = locked.retry.as_mut().expect("B left a hold-off");
+            retry.next = Instant::now();
+        }
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
@@ -7196,7 +7794,10 @@ pub(crate) mod tests {
             unchanged: true,
             ..wire::Frame::default()
         };
-        assert_eq!(merge(&mut held, &mut unchanged), Ok(false));
+        assert_eq!(
+            merge(&mut held, &mut unchanged),
+            Ok((false, Default::default()))
+        );
         assert_eq!(unchanged.root, Some(held_tree));
         let mut patched = wire::Frame::default();
         assert_eq!(merge(&mut None, &mut patched), Err("no tree to patch"));
