@@ -60,6 +60,8 @@ mod boot;
 mod cli;
 mod cli_args;
 mod code_plane;
+mod collab_cli;
+mod collab_keys;
 mod compute;
 mod config;
 mod constants;
@@ -292,6 +294,8 @@ enum Family {
     /// sandboxed provider sessions (pty attach, sched runs) and run control
     /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
+    /// cross-device agent collaboration: authenticated reads of a conversation
+    Collab(collab_cli::CollabArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]
     Module(module_cli::ModuleCmd),
@@ -324,6 +328,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Account(args) => account_cli::run(args),
         Family::Wallet(args) => wallet_cli::run(args),
         Family::Agent(args) => agent_cli::run(args),
+        Family::Collab(args) => collab_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),

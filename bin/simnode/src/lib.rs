@@ -951,6 +951,15 @@ fn run_sim(
                             sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
+                    Some(NodeCommand::QueryAs { target, req, reader, reply }) => {
+                        let result = sim
+                            .node
+                            .host()
+                            .query_as(&target, &req, sdk::Origin::External(reader))
+                            .await
+                            .map_err(|err| err.to_string());
+                        let _ = reply.send(result);
+                    }
                     None => break,
                 },
             }

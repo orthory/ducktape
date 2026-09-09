@@ -6650,6 +6650,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "chat",
  "clap",
+ "collaboration",
  "commonware-actor",
  "commonware-codec",
  "commonware-consensus",

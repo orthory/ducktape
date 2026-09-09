@@ -483,6 +483,9 @@ mod tests {
                     NodeCommand::SubmitFrame { .. } => {
                         panic!("ensure_channel used SubmitFrame unexpectedly")
                     }
+                    NodeCommand::QueryAs { .. } => {
+                        panic!("ensure_channel used an authenticated read unexpectedly")
+                    }
                 }
             }
         })
