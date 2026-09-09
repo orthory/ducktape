@@ -20,7 +20,7 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], rail_shown:bool, active_thread_seq:i64, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component MessageTimeline(messages:[ChatMessage], live_agents:[LiveRunHint], rail_shown:bool, active_thread_seq:i64, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
     cancel_run(str)
     add_reaction_at(i64, str)
@@ -29,6 +29,7 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], ra
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
     open_message_link(str)
+    open_run(str)
     press_message(i64, CopySurface)
   // KEYED BY STABLE VIEW IDENTITY. This is the app's one virtual list that
   // prepends, so row state and measured height must follow the message rather
@@ -87,6 +88,7 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], ra
               open_message_reactions
               open_message_actions
               open_message_link
+              open_run
               press_message
       // THE RANGE'S ENDS JOIN THE CHEAP KEY. A quiet row keeps its memo until
       // one of them moves, so shift-clicking down a channel re-renders the run
@@ -107,6 +109,7 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], ra
                 open_message_reactions
                 open_message_actions
                 open_message_link
+                open_run
                 press_message
       // THE RUN THIS MESSAGE ANCHORED, live under it while it runs; the
       // committed reply takes the row's place.
@@ -123,9 +126,10 @@ component MessageTimeline(messages:[ChatMessage], live_agents:[LiveAgentRow], ra
       // closes.
       for live in live_agents
         if live.anchor_seq == message.seq && !rail_owns_run(live, rail_shown, active_thread_seq)
-          LiveAgentCard live=live
+          LiveRunCard live=live
             forward
               cancel_run
+              open_run
 
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
@@ -138,6 +142,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
     open_message_link(str)
+    open_run(str)
     press_message(i64, CopySurface)
   keyed thread_message in messages by=thread_message.view_key
     with
@@ -149,6 +154,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
         ThreadParentBlock message=thread_message
           forward
             open_message_link
+            open_run
       if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
         ThreadMessageCard
           with
@@ -163,6 +169,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
             open_thread_message_actions
             open_thread_message_reactions
             open_message_link
+            open_run
             press_message
       if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
         lazy thread_message, copy_anchor_seq, copy_head_seq, copy_surface as cached_reply
@@ -179,6 +186,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_actions
               open_thread_message_reactions
               open_message_link
+              open_run
               press_message
 
 component CopyRangeBar(count:i64)
@@ -217,7 +225,7 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveAgentRow], timeline:Timeline, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveRunHint], timeline:Timeline, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
     cancel_run(str)
@@ -237,6 +245,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
     open_message_link(str)
+    open_run(str)
     copy_to_clipboard(str, str)
     copy_message_link(str)
     add_reaction_at(i64, str)
@@ -889,6 +898,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                                 open_message_reactions
                                 open_message_actions
                                 open_message_link
+                                open_run
                                 press_message
                   overlay
                     with
@@ -1809,6 +1819,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                             open_thread_message_actions
                             open_thread_message_reactions
                             open_message_link
+                            open_run
                             press_message
                       // THE RUN ANCHORED IN THIS THREAD, live at the foot of
                       // the rail until its reply lands. A run summoned by the
@@ -1817,9 +1828,10 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                       // thread the reply lives in.
                       for live in live_agents
                         if run_in_thread(live, active_thread_seq)
-                          LiveAgentCard live=live
+                          LiveRunCard live=live
                             forward
                               cancel_run
+                              open_run
                       if thread_has_more && thread_next_reply_seq > 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with

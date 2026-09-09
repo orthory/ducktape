@@ -449,6 +449,7 @@ fn history_pagination_prepends_older_and_flags_more() {
 /// of the two ends of this test moves.
 #[tokio::test(flavor = "current_thread")]
 async fn composer_markdown_round_trips_rich_spans() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -509,6 +510,7 @@ async fn composer_markdown_round_trips_rich_spans() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn timeline_pages_past_thread_only_traffic() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),

@@ -1676,7 +1676,7 @@ fn every_lifecycle_op_stamps_the_facts_it_committed_and_nothing_else() {
                     degraded: false,
                     executing_node: "unknown".into(),
                     output_ref: None,
-                    pr_number: None,
+                    pr: None,
                 },
             },
             RunEvent {

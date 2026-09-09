@@ -13,11 +13,13 @@
 // is the path only while the reader still stands where the file was
 // opened (same directory, same commit) — empty retires the preview.
 
-component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
+component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[ForgeBranch], branch_menu:bool, tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
     forge_toggle_repo_menu()
+    forge_toggle_branch_menu()
+    forge_pick_branch(str)
     select_forge_tab(str)
     forge_open_item(i64)
     forge_close_item()
@@ -151,7 +153,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                     with
                       org
                       repo=open_repo
-                      branch=""
                       open=repo_menu
                   active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
                   hovered bg=row_hover text=fg
@@ -255,9 +256,13 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                   hovered bg=transparent text=fg
                   pressed bg=transparent text=fg
-                // Branches are context for every repo seat, not a separate
-                // destination. Let them spend the remaining tab-bar width and
-                // scroll horizontally instead of charging the content a row.
+                // THE BRANCH SELECTOR. The commit the code browse is pinned
+                // to is context for every repo seat, so it sits in the tab
+                // row rather than charging the content a row of its own: the
+                // pill names the branch standing at that commit (or the
+                // commit itself once the branch has moved on) and opens the
+                // switcher; a pick leaves as an intent and the browse comes
+                // back re-rooted as props.
                 if !empty(branches)
                   box
                     with
@@ -265,36 +270,29 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                       h=18.0
                       bg=separator
                     space w=1.0 h=1.0
-                  scroll
-                    with
-                      dir=horizontal
-                      w=fill
-                      h=22.0
-                      bar=hidden
-                    row
+                  stack
+                    button -> emit(forge_toggle_branch_menu)
                       with
-                        h=fill
-                        gap=4.0
-                        align=center
-                      for branch in branches
-                        box
-                          with
-                            h=20.0
-                            pl=7.0
-                            pr=7.0
-                            align-y=center
-                            bg=surface
-                            border=border
-                            border-w=1.0
-                            r=10.0
-                          text branch
-                            with
-                              size=9.0
-                              wrap=none
-                              font=code_semibold
-                              @text-meta
-                if empty(branches) && display_omitted == 0
-                  space w=fill
+                        label="Switch branch"
+                        expanded=branch_menu
+                        p=0.0
+                        @ghost_action
+                      BranchPill
+                        with
+                          label=rev_label(tree_branch, tree_rev)
+                          open=branch_menu
+                      active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
+                      hovered bg=row_hover text=fg
+                      pressed bg=elevated text=fg
+                    if branch_menu
+                      pin x=0.0 y=26.0
+                        Popover width=240.0
+                          col w=fill gap=1.0
+                            for branch in branches
+                              BranchMenuRow branch=branch active=(branch.name == tree_branch)
+                                forward
+                                  forge_pick_branch
+                space w=fill
             box
               with
                 w=fill

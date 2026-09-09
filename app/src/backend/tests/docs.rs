@@ -309,6 +309,7 @@ fn block_moves_follow_visible_sibling_order() {
 /// green. This is the test that goes red.
 #[tokio::test(flavor = "current_thread")]
 async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let op = |msg: &PageMsg| ducktape_rpc::StreamOp {
         height: 9,
         seq: 0,
@@ -716,6 +717,7 @@ async fn a_wait_that_gave_up_leaves_the_next_read_still_owing_it() {
 /// the resync extern's argument list.
 #[tokio::test(flavor = "current_thread")]
 async fn an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     use std::sync::atomic::Ordering::SeqCst;
     let (origin, served) = node_scripting_its_fold_watermark(vec![Some("12:0")]).await;
     let rpc = rpc_client(&origin).expect("stub client");

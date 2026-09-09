@@ -1165,7 +1165,7 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     assert!(page_handlers.contains("on close_doc_tab(id)"));
     assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
     assert!(!root_state.contains("page_link"));
-    assert!(page_handlers.contains("let page_link = page_link_of(event)"));
+    assert!(page_handlers.contains("let page_link = document.link"));
 
     let native_surfaces = concat!(
         include_str!("../backend/live.rs"),

@@ -457,14 +457,18 @@ fn forge_layout_keeps_repo_navigation_compact() {
     let tabs_end = repo_body
         .find("emit(select_forge_tab, \"issues\")")
         .expect("issues tab");
-    let branches = repo_body
-        .find("for branch in branches")
-        .expect("branch strip");
+    let selector = repo_body
+        .find("emit(forge_toggle_branch_menu)")
+        .expect("branch selector");
     assert!(
-        tabs_end < branches,
+        tabs_end < selector,
         "branch context follows the tabs in their shared navigation row"
     );
     assert_eq!(repo_body.matches("for branch in branches").count(), 1);
+    assert!(
+        repo_body.contains("BranchMenuRow branch=branch active=(branch.name == tree_branch)"),
+        "the switcher's rows mark the branch the browse is pinned to"
+    );
 
     let item_body = screen
         .split_once("if forge_item_number > 0 && item_phase == \"ready\"")
@@ -499,7 +503,8 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     );
     for route in [
         "run every open_external_url(url)",
-        "-> open_page_search_hit(_, \"\")",
+        "-> open_page_search_hit(_, link.block)",
+        "-> open_run_panel _",
         "-> fs_open_dir _",
         "-> forge_open_repo _",
         "-> choose_channel _",
@@ -784,7 +789,10 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation: in_flight,
         repo: "core".into(),
-        branches: vec!["main".into()],
+        branches: vec![backend::ForgeBranch {
+            name: "main".into(),
+            head: "1111111111111111111111111111111111111111".into(),
+        }],
         items: Vec::new(),
     }));
     assert!(
@@ -987,6 +995,109 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     ));
     assert_eq!(app.forge_item_phase, ForgePhase::Failed);
     assert_eq!(app.error, "tracker unavailable");
+}
+
+/// A BRANCH PICK RE-ROOTS THE BROWSE at that branch's head, the commit the
+/// repo slice last read it at; the pill names the branch standing at the
+/// pinned commit and falls back to nothing once no branch does.
+#[test]
+fn a_branch_pick_re_roots_the_browse_at_that_branches_head() {
+    let dev = "1111111111111111111111111111111111111111";
+    let feature = "2222222222222222222222222222222222222222";
+    let branches = vec![
+        backend::ForgeBranch {
+            name: "dev".into(),
+            head: dev.into(),
+        },
+        backend::ForgeBranch {
+            name: "main".into(),
+            head: dev.into(),
+        },
+        backend::ForgeBranch {
+            name: "feature".into(),
+            head: feature.into(),
+        },
+    ];
+    // the label: the picked branch wins while it stands at the commit, then
+    // dev over main at a shared head, then the first branch there; none is ""
+    assert_eq!(backend::forge_tree_branch(&branches, "", dev), "dev");
+    assert_eq!(backend::forge_tree_branch(&branches, "main", dev), "main");
+    assert_eq!(backend::forge_tree_branch(&branches, "feature", dev), "dev");
+    assert_eq!(backend::forge_tree_branch(&branches, "", feature), "feature");
+    assert_eq!(backend::forge_tree_branch(&branches, "feature", "3333"), "");
+    assert_eq!(backend::forge_tree_branch(&branches, "", ""), "");
+    assert_eq!(backend::forge_branch_head(&branches, "feature"), feature);
+    assert_eq!(backend::forge_branch_head(&branches, "gone"), "");
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+    let generation = app.forge_generation;
+    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
+        generation,
+        repo: "core".into(),
+        branches: branches.clone(),
+        items: Vec::new(),
+    }));
+    let tree = |rev: &str, path: &str| {
+        __DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+            repo: "core".into(),
+            rev: rev.into(),
+            path: path.into(),
+            born: true,
+            entries: vec![backend::TreeEntry {
+                name: "src".into(),
+                path: "src".into(),
+                kind: "dir".into(),
+            }],
+            truncated: false,
+        })
+    };
+    let _ = app.__update(tree(dev, ""));
+    assert_eq!(app.forge_tree_rev, dev);
+    let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
+    let _ = app.__update(tree(dev, "src"));
+    assert_eq!(app.forge_tree_path, "src");
+
+    // the switchers are exclusive: one opening closes the other
+    let toggle = |kind: &str| {
+        __DucktapeMessage::ForgeViewEvent(crate::module_view::ModuleViewEvent {
+            kind: kind.into(),
+            detail: "{}".into(),
+        })
+    };
+    let _ = app.__update(toggle("toggle_repo_menu"));
+    assert!(app.forge_repo_menu);
+    let _ = app.__update(toggle("toggle_branch_menu"));
+    assert!(app.forge_branch_menu && !app.forge_repo_menu);
+
+    let pick = |name: &str| __DucktapeMessage::ForgePickBranch(name.into());
+    // a name the slice no longer holds picks nothing, but still closes the menu
+    let _ = app.__update(pick("gone"));
+    assert!(!app.forge_branch_menu);
+    assert_eq!(app.forge_tree_rev, dev);
+    assert_eq!(app.forge_tree_path, "src");
+    assert_eq!(app.forge_tree_phase, ForgeTreePhase::Ready);
+
+    let _ = app.__update(pick("feature"));
+    assert_eq!(app.forge_tree_branch, "feature");
+    assert_eq!(app.forge_tree_rev, feature, "the browse is pinned at the branch's head");
+    assert_eq!(app.forge_tree_path, "", "and starts over at that branch's root");
+    assert_eq!(app.forge_tree_phase, ForgeTreePhase::Loading);
+    assert!(app.forge_tree_entries.is_empty());
+    let _ = app.__update(tree(dev, ""));
+    assert!(
+        app.forge_tree_entries.is_empty(),
+        "the superseded branch's listing landing late paints nothing"
+    );
+    let _ = app.__update(tree(feature, ""));
+    assert_eq!(app.forge_tree_phase, ForgeTreePhase::Ready);
+    assert_eq!(app.forge_tree_entries.len(), 1);
+
+    // leaving the repo forgets the pick along with the browse
+    let _ = app.__update(__DucktapeMessage::ForgeCloseRepo);
+    assert!(app.forge_tree_branch.is_empty() && !app.forge_branch_menu);
 }
 
 #[test]

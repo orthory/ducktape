@@ -151,20 +151,20 @@ pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
 const PAGE_CHANNEL_PREFIX: &str = "runs:pages:";
 const PAGE_BLOCK_CHANNEL_PREFIX: &str = "runs:page-block:";
 
-enum PageSource<'a> {
+pub(crate) enum PageSource<'a> {
     CommentThread(&'a str),
     Block(&'a str),
 }
 
-fn page_channel_id(thread_id: &str) -> String {
+pub(crate) fn page_channel_id(thread_id: &str) -> String {
     format!("{PAGE_CHANNEL_PREFIX}{thread_id}")
 }
 
-fn page_block_channel_id(block_id: &str) -> String {
+pub(crate) fn page_block_channel_id(block_id: &str) -> String {
     format!("{PAGE_BLOCK_CHANNEL_PREFIX}{block_id}")
 }
 
-fn page_source(channel_id: &str) -> Option<PageSource<'_>> {
+pub(crate) fn page_source(channel_id: &str) -> Option<PageSource<'_>> {
     match channel_id.strip_prefix(PAGE_CHANNEL_PREFIX) {
         Some(thread) => Some(PageSource::CommentThread(thread)),
         None => channel_id
@@ -535,7 +535,7 @@ pub struct RunsModule {
     /// `commit_block` (an aborted block must leave no ghost record).
     pending_history: Vec<RunRecord>,
     /// Verified PR allocations update existing history only at commit.
-    pending_pr_links: BTreeMap<String, u64>,
+    pending_pr_links: BTreeMap<String, PrRef>,
     /// Authenticated result-action refusals become visible only at commit.
     pending_action_rejections: BTreeSet<String>,
     /// The receipt facts of every effect prepared in the current execute,
@@ -645,7 +645,7 @@ impl RunsModule {
                 degraded: record.degraded,
                 executing_node: record.executing_node.clone(),
                 output_ref: record.output_ref.clone(),
-                pr_number: record.pr_number,
+                pr: record.pr.clone(),
             },
         );
         self.pending_history.push(record);

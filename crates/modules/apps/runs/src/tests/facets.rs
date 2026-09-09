@@ -340,7 +340,7 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.run_id, run_id);
-    assert_eq!(rec.pr_number, None);
+    assert_eq!(rec.pr, None);
 }
 
 #[test]
@@ -879,7 +879,7 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
-    assert_eq!(rec.pr_number, None);
+    assert_eq!(rec.pr, None);
     assert_eq!(rec.executing_node, "ab".repeat(32));
 }
 
@@ -920,9 +920,15 @@ fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
         "the breadcrumb names the updated PR: {:?}",
         breadcrumbs(&ctx)
     );
-    // the ring records the guard-found PR as this run's pr_number.
+    // the ring records the guard-found PR, repo and number, as this run's PR.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, Some(4));
+    assert_eq!(
+        recent_runs(&m)[0].pr,
+        Some(PrRef {
+            repo: "app".into(),
+            number: 4
+        })
+    );
 }
 
 #[test]
@@ -1077,7 +1083,7 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
     );
     // A later program call decides whether to open a PR and allocates its id.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, None);
+    assert_eq!(recent_runs(&m)[0].pr, None);
 }
 
 #[test]
@@ -1116,7 +1122,7 @@ fn output_none_with_a_born_stale_branch_never_opens_a_pr_from_response_prose() {
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, None);
-    assert_eq!(rec.pr_number, None);
+    assert_eq!(rec.pr, None);
 }
 
 #[test]
@@ -1155,7 +1161,7 @@ fn a_late_commit_for_a_merged_anchor_stays_chat_and_history_only() {
         "run {run_id} pr sink skipped: bound Forge item is merged"
     )));
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, None);
+    assert_eq!(recent_runs(&m)[0].pr, None);
 }
 
 #[test]

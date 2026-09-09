@@ -527,7 +527,7 @@ impl RunsModule {
                 delivered_at: ctx.env().consensus_time,
                 executing_node,
                 output_ref,
-                pr_number: None,
+                pr: None,
             },
             None,
         );
@@ -565,7 +565,7 @@ impl RunsModule {
                 delivered_at: ctx.env().consensus_time,
                 executing_node,
                 output_ref: None,
-                pr_number: None,
+                pr: None,
             },
             Some(reason),
         );
@@ -621,7 +621,7 @@ impl RunsModule {
                 delivered_at: ctx.env().consensus_time,
                 executing_node,
                 output_ref: None,
-                pr_number: None,
+                pr: None,
             },
             Some(failure_excerpt(&reason)),
         );
@@ -712,7 +712,7 @@ impl RunsModule {
                 WireSink::Chain
             }
         };
-        let pr_number = self
+        let pr = self
             .emit_sink(
                 ctx,
                 run_id,
@@ -724,8 +724,8 @@ impl RunsModule {
             )
             .await;
         // record the delivery into the ring AFTER the sink so the record can
-        // carry the PR number the sink opened/updated. observation only —
-        // every emitted op above is byte-identical with or without it.
+        // carry the PR the sink found updated. observation only — every
+        // emitted op above is byte-identical with or without it.
         self.record_settled(
             RunRecord {
                 run_id: run_id.to_string(),
@@ -738,7 +738,7 @@ impl RunsModule {
                 delivered_at: ctx.env().consensus_time,
                 executing_node,
                 output_ref: output_ref_of(&result.workspace_receipt),
-                pr_number,
+                pr,
             },
             None,
         );

@@ -1302,6 +1302,9 @@ pub fn any_agent_active(rows: &[AgentRow]) -> bool {
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct RunRow {
     pub run_id: String,
+    /// the run's address: what a `duck://run/` link names and what the
+    /// journal read is keyed by
+    pub dispatch_id: String,
     pub agent_id: String,
     pub agent_name: String,
     /// what the run answers: a channel message, a job, or a calling run
@@ -1333,9 +1336,176 @@ pub struct JournalEntry {
     pub summary: String,
 }
 
+/// One place a run touched, as the chip the run panel draws: where it was
+/// called from (`relation` "from") or what its receipts landed on ("touched").
+/// `url` is the duck:// address the open plane warps to; "" for a place the
+/// protocol has no address for yet, which draws as a label alone.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct RunLink {
+    pub relation: String,
+    /// `chat`, `page`, `forge`, `file`, `task`, `job`, `module`,
+    /// `conversation`, `run` or `output` — the glyph the chip wears
+    pub kind: String,
+    pub label: String,
+    pub url: String,
+}
+
+/// A chip's label is one line: the text's words, single-spaced. How much of
+/// it a chip shows is the view's call, not a count picked here.
+fn chip_label(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A page block as a chip names it: the page's opening line, then the
+/// block's own when the block is not the page itself. The block's page is
+/// what the link opens, the block its anchor.
+async fn page_block_link(
+    client: &RpcClient,
+    chain: &str,
+    block_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let Some(block) = view_block(client, block_id).await? else {
+        return Ok(None);
+    };
+    let is_page = block.page_id == block.block_id;
+    let label = match is_page {
+        true => chip_label(&block.text),
+        false => match view_block(client, &block.page_id).await? {
+            Some(root) => chip_label(&format!("{} · {}", root.text, block.text)),
+            None => chip_label(&block.text),
+        },
+    };
+    Ok(Some((
+        label,
+        duck_page_block_link(block.page_id, block.block_id, chain.to_owned()),
+    )))
+}
+
+/// One block off pages' view lane; `None` for an id the index does not hold.
+async fn view_block(
+    client: &RpcClient,
+    block_id: &str,
+) -> Result<Option<::pages::index::PageBlockRow>, String> {
+    let reply: ::pages::index::PagesViewReply = client
+        .view(
+            "pages",
+            &::pages::index::PagesViewQuery::GetBlock {
+                block_id: block_id.to_owned(),
+            },
+        )
+        .await?;
+    match reply {
+        ::pages::index::PagesViewReply::Block(block) => Ok(block),
+        _ => Err("the pages index returned the wrong reply to a block read".into()),
+    }
+}
+
+/// The block a comment thread is anchored to, off pages' view lane; `None`
+/// for a thread the index does not hold.
+async fn view_thread_target(client: &RpcClient, thread_id: &str) -> Result<Option<String>, String> {
+    let reply: ::pages::index::PagesViewReply = client
+        .view(
+            "pages",
+            &::pages::index::PagesViewQuery::GetThread {
+                thread_id: thread_id.to_owned(),
+            },
+        )
+        .await?;
+    match reply {
+        ::pages::index::PagesViewReply::Thread(thread) => Ok(thread.map(|thread| thread.target)),
+        _ => Err("the pages index returned the wrong reply to a thread read".into()),
+    }
+}
+
+/// The chip for one place. Chat, forge, page and run places carry an
+/// address; the rest name what they are until the protocol addresses them.
+/// A page place whose block the index no longer holds, or whose read failed,
+/// names its id and carries no address: the run's journal still opens, one
+/// chip short of a link.
+async fn run_link(
+    client: &RpcClient,
+    chain: &str,
+    relation: &str,
+    place: runs::index::RunPlace,
+) -> RunLink {
+    use runs::index::RunPlace;
+    let link = |kind: &str, label: String, url: String| RunLink {
+        relation: relation.to_owned(),
+        kind: kind.to_owned(),
+        label,
+        url,
+    };
+    match place {
+        RunPlace::ChatMessage { channel_id, seq } => link(
+            "chat",
+            format!("#{channel_id} · msg {seq}"),
+            duck_channel_message_link(channel_id, height_i64(seq), chain.to_owned()),
+        ),
+        RunPlace::Channel { channel_id } => link(
+            "chat",
+            format!("#{channel_id}"),
+            duck_channel_link(channel_id, chain.to_owned()),
+        ),
+        RunPlace::PageBlock { block_id } => match page_block_link(client, chain, &block_id).await {
+            Ok(Some((label, url))) => link("page", label, url),
+            _ => link("page", format!("block {block_id}"), String::new()),
+        },
+        RunPlace::PageThread { thread_id } => {
+            let resolved = match view_thread_target(client, &thread_id).await {
+                Ok(Some(target)) => page_block_link(client, chain, &target).await,
+                _ => Ok(None),
+            };
+            match resolved {
+                Ok(Some((label, url))) => link("page", label, url),
+                _ => link("page", format!("thread {thread_id}"), String::new()),
+            }
+        }
+        RunPlace::Page { page_id, title } => link(
+            "page",
+            chip_label(&title),
+            duck_page_link(page_id, chain.to_owned()),
+        ),
+        RunPlace::Job { job_id } => link("job", format!("job {job_id}"), String::new()),
+        RunPlace::Task { task_id } => link("task", format!("task {task_id}"), String::new()),
+        RunPlace::File { path } => link("file", chip_label(&path), String::new()),
+        RunPlace::Module { module_id } => {
+            link("module", format!("module {module_id}"), String::new())
+        }
+        RunPlace::Conversation { conversation_id } => link(
+            "conversation",
+            chip_label(&format!("conversation {conversation_id}")),
+            String::new(),
+        ),
+        RunPlace::Run { dispatch_id } => link(
+            "run",
+            format!("run {}", short_pubkey(&dispatch_id)),
+            duck_run_link(dispatch_id, chain.to_owned()),
+        ),
+        RunPlace::ForgeItem { repo, number } => link(
+            "forge",
+            format!("{repo}#{number}"),
+            duck_forge_item_link(repo, height_i64(number), chain.to_owned()),
+        ),
+        RunPlace::Output { output_ref } => link("output", chip_label(&output_ref), String::new()),
+    }
+}
+
+/// Every chip of one run: its origin first, then each place its receipts
+/// touched in journal order.
+async fn run_links(client: &RpcClient, chain: &str, run: runs::index::RunView) -> Vec<RunLink> {
+    let mut links = Vec::with_capacity(run.places.len() + 1);
+    if let Some(origin) = run.origin {
+        links.push(run_link(client, chain, "from", origin).await);
+    }
+    for place in run.places {
+        links.push(run_link(client, chain, "touched", place).await);
+    }
+    links
+}
+
 /// The journal of one run, and the SCOPE it was read in.
 ///
-/// The run id alone is not a scope. Two networks can carry the same run id,
+/// The dispatch id alone is not a scope. Two networks can carry the same run,
 /// and a reconnect to the same endpoint is a different session — so a read
 /// started on network A, answering after the app moved to B with that same run
 /// open, would install A's journal under B. The fields below are what make the
@@ -1344,8 +1514,10 @@ pub struct JournalEntry {
 /// the seated account, and `op` a fresh per-dispatch nonce.
 #[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct RunJournal {
-    pub run_id: String,
+    pub dispatch_id: String,
     pub entries: Vec<JournalEntry>,
+    /// the run's origin and every place it touched, as chips
+    pub links: Vec<RunLink>,
     pub rpc: String,
     pub network: String,
     pub link: i64,
@@ -1373,14 +1545,14 @@ pub fn journal_in_scope(
     link: i64,
     account: &str,
     op: i64,
-    run_id: &str,
+    dispatch_id: &str,
 ) -> bool {
     journal.rpc == rpc
         && journal.network == network
         && journal.link == link
         && journal.account == account
         && journal.op == op
-        && journal.run_id == run_id
+        && journal.dispatch_id == dispatch_id
 }
 
 /// What a run answers, in the tracker's words.
@@ -1425,8 +1597,19 @@ fn run_row(run: runs::index::RunView, names: &BTreeMap<String, String>) -> RunRo
         &run.job_id,
         &run.delegation_id,
     );
+    // the only forge item among a run's touched places is the PR its sink
+    // opened or updated; the item it was called on is its origin
+    let pr_number = run
+        .places
+        .iter()
+        .find_map(|place| match place {
+            runs::index::RunPlace::ForgeItem { number, .. } => Some(height_i64(*number)),
+            _ => None,
+        })
+        .unwrap_or(0);
     let mut row = RunRow {
         run_id: run.run_id,
+        dispatch_id: run.dispatch_id,
         agent_id: run.agent_id,
         agent_name,
         origin,
@@ -1439,7 +1622,7 @@ fn run_row(run: runs::index::RunView, names: &BTreeMap<String, String>) -> RunRo
         degraded: false,
         reason: String::new(),
         output_ref: String::new(),
-        pr_number: run.pr_number.map_or(0, height_i64),
+        pr_number,
     };
     match run.state {
         runs::index::RunState::Dispatched => {}
@@ -1501,7 +1684,7 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
             degraded,
             executing_node,
             output_ref,
-            pr_number,
+            pr,
         } => {
             let mut parts = vec![outcome_word(outcome).to_string()];
             if degraded {
@@ -1512,17 +1695,21 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
                 parts.push(format!("on {}", short_pubkey(&executing_node)));
             }
             parts.extend(output_ref);
-            parts.extend(pr_number.map(|number| format!("PR #{number}")));
+            parts.extend(pr.map(|pr| pr_label(&pr)));
             ("settled", parts.join(" · "))
         }
         runs::RunFact::ResultActionRefused { request_id } => ("result action refused", request_id),
-        runs::RunFact::PrLinked { number } => ("pr linked", format!("PR #{number}")),
+        runs::RunFact::PrLinked { pr } => ("pr linked", pr_label(&pr)),
     };
     JournalEntry {
         height: height_label_short(height_i64(row.height)),
         kind: kind.into(),
         summary,
     }
+}
+
+fn pr_label(pr: &runs::PrRef) -> String {
+    format!("PR {}#{}", pr.repo, pr.number)
 }
 
 /// One staged action in the tracker's words: the operation, the lane that
@@ -1606,22 +1793,26 @@ pub async fn load_run_journal(
     link: i64,
     account: String,
     op: i64,
-    run_id: String,
+    dispatch_id: String,
 ) -> RunJournal {
     let scope = RunJournal {
-        run_id: run_id.clone(),
+        dispatch_id: dispatch_id.clone(),
         rpc: rpc.clone(),
-        network,
+        network: network.clone(),
         link,
         account,
         op,
         ..RunJournal::default()
     };
-    if run_id.is_empty() {
+    if dispatch_id.is_empty() {
         return scope;
     }
-    match read_run_journal(&rpc, &run_id).await {
-        Ok(entries) => RunJournal { entries, ..scope },
+    match read_run_journal(&rpc, &network, &dispatch_id).await {
+        Ok((entries, links)) => RunJournal {
+            entries,
+            links,
+            ..scope
+        },
         Err(error) => RunJournal {
             error: app_error(error).message,
             ..scope
@@ -1629,19 +1820,32 @@ pub async fn load_run_journal(
     }
 }
 
-async fn read_run_journal(rpc: &str, run_id: &str) -> Result<Vec<JournalEntry>, String> {
+/// The run's journal lines and its chips. `chain` is the network the links
+/// are spelled for, so a chip opened later on another network refuses
+/// instead of resolving its ids against the wrong store.
+async fn read_run_journal(
+    rpc: &str,
+    chain: &str,
+    dispatch_id: &str,
+) -> Result<(Vec<JournalEntry>, Vec<RunLink>), String> {
     let client = rpc_client(rpc)?;
     let reply: runs::index::RunsViewReply = client
-        .view("runs", &runs::index::RunsViewQuery::Run {
-            run_id: run_id.to_owned(),
-        })
+        .view(
+            "runs",
+            &runs::index::RunsViewQuery::Run {
+                dispatch_id: dispatch_id.to_owned(),
+            },
+        )
         .await?;
     let runs::index::RunsViewReply::Run(detail) = reply else {
         return Err("the runs journal returned the wrong reply to a run read".into());
     };
-    Ok(detail
-        .map(|detail| detail.journal.into_iter().map(journal_entry).collect())
-        .unwrap_or_default())
+    let Some(detail) = detail else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let links = run_links(&client, chain, detail.run).await;
+    let entries = detail.journal.into_iter().map(journal_entry).collect();
+    Ok((entries, links))
 }
 
 /// Pause or resume one agent — owner-gated at the module, not quorum-gated.
@@ -3008,7 +3212,8 @@ mod run_journal_scope_tests {
 
     fn read(network: &str, link: i64, op: i64) -> RunJournal {
         RunJournal {
-            run_id: "run-7".into(),
+            dispatch_id: "run-7".into(),
+            links: Vec::new(),
             entries: vec![JournalEntry {
                 height: "41".into(),
                 kind: "dispatched".into(),

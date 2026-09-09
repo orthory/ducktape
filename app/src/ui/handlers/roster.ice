@@ -125,6 +125,18 @@ on agents_loaded(next)
 // A's journal under B. Success AND refusal meet the same fence, which is why
 // the read is infallible and carries its scope in the answer: an error arm has
 // nowhere to put one.
+// THE RUN PANEL, ON ONE RUN. Every door that opens a run — the runs list, a
+// chat hint's "View run", the run chip on a message a run posted, a bell, a
+// duck://run link — comes through here: the agents tab, the run named, and
+// its journal read under a fresh op so a slower earlier read cannot land over
+// it. An empty id closes the panel.
+on open_run_panel(dispatch_id)
+  shell_tab = ShellTab.agents
+  agents_open_run = dispatch_id
+  agents_journal = empty_run_journal()
+  agents_journal_op = agents_journal_op + 1
+  run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
+
 on agent_journal_loaded(next)
   return if !journal_in_scope(next, connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run)
   agents_journal = next
@@ -222,10 +234,16 @@ on agents_view_event(event)
     AgentsIntent.register
       run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
     AgentsIntent.open_run
-      agents_open_run = event_text(event, "run_id")
-      agents_journal = empty_run_journal()
-      agents_journal_op = agents_journal_op + 1
-      run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
+      flow
+        from done event_text(event, "dispatch_id")
+        done -> open_run_panel _
+    // A CHIP IS A LINK. The run panel's places carry duck:// addresses, and
+    // the open plane in `handlers/chat.ice` is the one place a link becomes
+    // navigation, whichever tab it was pressed on.
+    AgentsIntent.open_link
+      flow
+        from done event_text(event, "url")
+        done -> open_message_link _
     // THE EXPLICIT ASSOCIATION. The reader named a participant and a
     // conversation; the app reads them under this device's key on the network
     // it is connected to. Empty names close the panel, which is the same read

@@ -90,7 +90,9 @@ extern crate::backend
   AgentChatEntry(id:i64, role:str, body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity], steps_label:str)
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   LiveActivity(label:str, done:bool)
-  LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
+  pure live_run_for(rows:&[LiveAgentRow], dispatch_id:&str) -> LiveRun
   LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
@@ -263,7 +265,7 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, block:str, dispatch:str, channel:str, path:str, rev:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
   pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
   pure duck_page_link(page:str, chain_id:str) -> str
@@ -376,15 +378,16 @@ extern crate::backend
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   ForgeRepo(name:str, head:str)
+  ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
-  ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
+  ForgeRepoData(generation:i64, repo:str, branches:[ForgeBranch], items:[ForgeItem])
   ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])
   ForgeReview(author:str, author_name:str, verdict:str, body:str, blocks:[ChatBlock], commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
   ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, blocks:[ChatBlock], author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
   ForgeDiscussionData(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
-  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
+  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[ForgeBranch], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
@@ -402,6 +405,8 @@ extern crate::backend
   pure forge_branch_moved(loaded:bool, next_oid:&str, current_oid:&str) -> bool
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
   pure forge_parent(path:str) -> str
+  pure forge_branch_head(branches:&[ForgeBranch], name:&str) -> str
+  pure forge_tree_branch(branches:&[ForgeBranch], picked:&str, rev:&str) -> str
   pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
@@ -419,13 +424,14 @@ extern crate::backend
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
-  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
   JournalEntry(height:str, kind:str, summary:str)
-  RunJournal(run_id:str, entries:[JournalEntry], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
+  RunLink(relation:str, kind:str, label:str, url:str)
+  RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
   AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, run_id:str) -> RunJournal
-  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, run_id:&str) -> bool
+  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
+  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
   pure empty_run_journal() -> RunJournal
   pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
@@ -523,7 +529,7 @@ extern crate::backend
   pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
   pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
   pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
-  pure keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
+  pure keep_branches(loaded:bool, next:[ForgeBranch], current:[ForgeBranch]) -> [ForgeBranch]
   pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
   pure keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
   pure keep_chat_blocks(loaded:bool, next:[ChatBlock], current:[ChatBlock]) -> [ChatBlock]

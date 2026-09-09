@@ -8,7 +8,7 @@
 
 use agents_view::host::{
     AgentsProps, MessagingBinding, MessagingMessage, MessagingProps, MessagingSeat,
-    OpenConversation, RunRow, SendMessage,
+    OpenConversation, OpenRun, RunRow, SendMessage,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, keys, pick, press, texts, type_into};
@@ -91,7 +91,9 @@ fn register_with_runs(messaging: MessagingProps, runs: Vec<RunRow>) -> Vec<u8> {
     serde_json::to_vec(&AgentsProps {
         rows: Vec::new(),
         runs,
+        open_run: String::new(),
         journal: Default::default(),
+        live: Default::default(),
         capabilities: Vec::new(),
         actions: Vec::new(),
         account: "7".into(),
@@ -564,6 +566,7 @@ fn the_three_panels_are_one_selector_and_never_overlap() {
 fn a_message_links_to_a_run_only_when_the_journal_has_one() {
     let run = |id: &str| RunRow {
         run_id: id.into(),
+        dispatch_id: format!("dispatch-of-{id}"),
         agent_id: "reviewer-bot".into(),
         agent_name: "Reviewer Bot".into(),
         state: "accepted".into(),
@@ -598,6 +601,13 @@ fn a_message_links_to_a_run_only_when_the_journal_has_one() {
     let frame = tick_native(press(&frame, "open run run-42 · accepted"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "agents.open_run");
+    assert_eq!(
+        serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
+        OpenRun {
+            dispatch_id: "dispatch-of-run-42".into()
+        },
+        "the link opens the run by its address, not by the task id"
+    );
 
     // THE COUNTEREXAMPLE: a task the journal does not list gets NO link. The
     // ids' shapes are not evidence that one names the other.
