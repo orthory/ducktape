@@ -47,6 +47,7 @@ fn seated(action: &str) -> Arc<Mutex<Mounted>> {
         wanted: None,
         waiting_since: None,
         replacement: Replacement::Preserve,
+        retry: None,
     }))
 }
 
