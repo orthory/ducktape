@@ -88,7 +88,7 @@ class LaneGuardTests(unittest.TestCase):
                         lane.main()
         self.assertEqual(len(seen), 6)
 
-    def test_owned_reset_stops_all_services_then_clears_only_network_state(self):
+    def test_owned_reset_stops_all_services_then_archives_network_state(self):
         record = {"owner": "ducktape-view-lane-test", "host": "root@zk", "nodes": [
             {"id": i, "name": f"dt-view-{i}"} for i in [801, 802, 803]
         ]}
@@ -109,14 +109,59 @@ class LaneGuardTests(unittest.TestCase):
             with patch("sys.argv", argv), patch.object(lane, "remote", remote), patch("sys.stdout", io.StringIO()):
                 lane.main()
             events = [json.loads(line) for line in path.with_suffix(".events.jsonl").read_text().splitlines()]
-            self.assertEqual([event["result"] for event in events], ["started", "network_data_removed"])
+            self.assertEqual([event["result"] for event in events], ["started", "node_archived", "node_archived", "node_archived", "network_data_archived"])
+            backup = Path(events[0]["record_backup"])
+            self.assertEqual(json.loads(backup.read_text()), record)
             self.assertEqual(events[0]["reason"], "schema changed")
             self.assertEqual(json.loads(path.read_text()), record)
         expected = [("pct", "exec", i, "--", "systemctl", "stop", "ducktape-view-lane.service")
                     for i in [801, 802, 803]]
-        expected += [("pct", "exec", i, "--", "rm", "-rf", "--", "/var/lib/ducktape-view-lane/network")
-                     for i in [801, 802, 803]]
-        self.assertEqual(mutations, expected)
+        self.assertEqual(mutations[:3], expected)
+        self.assertEqual(len(mutations), 6)
+        for command in mutations[3:]:
+            self.assertEqual(command[3:7], ("--", "sh", "-ec", command[-1]))
+            self.assertNotIn("rm ", command[-1])
+            self.assertIn("mv -T --", command[-1])
+
+    def test_partial_archive_preserves_release_record_and_completed_paths(self):
+        record = {"owner": "ducktape-view-lane-test", "host": "root@zk", "release": {"revision": "old"},
+                  "nodes": [{"id": i, "name": f"dt-view-{i}"} for i in [801, 802, 803]]}
+        def remote(host, *command):
+            if command[:2] == ("pct", "config"):
+                return f"hostname: dt-view-{command[2]}\ndescription: {record['owner']}\n"
+            if "cat" in command:
+                return record["owner"]
+            if "sh" in command and command[2] == 802:
+                raise RuntimeError("archive refused")
+            return ""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lane.json"
+            path.write_text(json.dumps(record))
+            with patch("sys.argv", ["lane", "--record", str(path), "--reason", "test", "reset-network"]), patch.object(lane, "remote", remote):
+                with self.assertRaisesRegex(RuntimeError, "archive refused"):
+                    lane.main()
+            self.assertEqual(json.loads(path.read_text()), record)
+            events = [json.loads(line) for line in path.with_suffix(".events.jsonl").read_text().splitlines()]
+            self.assertEqual([event["result"] for event in events], ["started", "node_archived"])
+            self.assertEqual(events[1]["container"], 801)
+            self.assertEqual(json.loads(Path(events[0]["record_backup"]).read_text()), record)
+
+    def test_archive_command_preserves_bytes_and_refuses_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            network = root / "network"
+            network.mkdir()
+            (network / "state").write_bytes(b"committed state")
+            archive = root / "network-archive-test"
+            command = lane.archive_network_command(str(root), str(archive))
+            subprocess.run(["sh", "-ec", command], check=True)
+            self.assertFalse(network.exists())
+            self.assertEqual((archive / "state").read_bytes(), b"committed state")
+            network.mkdir()
+            (network / "state").write_bytes(b"new state")
+            self.assertNotEqual(subprocess.run(["sh", "-ec", command]).returncode, 0)
+            self.assertEqual((network / "state").read_bytes(), b"new state")
+            self.assertEqual((archive / "state").read_bytes(), b"committed state")
 
     def test_inventory_excludes_existing_vms_and_containers(self):
         nodes = lane.choose_nodes([{"vmid": 200, "type": "qemu"}, {"vmid": 202, "type": "lxc"}],

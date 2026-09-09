@@ -1,11 +1,6 @@
+// This fixture exercises the source registry, not the app navigation consumers.
+#[allow(dead_code, unused_imports)]
 #[path = "../../../../../../app/src/pages/guest_document.rs"]
-// The app's registry, borrowed whole: its surface serves the app, and this
-// binary drives only the registry.
-#[expect(
-    dead_code,
-    unused_imports,
-    reason = "the borrowed app module carries the app's surface"
-)]
 mod source_registry;
 // The actual generated guest, driven through its editor transaction handlers.
 // Native editor layout/painting is owned by the runtime's separate host tests.
