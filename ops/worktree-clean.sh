@@ -45,6 +45,9 @@ git fetch -q origin dev 2>/dev/null || true
 # A borrowed Cargo target can be live under another worktree's cwd. Keep
 # references through open files, mapped artifacts and CARGO_TARGET_DIR too.
 # This tool handles same-user caches only; cross-user consumers are unsupported.
+# A process the kernel will not show (a vanished pid, or one whose /proc entries
+# refuse even its own user, as systemd --user does) holds no reference this
+# tool can see, so it counts for nothing and the scan goes on.
 # Print only PIDs: process environments may contain credentials.
 pids_under() {
   python3 - "$1" <<'PYTHON'
@@ -56,6 +59,8 @@ root = os.path.realpath(sys.argv[1])
 if os.stat(root).st_uid != os.geteuid():
     raise PermissionError("worktree is owned by another user")
 
+UNSEEN = (FileNotFoundError, ProcessLookupError, PermissionError)
+
 def inside(path):
     return path == root or path.startswith(root + "/")
 
@@ -64,16 +69,16 @@ def references(process):
         try:
             if inside(os.readlink(process / name)):
                 return True
-        except (FileNotFoundError, ProcessLookupError):
+        except UNSEEN:
             pass
     try:
         for descriptor in (process / "fd").iterdir():
             try:
                 if inside(os.readlink(descriptor)):
                     return True
-            except (FileNotFoundError, ProcessLookupError):
+            except UNSEEN:
                 pass
-    except (FileNotFoundError, ProcessLookupError):
+    except UNSEEN:
         pass
     try:
         for entry in (process / "environ").read_bytes().split(b"\0"):
@@ -83,14 +88,14 @@ def references(process):
                     target = os.path.join(os.readlink(process / "cwd"), target)
                 if inside(os.path.realpath(target)):
                     return True
-    except (FileNotFoundError, ProcessLookupError):
+    except UNSEEN:
         pass
     try:
         for line in (process / "maps").read_text().splitlines():
             fields = line.split(maxsplit=5)
             if len(fields) == 6 and inside(fields[5]):
                 return True
-    except (FileNotFoundError, ProcessLookupError):
+    except UNSEEN:
         pass
     return False
 
@@ -99,7 +104,7 @@ for process in Path("/proc").iterdir():
         continue
     try:
         owner = process.stat().st_uid
-    except (FileNotFoundError, ProcessLookupError):
+    except UNSEEN:
         continue
     if owner == os.geteuid() and references(process):
         print(process.name)
