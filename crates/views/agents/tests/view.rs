@@ -166,7 +166,9 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
 fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
     let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
-    for expected in ["Identity", "Executor", "Actions", "Grants", "Skills", "ducktape", "*"] {
+    for expected in [
+        "Identity", "Executor", "Actions", "Grants", "Skills", "ducktape", "*",
+    ] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
@@ -184,7 +186,11 @@ fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
     let frame = tick_native(type_into(&frame, "repo, prefix, page id…", "playground"));
     let frame = tick_native(press(&frame, "Add grant"));
     let frame = tick_native(type_into(&frame, "0", "4"));
-    assert!(frame.requests.is_empty(), "drafts leave nothing: {:?}", frame.requests);
+    assert!(
+        frame.requests.is_empty(),
+        "drafts leave nothing: {:?}",
+        frame.requests
+    );
 
     let frame = tick_native(press(&frame, "Save agent"));
     let intent = one_intent(&frame);
@@ -207,7 +213,10 @@ fn a_reader_who_is_not_the_controller_gets_the_record_read_only() {
     let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "9");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
     assert!(
-        has_text(&frame, "Only this agent's controller can change its record. You are reading it."),
+        has_text(
+            &frame,
+            "Only this agent's controller can change its record. You are reading it."
+        ),
         "{:?}",
         texts(&frame)
     );
@@ -253,7 +262,11 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let frame = tick_native(type_into(&frame, "display name…", "ChiefDuck"));
     let frame = tick_native(pick(&frame, CAPABILITY_PICK, "claude"));
     let frame = tick_native(toggle(&frame, "chat.post", true));
-    let frame = tick_native(type_into(&frame, "skill name (its mount directory)…", "chiefduck"));
+    let frame = tick_native(type_into(
+        &frame,
+        "skill name (its mount directory)…",
+        "chiefduck",
+    ));
     let frame = tick_native(toggle(&frame, "load always (persona)", true));
     let frame = tick_native(press(&frame, "Add skill"));
     let frame = tick_native(press(&frame, "Register agent"));
@@ -290,7 +303,11 @@ fn a_committed_write_reseeds_the_open_record_from_its_fresh_row() {
     let frame = tick_native(press(&frame, "Save agent"));
     let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
     assert_eq!(draft.display_name, "Renamed Bot");
-    assert_eq!(draft.allowed_actions, ["chat.post"], "the unsaved tick was consumed");
+    assert_eq!(
+        draft.allowed_actions,
+        ["chat.post"],
+        "the unsaved tick was consumed"
+    );
 }
 
 #[test]

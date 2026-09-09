@@ -360,6 +360,12 @@ on welcome_failed(cause)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  fs_generation = fs_generation + 1
+  fs_preview_path = ""
+  fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_loading = false
   invalidate lane=ceremony
   invalidate lane=desktop_ceremony
   mutation_phase = MutationPhase.idle
@@ -713,6 +719,12 @@ on onboarding_failed(cause)
 // left, so the signer seat is dropped with it and the next pick unlocks anew.
 on switch_network
   return if mutation_phase != MutationPhase.idle
+  fs_generation = fs_generation + 1
+  fs_preview_path = ""
+  fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_loading = false
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
   account_busy = account_busy && empty(account_ceremony_phase)

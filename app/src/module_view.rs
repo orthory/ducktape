@@ -16,10 +16,12 @@
 //! that holds none of them cannot leak one — and a view that traps shows why
 //! in its place instead of taking the window with it.
 
-use std::collections::HashMap;
+mod display_budget;
+
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
@@ -27,7 +29,10 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector, widget, window};
 use ui_lang_runtime::view_tree::{self, Inputs, Output, Pictures, Surfaces};
 use ui_lang_wire as wire;
 use wasmtime::component::{Component, Linker, TypedFunc};
-use wasmtime::{Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Cache, CacheConfig, Config, Engine, OptLevel, Store, StoreContextMut, StoreLimits,
+    StoreLimitsBuilder,
+};
 
 /// What a module view asked the app to do: `kind` is the operation
 /// (`vote`, `execute`), `detail` the guest's JSON for it.
@@ -50,6 +55,20 @@ const MAX_MODULE_BYTES: u64 = 64 << 20;
 const MAX_FRAME_BYTES: usize = 8 << 20;
 const MAX_REQUESTS_PER_TICK: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+/// A never-valid view may hold its replacement off for this long. Once a
+/// guest publishes a valid tree, neither pending work nor a later trap
+/// authorizes discarding its state.
+const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
+/// The gap before the first re-attempt at a candidate whose load failed,
+/// and the longest that gap widens to. A load fetches the artifact,
+/// instantiates it, restores the snapshot and verifies the first tree —
+/// and compiles the component too, whenever `compiled_view` does not
+/// already hold it. A deployment that cannot load fails that way every
+/// time, so trying it once a block buys nothing and never stops. Widening
+/// the gap rather than giving up keeps a fetch that failed on the
+/// transport recoverable: nothing is suppressed for good, only spaced out.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 /// How often a tab polls for a component still loading on its thread.
 const LOAD_POLL: Duration = Duration::from_millis(50);
 
@@ -628,6 +647,7 @@ struct ForgeProps<'a> {
     comment_cap_reached: bool,
     discussion: &'a [crate::backend::ChatMessage],
     linked_note: &'a [crate::backend::ChatMessage],
+    discussion_clipped: bool,
     landed_seq: i64,
     landed_tick: i64,
     tree_path: &'a str,
@@ -774,6 +794,7 @@ pub fn forge_view(
         comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
         discussion,
         linked_note: linked_note.as_slice(),
+        discussion_clipped: false,
         landed_seq,
         landed_tick,
         tree_path,
@@ -806,7 +827,10 @@ pub fn forge_view(
         note_scope,
         note_blocked,
     };
-    module_view("forge", serde_json::to_vec(&props).expect("props encode"))
+    module_view(
+        "forge",
+        display_budget::forge(serde_json::to_value(&props).expect("props encode")),
+    )
 }
 
 fn forge_phase_word(phase: crate::ForgePhase) -> &'static str {
@@ -1324,7 +1348,7 @@ pub fn chat_view(
     module_view("chat", encode_chat_props(props))
 }
 
-/// Body bytes the two timelines may put on one frame together: the wire
+/// Text bytes a guest's big list or blob may put on one frame: the wire
 /// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
 /// newest messages come last — a busy room's hot window (256 rows) drew its
 /// newest messages blank. The rest of the frame (rooms, names, times, the
@@ -1379,6 +1403,19 @@ fn newest_within(
         start -= 1;
     }
     (&messages[start..], start > 0)
+}
+
+/// The head of `text` that fits `budget`, cut on a char boundary, and
+/// whether anything was cut.
+fn head_within(text: &str, budget: usize) -> (&str, bool) {
+    if text.len() <= budget {
+        return (text, false);
+    }
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
 }
 
 fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
@@ -1522,8 +1559,17 @@ pub fn files_view(
     preview_text: &str,
     write_refusal: &str,
     writes: i64,
+    rpc: &str,
+    chain: &str,
+    connection: i64,
+    preview_base: &str,
+    save_reply: &crate::backend::FsSaveHistory,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
+        "network_scope": crate::backend::files_network_scope(rpc.into(), chain.into()),
+        "context": crate::backend::files_context(rpc.into(), chain.into(), connection),
+        "preview_base": preview_base,
+        "save_reply": save_reply,
         "path": path,
         "listed": listed,
         "entries": entries,
@@ -1546,7 +1592,7 @@ pub fn files_view(
         "write_refusal": write_refusal,
         "writes": writes,
     });
-    module_view("files", serde_json::to_vec(&props).expect("props encode"))
+    module_view("files", display_budget::files(props))
 }
 
 pub fn files_intent(event: &ModuleViewEvent) -> crate::FilesIntent {
@@ -1916,7 +1962,7 @@ fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleV
 /// slot without one — with no props pushed.
 pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
     let mounted = mounted(module);
-    let (content, rev, generation) = {
+    let (content, rev, generation, alive) = {
         let mut locked = mounted.lock().expect("module view lock");
         let generation = locked.generation;
         match &mut locked.slot {
@@ -1927,13 +1973,19 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
                 ));
             }
             Slot::Failed(reason) => return notice(reason),
-            Slot::Ready(guest) => (guest.render(), guest.frame_rev, generation),
+            Slot::Ready(guest) => (
+                guest.render(),
+                guest.frame_rev,
+                generation,
+                guest.alive.clone(),
+            ),
         }
     };
     Element::new(ModuleView {
         mounted,
         generation,
         rev,
+        alive,
         content,
     })
 }
@@ -2033,10 +2085,24 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
             // starting over on every block would never let it land
             let waited_for =
                 locked.in_flight && locked.wanted.is_none_or(|wanted| Some(wanted) == active);
-            if waited_for || active == locked.hash {
+            // a candidate that just failed is left alone until its gap is
+            // up: the same bytes fail the same way, so one attempt a block
+            // is unbounded work for a deployment that never lands
+            if waited_for || active == locked.hash || locked.held_off(active) {
                 return None;
             }
+            let Some(replacement) = locked.replacement_after_wait() else {
+                log_source(
+                    module,
+                    active.as_ref(),
+                    "Failed",
+                    locked.generation,
+                    "replacement_waiting",
+                );
+                return None;
+            };
             let generation = locked.start(active);
+            locked.replacement = replacement;
             Some(spawn_load(module, mounted, generation, asked_of.clone()))
         })
         .collect()
@@ -2074,24 +2140,89 @@ struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
-    /// The deployment the slot answers for — the view drawn, the empty
-    /// slot of a deployment without one, or the one that failed to load —
-    /// so a block moves it only when the active code moved.
+    /// The deployment the slot answers for — the view drawn, or the empty
+    /// slot of a deployment without one — so a block moves it only when the
+    /// active code moved. A load that failed never seated anything, so it
+    /// leaves this alone and is held off by `retry` instead.
     hash: Option<[u8; 32]>,
     /// A load is on its way for `generation`, and the deployment it is
     /// after when a block named one: a block that names it again waits
     /// for it instead of starting over.
     in_flight: bool,
     wanted: Option<[u8; 32]>,
+    /// The seated view has held a replacement off with pending work since
+    /// then; a block that names a deployment for it waits under the same
+    /// generation instead of opening one per block.
+    waiting_since: Option<Instant>,
+    replacement: Replacement,
+    /// The candidate a load last failed on, and when the next block may try
+    /// it again. Cleared by any load that comes back, so only a repeated
+    /// failure on the same candidate widens the gap.
+    retry: Option<Retry>,
+}
+
+/// A failed load's hold-off: the candidate it failed on, when the next
+/// attempt at that same candidate is due, and the gap that produced it.
+struct Retry {
+    hash: Option<[u8; 32]>,
+    next: Instant,
+    gap: Duration,
+}
+
+impl Retry {
+    /// The hold-off after a load for `hash` failed: the gap doubles up to
+    /// `RETRY_MAX` while the same candidate keeps failing, and starts over
+    /// at `RETRY_FIRST` for a different one.
+    fn after(previous: Option<&Retry>, hash: Option<[u8; 32]>) -> Retry {
+        let gap = match previous {
+            Some(previous) if previous.hash == hash => (previous.gap * 2).min(RETRY_MAX),
+            _ => RETRY_FIRST,
+        };
+        Retry {
+            hash,
+            next: Instant::now() + gap,
+            gap,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Replacement {
+    Preserve,
+    RecoverNeverValid,
 }
 
 impl Mounted {
+    fn replacement_after_wait(&mut self) -> Option<Replacement> {
+        let Slot::Ready(old) = &self.slot else {
+            return Some(Replacement::Preserve);
+        };
+        let no_pending_state = old.ticks == 0 || (old.ever_valid_tree && old.settled());
+        if no_pending_state {
+            return Some(Replacement::Preserve);
+        }
+        let since = *self.waiting_since.get_or_insert_with(Instant::now);
+        let never_valid_expired =
+            old.can_recover_without_state() && since.elapsed() >= REPLACEMENT_WAIT;
+        never_valid_expired.then_some(Replacement::RecoverNeverValid)
+    }
+
+    /// Whether a block naming `active` is still inside the hold-off a
+    /// failed load for that same candidate left behind.
+    fn held_off(&self, active: Option<[u8; 32]>) -> bool {
+        self.retry
+            .as_ref()
+            .is_some_and(|retry| retry.hash == active && Instant::now() < retry.next)
+    }
+
     /// Opens the next generation for a load after `wanted` (None: whatever
     /// the node holds active), and names it.
     fn start(&mut self, wanted: Option<[u8; 32]>) -> u64 {
         self.generation += 1;
         self.in_flight = true;
         self.wanted = wanted;
+        self.waiting_since = None;
+        self.replacement = Replacement::Preserve;
         self.generation
     }
 }
@@ -2124,6 +2255,9 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 hash: None,
                 in_flight: true,
                 wanted: None,
+                waiting_since: None,
+                replacement: Replacement::Preserve,
+                retry: None,
             }));
             spawn_load(module, &mounted, 0, snapshot);
             mounted
@@ -2154,7 +2288,19 @@ fn spawn_load(
         if connection.rev != asked_of.rev {
             return;
         }
-        let Mounted { slot, hash, .. } = &mut *locked;
+        let Mounted {
+            slot,
+            hash,
+            replacement,
+            wanted,
+            retry,
+            ..
+        } = &mut *locked;
+        let replacement = *replacement;
+        // a load that came back at all clears the hold-off; only the error
+        // arm below puts one back, widened against the one taken here
+        let wanted = *wanted;
+        let held_off = retry.take();
         match loaded {
             Ok(Loaded::Fresh(guest)) => {
                 *hash = guest.hash;
@@ -2182,7 +2328,13 @@ fn spawn_load(
                     );
                     return;
                 };
-                if !Arc::ptr_eq(&old.alive, &alive) || old.ticks != ticks || !old.settled() {
+                // A never-valid view may have become usable while bytes
+                // were loading. Recheck at installation before dropping it.
+                let still_eligible = match replacement {
+                    Replacement::Preserve => old.ticks == ticks && old.settled(),
+                    Replacement::RecoverNeverValid => old.can_recover_without_state(),
+                };
+                if !Arc::ptr_eq(&old.alive, &alive) || !still_eligible {
                     log_source(
                         module,
                         fresh.hash.as_ref(),
@@ -2206,7 +2358,11 @@ fn spawn_load(
                         _ => {}
                     });
                 }
-                log_source(module, fresh.hash.as_ref(), "Swapped", generation, "");
+                let reason = match replacement {
+                    Replacement::RecoverNeverValid => "recovered_never_valid_view",
+                    Replacement::Preserve => "",
+                };
+                log_source(module, fresh.hash.as_ref(), "Swapped", generation, reason);
                 *hash = fresh.hash;
                 *slot = Slot::Ready(fresh);
             }
@@ -2218,6 +2374,10 @@ fn spawn_load(
                     error = %reason,
                     "module view not loaded"
                 );
+                // the next block leaves this candidate alone until the gap
+                // is up; a transport error is only spaced out, never
+                // suppressed, and any other deployment is unaffected
+                *retry = Some(Retry::after(held_off.as_ref(), wanted));
                 // a view that is there stays, with its hash: the failure is
                 // the replacement's, not its own
                 if !matches!(slot, Slot::Ready(_)) {
@@ -2282,6 +2442,68 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
             .lock()
             .expect("view_source taps")
             .retain(|tap| tap.send(line.clone()).is_ok());
+    }
+}
+
+/// How long each stage of one module-owned load took: `status` and
+/// `fetch` are the node's answers, `compile` is cranelift, `init` the
+/// instance and its `on mount` or restore, `first_frame` the tree a
+/// replacement proves (a fresh view draws its first on the window thread),
+/// `check` the second look at the registry before the seat. `path` is
+/// `tab` for a mount (the tab's first draw), `first` for a load the
+/// connection asked for over an empty slot, `swap` over a view drawn.
+#[derive(Default)]
+struct LoadTiming {
+    path: &'static str,
+    status: Duration,
+    fetch: Duration,
+    compile: Duration,
+    init: Duration,
+    first_frame: Option<Duration>,
+    check: Duration,
+}
+
+impl LoadTiming {
+    /// One `view_load` line per load, every field every time, through the
+    /// same logger and test tap as `view_source`.
+    fn log(&self, module: &str, hash: Option<&[u8; 32]>, started: Instant, state: &str) {
+        let ms = |duration: Duration| duration.as_millis();
+        let hash = hash.map_or_else(|| "-".to_owned(), |hash| crate::backend::hex_encode(hash));
+        let first_frame = self
+            .first_frame
+            .map_or_else(|| "-".to_owned(), |frame| ms(frame).to_string());
+        let total = ms(started.elapsed());
+        tracing::info!(
+            target: "ducktape::app",
+            module,
+            hash = %hash,
+            path = self.path,
+            outcome = state,
+            status_ms = ms(self.status),
+            fetch_ms = ms(self.fetch),
+            compile_ms = ms(self.compile),
+            init_ms = ms(self.init),
+            first_frame_ms = %first_frame,
+            check_ms = ms(self.check),
+            total_ms = total,
+            "view_load"
+        );
+        #[cfg(test)]
+        {
+            let line = format!(
+                "view_load module={module} hash={hash} path={} outcome={state} status_ms={} fetch_ms={} compile_ms={} init_ms={} first_frame_ms={first_frame} check_ms={} total_ms={total}",
+                self.path,
+                ms(self.status),
+                ms(self.fetch),
+                ms(self.compile),
+                ms(self.init),
+                ms(self.check),
+            );
+            canary::TAPS
+                .lock()
+                .expect("view_source taps")
+                .retain(|tap| tap.send(line.clone()).is_ok());
+        }
     }
 }
 
@@ -2385,6 +2607,8 @@ struct Guest {
     /// number it has not rendered.
     frame_rev: u64,
     ticks: u64,
+    /// A later patch gap or trap must not erase evidence of authored state.
+    ever_valid_tree: bool,
     /// The live text of every input in the tree — the host's, not the guest's.
     inputs: Inputs,
     /// Every picture the guest has sent, by hash: the bytes cross once.
@@ -2394,6 +2618,8 @@ struct Guest {
     /// props it was last given on it.
     props_subscription: Option<u64>,
     props_sent: Option<Vec<u8>>,
+    /// Separates Files save acknowledgements across fresh guest instances.
+    files_save_namespace: Option<String>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
@@ -2432,6 +2658,80 @@ fn hex_short(hash: &[u8; 32]) -> String {
     hash[..6].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+const COMPILED_VIEW_LIMIT: usize = 16;
+const COMPILED_VIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct ViewCodeCache {
+    entries: VecDeque<CompiledView>,
+}
+
+struct CompiledView {
+    hash: [u8; 32],
+    source_bytes: usize,
+    component: Arc<Component>,
+}
+
+impl ViewCodeCache {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<Component>> {
+        let index = self.entries.iter().position(|entry| &entry.hash == hash)?;
+        let entry = self.entries.remove(index)?;
+        let component = entry.component.clone();
+        self.entries.push_back(entry);
+        Some(component)
+    }
+
+    fn insert(&mut self, entry: CompiledView) {
+        if entry.source_bytes > COMPILED_VIEW_SOURCE_BYTES {
+            return;
+        }
+        let mut bytes: usize = self.entries.iter().map(|entry| entry.source_bytes).sum();
+        loop {
+            let fits = self.entries.len() < COMPILED_VIEW_LIMIT
+                && bytes + entry.source_bytes <= COMPILED_VIEW_SOURCE_BYTES;
+            if fits {
+                break;
+            }
+            let Some(old) = self.entries.pop_front() else {
+                break;
+            };
+            bytes -= old.source_bytes;
+        }
+        self.entries.push_back(entry);
+    }
+}
+
+fn compiled_view(bytes: &[u8]) -> Result<Arc<Component>, String> {
+    static CODE: OnceLock<Mutex<ViewCodeCache>> = OnceLock::new();
+    compile_view(engine(), CODE.get_or_init(Mutex::default), bytes)
+}
+
+// Cache code only: every load still creates its own Store, instance and assets.
+// The cache belongs to this one Engine. Compile outside the lock so unrelated
+// views can prepare concurrently; a competing result adopts the existing entry.
+fn compile_view(
+    engine: &Engine,
+    cache: &Mutex<ViewCodeCache>,
+    bytes: &[u8],
+) -> Result<Arc<Component>, String> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes).into();
+    if let Some(component) = cache.lock().expect("view code cache").get(&hash) {
+        return Ok(component);
+    }
+    let component = Arc::new(Component::new(engine, bytes).map_err(|error| error.to_string())?);
+    let mut cache = cache.lock().expect("view code cache");
+    if let Some(existing) = cache.get(&hash) {
+        return Ok(existing);
+    }
+    cache.insert(CompiledView {
+        hash,
+        source_bytes: bytes.len(),
+        component: component.clone(),
+    });
+    Ok(component)
+}
+
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
@@ -2444,6 +2744,19 @@ fn engine() -> &'static Engine {
         config.cranelift_opt_level(OptLevel::Speed);
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        match crate::backend::cache_dir() {
+            Ok(directory) => {
+                let mut cache = CacheConfig::new();
+                cache.with_directory(directory.join("view-code"));
+                match Cache::new(cache) {
+                    Ok(cache) => {
+                        config.cache(Some(cache));
+                    }
+                    Err(error) => tracing::warn!(reason = "view_cache_unavailable", %error),
+                }
+            }
+            Err(error) => tracing::warn!(reason = "view_cache_directory_unavailable", %error),
+        }
         let engine = Engine::new(&config).expect("wasmtime engine");
         // The clock every tick's deadline is measured against: one thread
         // for the process, never stopped.
@@ -2502,28 +2815,54 @@ impl Guest {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let source = match runtime.block_on(view_source::resolve(client, module)) {
+        let started = Instant::now();
+        let mut timing = LoadTiming {
+            // the mount is the tab's first draw; a later load is one the
+            // connection asked for, over a view drawn or not
+            path: if generation == 0 { "tab" } else { "first" },
+            ..LoadTiming::default()
+        };
+        let mut asked = view_source::Asked::default();
+        let source = runtime.block_on(view_source::resolve(client, module, &mut asked));
+        timing.status = asked.status;
+        timing.fetch = asked.fetch;
+        let source = match source {
             Ok(source) => source,
             Err(error) => {
                 let reason = error.to_string();
                 logged(None, "Failed", &reason);
+                timing.log(module, None, started, "Failed");
                 return Err(reason);
             }
         };
         let (hash, component, assets) = match source {
             ViewSource::NotActivated => {
                 logged(None, "NotActivated", "");
+                timing.log(module, None, started, "NotActivated");
                 return Err(format!("the {module} module is not activated yet"));
             }
             ViewSource::Missing { hash } => {
                 // a removal answered late, after the code moved on, is not
                 // the current deployment's word
-                if !runtime.block_on(still_active(client, module, hash))? {
+                let checked = Instant::now();
+                let active = runtime.block_on(still_active(client, module, hash));
+                timing.check = checked.elapsed();
+                let active = match active {
+                    Ok(active) => active,
+                    Err(reason) => {
+                        logged(Some(&hash), "Failed", &reason);
+                        timing.log(module, Some(&hash), started, "Failed");
+                        return Err(reason);
+                    }
+                };
+                if !active {
                     let reason = "the active code moved while the view was prepared";
                     logged(Some(&hash), "Failed", reason);
+                    timing.log(module, Some(&hash), started, "Failed");
                     return Err(reason.to_owned());
                 }
                 logged(Some(&hash), "Missing", "");
+                timing.log(module, Some(&hash), started, "Missing");
                 return Ok(Loaded::Empty(hash));
             }
             ViewSource::Ready {
@@ -2537,45 +2876,80 @@ impl Guest {
             // the instance in the slot, if the deployment is a new one for
             // it: the replacement is seated only against that very
             // instance at that very tick count
-            let against = {
+            let (against, replacement) = {
                 let locked = mounted.lock().expect("module view lock");
-                match &locked.slot {
+                let against = match &locked.slot {
                     Slot::Ready(old) if old.hash == Some(hash) => return Ok(Loaded::Unchanged),
                     Slot::Ready(old) => Some((old.alive.clone(), old.ticks)),
                     _ => None,
-                }
+                };
+                (against, locked.replacement)
             };
-            let mut fresh = Self::instantiate(module, &component, &shown)?;
-            fresh.deployed(hash, assets);
-            match against {
-                // a view drawn carries its state over
-                Some((_, ticks)) if ticks > 0 => {
-                    let snapshot = {
-                        let mut locked = mounted.lock().expect("module view lock");
-                        let Slot::Ready(old) = &mut locked.slot else {
-                            return Err("the view left while its replacement was prepared".into());
-                        };
-                        if !old.settled() {
-                            return Err("the view has pending work; its replacement waits".into());
-                        }
-                        old.snapshot()?
-                    };
-                    wire::Snapshot::decode(&snapshot)?;
-                    fresh.restore(&snapshot, &shown)?;
-                    fresh.first_frame(&shown)?;
-                }
-                // one mounted but never ticked has no state worth carrying;
-                // its replacement still proves its first tree before it
-                // takes the slot
-                Some(_) => {
-                    fresh.init(&shown)?;
-                    fresh.first_frame(&shown)?;
-                }
-                None => fresh.init(&shown)?,
+            if against.is_some() {
+                timing.path = "swap";
             }
+            let compiled = Instant::now();
+            let component = Self::compile(&component, &shown);
+            timing.compile = compiled.elapsed();
+            let component = component?;
+            let seated = Instant::now();
+            let prepared = (|| -> Result<Self, String> {
+                let mut fresh = Self::instantiate(module, &component, &shown)?;
+                fresh.deployed(hash, assets);
+                match against {
+                    // A once-valid view carries its state over. Only an
+                    // explicitly admitted never-valid recovery may initialize.
+                    Some((_, ticks))
+                        if ticks > 0 && matches!(replacement, Replacement::Preserve) =>
+                    {
+                        let snapshot = {
+                            let mut locked = mounted.lock().expect("module view lock");
+                            let Slot::Ready(old) = &mut locked.slot else {
+                                return Err(
+                                    "the view left while its replacement was prepared".into()
+                                );
+                            };
+                            if !old.settled() {
+                                return Err(
+                                    "the view has pending work; its replacement waits".into()
+                                );
+                            }
+                            old.snapshot()?
+                        };
+                        wire::Snapshot::decode(&snapshot)?;
+                        fresh.restore(&snapshot, &shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    // one mounted but never ticked has no state worth carrying;
+                    // its replacement still proves its first tree before it
+                    // takes the slot
+                    Some(_) => {
+                        fresh.init(&shown)?;
+                        let framed = Instant::now();
+                        let frame = fresh.first_frame(&shown);
+                        timing.first_frame = Some(framed.elapsed());
+                        frame?;
+                    }
+                    None => {
+                        fresh.init(&shown)?;
+                    }
+                }
+                Ok(fresh)
+            })();
+            // Include failed instantiate/restore/init work as well as success.
+            timing.init = seated
+                .elapsed()
+                .saturating_sub(timing.first_frame.unwrap_or_default());
+            let fresh = prepared?;
             // the deployment may have moved while this one was prepared;
             // the block that moved it starts another load
-            if !runtime.block_on(still_active(client, module, hash))? {
+            let checked = Instant::now();
+            let active = runtime.block_on(still_active(client, module, hash));
+            timing.check = checked.elapsed();
+            if !active? {
                 return Err("the active code moved while the view was prepared".into());
             }
             Ok(match against {
@@ -2587,12 +2961,20 @@ impl Guest {
                 None => Loaded::Fresh(Box::new(fresh)),
             })
         })();
-        match &outcome {
-            Ok(Loaded::Fresh(_)) => logged(Some(&hash), "Ready", ""),
+        let state = match &outcome {
+            Ok(Loaded::Fresh(_)) => {
+                logged(Some(&hash), "Ready", "");
+                "Ready"
+            }
+            Ok(Loaded::Unchanged) => "Unchanged",
             // `Swapped` is logged at the seat: the swap can still be refused there
-            Ok(_) => {}
-            Err(reason) => logged(Some(&hash), "Failed", reason),
-        }
+            Ok(_) => "Swap",
+            Err(reason) => {
+                logged(Some(&hash), "Failed", reason);
+                "Failed"
+            }
+        };
+        timing.log(module, Some(&hash), started, state);
         outcome
     }
 
@@ -2659,6 +3041,12 @@ impl Guest {
                 },
             ),
         );
+    }
+
+    /// A trap or temporary missing tree cannot revoke previously accepted
+    /// authored state. Both recovery admission and installation use this fact.
+    fn can_recover_without_state(&self) -> bool {
+        !self.ever_valid_tree
     }
 
     /// Everything this instance was asked to do is done: nothing pending,
@@ -2741,14 +3129,15 @@ impl Guest {
 
     /// The component instantiated and mounted; `shown` names it in errors.
     fn from_bytes(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
-        let mut guest = Self::instantiate(module, bytes, shown)?;
+        let component = Self::compile(bytes, shown)?;
+        let mut guest = Self::instantiate(module, &component, shown)?;
         guest.init(shown)?;
         Ok(guest)
     }
 
-    /// The component instantiated, its exports bound, nothing run yet: a
-    /// fresh view is `init`ed, a replacement `restore`d.
-    fn instantiate(module: &'static str, bytes: &[u8], shown: &str) -> Result<Self, String> {
+    /// The component's bytes checked and compiled — the cranelift stage of
+    /// a load, measured on its own.
+    fn compile(bytes: &[u8], shown: &str) -> Result<Arc<Component>, String> {
         if bytes.len() as u64 > MAX_MODULE_BYTES {
             return Err(format!(
                 "{shown}: past the {MAX_MODULE_BYTES} byte module limit"
@@ -2757,9 +3146,17 @@ impl Guest {
         // its preferred size is for placing a new window; the tab embeds
         ui_lang_wire::manifest::read_manifest(bytes)
             .ok_or_else(|| format!("{shown}: the component's manifest cannot be read"))?;
+        compiled_view(bytes).map_err(|error| format!("{shown}: {error}"))
+    }
+
+    /// The component instantiated, its exports bound, nothing run yet: a
+    /// fresh view is `init`ed, a replacement `restore`d.
+    fn instantiate(
+        module: &'static str,
+        component: &Component,
+        shown: &str,
+    ) -> Result<Self, String> {
         let engine = engine();
-        let component =
-            Component::new(engine, bytes).map_err(|error| format!("{shown}: {error}"))?;
         // Tables are allocated eagerly at their declared minimum, before any
         // fuel or memory limit is consulted; a component is several core
         // instances — the app, the stub adapters `cargo ice bundle` gave it,
@@ -2796,11 +3193,11 @@ impl Guest {
             )
             .map_err(|error| error.to_string())?;
         linker
-            .define_unknown_imports_as_traps(&component)
+            .define_unknown_imports_as_traps(component)
             .map_err(|error| error.to_string())?;
         arm(&mut store);
         let instance = linker
-            .instantiate(&mut store, &component)
+            .instantiate(&mut store, component)
             .map_err(|error| format!("{shown}: {}", first_line(&error)))?;
         let init = instance
             .get_typed_func::<(bool,), ()>(&mut store, "init")
@@ -2822,11 +3219,14 @@ impl Guest {
             frame: wire::Frame::default(),
             frame_rev: 0,
             ticks: 0,
+            ever_valid_tree: false,
             inputs: Inputs::default(),
             pictures: Pictures::default(),
             surfaces: surfaces_of(module),
             props_subscription: None,
             props_sent: None,
+            files_save_namespace: (module == "files")
+                .then(|| crate::backend::fresh_operation_id("files-view".into())),
             intents: Vec::new(),
             fault: None,
             assets: Arc::default(),
@@ -2898,9 +3298,16 @@ impl Guest {
             return;
         }
         self.props_sent = props.clone();
+        let mut bytes = props.clone().unwrap_or_default();
+        if let Some(namespace) = &self.files_save_namespace
+            && let Ok(serde_json::Value::Object(mut facts)) = serde_json::from_slice(&bytes)
+        {
+            facts.insert("save_namespace".into(), namespace.clone().into());
+            bytes = serde_json::to_vec(&facts).expect("JSON object serializes");
+        }
         self.pending.push(wire::Event::Response {
             id,
-            result: Ok(props.clone().unwrap_or_default()),
+            result: Ok(bytes),
             done: false,
         });
     }
@@ -3012,6 +3419,7 @@ impl Guest {
                     Ok(true) => {
                         self.frame_rev += 1;
                         if let Some(root) = &mut frame.root {
+                            self.ever_valid_tree = true;
                             self.inputs.adopt(root);
                             self.pictures.adopt(root);
                             // The guest remembers its tree without the
@@ -3113,6 +3521,12 @@ fn first_line(error: &wasmtime::Error) -> String {
         .to_string()
 }
 
+#[path = "module_view/input.rs"]
+mod input;
+#[cfg(test)]
+#[path = "module_view/input_tests.rs"]
+mod input_tests;
+
 // ---------- the widget ----------
 
 /// The tree the guest last sent, rendered with the app's own widgets and
@@ -3126,6 +3540,7 @@ struct ModuleView {
     generation: u64,
     /// The frame `content` was rendered from.
     rev: u64,
+    alive: Arc<()>,
     content: Element<'static, Output, iced::Theme, iced::Renderer>,
 }
 
@@ -3228,7 +3643,9 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             }
             Slot::Failed(_) | Slot::Empty => return,
         };
-        let outputs = if *generation == self.generation {
+        let same_instance =
+            *generation == self.generation && Arc::ptr_eq(&guest.alive, &self.alive);
+        let outputs = if same_instance {
             outputs
         } else {
             // a tree of an earlier load: its messages index nothing here
@@ -3240,6 +3657,17 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             for output in outputs {
                 guest.deliver(output);
             }
+            shell.request_redraw();
+        }
+        if same_instance
+            && let Event::Mouse(event) = event
+            && input::mouse(
+                guest,
+                *event,
+                layout.bounds().position(),
+                shell.is_event_captured(),
+            )
+        {
             shell.request_redraw();
         }
         let Event::Window(window::Event::RedrawRequested(_)) = event else {
@@ -3255,6 +3683,7 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         // rebuilt only by its own messages, and a guest's tick is not one.
         if guest.frame_rev != self.rev {
             self.rev = guest.frame_rev;
+            self.alive = guest.alive.clone();
             self.content = guest.render();
             tree.diff(self.content.as_widget());
             shell.invalidate_layout();
@@ -3298,16 +3727,134 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, ModuleViewEvent, iced::Theme, iced::Renderer>> {
-        // An overlay's messages would be the guest's too; the tree carries
-        // no widget that opens one.
-        let _ = (tree, layout, renderer, viewport, translation);
-        None
+        let alive = {
+            let mounted = self.mounted.lock().expect("module view lock");
+            let Slot::Ready(guest) = &mounted.slot else {
+                return None;
+            };
+            if mounted.generation != self.generation
+                || guest.frame_rev != self.rev
+                || !Arc::ptr_eq(&guest.alive, &self.alive)
+            {
+                return None;
+            }
+            guest.alive.clone()
+        };
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
+            .map(|content| {
+                input::overlay(
+                    content,
+                    self.mounted.clone(),
+                    self.generation,
+                    alive,
+                    layout.bounds().position() + translation,
+                )
+            })
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // Explicit manual measurement, not a wall-clock performance assertion.
+    // Use a fresh XDG cache directory for cold-cache evidence.
+    #[test]
+    #[ignore = "requires DUCKTAPE_BENCH_VIEW pointing to a matching governance guest"]
+    fn measure_governance_view_code_and_first_tree() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let path =
+            std::env::var_os("DUCKTAPE_BENCH_VIEW").expect("DUCKTAPE_BENCH_VIEW is required");
+        let bytes = std::fs::read(path).expect("read matching governance wasm");
+        let mut config = Config::new();
+        config.cranelift_opt_level(OptLevel::Speed);
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let uncached = Engine::new(&config).unwrap();
+        let before = Instant::now();
+        let baseline = Component::new(&uncached, &bytes).expect("uncached compilation");
+        let baseline_time = before.elapsed();
+        drop(baseline);
+        let before = Instant::now();
+        let cold = Guest::compile(&bytes, "benchmark").unwrap();
+        let cold_time = before.elapsed();
+        let before = Instant::now();
+        let warm = Guest::compile(&bytes, "benchmark").unwrap();
+        let warm_time = before.elapsed();
+        assert!(
+            Arc::ptr_eq(&cold, &warm),
+            "actual guest code must be reused"
+        );
+        let before = Instant::now();
+        let mut first = Guest::instantiate("governance", &warm, "benchmark").unwrap();
+        first.init("benchmark").unwrap();
+        let initialized = before.elapsed();
+        let before = Instant::now();
+        first.redraw(&register());
+        first.redraw(&register());
+        assert!(first.fault.is_none(), "{:?}", first.fault);
+        assert!(
+            texts(&first).iter().any(|text| text == "node-7"),
+            "real register tree: {:?}",
+            texts(&first)
+        );
+        let tree_time = before.elapsed();
+        let second = Guest::from_bytes("governance", &bytes, "benchmark").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.alive, &second.alive),
+            "code reuse must not reuse mutable instances"
+        );
+        assert!(second.frame.root.is_none());
+        tracing::info!(
+            baseline_compile_us = baseline_time.as_micros(),
+            cold_compile_us = cold_time.as_micros(),
+            warm_compile_us = warm_time.as_micros(),
+            instantiate_init_us = initialized.as_micros(),
+            first_tree_us = tree_time.as_micros(),
+            source_bytes = bytes.len(),
+            "view_code_benchmark"
+        );
+    }
+
+    #[test]
+    fn view_code_reuses_identical_bytes_but_not_changed_code() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let first = compile_view(&engine, &cache, b"(component)").unwrap();
+        let repeated = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &repeated),
+            "warm loads must reuse compiled code"
+        );
+        let changed = compile_view(&engine, &cache, b"(component (type (func)))").unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(compile_view(&engine, &cache, b"invalid wasm").is_err());
+        assert_eq!(cache.lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn view_code_evicts_old_entries_and_bounds_retained_source_size() {
+        let engine = Engine::default();
+        let cache = Mutex::new(ViewCodeCache::default());
+        let oldest = compile_view(&engine, &cache, b"(component)").unwrap();
+        for i in 0..COMPILED_VIEW_LIMIT {
+            let source = format!("(component) ;; entry {i}");
+            compile_view(&engine, &cache, source.as_bytes()).unwrap();
+        }
+        assert_eq!(cache.lock().unwrap().entries.len(), COMPILED_VIEW_LIMIT);
+        let revisited = compile_view(&engine, &cache, b"(component)").unwrap();
+        assert!(!Arc::ptr_eq(&oldest, &revisited));
+        let mut retained = cache.lock().unwrap();
+        retained.insert(CompiledView {
+            hash: [99; 32],
+            source_bytes: COMPILED_VIEW_SOURCE_BYTES,
+            component: revisited,
+        });
+        assert_eq!(retained.entries.len(), 1);
+        assert_eq!(retained.entries[0].hash, [99; 32]);
+    }
 
     fn event(kind: &str, detail: &str) -> ModuleViewEvent {
         ModuleViewEvent {
@@ -4094,6 +4641,101 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    /// EVERY DIGEST THE LEDGER PUBLISHES REACHES THE SCREEN WHOLE, IN HEX.
+    /// The rows are the node's own `GET /v1/blocks` shape, the props are what
+    /// `explorer_window` makes of them — the production conversion, not a
+    /// hand-built prop — and the reader is the bundled wasm guest. Nothing
+    /// between the two may cut a digest or leave one in decimal: the block
+    /// hash on the list row, the commit hash and the op hash in the detail,
+    /// and the `new_oid` inside the payload all read `0x` and every character
+    /// — and the copy intent carries the bare key the blob route takes.
+    #[test]
+    fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
+        let Some(staged) = staged("explorer") else {
+            return;
+        };
+        let hash = "9f3e".repeat(16);
+        let commit = "c0ffee11".repeat(8);
+        let op_hash = "dd".repeat(32);
+        let oid: Vec<u8> = (1..=20).collect();
+        let rows = vec![serde_json::json!({
+            "height": 84_912,
+            "hash": hash,
+            "commit_hash": commit,
+            "ops": [{
+                "proposer": "cc".repeat(32),
+                "target": "forge",
+                "disposition": "applied",
+                "op_hash": op_hash,
+                "payload": serde_json::to_string(&serde_json::json!({
+                    "push": { "new_oid": oid }
+                }))
+                .expect("payload encodes"),
+                "operations": []
+            }]
+        })];
+        let ledger = crate::backend::explorer_window(1, &rows);
+
+        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
+        guest.redraw(&None);
+        let props = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "connected": true, "loading": false, "dark": false,
+                "blocks": ledger.blocks, "ops": ledger.ops,
+                "head": 84_912, "sync_line": "live",
+                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+            }))
+            .expect("props encode"),
+        );
+        guest.redraw(&props);
+
+        let whole = format!("0x{hash}");
+        let listed = texts(&guest);
+        assert!(
+            listed.contains(&whole),
+            "the list row carries the whole block hash: {listed:?}"
+        );
+        // and nothing on it is a cut-down version of that hash — the guard
+        // that fails the moment a landmark form comes back.
+        let abbreviated = listed
+            .iter()
+            .find(|text| text.starts_with("0x9f3e") && **text != whole);
+        assert!(
+            abbreviated.is_none(),
+            "the list carries the whole hash, not {abbreviated:?}"
+        );
+
+        guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
+        guest.redraw(&props);
+        let opened = texts(&guest);
+        for expected in [format!("0x{commit}"), format!("0x{op_hash}")] {
+            assert!(
+                opened.iter().any(|text| text == &expected),
+                "missing {expected:?} in {opened:?}"
+            );
+        }
+        assert!(
+            opened
+                .iter()
+                .any(|text| text
+                    .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
+            "the payload's digest is hex too: {opened:?}"
+        );
+
+        // AND THE CLIPBOARD GETS THE KEY, not the reading of it: `0x` is for
+        // the eye, and `GET /v1/files/blob/{op_hash}` takes the bare digest.
+        guest.deliver(Output::Activate(button_message(&guest, "Copy op hash")));
+        guest.redraw(&props);
+        assert_eq!(
+            std::mem::take(&mut guest.intents),
+            [ModuleViewEvent {
+                kind: "copy".into(),
+                detail: format!(r#"{{"text":"{op_hash}","label":"Op hash copied"}}"#),
+            }]
+        );
+        assert!(guest.fault.is_none());
+    }
+
     /// The bundled Settings view through the host: the facts, then a
     /// rename that leaves as an intent carrying the trimmed name — and the
     /// password crosses in as a flag only.
@@ -4213,6 +4855,165 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    #[test]
+    fn the_staged_files_draft_keeps_its_original_file_and_save_snapshot() {
+        let staged = staged("files").expect("the actual Files Wasm fixture is required");
+        let mut guest = Guest::load_from("files", &staged).expect("Files loads");
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        let original_text = format!("X{}", facts["preview_text"].as_str().unwrap());
+        let props = |facts: &serde_json::Value| Some(serde_json::to_vec(facts).unwrap());
+        guest.redraw(&None);
+        guest.redraw(&props(&facts));
+        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+        guest.redraw(&props(&facts));
+        let mut editor = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor {
+                key,
+                reset,
+                on_edit: Some(handler),
+                ..
+            } = node
+            {
+                editor = Some((key.clone(), *reset, *handler));
+            }
+        });
+        let (key, reset, handler) = editor.expect("editable document");
+        guest.deliver(Output::EditorAction {
+            key,
+            reset,
+            handler,
+            action: iced::widget::text_editor::Action::Edit(
+                iced::widget::text_editor::Edit::Insert('X'),
+            ),
+        });
+        guest.redraw(&props(&facts));
+        let old_save = button_message(&guest, "Save");
+        facts["network_scope"] = "network-b".into();
+        facts["context"] = "connection-b".into();
+        facts["preview_path"] = "/shared/other.md".into();
+        facts["preview_text"] = "B source".into();
+        guest.redraw(&props(&facts));
+        guest.deliver(Output::Activate(old_save));
+        guest.redraw(&props(&facts));
+        assert!(guest.intents.is_empty(), "an old Save cannot target B");
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text == "Unsaved changes to:")
+        );
+        assert!(texts(&guest).iter().any(|text| text == "/shared/README.md"));
+
+        facts["network_scope"] = "network-a".into();
+        facts["context"] = "connection-a-reconnected".into();
+        facts["preview_path"] = "/shared/README.md".into();
+        facts["preview_base"] = "external-new-snapshot".into();
+        facts["preview_text"] = "external replacement".into();
+        guest.redraw(&props(&facts));
+        let draft_text = |guest: &Guest| {
+            let mut value = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { text, .. } = node {
+                    value = Some(text.clone());
+                }
+            });
+            value.expect("the retained editor")
+        };
+        assert_eq!(draft_text(&guest), original_text);
+        guest.deliver(Output::Activate(button_message(&guest, "Save")));
+        guest.redraw(&props(&facts));
+        let saves = std::mem::take(&mut guest.intents);
+        assert_eq!(saves.len(), 1, "one Save");
+        let save = &saves[0];
+        assert_eq!(save.kind, "save");
+        let payload: serde_json::Value = serde_json::from_str(&save.detail).unwrap();
+        assert_eq!(payload["path"], "/shared/README.md");
+        assert_eq!(payload["text"], original_text);
+        assert_eq!(payload["base"], "snapshot-a");
+        assert_eq!(payload["context"], "connection-a-reconnected");
+        facts["save_reply"] = serde_json::json!({"replies":[{
+            "context": payload["context"], "namespace": payload["namespace"], "request": payload["request"],
+            "success": false, "message": "The file changed elsewhere. Your edits are kept."
+        }], "overflow":""});
+        guest.redraw(&props(&facts));
+        assert_eq!(draft_text(&guest), original_text);
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text == "The file changed elsewhere. Your edits are kept.")
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    #[test]
+    fn fresh_files_wasm_instances_reject_retained_and_late_old_save_successes() {
+        let editor_text = |guest: &Guest| {
+            let mut text = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { text: value, .. } = node {
+                    text = Some(value.clone());
+                }
+            });
+            text
+        };
+        let staged = staged("files").expect("actual Files Wasm fixture required");
+        let mut old = Guest::load_from("files", &staged).unwrap();
+        let old_props = files_facts();
+        old.redraw(&None);
+        old.redraw(&old_props);
+        old.deliver(Output::Activate(button_message(&old, "Edit")));
+        old.redraw(&old_props);
+        old.deliver(Output::Activate(button_message(&old, "Save")));
+        old.redraw(&old_props);
+        let old_intents = std::mem::take(&mut old.intents);
+        assert_eq!(old_intents.len(), 1);
+        let old_save: serde_json::Value = serde_json::from_str(&old_intents[0].detail).unwrap();
+        let old_namespace = old_save["namespace"].as_str().unwrap().to_owned();
+        assert_eq!(old_save["request"], 1);
+        for retained in [true, false] {
+            let mut guest = Guest::load_from("files", &staged).unwrap();
+            assert_ne!(guest.files_save_namespace.as_ref().unwrap(), &old_namespace);
+            let mut facts: serde_json::Value =
+                serde_json::from_slice(&files_facts().unwrap()).unwrap();
+            let success = serde_json::json!({"replies":[{"context":"connection-a", "namespace":old_namespace, "request":1, "success":true, "message":""}], "overflow":""});
+            if retained {
+                facts["save_reply"] = success.clone();
+            }
+            let props = |value: &serde_json::Value| Some(serde_json::to_vec(value).unwrap());
+            guest.redraw(&None);
+            guest.redraw(&props(&facts));
+            guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+            guest.redraw(&props(&facts));
+            guest.deliver(Output::Activate(button_message(&guest, "Save")));
+            guest.redraw(&props(&facts));
+            let saves = std::mem::take(&mut guest.intents);
+            assert_eq!(saves.len(), 1);
+            let save: serde_json::Value = serde_json::from_str(&saves[0].detail).unwrap();
+            assert_eq!(save["request"], 1);
+            assert_eq!(
+                save["namespace"],
+                guest.files_save_namespace.as_ref().unwrap().as_str()
+            );
+            facts["save_reply"] = success;
+            // A changed loading prop forces delivery even when the old success was already retained.
+            facts["loading"] = true.into();
+            guest.redraw(&props(&facts));
+            assert_eq!(
+                editor_text(&guest),
+                Some(facts["preview_text"].as_str().unwrap().to_owned()),
+                "old instance completion must not close the fresh editor"
+            );
+            facts["save_reply"]["replies"][0]["namespace"] = save["namespace"].clone();
+            facts["loading"] = false.into();
+            guest.redraw(&props(&facts));
+            assert!(
+                editor_text(&guest).is_none(),
+                "its own confirmation closes the editor"
+            );
+            assert!(guest.fault.is_none());
+        }
+    }
+
     /// A module-owned view has one source, the module's deployment on the
     /// connected node: with no node it is not there yet, and the staged file
     /// a desktop view would take is never opened for it.
@@ -4235,6 +5036,9 @@ pub(crate) mod tests {
                 hash: None,
                 in_flight: true,
                 wanted: None,
+                waiting_since: None,
+                replacement: Replacement::Preserve,
+                retry: None,
             }));
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
@@ -4515,12 +5319,16 @@ pub(crate) mod tests {
                 {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
             ],
             "connected": true, "loading": false,
+            "network_scope": "network-a", "context": "connection-a", "preview_base": "snapshot-a",
+            "save_reply": {"replies":[], "overflow":""},
             "preview_path": "/shared/README.md",
             "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
             "delete_target": "", "diff_from": "", "diff": [], "history": [],
             "preview_truncated": false, "preview_binary": false, "preview_picture": false,
             "preview_width": 0, "preview_height": 0,
             "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "preview_display_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "preview_display_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
             "dark": false, "write_refusal": "", "writes": 0
         }))
         .expect("props encode"),
@@ -4568,9 +5376,9 @@ pub(crate) mod tests {
           "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
           "forge_item_merge_oid": "", "forge_item_source_oid": "",
           "forge_item_approvals": 0, "forge_item_change_requests": 0,
-          "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-          "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-          "comment_cap_reached": false, "discussion": [], "linked_note": [],
+          "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+          "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
+          "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
           "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
           "tree_entries": [], "tree_born": false, "tree_truncated": false,
           "tree_phase": "loading", "file_path": "", "file_text": "",
@@ -4583,7 +5391,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn chat_facts() -> Option<Vec<u8>> {
+    pub(super) fn chat_facts() -> Option<Vec<u8>> {
         chat_facts_with(&[first_light()], &[])
     }
 
@@ -4690,6 +5498,175 @@ pub(crate) mod tests {
         Some(encode_chat_props(props))
     }
 
+    /// Inspect the guest frame before the host sanitizer, not its already
+    /// sanitized held tree. Resync prevents patch application hiding a loss.
+    fn assert_display_projection_survives_wire(
+        module: &'static str,
+        props: &[u8],
+        expected: &str,
+        actions: &[&str],
+    ) {
+        let path = staged(module).expect("build the actual budget fixture with make views");
+        let mut guest = Guest::load_from(module, &path).expect("actual guest loads");
+        guest.redraw(&None);
+        let supplied = Some(props.to_vec());
+        guest.redraw(&supplied);
+        for action in actions {
+            guest.deliver(Output::Activate(button_message(&guest, action)));
+            guest.redraw(&supplied);
+        }
+        guest.pending.push(wire::Event::Resync);
+        let events = std::mem::take(&mut guest.pending);
+        arm(&mut guest.store);
+        let (bytes,) = guest
+            .tick
+            .call(&mut guest.store, (wire::encode(&events),))
+            .expect("guest full frame");
+        let frame: wire::Frame = wire::decode(&bytes).expect("wire frame");
+        assert!(frame.root.is_some(), "resync emits a full tree");
+        let mut observed = frame.root.clone().unwrap();
+        let supplied: serde_json::Value = serde_json::from_slice(props).unwrap();
+        let omitted = supplied["display_omitted"].as_i64().unwrap();
+        let omitted_text = omitted.to_string();
+        let mut omitted_seen = omitted == 0;
+        let mut expected_seen = false;
+        observed.for_each_mut(&mut |node| {
+            if let wire::Node::Text { key, content, .. } = node {
+                expected_seen |= content.starts_with(expected);
+                omitted_seen |= key.ends_with("/display-omitted") && *content == omitted_text;
+            }
+        });
+        assert!(
+            expected_seen,
+            "{module}: expected actual projected content {expected:?}"
+        );
+        assert!(
+            omitted_seen,
+            "{module}: omitted row count is not rendered as a number"
+        );
+        let mut sanitized = frame.clone();
+        wire::sanitize(&mut sanitized);
+        assert_eq!(
+            frame.root, sanitized.root,
+            "{module}: sanitizer changed the production projection"
+        );
+    }
+
+    #[test]
+    fn files_display_projection_bounds_preview_rows_and_preserves_the_edit_source() {
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        let source = "한글 preview ".repeat(5_000);
+        facts["preview_text"] = source.clone().into();
+        let entries: Vec<_> = (0..80).map(|n| serde_json::json!({
+            "key": n + 100, "path": format!("/shared/{n}"), "name": format!("entry-{n}-{}", "한".repeat(300)),
+            "kind": "dir", "size": 1, "object": format!("object-{n}")
+        })).collect();
+        facts["entries"] = entries.clone().into();
+        facts["directories"] = entries.into();
+        facts["history"] = (0..80).map(|n| serde_json::json!({"id": format!("s{n}"), "short_id": format!("s{n}"), "author": "duck", "height": n, "message": "history".repeat(300)})).collect::<Vec<_>>().into();
+        facts["diff_from"] = "s0".into();
+        facts["diff"] = (0..80)
+            .map(|n| serde_json::json!({"path": format!("/shared/{n}"), "kind": "added"}))
+            .collect::<Vec<_>>()
+            .into();
+        let bytes = display_budget::files(facts.clone());
+        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(projected["preview_text"], source);
+        assert_eq!(projected["preview_truncated"], false);
+        assert_eq!(projected["preview_display_clipped"], true);
+        assert!(
+            projected["preview_display_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("한글 preview")
+        );
+        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert_display_projection_survives_wire(
+            "files",
+            &bytes,
+            "Preview shortened for display.",
+            &[],
+        );
+        facts["entries"] = Vec::<serde_json::Value>::new().into();
+        facts["directories"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "".into();
+        let history = display_budget::files(facts.clone());
+        assert_display_projection_survives_wire("files", &history, "historyhistory", &["History"]);
+        facts["history"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "s0".into();
+        facts["diff"] = (0..80).map(|n| serde_json::json!({"path": format!("/shared/{n}-{}", "long".repeat(200)), "kind": "added"})).collect::<Vec<_>>().into();
+        let diff = display_budget::files(facts);
+        assert_display_projection_survives_wire("files", &diff, "/shared/0-long", &["History"]);
+    }
+
+    #[test]
+    fn forge_display_projection_bounds_body_diff_and_newest_notes_together() {
+        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
+        facts["open_repo"] = "core".into();
+        facts["forge_item_number"] = 7.into();
+        facts["item_phase"] = "ready".into();
+        facts["forge_item_kind"] = "pr".into();
+        facts["forge_item_state"] = "open".into();
+        facts["forge_item_source_oid"] = "source-oid".into();
+        facts["forge_item_body"] = "body".repeat(16_000).into();
+        facts["forge_item_blocks"] =
+            serde_json::to_value(crate::backend::paragraph_blocks(&format!(
+                "**{}**\n\n{}",
+                "rich body ".repeat(3_000),
+                "plain body ".repeat(3_000)
+            )))
+            .unwrap();
+        facts["discussion"] = (1..=40)
+            .map(|n| {
+                let body = format!("latest-{n} {}", "한글".repeat(400));
+                serde_json::to_value(crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(n)
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        facts["diff_rows"] = serde_json::to_value(crate::backend::diff_lines(&format!(
+            "--- a/main\n+++ b/main\n@@ -1 +1 @@\n-{}\n+{}\n",
+            "old".repeat(10_000),
+            "new".repeat(10_000)
+        )))
+        .unwrap();
+        facts["staged_comments"] = (0..64).map(|n| serde_json::json!({"anchor": format!("a{n}{}", "x".repeat(12_000)), "path": "main", "line": "1", "side": "new", "body": "comment".repeat(2_000)})).collect::<Vec<_>>().into();
+        facts["merge_conflicts"] = vec!["conflict-path".repeat(8_000)].into();
+        let bytes = display_budget::forge(facts);
+        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            projected["discussion"].as_array().unwrap().last().unwrap()["seq"],
+            40
+        );
+        assert_eq!(projected["has_staged_comments"], true);
+        assert_display_projection_survives_wire("forge", &bytes, "latest-40", &[]);
+        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert!(projected["staged_comments"].as_array().unwrap().is_empty());
+        assert!(projected["merge_conflicts"].as_array().unwrap().is_empty());
+        let path = staged("forge").expect("actual forge wasm");
+        let mut guest = Guest::load_from("forge", &path).unwrap();
+        guest.redraw(&None);
+        let props = Some(bytes);
+        guest.redraw(&props);
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text.starts_with("Merge conflicts —"))
+        );
+        guest.deliver(Output::Activate(button_message(&guest, "Submit review")));
+        guest.redraw(&props);
+        assert!(
+            guest
+                .intents
+                .iter()
+                .any(|event| event.kind == "review_submit")
+        );
+    }
+
     /// A busy room's whole hot window through the real wire: the newest
     /// message must still read, and the clipped older ones are offered as
     /// history.
@@ -4734,6 +5711,149 @@ pub(crate) mod tests {
             "the clip is history"
         );
         assert!(guest.fault.is_none());
+    }
+
+    /// The forge discussion has the chat stream's shape: 40 notes of 2 KB
+    /// are past the frame's text budget, and the newest note — drawn last —
+    /// must still read; the landing note above the list stays whole.
+    #[test]
+    fn the_newest_discussion_note_still_reads_through_the_wire() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        const ROWS: i64 = 40;
+        let notes: Vec<_> = (1..=ROWS)
+            .map(|seq| {
+                let body = format!("n{seq} {}", "x".repeat(2_000));
+                crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(seq)
+                }
+            })
+            .collect();
+        let landing = crate::backend::ChatMessage {
+            body: "the note a link landed on".into(),
+            blocks: crate::backend::paragraph_blocks("the note a link landed on"),
+            ..first_light_at(1_000)
+        };
+        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
+        facts["open_repo"] = "core".into();
+        facts["forge_item_number"] = 7.into();
+        facts["item_phase"] = "ready".into();
+        facts["discussion"] = serde_json::to_value(&notes).unwrap();
+        facts["linked_note"] = serde_json::to_value([&landing]).unwrap();
+        let props = Some(display_budget::forge(facts));
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let newest = format!("n{ROWS} ");
+        assert!(
+            shown.iter().any(|text| text.starts_with(&newest)),
+            "the newest note is blank (fault {:?}): last texts {:?}",
+            guest.fault,
+            shown
+                .iter()
+                .rev()
+                .take(6)
+                .map(|text| &text[..text.len().min(24)])
+                .collect::<Vec<_>>()
+        );
+        assert!(shown.iter().any(|text| text == "the note a link landed on"));
+        assert!(
+            shown
+                .iter()
+                .any(|text| text == "Older comments are not shown.")
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// A 60 KB file preview: the reader either sees all of it or is told
+    /// it is cut — never a silently shortened text.
+    #[test]
+    fn a_long_file_preview_says_where_it_is_cut() {
+        let Some(staged) = staged("files") else {
+            return;
+        };
+        let text = format!("{}END-MARK", "y".repeat(60_000));
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        facts["preview_text"] = text.clone().into();
+        let props = Some(display_budget::files(facts));
+        let projected: serde_json::Value = serde_json::from_slice(props.as_ref().unwrap()).unwrap();
+        assert_eq!(projected["preview_text"], text);
+        assert_eq!(projected["preview_truncated"], false);
+        assert_eq!(projected["preview_display_clipped"], true);
+        let mut guest = Guest::load_from("files", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let whole = shown.iter().any(|text| text.ends_with("END-MARK"));
+        let told = shown
+            .iter()
+            .any(|text| text == "Preview shortened for display.");
+        assert!(
+            whole || told,
+            "the preview is cut without a word (fault {:?}): {} texts, longest {}",
+            guest.fault,
+            shown.len(),
+            shown.iter().map(String::len).max().unwrap_or(0)
+        );
+        assert!(guest.fault.is_none());
+        // Display clipping does not hide Edit or replace its authoritative seed.
+        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+        guest.redraw(&props);
+        let mut root = guest.frame.root.clone().expect("editing tree");
+        let mut editor_source = None;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::Editor { text, .. } = node {
+                editor_source = Some(text.clone());
+            }
+        });
+        assert_eq!(editor_source.as_deref(), Some(text.as_str()));
+        // An oversized identity only hides rendering: it must not reseed or
+        // consume this draft. Returning to the same facts restores the editor.
+        let mut unavailable: serde_json::Value =
+            serde_json::from_slice(props.as_ref().unwrap()).unwrap();
+        unavailable["path"] = "x".repeat(20_000).into();
+        guest.redraw(&Some(display_budget::files(unavailable)));
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|line| line.starts_with("Too much display data."))
+        );
+        guest.redraw(&props);
+        guest.deliver(Output::Activate(button_message(&guest, "Save")));
+        guest.redraw(&props);
+        let saved = guest
+            .intents
+            .iter()
+            .find(|event| event.kind == "save")
+            .expect("save intent");
+        let payload: serde_json::Value = serde_json::from_str(&saved.detail).unwrap();
+        assert_eq!(payload["text"], text);
+        assert_eq!(payload["path"], "/shared/README.md");
+    }
+
+    /// `head_within` never cuts inside a char; the discussion budget keeps
+    /// the landing note whole and the newest notes.
+    #[test]
+    fn the_text_head_and_the_discussion_split_hold_their_budgets() {
+        assert_eq!(head_within("abc", 3), ("abc", false));
+        // "한" is 3 bytes: a 4-byte budget cuts before the second char
+        assert_eq!(head_within("한글", 4), ("한", true));
+        assert_eq!(head_within("한글", 6), ("한글", false));
+        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
+            author: String::new(),
+            meta: String::new(),
+            body: "x".repeat(bytes),
+            ..first_light_at(seq)
+        };
+        let landing = row(9, 100);
+        let notes = [row(1, 100), row(2, 100), row(3, 100)];
+        let (kept, clipped) = newest_within(&notes, 300usize.saturating_sub(text_bytes(&landing)));
+        assert_eq!(kept.iter().map(|m| m.seq).collect::<Vec<_>>(), [2, 3]);
+        assert!(clipped);
     }
 
     fn first_light_at(seq: i64) -> crate::backend::ChatMessage {
@@ -4898,6 +6018,250 @@ pub(crate) mod tests {
         }
     }
 
+    /// A valid view with an admitted event it has not consumed yet.
+    fn drawn_then_stuck(mounted: &Arc<Mutex<Mounted>>) -> u64 {
+        let mut locked = mounted.lock().expect("module view lock");
+        let generation = locked.generation;
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of A");
+        };
+        assert!((0..4).any(|_| !guest.redraw(&register())));
+        assert!(guest.settled(), "{:?}", guest.fault);
+        assert!(guest.ever_valid_tree);
+        guest.pending.push(wire::Event::Resync);
+        assert!(!guest.settled());
+        generation
+    }
+
+    /// The host boundary after a tick returned no valid frame. The actual
+    /// staged instance has not published a tree; its next redraw can recover.
+    fn never_valid_pending(mounted: &Arc<Mutex<Mounted>>) -> u64 {
+        let mut locked = mounted.lock().expect("module view lock");
+        let generation = locked.generation;
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of A");
+        };
+        assert_eq!(guest.ticks, 0);
+        assert!(!guest.ever_valid_tree);
+        assert!(guest.frame.root.is_none());
+        guest.ticks = 1;
+        guest.pending.push(wire::Event::Resync);
+        generation
+    }
+
+    /// A block that finds the seated view busy waits under the generation
+    /// it has: one generation per load, not one per block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_that_waits_on_pending_work_keeps_the_generation() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        for _ in 0..3 {
+            join_all(deployments_checked().await);
+            let locked = mounted.lock().expect("module view lock");
+            assert_eq!(locked.generation, generation, "no load opened");
+            assert_eq!(locked.hash, Some(a.hash()));
+            assert!(locked.waiting_since.is_some(), "the wait is counted");
+        }
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A view that never drew a usable tree and keeps work pending past
+    /// the wait is replaced without its state; the candidate still proves
+    /// its first tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_without_a_tree_is_replaced_once_its_pending_work_outlives_the_wait() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = never_valid_pending(&mounted);
+        node.deploy("governance", &b);
+        // inside the wait: nothing moves
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["a.svg"]);
+        // the wait is over
+        mounted.lock().expect("module view lock").waiting_since =
+            Some(Instant::now() - REPLACEMENT_WAIT);
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["b.svg"],
+            "B replaced the stuck view"
+        );
+        let mut locked = mounted.lock().expect("module view lock");
+        assert_eq!(locked.hash, Some(b.hash()));
+        assert_eq!(
+            locked.generation,
+            generation + 1,
+            "one load, one generation"
+        );
+        assert!(locked.waiting_since.is_none());
+        let Slot::Ready(guest) = &mut locked.slot else {
+            panic!("the view of B");
+        };
+        assert!(guest.frame.root.is_some(), "B proved its first tree");
+        assert!(guest.settled(), "{:?}", guest.fault);
+        drop(locked);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A view that has drawn a tree is never replaced under it: its pending
+    /// work may be a reader's, and it waits however long that takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_that_drew_a_tree_keeps_waiting_past_the_wait() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        join_all(deployments_checked().await);
+        mounted.lock().expect("module view lock").waiting_since =
+            Some(Instant::now() - REPLACEMENT_WAIT * 4);
+        join_all(deployments_checked().await);
+        assert_eq!(slot_assets(&mounted), ["a.svg"], "the drawn view stays");
+        let locked = mounted.lock().expect("module view lock");
+        assert_eq!(
+            (locked.generation, locked.hash),
+            (generation, Some(a.hash()))
+        );
+        drop(locked);
+        registry()
+            .lock()
+            .expect("module views")
+            .remove("governance");
+    }
+
+    /// A valid view can temporarily lose its rendered tree during resync,
+    /// or trap after an edit. Neither state authorizes throwing its data away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_once_valid_view_keeps_its_state_after_a_patch_gap_or_terminal_fault() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let b = deployment(&component, "b.svg");
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = drawn_then_stuck(&mounted);
+        node.deploy("governance", &b);
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("A")
+            };
+            guest.frame.root = None;
+            locked.waiting_since = Some(Instant::now() - REPLACEMENT_WAIT * 4);
+        }
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "a temporary patch gap must preserve A"
+        );
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                panic!("A")
+            };
+            guest.fault = Some("terminal trap after unsaved edits (test)".into());
+        }
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "a later trap must preserve authored state"
+        );
+        assert_eq!(mounted.lock().unwrap().generation, generation);
+        registry().lock().unwrap().remove("governance");
+    }
+
+    /// Once A starts serving a real tree, an already prepared destructive
+    /// recovery must be rejected at the final seat, even without a new block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_never_valid_view_that_recovers_during_candidate_loading_is_not_discarded() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged =
+            staged("governance").expect("staged governance is required for recovery evidence");
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let b = deployment(&component, "b.svg");
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("governance");
+        join_all(connected(&client));
+        let generation = never_valid_pending(&mounted);
+        mounted.lock().unwrap().waiting_since = Some(Instant::now() - REPLACEMENT_WAIT);
+        node.deploy("governance", &b);
+        let hold = hold_blob(&node);
+        let loads = deployments_checked().await;
+        node.held.notified().await;
+        drawn_then_stuck(&mounted);
+        hold.notify_one();
+        join_all(loads);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "healthy A must not be reset by stale recovery"
+        );
+        let locked = mounted.lock().unwrap();
+        assert_eq!(locked.generation, generation + 1);
+        assert!(!locked.in_flight);
+        let Slot::Ready(guest) = &locked.slot else {
+            panic!("A")
+        };
+        assert!(guest.ever_valid_tree);
+        assert!(
+            !guest.pending.is_empty(),
+            "the admitted work remains owned by A"
+        );
+        drop(locked);
+        registry().lock().unwrap().remove("governance");
+    }
+
     /// A deployment that moves while its view is prepared is not installed:
     /// the active code is read again right before the seat, and the view
     /// drawn keeps its place and its hash.
@@ -5005,6 +6369,59 @@ pub(crate) mod tests {
         assert_eq!((locked.generation, locked.in_flight), (generation, false));
     }
 
+    /// Blocks keep landing on a deployment whose view cannot load: it is
+    /// tried again, then held off with a widening gap, instead of paying a
+    /// cranelift compile once a block for a candidate that never lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deployment_is_not_retried_by_every_block() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        // bytes that are not a component: every load of them fails alike
+        let bad = deployment(b"not a component", "a.svg");
+        let node = FakeDeployment::serving("forge", &bad);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("forge");
+        join_all(connected(&client));
+        let locked = mounted.lock().unwrap();
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "{}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // the first block names the candidate the reconnect did not: it is
+        // tried once under its own hash, and every block after it is held
+        join_all(deployments_checked().await);
+        let generation = mounted.lock().unwrap().generation;
+        for _ in 0..5 {
+            join_all(deployments_checked().await);
+        }
+        let locked = mounted.lock().unwrap();
+        assert_eq!(
+            locked.generation, generation,
+            "a failed candidate was loaded again on every block"
+        );
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "the failure is still what the tab shows: {}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // nothing is suppressed for good: once the gap is up the same
+        // candidate is tried again, so a load that failed on the transport
+        // still recovers on its own
+        tokio::time::sleep(RETRY_FIRST + Duration::from_millis(100)).await;
+        join_all(deployments_checked().await);
+        assert_eq!(
+            mounted.lock().unwrap().generation,
+            generation + 1,
+            "the hold-off never expired"
+        );
+        registry().lock().unwrap().remove("forge");
+    }
+
     /// A removal answered late — the code moved on to C while the
     /// verified "no view" for B was on its way — does not empty the slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5037,6 +6454,76 @@ pub(crate) mod tests {
         assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["c.svg"]);
+    }
+
+    /// Every module-owned load leaves one `view_load` line naming its path
+    /// and the time of each of its stages — the node's two answers, the
+    /// compile, the instance, the tree a replacement proves, the second
+    /// look at the registry — so where a "Loading" wait goes is read off
+    /// the log, not guessed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_load_reports_the_time_of_each_of_its_stages() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let staged = staged("governance").expect("build the governance guest before this test");
+        let component = std::fs::read(staged).expect("the staged view");
+        let (a, b) = (
+            deployment(&component, "a.svg"),
+            deployment(&component, "b.svg"),
+        );
+        let node = FakeDeployment::serving("governance", &a);
+        let client = fake_node(node.clone()).await;
+        let lines = super::canary::tap();
+        let _mounted = fresh("governance");
+        join_all(connected(&client));
+        node.deploy("governance", &b);
+        join_all(deployments_checked().await);
+
+        let loads: Vec<String> = lines
+            .try_iter()
+            .filter(|line| line.starts_with("view_load module=governance "))
+            .collect();
+        let field = |line: &str, name: &str| -> String {
+            line.split_whitespace()
+                .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("no {name} in {line}"))
+                .to_owned()
+        };
+        let of = |hash: [u8; 32]| -> String {
+            let hash = crate::backend::hex_encode(&hash);
+            loads
+                .iter()
+                .find(|line| field(line, "hash") == hash)
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for {hash} in {loads:?}"))
+        };
+        let (first, swap) = (of(a.hash()), of(b.hash()));
+        assert_eq!(field(&first, "path"), "first");
+        assert_eq!(field(&first, "outcome"), "Ready");
+        assert_eq!(
+            field(&first, "first_frame_ms"),
+            "-",
+            "a fresh view draws its first tree on the window thread"
+        );
+        assert_eq!(field(&swap, "path"), "swap");
+        assert_eq!(field(&swap, "outcome"), "Swap");
+        field(&swap, "first_frame_ms")
+            .parse::<u128>()
+            .expect("the replacement's first frame is timed");
+        for line in [&first, &swap] {
+            let ms = |name: &str| {
+                field(line, name)
+                    .parse::<u128>()
+                    .unwrap_or_else(|_| panic!("{name} in {line}"))
+            };
+            let total = ms("total_ms");
+            let stages = ms("status_ms")
+                + ms("fetch_ms")
+                + ms("compile_ms")
+                + ms("init_ms")
+                + ms("check_ms");
+            assert!(total >= stages, "{line}");
+        }
     }
 
     /// A view mounted but not yet ticked names its instance too: a tick
@@ -5139,7 +6626,20 @@ pub(crate) mod tests {
             let locked = mounted.lock().unwrap();
             assert_eq!((locked.hash, locked.in_flight), (Some(a.hash()), false));
         }
-        // the next block's candidate, drawing its first tree, is seated
+        // a first frame that trapped is a property of those bytes, so the
+        // very next block does not pay for the same candidate again
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "B is held off, not retried at once"
+        );
+        // once its gap is up the candidate is tried again, and this time
+        // its first tree draws
+        let mut locked = mounted.lock().unwrap();
+        let retry = locked.retry.as_mut().expect("B left a hold-off");
+        retry.next = Instant::now();
+        drop(locked);
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
@@ -5207,9 +6707,9 @@ pub(crate) mod tests {
               "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
               "forge_item_merge_oid": "", "forge_item_source_oid": "",
               "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
+              "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
               "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
               "tree_entries": [], "tree_born": false, "tree_truncated": false,
               "tree_phase": "loading", "file_path": "", "file_text": "",

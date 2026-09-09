@@ -11,6 +11,7 @@ on fs_open_dir(path)
   fs_preview_path = ""
   fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
+  fs_preview_base = ""
   run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
 
 on fs_open_file(path)
@@ -20,6 +21,7 @@ on fs_open_file(path)
   // The old body must not sit under the new path while the read is in
   // flight — the pane would show A's text (and A's Edit button) under B.
   fs_preview_text = ""
+  fs_preview_base = ""
   fs_preview_truncated = false
   fs_preview_binary = false
   fs_preview_picture = false
@@ -42,6 +44,7 @@ on fs_listed(next)
 on fs_previewed(next)
   return if next.generation != fs_generation
   fs_preview_text = next.text
+  fs_preview_base = next.base_snapshot
   fs_preview_truncated = next.truncated
   fs_preview_binary = next.binary
   fs_preview_picture = next.picture
@@ -89,19 +92,26 @@ on files_view_event(event)
       fs_preview_path = ""
       fs_preview_entry = no_fs_entry()
       fs_preview_text = ""
+      fs_preview_base = ""
       run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     FilesIntent.mkdir
       return if fs_loading || !connected || empty(trim(event_text(event, "name")))
       error = files_write_gate(fs_path, settings_user_key)
       return if !empty(error)
       fs_loading = true
-      run every files_mkdir(connected_rpc, password, fs_child(fs_path, trim(event_text(event, "name")))) -> fs_wrote _ | fs_write_failed _
+      let context = files_context(connected_rpc, network_chain_id, connect_generation)
+      let op = fresh_operation_id("files-write")
+      fs_write_pending = op
+      run every files_mkdir(connected_rpc, password, fs_child(fs_path, trim(event_text(event, "name")))) -> fs_wrote(context, "", op, 0, _) | fs_write_failed(context, "", op, 0, _)
     FilesIntent.new_file
       return if fs_loading || !connected || empty(trim(event_text(event, "name")))
       error = files_write_gate(fs_path, settings_user_key)
       return if !empty(error)
       fs_loading = true
-      run every files_write_text(connected_rpc, password, fs_child(fs_path, trim(event_text(event, "name"))), "") -> fs_wrote _ | fs_write_failed _
+      let context = files_context(connected_rpc, network_chain_id, connect_generation)
+      let op = fresh_operation_id("files-write")
+      fs_write_pending = op
+      run every files_write_text(connected_rpc, password, fs_child(fs_path, trim(event_text(event, "name"))), "") -> fs_wrote(context, "", op, 0, _) | fs_write_failed(context, "", op, 0, _)
     FilesIntent.arm_delete
       fs_delete_target = event_text(event, "path")
     FilesIntent.disarm_delete
@@ -111,15 +121,28 @@ on files_view_event(event)
       error = files_write_gate(fs_parent(fs_delete_target), settings_user_key)
       return if !empty(error)
       fs_loading = true
-      run every files_remove(connected_rpc, password, fs_delete_target) -> fs_wrote _ | fs_write_failed _
-    // The edited body: shown under the path at once, written back, re-read.
+      let context = files_context(connected_rpc, network_chain_id, connect_generation)
+      let op = fresh_operation_id("files-write")
+      fs_write_pending = op
+      run every files_remove(connected_rpc, password, fs_delete_target) -> fs_wrote(context, "", op, 0, _) | fs_write_failed(context, "", op, 0, _)
+    // The draft carries its original file, snapshot and connection.
     FilesIntent.save
-      return if fs_loading || !connected || empty(fs_preview_path) || event_text(event, "path") != fs_preview_path
-      error = files_write_gate(fs_parent(fs_preview_path), settings_user_key)
-      return if !empty(error)
-      fs_loading = true
-      fs_preview_text = event_text(event, "text")
-      run every files_write_text(connected_rpc, password, fs_preview_path, event_text(event, "text")) -> fs_wrote _ | fs_write_failed _
+      let context = event_text(event, "context")
+      let request = event_int(event, "request")
+      let namespace = event_text(event, "namespace")
+      let path = event_text(event, "path")
+      let base = event_text(event, "base")
+      return if context != files_context(connected_rpc, network_chain_id, connect_generation) || path != fs_preview_path
+      let refusal = files_write_gate(fs_parent(path), settings_user_key)
+      let document_ready = !empty(namespace) && !empty(network_chain_id) && !empty(fs_preview_base) && !empty(base) && request > 0 && path == fs_preview_path
+      match submit_verdict(fs_loading, connected, path, refusal, document_ready, context, files_context(connected_rpc, network_chain_id, connect_generation))
+        SubmitVerdict.refused
+          fs_save_reply = fs_save_reply(context, namespace, request, false, "The file changed while you were editing. Your unsaved changes are still here.", fs_save_reply)
+        SubmitVerdict.admitted
+          let op = fresh_operation_id("files-write")
+          fs_write_pending = op
+          fs_loading = true
+          run every files_save_text(connected_rpc, password, path, base, event_text(event, "text")) -> fs_wrote(context, namespace, op, request, _) | fs_write_failed(context, namespace, op, request, _)
     FilesIntent.show_diff
       return if fs_loading || !connected
       fs_diff_from = event_text(event, "id")
@@ -135,7 +158,11 @@ on files_view_event(event)
         from done event_text(event, "url")
         done -> open_message_link _
 
-on fs_wrote(_result)
+on fs_wrote(context, namespace, op, request, _result)
+  return if op != fs_write_pending || context != files_context(connected_rpc, network_chain_id, connect_generation)
+  fs_write_pending = ""
+  fs_save_reply = fs_save_reply(context, namespace, request, true, "", fs_save_reply)
+  fs_focus_path = keep_str(request > 0, fs_preview_path, fs_focus_path)
   fs_delete_target = ""
   fs_writes = fs_writes + 1
   fs_generation = fs_generation + 1
@@ -144,7 +171,10 @@ on fs_wrote(_result)
     run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=files_history files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
 
-on fs_write_failed(cause)
+on fs_write_failed(context, namespace, op, request, cause)
+  return if op != fs_write_pending || context != files_context(connected_rpc, network_chain_id, connect_generation)
+  fs_write_pending = ""
+  fs_save_reply = fs_save_reply(context, namespace, request, false, cause.message, fs_save_reply)
   fs_loading = false
   error = cause.message
 
@@ -153,7 +183,10 @@ on fs_file_dropped(path)
   error = files_write_gate(fs_path, settings_user_key)
   return if !empty(error)
   fs_loading = true
-  run every files_upload(connected_rpc, password, fs_path, path) -> fs_wrote _ | fs_write_failed _
+  let context = files_context(connected_rpc, network_chain_id, connect_generation)
+  let op = fresh_operation_id("files-write")
+  fs_write_pending = op
+  run every files_upload(connected_rpc, password, fs_path, path) -> fs_wrote(context, "", op, 0, _) | fs_write_failed(context, "", op, 0, _)
 
 on fs_diffed(next)
   return if next.generation != fs_generation
