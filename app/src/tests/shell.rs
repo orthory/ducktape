@@ -1317,14 +1317,17 @@ fn the_explorer_names_what_it_shows() {
         .split_once("for op in explorer_ops_at(ops, selected)")
         .expect("the op detail pane iterates the selected block's ops")
         .1;
-    for (label, value) in [
-        ("hash", "text op.op_hash"),
-        ("by", "text op.proposer"),
-        ("dispatch", "text op.trace"),
+    // The two digests are drawn by `DigestRow`, which takes its label as a
+    // prop; the trace is still a bare pair of `text`s. The RULE is the same
+    // either way — the name is written before the value — so each row names
+    // the two markers its own shape uses rather than the check assuming one.
+    for (named, value) in [
+        ("name=\"hash\"", "digest=op.op_hash"),
+        ("name=\"by\"", "digest=op.proposer"),
+        ("text \"dispatch\"", "text op.trace"),
     ] {
-        let named = format!("text \"{label}\"");
         let label_at = detail
-            .find(&named)
+            .find(named)
             .unwrap_or_else(|| panic!("`{value}` is drawn with no `{named}` beside it"));
         let value_at = detail
             .find(value)

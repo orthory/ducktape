@@ -142,6 +142,28 @@ pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {
         .collect()
 }
 
+/// A digest the way this screen PRINTS one: `0x` and every character of it.
+/// The prefix is what tells a reader the run of digits is hex rather than the
+/// decimal byte array the same value reads as elsewhere, and nothing is cut —
+/// a shortened digest is a key that opens nothing.
+///
+/// FOR THE EYE ONLY. The prefix is not part of the key: `GET
+/// /v1/files/blob/{op_hash}` and every CLI that takes a digest want the bare
+/// form, so a copy carries the prop this decorated, never this.
+///
+/// VERBATIM WHEN IT IS NOT A DIGEST. `proposer` carries a hex key only for
+/// frame-authored ops; `project_root_op` labels the rest `system`,
+/// `module:<id>` or `acct:<account>`, and a follower's boundary row carries an
+/// empty `hash`. `0xsystem` names nothing, so anything that is not bare hex
+/// passes through untouched.
+pub fn hex(digest: &str) -> String {
+    let is_hex = !digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit());
+    if !is_hex {
+        return digest.to_string();
+    }
+    format!("0x{digest}")
+}
+
 /// `h 84,912`; a height the node has not reported reads `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
