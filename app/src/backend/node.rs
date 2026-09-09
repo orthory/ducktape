@@ -1491,8 +1491,10 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
         ),
         runs::RunFact::Acted {
             request_id,
+            lane,
             operation,
-        } => ("acted", format!("{operation} · {request_id}")),
+            result,
+        } => ("acted", action_summary(lane, &operation, &result, &request_id)),
         runs::RunFact::Settled {
             outcome,
             reason,
@@ -1520,6 +1522,41 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
         height: height_label_short(height_i64(row.height)),
         kind: kind.into(),
         summary,
+    }
+}
+
+/// One staged action in the tracker's words: the operation, the lane that
+/// admitted it, what its receipt says it did, and the receipt id.
+fn action_summary(
+    lane: runs::LaneKind,
+    operation: &str,
+    result: &serde_json::Value,
+    request_id: &str,
+) -> String {
+    let lane = match lane {
+        runs::LaneKind::Live => "live",
+        runs::LaneKind::Final => "final",
+    };
+    let mut parts = vec![operation.to_string(), lane.to_string()];
+    receipt_leaves(result, &mut parts);
+    parts.push(request_id.to_string());
+    parts.join(" · ")
+}
+
+/// The scalar leaves of a receipt, each as `key value`, in key order; a
+/// nested object contributes its leaves under their own keys and a null
+/// leaf says nothing.
+fn receipt_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
+    let serde_json::Value::Object(fields) = value else {
+        return;
+    };
+    for (key, value) in fields {
+        match value {
+            serde_json::Value::Null => {}
+            serde_json::Value::Object(_) => receipt_leaves(value, out),
+            serde_json::Value::String(text) => out.push(format!("{key} {text}")),
+            other => out.push(format!("{key} {other}")),
+        }
     }
 }
 
@@ -2894,6 +2931,70 @@ mod qr_ceremony_tests {
         let done: Vec<CeremonyStep> = ceremony_stream(|_tx| async move { Ok(()) }).collect().await;
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].phase, "done");
+    }
+}
+
+#[cfg(test)]
+mod journal_summary_tests {
+    //! An action's journal line says what the run did, from the receipt the
+    //! module minted, not from the model's input: the reader sees where a
+    //! reply landed and which emoji a reaction set, on whichever lane.
+
+    use super::*;
+
+    #[test]
+    fn an_action_reads_as_operation_lane_receipt_and_id() {
+        let entry = journal_entry(runs::index::JournalRow {
+            height: 309,
+            time: 0,
+            fact: runs::RunFact::Acted {
+                request_id: "action/abc/ack".into(),
+                lane: runs::LaneKind::Live,
+                operation: "react".into(),
+                result: serde_json::json!({"channel_id": "engineering", "seq": 2, "emoji": "👀"}),
+            },
+        });
+        assert_eq!(entry.kind, "acted");
+        assert_eq!(
+            entry.summary,
+            "react · live · channel_id engineering · emoji 👀 · seq 2 · action/abc/ack"
+        );
+    }
+
+    #[test]
+    fn a_final_lane_reply_names_its_destination_from_the_nested_receipt() {
+        let entry = journal_entry(runs::index::JournalRow {
+            height: 579,
+            time: 0,
+            fact: runs::RunFact::Acted {
+                request_id: "result/abc/0".into(),
+                lane: runs::LaneKind::Final,
+                operation: "reply".into(),
+                result: serde_json::json!({
+                    "destination": {"channel_id": "engineering", "kind": "chat", "thread": 12},
+                    "id": "agent/abc",
+                }),
+            },
+        });
+        assert_eq!(
+            entry.summary,
+            "reply · final · channel_id engineering · kind chat · thread 12 · id agent/abc · result/abc/0"
+        );
+    }
+
+    #[test]
+    fn a_module_authored_effect_with_no_receipt_reads_as_its_label_alone() {
+        let entry = journal_entry(runs::index::JournalRow {
+            height: 580,
+            time: 0,
+            fact: runs::RunFact::Acted {
+                request_id: "result/abc/1".into(),
+                lane: runs::LaneKind::Final,
+                operation: "forge".into(),
+                result: serde_json::Value::Null,
+            },
+        });
+        assert_eq!(entry.summary, "forge · final · result/abc/1");
     }
 }
 

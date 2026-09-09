@@ -185,13 +185,6 @@ impl RunsModule {
             prepared,
         )
         .await?;
-        self.record(
-            &run_id,
-            crate::RunFact::Acted {
-                request_id: id.clone(),
-                operation: envelope.operation.clone(),
-            },
-        );
         // spend the budget. the counter is committed state: it is both the audit
         // record and the id salt the NEXT action mints from, so it must move on
         // every applied action and on no refused one (a refusal is an `Err`, and
