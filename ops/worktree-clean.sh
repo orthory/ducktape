@@ -36,19 +36,74 @@ PRIMARY="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
 say() { [ "$YES" = 1 ] && echo "  $*" || echo "  [dry-run] $*"; }
 run() { [ "$YES" = 1 ] && "$@"; }
 
+command -v python3 >/dev/null || { echo "python3 is required to check active caches" >&2; exit 1; }
+[ -d /proc/self/fd ] || { echo "process reference checks require /proc; nothing removed" >&2; exit 1; }
+
 git fetch -q origin dev 2>/dev/null || true
 
 # ── does anything live in this directory? ────────────────────────────────────
-# By cwd, not `pkill -f`: a pattern match would happily kill a process that
-# merely mentions the path (this script, an editor, a grep). The QA skill says
-# the same thing in more words — "Never find or stop desktop processes with
-# pkill -f".
+# A borrowed Cargo target can be live under another worktree's cwd. Keep
+# references through open files, mapped artifacts and CARGO_TARGET_DIR too.
+# This tool handles same-user caches only; cross-user consumers are unsupported.
+# Print only PIDs: process environments may contain credentials.
 pids_under() {
-  local dir="$1" p cwd
-  for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-    cwd=$(readlink "/proc/$p/cwd" 2>/dev/null) || continue
-    case "$cwd" in "$dir"|"$dir"/*) echo "$p" ;; esac
-  done
+  python3 - "$1" <<'PYTHON'
+import os
+from pathlib import Path
+import sys
+
+root = os.path.realpath(sys.argv[1])
+if os.stat(root).st_uid != os.geteuid():
+    raise PermissionError("worktree is owned by another user")
+
+def inside(path):
+    return path == root or path.startswith(root + "/")
+
+def references(process):
+    for name in ("cwd", "exe"):
+        try:
+            if inside(os.readlink(process / name)):
+                return True
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    try:
+        for descriptor in (process / "fd").iterdir():
+            try:
+                if inside(os.readlink(descriptor)):
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    try:
+        for entry in (process / "environ").read_bytes().split(b"\0"):
+            if entry.startswith(b"CARGO_TARGET_DIR="):
+                target = os.fsdecode(entry.split(b"=", 1)[1])
+                if not os.path.isabs(target):
+                    target = os.path.join(os.readlink(process / "cwd"), target)
+                if inside(os.path.realpath(target)):
+                    return True
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    try:
+        for line in (process / "maps").read_text().splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) == 6 and inside(fields[5]):
+                return True
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    return False
+
+for process in Path("/proc").iterdir():
+    if not process.name.isdigit() or int(process.name) == os.getpid():
+        continue
+    try:
+        owner = process.stat().st_uid
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+    if owner == os.geteuid() and references(process):
+        print(process.name)
+PYTHON
 }
 
 # ── did this branch land as a squash merge? ──────────────────────────────────
@@ -78,7 +133,10 @@ while read -r wt; do
 
   dirty=$(git -C "$wt" status --porcelain 2>/dev/null | wc -l)
   ahead=$(git -C "$wt" rev-list --count origin/dev..HEAD 2>/dev/null || echo 1)
-  live=$(pids_under "$wt" | wc -w)
+  if ! live_pids=$(pids_under "$wt"); then
+    echo "- SKIP $(basename "$wt") — process references could not be inspected"; continue
+  fi
+  live=$(wc -w <<< "$live_pids")
 
   # The refusals that make this safe to run without reading the code.
   if [ "$ahead" != "0" ] && ! squash_merged "$wt" "$branch"; then
