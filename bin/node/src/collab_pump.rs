@@ -67,14 +67,15 @@ const PAGES_PER_SWEEP: usize = 8;
 /// hide a wedged pump behind.
 const RECEIPT_LANE: usize = 256;
 
-/// Sweeps one receipt is re-submitted over before it is abandoned with a loud
-/// reason. A transport failure clears in one; a module refusal never clears, and
-/// the error string cannot tell them apart.
-const ACK_TRIES: u32 = 5;
-
-/// How many un-submitted receipts to hold. Past this the OLDEST goes — a later
-/// transition is the more truthful statement about where a delivery stands.
-const MAX_PENDING_ACKS: usize = 1024;
+/// How many MESSAGES may owe the chain a receipt at once.
+///
+/// The bound is backpressure and not a bin: at the ceiling a message that owes
+/// nothing yet is REFUSED with a loud reason, and every message already owing
+/// keeps its whole ordered chain. Dropping an owed transition is never the
+/// answer — the diagram refuses `Stored -> AdapterAccepted`, so a lost `Queued`
+/// makes the acceptance behind it permanently unsubmittable, and a later state
+/// cannot stand in for an earlier one.
+const MAX_OWING_MESSAGES: usize = 4096;
 
 /// How often production sweeps committed state.
 ///
@@ -166,25 +167,24 @@ pub(crate) struct Pump {
     /// the chain id every op is bound to and every key is scoped by. Taken from
     /// the workspace at boot: a node serves exactly one network.
     network: String,
-    /// receipts the chain has not taken yet, oldest first. See
-    /// [`Pump::commit_receipt`]. `std::sync::Mutex`: every critical section
-    /// takes what it needs and drops the guard before any `.await`.
-    pending: std::sync::Mutex<std::collections::VecDeque<Unsent>>,
+    /// what the chain still owes, PER MESSAGE and in reported order. See
+    /// [`Pump::owe`]. `std::sync::Mutex`: every critical section takes what it
+    /// needs and drops the guard before any `.await`.
+    owed: std::sync::Mutex<BTreeMap<Message, std::collections::VecDeque<Unsent>>>,
 }
+
+/// one message's delivery record, as the module keys it.
+type Message = (String, String, u64);
 
 /// one receipt the daemon reported and the chain has not taken.
 #[derive(Debug, Clone)]
 struct Unsent {
-    conversation: String,
-    participant: String,
-    seq: u64,
     /// the generation the daemon reported, carried VERBATIM through every
     /// retry. Substituting the current one would let a stale device's receipt
     /// pass the module's fence on the second attempt.
     credential: collab::Credential,
     state: wire::State,
     reason: Option<String>,
-    tries: u32,
 }
 
 /// What the daemon has already been told about one binding.
@@ -238,7 +238,7 @@ impl Pump {
             terminals,
             workspace,
             network,
-            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            owed: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -700,36 +700,53 @@ impl Pump {
         state: wire::State,
         reason: Option<String>,
     ) {
-        self.commit_receipt(Unsent {
-            conversation: conversation.to_string(),
-            participant: participant.to_string(),
-            seq,
+        let message = (conversation.to_string(), participant.to_string(), seq);
+        let unsent = Unsent {
             credential: binding_generation,
             state,
             reason,
-            tries: 0,
-        })
-        .await;
+        };
+        // BEHIND whatever this message already owes. The diagram is a chain —
+        // `Stored -> Queued -> AdapterAccepted` — so submitting this now, while
+        // an earlier transition of the SAME message is still waiting, is the
+        // out-of-order submission the module refuses. Another message's queue
+        // is unrelated and is not waited on.
+        if self.owe_behind(&message, &unsent) {
+            return;
+        }
+        self.commit_receipt(&message, unsent).await;
     }
 
-    /// Submit one receipt, and REMEMBER it if the submission did not land.
+    /// Queue `unsent` behind this message's existing debt, if it has any.
+    /// Answers whether it was queued.
+    fn owe_behind(&self, message: &Message, unsent: &Unsent) -> bool {
+        let mut owed = self.owed.lock().expect("collab owed lock poisoned");
+        let Some(chain) = owed.get_mut(message) else {
+            return false;
+        };
+        chain.push_back(unsent.clone());
+        true
+    }
+
+    /// Submit one receipt, and OWE it if the submission did not land.
     ///
     /// A dropped acknowledgement is not self-healing. Once `Queued` commits, the
     /// eligibility read answers `already_queued` forever, so the pump never
     /// re-offers the message and the daemon never re-reports it: a failed
     /// `AdapterAccepted` submission would leave the network reading `Queued` for
     /// a message a provider took, with no operator action short of re-binding
-    /// able to correct it. So it is queued for [`Pump::resubmit`] and retried on
-    /// the next sweeps, in the order the daemon reported the transitions.
-    async fn commit_receipt(&self, unsent: Unsent) {
+    /// able to correct it.
+    async fn commit_receipt(&self, message: &Message, unsent: Unsent) {
+        let (conversation, participant, seq) = message;
         let binding = crate::collab_keys::BindingRef {
             network: &self.network,
-            conversation: &unsent.conversation,
-            participant: &unsent.participant,
+            conversation,
+            participant,
         };
         let key = match crate::collab_keys::load(&self.workspace, binding) {
             Ok(Some(key)) => key,
-            // no key is not transient: nothing here can ever sign it.
+            // no key is not transient: nothing here can ever sign it, and no
+            // amount of retrying changes that.
             Ok(None) => {
                 return self.refuse(
                     "receipt_without_key",
@@ -739,8 +756,8 @@ impl Pump {
             Err(error) => return self.refuse("service_key_unreadable", &error),
         };
         let op = collab::CollaborationMsg::Acknowledge {
-            conversation_id: unsent.conversation.clone(),
-            seq: unsent.seq,
+            conversation_id: conversation.clone(),
+            seq: *seq,
             binding_credential: unsent.credential,
             state: delivery_state(unsent.state),
             reason: unsent.reason.clone(),
@@ -748,56 +765,135 @@ impl Pump {
         match self.submit(&key, op).await {
             Ok(height) => tracing::debug!(
                 target: "ducktape::collab",
-                conversation = %unsent.conversation,
-                seq = unsent.seq,
+                conversation = %conversation,
+                seq,
                 height,
                 "acknowledged a delivery on-chain"
             ),
-            Err(error) => self.remember_unsent(unsent, &error),
+            Err(error) => self.owe(message, unsent, &key, &error).await,
         }
     }
 
-    /// Keep a receipt the chain did not take, up to [`ACK_TRIES`].
+    /// Keep a receipt the chain did not take — unless the chain has ALREADY
+    /// been shown to hold the fact, or to have moved somewhere this transition
+    /// can never reach.
     ///
-    /// Bounded, because a refusal can also be PERMANENT: the module rejects a
-    /// transition outside the delivery diagram and a credential that is no
-    /// longer current, and re-submitting the identical op produces the identical
-    /// refusal forever. The retry cannot tell the two apart from the error
-    /// string, so it gives up after a few sweeps and says so loudly rather than
-    /// retrying one op for the life of the process.
-    fn remember_unsent(&self, mut unsent: Unsent, error: &str) {
-        unsent.tries += 1;
-        if unsent.tries >= ACK_TRIES {
-            return self.refuse("acknowledge_abandoned", error);
+    /// There is no attempt counter, deliberately. A count cannot tell a busy
+    /// actor from a permanent refusal, so counting means eventually throwing
+    /// away a fact that was merely unlucky. The committed record can tell:
+    /// [`settled`] reads it and retires the receipt only on a VERIFIED outcome.
+    /// Everything else is owed, for as long as it takes.
+    async fn owe(
+        &self,
+        message: &Message,
+        unsent: Unsent,
+        key: &commonware_cryptography::ed25519::PrivateKey,
+        error: &str,
+    ) {
+        if let Some(verdict) = self.settled(message, unsent.state, key).await {
+            return self.refuse(verdict, error);
         }
-        let mut pending = self.pending.lock().expect("collab pending lock poisoned");
-        if pending.len() >= MAX_PENDING_ACKS {
-            // the oldest goes, not the newest: a later transition is the more
-            // truthful statement about where the delivery stands.
-            pending.pop_front();
-            self.refuse(
-                "pending_acks_full",
-                "dropped the oldest unsent receipt to make room",
+        let mut owed = self.owed.lock().expect("collab owed lock poisoned");
+        // BACKPRESSURE, not eviction: a message already owing always takes its
+        // next transition, because dropping one strands every later one behind
+        // it. Only a message owing NOTHING is turned away at the ceiling.
+        let known = owed.contains_key(message);
+        if !known && owed.len() >= MAX_OWING_MESSAGES {
+            return self.refuse(
+                "owed_receipts_full",
+                "refused a receipt: too many messages already owe the chain one",
             );
         }
-        pending.push_back(unsent);
+        owed.entry(message.clone()).or_default().push_back(unsent);
+        drop(owed);
         self.refuse("acknowledge_retrying", error);
     }
 
-    /// Retry every receipt the chain has not taken, oldest first.
+    /// Has the network already settled this transition's question?
     ///
-    /// Order is preserved on purpose: the module's diagram admits
-    /// `Queued -> Held -> AdapterAccepted` and refuses transitions taken out of
-    /// order, so replaying them as they were reported is what makes the retry a
-    /// recovery rather than a second way to lose the record. A retry that fails
-    /// again goes back on the queue with its count raised.
-    async fn resubmit(&self) {
-        let queued: Vec<Unsent> = {
-            let mut pending = self.pending.lock().expect("collab pending lock poisoned");
-            pending.drain(..).collect()
+    /// `Some(reason)` retires the receipt, and only on a fact READ BACK off the
+    /// chain:
+    ///
+    /// * the committed state IS the one being reported — it landed after all
+    ///   (a lost reply is indistinguishable from a lost submission from here);
+    /// * the record is TERMINAL and different — the diagram refuses every
+    ///   transition out of a terminal state, so this one can never apply again;
+    /// * there is no record — the message was pruned, and nothing will accept a
+    ///   receipt for it.
+    ///
+    /// `None` on every read failure. An unverified receipt is never abandoned.
+    async fn settled(
+        &self,
+        message: &Message,
+        state: wire::State,
+        key: &commonware_cryptography::ed25519::PrivateKey,
+    ) -> Option<&'static str> {
+        let (conversation, participant, seq) = message;
+        // the device label is not part of a READ — only the participant acting
+        // and the conversation its key is scoped to are.
+        let attachment = Attached {
+            network: self.network.clone(),
+            conversation: conversation.clone(),
+            participant: participant.clone(),
+            device: String::new(),
         };
-        for unsent in queued {
-            self.commit_receipt(unsent).await;
+        let collab::CollaborationReply::Receipt(receipt) = self
+            .read(
+                &attachment,
+                key,
+                collab::ProtectedRead::Receipt {
+                    conversation_id: conversation.clone(),
+                    seq: *seq,
+                },
+            )
+            .await?
+        else {
+            // not a receipt: this build cannot read the answer, so it has
+            // verified nothing.
+            return None;
+        };
+        let Some(receipt) = receipt else {
+            return Some("receipt_gone");
+        };
+        if receipt.state == delivery_state(state) {
+            return Some("acknowledge_already_landed");
+        }
+        receipt
+            .state
+            .is_terminal()
+            .then_some("acknowledge_superseded")
+    }
+
+    /// Retry what the chain is owed, per message and in reported order.
+    ///
+    /// A message stops at its FIRST failure and keeps the rest of its chain
+    /// behind it — that is what makes this a recovery rather than a second way
+    /// to lose the record, because the diagram refuses a transition taken out of
+    /// order. Messages do not wait on each other.
+    async fn resubmit(&self) {
+        let debts: Vec<(Message, std::collections::VecDeque<Unsent>)> = {
+            let mut owed = self.owed.lock().expect("collab owed lock poisoned");
+            std::mem::take(&mut *owed).into_iter().collect()
+        };
+        for (message, chain) in debts {
+            for (offset, unsent) in chain.iter().enumerate() {
+                self.commit_receipt(&message, unsent.clone()).await;
+                let still_owing = self
+                    .owed
+                    .lock()
+                    .expect("collab owed lock poisoned")
+                    .contains_key(&message);
+                if still_owing {
+                    // it failed again and re-owed itself. Everything after it
+                    // goes back behind it, unattempted.
+                    let mut owed = self.owed.lock().expect("collab owed lock poisoned");
+                    let queue = owed.entry(message.clone()).or_default();
+                    for later in chain.iter().skip(offset + 1) {
+                        queue.push_back(later.clone());
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -1588,14 +1684,19 @@ mod tests {
         /// exactly the transient class the pump has to survive — a dropped
         /// reply, a busy actor, a submission that did not land.
         fn flaky(&self, fault: Fault) -> mpsc::Sender<noded::NodeCommand> {
+            self.flaky_times(fault, 1)
+        }
+
+        /// [`Fixture::flaky`], failing the first `times` matching commands.
+        fn flaky_times(&self, fault: Fault, times: u32) -> mpsc::Sender<noded::NodeCommand> {
             use futures::StreamExt as _;
             let (tx, mut rx) = mpsc::channel(16);
             let mut real = self.daemon.commands();
             tokio::spawn(async move {
-                let mut armed = true;
+                let mut left = times;
                 while let Some(command) = rx.next().await {
-                    if armed && fault.matches(&command) {
-                        armed = false;
+                    if left > 0 && fault.matches(&command) {
+                        left -= 1;
                         fault.refuse(command);
                         continue;
                     }
@@ -1626,6 +1727,8 @@ mod tests {
         Eligibility,
         /// the acknowledgement of an accepted delivery does not land.
         AcceptedReceipt,
+        /// the acknowledgement that the daemon queued it does not land.
+        QueuedReceipt,
     }
 
     impl Fault {
@@ -1638,19 +1741,31 @@ mod tests {
                         ..
                     })
                 ),
-                (Fault::AcceptedReceipt, noded::NodeCommand::SubmitFrame { frame, .. }) => {
+                (
+                    Fault::AcceptedReceipt | Fault::QueuedReceipt,
+                    noded::NodeCommand::SubmitFrame { frame, .. },
+                ) => {
                     let Ok((_, msg)) = node::decode_frame(frame) else {
                         return false;
                     };
-                    matches!(
-                        collab::decode_msg(&msg.payload).map(|request| request.op),
-                        Ok(collab::CollaborationMsg::Acknowledge {
-                            state: collab::DeliveryState::AdapterAccepted,
-                            ..
-                        })
-                    )
+                    let Ok(collab::CollaborationMsg::Acknowledge { state, .. }) =
+                        collab::decode_msg(&msg.payload).map(|request| request.op)
+                    else {
+                        return false;
+                    };
+                    state == self.acknowledges()
                 }
                 _ => false,
+            }
+        }
+
+        /// the one delivery state this fault refuses to let commit.
+        fn acknowledges(self) -> collab::DeliveryState {
+            match self {
+                Fault::AcceptedReceipt => collab::DeliveryState::AdapterAccepted,
+                Fault::QueuedReceipt => collab::DeliveryState::Queued,
+                // never reached: `matches` only asks on a SubmitFrame arm.
+                Fault::Eligibility => collab::DeliveryState::Stored,
             }
         }
 
@@ -1990,6 +2105,93 @@ mod tests {
         assert_no_delivery(
             &drained(&mut fixture.link),
             "recovering a receipt must not re-offer the message it is about",
+        );
+    }
+
+    /// A receipt is owed until the CHAIN says otherwise, however long that
+    /// takes. There is no attempt counter to run out: a count cannot tell a
+    /// busy actor from a permanent refusal, so counting means eventually
+    /// throwing away a fact that was merely unlucky.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_receipt_survives_far_more_transient_failures_than_a_retry_budget_would() {
+        const FAILURES: u32 = 9;
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "keep trying").await;
+        let pump = fixture.pump_behind(fixture.flaky_times(Fault::AcceptedReceipt, FAILURES));
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (bound, deliver) = bind_and_delivery(&drained(&mut fixture.link));
+        for state in [wire::State::Queued, wire::State::AdapterAccepted] {
+            pump.receipt(reported(
+                deliver.seq,
+                bound.generation,
+                deliver.message_id,
+                state,
+            ))
+            .await;
+        }
+
+        // one submission attempt per sweep, and the first FAILURES of them are
+        // swallowed. Nothing else happens in between: no provider, no re-bind.
+        for _ in 0..FAILURES {
+            assert_eq!(
+                fixture.receipt(deliver.seq).await.state,
+                collab::DeliveryState::Queued,
+                "still owed"
+            );
+            pump.sweep(&mut seen).await;
+        }
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::AdapterAccepted,
+            "the acceptance lands as soon as the chain will take it"
+        );
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "and no provider was asked to do anything again",
+        );
+    }
+
+    /// A later transition cannot stand in for an earlier one: the diagram has
+    /// no `Stored -> AdapterAccepted` edge. So while `Queued` is still owed, the
+    /// `AdapterAccepted` behind it must WAIT rather than race past it — and both
+    /// must land, in order, once the chain takes them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acceptance_waits_behind_the_queued_receipt_it_follows() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "order matters").await;
+        let pump = fixture.pump_behind(fixture.flaky(Fault::QueuedReceipt));
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (bound, deliver) = bind_and_delivery(&drained(&mut fixture.link));
+        // `Queued` is swallowed; `AdapterAccepted` arrives while it is owed.
+        for state in [wire::State::Queued, wire::State::AdapterAccepted] {
+            pump.receipt(reported(
+                deliver.seq,
+                bound.generation,
+                deliver.message_id,
+                state,
+            ))
+            .await;
+        }
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::Stored,
+            "the acceptance did not jump the queue: the module would have refused \
+             it out of `Stored`, and the fact would have been lost"
+        );
+
+        pump.sweep(&mut seen).await;
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::AdapterAccepted,
+            "both land, in the order the daemon reported them"
+        );
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "recovering an ordered chain must not re-offer the message",
         );
     }
 
