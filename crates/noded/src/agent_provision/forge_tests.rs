@@ -14,6 +14,26 @@ use super::*;
 use crate::NodeHandle;
 use compute_service::WorkspaceProvisioner as _;
 
+/// write `body` to `path` as an executable script, through a child shell
+/// rather than this process: a file this process holds open for writing is
+/// inherited by every child another test forks meanwhile, and executing it
+/// while such a child still holds the descriptor fails with ETXTBSY.
+fn install_script(path: &std::path::Path, body: &str) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 022 && cat > \"$0\" && chmod 755 \"$0\"")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child.stdin.take().unwrap().write_all(body.as_bytes())?;
+            child.wait()
+        })
+        .unwrap();
+    assert!(status.success(), "install {}", path.display());
+}
+
 const REPO: &str = "app";
 const BRANCH: &str = "agent/item-7";
 const AGENT: &str = "quackbot";
@@ -232,11 +252,9 @@ fn the_probe_fails_loud_when_git_is_absent() {
 #[cfg(unix)]
 #[test]
 fn the_probe_rejects_git_without_the_runtime_rebase_options() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let tmp = tempfile::tempdir().unwrap();
     let shim = tmp.path().join("git-with-old-rebase");
-    std::fs::write(
+    install_script(
         &shim,
         "#!/bin/sh\n\
          for arg in \"$@\"; do\n\
@@ -248,9 +266,7 @@ fn the_probe_rejects_git_without_the_runtime_rebase_options() {
            esac\n\
          done\n\
          exec git \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let err = probe_host_git_with(shim.to_str().unwrap()).unwrap_err();
     assert!(err.contains("runtime-compatible git"), "{err}");
@@ -858,8 +874,6 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_git_ignores_agent_installed_hooks_and_filters() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let bed = bed();
     bed.snapshot_bare();
     let ws = bed
@@ -871,12 +885,10 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
     let dir = ws.workdir();
     let sentinel = dir.join("host-git-ran");
     let filter = dir.join("evil-filter.sh");
-    std::fs::write(
+    install_script(
         &filter,
-        format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\ncat\n", sentinel.display()),
+    );
     run_git(
         &dir,
         &["config", "filter.evil.clean", &filter.display().to_string()],
@@ -885,12 +897,10 @@ async fn host_git_ignores_agent_installed_hooks_and_filters() {
     .unwrap();
     std::fs::write(dir.join(".gitattributes"), "answer.md filter=evil\n").unwrap();
     let hook = dir.join(".git/hooks/pre-push");
-    std::fs::write(
+    install_script(
         &hook,
-        format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+    );
     std::fs::write(dir.join("answer.md"), "safe work\n").unwrap();
 
     ws.commit("agent run s1:0", Some("Publish without host execution"))
@@ -1455,11 +1465,7 @@ async fn a_remote_that_always_rejects_exhausts_the_bounded_retries() {
     // a pre-receive hook that logs every push attempt and declines it.
     let hook = bare.join("hooks").join("pre-receive");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    std::fs::write(&hook, "#!/bin/sh\necho x >> hook.log\nexit 1\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    install_script(&hook, "#!/bin/sh\necho x >> hook.log\nexit 1\n");
 
     let ws = bed
         .provisioner()

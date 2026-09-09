@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::{ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps};
+use crate::{
+    ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps,
+};
 use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +86,72 @@ pub struct RunRecord {
     pub output_ref: Option<String>,
     /// the forge PR this run opened or updated, when the PR sink applied.
     pub pr_number: Option<u64>,
+}
+
+// ---- the run journal ----------------------------------------------------------
+
+/// one lifecycle fact the module committed about a run. every op (and
+/// acknowledgment) that moves a run's lifecycle stamps the facts it
+/// committed ([`sdk::Ctx::set_assigned`], encoded by [`encode_assigned`]) so
+/// the derived tier folds the module's exact transitions into the run
+/// journal (`crate::index`) instead of re-deriving them from op payloads.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunFact {
+    /// the run was staged on the dispatch plane for `agent_id`.
+    Dispatched {
+        agent_id: String,
+        /// empty for job-backed runs.
+        channel_id: String,
+        /// 0 for job-backed runs.
+        anchor_seq: u64,
+        job_id: Option<String>,
+        /// the run-scoped call edge that created a delegated run.
+        delegation_id: Option<String>,
+        requester: RunOrigin,
+    },
+    /// the node holding the run's execution lease bound its session key.
+    SessionOpened {
+        attempt: u32,
+        /// lowercase key hex of the lease holder.
+        holder: String,
+    },
+    /// the bound session admitted one live action.
+    Acted {
+        request_id: String,
+        operation: String,
+    },
+    /// the dispatch plane delivered the run's result: the run is over.
+    Settled {
+        outcome: RunOutcome,
+        /// the failure excerpt, for a failed run.
+        reason: Option<String>,
+        degraded: bool,
+        executing_node: String,
+        output_ref: Option<String>,
+        pr_number: Option<u64>,
+    },
+    /// a settled run's result action was refused by its program or target.
+    ResultActionRefused { request_id: String },
+    /// the forge PR a settled run's sink opened or updated was authenticated.
+    PrLinked { number: u64 },
+}
+
+/// one journal entry: the run a fact is about.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvent {
+    pub run_id: String,
+    pub fact: RunFact,
+}
+
+/// the assigned stamp of one applied runs op: every fact it committed, in
+/// commit order. an op that moved no run stamps nothing.
+pub fn encode_assigned(journal: &[RunEvent]) -> Vec<u8> {
+    sdk::wire::encode(&journal)
+}
+pub fn decode_assigned(b: &[u8]) -> Result<Vec<RunEvent>, String> {
+    sdk::wire::decode(b)
 }
 
 // ---- run-scoped agent calls -------------------------------------------------

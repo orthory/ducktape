@@ -8,6 +8,7 @@ use super::{
     dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply,
     files_encode_query, inject, recipe_id_for,
 };
+use crate::RunFact;
 use crate::facets::WireSink;
 
 impl RunsModule {
@@ -587,6 +588,17 @@ impl RunsModule {
                 admission: dispatch::AdmissionPolicy::Queue,
             }),
         });
+        self.record(
+            run_id,
+            RunFact::Dispatched {
+                agent_id: agent_id.clone(),
+                channel_id: channel_id.clone(),
+                anchor_seq,
+                job_id: None,
+                delegation_id: delegation_id.clone(),
+                requester: requester.clone(),
+            },
+        );
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {

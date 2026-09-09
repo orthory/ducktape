@@ -260,6 +260,7 @@ fn insert_boundary_is_fully_queryable_and_one_deeper_is_rejected() {
             &PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -384,6 +385,7 @@ fn empty_nested_page_terminates_at_its_own_root() {
             &PageMsg::CreatePage {
                 page_id: "outer".into(),
                 title: "outer".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -456,6 +458,7 @@ fn block_ids_are_globally_unique_across_pages() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "two".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -487,6 +490,7 @@ fn block_ids_are_globally_unique_across_pages() {
             &PageMsg::CreatePage {
                 page_id: "b1".into(),
                 title: "steal".into(),
+                blocks: Vec::new(),
             },
             "duplicate block id",
         )
@@ -681,6 +685,7 @@ fn move_subtree_accepts_the_depth_boundary_and_rejects_overflow() {
             &PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -1054,6 +1059,7 @@ fn illegal_moves_are_rejected() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "two".into(),
+                blocks: Vec::new(),
             },
         )
         .await;

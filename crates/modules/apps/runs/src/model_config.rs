@@ -65,14 +65,20 @@ fn is_scoped_duckfs_prefix(prefix: &str) -> bool {
 
 impl RunsModule {
     /// every granted action must come from the known vocabulary, so a grant
-    /// always means something; duplicates collapse into the sorted set.
-    fn validate_actions(actions: Vec<String>) -> Result<Vec<String>, Error> {
+    /// always means something; duplicates collapse into the sorted set. the
+    /// [`EVERY`] entry subsumes any names beside it: the stored grant is then
+    /// exactly `["*"]`, so "all" reads the same however it was written.
+    pub(super) fn validate_actions(actions: Vec<String>) -> Result<Vec<String>, Error> {
         let mut set = BTreeSet::new();
         for action in actions {
-            if !KNOWN_ACTIONS.contains(&action.as_str()) {
+            let known = action == EVERY || KNOWN_ACTIONS.contains(&action.as_str());
+            if !known {
                 return Err(Error::Module(format!("unknown action: {action}")));
             }
             set.insert(action);
+        }
+        if set.contains(EVERY) {
+            return Ok(vec![EVERY.to_string()]);
         }
         Ok(set.into_iter().collect())
     }

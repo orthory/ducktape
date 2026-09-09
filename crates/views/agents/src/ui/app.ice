@@ -21,9 +21,21 @@ extern crate::host
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
   AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
-  AgentsProps(rows:[AgentRow], capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool)
+  MessagingSeat(participant:str, role:str, you:bool)
+  MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
+  MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
+  MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
+  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  JournalEntry(height:str, kind:str, summary:str)
+  RunJournal(run_id:str, entries:[JournalEntry])
+  AgentsProps(rows:[AgentRow], runs:[RunRow], journal:RunJournal, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
+  pure runs_summary(runs:&[RunRow]) -> str
+  pure run_named(runs:&[RunRow], run_id:&str) -> RunRow
+  pure empty_journal() -> RunJournal
+  pure empty_run() -> RunRow
+  pure open_run(run_id:&str) -> bool
   pure cap_count(caps:&AgentCaps) -> i64
   pure skill_count(skills:&[AgentSkill]) -> i64
   pure row_named(rows:&[AgentRow], id:&str) -> AgentRow
@@ -45,11 +57,39 @@ extern crate::host
   pure or_empty(value:&str?) -> str
   pure pick_str(condition:bool, then:&str, or:&str) -> str
   pure pick_capability(condition:bool, then:&str, or:&str?) -> str?
+  pure pick_option(condition:bool, then:&str, or:&str?) -> str?
   pure empty_caps() -> AgentCaps
   pure pick_list(condition:bool, then:&[str], or:&[str]) -> [str]
   pure pick_caps(condition:bool, then:&AgentCaps, or:&AgentCaps) -> AgentCaps
   pure pick_skills(condition:bool, then:&[AgentSkill], or:&[AgentSkill]) -> [AgentSkill]
   pure valid_agent_id(id:&str) -> bool
+  pure empty_messaging() -> MessagingProps
+  pure pane_note(pane:&str) -> str
+  pure pick_int(condition:bool, then:i64, or:i64) -> i64
+  pure delivery_label(state:&str) -> str
+  pure delivery_note(state:&str) -> str
+  pure delivery_unsettled(state:&str) -> bool
+  pure kind_label(kind:&str) -> str
+  pure body_note(body_bytes:i64, shown_bytes:i64) -> str
+  pure task_note(task:&str, attempt:i64) -> str
+  pure run_for_task(runs:&[RunRow], task:&str) -> str
+  pure run_link_note(runs:&[RunRow], task:&str) -> str
+  pure denied_note(denied:&str) -> str
+  pure seat_role(role:&str) -> str
+  pure binding_note(binding:&MessagingBinding) -> str
+  pure mailbox_note(undelivered:i64, queued_bytes:i64) -> str
+  pure page_note(messages:&[MessagingMessage], from_seq:i64, next_seq:i64) -> str
+  pure compose_kinds(reply_to:i64) -> [str]
+  pure body_refusal(body:&str, max_body_bytes:i64) -> str
+  pure send_ready(may_send:bool, sending:bool, recipient:&str?, kind:&str?, body:&str, max_body_bytes:i64) -> bool
+  pure recipients(roster:&[MessagingSeat]) -> [str]
+  pure older_from(from_seq:i64, floor_seq:i64, page_size:i64) -> i64
+  pure newer_from(from_seq:i64, page_size:i64, next_seq:i64) -> i64
+  pure reply_note(reply_to:i64) -> str
+  pure same_scope(network:&str, participant:&str, conversation:&str, other_network:&str, other_participant:&str, other_conversation:&str) -> bool
+  pure open_conversation(participant:&str, conversation:&str) -> bool
+  pure page_messages(from_seq:i64, newest:bool) -> bool
+  pure send_message(kind:&str, recipient:&str, body:&str, reply_to:i64) -> bool
   pure status(agent_id:&str, paused:bool) -> bool
   pure save(agent_id:&str, display_name:&str, capability:&str, allowed_actions:&[str], caps:&AgentCaps, skills:&[AgentSkill]) -> bool
   pure register(agent_id:&str, display_name:&str, capability:&str, allowed_actions:&[str], caps:&AgentCaps, skills:&[AgentSkill]) -> bool
@@ -57,6 +97,17 @@ extern crate::host
 state
   active_palette:palette[AppTheme] = AppTheme.app
   rows:[AgentRow] = []
+  runs:[RunRow] = []
+  journal:RunJournal = empty_journal()
+  // which panel the reader is on: the registry (who may act), the runs
+  // tracker (what they did, and how it settled) or the messages pane (what was
+  // said, and what was delivered). Mutually exclusive by construction — one
+  // value, and every panel's content is gated on it.
+  panel = "registry"
+  // the run open in the tracker, by run id; "" is none — and its row, as
+  // the register last listed it
+  open_run = ""
+  open_row:RunRow = empty_run()
   capabilities:[str] = []
   actions:[str] = []
   account = ""
@@ -91,6 +142,24 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind, and
   // the host's answer arrives as the next register
   sent = false
+  // the panel's whole reading, exactly as the app authenticated it
+  messaging:MessagingProps = empty_messaging()
+  // THE EXPLICIT ASSOCIATION: who the viewer acts as, and what they open.
+  // Nothing here scans, discovers or attaches on its own.
+  open_participant = ""
+  open_conversation_id = ""
+  // the composer
+  msg_kind:str? = some("notice")
+  msg_recipient:str? = none
+  msg_body = ""
+  msg_reply_to:i64 = 0
+  // THE SCOPE THE DRAFT WAS WRITTEN FOR, captured when a send leaves. An
+  // answer about another network, participant or conversation never clears
+  // text written for this one — and a failed send keeps it whole.
+  draft_network = ""
+  draft_participant = ""
+  draft_conversation = ""
+  last_sent_seq:i64 = 0
 
 on mount
   stream every props() -> props_changed _ | props_failed _
@@ -101,6 +170,9 @@ on mount
 // row is now the truth.
 on props_changed(next)
   rows = next.rows
+  runs = next.runs
+  journal = next.journal
+  open_row = run_named(runs, open_run)
   capabilities = next.capabilities
   actions = next.actions
   account = next.account
@@ -119,6 +191,20 @@ on props_changed(next)
   draft_caps = pick_caps(consumed, row.caps, draft_caps)
   draft_budget = pick_str(consumed, budget_text(row.caps.subagent_budget), draft_budget)
   draft_skills = pick_skills(consumed, row.skills, draft_skills)
+  // A LANDED SEND CLEARS ONLY ITS OWN DRAFT. `sent_seq` moves when the network
+  // admitted this panel's send; the scope check is what stops an answer about
+  // conversation A from clearing a message being written for B after a switch.
+  let landed = next.messaging.sent_seq > last_sent_seq
+  let draft_landed = landed && same_scope(draft_network, draft_participant, draft_conversation, next.messaging.network, next.messaging.participant, next.messaging.conversation)
+  last_sent_seq = next.messaging.sent_seq
+  // OPENING A DIFFERENT CONVERSATION EMPTIES THE COMPOSER. Text written for
+  // one roster is not silently retargeted at another.
+  let switched = messaging.conversation != next.messaging.conversation || messaging.participant != next.messaging.participant || messaging.network != next.messaging.network
+  msg_body = pick_str(draft_landed || switched, "", msg_body)
+  msg_reply_to = pick_int(draft_landed || switched, 0, msg_reply_to)
+  msg_recipient = pick_option(switched, "", msg_recipient)
+  msg_kind = pick_option(switched, "notice", msg_kind)
+  messaging = next.messaging
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
@@ -168,6 +254,24 @@ on close_editor
   selected = ""
   creating = false
 
+// ONE SELECTOR FOR THREE MUTUALLY EXCLUSIVE PANELS. Three zero-arg handlers
+// would be three places to forget a panel; the value IS the panel, and the
+// header's three buttons are the only callers.
+on choose_panel(next)
+  panel = next
+
+// Open a run: the app is asked for its journal, which arrives as the next
+// register under this run's id.
+on open_run_row(run_id)
+  open_run = run_id
+  open_row = run_named(runs, run_id)
+  sent = open_run(run_id)
+
+on close_run
+  open_run = ""
+  open_row = empty_run()
+  sent = open_run("")
+
 on pick_capability_option(value)
   draft_capability = some(value)
 
@@ -209,6 +313,53 @@ on submit_save
 on submit_register
   sent = register(draft_id, draft_name, or_empty(draft_capability), draft_actions, caps_with_budget(draft_caps, draft_budget), draft_skills)
 
+// ---- the messaging panel ----------------------------------------------------
+
+// OPEN ONE CONVERSATION, EXPLICITLY. The ids are the reader's own: the network
+// resolves them under the key this device already holds, and a refusal is
+// shown as a refusal. Nothing is scanned and no provider is contacted.
+on submit_open
+  sent = open_conversation(open_participant, open_conversation_id)
+
+// Closing is the same intent with nothing named — the app drops the panel's
+// whole reading rather than leaving a stale one on screen.
+on close_conversation
+  sent = open_conversation("", "")
+
+on pick_message_kind(value)
+  msg_kind = some(value)
+
+on pick_recipient(value)
+  msg_recipient = some(value)
+
+on reply_to_message(seq)
+  msg_reply_to = seq
+
+// `result` exists as a kind only while replying; dropping the reply drops it.
+on clear_reply
+  msg_reply_to = 0
+  msg_kind = pick_option(or_empty(msg_kind) == "result", "notice", msg_kind)
+
+on submit_message
+  draft_network = messaging.network
+  draft_participant = messaging.participant
+  draft_conversation = messaging.conversation
+  sent = send_message(or_empty(msg_kind), or_empty(msg_recipient), msg_body, msg_reply_to)
+
+on page_older
+  sent = page_messages(older_from(messaging.from_seq, messaging.floor_seq, messaging.page_size), false)
+
+on page_newer
+  sent = page_messages(newer_from(messaging.from_seq, messaging.page_size, messaging.next_seq), false)
+
+on page_newest
+  sent = page_messages(0, true)
+
+// A history gap is not a page to skip: resync from the retained floor rather
+// than advancing a cursor past events that no longer exist.
+on resync_history
+  sent = page_messages(messaging.floor_seq, false)
+
 view
   box #root
     with
@@ -232,15 +383,58 @@ view
               size=16.0
               @text-primary
               @font-semibold
-          text agents_summary(connected, rows) #meta
-            with
-              size=12.0
-              @text-hint
-              @font-mono
+          if panel == "registry"
+            text agents_summary(connected, rows) #meta
+              with
+                size=12.0
+                @text-hint
+                @font-mono
+          if panel == "runs"
+            text runs_summary(runs) #runs-meta
+              with
+                size=12.0
+                @text-hint
+                @font-mono
           space w=fill
+          // ONE SCREEN, THREE READINGS OF THE SAME AGENTS: their records
+          // (who may act), their runs (what they did, and how it settled) and
+          // their messages (what was said, and what was delivered). One
+          // selector, mutually exclusive content — a run is a registry entry
+          // in motion, and a message is not a run.
+          //
+          // Disabled rather than hidden on the panel you are on: a hidden row
+          // is a row that is MISSING, and a reader cannot see what the screen
+          // has by looking at what it is not showing.
+          if connected
+            button -> choose_panel("registry")
+              with
+                label="Registry"
+                h=28.0
+                p=5.0
+                disabled=(panel == "registry")
+                @outline_action
+              text "Registry" size=12.0
+          if connected
+            button -> choose_panel("runs")
+              with
+                label="Runs"
+                h=28.0
+                p=5.0
+                disabled=(panel == "runs")
+                @outline_action
+              text "Runs" size=12.0
+          if connected
+            button -> choose_panel("messages")
+              with
+                label="Messages"
+                h=28.0
+                p=5.0
+                disabled=(panel == "messages")
+                @outline_action
+              text "Messages" size=12.0
           // registering needs an account to control the new agent; a device
           // without one is offered nothing rather than a refusal later
-          if connected && !empty(account)
+          if connected && !empty(account) && panel == "registry"
             button -> open_new
               with
                 label="New agent"
@@ -254,15 +448,15 @@ view
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-      // The registry explainer: the model, not a reading, so it stays with
-      // the node down.
+      // The explainer for the pane on screen: the model, not a reading, so it
+      // stays with the node down.
       box
         with
           w=fill
           px=22.0
           pt=12.0
           pb=10.0
-        text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs."
+        text pane_note(panel)
           with
             w=fill
             size=12.0
@@ -310,7 +504,312 @@ view
               with
                 size=12.5
                 @text-caption
-      if connected && empty(rows) && answered && !creating
+      if connected && panel == "runs"
+        row w=fill h=fill
+          if empty(runs)
+            box
+              with
+                w=fill
+                h=fill
+                p=22.0
+              box #no-runs
+                with
+                  w=fill
+                  p=30.0
+                  align-x=center
+                  border=border
+                  border-w=1.0
+                  r=12.0
+                text "No runs yet — every dispatch of an agent lands here with its journal."
+                  with
+                    size=13.0
+                    @text-meta
+          if !empty(runs)
+            scroll #runs-body
+              with
+                dir=vertical
+                w=fill
+                h=fill
+              col
+                with
+                  w=fill
+                  p=18.0
+                  gap=11.0
+                // A run row: who ran, what it answered, where it stands and
+                // how far it got. The row opens its journal; its accessible
+                // name is the run id.
+                for run in runs
+                  col w=fill
+                    button -> open_run_row(run.run_id)
+                      with
+                        label=run.run_id
+                        w=fill
+                        p=0.0
+                      box
+                        with
+                          w=fill
+                          pl=14.0
+                          pr=14.0
+                          pt=11.0
+                          pb=11.0
+                        row
+                          with
+                            w=fill
+                            gap=13.0
+                            align=center
+                          col w=fill gap=3.0
+                            row
+                              with
+                                w=fill
+                                gap=8.0
+                                align=center
+                              text run.agent_name
+                                with
+                                  size=13.5
+                                  @text-fg
+                                  @font-semibold
+                              text run.origin
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            row
+                              with
+                                w=fill
+                                gap=5.0
+                                align=center
+                              text run.dispatched
+                                with
+                                  size=10.5
+                                  @text-hint
+                                  @font-mono
+                              text "·"
+                                with
+                                  size=10.5
+                                  @text-hint
+                                  @font-mono
+                              text run.actions
+                                with
+                                  size=10.5
+                                  @text-meta
+                                  @font-mono
+                                  @font-medium
+                              text "actions"
+                                with
+                                  size=10.5
+                                  @text-meta
+                                  @font-mono
+                                  @font-medium
+                              if !empty(run.holder)
+                                text "· on"
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if !empty(run.holder)
+                                text run.holder
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if run.pr_number > 0
+                                text "· PR #"
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                              if run.pr_number > 0
+                                text run.pr_number
+                                  with
+                                    size=10.5
+                                    @text-hint
+                                    @font-mono
+                          // Standing, in the journal's own words: in flight
+                          // on a warning plate, accepted on a success one,
+                          // refused or failed on a danger one.
+                          if run.state == "dispatched" || run.state == "running"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=warning_bg
+                                border=warning_line
+                                border-w=1.0
+                                r=6.0
+                              row gap=5.0 align=center
+                                box
+                                  with
+                                    w=5.0
+                                    h=5.0
+                                    bg=warning_dot
+                                    r=2.5
+                                  space w=1.0 h=1.0
+                                text run.state
+                                  with
+                                    size=9.0
+                                    @text-warning
+                                    @font-mono
+                                    @font-semibold
+                          if run.state == "accepted"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=success_bg
+                                border=success_line
+                                border-w=1.0
+                                r=6.0
+                              row gap=5.0 align=center
+                                box
+                                  with
+                                    w=5.0
+                                    h=5.0
+                                    bg=success_dot
+                                    r=2.5
+                                  space w=1.0 h=1.0
+                                text run.state
+                                  with
+                                    size=9.0
+                                    @text-success
+                                    @font-mono
+                                    @font-semibold
+                          if run.state == "rejected" || run.state == "failed"
+                            box
+                              with
+                                px=8.0
+                                py=3.0
+                                bg=danger_bg
+                                border=danger_line
+                                border-w=1.0
+                                r=6.0
+                              text run.state
+                                with
+                                  size=9.0
+                                  @text-danger
+                                  @font-mono
+                                  @font-semibold
+                      active bg=bg
+                      hovered bg=row_hover
+                    box
+                      with
+                        w=fill
+                        h=1.0
+                        bg=muted_bg
+                      space w=1.0 h=1.0
+          // THE JOURNAL: the open run's lifecycle, fact by fact, beside the
+          // list. Read-only — a run is history the moment it is written.
+          if !empty(open_run)
+            box #journal
+              with
+                w=400.0
+                h=fill
+                bg=surface
+                border=border
+                border-w=1.0
+              scroll
+                with
+                  dir=vertical
+                  w=fill
+                  h=fill
+                col
+                  with
+                    w=fill
+                    p=18.0
+                    gap=12.0
+                  row
+                    with
+                      w=fill
+                      gap=10.0
+                      align=center
+                    text open_row.agent_name
+                      with
+                        size=14.0
+                        @text-fg
+                        @font-semibold
+                    text open_row.state
+                      with
+                        size=11.0
+                        @text-meta
+                        @font-mono
+                    space w=fill
+                    button -> close_run
+                      with
+                        label="Close journal"
+                        w=24.0
+                        h=24.0
+                        p=0.0
+                      text "×" size=16.0 @text-meta
+                  text open_row.origin
+                    with
+                      w=fill
+                      size=11.0
+                      @text-meta
+                      @font-mono
+                  text open_run
+                    with
+                      w=fill
+                      size=10.0
+                      @text-hint
+                      @font-mono
+                  if !empty(open_row.reason)
+                    box
+                      with
+                        w=fill
+                        px=12.0
+                        py=9.0
+                        bg=danger_bg
+                        border=danger_line
+                        border-w=1.0
+                        r=8.0
+                      text open_row.reason
+                        with
+                          w=fill
+                          size=12.0
+                          @text-danger
+                  if !empty(open_row.output_ref)
+                    text open_row.output_ref
+                      with
+                        w=fill
+                        size=11.0
+                        @text-meta
+                        @font-mono
+                  text "Journal"
+                    with
+                      size=12.5
+                      @text-fg
+                      @font-semibold
+                  if journal.run_id != open_run
+                    text "Reading the journal…"
+                      with
+                        size=12.0
+                        @text-caption
+                  if journal.run_id == open_run && empty(journal.entries)
+                    text "This run's journal has no entries yet — the fold may still be catching up to the chain."
+                      with
+                        w=fill
+                        size=12.0
+                        @text-caption
+                  if journal.run_id == open_run
+                    for entry in journal.entries
+                      row w=fill gap=8.0
+                        text entry.height
+                          with
+                            size=10.5
+                            @text-hint
+                            @font-mono
+                        col w=fill gap=2.0
+                          text entry.kind
+                            with
+                              size=11.0
+                              @text-fg
+                              @font-mono
+                              @font-semibold
+                          text entry.summary
+                            with
+                              w=fill
+                              size=12.0
+                              @text-meta
+      if connected && panel == "registry" && empty(rows) && answered && !creating
         box
           with
             w=fill
@@ -328,7 +827,7 @@ view
               with
                 size=13.0
                 @text-meta
-      if connected && (!empty(rows) || creating)
+      if connected && panel == "registry" && (!empty(rows) || creating)
         row w=fill h=fill
           if !empty(rows)
             scroll #agents-body
@@ -710,8 +1209,12 @@ view
                         w=fill
                         size=11.0
                         @text-caption
+                    // "*" is every action the catalog knows today and every
+                    // one added later; the registry keeps it as the whole
+                    // grant, so the individual ticks read as implied.
+                    checkbox "every action (*)" #action-every checked=has(draft_actions, "*") disabled=!can_edit -> toggle_action("*", _)
                     for action in actions
-                      checkbox action #action(action) checked=has(draft_actions, action) disabled=!can_edit -> toggle_action(action, _)
+                      checkbox action #action(action) checked=(has(draft_actions, action) || has(draft_actions, "*")) disabled=(!can_edit || has(draft_actions, "*")) -> toggle_action(action, _)
                   // Resource caps: exact repos, duckfs prefixes, page ids ("*"
                   // is every page), tool ids, vault refs, and the peer-call
                   // budget.
@@ -1046,3 +1549,510 @@ view
                         p=10.0
                         @primary_action
                       text "Register" size=12.5
+      // THE MESSAGES PANE. A conversation is opened EXPLICITLY, read under
+      // this device's own key, and shown with what the network actually said —
+      // including that it refused. A refusal is never an empty list, and a
+      // delivery state is never dressed up as work.
+      if panel == "messages" && connected
+        scroll #messages-body
+          with
+            dir=vertical
+            w=fill
+            h=fill
+          col
+            with
+              w=fill
+              p=18.0
+              gap=13.0
+            if !empty(messaging.visibility)
+              box #visibility
+                with
+                  w=fill
+                  px=12.0
+                  py=9.0
+                  bg=elevated
+                  r=8.0
+                text messaging.visibility
+                  with
+                    w=fill
+                    size=11.5
+                    @text-caption
+            // OPEN ONE, BY NAME. There is no directory of conversations to
+            // browse: a reader names the participant it acts as and the
+            // conversation it opens, and the network answers for that pair or
+            // refuses it.
+            if empty(messaging.conversation)
+              col #open-form
+                with
+                  w=fill
+                  gap=8.0
+                text "Open a conversation"
+                  with
+                    size=13.0
+                    @text-fg
+                    @font-semibold
+                text "Name the participant you are acting as and the conversation to open. Both are resolved on this network under this device's key — nothing is discovered by scanning, and no provider session is contacted."
+                  with
+                    w=fill
+                    size=11.5
+                    @text-caption
+                input "" #open-participant <-> open_participant
+                  with
+                    label="Acting participant"
+                    hint="the participant id you own…"
+                    w=fill
+                    p=7.0
+                    text-size=13.0
+                    line-h=1.2
+                    @control
+                  active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                  hovered bg=elevated border=fg/21
+                  disabled bg=muted_bg/54 value=muted
+                input "" #open-conversation <-> open_conversation_id
+                  with
+                    label="Conversation"
+                    hint="the conversation id…"
+                    w=fill
+                    p=7.0
+                    text-size=13.0
+                    line-h=1.2
+                    @control
+                  active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                  hovered bg=elevated border=fg/21
+                  disabled bg=muted_bg/54 value=muted
+                button -> submit_open
+                  with
+                    label="Open conversation"
+                    disabled=(empty(trim(open_participant)) || empty(trim(open_conversation_id)) || messaging.loading)
+                    p=9.0
+                    @primary_action
+                  text "Open" size=12.5
+            // WHAT IS OPEN, UNDER WHOSE IDENTITY, ON WHICH NETWORK. The ids
+            // mean nothing without the network: the same name on another chain
+            // is another conversation.
+            if !empty(messaging.conversation)
+              col w=fill gap=5.0
+                row
+                  with
+                    w=fill
+                    gap=9.0
+                    align=center
+                  text messaging.conversation #conversation-id
+                    with
+                      size=14.0
+                      @text-fg
+                      @font-semibold
+                  if !empty(messaging.topic)
+                    text messaging.topic
+                      with
+                        size=12.0
+                        @text-meta
+                  space w=fill
+                  button -> close_conversation
+                    with
+                      label="Close conversation"
+                      w=24.0
+                      h=24.0
+                      p=0.0
+                    text "×" size=16.0 @text-meta
+                row w=fill gap=6.0 align=center
+                  text "as"
+                    with
+                      size=10.5
+                      @text-hint
+                      @font-mono
+                  text messaging.participant
+                    with
+                      size=10.5
+                      @text-fg
+                      @font-mono
+                  text "· network"
+                    with
+                      size=10.5
+                      @text-hint
+                      @font-mono
+                  text messaging.network #network-id
+                    with
+                      size=10.5
+                      @text-hint
+                      @font-mono
+            // A REFUSAL IS SHOWN AS A REFUSAL. Neither of these plates may be
+            // replaced by an empty conversation.
+            if !empty(messaging.denied)
+              box #denied
+                with
+                  w=fill
+                  px=12.0
+                  py=9.0
+                  bg=warning_bg
+                  border=warning_line
+                  border-w=1.0
+                  r=8.0
+                col w=fill gap=3.0
+                  text denied_note(messaging.denied)
+                    with
+                      w=fill
+                      size=12.0
+                      @text-warning
+                  text messaging.denied
+                    with
+                      size=10.0
+                      @text-warning
+                      @font-mono
+            if !empty(messaging.error)
+              box #messaging-error
+                with
+                  w=fill
+                  px=12.0
+                  py=9.0
+                  bg=warning_bg
+                  border=warning_line
+                  border-w=1.0
+                  r=8.0
+                text messaging.error
+                  with
+                    w=fill
+                    size=12.0
+                    @text-danger
+            if messaging.loading
+              text "Reading…" #loading size=11.5 @text-hint
+            // WHO IS ON IT, WHAT THIS DEVICE HOLDS, AND WHAT IS QUEUED.
+            if !empty(messaging.conversation) && messaging.may_read
+              col w=fill gap=6.0
+                text "Participants"
+                  with
+                    size=12.5
+                    @text-fg
+                    @font-semibold
+                for seat in messaging.roster
+                  row w=fill gap=6.0 align=center
+                    text seat.participant
+                      with
+                        size=12.0
+                        @text-fg
+                        @font-mono
+                    text seat_role(seat.role)
+                      with
+                        size=10.5
+                        @text-hint
+                        @font-mono
+                    if seat.you
+                      text "you"
+                        with
+                          size=10.0
+                          @text-secondary_fg
+                          @font-mono
+                          @font-semibold
+                text binding_note(messaging.binding) #binding-note
+                  with
+                    w=fill
+                    size=11.5
+                    @text-caption
+                text mailbox_note(messaging.undelivered, messaging.queued_bytes) #mailbox-note
+                  with
+                    size=11.0
+                    @text-hint
+                    @font-mono
+            // A GAP IS A GAP. The cursor fell below the retained floor, so the
+            // only honest move is to resync from the floor — never to advance
+            // past events that no longer exist.
+            if messaging.history_gap
+              box #history-gap
+                with
+                  w=fill
+                  px=12.0
+                  py=9.0
+                  bg=warning_bg
+                  border=warning_line
+                  border-w=1.0
+                  r=8.0
+                col w=fill gap=6.0
+                  text "This conversation was pruned past the page you asked for. Older events no longer exist; resync from the retained floor."
+                    with
+                      w=fill
+                      size=12.0
+                      @text-warning
+                  button -> resync_history
+                    with
+                      label="Resync from the retained floor"
+                      h=26.0
+                      p=5.0
+                      @outline_action
+                    text "Resync" size=11.5
+            // THE PAGE, SAID OUT LOUD: what is on screen against the
+            // conversation's own tip, so a tail is never hidden in silence.
+            if !empty(messaging.conversation) && messaging.may_read && !messaging.history_gap
+              col w=fill gap=8.0
+                row w=fill gap=6.0 align=center
+                  text page_note(messaging.messages, messaging.from_seq, messaging.next_seq) #page-note
+                    with
+                      size=11.0
+                      @text-hint
+                      @font-mono
+                  space w=fill
+                  if messaging.more_before
+                    button -> page_older
+                      with
+                        label="Older messages"
+                        h=26.0
+                        p=5.0
+                        @outline_action
+                      text "Older" size=11.5
+                  if messaging.more_after
+                    button -> page_newer
+                      with
+                        label="Newer messages"
+                        h=26.0
+                        p=5.0
+                        @outline_action
+                      text "Newer" size=11.5
+                  button -> page_newest
+                    with
+                      label="Newest messages"
+                      h=26.0
+                      p=5.0
+                      @outline_action
+                    text "Newest" size=11.5
+                if empty(messaging.messages) && messaging.answered
+                  box #no-messages
+                    with
+                      w=fill
+                      p=22.0
+                      align-x=center
+                      border=border
+                      border-w=1.0
+                      r=10.0
+                    text "No messages in the retained range this page covers."
+                      with
+                        size=12.5
+                        @text-meta
+                for message in messaging.messages
+                  col
+                    with
+                      w=fill
+                      gap=5.0
+                      px=13.0
+                      py=11.0
+                    row w=fill gap=7.0 align=center
+                      text message.sender
+                        with
+                          size=12.5
+                          @text-fg
+                          @font-semibold
+                      text "→"
+                        with
+                          size=11.0
+                          @text-hint
+                      text message.recipient
+                        with
+                          size=12.0
+                          @text-meta
+                          @font-mono
+                      box
+                        with
+                          px=7.0
+                          py=2.0
+                          bg=elevated
+                          r=5.0
+                        text kind_label(message.kind)
+                          with
+                            size=10.0
+                            @text-secondary_fg
+                            @font-mono
+                            @font-semibold
+                      space w=fill
+                      text message.seq
+                        with
+                          size=10.0
+                          @text-hint
+                          @font-mono
+                    // DELIVERY, AND WHAT IT DOES NOT MEAN. The chip is the
+                    // committed state; the sentence beside it is the limit.
+                    row w=fill gap=6.0 align=center
+                      if !delivery_unsettled(message.delivery)
+                        box
+                          with
+                            px=8.0
+                            py=3.0
+                            bg=success_bg
+                            border=success_line
+                            border-w=1.0
+                            r=6.0
+                          text delivery_label(message.delivery)
+                            with
+                              size=9.0
+                              @text-success
+                              @font-mono
+                              @font-semibold
+                      if delivery_unsettled(message.delivery)
+                        box
+                          with
+                            px=8.0
+                            py=3.0
+                            bg=warning_bg
+                            border=warning_line
+                            border-w=1.0
+                            r=6.0
+                          text delivery_label(message.delivery)
+                            with
+                              size=9.0
+                              @text-warning
+                              @font-mono
+                              @font-semibold
+                      if !empty(message.delivery_reason)
+                        text message.delivery_reason
+                          with
+                            size=10.0
+                            @text-hint
+                            @font-mono
+                    text delivery_note(message.delivery)
+                      with
+                        w=fill
+                        size=10.5
+                        @text-caption
+                    text message.body
+                      with
+                        w=fill
+                        size=12.5
+                        @text-fg
+                    if !empty(body_note(message.body_bytes, message.shown_bytes))
+                      text body_note(message.body_bytes, message.shown_bytes)
+                        with
+                          size=10.0
+                          @text-hint
+                          @font-mono
+                    if !empty(message.references)
+                      text message.references
+                        with
+                          w=fill
+                          size=10.5
+                          @text-hint
+                          @font-mono
+                    if !empty(message.task)
+                      text task_note(message.task, message.task_attempt)
+                        with
+                          w=fill
+                          size=10.5
+                          @text-warning
+                          @font-mono
+                    // THE ONLY LINK FROM A MESSAGE TO AN EXECUTION STATUS, and
+                    // it exists only when the runs journal on this same screen
+                    // actually lists that id. A task id is not a run id; where
+                    // the two do not meet, the line above stands and nothing
+                    // here is offered.
+                    if !empty(run_for_task(runs, message.task))
+                      button -> open_run_row(run_for_task(runs, message.task))
+                        with
+                          label=run_link_note(runs, message.task)
+                          h=22.0
+                          p=4.0
+                          @outline_action
+                        text run_link_note(runs, message.task) size=10.5
+                    if message.reply_to > 0
+                      text reply_note(message.reply_to)
+                        with
+                          size=10.0
+                          @text-hint
+                          @font-mono
+                    if messaging.may_send
+                      row w=fill gap=6.0 align=center
+                        space w=fill
+                        button -> reply_to_message(message.seq)
+                          with
+                            label="Reply to this message"
+                            h=24.0
+                            p=4.0
+                            @outline_action
+                          text "Reply" size=11.0
+                  box
+                    with
+                      w=fill
+                      h=1.0
+                      bg=muted_bg
+                    space w=1.0 h=1.0
+            // THE COMPOSER. One recipient per send — group delivery is
+            // per-recipient messages under the same conversation. An observer
+            // sees this pane and is told why it cannot send.
+            if !empty(messaging.conversation) && messaging.may_read && !messaging.may_send
+              text "You hold an observer seat on this conversation: you receive it and do not send on it."
+                with
+                  w=fill
+                  size=11.5
+                  @text-caption
+            if !empty(messaging.conversation) && messaging.may_send
+              col #composer
+                with
+                  w=fill
+                  gap=7.0
+                text "Send"
+                  with
+                    size=12.5
+                    @text-fg
+                    @font-semibold
+                text "A task update names a task and the attempt it addresses, which an attached service holds and this panel does not — compose one from the service."
+                  with
+                    w=fill
+                    size=11.0
+                    @text-caption
+                row w=fill gap=6.0 align=center
+                  pick recipients(messaging.roster) msg_recipient #recipient -> pick_recipient _
+                    with
+                      hint="recipient…"
+                      w=fill
+                  pick compose_kinds(msg_reply_to) msg_kind #kind -> pick_message_kind _
+                    with
+                      hint="kind"
+                      w=150.0
+                if msg_reply_to > 0
+                  row w=fill gap=6.0 align=center
+                    text reply_note(msg_reply_to)
+                      with
+                        size=11.0
+                        @text-hint
+                        @font-mono
+                    space w=fill
+                    button -> clear_reply
+                      with
+                        label="Clear the reply target"
+                        h=24.0
+                        p=4.0
+                        @outline_action
+                      text "Clear reply" size=11.0
+                input "" #message-body <-> msg_body
+                  with
+                    label="Message body"
+                    hint="what to send…"
+                    disabled=messaging.sending
+                    w=fill
+                    p=8.0
+                    text-size=13.0
+                    line-h=1.3
+                    @control
+                  active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                  hovered bg=elevated border=fg/21
+                  disabled bg=muted_bg/54 value=muted
+                // OVERSIZED INPUT IS REFUSED BEFORE ADMISSION, never truncated
+                // into a message the sender did not write.
+                if !empty(body_refusal(msg_body, messaging.max_body_bytes))
+                  text body_refusal(msg_body, messaging.max_body_bytes) #body-refusal
+                    with
+                      w=fill
+                      size=11.0
+                      @text-danger
+                // A FAILED OR STALE SEND KEEPS THE DRAFT. Nothing is appended
+                // to the list on the way out — a message appears when the
+                // network says it was admitted.
+                if !empty(messaging.send_error)
+                  text messaging.send_error #send-error
+                    with
+                      w=fill
+                      size=11.5
+                      @text-danger
+                button -> submit_message
+                  with
+                    label="Send message"
+                    disabled=(!send_ready(messaging.may_send, messaging.sending, msg_recipient, msg_kind, msg_body, messaging.max_body_bytes))
+                    w=fill
+                    p=10.0
+                    @primary_action
+                  text "Send" size=12.5

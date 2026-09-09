@@ -168,6 +168,7 @@ async fn seed_page(p: &mut Pages, page: &str) {
         &PageMsg::CreatePage {
             page_id: page.into(),
             title: format!("{page} title"),
+            blocks: Vec::new(),
         },
     )
     .await;

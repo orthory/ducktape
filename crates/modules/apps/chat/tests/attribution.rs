@@ -337,6 +337,7 @@ fn pages_text_and_comment_edits_remove_mentions_and_subtree_purge_retires_relati
             PageMsg::CreatePage {
                 page_id: "p".into(),
                 title: "Program's page".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -439,6 +440,7 @@ fn pages_text_and_comment_edits_remove_mentions_and_subtree_purge_retires_relati
             PageMsg::CreatePage {
                 page_id: "p".into(),
                 title: "Recreated".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -467,6 +469,7 @@ fn a_local_page_rejection_preserves_previous_staging_without_abort() {
                     &PageMsg::CreatePage {
                         page_id: "kept".into(),
                         title: "Kept".into(),
+                        blocks: Vec::new(),
                     },
                 ),
             )
@@ -480,7 +483,8 @@ fn a_local_page_rejection_preserves_previous_staging_without_abort() {
                         "pages",
                         &PageMsg::CreatePage {
                             page_id: "bad".into(),
-                            title: "x".repeat(pages::MAX_PAGE_TITLE_LEN + 1)
+                            title: "x".repeat(pages::MAX_PAGE_TITLE_LEN + 1),
+                            blocks: Vec::new(),
                         }
                     )
                 )
@@ -551,6 +555,7 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
             PageMsg::CreatePage {
                 page_id: "key-page".into(),
                 title: "Before".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -883,6 +888,7 @@ fn account_membership_changes_do_not_transfer_historic_key_ownership() {
                     &PageMsg::CreatePage {
                         page_id: "key".into(),
                         title: "Before".into(),
+                        blocks: Vec::new(),
                     },
                 ),
             )
@@ -1182,6 +1188,7 @@ fn attribution_batches_retire_more_than_the_host_dispatch_limit_of_sources() {
             PageMsg::CreatePage {
                 page_id: "wide".into(),
                 title: "Wide page".into(),
+                blocks: Vec::new(),
             },
         )
         .await;

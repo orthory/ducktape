@@ -203,11 +203,23 @@ impl RunsModule {
                 admission: dispatch::AdmissionPolicy::Queue,
             }),
         });
+        let generation = self.active_generation(&*ctx, agent.account).await?;
+        self.record(
+            &run_id,
+            crate::RunFact::Dispatched {
+                agent_id: agent_id.to_string(),
+                channel_id: String::new(),
+                anchor_seq: 0,
+                job_id: Some(job_id.clone()),
+                delegation_id: None,
+                requester: requester.clone(),
+            },
+        );
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
                 account: agent.account,
-                generation: self.active_generation(&*ctx, agent.account).await?,
+                generation,
                 cause: ctx.env().cause.clone(),
                 run_id: run_id.clone(),
                 workspace_agent_id: agent_id.to_string(),

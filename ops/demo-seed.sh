@@ -298,15 +298,16 @@ MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\
   if(matches.length!==1) throw new Error(`expected exactly one ${process.argv[1]} program account`);
   process.stdout.write(String(matches[0].number));
 ' "$AGENT_NAME") || die "cannot resolve the model account"
-# The grant is the whole vocabulary: every action the runs module knows, forge
-# read and push on the playground repo seeded below and on the dogfood mirror
-# `make dev` pushes (`ops/dogfood-forge.sh`, repo `ducktape`), every page, and
-# the shared skill library its persona is read from.
+# The grant is everything: every action the runs module knows now or later
+# ("*"), forge read and push on every repository (the playground seeded below,
+# the dogfood mirror `make dev` pushes — `ops/dogfood-forge.sh`, repo
+# `ducktape` — and any registered after), every page, and the whole of duckfs.
+# Narrowing it is a registry edit in the Agents tab, not a re-seed.
 PLAYGROUND="playground"
 REGISTER=$(bun -e 'process.stdout.write(JSON.stringify({configure_model:{operation:{register_model:{
   account:Number(process.argv[1]),agent_id:process.argv[2],display_name:process.argv[3],capability:"claude",
-  allowed_actions:["chat.post","chat.post_message","jobs.comment","tasks.create","tasks.update_status","pages.comment","pages.set_checked","duckfs.write_text","modules.update"],
-  caps:{forge_read:["ducktape",process.argv[4]],forge_push:["ducktape",process.argv[4]],pages_write:["*"],duckfs_read:["/shared/skills"]},
+  allowed_actions:["*"],
+  caps:{forge_read:["*"],forge_push:["*"],pages_write:["*"],duckfs_read:["/"],duckfs_write:["/"]},
   skills:[{name:process.argv[2],source_prefix:`/shared/skills/${process.argv[2]}`,load:"always"}]
 }}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME" "$PLAYGROUND") || die "invalid registration"
 submit runs "$REGISTER"

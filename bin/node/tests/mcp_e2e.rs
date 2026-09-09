@@ -22,15 +22,9 @@ use commonware_cryptography::Signer as _;
 use serde_json::json;
 use support::{AGENT_ID, Harness, OWNER, content, payload};
 
-/// every action the registry knows — the "fully trusted agent" grant.
-const ALL_ACTIONS: &[&str] = &[
-    "chat.post",
-    "chat.post_message",
-    "tasks.create",
-    "tasks.update_status",
-    "pages.comment",
-    "pages.set_checked",
-];
+/// every action the registry knows — the "fully trusted agent" grant, spelled
+/// out so `whoami` lists each one by name.
+const ALL_ACTIONS: &[&str] = &runs::KNOWN_ACTIONS;
 
 #[test]
 fn whoami_reports_the_committed_grant() {
@@ -341,7 +335,11 @@ fn an_ungated_read_reaches_the_module() {
     // chat/tasks/pages carry no read cap in the caps vocabulary, so reads of
     // them are ungated — inventing a gate the registry cannot express would be
     // a permission nobody could grant.
-    let listed = payload(&h.call(h.mcp(), "ducktape_query", json!({"operation": "tasks.list"})));
+    let listed = payload(&h.call(
+        h.mcp(),
+        "ducktape_query",
+        json!({"operation": "tasks.list"}),
+    ));
     assert_eq!(listed["task"]["tasks"][0]["id"], "seeded");
     assert_eq!(listed["task"]["tasks"][0]["title"], "from the test");
 }
@@ -415,11 +413,7 @@ fn the_catalog_reaches_the_model_from_consensus_with_its_schemas() {
     // nothing about an operation's shape is spelled out in this binary: the
     // catalog the model reads is the runs module's own, fetched per call, with
     // the read table this server serves beside it.
-    let listed = payload(&h.call(
-        h.mcp(),
-        "ducktape_actions",
-        json!({"filter": "tasks."}),
-    ));
+    let listed = payload(&h.call(h.mcp(), "ducktape_actions", json!({"filter": "tasks."})));
     let operations = listed["operations"].as_array().expect("operations");
     let names: Vec<&str> = operations
         .iter()
@@ -441,7 +435,11 @@ fn the_catalog_reaches_the_model_from_consensus_with_its_schemas() {
         json!(["open", "in_progress", "done"])
     );
     assert_eq!(status["target"]["required"], json!(["task_id"]));
-    assert!(status["schema_digest"].as_str().is_some_and(|d| d.len() == 64));
+    assert!(
+        status["schema_digest"]
+            .as_str()
+            .is_some_and(|d| d.len() == 64)
+    );
     let list = operations
         .iter()
         .find(|op| op["name"] == "tasks.list")

@@ -32,6 +32,11 @@ agent.workspace = true
 # picker: which peers can actually run an agent.
 capability.workspace = true
 chat.workspace = true
+# the collaboration module's WIRE SURFACE — the messages pane speaks its types
+# (`SendRequest`, `Message`, `ProtectedRead`) rather than keeping a second copy
+# of them here to drift. Types only: the module's own consensus port is behind
+# its `guest` feature and never enters this binary.
+collaboration.workspace = true
 # the huddle media planes: the call-socket framing and voice/video wire.
 media-service.workspace = true
 design.workspace = true

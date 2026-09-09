@@ -1164,6 +1164,83 @@ fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
     }
 }
 
+/// THE ACKNOWLEDGEMENT: a live reaction lands on the anchor message under
+/// the reply grant alone, its removal is the mirror op, and the receipt
+/// names the message it marked.
+#[test]
+fn live_reactions_mark_the_anchor_message_with_only_the_reply_grant() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    exec(&mut m, &mut ctx, &act_as(&run, "ack", react("👀"))).unwrap();
+    assert_eq!(
+        ctx.chat_msgs(),
+        vec![ChatMsg::AddReaction {
+            channel_id: "general".into(),
+            seq: 2,
+            emoji: "👀".into(),
+        }]
+    );
+    commit(&mut m);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    exec(&mut m, &mut ctx, &act_as(&run, "done", unreact("👀"))).unwrap();
+    assert_eq!(
+        ctx.chat_msgs(),
+        vec![ChatMsg::RemoveReaction {
+            channel_id: "general".into(),
+            seq: 2,
+            emoji: "👀".into(),
+        }]
+    );
+    commit(&mut m);
+    let receipt = block_on(m.action_request(&crate::action_request_id(&run, "ack")))
+        .unwrap()
+        .expect("receipt");
+    assert_eq!(receipt.view.operation, crate::OP_REACT);
+    assert_eq!(
+        receipt.view.result,
+        serde_json::json!({"channel_id": "general", "seq": 2, "emoji": "👀"})
+    );
+    assert_eq!(sessions(&m)[0].actions, 2);
+}
+
+#[test]
+fn a_reaction_needs_the_reply_grant_a_chat_source_and_a_bounded_emoji() {
+    for (grants, emoji, expected) in [
+        (
+            vec![ACTION_CHAT_POST_MESSAGE],
+            "👀",
+            "not allowed to chat.post",
+        ),
+        (vec![ACTION_CHAT_POST], "", "requires an emoji"),
+        (
+            vec![ACTION_CHAT_POST],
+            "🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆🦆",
+            "chat's cap",
+        ),
+    ] {
+        let (mut m, registry, run) = with_open_session(&grants, &[]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(&mut m, &mut ctx, &act(&run, react(emoji))).unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains(expected)),
+            "{error:?}"
+        );
+        assert_eq!(sessions(&m)[0].actions, 0);
+    }
+    {
+        let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+        let entry = m.pending.get_mut(&dispatch_id_for(&run)).unwrap();
+        entry.channel_id.clear();
+        entry.anchor_seq = 0;
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(&mut m, &mut ctx, &act(&run, react("👀"))).unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains("no reply destination")),
+            "{error:?}"
+        );
+    }
+}
+
 #[test]
 fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
     for (grants, text, expected) in [
@@ -1473,4 +1550,130 @@ fn a_callee_result_cannot_stage_a_module_update() {
     ))
     .unwrap_err();
     assert!(reason.contains("run's own final response"), "{reason}");
+}
+
+/// A live page post mints its page under the session's action slot and the
+/// receipt names it, so the agent can link the page it just published.
+#[test]
+fn a_live_page_post_mints_its_page_under_the_action_slot() {
+    let (mut m, registry, run) =
+        with_open_session(&[ACTION_CHAT_POST, crate::ACTION_PAGES_POST], &["*"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    let content = serde_json::json!([{"type": "text", "text": "notes"}]);
+    exec(
+        &mut m,
+        &mut ctx,
+        &act_as(&run, "pub", page_post("Notes", content)),
+    )
+    .unwrap();
+    let page_id = format!("agent/{}/page/s0", dispatch_id_for(&run));
+    let msgs = ctx.page_msgs();
+    assert!(
+        matches!(&msgs[..], [PageMsg::CreatePage { page_id: id, title, blocks }] if *id == page_id && title == "Notes" && blocks.len() == 1),
+        "{msgs:?}"
+    );
+    commit(&mut m);
+    let receipt = block_on(m.action_request(&crate::action_request_id(&run, "pub")))
+        .unwrap()
+        .expect("receipt");
+    assert_eq!(receipt.view.operation, crate::ACTION_PAGES_POST);
+    assert_eq!(
+        receipt.view.result,
+        serde_json::json!({"page_id": page_id, "title": "Notes"})
+    );
+    // without the every-page entry no page id can be granted ahead of time.
+    let (mut m, registry, run) =
+        with_open_session(&[ACTION_CHAT_POST, crate::ACTION_PAGES_POST], &["p1"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    let content = serde_json::json!([{"type": "text", "text": "notes"}]);
+    let error = exec(&mut m, &mut ctx, &act(&run, page_post("Notes", content))).unwrap_err();
+    assert!(
+        matches!(error, Error::Module(ref reason) if reason.contains("lacks pages_write for agent/")),
+        "{error:?}"
+    );
+}
+
+// ---- the run journal ------------------------------------------------------------
+
+#[test]
+fn every_lifecycle_op_stamps_the_facts_it_committed_and_nothing_else() {
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let mut m = configured(&registry);
+    let ctx = request_post(&mut m, &registry, 2, &[]);
+    let run = run_id_for("general", 2, "bot");
+    assert_eq!(
+        ctx.journal(),
+        vec![RunEvent {
+            run_id: run.clone(),
+            fact: RunFact::Dispatched {
+                agent_id: "bot".into(),
+                channel_id: "general".into(),
+                anchor_seq: 2,
+                job_id: None,
+                delegation_id: None,
+                requester: Origin::Program(registry["bot"].account),
+            },
+        }]
+    );
+    commit(&mut m);
+
+    let mut ctx = session_ctx(&registry, &run, Origin::External(ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).unwrap();
+    assert_eq!(
+        ctx.journal(),
+        vec![RunEvent {
+            run_id: run.clone(),
+            fact: RunFact::SessionOpened {
+                attempt: 0,
+                holder: crate::hex(&ASSIGNEE),
+            },
+        }]
+    );
+    commit(&mut m);
+    // the idempotent re-open moves nothing, so it stamps nothing
+    let mut ctx = session_ctx(&registry, &run, Origin::External(ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).unwrap();
+    assert!(ctx.journal().is_empty());
+
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    exec(&mut m, &mut ctx, &act_as(&run, "ack", react("👀"))).unwrap();
+    assert_eq!(
+        ctx.journal(),
+        vec![RunEvent {
+            run_id: run.clone(),
+            fact: RunFact::Acted {
+                request_id: crate::action_request_id(&run, "ack"),
+                operation: crate::OP_REACT.into(),
+            },
+        }]
+    );
+    commit(&mut m);
+
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run, Err("worker  exploded".into())),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.journal(),
+        vec![RunEvent {
+            run_id: run.clone(),
+            fact: RunFact::Settled {
+                outcome: RunOutcome::Failed,
+                reason: Some("worker exploded".into()),
+                degraded: false,
+                executing_node: "unknown".into(),
+                output_ref: None,
+                pr_number: None,
+            },
+        }]
+    );
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
 }

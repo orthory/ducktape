@@ -119,11 +119,19 @@ pub struct NewBlock {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageMsg {
-    /// create a top-level page block. Subpages use `InsertBlock` with kind
-    /// `Page`, so their position is part of the containing document tree.
-    /// Idempotent: re-creating an existing page is a benign no-op that does
-    /// not clobber its title or position.
-    CreatePage { page_id: String, title: String },
+    /// create a top-level page block carrying its initial body: `blocks` are
+    /// its top-level children in document order, staged in the same op so a
+    /// page with content exists whole or not at all. Subpages use
+    /// `InsertBlock` with kind `Page` (or a `Page` block here), so their
+    /// position is part of the containing document tree. Idempotent:
+    /// re-creating an existing page is a benign no-op that does not clobber
+    /// its title, body, or position.
+    CreatePage {
+        page_id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocks: Vec<NewBlock>,
+    },
     /// insert `block` under `parent` after the given sibling anchor (see the
     /// `after` rule). the parent may be a page block or any content block — nesting
     /// is what makes toggles, indentation, and inline subpages work.
@@ -406,6 +414,10 @@ pub enum PageQuery {
     /// the target's thread-index record, deliberately NOT the thread views
     /// (those are the index guest's `threads_for_targets`).
     TargetThreadCount { target: String },
+    /// how many pages the enumeration index holds — the [`MAX_PAGES`] cap
+    /// probe a module staging a `CreatePage` follow-up runs, so a refused
+    /// create never aborts the block that carries it.
+    PageCount,
 }
 
 /// One bounded slice of a page's preorder block traversal.
@@ -426,6 +438,7 @@ pub enum PageReply {
     CommentThreadHead(Option<CommentThreadHead>),
     Comment(Option<Comment>),
     TargetThreadCount(u64),
+    PageCount(u64),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {
@@ -450,6 +463,7 @@ mod interface_tests {
         let m = PageMsg::CreatePage {
             page_id: "p1".into(),
             title: "root".into(),
+            blocks: Vec::new(),
         };
         let round: PageMsg = decode_msg(&encode_msg(&m)).unwrap();
         assert_eq!(round, m);
