@@ -214,21 +214,39 @@ impl ClaudeInbox {
         // registered BEFORE the write: a verdict can come back the moment the
         // recipient reads the line, and a waiter installed afterwards would
         // race it and read silence.
-        let verdict = match &self.receipts {
-            Some(receipts) => Some(receipts.expect(&correlation)),
-            None => None,
-        };
+        let verdict = self
+            .receipts
+            .as_ref()
+            .map(|receipts| receipts.expect(&correlation));
         let reply_to = self
             .receipts
             .as_ref()
             .map(|receipts| format!("uds:{}", receipts.address().display()));
         let frames = self.frames(offer, &correlation, reply_to.as_deref());
 
-        match write_frames(&self.attached.socket, &frames).await {
+        let outcome = self.write_and_wait(&frames, verdict).await;
+        // the waiter went in before the write, so every path that did not
+        // consume it has to take it back out. A verdict that never arrives —
+        // the session refused the auth line, the socket was gone, the window
+        // passed — otherwise leaves its sender in the map for the life of the
+        // process, and that map only ever grows.
+        if let Some(receipts) = &self.receipts {
+            receipts.forget(&correlation);
+        }
+        outcome
+    }
+
+    /// write the frames, then wait for whatever the recipient says about them.
+    async fn write_and_wait(
+        &self,
+        frames: &[String],
+        verdict: Option<tokio::sync::oneshot::Receiver<Status>>,
+    ) -> Outcome {
+        match write_frames(&self.attached.socket, frames).await {
             // a socket that is not there is a session that is not running. The
             // item stays queued: a closed session is never silently recreated,
             // and a replacement would not be the session anyone attached.
-            Err(WriteFailed::Unreachable) => Outcome::NotAttached {
+            Err(WriteFailed::Unreachable) => Outcome::Deferred {
                 reason: "inbox_unreachable".to_string(),
             },
             // the recipient destroys the connection on a bad auth line, which
@@ -236,7 +254,7 @@ impl ClaudeInbox {
             Err(WriteFailed::Rejected) => Outcome::Refused {
                 reason: "auth_rejected".to_string(),
             },
-            Err(WriteFailed::Io) => Outcome::NotAttached {
+            Err(WriteFailed::Io) => Outcome::Deferred {
                 reason: "inbox_write_failed".to_string(),
             },
             Ok(()) => match verdict {
@@ -494,6 +512,19 @@ impl Receipts {
         rx
     }
 
+    /// stop waiting for one message's verdict.
+    ///
+    /// The counterpart to [`Receipts::expect`], for every path that registers a
+    /// waiter and then never gets a verdict: a refused connection, a session
+    /// that was not there, a window that passed. Without it each of those
+    /// leaves a sender behind, and nothing else ever drains this map.
+    fn forget(&self, correlation: &str) {
+        self.waiting
+            .lock()
+            .expect("receipt waiters lock poisoned")
+            .remove(correlation);
+    }
+
     /// hand a verdict to whoever is waiting for it.
     ///
     /// A verdict nobody awaits is DROPPED with a debug line rather than
@@ -687,7 +718,7 @@ mod tests {
                 Outcome::Refused { .. } => "refused",
                 Outcome::Expired { .. } => "expired",
                 Outcome::Unknown { .. } => "unknown",
-                Outcome::NotAttached { .. } => "not_attached",
+                Outcome::Deferred { .. } => "not_attached",
             };
             assert_eq!(got, expected, "{status:?} must map to {expected}");
         }
@@ -870,7 +901,7 @@ mod tests {
             None,
         );
         let outcome = inbox.offer(&an_offer("hello")).await;
-        let Outcome::NotAttached { reason } = outcome else {
+        let Outcome::Deferred { reason } = outcome else {
             panic!("a closed session must not settle, got {outcome:?}");
         };
         assert_eq!(reason, "inbox_unreachable");
@@ -883,6 +914,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ducktape-receipts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let receipts = Receipts::bind(&dir).await.expect("binds");
+        // the peer below is this process, and a verdict is only read from a
+        // process a BINDING named. Without this the connection is dropped on
+        // the credential check and the waiter below never resolves at all.
+        receipts.trust(std::process::id());
         let waiter = receipts.expect("2.1");
 
         let mut peer = tokio::net::UnixStream::connect(receipts.address())
@@ -902,5 +937,50 @@ mod tests {
         // synchronized on the verdict arriving, not on a sleep.
         assert_eq!(waiter.await.expect("a verdict arrives"), Status::Held);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A verdict is only read from a process a BINDING named. One from anywhere
+    /// else is dropped — and dropping it must be an EVENT, not a silence: a
+    /// waiter left in the map forever is how the connection check turned into a
+    /// test that hung instead of failing.
+    #[tokio::test]
+    async fn a_verdict_from_a_process_no_binding_names_is_dropped() {
+        let receipts = Receipts {
+            address: PathBuf::from("/tmp/ducktape-unused.sock"),
+            waiting: std::sync::Mutex::new(std::collections::HashMap::new()),
+            trusted_pids: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+        let waiter = receipts.expect("2.1");
+
+        // both ends are this process, and no binding has named it.
+        let (mut peer, ours) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let frame = serde_json::json!({
+            "type": "control",
+            "action": "peer_message_status",
+            "status": "delivered",
+            "orig_msg_id": "2.1",
+        });
+        peer.write_all(format!("{frame}\n").as_bytes())
+            .await
+            .expect("writes");
+        peer.flush().await.expect("flushes");
+
+        // `serve` returns once it has decided, so this is the decision itself
+        // rather than a wait for one.
+        receipts.serve(ours).await;
+        assert!(
+            receipts
+                .waiting
+                .lock()
+                .expect("lock")
+                .contains_key("2.1"),
+            "an untrusted verdict must not resolve a waiter"
+        );
+
+        // and the offer path takes its own waiter back, so a verdict that never
+        // comes does not leave a sender behind for the life of the process.
+        receipts.forget("2.1");
+        assert!(receipts.waiting.lock().expect("lock").is_empty());
+        drop(waiter);
     }
 }

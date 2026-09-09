@@ -71,7 +71,12 @@ pub enum Command {
     },
     /// place one immutable, already-admitted message into a bound session.
     /// Answered by one or more [`Event::MsgDelivery`] frames.
-    MsgDeliver(Deliver),
+    ///
+    /// Boxed: a `Deliver` carries a body, and an enum is as large as its
+    /// largest variant everywhere it goes — on the link's lane, in the
+    /// `Result` [`crate::messaging::route`] returns, and in every `TermInput`
+    /// that shares this type.
+    MsgDeliver(Box<Deliver>),
     /// the agreed network clock has advanced to `network_now`.
     ///
     /// A daemon owns no clock — deliberately, because expiry is a network fact
@@ -81,6 +86,17 @@ pub enum Command {
     /// offline provider for a day would still look fresh. The node pushes the
     /// agreed value as it advances, and the daemon takes the larger of the two.
     MsgTime { network_now: u64 },
+    /// a conversation's retention floor has advanced: the network no longer
+    /// retains anything below `floor_seq`, so this daemon need not either.
+    ///
+    /// The daemon's dedup record is the only thing standing between a retry
+    /// and a duplicated instruction, so it is never pruned on a local
+    /// heuristic — not by age, not by count. It is pruned only where the
+    /// NETWORK has already stopped retaining the message, because below that
+    /// line a replay cannot be admitted upstream in the first place. This
+    /// field is the module's `Conversation::floor_seq`, and it is what turns a
+    /// bounded tracking table from a permanent refusal into a working one.
+    MsgRetain { conversation: String, floor_seq: u64 },
 }
 
 /// everything the daemon needs to spawn one session. The node has already
@@ -242,13 +258,26 @@ pub struct TaskRef {
     pub expected_attempt: u64,
 }
 
-/// an immutable reference a message points at. A local filesystem path is not
-/// a portable artifact reference and never appears here.
+/// one reference a message carries: the collaboration module's CLOSED set,
+/// decoded here rather than translated.
+///
+/// A `{kind, value}` pair would re-open at this hop exactly what the module
+/// closed at admission — `file:///tmp/private`, a mutable branch name, and
+/// every scheme nobody thought of — because this is the last decoder before a
+/// body is written into somebody's session. There is no arm for those, so the
+/// class is unreachable instead of filtered, and a frame carrying one fails to
+/// decode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Reference {
-    pub kind: String,
-    pub value: String,
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Reference {
+    /// a Forge commit by its immutable object id. A branch or tag name moves,
+    /// so it is not a reference and has no arm.
+    Commit { repo: String, commit: String },
+    /// content-addressed bytes, by lowercase hex sha256.
+    Blob { hash: String },
+    /// a scoped `duck://` link. Relaying one grants the recipient nothing: it
+    /// fetches under its own authority or not at all.
+    Duck { url: String },
 }
 
 /// one recipient's delivery state, exactly the collaboration module's
@@ -584,9 +613,9 @@ mod tests {
             }),
             reply_to: Some(5),
             body: "does the review cover the migration?".into(),
-            references: vec![Reference {
-                kind: "commit".into(),
-                value: "deadbeef".into(),
+            references: vec![Reference::Commit {
+                repo: "ducktape".into(),
+                commit: "deadbeef".into(),
             }],
             expires_at: 1_200,
             network_now: 1_000,
@@ -608,7 +637,12 @@ mod tests {
                 participant: "p-recipient".into(),
                 generation: 3,
             },
-            Command::MsgDeliver(a_deliver()),
+            Command::MsgDeliver(Box::new(a_deliver())),
+            Command::MsgTime { network_now: 1_000 },
+            Command::MsgRetain {
+                conversation: "conv-1".into(),
+                floor_seq: 12,
+            },
         ] {
             let text = serde_json::to_string(&command).expect("encodes");
             assert_eq!(serde_json::from_str::<Command>(&text).unwrap(), command);
@@ -672,15 +706,18 @@ mod tests {
         }))
         .expect("encodes");
         let fields: serde_json::Value = serde_json::from_str(&text).expect("decodes as json");
-        let keys: Vec<&str> = fields
+        // sorted, because what is under test is WHICH fields exist and not the
+        // order serde_json happens to hold them in.
+        let mut keys: Vec<&str> = fields
             .as_object()
             .expect("an object")
             .keys()
             .map(String::as_str)
             .collect();
+        keys.sort_unstable();
         assert_eq!(
             keys,
-            ["op", "conversation", "participant", "generation", "device"],
+            ["conversation", "device", "generation", "op", "participant"],
             "the bind frame grew a field: {text}"
         );
         for leak in ["session_id", "thread", "socket", "token", "path", "pid"] {
@@ -688,6 +725,37 @@ mod tests {
                 !text.contains(leak),
                 "a bind frame must not carry {leak}: {text}"
             );
+        }
+    }
+
+    /// The reference set is closed at this hop too, and closed the same way the
+    /// module closes it: by having no arm, not by filtering a string.
+    ///
+    /// This is the last decoder before a body is written into somebody's
+    /// session, so a `{kind, value}` pair here would re-open the whole class
+    /// the module made unreachable — a `file://` path, a mutable branch alias,
+    /// a scheme nobody thought of. A frame carrying one does not decode.
+    #[test]
+    fn a_reference_this_daemon_cannot_name_does_not_decode() {
+        for forged in [
+            r#"{"local_path":{"path":"/tmp/private"}}"#,
+            r#"{"commit":{"repo":"ducktape","branch":"main"}}"#,
+            r#"{"blob":{"hash":"abc","extra":"x"}}"#,
+            r#"{"duck":{"url":"file:///tmp/private","grant":"read"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Reference>(forged).is_err(),
+                "this reference must not decode: {forged}"
+            );
+        }
+        // and the three the module admits still do.
+        for named in [
+            r#"{"commit":{"repo":"ducktape","commit":"deadbeef"}}"#,
+            r#"{"blob":{"hash":"abc"}}"#,
+            r#"{"duck":{"url":"duck://conv/1"}}"#,
+        ] {
+            serde_json::from_str::<Reference>(named)
+                .unwrap_or_else(|error| panic!("{named} must decode: {error}"));
         }
     }
 

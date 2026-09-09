@@ -12,12 +12,22 @@ use std::path::PathBuf;
 
 use super::*;
 
+/// the network every test plane belongs to. The outbox is bound to it, so the
+/// prior-run fixture below must open under the same one.
+const NETWORK: &str = "ducktape-test@aaaa";
+
 /// a scratch directory that is this test's alone.
+///
+/// The name is `[a-z0-9-]` and nothing else, on purpose: it is interpolated
+/// into a `/bin/sh` script below, and a thread id rendered with `{:?}` puts
+/// PARENTHESES in a path — which made every stub a syntax error that never ran,
+/// while the tests waiting on it hung rather than failed.
 fn scratch(name: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "ducktape-collab-{name}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
+        "ducktape-collab-{name}-{}-{unique}",
+        std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -43,13 +53,32 @@ fn attach(dir: &Path, device: &str, target: Target) -> PathBuf {
 /// deliveries reach it in order. It is a stub of the PROVIDER, and it proves
 /// nothing whatever about a model — see the module doc.
 fn stub_codex(dir: &Path, exit_code: i32) -> PathBuf {
-    let log = dir.join("invocations.log");
+    stub(dir, &format!("exit {exit_code}\n"))
+}
+
+/// the same stub, but it does not return until `gate` — a fifo — is opened for
+/// writing and closed. That gives a test a real HOLD: one message is inside a
+/// provider and the ones behind it are waiting, with no sleep anywhere.
+fn stub_codex_holding(dir: &Path, gate: &Path) -> PathBuf {
+    std::process::Command::new("mkfifo")
+        .arg(gate)
+        .status()
+        .expect("mkfifo runs");
+    stub(dir, &format!("read _ < {}\nexit 0\n", quoted(gate)))
+}
+
+/// write an executable stub that records its argv, then runs `tail`.
+///
+/// The argv is recorded as exactly ONE line per invocation: a wrapped message
+/// spans many lines, and a log that inherits them cannot say how many times the
+/// provider was called — which is what every one of these tests asks it.
+fn stub(dir: &Path, tail: &str) -> PathBuf {
+    let log = quoted(&dir.join("invocations.log"));
     let program = dir.join("stub-codex");
     std::fs::write(
         &program,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit {exit_code}\n",
-            log.display()
+            "#!/bin/sh\nprintf '%s' \"$*\" | tr '\\n' ' ' >> {log}\nprintf '\\n' >> {log}\n{tail}"
         ),
     )
     .expect("writes the stub");
@@ -60,6 +89,17 @@ fn stub_codex(dir: &Path, exit_code: i32) -> PathBuf {
             .expect("makes the stub executable");
     }
     program
+}
+
+/// one path, safe to drop into a `/bin/sh` script.
+///
+/// Single quotes, and a refusal rather than an escape for a path containing
+/// one: nothing here produces such a path, and a quoting scheme with a clever
+/// case is how a stub silently becomes a syntax error again.
+fn quoted(path: &Path) -> String {
+    let text = path.to_str().expect("a scratch path is utf-8");
+    assert!(!text.contains('\''), "a scratch path may not be quoted: {text}");
+    format!("'{text}'")
 }
 
 /// every invocation the stub recorded, in order.
@@ -84,6 +124,7 @@ async fn plane_with(
     let (events, rx) = mpsc::channel(64);
     let plane = Deliveries::open(
         &dir.join("outbox"),
+        NETWORK,
         attachments,
         dir.join("registry"),
         codex,
@@ -144,17 +185,6 @@ fn drained(rx: &mut mpsc::Receiver<wire::Event>) -> Vec<wire::Event> {
         events.push(event);
     }
     events
-}
-
-/// the delivery states reported, in order.
-fn states(events: &[wire::Event]) -> Vec<(State, Option<String>)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            wire::Event::MsgDelivery { state, reason, .. } => Some((*state, reason.clone())),
-            _ => None,
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -416,10 +446,15 @@ async fn an_expired_message_is_never_offered_to_a_provider() {
     expired.expires_at = 2_000;
     plane.dispatch(Messaging::Deliver(expired)).await;
 
-    let reported = states(&drained(&mut rx));
+    // waited for, not drained: the expiry is decided on the binding's lane, so
+    // the second receipt is the lane having got to it.
+    let reported = [
+        next_delivery(&mut rx).await,
+        next_delivery(&mut rx).await,
+    ];
     assert_eq!(
         reported,
-        vec![
+        [
             (State::Queued, None),
             (State::Expired, Some("deadline_passed".to_string())),
         ],
@@ -446,8 +481,10 @@ async fn ownership_is_on_disk_before_it_is_acknowledged() {
     let _ = drained(&mut rx);
 
     plane.dispatch(Messaging::Deliver(deliver(7, 1))).await;
-    let reported = states(&drained(&mut rx));
-    assert_eq!(reported.first().map(|(state, _)| *state), Some(State::Queued));
+    assert_eq!(next_delivery(&mut rx).await.0, State::Queued);
+    // the attempt happens on the lane, so its receipt is what says the lane
+    // has been there — reading the file before that would be reading a race.
+    next_delivery(&mut rx).await;
 
     let journal =
         std::fs::read_to_string(dir.join("outbox").join("outbox.jsonl")).expect("the journal");
@@ -479,7 +516,7 @@ async fn recovery_reports_an_unknown_delivery_and_does_not_replay_it() {
     );
     // a previous run that died between the provider write and its receipt.
     {
-        let (outbox, _) = outbox::Outbox::open(&dir.join("outbox"))
+        let (outbox, _) = outbox::Outbox::open(&dir.join("outbox"), NETWORK)
             .await
             .expect("opens");
         let key = outbox::Key {
@@ -501,6 +538,7 @@ async fn recovery_reports_an_unknown_delivery_and_does_not_replay_it() {
                     digest: digest_of(&deliver(7, 1)),
                     state: State::Queued,
                     reason: None,
+                    claimed: false,
                 },
             )
             .await
@@ -747,6 +785,119 @@ async fn a_deadline_that_passes_while_queued_expires_the_message() {
     assert!(
         invocations(&dir).is_empty(),
         "an expired message must never reach a provider"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A journal that can no longer describe itself must not let anything reach a
+/// provider. The delivery is not owned, not reported, and above all not
+/// offered — the daemon stops rather than acting on a record it cannot vouch
+/// for.
+#[tokio::test]
+async fn a_poisoned_outbox_offers_nothing_to_a_provider() {
+    let dir = scratch("poisoned-plane");
+    let codex = stub_codex(&dir, 0);
+    let attachments = attach(
+        &dir,
+        "laptop-a",
+        Target::CodexThread {
+            thread_id: "thread-abc".to_string(),
+        },
+    );
+    let (plane, mut rx) = plane_with(&dir, attachments, codex).await;
+    plane.dispatch(Messaging::Bind(bind(1))).await;
+    let _ = drained(&mut rx);
+
+    plane.0.outbox.injure("sync outbox record: simulated").await;
+    plane.dispatch(Messaging::Deliver(deliver(7, 1))).await;
+
+    // the delivery reports nothing, so a later command's answer is what says
+    // it is finished: `dispatch` returns only after the delivery has been
+    // decided, and a bind answers unconditionally.
+    plane.dispatch(Messaging::Bind(bind(2))).await;
+    let events = drained(&mut rx);
+    assert!(
+        matches!(events.as_slice(), [wire::Event::MsgBound { .. }]),
+        "a poisoned delivery must report nothing at all: {events:?}"
+    );
+    assert!(
+        invocations(&dir).is_empty(),
+        "a poisoned journal must never reach a provider"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A message waiting behind a held one belongs to the binding it was queued
+/// under and to nothing else.
+///
+/// The dangerous shape is entirely invisible without a hold: a delivery is
+/// fenced when it arrives, waits while the provider ahead of it is busy, and
+/// the operator re-attaches in the meantime. If the lane offers it on the
+/// strength of the check made at arrival, a message the network addressed to
+/// one attachment is typed into the session that replaced it.
+#[tokio::test]
+async fn a_message_waiting_behind_a_hold_is_never_offered_to_the_binding_that_replaced_it() {
+    let dir = scratch("hold-then-rebind");
+    let gate = dir.join("gate.fifo");
+    let codex = stub_codex_holding(&dir, &gate);
+    let attachments = attach(
+        &dir,
+        "laptop-a",
+        Target::CodexThread {
+            thread_id: "thread-abc".to_string(),
+        },
+    );
+    let (plane, mut rx) = plane_with(&dir, attachments, codex).await;
+    plane.dispatch(Messaging::Bind(bind(1))).await;
+    let _ = drained(&mut rx);
+
+    plane.dispatch(Messaging::Deliver(deliver(7, 1))).await;
+    plane.dispatch(Messaging::Deliver(deliver(8, 1))).await;
+    // `Queued` is reported from the admission itself, so two of them is both
+    // messages owned and both on the lane — before anything is released.
+    for _ in 0..2 {
+        assert_eq!(next_delivery(&mut rx).await.0, State::Queued);
+    }
+
+    // opening the writing end of the fifo returns only once the stub has
+    // opened the reading end: the first message is inside a provider and the
+    // second is waiting behind it. The system's own event, not a sleep.
+    //
+    // Raced against the delivery settling, because those are the only two
+    // things that can happen: either the stub holds the message, or it never
+    // ran and the delivery has an outcome. Awaiting the fifo alone means a
+    // stub that fails to start hangs this test — and a hung test strands a
+    // build, where a failed one names its cause.
+    let gate_path = gate.clone();
+    let opening = tokio::task::spawn_blocking(move || std::fs::File::create(&gate_path));
+    let release = tokio::select! {
+        opened = opening => opened.expect("the opening task runs").expect("the fifo opens for writing"),
+        settled = next_delivery(&mut rx) => panic!(
+            "the stub never held the message; the delivery settled {settled:?} instead \
+             (a stub that will not run is a broken fixture, not a provider refusal)"
+        ),
+    };
+
+    // the operator re-attaches while the provider still holds the first.
+    plane.dispatch(Messaging::Bind(bind(2))).await;
+    drop(release);
+
+    let mut settled = Vec::new();
+    while settled.len() < 2 {
+        settled.push(next_delivery(&mut rx).await);
+    }
+    assert_eq!(
+        settled,
+        vec![
+            (State::AdapterAccepted, Some("queued_by_cli".to_string())),
+            (State::Queued, Some("binding_replaced".to_string())),
+        ],
+        "the held message settles under its own binding; the one behind it goes back to the queue"
+    );
+    assert_eq!(
+        invocations(&dir).len(),
+        1,
+        "only the message the held binding owned may reach a provider"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

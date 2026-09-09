@@ -25,7 +25,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
 
-use crate::wire::{Deliver, Kind};
+use crate::wire::{Deliver, Kind, Reference};
 
 /// the standing note that travels with every relayed message.
 ///
@@ -60,13 +60,27 @@ pub fn wrap(deliver: &Deliver) -> String {
         ));
     }
     for reference in &deliver.references {
-        out.push_str(&format!("reference: {} {}\n", reference.kind, reference.value));
+        out.push_str(&format!("reference: {}\n", named(reference)));
     }
     out.push_str(PROVENANCE);
     out.push_str("\n\n");
     out.push_str(&deliver.body);
     out.push_str(&format!("\n</ducktape-message {fence}>"));
     out
+}
+
+/// how one reference reads in the wrapper.
+///
+/// Written out per arm rather than through a `Debug` or a serde tag, because
+/// this line is prose a model reads: the arm names the KIND of thing it is
+/// looking at, which is the only part that tells it whether the value is an
+/// immutable object or a link it would have to fetch under its own authority.
+fn named(reference: &Reference) -> String {
+    match reference {
+        Reference::Commit { repo, commit } => format!("commit {repo} {commit}"),
+        Reference::Blob { hash } => format!("blob {hash}"),
+        Reference::Duck { url } => format!("duck {url}"),
+    }
 }
 
 /// the per-message fence tag, derived from the body.
@@ -129,9 +143,9 @@ mod tests {
             }),
             reply_to: Some(5),
             body: body.into(),
-            references: vec![Reference {
-                kind: "commit".into(),
-                value: "deadbeef".into(),
+            references: vec![Reference::Commit {
+                repo: "ducktape".into(),
+                commit: "deadbeef".into(),
             }],
             expires_at: 1_200,
             network_now: 1_000,
@@ -150,7 +164,7 @@ mod tests {
             "kind: question",
             "in-reply-to-sequence: 5",
             "task: job-9 (expected attempt 4)",
-            "reference: commit deadbeef",
+            "reference: commit ducktape deadbeef",
             "does the review cover the migration?",
         ] {
             assert!(text.contains(named), "the wrapper must state {named}:\n{text}");

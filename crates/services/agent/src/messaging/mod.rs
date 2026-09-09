@@ -157,15 +157,14 @@ struct BindingKey {
     participant: String,
 }
 
-/// a live binding: its generation, and the adapter it drives.
+/// a live binding: its generation, and the lane its deliveries ride.
 ///
-/// The adapter is behind an `Arc` so a delivery can take a handle out of the
-/// map and DROP THE LOCK before offering. An adapter call spawns a process or
-/// writes a socket; holding the binding map across one would make a single
-/// slow provider stall every other binding on this device.
+/// The adapter itself is NOT here. It lives in the lane's drain task, which is
+/// the only thing that calls it — so an adapter call, which spawns a process or
+/// writes a socket, never happens while this map is locked, and one slow
+/// provider cannot stall every other binding on the device.
 struct Bound {
     generation: u64,
-    adapter: Arc<Adapter>,
     /// this binding's ordered delivery lane.
     ///
     /// One task drains it, so a binding's eligible messages reach its provider
@@ -185,6 +184,13 @@ struct Bound {
 /// deep local queue would just move the network's accounting somewhere it
 /// cannot see it.
 const LANE_CAPACITY: usize = 32;
+
+/// how many commands may wait on the plane's own lane before it refuses.
+///
+/// Deeper than a binding's lane because it carries binds, unbinds and clock
+/// updates as well as deliveries, and a bind can be slow (it resolves a
+/// session, and may start an App Server child).
+const COMMAND_LANE: usize = 256;
 
 /// the provider behind a binding.
 enum Adapter {
@@ -216,6 +222,8 @@ impl Adapter {
 pub struct Deliveries(Arc<Inner>);
 
 struct Inner {
+    /// this plane's ordered command lane. See [`Deliveries::enqueue`].
+    commands: mpsc::Sender<Messaging>,
     /// the operator's local device map.
     attachments: PathBuf,
     /// where Claude publishes its session registry.
@@ -271,14 +279,17 @@ impl Deliveries {
     /// daemon no longer holds its body to replay even if it wanted to.
     pub async fn open(
         storage: &Path,
+        network: &str,
         attachments: PathBuf,
         registry: PathBuf,
         codex: PathBuf,
         receipts: Option<Arc<claude::Receipts>>,
         events: mpsc::Sender<wire::Event>,
     ) -> Result<Self, String> {
-        let (outbox, recovered) = outbox::Outbox::open(storage).await?;
+        let (outbox, recovered) = outbox::Outbox::open(storage, network).await?;
+        let (commands, queue) = mpsc::channel(COMMAND_LANE);
         let plane = Self(Arc::new(Inner {
+            commands,
             attachments,
             registry,
             codex,
@@ -289,6 +300,7 @@ impl Deliveries {
             network_now: std::sync::atomic::AtomicU64::new(0),
             events,
         }));
+        plane.spawn_command_lane(queue);
         for (key, entry) in recovered {
             tracing::info!(
                 target: "ducktape::collab",
@@ -315,6 +327,33 @@ impl Deliveries {
         Ok(plane)
     }
 
+    /// hand one command to this plane's ordered command lane.
+    ///
+    /// Non-blocking by construction, and ordered: the link must keep reading
+    /// (a bind starts a child process, a deliver fsyncs), while a `MsgDeliver`
+    /// that overtook its `MsgBind` — or another deliver — would put a
+    /// conversation's messages into a provider out of sequence. One lane, one
+    /// drain task, `try_send`: the link never waits, and nothing reorders.
+    ///
+    /// `false` when the lane is full. The command is DROPPED, never buffered
+    /// past the ceiling; the network still holds the message and will re-drive
+    /// it.
+    pub fn enqueue(&self, command: Messaging) -> bool {
+        match self.0.commands.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "command_lane_full",
+                    "a collaboration command was dropped: this daemon is behind"
+                );
+                false
+            }
+            // the drain task is gone, which happens only as the process ends.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// THE dispatch. One arm per command, each a single delegation to a
     /// handler named for it, so a new command fails the build until it is
     /// routed.
@@ -328,6 +367,10 @@ impl Deliveries {
             } => self.unbind(&conversation, &participant, generation),
             Messaging::Deliver(deliver) => self.deliver(deliver).await,
             Messaging::Time { network_now } => self.advance_clock(network_now),
+            Messaging::Retain {
+                conversation,
+                floor_seq,
+            } => self.retain(&conversation, floor_seq).await,
         }
     }
 
@@ -341,6 +384,32 @@ impl Deliveries {
         self.0
             .network_now
             .fetch_max(network_now, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// forget what the network has stopped retaining, and compact.
+    ///
+    /// Nothing is reported to the node: pruning a record the network already
+    /// dropped changes no delivery's state, and inventing a receipt for it
+    /// would be a status this daemon does not have.
+    async fn retain(&self, conversation: &str, floor_seq: u64) {
+        match self.0.outbox.retain(conversation, floor_seq).await {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(
+                target: "ducktape::collab",
+                conversation = %conversation,
+                floor_seq,
+                pruned,
+                "compacted the outbox to the network's retention floor"
+            ),
+            Err(error) => tracing::warn!(
+                target: "ducktape::collab",
+                conversation = %conversation,
+                floor_seq,
+                reason = "outbox_compact_failed",
+                %error,
+                "the outbox could not be compacted; it keeps every record it has"
+            ),
+        }
     }
 
     /// how many bindings are live — what the daemon's status line reports.
@@ -432,7 +501,7 @@ impl Deliveries {
         // the lane's ONLY long-lived sender lives in the map, so replacing or
         // releasing this binding ends its drain task by dropping the entry —
         // the same drop-driven teardown the terminal plane's driver takes.
-        self.spawn_lane(bind.generation, adapter.clone(), queue);
+        self.spawn_lane(bind.generation, adapter, queue);
         self.0
             .bindings
             .lock()
@@ -441,11 +510,20 @@ impl Deliveries {
                 key,
                 Bound {
                     generation: bind.generation,
-                    adapter,
                     lane,
                 },
             );
         Ok(capabilities)
+    }
+
+    /// drain the plane's command lane, in arrival order, one at a time.
+    fn spawn_command_lane(&self, mut queue: mpsc::Receiver<Messaging>) {
+        let plane = self.clone();
+        tokio::spawn(async move {
+            while let Some(command) = queue.recv().await {
+                plane.dispatch(command).await;
+            }
+        });
     }
 
     /// drain one binding's lane, in order, one delivery at a time.
@@ -611,6 +689,7 @@ impl Deliveries {
             digest: digest_of(&deliver),
             state: State::Queued,
             reason: None,
+            claimed: false,
         };
         // durable BEFORE the node hears `Queued`, and atomic against a
         // duplicate: queue ownership is a promise that survives this process,
@@ -645,6 +724,28 @@ impl Deliveries {
                 self.report(&deliver, generation, state, reason.as_deref())
                     .await;
             }
+            // the network stopped retaining this sequence, so this daemon
+            // retired its record. A delivery arriving for it now is a replay
+            // of something nobody is entitled to re-drive — and admitting it
+            // would be indistinguishable from a first delivery, because the
+            // record that would have said otherwise is exactly what was
+            // pruned.
+            outbox::Admission::Retired => {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    conversation = %deliver.conversation,
+                    seq = deliver.seq,
+                    reason = "below_retention_floor",
+                    "refused: the network no longer retains this sequence"
+                );
+                self.report(
+                    &deliver,
+                    generation,
+                    State::Refused,
+                    Some("below_retention_floor"),
+                )
+                .await;
+            }
             // one id, one message.
             outbox::Admission::Conflict => {
                 tracing::warn!(
@@ -662,7 +763,12 @@ impl Deliveries {
                 )
                 .await;
             }
-            outbox::Admission::Fresh => {
+            // `Fresh` is a new item; `Reclaimed` is one the journal still
+            // records as never offered — a crash between taking ownership and
+            // reaching the lane, or a provider that told us it never wrote.
+            // Both are safe to offer, and both are safe for the same reason:
+            // `Queued` is the one state that proves no provider has seen it.
+            outbox::Admission::Fresh | outbox::Admission::Reclaimed => {
                 self.report(&deliver, generation, State::Queued, None).await;
                 permit.send(deliver);
             }
@@ -676,6 +782,18 @@ impl Deliveries {
             conversation: deliver.conversation.clone(),
             seq: deliver.seq,
         };
+        // the binding may have been replaced while this waited its turn — a
+        // held item ahead of it, a slow provider, an operator re-attaching.
+        // Offering it now would write a message aimed at one attachment into
+        // the session that replaced it, which is precisely the stale-target
+        // delivery the generation exists to prevent. Re-checked HERE because
+        // the lane is where the waiting happens.
+        let still_current = self.holds_generation(deliver, generation);
+        if !still_current {
+            self.not_offered(&key, deliver, generation, "binding_replaced")
+                .await;
+            return;
+        }
         // expiry is decided against the AGREED clock, never against this
         // laptop's — and against the FRESHEST agreed value known, not the one
         // frozen at admission: a message can sit on this lane while a provider
@@ -714,8 +832,63 @@ impl Deliveries {
             );
             return;
         }
-        let (state, reason) = adapter.offer(&offer).await.record();
+        let outcome = adapter.offer(&offer).await;
+        // `Deferred` is the adapter's own statement that it wrote NOTHING —
+        // and it is the only thing entitled to make that statement, because
+        // `attempting` is already on the disk. Recorded through its own seam
+        // so the item goes back to deliverable, rather than through `settle`,
+        // which refuses to walk an uncertain delivery back to `Queued`.
+        if let Outcome::Deferred { reason } = &outcome {
+            self.not_offered(&key, deliver, generation, reason).await;
+            return;
+        }
+        let (state, reason) = outcome.record();
         self.settle(&key, deliver, generation, state, reason).await;
+    }
+
+    /// whether this device still holds the generation a queued delivery was
+    /// admitted under.
+    fn holds_generation(&self, deliver: &wire::Deliver, generation: u64) -> bool {
+        let key = BindingKey {
+            conversation: deliver.conversation.clone(),
+            participant: deliver.participant.clone(),
+        };
+        self.0
+            .bindings
+            .lock()
+            .expect("collab bindings lock poisoned")
+            .get(&key)
+            .is_some_and(|bound| bound.generation == generation)
+    }
+
+    /// record that no provider was offered this item, and report it still
+    /// queued.
+    async fn not_offered(
+        &self,
+        key: &outbox::Key,
+        deliver: &wire::Deliver,
+        generation: u64,
+        reason: &str,
+    ) {
+        if let Err(error) = self.0.outbox.not_offered(key, reason).await {
+            tracing::error!(
+                target: "ducktape::collab",
+                conversation = %deliver.conversation,
+                seq = deliver.seq,
+                reason = "outbox_write_failed",
+                %error,
+                "a delivery could not be returned to the queue"
+            );
+        }
+        tracing::debug!(
+            target: "ducktape::collab",
+            conversation = %deliver.conversation,
+            seq = deliver.seq,
+            reason,
+            "delivery left queued: no provider was offered it"
+        );
+        self.report(deliver, generation, State::Queued, Some(reason))
+            .await;
     }
 
     /// the binding's generation and lane, if this device holds the one the
@@ -814,6 +987,8 @@ pub enum Messaging {
     Deliver(Box<wire::Deliver>),
     /// the agreed network clock has advanced.
     Time { network_now: u64 },
+    /// a conversation's retention floor has advanced.
+    Retain { conversation: String, floor_seq: u64 },
 }
 
 /// route one command to its plane.
@@ -824,6 +999,11 @@ pub enum Messaging {
 /// is handed back untouched for [`crate::Sessions`], because the two planes
 /// share a link and nothing else: a pty dies with that link and a binding
 /// outlives it.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err IS the input, handed straight back for the terminal plane \
+              to run — boxing it would allocate on every keystroke"
+)]
 pub fn route(command: wire::Command) -> Result<Messaging, wire::Command> {
     match command {
         wire::Command::MsgBind(bind) => Ok(Messaging::Bind(bind)),
@@ -836,8 +1016,15 @@ pub fn route(command: wire::Command) -> Result<Messaging, wire::Command> {
             participant,
             generation,
         }),
-        wire::Command::MsgDeliver(deliver) => Ok(Messaging::Deliver(Box::new(deliver))),
+        wire::Command::MsgDeliver(deliver) => Ok(Messaging::Deliver(deliver)),
         wire::Command::MsgTime { network_now } => Ok(Messaging::Time { network_now }),
+        wire::Command::MsgRetain {
+            conversation,
+            floor_seq,
+        } => Ok(Messaging::Retain {
+            conversation,
+            floor_seq,
+        }),
         terminal @ (wire::Command::TermCreate(_)
         | wire::Command::TermInput { .. }
         | wire::Command::TermResize { .. }
