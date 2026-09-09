@@ -257,8 +257,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     remove_channel_member_submit(str)
     close_thread()
     start_thread_resize()
-    narrow_thread()
-    widen_thread()
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
     begin_thread_message_edit(i64, str, i64)
@@ -1657,8 +1655,18 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                         @secondary_action
         if active_thread_seq > 0 && !channel_settings_open
           mouse #thread-resize press=emit(start_thread_resize)
-            box w=6.0 h=fill bg=separator
-              space w=6.0 h=1.0
+            box #thread-divider
+              with
+                w=10.0
+                h=fill
+                bg=sidebar
+                align-x=center
+              box
+                with
+                  w=2.0
+                  h=fill
+                  bg=separator
+                space w=2.0 h=1.0
           box #thread-pane
             with
               w=thread_width
@@ -1716,20 +1724,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                             wrap=none
                             @text-caption
                       space w=fill
-                      button "−" -> emit(narrow_thread)
-                        with
-                          label="Narrow thread"
-                          w=24.0
-                          h=24.0
-                          p=0.0
-                          @icon_action
-                      button "+" -> emit(widen_thread)
-                        with
-                          label="Widen thread"
-                          w=24.0
-                          h=24.0
-                          p=0.0
-                          @icon_action
                       button -> emit(close_thread)
                         with
                           label="Close thread"
