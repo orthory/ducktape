@@ -131,16 +131,16 @@ impl Doc {
 
     /// The lines as the editor counts them: a trailing newline is a final
     /// empty line.
-    fn lines(&self) -> Vec<&str> {
+    pub(crate) fn lines(&self) -> Vec<&str> {
         self.text.split('\n').collect()
     }
 
-    fn line(&self, index: usize) -> Option<&str> {
+    pub(crate) fn line(&self, index: usize) -> Option<&str> {
         self.text.split('\n').nth(index)
     }
 
     /// Byte offset of `position` in `text`, clamped to the line.
-    fn offset(&self, position: EditorPosition) -> usize {
+    pub(crate) fn offset(&self, position: EditorPosition) -> usize {
         let mut offset = 0;
         for (index, line) in self.lines().iter().enumerate() {
             if index == position.line as usize {
@@ -151,7 +151,7 @@ impl Doc {
         self.text.len()
     }
 
-    fn position_at(&self, offset: usize) -> EditorPosition {
+    pub(crate) fn position_at(&self, offset: usize) -> EditorPosition {
         let before = &self.text[..offset.min(self.text.len())];
         let line = before.matches('\n').count();
         let column = before.rfind('\n').map_or(offset, |nl| offset - nl - 1);
@@ -729,7 +729,11 @@ impl History {
 
 /// The one patch that turns `current`'s text into `snapshot`'s, over the
 /// span that differs.
-fn restore(current: &Doc, snapshot: &Doc, history: EditorHistoryEffect) -> EditorDecision {
+pub(crate) fn restore(
+    current: &Doc,
+    snapshot: &Doc,
+    history: EditorHistoryEffect,
+) -> EditorDecision {
     let (old, new) = (&current.text, &snapshot.text);
     let mut prefix = old
         .bytes()

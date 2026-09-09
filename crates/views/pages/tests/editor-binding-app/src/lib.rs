@@ -5,6 +5,8 @@ pub mod document_ingress;
 pub mod editor;
 #[path = "../../../src/editor_binding.rs"]
 pub mod editor_binding;
+#[path = "../../../src/editor_menu.rs"]
+pub mod editor_menu;
 pub mod fixture {
     use crate::document_ingress::DocumentSource;
     use ui_lang_guest::wire::{self, EditorCursor};

@@ -5,6 +5,7 @@
 //! a delete — leaves as an intent the app signs.
 
 pub mod editor;
+pub mod editor_menu;
 pub mod host;
 
 ui_lang::include_app!("src/ui/app.ice");
