@@ -92,34 +92,6 @@ impl ResolutionParity {
         view.thread
     }
 
-    async fn refuse_resolution(&mut self, origin: Origin, thread: &str, resolved: bool) {
-        let before = self.thread(thread).await;
-        self.height += 1;
-        for host in [&mut self.native, &mut self.wasm] {
-            let roots = host.module_roots();
-            let error = host
-                .submit_at(
-                    BlockContext {
-                        height: self.height,
-                        consensus_time: 1_000 + self.height,
-                        origin: origin.clone(),
-                    },
-                    op(&PageMsg::ResolveThread {
-                        thread_id: thread.into(),
-                        resolved,
-                    }),
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("not the comment author"),
-                "{error}"
-            );
-            assert_eq!(host.module_roots(), roots);
-        }
-        assert_eq!(self.thread(thread).await, before);
-    }
-
     async fn resolve(&mut self, origin: Origin, thread: &str, resolved: bool, actor: pages::Party) {
         let relations = self.native.module_root("attribution");
         let dispatches = self
@@ -184,7 +156,7 @@ fn thread_comment(thread: &str, target: &str) -> PageMsg {
 }
 
 #[test]
-fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
+fn compiled_thread_resolution_records_the_signers_canonical_actor() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = ResolutionParity::new(&context).await;
         let (alice, bob, sibling, stranger) = (
@@ -193,8 +165,8 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
             PrivateKey::from_seed(3),
             PrivateKey::from_seed(4),
         );
-        // Both old-key grant routes precede identity admission: opener and
-        // page editor. Joining an account must preserve exactly those keys.
+        // Threads opened before a key joins an account, and after, resolve
+        // under whatever party the signer canonically is at that height.
         p.page(
             signed(&bob),
             PageMsg::CreatePage {
@@ -254,18 +226,18 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
         )
         .await;
         for thread in ["old-opener", "old-editor"] {
-            p.refuse_resolution(signed(&sibling), thread, true).await;
-            p.resolve(signed(&alice), thread, true, pages::Party::Account(1))
+            p.resolve(signed(&sibling), thread, true, pages::Party::Account(1))
                 .await;
-            p.refuse_resolution(signed(&sibling), thread, false).await;
+            p.resolve(signed(&alice), thread, false, pages::Party::Account(1))
+                .await;
         }
         assert_eq!(
             p.thread("old-opener").await.opener,
             pages::Party::Key(alice.public_key().as_ref().to_vec())
         );
 
-        // New account-owned pages admit sibling keys as the same editor;
-        // the independent opener can reopen, and a stranger can do neither.
+        // A key with no account resolves under itself; a sibling key under
+        // the account it joined, until that key is removed again.
         p.page(
             signed(&alice),
             PageMsg::CreatePage {
@@ -280,31 +252,37 @@ fn compiled_thread_resolution_preserves_accounts_and_original_key_authority() {
             thread_comment("account-thread", "account-page"),
         )
         .await;
-        p.refuse_resolution(signed(&stranger), "account-thread", true)
+        let stranger_key = pages::Party::Key(stranger.public_key().as_ref().to_vec());
+        p.resolve(signed(&stranger), "account-thread", true, stranger_key)
             .await;
         p.resolve(
             signed(&sibling),
             "account-thread",
-            true,
+            false,
             pages::Party::Account(1),
         )
         .await;
-        p.refuse_resolution(signed(&stranger), "account-thread", false)
-            .await;
         p.resolve(
             signed(&bob),
             "account-thread",
-            false,
+            true,
             pages::Party::Account(2),
         )
         .await;
         p.identity(
             signed(&alice),
-            identity::IdentityMsg::RemoveKey { key: sibling_key },
+            identity::IdentityMsg::RemoveKey {
+                key: sibling_key.clone(),
+            },
         )
         .await;
-        p.refuse_resolution(signed(&sibling), "account-thread", true)
-            .await;
+        p.resolve(
+            signed(&sibling),
+            "account-thread",
+            false,
+            pages::Party::Key(sibling_key),
+        )
+        .await;
     });
 }
 
@@ -409,16 +387,15 @@ fn compiled_thread_resolution_authenticates_queued_program_accounts() {
         let opened = p.program_call(3, thread_comment("program-opener", "human-page")).await;
         assert_eq!(opened.disposition, host::CallDisposition::Applied);
         for thread in ["program-editor", "program-opener"] {
-            p.refuse_resolution(signed(&alice), thread, true).await;
-            p.refuse_resolution(Origin::Module("resolution-executor".into()), thread, true).await;
+            p.resolve(signed(&alice), thread, true, pages::Party::Account(1)).await;
+            p.resolve(Origin::Module("resolution-executor".into()), thread, false, pages::Party::Module("resolution-executor".into())).await;
             let operation = PageMsg::ResolveThread { thread_id: thread.into(), resolved: true };
-            let before = p.thread(thread).await;
-            let pages_root = p.native.module_root("pages");
             let relation_root = p.native.module_root("attribution");
-            let refused = p.program_call(4, operation.clone()).await;
-            assert!(matches!(refused.disposition, host::CallDisposition::Rejected { ref reason } if reason.contains("not the comment author")));
-            assert_eq!(p.thread(thread).await, before);
-            assert_eq!(p.native.module_root("pages"), pages_root);
+            let resolved = p.program_call(4, operation.clone()).await;
+            assert_eq!(resolved.disposition, host::CallDisposition::Applied);
+            assert_eq!(p.thread(thread).await.resolved_by, Some(pages::Party::Account(4)));
+            let reopened = p.program_call(4, PageMsg::ResolveThread { thread_id: thread.into(), resolved: false }).await;
+            assert_eq!(reopened.disposition, host::CallDisposition::Applied);
             assert_eq!(p.native.module_root("attribution"), relation_root);
             let resolved = p.program_call(3, operation).await;
             assert_eq!(resolved.disposition, host::CallDisposition::Applied);
@@ -667,8 +644,6 @@ fn same_ops_identical_roots_block_by_block() {
                 },
             ),
             (
-                // block ops are gated to the page author (#1650) — bob has no
-                // standing on alice's page, so these run as alice.
                 alice.clone(),
                 PageMsg::UpdateText {
                     block_id: "b1".into(),
@@ -1000,28 +975,10 @@ fn rejections_match_and_leave_no_trace() {
                 },
                 "comment not found",
             ),
-            // THE OPENER GATE, proven in the compiled component and not just
-            // natively: it reads `env().origin`, the one authorization input
-            // that crosses the WIT boundary, so a gate keyed on it is exactly
-            // the kind that can compile, review as correct, and be inert
-            // inside the guest.
-            //
-            // alice opened t1, so bob may not re-home it — and an ungated move
-            // was the aiming device for `RemoveBlock`'s comment purge: put a
-            // stranger's thread on a throwaway block, remove the block, and
-            // their comments are hard-deleted past `DeleteComment`'s own
-            // author check.
-            (
-                bob.clone(),
-                PageMsg::MoveCommentThread {
-                    thread_id: "t1".into(),
-                    target: "b2".into(),
-                    anchor: None,
-                },
-                "not the comment author",
-            ),
-            // and the pre-consensus empty external origin never passes as a
-            // real user here, exactly as on the four sibling comment ops.
+            // the pre-consensus empty external origin never passes as a real
+            // user here, exactly as on the four sibling comment ops. It reads
+            // `env().origin`, the one authorization input that crosses the
+            // WIT boundary, so it is proven in the compiled component too.
             (
                 Vec::new(),
                 PageMsg::MoveCommentThread {

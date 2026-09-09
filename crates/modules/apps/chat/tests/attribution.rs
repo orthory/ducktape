@@ -224,12 +224,6 @@ fn chat_full_relation_sets_and_program_authority() {
             blocks: vec![Block::paragraph("edited")],
             base_rev: None,
         };
-        assert!(
-            host.submit_at(context(key(1)), message("chat", &edit))
-                .await
-                .is_err(),
-            "controller does not inherit the program's page/message permissions"
-        );
         apply(&mut host, Origin::Program(3), "chat", edit).await;
         let bytes = host
             .query(
@@ -373,11 +367,6 @@ fn pages_text_and_comment_edits_remove_mentions_and_subtree_purge_retires_relati
             text: "next".into(),
             marks: Some(Vec::new()),
         };
-        assert!(
-            host.submit_at(context(key(1)), message("pages", &update))
-                .await
-                .is_err()
-        );
         apply(&mut host, Origin::Program(3), "pages", update).await;
         assert_eq!(
             relations(&host, "pages", "block", "b")
@@ -822,21 +811,6 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
             .await
             .is_err()
         );
-        assert!(
-            host.submit_at(
-                context(key(2)),
-                message(
-                    "pages",
-                    &PageMsg::UpdateText {
-                        block_id: "key-page".into(),
-                        text: "Stolen".into(),
-                        marks: None
-                    }
-                )
-            )
-            .await
-            .is_err()
-        );
     });
 }
 
@@ -844,7 +818,6 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
 fn account_membership_changes_do_not_transfer_historic_key_ownership() {
     block_on(async {
         let mut chat = Chat::new("chat", Box::new(MemStore::new())).with_identity("identity");
-        let mut pages = Pages::new("pages", Box::new(MemStore::new())).with_identity("identity");
         let context = |key: u8, account: Option<u64>| {
             TestCtx::with_env(sdk::Env {
                 height: 1,
@@ -880,20 +853,6 @@ fn account_membership_changes_do_not_transfer_historic_key_ownership() {
         )
         .await
         .unwrap();
-        pages
-            .execute(
-                &mut context(9, None),
-                &message(
-                    "pages",
-                    &PageMsg::CreatePage {
-                        page_id: "key".into(),
-                        title: "Before".into(),
-                        blocks: Vec::new(),
-                    },
-                ),
-            )
-            .await
-            .unwrap();
         let rename = message(
             "chat",
             &ChatMsg::RenameChannel {
@@ -901,21 +860,9 @@ fn account_membership_changes_do_not_transfer_historic_key_ownership() {
                 name: "After".into(),
             },
         );
-        let edit = message(
-            "pages",
-            &PageMsg::UpdateText {
-                block_id: "key".into(),
-                text: "After".into(),
-                marks: None,
-            },
-        );
         // The same signing key gains an account, leaves it, and joins another.
         for account in [Some(1), None, Some(2)] {
             chat.execute(&mut context(9, account), &rename)
-                .await
-                .unwrap();
-            pages
-                .execute(&mut context(9, account), &edit)
                 .await
                 .unwrap();
             assert!(
@@ -923,12 +870,6 @@ fn account_membership_changes_do_not_transfer_historic_key_ownership() {
                     .await
                     .is_err(),
                 "another key on that account has no ownership proof"
-            );
-            assert!(
-                pages
-                    .execute(&mut context(10, account), &edit)
-                    .await
-                    .is_err()
             );
         }
     });

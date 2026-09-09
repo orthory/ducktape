@@ -215,7 +215,7 @@ pub enum PageMsg {
         #[serde(default)]
         anchor: Option<RelativeAnchor>,
     },
-    /// replace a comment's text; stored-author-only. rejected on a tombstone.
+    /// replace a comment's text; rejected on a tombstone.
     /// `mentions` replaces the complete mention set; retained relations do
     /// not produce new attribution events.
     EditComment {
@@ -224,7 +224,7 @@ pub enum PageMsg {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<sdk::AccountNumber>,
     },
-    /// tombstone a comment; stored-author-only. when it was the thread's last
+    /// tombstone a comment; when it was the thread's last
     /// live comment, the whole thread record is removed.
     DeleteComment { comment_id: String },
     /// toggle a thread's resolved flag; records the resolver as origin.

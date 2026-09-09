@@ -570,41 +570,20 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
         assert_eq!(messages[0].head.author, author_of(1));
         assert_eq!(messages[1].head.author, Party::Module("agent".into()));
 
-        // external origin B cannot edit or delete A's message.
-        for op in [
-            ChatMsg::EditMessage {
-                channel_id: "general".into(),
-                seq: 1,
-                blocks: vec![Block::paragraph("stolen")],
-                base_rev: None,
-            },
-            ChatMsg::DeleteMessage {
-                channel_id: "general".into(),
-                seq: 1,
-            },
-        ] {
-            let err = module
-                .execute(&mut ctx_with_origin(30, user(2)), &module_msg(op))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::Module(_)));
-            module.abort_block().await.unwrap();
-        }
-        // and a module origin cannot touch a user's message either.
-        let err = module
+        // external origin B edits A's message: the author stays A.
+        module
             .execute(
-                &mut ctx_with_origin(31, Origin::Module("agent".into())),
+                &mut ctx_with_origin(30, user(2)),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
-                    blocks: vec![Block::paragraph("stolen")],
+                    blocks: vec![Block::paragraph("edited by bob")],
                     base_rev: None,
                 }),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Module(_)));
-        module.abort_block().await.unwrap();
+            .unwrap();
+        module.commit_block().await.unwrap();
 
         let ChatReply::Message(Some(view)) = query(
             &module,
@@ -616,13 +595,14 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
         else {
             panic!("message must exist");
         };
-        assert_eq!(view.head.blocks, vec![Block::paragraph("alice's message")]);
+        assert_eq!(view.head.author, author_of(1));
+        assert_eq!(view.head.blocks, vec![Block::paragraph("edited by bob")]);
         assert!(!view.head.deleted);
     });
 }
 
 #[test]
-fn program_accounts_author_and_edit_their_own_messages() {
+fn program_accounts_author_messages_as_themselves() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
@@ -656,15 +636,6 @@ fn program_accounts_author_and_edit_their_own_messages() {
             blocks: vec![Block::paragraph("edited")],
             base_rev: None,
         };
-        assert!(
-            module
-                .execute(
-                    &mut ctx_with_origin(21, Origin::Module("agent".into())),
-                    &module_msg(edit.clone())
-                )
-                .await
-                .is_err()
-        );
         module
             .execute(
                 &mut ctx_with_origin(22, Origin::Program(5)),

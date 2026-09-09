@@ -352,7 +352,6 @@ impl Module for Pages {
         let reports = async {
             let authority = super::Authority {
                 actor: actor.clone(),
-                origin: ctx.env().origin.clone(),
             };
             self.apply(m, &authority, now)
                 .await

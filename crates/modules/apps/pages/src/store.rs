@@ -7,18 +7,6 @@ use super::{
 use crate::comment_ops::{comment_key, target_index_key, thread_key};
 
 impl Pages {
-    /// The page's canonical author owns mutations to all its ordinary blocks.
-    /// A nested page owns its own document, while moves also require authority
-    /// over the old and new containing pages.
-    pub(super) async fn may_edit(
-        &self,
-        page_id: &str,
-        authority: &super::Authority,
-    ) -> Result<bool, PageError> {
-        let page = self.require_block(page_id, PageError::Corrupt).await?;
-        Ok(authority.owns(&page.author))
-    }
-
     /// wrap the host-constructed store under module identity `id`. sync — the
     /// store arrives already opened (or already synced to a verified root).
     pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {

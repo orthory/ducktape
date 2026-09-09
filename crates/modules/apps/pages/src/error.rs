@@ -57,9 +57,6 @@ pub(super) enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
-    /// a create/insert/update/move/remove was attempted by an origin other
-    /// than the page's recorded author (see [`Pages::may_edit`]).
-    NotPageAuthor,
     /// a block/page or comment op arrived with an empty (pre-consensus)
     /// origin — the actor resolver rejects it before any op can
     /// derive an author from it.
@@ -75,11 +72,6 @@ pub(super) enum PageError {
     DuplicateComment,
     /// an append named a target that differs from the thread's.
     TargetMismatch,
-    /// edit/delete of a comment by someone other than its stored `author`, a
-    /// thread move by someone other than its stored `opener`, or a resolve/
-    /// re-open by someone who is neither the thread's `opener` nor a page
-    /// editor of its target block.
-    NotAuthor,
     /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
     TextTooLarge,
     /// an AddComment thread_id/comment_id/target over its length cap —
@@ -122,14 +114,12 @@ impl core::fmt::Display for PageError {
             PageError::TitleTooLarge => "page title too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
-            PageError::NotPageAuthor => "not the page author",
             PageError::EmptyOrigin => "empty origin",
             PageError::AuthorTooLarge => "comment author is too large",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
             PageError::DuplicateComment => "duplicate comment id",
             PageError::TargetMismatch => "target mismatch",
-            PageError::NotAuthor => "not the comment author",
             PageError::TextTooLarge => "comment text too large",
             PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",

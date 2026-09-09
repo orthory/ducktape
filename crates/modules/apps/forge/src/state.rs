@@ -432,21 +432,8 @@ impl ForgeState {
                 body,
             } => {
                 let name = norm_repo(&repo)?;
-                let author = self
-                    .tracker_view()
-                    .get(&name, number)
-                    .ok_or_else(|| {
-                        Error::Module(format!("forge: no item #{number} in repo {name}"))
-                    })?
-                    .summary
-                    .author;
-                if !authority.owns(&author) {
-                    return Err(Error::Module(
-                        "forge: only the item author may edit it".into(),
-                    ));
-                }
                 self.staged_tracker_mut()
-                    .edit_item(&name, number, &author, title, body, now)
+                    .edit_item(&name, number, title, body, now)
             }
             ForgeMsg::SetItemState { repo, number, open } => {
                 let name = norm_repo(&repo)?;
@@ -485,7 +472,7 @@ impl ForgeState {
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
                 self.settle_owner(ctx, &name).await?;
-                self.require_merge_authorized(&name, &target, number, authority)?;
+                self.require_merge_authorized(&name, &target, authority)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
                 // under the merger, and the merge must have been computed
@@ -757,19 +744,13 @@ impl ForgeState {
     /// only. every other target opens to whoever forge already vouches for
     /// independently of `SubmitReview` — the PR's author, or the repo owner.
     ///
-    /// `SubmitReview` has no standing gate (any account may review any PR)
-    /// and forge has no collaborator/member list to check a reviewer against,
-    /// so a review's author is NOT sound merge standing (#1760): admitting
-    /// `reviewers.contains(actor)` here let a stranger file one throwaway
-    /// review, then merge with the very next op. this is the smallest sound
-    /// rule available without inventing a membership list forge doesn't
-    /// have: reviews are still stored and shown, they just don't unlock a
-    /// merge.
+    /// A merge onto a protected branch is the repo owner's; onto any other
+    /// branch it is any member's. Reviews are stored and shown and grant no
+    /// standing of their own.
     fn require_merge_authorized(
         &self,
         name: &str,
         target: &str,
-        number: u64,
         authority: &Authority,
     ) -> Result<(), Error> {
         let owner = self.tracker_view().owner(name);
@@ -783,14 +764,6 @@ impl ForgeState {
                      {target:?}"
                 )))
             };
-        }
-        let author = self.tracker_view().pr_author(name, number)?;
-        let may_merge = authority.owns(&author) || is_owner;
-        if !may_merge {
-            return Err(Error::Module(format!(
-                "forge: only pull request #{number}'s author or the owner of repo {name:?} may \
-                 merge it"
-            )));
         }
         Ok(())
     }

@@ -375,7 +375,7 @@ fn removing_page_block_removes_its_entire_nested_subtree() {
 }
 
 #[test]
-fn block_ops_are_gated_to_the_page_author() {
+fn any_member_edits_any_page() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit_as(
@@ -399,83 +399,47 @@ fn block_ops_are_gated_to_the_page_author() {
         )
         .await;
 
-        // a stranger may not touch the document body …
-        apply_err_as(
+        // a page's author is who created it, not a gate on who edits it.
+        apply_commit_as(
             &mut p,
             &PageMsg::UpdateText {
                 block_id: "b1".into(),
-                text: "hijacked".into(),
+                text: "edited by mallory".into(),
                 marks: None,
             },
             user("mallory"),
-            "not the page author",
         )
         .await;
-        apply_err_as(
-            &mut p,
-            &PageMsg::RemoveBlock {
-                block_id: "b1".into(),
-            },
-            user("mallory"),
-            "not the page author",
-        )
-        .await;
-        apply_err_as(
+        assert_eq!(get_block(&p, "b1").await.unwrap().text, "edited by mallory");
+        apply_commit_as(
             &mut p,
             &PageMsg::InsertBlock {
                 parent: "p1".into(),
                 after: None,
-                block: para("intruder", "nope"),
+                block: para("b2", "from mallory"),
             },
             user("mallory"),
-            "not the page author",
         )
         .await;
-
-        // … but the recorded author may.
-        apply_commit_as(
-            &mut p,
-            &PageMsg::UpdateText {
-                block_id: "b1".into(),
-                text: "edited by alice".into(),
-                marks: None,
-            },
-            user("alice"),
-        )
-        .await;
-        assert_eq!(get_block(&p, "b1").await.unwrap().text, "edited by alice");
-
+        assert!(get_block(&p, "b2").await.is_some());
         apply_commit_as(
             &mut p,
             &PageMsg::RemoveBlock {
                 block_id: "b1".into(),
             },
-            user("alice"),
-        )
-        .await;
-        assert!(get_block(&p, "b1").await.is_none());
-
-        // comment ops are unaffected: still gated on stored comment/thread
-        // authorship, not page authorship.
-        apply_commit_as(
-            &mut p,
-            &PageMsg::AddComment {
-                thread_id: "t1".into(),
-                comment_id: "c1".into(),
-                target: "p1".into(),
-                text: "a note".into(),
-                anchor: None,
-                mentions: Vec::new(),
-            },
             user("mallory"),
         )
         .await;
-        assert!(query_thread(&p, "t1").await.is_some());
+        assert!(get_block(&p, "b1").await.is_none());
+        assert_eq!(
+            get_block(&p, "p1").await.unwrap().author,
+            Party::Key(b"alice".to_vec())
+        );
     });
 }
 
 #[test]
-fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
+fn any_member_moves_a_page_under_another_members_page() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit_as(
@@ -498,9 +462,7 @@ fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
             user("mallory"),
         )
         .await;
-
-        // mallory cannot graft her own page under alice's without alice's say.
-        apply_err_as(
+        apply_commit_as(
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "mallory-page".into(),
@@ -508,9 +470,16 @@ fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
                 after: None,
             },
             user("mallory"),
-            "not the page author",
         )
         .await;
+        assert_eq!(
+            get_block(&p, "mallory-page").await.unwrap().parent.as_deref(),
+            Some("alice-page")
+        );
+        assert_eq!(
+            get_block(&p, "alice-page").await.unwrap().children,
+            vec!["mallory-page".to_string()]
+        );
     });
 }
 

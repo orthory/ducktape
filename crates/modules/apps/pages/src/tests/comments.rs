@@ -255,7 +255,6 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
             },
             &Authority {
                 actor: Party::System,
-                origin: sdk::Origin::System,
             },
             0,
         )
@@ -352,31 +351,11 @@ fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
 }
 
 #[test]
-fn comment_edit_and_delete_are_author_only() {
+fn any_member_edits_and_deletes_any_comment() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
-        apply_err_as(
-            &mut p,
-            &PageMsg::EditComment {
-                comment_id: "m1".into(),
-                text: "hax".into(),
-                mentions: Vec::new(),
-            },
-            user("bob"),
-            "not the comment author",
-        )
-        .await;
-        apply_err_as(
-            &mut p,
-            &PageMsg::DeleteComment {
-                comment_id: "m1".into(),
-            },
-            user("bob"),
-            "not the comment author",
-        )
-        .await;
         apply_commit_as(
             &mut p,
             &PageMsg::EditComment {
@@ -384,12 +363,22 @@ fn comment_edit_and_delete_are_author_only() {
                 text: "edited".into(),
                 mentions: Vec::new(),
             },
-            user("alice"),
+            user("bob"),
         )
         .await;
         let v = query_thread(&p, "t1").await.unwrap();
         assert_eq!(v.comments[0].text, "edited");
         assert_eq!(v.comments[0].edited_at, Some(7));
+        assert_eq!(v.comments[0].author, Party::Key(b"alice".to_vec()));
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("bob"),
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_none());
     });
 }
 
@@ -473,158 +462,44 @@ fn comment_resolve_toggles_and_records_resolver() {
     });
 }
 
-// The opener and the target page's editors may resolve and reopen a thread.
-// A different comment's author does not gain either authority.
+// Whoever resolves or reopens a thread is recorded as having done so.
 #[test]
-fn resolve_thread_requires_opener_or_page_editor() {
+fn any_member_resolves_and_reopens_any_thread() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
-        // p1's blocks are seeded under the System origin (seed_page), so
-        // alice (the opener) is the only principal admitted here — a plain
-        // stranger has neither the opener nor the page-author identity.
         seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
 
-        let resolve_t1 = PageMsg::ResolveThread {
-            thread_id: "t1".into(),
-            resolved: true,
-        };
-        apply_err_as(
-            &mut p,
-            &resolve_t1,
-            user("mallory"),
-            "not the comment author",
-        )
-        .await;
-        assert!(!query_thread(&p, "t1").await.unwrap().thread.resolved);
-
-        apply_commit_as(&mut p, &resolve_t1, user("alice")).await;
-        assert!(query_thread(&p, "t1").await.unwrap().thread.resolved);
-
-        // a page actually owned by a real user: its editor may resolve a
-        // thread they never opened, same as they could move/edit its blocks.
         apply_commit_as(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "p2".into(),
-                title: "p2 title".into(),
-                blocks: Vec::new(),
-            },
-            user("carol"),
-        )
-        .await;
-        apply_commit_as(
-            &mut p,
-            &PageMsg::InsertBlock {
-                parent: "p2".into(),
-                after: None,
-                block: para("c1", "c1"),
-            },
-            user("carol"),
-        )
-        .await;
-        apply_commit_as(&mut p, &add("t2", "m2", "c1", "a"), user("alice")).await;
-
-        let resolve_t2 = PageMsg::ResolveThread {
-            thread_id: "t2".into(),
-            resolved: true,
-        };
-        apply_err_as(
-            &mut p,
-            &resolve_t2,
-            user("mallory"),
-            "not the comment author",
-        )
-        .await;
-
-        apply_commit_as(&mut p, &resolve_t2, user("carol")).await;
-        let v2 = query_thread(&p, "t2").await.unwrap();
-        assert!(v2.thread.resolved);
-        assert_eq!(v2.thread.resolved_by, Some(Party::Key(b"carol".to_vec())));
-
-        // unresolve follows the same rule: the stranger is still refused,
-        // the editor still succeeds.
-        let unresolve_t2 = PageMsg::ResolveThread {
-            thread_id: "t2".into(),
-            resolved: false,
-        };
-        apply_err_as(
-            &mut p,
-            &unresolve_t2,
-            user("mallory"),
-            "not the comment author",
-        )
-        .await;
-        apply_commit_as(&mut p, &unresolve_t2, user("carol")).await;
-        assert_eq!(
-            query_thread(&p, "t2").await.unwrap().thread.resolved_by,
-            None
-        );
-    });
-}
-
-#[test]
-fn resolving_old_key_owned_threads_keeps_exact_signer_authority() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        seed_page(&mut p, "system-page").await;
-        apply_commit_as(&mut p, &add("opened", "m1", "b1", "x"), user("alice")).await;
-        apply_commit_as(
-            &mut p,
-            &PageMsg::CreatePage {
-                page_id: "owned".into(),
-                title: "Owned".into(),
-                blocks: Vec::new(),
-            },
-            user("alice"),
-        )
-        .await;
-        apply_commit_as(&mut p, &add("page-thread", "m2", "owned", "x"), user("bob")).await;
-
-        // The actor has joined account 7, but these records still belong to
-        // the original key. The resolved actor alone must grant no access.
-        for thread_id in ["opened", "page-thread"] {
-            let resolve = PageMsg::ResolveThread {
-                thread_id: thread_id.into(),
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
                 resolved: true,
-            };
-            for origin in [user("sibling-key"), sdk::Origin::Program(7)] {
-                let before = p.root();
-                let error = p
-                    .apply(
-                        resolve.clone(),
-                        &Authority {
-                            actor: Party::Account(7),
-                            origin,
-                        },
-                        10,
-                    )
-                    .await
-                    .unwrap_err();
-                assert_eq!(error, PageError::NotAuthor);
-                assert_eq!(p.root(), before);
-                assert!(!query_thread(&p, thread_id).await.unwrap().thread.resolved);
-            }
-            p.apply(
-                resolve,
-                &Authority {
-                    actor: Party::Account(7),
-                    origin: user("alice"),
-                },
-                10,
-            )
-            .await
-            .unwrap();
-            p.commit_block().await.unwrap();
-            let thread = query_thread(&p, thread_id).await.unwrap().thread;
-            assert!(thread.resolved);
-            assert_eq!(thread.resolved_by, Some(Party::Account(7)));
-        }
+            },
+            user("mallory"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert!(v.thread.resolved);
+        assert_eq!(v.thread.resolved_by, Some(Party::Key(b"mallory".to_vec())));
+
+        apply_commit_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
+                resolved: false,
+            },
+            user("carol"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert!(!v.thread.resolved);
+        assert_eq!(v.thread.resolved_by, None);
     });
 }
 
 #[test]
-fn a_program_can_resolve_only_its_own_thread_or_page() {
+fn programs_and_modules_resolve_threads_as_themselves() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "system-page").await;
@@ -657,18 +532,22 @@ fn a_program_can_resolve_only_its_own_thread_or_page() {
                 thread_id: thread_id.into(),
                 resolved: true,
             };
-            apply_err_as(
+            apply_commit_as(&mut p, &resolve, sdk::Origin::Program(8)).await;
+            assert_eq!(
+                query_thread(&p, thread_id)
+                    .await
+                    .unwrap()
+                    .thread
+                    .resolved_by,
+                Some(Party::Account(8))
+            );
+            apply_commit_as(
                 &mut p,
-                &resolve,
-                sdk::Origin::Program(8),
-                "not the comment author",
-            )
-            .await;
-            apply_err_as(
-                &mut p,
-                &resolve,
+                &PageMsg::ResolveThread {
+                    thread_id: thread_id.into(),
+                    resolved: false,
+                },
                 sdk::Origin::Module("agent".into()),
-                "not the comment author",
             )
             .await;
             apply_commit_as(&mut p, &resolve, sdk::Origin::Program(7)).await;
@@ -702,7 +581,7 @@ fn a_program_can_resolve_only_its_own_thread_or_page() {
 }
 
 #[test]
-fn resolving_with_real_accounts_preserves_source_relations_and_rejection_roots() {
+fn resolving_with_real_accounts_preserves_source_relations() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = host::Host::genesis(vec![
             Box::new(
@@ -762,13 +641,6 @@ fn resolving_with_real_accounts_preserves_source_relations_and_rejection_roots()
                 thread_id: "thread".into(),
                 resolved,
             });
-            let before = host.module_roots();
-            let error = host
-                .submit_at(block(3), operation.clone())
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("not the comment author"));
-            assert_eq!(host.module_roots(), before);
             let outcome = host.submit_at(block(signer), operation).await.unwrap();
             let PageReply::CommentThread(Some(view)) =
                 decode_reply(&host.query("pages", &query).await.unwrap()).unwrap()
@@ -880,12 +752,11 @@ fn deleting_a_block_purges_its_comment_threads() {
     });
 }
 
-// re-homing a thread is the opener's call — the same stored-author rule
-// `EditComment`/`DeleteComment` already enforce. It is also what bounds the
-// comment purge: without it, a stranger aims `RemoveBlock` at comments they
-// may not delete by first moving the thread onto a block of their own.
+// re-homing a thread is any member's call, and the purge on `RemoveBlock`
+// follows the anchor: it reaches exactly the threads anchored to the removed
+// subtree, wherever they were moved from.
 #[test]
-fn a_thread_moves_only_by_its_opener() {
+fn any_member_moves_a_thread_and_the_purge_follows_its_anchor() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
@@ -896,16 +767,7 @@ fn a_thread_moves_only_by_its_opener() {
             target: "b2".into(),
             anchor: None,
         };
-        // a stranger, a module and the system are all refused: the opener is a
-        // stored author, not an origin KIND, so nothing outranks it here.
-        for origin in [
-            user("mallory"),
-            sdk::Origin::Module("runs".into()),
-            sdk::Origin::System,
-        ] {
-            apply_err_as(&mut p, &move_to_b2, origin, "not the comment author").await;
-        }
-        // and the pre-consensus empty origin never passes as a real user,
+        // the pre-consensus empty origin never passes as a real user,
         // exactly as on `AddComment`/`EditComment`/`DeleteComment`.
         apply_err_as(
             &mut p,
@@ -917,31 +779,12 @@ fn a_thread_moves_only_by_its_opener() {
         assert_eq!(target_thread_count(&p, "b1").await, 1);
         assert_eq!(target_thread_count(&p, "b2").await, 0);
 
-        // so mallory removing her OWN block takes nothing of alice's with it:
-        // the purge reaches exactly what was anchored to the removed subtree.
-        apply_commit(
-            &mut p,
-            &PageMsg::RemoveBlock {
-                block_id: "b2".into(),
-            },
-        )
-        .await;
-        assert!(query_comment(&p, "m1").await.is_some());
-        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b1");
+        apply_commit_as(&mut p, &move_to_b2, user("mallory")).await;
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
+        assert_eq!(query_thread(&p, "t1").await.unwrap().thread.target, "b2");
 
-        // the opener re-homes it herself, and then the purge does reach it —
-        // that is the block op's authority, and it is unchanged.
-        apply_commit_as(
-            &mut p,
-            &PageMsg::MoveCommentThread {
-                thread_id: "t1".into(),
-                target: "b3".into(),
-                anchor: None,
-            },
-            user("alice"),
-        )
-        .await;
-        assert_eq!(target_thread_count(&p, "b3").await, 1);
+        // removing b3 takes nothing anchored elsewhere …
         apply_commit(
             &mut p,
             &PageMsg::RemoveBlock {
@@ -949,8 +792,18 @@ fn a_thread_moves_only_by_its_opener() {
             },
         )
         .await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        // … and removing b2 purges the thread now anchored there.
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b2".into(),
+            },
+        )
+        .await;
         assert!(query_thread(&p, "t1").await.is_none());
         assert!(query_comment(&p, "m1").await.is_none());
+        assert_eq!(target_thread_count(&p, "b2").await, 0);
     });
 }
 

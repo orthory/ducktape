@@ -1211,17 +1211,6 @@ fn rejections_match_and_leave_no_trace() {
                 post("general", "anon", "anonymous", None),
                 "non-empty submitter id",
             ),
-            // only the stored author may edit.
-            (
-                carol.clone(),
-                ChatMsg::EditMessage {
-                    channel_id: "general".into(),
-                    seq: 1,
-                    blocks: vec![Block::paragraph("hijack")],
-                    base_rev: None,
-                },
-                "only the author",
-            ),
             // members-only gate: carol never joined.
             (
                 carol.clone(),

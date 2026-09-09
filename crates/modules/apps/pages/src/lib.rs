@@ -88,22 +88,12 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
-/// The current account is a canonical actor, while an original signed key
-/// retains authority over records it created before joining an account.
+/// The canonical actor an op is recorded under: the current account, or the
+/// signing key of one that has not joined an account. Every member may
+/// write every page and comment; a record's author is who wrote it, not a
+/// gate on who may write it next.
 struct Authority {
     actor: Party,
-    origin: sdk::Origin,
-}
-
-impl Authority {
-    fn owns(&self, owner: &Party) -> bool {
-        match owner {
-            Party::Key(key) => {
-                matches!(&self.origin, sdk::Origin::External(signer) if signer == key)
-            }
-            Party::Account(_) | Party::Module(_) | Party::System => owner == &self.actor,
-        }
-    }
 }
 
 /// write-time cap on ONE serialized block record (and on the enumeration

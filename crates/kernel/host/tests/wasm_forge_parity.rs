@@ -916,7 +916,7 @@ fn full_matrix_roots_identical_block_by_block() {
                 pack_digest: hex(&packs[3]),
             }),
         ),
-        // edit + close the issue (author-only).
+        // any member edits + closes the issue.
         (
             8,
             stranger(),
@@ -967,20 +967,9 @@ fn full_matrix_roots_identical_block_by_block() {
             owner(),
             push(vec![update("main", Some(c1), Some(c3))], Some(packs[2])),
         ),
-        // a stranger editing someone else's issue.
-        (
-            13,
-            owner(),
-            op(&ForgeMsg::EditItem {
-                repo: REPO.into(),
-                number: 1,
-                title: Some("hijack".into()),
-                body: None,
-            }),
-        ),
         // re-merging a merged PR.
         (
-            14,
+            13,
             owner(),
             op(&ForgeMsg::MergePr {
                 repo: REPO.into(),
@@ -993,7 +982,7 @@ fn full_matrix_roots_identical_block_by_block() {
         ),
         // a PR from a deleted (unborn) branch.
         (
-            15,
+            14,
             owner(),
             op(&ForgeMsg::OpenPr {
                 repo: REPO.into(),
