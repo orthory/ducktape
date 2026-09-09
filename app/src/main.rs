@@ -80,12 +80,17 @@ fn install_panic_hook() {
             .location()
             .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()))
             .unwrap_or_default();
+        // The location alone names a line inside a library (a container's
+        // unwrap); the backtrace names the widget of ours under it, which
+        // is what a member needs to find without a debugger attached.
+        let backtrace = std::backtrace::Backtrace::force_capture();
         tracing::error!(
             target: "ducktape::app",
             event = "app_panic",
             thread = std::thread::current().name().unwrap_or("?"),
             payload = info.payload_as_str().unwrap_or("non-string panic payload"),
             location,
+            backtrace = %backtrace,
             "panicked at: {info}"
         );
         default(info);

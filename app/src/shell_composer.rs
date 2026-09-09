@@ -13,12 +13,14 @@
 //! is the built composer's own, so focus and caret carry over between calls.
 //!
 //! THE TREE THE LAYOUT WAS MADE FOR. iced lays a tree out once and walks
-//! that layout with every later call, so the document `build` reads may
-//! change only where a layout follows before any walk: the runtime's build
-//! (`children` or `diff`, then `layout`) and the event walk (`update`, then
-//! the relayout it asks for). The app's reset runs between frames, so it
-//! never reaches the document: it queues in the slot's inbox and the widget
-//! takes it in ([`take_inputs`]) at exactly those two points, the shape
+//! that layout with every later call — a parent's own walk inside its
+//! `update` included, before any relayout — so the tree `build` makes is
+//! diffed only where a layout follows at once: the runtime's build
+//! (`children` or `diff`, then `layout`) and `layout` itself. This
+//! composer's tree has one shape whatever the words, so the paint here only
+//! notes which revision of the document the tree was laid out with; the
+//! reader's events and the app's reset ([`clear`]) move the document and
+//! its revision, and `update` answers with a relayout. The shape is the one
 //! `composer_surface`'s lint test holds for both host composers.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -32,19 +34,13 @@ use ui_lang_wire::SurfaceValue as Value;
 
 use crate::editor::{ComposerEvent, apply_composer_event, rich_composer};
 
-/// What the app hands the composer between frames, held in the inbox until
-/// the widget takes it in where a layout follows.
-enum Input {
-    /// The draft emptied: a new chat, or a workspace reset.
-    Clear,
-}
-
-/// The one seat: the document the painted composer reads and the inbox
-/// the app writes.
+/// The one seat: the document every writer moves (and its revision), and
+/// the revision the tree was last laid out with.
 #[derive(Default)]
 struct Slot {
     document: Content,
-    inbox: Vec<Input>,
+    rev: u64,
+    painted_rev: u64,
 }
 
 fn slot() -> &'static Mutex<Slot> {
@@ -60,28 +56,22 @@ fn lock() -> MutexGuard<'static, Slot> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Empties the draft: a new chat, or a workspace reset. It waits in the
-/// inbox until the composer next takes its inputs in.
+/// Empties the draft: a new chat, or a workspace reset.
 pub fn clear() {
-    lock().inbox.push(Input::Clear);
+    let mut slot = lock();
+    slot.document = Content::new();
+    slot.rev += 1;
 }
 
-/// The app's inputs taken into the document, and whether it changed for
-/// them. This is the ONLY writer of the document outside the reader's own
-/// events, and it runs only where a layout follows before any walk of the
-/// tree: `children`, `diff`, and `update` after its event walk.
-fn take_inputs(slot: &mut Slot) -> bool {
-    let inputs = std::mem::take(&mut slot.inbox);
-    if inputs.is_empty() {
+/// The tree noted as laid out with the document as it stands; whether the
+/// document moved since the last paint. Runs only where a layout follows
+/// at once: `children`, `diff`, and `layout` before it lays the tree out.
+fn paint(slot: &mut Slot) -> bool {
+    if slot.painted_rev == slot.rev {
         return false;
     }
-    let before = slot.document.text();
-    for input in inputs {
-        match input {
-            Input::Clear => slot.document = Content::new(),
-        }
-    }
-    slot.document.text() != before
+    slot.painted_rev = slot.rev;
+    true
 }
 
 /// The `shell_composer` surface: `(hint, disabled)`, as the view declares
@@ -115,12 +105,12 @@ struct Composer {
 }
 
 impl Composer {
-    /// The child tree diffed against the element `document` builds. iced
+    /// The child tree diffed against the element `content` builds. iced
     /// does this on a rebuild of the app's view and never on a relayout, so
-    /// a document change inside `update` does it itself, before the layout
-    /// that reuses the tree.
-    fn diff_document(&self, tree: &mut Tree, document: &Content) {
-        tree.diff_children(&[self.build(document).as_widget()]);
+    /// `layout` does it itself whenever it paints, before laying the tree
+    /// out.
+    fn diff_shape(&self, tree: &mut Tree, content: &Content) {
+        tree.diff_children(&[self.build(content).as_widget()]);
     }
 
     /// One editor event applied to the document; a submit that goes
@@ -139,13 +129,13 @@ impl Composer {
         None
     }
 
-    /// The composer for this call, over the locked document: the editor
-    /// and the round send button — the composer row of screens/shell.ice
-    /// before the port, shape for shape.
-    fn build<'a>(&'a self, document: &'a Content) -> Element<'a, ComposerEvent> {
-        let empty = document.text().trim().is_empty();
+    /// The composer for this call, over the live words: the editor and the
+    /// round send button — the composer row of screens/shell.ice before the
+    /// port, shape for shape.
+    fn build<'a>(&'a self, content: &'a Content) -> Element<'a, ComposerEvent> {
+        let empty = content.text().trim().is_empty();
         let editor = rich_composer(
-            document,
+            content,
             self.hint.clone(),
             self.disabled,
             false,
@@ -205,14 +195,14 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
 
     fn children(&self) -> Vec<Tree> {
         let mut slot = lock();
-        take_inputs(&mut slot);
+        paint(&mut slot);
         vec![Tree::new(self.build(&slot.document).as_widget())]
     }
 
     fn diff(&self, tree: &mut Tree) {
         let mut slot = lock();
-        take_inputs(&mut slot);
-        self.diff_document(tree, &slot.document);
+        paint(&mut slot);
+        self.diff_shape(tree, &slot.document);
     }
 
     fn layout(
@@ -221,7 +211,11 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let slot = lock();
+        let mut slot = lock();
+        let document_moved = paint(&mut slot);
+        if document_moved {
+            self.diff_shape(tree, &slot.document);
+        }
         self.build(&slot.document)
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
@@ -304,21 +298,22 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
             iced::window::RedrawRequest::Wait => {}
         }
         shell.input_method_mut().merge(local.input_method());
-        // The reader acted on the tree she saw, so her events land before
-        // the app's inputs: a body she submitted leaves before a reset
-        // that arrived meanwhile empties the box.
+        // The reader's events move the document, never the tree: a parent
+        // may still walk this tree over the current layout before the
+        // relayout asked for below.
         let reader_acted = !events.is_empty();
         for event in events {
             if let Some(submitted) = self.apply(&mut slot.document, event) {
                 shell.publish(submitted);
             }
         }
-        let inputs_taken = take_inputs(&mut slot);
-        let document_changed = reader_acted || inputs_taken;
-        if !document_changed {
+        if reader_acted {
+            slot.rev += 1;
+        }
+        let painted_is_behind = slot.rev != slot.painted_rev;
+        if !painted_is_behind {
             return;
         }
-        self.diff_document(tree, &slot.document);
         shell.invalidate_layout();
         shell.request_redraw();
     }
@@ -392,12 +387,12 @@ mod tests {
         assert!(intent(&Value::Unit).is_none());
     }
 
-    /// THE APP'S RESET LANDS BETWEEN FRAMES. The words the window laid the
-    /// editor out over stay its words for every walk of that layout — the
-    /// operation, the draw — and the box empties at the next update, under
-    /// the relayout that update runs.
+    /// THE APP'S RESET LANDS BETWEEN FRAMES. It empties the words at once —
+    /// the editor is a leaf, so the words are not shape — and every walk of
+    /// the laid-out tree still meets the tree that layout was made for; the
+    /// next update relayouts over the emptied box.
     #[test]
-    fn a_clear_written_between_frames_waits_for_the_next_update() {
+    fn a_clear_written_between_frames_leaves_the_laid_out_tree_walkable() {
         use iced::advanced::clipboard;
         use iced::keyboard;
         use iced_test::runtime::user_interface::{self, UserInterface};
@@ -422,8 +417,7 @@ mod tests {
 
         // the one document is the process's, so the box starts as the
         // reset leaves it
-        take_inputs(&mut lock());
-        lock().document = Content::new();
+        clear();
         let composer = Element::<Value>::new(Composer {
             hint: String::new(),
             disabled: false,
@@ -458,8 +452,8 @@ mod tests {
         // between frames: the app resets the draft
         clear();
 
-        // every walk of the laid-out tree is over the words it was laid
-        // out for
+        assert_eq!(lock().document.text().trim_end(), "", "the box emptied");
+        // every walk of the laid-out tree meets the tree it was made for
         ui.operate(&renderer, &mut Walk);
         ui.draw(
             &mut renderer,
@@ -467,13 +461,8 @@ mod tests {
             &renderer::Style::default(),
             cursor,
         );
-        assert_eq!(
-            lock().document.text().trim_end(),
-            "hi",
-            "the reset waits for the next update"
-        );
 
-        // the next update takes the reset in and relayouts over it
+        // the next update relayouts over the emptied box
         ui.update(
             &[Event::Window(iced::window::Event::RedrawRequested(
                 std::time::Instant::now(),
@@ -483,7 +472,6 @@ mod tests {
             &mut clipboard,
             &mut published,
         );
-        assert_eq!(lock().document.text().trim_end(), "", "the box emptied");
         ui.draw(
             &mut renderer,
             &iced::Theme::Dark,
