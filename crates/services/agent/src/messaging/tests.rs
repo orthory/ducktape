@@ -942,6 +942,75 @@ async fn the_agreed_clock_never_moves_backwards() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A delivery state is a fact only this process observed. When the node loses
+/// one on the way to the chain, nothing can re-derive it — so a replay
+/// re-reports what is ON DISK for one binding, oldest sequence first, and
+/// offers no provider anything.
+#[tokio::test]
+async fn a_replay_re_reports_the_journal_and_touches_no_provider() {
+    let dir = scratch("replay");
+    let codex = stub_codex(&dir, 0);
+    let attachments = attach(
+        &dir,
+        "laptop-a",
+        Target::CodexThread {
+            thread_id: "thread-abc".to_string(),
+        },
+    );
+    let (plane, mut rx) = plane_with(&dir, attachments, codex).await;
+    plane.dispatch(Messaging::Bind(bind(1))).await;
+    let _ = drained(&mut rx);
+
+    for seq in [8, 7] {
+        plane.dispatch(Messaging::Deliver(deliver(seq, 1))).await;
+    }
+    // two queued receipts and two settled ones: both have been through the
+    // adapter, so the journal is what it is going to be.
+    for _ in 0..4 {
+        next_delivery(&mut rx).await;
+    }
+    let offered = invocations(&dir).len();
+    let _ = drained(&mut rx);
+
+    plane
+        .dispatch(Messaging::Replay {
+            conversation: "conv-1".to_string(),
+            participant: "p-recipient".to_string(),
+        })
+        .await;
+
+    let replayed: Vec<(u64, State)> = drained(&mut rx)
+        .into_iter()
+        .map(|event| match event {
+            wire::Event::MsgDelivery { seq, state, .. } => (seq, state),
+            other => panic!("a replay reports deliveries and nothing else: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![(7, State::AdapterAccepted), (8, State::AdapterAccepted)],
+        "every tracked item, in sequence order and not arrival order"
+    );
+    assert_eq!(
+        invocations(&dir).len(),
+        offered,
+        "a replay says what already happened; it never makes it happen again"
+    );
+
+    // a binding this device tracks nothing for says nothing at all.
+    plane
+        .dispatch(Messaging::Replay {
+            conversation: "conv-1".to_string(),
+            participant: "p-somebody-else".to_string(),
+        })
+        .await;
+    assert!(
+        drained(&mut rx).is_empty(),
+        "another participant's replay is not this one's journal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The plane holds no clock and no wall-clock comparison. Expiry uses only the
 /// two agreed values on the frame, in whatever unit the network keeps them —
 /// so a laptop with a wrong clock cannot expire or revive anything.

@@ -325,6 +325,11 @@ fn classify(text: &str) -> Incoming {
 /// anywhere else on this plane.
 static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
 
+/// how many `command_lane_full` drops pass between log lines after the first.
+/// Latched for the same reason `input_lane_full` is: one per refused command,
+/// and an unlatched line evicts the ring that holds the evidence.
+static COLLAB_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
+
 /// Perform one command, on this task or its own.
 ///
 /// The link must never stop reading, so nothing slow may run on it:
@@ -341,11 +346,6 @@ static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
 ///   bounded (frame count and pending bytes both), so a refusal is ordinary
 ///   under load, not a bug: it is warned, latched, and the frame is dropped —
 ///   never buffered, and never blocks this task.
-/// how many `command_lane_full` drops pass between log lines after the first.
-/// Latched for the same reason `input_lane_full` is: one per refused command,
-/// and an unlatched line evicts the ring that holds the evidence.
-static COLLAB_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
-
 async fn execute(
     sessions: &Arc<Sessions>,
     deliveries: &Option<Arc<messaging::Deliveries>>,
