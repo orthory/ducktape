@@ -228,9 +228,9 @@ fn publish_owner_only(
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let tmp = dir.join(format!(".mint.{}.{}", std::process::id(), file_stem(path)));
-    // a leftover temp from a killed run must not fail this mint forever, and it
-    // is ours by name: same pid, same binding.
+    let tmp = dir.join(temp_name());
+    // a leftover from a killed run must not wedge this mint forever. Safe to
+    // remove because the name is THIS call's alone — see `temp_name`.
     let _ = std::fs::remove_file(&tmp);
 
     let published = (|| {
@@ -256,14 +256,23 @@ fn publish_owner_only(
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// The digest half of a key path, for naming its temp file. Falls back to a
-/// constant rather than panicking — `path` is always `<dir>/<digest>` here.
-#[cfg(unix)]
-fn file_stem(path: &std::path::Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("key")
-        .to_string()
+/// A temp name belonging to exactly ONE call of [`publish_owner_only`].
+///
+/// Per-CALL, not per-binding: two threads minting the same binding is the
+/// ordinary race (`collab attach` twice, a daemon and an operator at once), and
+/// a name keyed on pid and binding is identical for both. They would then share
+/// one temp file, and the pre-remove above would delete the other's half-written
+/// secret — whose `hard_link` then fails ENOENT, turning a race that should
+/// converge into an error. The counter is what makes each attempt's scratch its
+/// own; the pid keeps two processes apart.
+fn temp_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".mint.{}.{}",
+        std::process::id(),
+        ATTEMPT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Non-unix publish: complete, durable and non-clobbering, but **NOT
@@ -281,7 +290,7 @@ fn publish_owner_only(
 ) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let tmp = dir.join(format!(".mint.{}.tmp", std::process::id()));
+    let tmp = dir.join(temp_name());
     let _ = std::fs::remove_file(&tmp);
 
     let published = (|| {
@@ -340,6 +349,71 @@ mod tests {
         let first = ensure(dir.path(), binding("c1", "p1")).expect("mints");
         let second = ensure(dir.path(), binding("c1", "p1")).expect("loads");
         assert_eq!(public_hex(&first), public_hex(&second));
+    }
+
+    /// Racing mints converge on ONE key, and every racer gets that key.
+    ///
+    /// This is the property the publish rewrite exists for. Exactly one thread
+    /// wins the `hard_link`; every loser must see `AlreadyExists` and read the
+    /// WINNER's key rather than overwrite it — an overwrite would strand the
+    /// on-chain binding on a public key nothing holds.
+    ///
+    /// It also covers the partial-read window that `create_new` + `write_all`
+    /// had: under that shape a loser could observe the final path existing but
+    /// empty and fail to decode it. Here the name only ever appears complete,
+    /// so a loser either does not see it or sees all 32 bytes.
+    ///
+    /// Threads synchronize on a barrier, not a sleep — they are released
+    /// together and the assertions are over the values they return.
+    #[test]
+    fn racing_mints_converge_on_one_key_and_never_clobber() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = workspace();
+        let racers = 8;
+        let start = Arc::new(Barrier::new(racers));
+        let path = Arc::new(dir.path().to_path_buf());
+
+        let minted: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..racers)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    let path = Arc::clone(&path);
+                    scope.spawn(move || {
+                        start.wait();
+                        let key = ensure(&path, binding("c1", "p1")).expect("mints or loads");
+                        public_hex(&key)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("no racer panicked"))
+                .collect()
+        });
+
+        let winner = &minted[0];
+        assert!(
+            minted.iter().all(|key| key == winner),
+            "every racer must end up with the one published key: {minted:?}"
+        );
+
+        // and the file on disk is that key, not a ninth one.
+        let stored = load(dir.path(), binding("c1", "p1"))
+            .expect("readable")
+            .expect("published");
+        assert_eq!(&public_hex(&stored), winner);
+
+        // exactly one key file, and no temp left behind.
+        let entries: Vec<String> = std::fs::read_dir(dir.path().join(DIR))
+            .expect("key dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
+            .collect();
+        assert_eq!(entries.len(), 1, "one binding, one file: {entries:?}");
+        assert!(
+            !entries[0].starts_with(".mint."),
+            "a temp file was published or left behind: {entries:?}"
+        );
     }
 
     /// A key is scoped to ONE binding: that is what "scoped" means, and it is
