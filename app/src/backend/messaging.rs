@@ -30,9 +30,9 @@
 
 use super::*;
 use collaboration::{
-    BindingView, CollaborationMsg, CollaborationQuery, CollaborationReply, Conversation, DenyReason,
-    EventPage, Message, MessageId, MessageKind, Participant, ProtectedRead, Receipt, Reference,
-    Role, SendRequest, SendState,
+    BindingView, CollaborationMsg, CollaborationQuery, CollaborationReply, Conversation,
+    DenyReason, EventPage, Message, MessageId, MessageKind, Participant, ProtectedRead, Receipt,
+    Reference, Role, SendRequest, SendState,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -335,9 +335,13 @@ async fn read_conversation(
     newest: bool,
 ) -> Result<MessagingView, String> {
     let (client, identity) = reader_client(&view.rpc, &view.network).await?;
-    let access = match read(&client, &view.participant, ProtectedRead::Access {
-        conversation_id: view.conversation.clone(),
-    })
+    let access = match read(
+        &client,
+        &view.participant,
+        ProtectedRead::Access {
+            conversation_id: view.conversation.clone(),
+        },
+    )
     .await?
     {
         CollaborationReply::Access(access) => access,
@@ -355,18 +359,26 @@ async fn read_conversation(
             ..view.clone()
         });
     }
-    let conversation = match read(&client, &view.participant, ProtectedRead::Conversation {
-        conversation_id: view.conversation.clone(),
-    })
+    let conversation = match read(
+        &client,
+        &view.participant,
+        ProtectedRead::Conversation {
+            conversation_id: view.conversation.clone(),
+        },
+    )
     .await?
     {
         CollaborationReply::Conversation(conversation) => conversation,
         CollaborationReply::Denied(reason) => return Ok(refused(view, reason)),
         other => return Err(unexpected("a conversation", &other)),
     };
-    let binding = match read(&client, &view.participant, ProtectedRead::Binding {
-        conversation_id: view.conversation.clone(),
-    })
+    let binding = match read(
+        &client,
+        &view.participant,
+        ProtectedRead::Binding {
+            conversation_id: view.conversation.clone(),
+        },
+    )
     .await?
     {
         CollaborationReply::Binding(binding) => binding,
@@ -379,11 +391,15 @@ async fn read_conversation(
         other => return Err(unexpected("a mailbox", &other)),
     };
     let from = page_start(from_seq, newest, &conversation);
-    let page = match read(&client, &view.participant, ProtectedRead::Events {
-        conversation_id: view.conversation.clone(),
-        from_seq: from,
-        limit: PAGE,
-    })
+    let page = match read(
+        &client,
+        &view.participant,
+        ProtectedRead::Events {
+            conversation_id: view.conversation.clone(),
+            from_seq: from,
+            limit: PAGE,
+        },
+    )
     .await?
     {
         CollaborationReply::Events(page) => page,
@@ -440,9 +456,11 @@ async fn read_conversation(
 /// account switch and a network change.
 async fn reader_client(rpc: &str, network: &str) -> Result<(RpcClient, String), String> {
     if network.is_empty() {
-        return Err("this node has not named its network yet — an unnamed chain is not a scope \
+        return Err(
+            "this node has not named its network yet — an unnamed chain is not a scope \
                     to read a conversation under"
-            .into());
+                .into(),
+        );
     }
     let client = rpc_client(rpc)?;
     let status = client
@@ -459,9 +477,7 @@ async fn reader_client(rpc: &str, network: &str) -> Result<(RpcClient, String), 
     }
     match seated_data_plane_signer(&facts.public_key).await {
         ReadSigner::Seated { auth, key } => Ok((client.with_write_auth(auth), key)),
-        ReadSigner::Locked => {
-            Err("this device's key is locked; unlock it to read messages".into())
-        }
+        ReadSigner::Locked => Err("this device's key is locked; unlock it to read messages".into()),
         ReadSigner::Unavailable(reason) => Err(format!(
             "this node could not say which key to sign this read for: {reason}"
         )),
@@ -478,9 +494,11 @@ async fn reader_client(rpc: &str, network: &str) -> Result<(RpcClient, String), 
 async fn still_signing_as(identity: &str) -> Result<(), String> {
     match seated_public_key().await.as_deref() {
         Some(seated) if seated == identity => Ok(()),
-        Some(_) => Err("the signing key changed while this was being read — reopen the \
+        Some(_) => Err(
+            "the signing key changed while this was being read — reopen the \
                         conversation"
-            .into()),
+                .into(),
+        ),
         None => Err("this device's key was locked while this was being read".into()),
     }
 }
@@ -496,11 +514,14 @@ async fn read(
     read: ProtectedRead,
 ) -> Result<CollaborationReply, String> {
     client
-        .query_as_reader(COLLABORATION, &CollaborationQuery::Read {
-            participant_id: participant.to_owned(),
-            via: None,
-            read,
-        })
+        .query_as_reader(
+            COLLABORATION,
+            &CollaborationQuery::Read {
+                participant_id: participant.to_owned(),
+                via: None,
+                read,
+            },
+        )
         .await
         .map_err(|error| error.to_string())
 }
@@ -517,10 +538,14 @@ async fn message_rows(
     messages: &[Message],
 ) -> Vec<MessagingMessage> {
     let receipts = iced::futures::future::join_all(messages.iter().map(|message| {
-        read(client, &view.participant, ProtectedRead::Receipt {
-            conversation_id: view.conversation.clone(),
-            seq: message.seq,
-        })
+        read(
+            client,
+            &view.participant,
+            ProtectedRead::Receipt {
+                conversation_id: view.conversation.clone(),
+                seq: message.seq,
+            },
+        )
     }))
     .await;
     messages
@@ -553,7 +578,11 @@ fn message_row(
         shown_bytes: shown,
         references: render_references(&message.references),
         reply_to: message.reply_to.map(count_i64_u64).unwrap_or_default(),
-        task: message.task.as_ref().map(|task| task.id.clone()).unwrap_or_default(),
+        task: message
+            .task
+            .as_ref()
+            .map(|task| task.id.clone())
+            .unwrap_or_default(),
         task_attempt: message
             .task
             .as_ref()
@@ -563,9 +592,7 @@ fn message_row(
             .as_ref()
             .map(|receipt| receipt.state.as_str().to_owned())
             .unwrap_or_default(),
-        delivery_reason: state
-            .and_then(|receipt| receipt.reason)
-            .unwrap_or_default(),
+        delivery_reason: state.and_then(|receipt| receipt.reason).unwrap_or_default(),
         mine: message.sender == participant,
         expires_at: count_i64_u64(message.expires_at),
         admitted_at: count_i64_u64(message.admitted_at),
@@ -901,9 +928,11 @@ async fn deadline(client: &RpcClient) -> Result<u64, String> {
         Some("height") => DELIVERY_TTL_SECS,
         Some("millis") => DELIVERY_TTL_SECS.saturating_mul(1_000),
         _ => {
-            return Err("this node's status names no consensus_time_unit — an unnamed unit \
+            return Err(
+                "this node's status names no consensus_time_unit — an unnamed unit \
                         cannot be scaled into"
-                .into());
+                    .into(),
+            );
         }
     };
     now.checked_add(ttl)
@@ -970,10 +999,14 @@ async fn used(
     generation: u64,
     sequence: u64,
 ) -> Result<bool, String> {
-    match read(client, &record.id, ProtectedRead::SendState {
-        generation,
-        sequence,
-    })
+    match read(
+        client,
+        &record.id,
+        ProtectedRead::SendState {
+            generation,
+            sequence,
+        },
+    )
     .await?
     {
         CollaborationReply::SendState(SendState::Absent) => Ok(false),
@@ -1018,7 +1051,12 @@ fn lock_exclusive(path: &std::path::Path) -> Result<std::fs::File, String> {
         .truncate(false)
         .write(true)
         .open(path)
-        .map_err(|error| format!("the outbox lock at {} is not writable: {error}", path.display()))?;
+        .map_err(|error| {
+            format!(
+                "the outbox lock at {} is not writable: {error}",
+                path.display()
+            )
+        })?;
     // SAFETY: a live fd this function owns, and an operation that only takes an
     // advisory lock on it.
     let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1032,19 +1070,17 @@ fn lock_exclusive(path: &std::path::Path) -> Result<std::fs::File, String> {
             true => "another window or device process is sending as this device right now — \
                      wait for it to finish and send again"
                 .to_owned(),
-            false => format!("this device's outbox could not be locked ({error}); nothing is sent \
-                              while its state is unknown"),
+            false => format!(
+                "this device's outbox could not be locked ({error}); nothing is sent \
+                              while its state is unknown"
+            ),
         });
     }
     Ok(file)
 }
 
 /// The outbox's bytes as state, or the reason this device will not send.
-fn read_outbox(
-    bytes: &[u8],
-    network: &str,
-    path: &std::path::Path,
-) -> Result<OutboxFile, String> {
+fn read_outbox(bytes: &[u8], network: &str, path: &std::path::Path) -> Result<OutboxFile, String> {
     let unreadable = |why: String| {
         format!(
             "this device's outbox at {} is unusable ({why}); it may hold sends whose outcome is \
@@ -1144,14 +1180,19 @@ impl Outbox {
     /// would re-allocate their sequences and mint duplicates.
     fn open(network: &str) -> Result<Self, String> {
         if network.is_empty() {
-            return Err("this node has not named its network yet — an unnamed chain is not a \
+            return Err(
+                "this node has not named its network yet — an unnamed chain is not a \
                         scope to send under"
-                .into());
+                    .into(),
+            );
         }
         let digest = hex_encode(&Sha256::digest(network.as_bytes()));
         let directory = super::app_dirs::state_dir()?.join("messaging");
         std::fs::create_dir_all(&directory).map_err(|error| {
-            format!("the outbox directory {} is not writable: {error}", directory.display())
+            format!(
+                "the outbox directory {} is not writable: {error}",
+                directory.display()
+            )
         })?;
         let path = directory.join(format!("outbox-{}.json", &digest[..16]));
         let lock = lock_exclusive(&path.with_extension("lock"))?;
@@ -1252,9 +1293,11 @@ impl Outbox {
     }
 
     fn raise(&mut self, participant: &str, id: MessageId) -> Result<(), String> {
-        let mark = self.state.high_water.iter_mut().find(|mark| {
-            mark.participant == participant && mark.credential == id.generation
-        });
+        let mark = self
+            .state
+            .high_water
+            .iter_mut()
+            .find(|mark| mark.participant == participant && mark.credential == id.generation);
         match mark {
             Some(mark) => mark.sequence = mark.sequence.max(id.sequence),
             None => {
@@ -1304,10 +1347,14 @@ impl Outbox {
         let now = self.now(client).await?;
         let mut settled: Vec<MessageId> = Vec::new();
         for request in &mine {
-            let state = match read(client, participant, ProtectedRead::SendState {
-                generation: request.message_id.generation,
-                sequence: request.message_id.sequence,
-            })
+            let state = match read(
+                client,
+                participant,
+                ProtectedRead::SendState {
+                    generation: request.message_id.generation,
+                    sequence: request.message_id.sequence,
+                },
+            )
             .await?
             {
                 CollaborationReply::SendState(state) => state,
@@ -1355,8 +1402,7 @@ impl Outbox {
         let temporary = self.path.with_extension("json.new");
         {
             use std::io::Write as _;
-            let mut file =
-                std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+            let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
             file.write_all(&bytes).map_err(|error| error.to_string())?;
             file.sync_all().map_err(|error| error.to_string())?;
         }
@@ -1458,23 +1504,96 @@ mod tests {
             ..MessagingView::default()
         };
         let live = |rpc, network, link, account, op, participant, conversation| {
-            messaging_in_scope(&view, rpc, network, link, account, op, participant, conversation)
+            messaging_in_scope(
+                &view,
+                rpc,
+                network,
+                link,
+                account,
+                op,
+                participant,
+                conversation,
+            )
         };
-        assert!(live("http://node", "duck-1", 4, "7", 11, "claude-a", "standup"));
+        assert!(live(
+            "http://node",
+            "duck-1",
+            4,
+            "7",
+            11,
+            "claude-a",
+            "standup"
+        ));
         // every way a late answer stops being about what is on screen
-        assert!(!live("http://other", "duck-1", 4, "7", 11, "claude-a", "standup"));
-        assert!(!live("http://node", "duck-2", 4, "7", 11, "claude-a", "standup"));
-        assert!(!live("http://node", "duck-1", 4, "7", 11, "codex-b", "standup"));
-        assert!(!live("http://node", "duck-1", 4, "7", 11, "claude-a", "release"));
+        assert!(!live(
+            "http://other",
+            "duck-1",
+            4,
+            "7",
+            11,
+            "claude-a",
+            "standup"
+        ));
+        assert!(!live(
+            "http://node",
+            "duck-2",
+            4,
+            "7",
+            11,
+            "claude-a",
+            "standup"
+        ));
+        assert!(!live(
+            "http://node",
+            "duck-1",
+            4,
+            "7",
+            11,
+            "codex-b",
+            "standup"
+        ));
+        assert!(!live(
+            "http://node",
+            "duck-1",
+            4,
+            "7",
+            11,
+            "claude-a",
+            "release"
+        ));
         // A RECONNECT TO THE SAME PLACE IS A DIFFERENT LINK. Every id above
         // still matches; the session this answer was read over does not exist.
-        assert!(!live("http://node", "duck-1", 5, "7", 11, "claude-a", "standup"));
+        assert!(!live(
+            "http://node",
+            "duck-1",
+            5,
+            "7",
+            11,
+            "claude-a",
+            "standup"
+        ));
         // A SEAT CHANGE READS AS SOMEONE ELSE, at the same endpoint and chain.
-        assert!(!live("http://node", "duck-1", 4, "8", 11, "claude-a", "standup"));
+        assert!(!live(
+            "http://node",
+            "duck-1",
+            4,
+            "8",
+            11,
+            "claude-a",
+            "standup"
+        ));
         // THE A -> B -> A RETURN. The reader left standup, came back, and the
         // panel read it again: the ids are identical and only the operation
         // number tells the first answer from the second.
-        assert!(!live("http://node", "duck-1", 4, "7", 12, "claude-a", "standup"));
+        assert!(!live(
+            "http://node",
+            "duck-1",
+            4,
+            "7",
+            12,
+            "claude-a",
+            "standup"
+        ));
     }
 
     /// A send's outcome carries its own scope for the same reason: a refusal about
@@ -1528,7 +1647,10 @@ mod tests {
         // a multi-byte character straddling the cut must not be split in half
         let long = admitted(&"é".repeat(2000), Vec::new(), None);
         let row = message_row(&long, Err("no receipt".into()), "claude-a");
-        assert_eq!(row.body_bytes, 4000, "the stored body's own size is reported");
+        assert_eq!(
+            row.body_bytes, 4000,
+            "the stored body's own size is reported"
+        );
         assert!(row.shown_bytes < row.body_bytes, "the display bound bit");
         assert!(row.shown_bytes <= 1024);
         assert!(
@@ -1600,7 +1722,10 @@ mod tests {
             deny_token(collaboration::DenyReason::Unauthenticated),
             "unauthenticated"
         );
-        assert_eq!(deny_token(collaboration::DenyReason::NotReader), "not_reader");
+        assert_eq!(
+            deny_token(collaboration::DenyReason::NotReader),
+            "not_reader"
+        );
         assert_eq!(
             deny_token(collaboration::DenyReason::NotPermitted),
             "not_permitted"
@@ -1615,18 +1740,21 @@ mod tests {
     fn a_retry_of_the_same_draft_reuses_the_pending_id_and_bytes() {
         let pending = request(8, "ship it", 90_000);
         let directory = tempfile::tempdir().expect("a temporary state directory");
-        let outbox = held(&directory, OutboxFile {
-            chain_id: "duck-1".into(),
-            high_water: vec![HighWater {
-                participant: "claude-a".into(),
-                credential: 4,
-                sequence: 8,
-            }],
-            pending: vec![Pending {
-                participant: "claude-a".into(),
-                request: pending.clone(),
-            }],
-        });
+        let outbox = held(
+            &directory,
+            OutboxFile {
+                chain_id: "duck-1".into(),
+                high_water: vec![HighWater {
+                    participant: "claude-a".into(),
+                    credential: 4,
+                    sequence: 8,
+                }],
+                pending: vec![Pending {
+                    participant: "claude-a".into(),
+                    request: pending.clone(),
+                }],
+            },
+        );
         let matched = outbox
             .pending_match(
                 "claude-a",
@@ -1638,7 +1766,10 @@ mod tests {
                 0,
             )
             .expect("the same draft finds its pending request");
-        assert_eq!(matched, pending, "the whole request is reused, deadline included");
+        assert_eq!(
+            matched, pending,
+            "the whole request is reused, deadline included"
+        );
 
         // a CHANGED draft is a different message and must not ride the pending id
         assert!(
@@ -1669,7 +1800,11 @@ mod tests {
                 .is_none()
         );
         assert_eq!(outbox.high_water("claude-a", 4), 8);
-        assert_eq!(outbox.high_water("claude-a", 5), 0, "another credential is its own space");
+        assert_eq!(
+            outbox.high_water("claude-a", 5),
+            0,
+            "another credential is its own space"
+        );
     }
 
     /// An empty chain id is refused, never used as a namespace: an empty fence is
@@ -1739,7 +1874,10 @@ mod tests {
         let path = directory.path().join("outbox.lock");
         let first = lock_exclusive(&path).expect("the first holder takes the lock");
         let refused = lock_exclusive(&path).expect_err("the second is refused, not blocked");
-        assert!(refused.contains("sending as this device right now"), "{refused}");
+        assert!(
+            refused.contains("sending as this device right now"),
+            "{refused}"
+        );
         // and the lock is released with the file, so the next opener gets it
         drop(first);
         lock_exclusive(&path).expect("released with its holder");
@@ -1751,10 +1889,13 @@ mod tests {
     #[test]
     fn settling_one_id_leaves_the_others_pending() {
         let directory = tempfile::tempdir().expect("a temporary state directory");
-        let mut outbox = held(&directory, OutboxFile {
-            chain_id: "duck-1".into(),
-            ..OutboxFile::default()
-        });
+        let mut outbox = held(
+            &directory,
+            OutboxFile {
+                chain_id: "duck-1".into(),
+                ..OutboxFile::default()
+            },
+        );
         outbox
             .stage("claude-a", &request(8, "first", 90_000))
             .expect("staged");
@@ -1762,19 +1903,38 @@ mod tests {
             .stage("claude-a", &request(9, "second", 90_000))
             .expect("staged");
         outbox
-            .settle("claude-a", MessageId {
-                generation: 4,
-                sequence: 8,
-            })
+            .settle(
+                "claude-a",
+                MessageId {
+                    generation: 4,
+                    sequence: 8,
+                },
+            )
             .expect("settled");
         assert!(
             outbox
-                .pending_match("claude-a", 4, "standup", "codex-b", MessageKind::Question, "first", 0)
+                .pending_match(
+                    "claude-a",
+                    4,
+                    "standup",
+                    "codex-b",
+                    MessageKind::Question,
+                    "first",
+                    0
+                )
                 .is_none()
         );
         assert!(
             outbox
-                .pending_match("claude-a", 4, "standup", "codex-b", MessageKind::Question, "second", 0)
+                .pending_match(
+                    "claude-a",
+                    4,
+                    "standup",
+                    "codex-b",
+                    MessageKind::Question,
+                    "second",
+                    0
+                )
                 .is_some()
         );
         // the high-water mark never walks backwards: a settled 8 does not free 9
