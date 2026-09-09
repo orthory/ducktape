@@ -28,6 +28,7 @@ const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "ru
 const BINDINGS: Bindings<'static> = Bindings {
     invite: b"t",
     chain_id: "t",
+    time_unit: sdk::genesis_config::TimeUnit::Height,
 };
 
 fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<'static, ()>) {
@@ -376,6 +377,7 @@ fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
             let bindings = Bindings {
                 invite: b"t",
                 chain_id: "net#odb-1773",
+                time_unit: sdk::genesis_config::TimeUnit::Height,
             };
             let mut module = wasm_module(
                 "files",

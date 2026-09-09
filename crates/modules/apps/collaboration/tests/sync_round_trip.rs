@@ -12,7 +12,7 @@
 //! same root.
 
 use collaboration::{
-    encode_msg, encode_query, Collaboration, CollaborationMsg, CollaborationQuery,
+    encode_msg, encode_query, BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery,
     CollaborationReply, DeliveryState, EventPage, MessageId, MessageKind, ProtectedRead, Role,
     SendRequest, SendState,
 };
@@ -22,7 +22,10 @@ use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
 const MODULE: &str = "collaboration";
-const TTL: u64 = collaboration::HEIGHT_LANE_MAX_DELIVERY_TTL;
+const TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
+/// the network every op here is bound to; the synced twin must be composed
+/// with the SAME one or its ops stop applying.
+const NETWORK: &str = "test-net";
 
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
@@ -49,7 +52,7 @@ fn ext(byte: u8) -> Origin {
 async fn apply(module: &mut Collaboration, height: u64, origin: Origin, payload: CollaborationMsg) {
     let msg = Msg {
         target: MODULE.into(),
-        payload: encode_msg(&payload),
+        payload: encode_msg(&collaboration::Request::new(NETWORK, payload)),
     };
     module
         .execute(&mut ctx(height, origin), &msg)
@@ -104,6 +107,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             "tasks",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
             TTL,
+            NETWORK,
         );
 
         // registry: two participants under two keys, one conversation, both
@@ -164,7 +168,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
                 conversation_id: "c1".into(),
                 participant_id: "bob".into(),
                 device: "laptop".into(),
-                service_key: vec![20; 32],
+                principal: BoundPrincipal::ServiceKey(vec![20; 32]),
                 expected_credential: 0,
             },
         )
@@ -177,7 +181,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
                 conversation_id: "c1".into(),
                 participant_id: "bob".into(),
                 device: "desktop".into(),
-                service_key: vec![21; 32],
+                principal: BoundPrincipal::ServiceKey(vec![21; 32]),
                 expected_credential: 2,
             },
         )
@@ -272,7 +276,8 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let mut synced = Collaboration::new(MODULE, "identity", "tasks", Box::new(store), TTL);
+        let mut synced =
+            Collaboration::new(MODULE, "identity", "tasks", Box::new(store), TTL, NETWORK);
 
         assert_eq!(
             synced.root(),
@@ -356,13 +361,16 @@ fn synced_store_reconstructs_source_root_and_every_read() {
                 &mut write_ctx,
                 &Msg {
                     target: MODULE.into(),
-                    payload: encode_msg(&CollaborationMsg::Acknowledge {
-                        conversation_id: "c1".into(),
-                        seq: messages[0].seq,
-                        binding_credential: 3,
-                        state: DeliveryState::Queued,
-                        reason: None,
-                    }),
+                    payload: encode_msg(&collaboration::Request::new(
+                        NETWORK,
+                        CollaborationMsg::Acknowledge {
+                            conversation_id: "c1".into(),
+                            seq: messages[0].seq,
+                            binding_credential: 3,
+                            state: DeliveryState::Queued,
+                            reason: None,
+                        },
+                    )),
                 },
             )
             .await

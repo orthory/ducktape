@@ -12,8 +12,8 @@
 use sdk::{Error, Origin, StagedStore};
 
 use crate::interface::{
-    Binding, Conversation, Credential, EventBody, Participant, Role, MAX_ID_BYTES,
-    MAX_LABEL_BYTES, MAX_ROSTER,
+    Binding, BoundPrincipal, Conversation, Credential, EventBody, Participant, Role,
+    MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_ROSTER, MAX_SERVICE_KEY_BYTES,
 };
 use crate::store;
 use crate::{controls, Party};
@@ -35,6 +35,23 @@ pub fn check_label(what: &str, label: &str) -> Result<(), Error> {
         return Err(Error::Module(format!(
             "{what} is {} bytes, over the {MAX_LABEL_BYTES}-byte cap",
             label.len()
+        )));
+    }
+    Ok(())
+}
+
+/// a principal must be one an origin can actually equal. an EMPTY service key
+/// would otherwise sit in committed state matching nothing — a binding that
+/// looks live and can never authenticate — and an unbounded one is a record
+/// nobody bounded.
+pub fn check_principal(principal: &BoundPrincipal) -> Result<(), Error> {
+    let BoundPrincipal::ServiceKey(key) = principal else {
+        return Ok(());
+    };
+    let shaped = !key.is_empty() && key.len() <= MAX_SERVICE_KEY_BYTES;
+    if !shaped {
+        return Err(Error::Module(format!(
+            "a bound service key must be 1..={MAX_SERVICE_KEY_BYTES} bytes"
         )));
     }
     Ok(())
@@ -69,11 +86,26 @@ pub fn roster_role(conversation: &Conversation, participant_id: &str) -> Option<
     conversation.roster.get(participant_id).copied()
 }
 
-/// did THIS dispatch's authenticated key sign as `key`? only an external
-/// origin carries a key: a module, program or system origin holds none, so
-/// none of them can ever pass as a scoped service credential.
-pub fn signed_by(origin: &Origin, key: &[u8]) -> bool {
-    matches!(origin, Origin::External(signer) if !signer.is_empty() && signer == key)
+/// is THIS dispatch's origin the principal the binding authorized? the match
+/// is against the ORIGIN THE HOST MINTED and nothing on the wire.
+///
+/// One `match` over the principal, and the arms are exhaustive on purpose:
+/// `Origin::Module` and `Origin::System` fall through every arm, so neither
+/// the module in the middle of a follow-up nor the public read lane can ever
+/// pass as an attached principal.
+pub fn authenticates(origin: &Origin, principal: &BoundPrincipal) -> bool {
+    match principal {
+        // an empty key would match an `External(vec![])` origin no honest
+        // signer produces; refused at bind, and refused again here.
+        BoundPrincipal::ServiceKey(key) => {
+            matches!(origin, Origin::External(signer) if !signer.is_empty() && signer == key)
+        }
+        // only the dispatch call lane mints this origin, and only for an
+        // account identity holds as a program at an unmoved generation.
+        BoundPrincipal::Program(account) => {
+            matches!(origin, Origin::Program(caller) if caller == account)
+        }
+    }
 }
 
 /// the participant's live binding on one conversation, if it holds one that
@@ -316,15 +348,11 @@ pub async fn bind(
     conversation_id: String,
     participant_id: String,
     device: String,
-    service_key: Vec<u8>,
+    principal: BoundPrincipal,
     expected_credential: Credential,
 ) -> Result<Advanced, Error> {
     check_label("device", &device)?;
-    if service_key.is_empty() {
-        return Err(Error::Module(
-            "a binding must authorize a non-empty scoped service key".into(),
-        ));
-    }
+    check_principal(&principal)?;
     let mut participant = live_participant(staged, &participant_id).await?;
     // the OWNER issues the scoped credential. a service cannot promote itself,
     // and cannot mint a second credential for its own key.
@@ -358,7 +386,7 @@ pub async fn bind(
         conversation_id: conversation_id.clone(),
         participant_id: participant_id.clone(),
         credential,
-        service_key,
+        principal,
         device,
         attached_at: now,
         detached: false,
@@ -412,10 +440,10 @@ pub async fn unbind(
         )));
     };
     let by_owner = controls(&participant.owner, actor, origin);
-    let by_service = !binding.detached && signed_by(origin, &binding.service_key);
+    let by_service = !binding.detached && authenticates(origin, &binding.principal);
     if !(by_owner || by_service) {
         return Err(Error::Module(
-            "only the owner or the bound service key may unbind".into(),
+            "only the owner or the bound principal may unbind".into(),
         ));
     }
     if expected_credential != binding.credential {

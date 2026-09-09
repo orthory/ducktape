@@ -39,6 +39,63 @@ pub const CHAIN_ID: &str = "chain_id";
 /// genesis-config key: the per-network invite namespace (governance verifies
 /// tokens and join proofs against it).
 pub const INVITE: &str = "invite";
+/// genesis-config key: the unit this network's `consensus_time` advances in.
+/// A module that turns a DURATION into a deadline cannot be correct without
+/// it — the same literal means seven days on the height lane and ten minutes
+/// on the millisecond one. The value is [`TimeUnit::encode`].
+pub const TIME_UNIT: &str = "time_unit";
+
+/// What one `consensus_time` unit is on this network. The genesis-config twin
+/// of `noded::ConsensusTimeUnit` / `node::ConsensusTimePolicy`, and it lives
+/// in `sdk` because BOTH ends need it: the composer binds the network's value,
+/// and a wasm tenant whose bytes are fixed reads it back.
+///
+/// It is consensus state, so every node of a network agrees on it by
+/// construction. There is no default: a module that needs the unit and does
+/// not get one rejects deterministically rather than guessing a scale that
+/// would silently mean the wrong duration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeUnit {
+    /// `consensus_time` IS the block height: one unit is roughly one second at
+    /// a one-block-per-second heartbeat. The validator and replica lanes.
+    #[default]
+    Height,
+    /// `consensus_time` is a millisecond epoch clock: one unit is one
+    /// millisecond. The sim lane.
+    Millis,
+}
+
+impl TimeUnit {
+    /// the canonical config bytes. a fixed token, not a number, so a value
+    /// read back is either one of these or a wiring fault — never a plausible
+    /// misparse.
+    pub const fn encode(self) -> &'static [u8] {
+        match self {
+            Self::Height => b"height",
+            Self::Millis => b"millis",
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        match bytes {
+            b"height" => Ok(Self::Height),
+            b"millis" => Ok(Self::Millis),
+            other => Err(Error::Module(format!(
+                "genesis config time_unit is {:?}, not \"height\" or \"millis\"",
+                String::from_utf8_lossy(other)
+            ))),
+        }
+    }
+
+    /// how many `consensus_time` units one second is. The one conversion a
+    /// module needs to express a spec's duration on either lane.
+    pub const fn per_second(self) -> u64 {
+        match self {
+            Self::Height => 1,
+            Self::Millis => 1_000,
+        }
+    }
+}
 
 /// canonical bytes of a genesis parameter list. keys must be strictly
 /// increasing (one parameter set, one encoding) — the caller is the host's

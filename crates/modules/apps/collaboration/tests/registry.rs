@@ -5,7 +5,8 @@
 mod common;
 
 use collaboration::{
-    CollaborationMsg, CollaborationReply, DenyReason, ProtectedRead, Role, SendState,
+    BoundPrincipal, CollaborationMsg, CollaborationReply, DenyReason, ProtectedRead, Role,
+    SendState,
 };
 use common::*;
 use futures::executor::block_on;
@@ -415,5 +416,177 @@ fn a_detached_service_key_cannot_send_or_unbind() {
         .await
         .unwrap_err();
         assert!(format!("{refusal:?}").contains("only the owner"), "{refusal:?}");
+    });
+}
+
+// ---- the program-account principal -----------------------------------------
+//
+// The lane an AGENT reaches this module through. It never signs: dispatch's
+// call lane mints `Origin::Program(account)` after `identity` has proved the
+// account is a program executed by the requesting module at an unmoved
+// generation, and the host runs the unit at this module under that origin.
+// This module's own check is the second, independent authorization — the
+// participant's owner bound THAT account to THIS conversation.
+
+/// the account number alice's owner delegates to. a number, not a key: nothing
+/// here is signed.
+const AGENT_ACCOUNT: sdk::AccountNumber = 42;
+
+#[test]
+fn a_bound_program_account_sends_under_its_credential() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner = at(1, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut owner,
+            bind_to(
+                "c1",
+                "alice",
+                BoundPrincipal::Program(AGENT_ACCOUNT),
+                0,
+            ),
+        )
+        .await;
+        let credential = credential_of(&module, &owner, "alice", "c1").await;
+
+        // the CALL lane's origin — no signature anywhere in this dispatch.
+        let mut agent = as_program(2, AGENT_ACCOUNT);
+        ok(
+            &mut module,
+            &mut agent,
+            CollaborationMsg::Send(note("c1", "alice", "bob", credential, 1, 400)),
+        )
+        .await;
+
+        let CollaborationReply::SendState(state) = read(
+            &module,
+            &agent,
+            "alice",
+            Some("c1"),
+            ProtectedRead::SendState {
+                generation: credential,
+                sequence: 1,
+            },
+        )
+        .await
+        else {
+            panic!("the bound program reads its own send state");
+        };
+        assert!(
+            matches!(state, SendState::Admitted { .. }),
+            "the program-account lane admits: {state:?}"
+        );
+    });
+}
+
+#[test]
+fn a_module_origin_never_authenticates_as_a_bound_principal() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner = at(1, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut owner,
+            bind_to(
+                "c1",
+                "alice",
+                BoundPrincipal::Program(AGENT_ACCOUNT),
+                0,
+            ),
+        )
+        .await;
+        let credential = credential_of(&module, &owner, "alice", "c1").await;
+
+        // a follow-up from the module that would have queued the call. It is
+        // the module in the MIDDLE, not a principal, and it carries no account
+        // — so it can never pass for the bound one.
+        let mut relay = at(2, Origin::Module("runs".into()));
+        let refusal = apply(
+            &mut module,
+            &mut relay,
+            CollaborationMsg::Send(note("c1", "alice", "bob", credential, 1, 400)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("not authorized to send as"),
+            "a module origin must not send as a participant: {refusal:?}"
+        );
+
+        // and it reads nothing either.
+        assert_eq!(
+            read(
+                &module,
+                &relay,
+                "alice",
+                Some("c1"),
+                ProtectedRead::Events {
+                    conversation_id: "c1".into(),
+                    from_seq: 1,
+                    limit: 8,
+                },
+            )
+            .await,
+            CollaborationReply::Denied(DenyReason::Unauthenticated),
+            "a module origin is not a reader"
+        );
+    });
+}
+
+#[test]
+fn a_different_program_account_is_not_the_bound_one() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner = at(1, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut owner,
+            bind_to(
+                "c1",
+                "alice",
+                BoundPrincipal::Program(AGENT_ACCOUNT),
+                0,
+            ),
+        )
+        .await;
+        let credential = credential_of(&module, &owner, "alice", "c1").await;
+
+        // identity knows this account too; it is simply not the bound one.
+        let mut other = as_program(2, AGENT_ACCOUNT + 1);
+        let refusal = apply(
+            &mut module,
+            &mut other,
+            CollaborationMsg::Send(note("c1", "alice", "bob", credential, 1, 400)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("not authorized to send as"),
+            "the binding names ONE account: {refusal:?}"
+        );
+    });
+}
+
+#[test]
+fn a_binding_cannot_authorize_an_empty_service_key() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner = at(1, Origin::External(scene.owner_a.clone()));
+        let refusal = apply(
+            &mut module,
+            &mut owner,
+            bind_to("c1", "alice", BoundPrincipal::ServiceKey(Vec::new()), 0),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("bound service key must be"),
+            "an empty key would authenticate nobody and look live: {refusal:?}"
+        );
     });
 }

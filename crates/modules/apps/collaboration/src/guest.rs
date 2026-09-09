@@ -16,33 +16,51 @@
 //! stages nothing on either side, which is why every write path here checks
 //! all of its records before staging any of them.
 //!
-//! ## the delivery-deadline ceiling
+//! ## the delivery-deadline ceiling, on EITHER lane
 //!
-//! [`Collaboration::new`] takes the ceiling in `consensus_time` units, and a
-//! wasm-composed genesis runs the height lane, so the port passes
-//! [`crate::HEIGHT_LANE_MAX_DELIVERY_TTL`]. A network whose `consensus_time`
-//! is a millisecond epoch clock needs that number scaled, which means a
-//! genesis-config key this module does not yet declare: until one exists such
-//! a network gets a ceiling that is too TIGHT — deadlines are refused, never
-//! silently honoured for longer than promised.
+//! A component's bytes are fixed and a deadline is a duration, so the ceiling
+//! cannot be compiled in: `consensus_time` is the block height on the
+//! validator and replica lanes and a millisecond epoch clock on the sim lane,
+//! and one number cannot mean seven days on both. The network states which it
+//! is as the `time_unit` genesis parameter — seeded into this module's own
+//! store at genesis construction and read back each dispatch — and
+//! [`crate::max_delivery_ttl`] scales [`crate::MAX_DELIVERY_TTL_SECONDS`] into
+//! that lane's units. A missing or malformed value REJECTS: guessing a scale
+//! would silently mean the wrong duration, which is the one failure a
+//! deadline must not have.
+//!
+//! ## the network binding
+//!
+//! The other genesis parameter is the `chain_id` every op names. A submitted
+//! frame's signature covers no chain id, so the binding is the payload's and
+//! this is where the network's value reaches a component whose bytes are the
+//! same everywhere.
 
-use crate::{Collaboration, HEIGHT_LANE_MAX_DELIVERY_TTL};
+use crate::{max_delivery_ttl, Collaboration};
 
 /// the id this module registers under (the native twin's id: `Env::me` and
 /// follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "collaboration";
 
-use ducktape_module_sdk::WitStore;
+use ducktape_module_sdk::{store_genesis_chain_id, store_genesis_time_unit, WitStore};
 
 ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Collaboration,
-    shape: ducktape_module_sdk::store_shape(),
+    // the config keys must be strictly increasing — `encode_config` asserts it.
+    shape: ducktape_module_sdk::host::ModuleShape {
+        config: vec![
+            sdk::genesis_config::CHAIN_ID.into(),
+            sdk::genesis_config::TIME_UNIT.into(),
+        ],
+        ..ducktape_module_sdk::store_shape()
+    },
     new: Collaboration::new(
         MODULE_ID,
         "identity",
         "tasks",
         Box::new(WitStore),
-        HEIGHT_LANE_MAX_DELIVERY_TTL,
+        max_delivery_ttl(store_genesis_time_unit(MODULE_ID)?),
+        store_genesis_chain_id(MODULE_ID)?,
     ),
 }

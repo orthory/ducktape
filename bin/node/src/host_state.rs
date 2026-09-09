@@ -63,6 +63,13 @@ impl<'a> NetworkBindings<'a> {
         Bindings {
             invite: self.invite,
             chain_id: self.identity_chain_id,
+            // NOT a per-call binding, because it does not vary here: no lane
+            // this binary composes — validator, replica, sync-only — installs
+            // a `ConsensusTimePolicy`, so `consensus_time` IS the height on
+            // every one of them, which is what each reports as its
+            // `consensus_time_unit`. The sim lane, which arms
+            // `ConsensusTimePolicy::Epoch`, binds `Millis` in `bin/simnode`.
+            time_unit: sdk::genesis_config::TimeUnit::Height,
         }
     }
 }
