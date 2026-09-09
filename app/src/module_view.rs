@@ -1460,8 +1460,17 @@ pub fn files_view(
     preview_text: &str,
     write_refusal: &str,
     writes: i64,
+    rpc: &str,
+    chain: &str,
+    connection: i64,
+    preview_base: &str,
+    save_reply: &crate::backend::FsSaveHistory,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
+        "network_scope": crate::backend::files_network_scope(rpc.into(), chain.into()),
+        "context": crate::backend::files_context(rpc.into(), chain.into(), connection),
+        "preview_base": preview_base,
+        "save_reply": save_reply,
         "path": path,
         "listed": listed,
         "entries": entries,
@@ -2392,6 +2401,8 @@ struct Guest {
     /// props it was last given on it.
     props_subscription: Option<u64>,
     props_sent: Option<Vec<u8>>,
+    /// Separates Files save acknowledgements across fresh guest instances.
+    files_save_namespace: Option<String>,
     /// What the guest asked the app to do this redraw.
     intents: Vec<ModuleViewEvent>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
@@ -2986,6 +2997,8 @@ impl Guest {
             surfaces: surfaces_of(module),
             props_subscription: None,
             props_sent: None,
+            files_save_namespace: (module == "files")
+                .then(|| crate::backend::fresh_operation_id("files-view".into())),
             intents: Vec::new(),
             fault: None,
             assets: Arc::default(),
@@ -3057,9 +3070,16 @@ impl Guest {
             return;
         }
         self.props_sent = props.clone();
+        let mut bytes = props.clone().unwrap_or_default();
+        if let Some(namespace) = &self.files_save_namespace
+            && let Ok(serde_json::Value::Object(mut facts)) = serde_json::from_slice(&bytes)
+        {
+            facts.insert("save_namespace".into(), namespace.clone().into());
+            bytes = serde_json::to_vec(&facts).expect("JSON object serializes");
+        }
         self.pending.push(wire::Event::Response {
             id,
-            result: Ok(props.clone().unwrap_or_default()),
+            result: Ok(bytes),
             done: false,
         });
     }
@@ -4287,6 +4307,165 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    #[test]
+    fn the_staged_files_draft_keeps_its_original_file_and_save_snapshot() {
+        let staged = staged("files").expect("the actual Files Wasm fixture is required");
+        let mut guest = Guest::load_from("files", &staged).expect("Files loads");
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        let original_text = format!("X{}", facts["preview_text"].as_str().unwrap());
+        let props = |facts: &serde_json::Value| Some(serde_json::to_vec(facts).unwrap());
+        guest.redraw(&None);
+        guest.redraw(&props(&facts));
+        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+        guest.redraw(&props(&facts));
+        let mut editor = None;
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor {
+                key,
+                reset,
+                on_edit: Some(handler),
+                ..
+            } = node
+            {
+                editor = Some((key.clone(), *reset, *handler));
+            }
+        });
+        let (key, reset, handler) = editor.expect("editable document");
+        guest.deliver(Output::EditorAction {
+            key,
+            reset,
+            handler,
+            action: iced::widget::text_editor::Action::Edit(
+                iced::widget::text_editor::Edit::Insert('X'),
+            ),
+        });
+        guest.redraw(&props(&facts));
+        let old_save = button_message(&guest, "Save");
+        facts["network_scope"] = "network-b".into();
+        facts["context"] = "connection-b".into();
+        facts["preview_path"] = "/shared/other.md".into();
+        facts["preview_text"] = "B source".into();
+        guest.redraw(&props(&facts));
+        guest.deliver(Output::Activate(old_save));
+        guest.redraw(&props(&facts));
+        assert!(guest.intents.is_empty(), "an old Save cannot target B");
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text == "Unsaved changes to:")
+        );
+        assert!(texts(&guest).iter().any(|text| text == "/shared/README.md"));
+
+        facts["network_scope"] = "network-a".into();
+        facts["context"] = "connection-a-reconnected".into();
+        facts["preview_path"] = "/shared/README.md".into();
+        facts["preview_base"] = "external-new-snapshot".into();
+        facts["preview_text"] = "external replacement".into();
+        guest.redraw(&props(&facts));
+        let draft_text = |guest: &Guest| {
+            let mut value = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { text, .. } = node {
+                    value = Some(text.clone());
+                }
+            });
+            value.expect("the retained editor")
+        };
+        assert_eq!(draft_text(&guest), original_text);
+        guest.deliver(Output::Activate(button_message(&guest, "Save")));
+        guest.redraw(&props(&facts));
+        let saves = std::mem::take(&mut guest.intents);
+        assert_eq!(saves.len(), 1, "one Save");
+        let save = &saves[0];
+        assert_eq!(save.kind, "save");
+        let payload: serde_json::Value = serde_json::from_str(&save.detail).unwrap();
+        assert_eq!(payload["path"], "/shared/README.md");
+        assert_eq!(payload["text"], original_text);
+        assert_eq!(payload["base"], "snapshot-a");
+        assert_eq!(payload["context"], "connection-a-reconnected");
+        facts["save_reply"] = serde_json::json!({"replies":[{
+            "context": payload["context"], "namespace": payload["namespace"], "request": payload["request"],
+            "success": false, "message": "The file changed elsewhere. Your edits are kept."
+        }], "overflow":""});
+        guest.redraw(&props(&facts));
+        assert_eq!(draft_text(&guest), original_text);
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text == "The file changed elsewhere. Your edits are kept.")
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    #[test]
+    fn fresh_files_wasm_instances_reject_retained_and_late_old_save_successes() {
+        let editor_text = |guest: &Guest| {
+            let mut text = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { text: value, .. } = node {
+                    text = Some(value.clone());
+                }
+            });
+            text
+        };
+        let staged = staged("files").expect("actual Files Wasm fixture required");
+        let mut old = Guest::load_from("files", &staged).unwrap();
+        let old_props = files_facts();
+        old.redraw(&None);
+        old.redraw(&old_props);
+        old.deliver(Output::Activate(button_message(&old, "Edit")));
+        old.redraw(&old_props);
+        old.deliver(Output::Activate(button_message(&old, "Save")));
+        old.redraw(&old_props);
+        let old_intents = std::mem::take(&mut old.intents);
+        assert_eq!(old_intents.len(), 1);
+        let old_save: serde_json::Value = serde_json::from_str(&old_intents[0].detail).unwrap();
+        let old_namespace = old_save["namespace"].as_str().unwrap().to_owned();
+        assert_eq!(old_save["request"], 1);
+        for retained in [true, false] {
+            let mut guest = Guest::load_from("files", &staged).unwrap();
+            assert_ne!(guest.files_save_namespace.as_ref().unwrap(), &old_namespace);
+            let mut facts: serde_json::Value =
+                serde_json::from_slice(&files_facts().unwrap()).unwrap();
+            let success = serde_json::json!({"replies":[{"context":"connection-a", "namespace":old_namespace, "request":1, "success":true, "message":""}], "overflow":""});
+            if retained {
+                facts["save_reply"] = success.clone();
+            }
+            let props = |value: &serde_json::Value| Some(serde_json::to_vec(value).unwrap());
+            guest.redraw(&None);
+            guest.redraw(&props(&facts));
+            guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+            guest.redraw(&props(&facts));
+            guest.deliver(Output::Activate(button_message(&guest, "Save")));
+            guest.redraw(&props(&facts));
+            let saves = std::mem::take(&mut guest.intents);
+            assert_eq!(saves.len(), 1);
+            let save: serde_json::Value = serde_json::from_str(&saves[0].detail).unwrap();
+            assert_eq!(save["request"], 1);
+            assert_eq!(
+                save["namespace"],
+                guest.files_save_namespace.as_ref().unwrap().as_str()
+            );
+            facts["save_reply"] = success;
+            // A changed loading prop forces delivery even when the old success was already retained.
+            facts["loading"] = true.into();
+            guest.redraw(&props(&facts));
+            assert_eq!(
+                editor_text(&guest),
+                Some(facts["preview_text"].as_str().unwrap().to_owned()),
+                "old instance completion must not close the fresh editor"
+            );
+            facts["save_reply"]["replies"][0]["namespace"] = save["namespace"].clone();
+            facts["loading"] = false.into();
+            guest.redraw(&props(&facts));
+            assert!(
+                editor_text(&guest).is_none(),
+                "its own confirmation closes the editor"
+            );
+            assert!(guest.fault.is_none());
+        }
+    }
+
     /// A module-owned view has one source, the module's deployment on the
     /// connected node: with no node it is not there yet, and the staged file
     /// a desktop view would take is never opened for it.
@@ -4589,6 +4768,8 @@ pub(crate) mod tests {
                 {"key": 1, "path": "/shared/docs", "name": "docs", "kind": "dir", "size": 2, "object": "aa"}
             ],
             "connected": true, "loading": false,
+            "network_scope": "network-a", "context": "connection-a", "preview_base": "snapshot-a",
+            "save_reply": {"replies":[], "overflow":""},
             "preview_path": "/shared/README.md",
             "preview_entry": {"key": 2, "path": "/shared/README.md", "name": "README.md", "kind": "file", "size": 1024, "object": "bb"},
             "delete_target": "", "diff_from": "", "diff": [], "history": [],

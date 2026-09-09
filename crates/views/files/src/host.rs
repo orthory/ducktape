@@ -38,6 +38,11 @@ pub struct FsDiffEntry {
 /// clears the name draft it consumed.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct FilesProps {
+    pub save_namespace: String,
+    pub network_scope: String,
+    pub context: String,
+    pub preview_base: String,
+    pub save_reply: SaveHistory,
     pub display_omitted: i64,
     pub display_shortened: bool,
     pub display_unavailable: bool,
@@ -66,6 +71,53 @@ pub struct FilesProps {
     pub dark: bool,
     pub write_refusal: String,
     pub writes: i64,
+}
+
+/// Acknowledges exactly the Save request admitted by the host.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SaveReply {
+    pub namespace: String,
+    pub context: String,
+    pub request: i64,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Replies are bounded by the host; overflow explicitly retires an uncertain pending save.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SaveHistory {
+    pub replies: Vec<SaveReply>,
+    pub overflow: String,
+}
+
+impl From<SaveReply> for SaveHistory {
+    fn from(reply: SaveReply) -> Self {
+        Self {
+            replies: vec![reply],
+            overflow: String::new(),
+        }
+    }
+}
+
+pub fn save_answer(
+    history: &SaveHistory,
+    context: &str,
+    namespace: &str,
+    request: i64,
+) -> SaveReply {
+    history
+        .replies
+        .iter()
+        .find(|reply| {
+            reply.context == context && reply.namespace == namespace && reply.request == request
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A rendered button names both its document and this occurrence of the draft.
+pub fn edit_token(context: &str, path: &str, base: &str, draft: i64) -> String {
+    serde_json::to_string(&(context, path, base, draft)).expect("edit identity encodes")
 }
 
 /// One item of the facts subscription: the facts, or why not.
@@ -118,6 +170,10 @@ pub struct Snapshot {
 /// `files.save` — the edited body, written back to its path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Save {
+    pub namespace: String,
+    pub context: String,
+    pub base: String,
+    pub request: i64,
     pub path: String,
     pub text: String,
 }
@@ -168,10 +224,21 @@ pub fn show_diff(id: &str) -> bool {
     notify("files.show_diff", &Snapshot { id: id.into() })
 }
 
-pub fn save(path: &str, text: &str) -> bool {
+pub fn save(
+    namespace: &str,
+    context: &str,
+    path: &str,
+    base: &str,
+    request: i64,
+    text: &str,
+) -> bool {
     notify(
         "files.save",
         &Save {
+            namespace: namespace.into(),
+            context: context.into(),
+            base: base.into(),
+            request,
             path: path.into(),
             text: text.into(),
         },
@@ -265,4 +332,8 @@ pub fn picture_caption(width: i64, height: i64) -> String {
 pub fn markdown_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+pub fn keep_str(take: bool, next: &str, previous: &str) -> String {
+    if take { next.into() } else { previous.into() }
 }
