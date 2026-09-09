@@ -11,6 +11,15 @@
 //! shared document and builds the real composer afresh inside every
 //! `Widget` method, over a lock held for that call alone. The `Tree` state
 //! is the built composer's own, so focus and caret carry over between calls.
+//!
+//! THE TREE THE LAYOUT WAS MADE FOR. iced lays a tree out once and walks
+//! that layout with every later call, so the document `build` reads may
+//! change only where a layout follows before any walk: the runtime's build
+//! (`children` or `diff`, then `layout`) and the event walk (`update`, then
+//! the relayout it asks for). The app's reset runs between frames, so it
+//! never reaches the document: it queues in the slot's inbox and the widget
+//! takes it in ([`take_inputs`]) at exactly those two points, the shape
+//! `composer_surface`'s lint test holds for both host composers.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -23,22 +32,56 @@ use ui_lang_wire::SurfaceValue as Value;
 
 use crate::editor::{ComposerEvent, apply_composer_event, rich_composer};
 
-fn document() -> &'static Mutex<Content> {
-    static DOCUMENT: OnceLock<Mutex<Content>> = OnceLock::new();
-    DOCUMENT.get_or_init(Mutex::default)
+/// What the app hands the composer between frames, held in the inbox until
+/// the widget takes it in where a layout follows.
+enum Input {
+    /// The draft emptied: a new chat, or a workspace reset.
+    Clear,
 }
 
-fn lock() -> MutexGuard<'static, Content> {
-    // A panic while the lock was held leaves the document usable: the
-    // widget only ever reads it here and applies whole interactions.
-    document()
+/// The one seat: the document the painted composer reads and the inbox
+/// the app writes.
+#[derive(Default)]
+struct Slot {
+    document: Content,
+    inbox: Vec<Input>,
+}
+
+fn slot() -> &'static Mutex<Slot> {
+    static SLOT: OnceLock<Mutex<Slot>> = OnceLock::new();
+    SLOT.get_or_init(Mutex::default)
+}
+
+fn lock() -> MutexGuard<'static, Slot> {
+    // A panic while the lock was held leaves the slot usable: the widget
+    // only ever reads it here and applies whole interactions.
+    slot()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Empties the draft: a new chat, or a workspace reset.
+/// Empties the draft: a new chat, or a workspace reset. It waits in the
+/// inbox until the composer next takes its inputs in.
 pub fn clear() {
-    *lock() = Content::new();
+    lock().inbox.push(Input::Clear);
+}
+
+/// The app's inputs taken into the document, and whether it changed for
+/// them. This is the ONLY writer of the document outside the reader's own
+/// events, and it runs only where a layout follows before any walk of the
+/// tree: `children`, `diff`, and `update` after its event walk.
+fn take_inputs(slot: &mut Slot) -> bool {
+    let inputs = std::mem::take(&mut slot.inbox);
+    if inputs.is_empty() {
+        return false;
+    }
+    let before = slot.document.text();
+    for input in inputs {
+        match input {
+            Input::Clear => slot.document = Content::new(),
+        }
+    }
+    slot.document.text() != before
 }
 
 /// The `shell_composer` surface: `(hint, disabled)`, as the view declares
@@ -161,13 +204,15 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
     }
 
     fn children(&self) -> Vec<Tree> {
-        let document = lock();
-        vec![Tree::new(self.build(&document).as_widget())]
+        let mut slot = lock();
+        take_inputs(&mut slot);
+        vec![Tree::new(self.build(&slot.document).as_widget())]
     }
 
     fn diff(&self, tree: &mut Tree) {
-        let document = lock();
-        self.diff_document(tree, &document);
+        let mut slot = lock();
+        take_inputs(&mut slot);
+        self.diff_document(tree, &slot.document);
     }
 
     fn layout(
@@ -176,8 +221,8 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let document = lock();
-        self.build(&document)
+        let slot = lock();
+        self.build(&slot.document)
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
@@ -192,8 +237,8 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let document = lock();
-        self.build(&document).as_widget().draw(
+        let slot = lock();
+        self.build(&slot.document).as_widget().draw(
             &tree.children[0],
             renderer,
             theme,
@@ -211,8 +256,8 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
-        let document = lock();
-        self.build(&document).as_widget_mut().operate(
+        let slot = lock();
+        self.build(&slot.document).as_widget_mut().operate(
             &mut tree.children[0],
             layout,
             renderer,
@@ -231,10 +276,10 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         shell: &mut Shell<'_, Value>,
         viewport: &Rectangle,
     ) {
-        let mut document = lock();
+        let mut slot = lock();
         let mut events = Vec::new();
         let mut local = Shell::new(&mut events);
-        self.build(&document).as_widget_mut().update(
+        self.build(&slot.document).as_widget_mut().update(
             &mut tree.children[0],
             event,
             layout,
@@ -259,15 +304,21 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
             iced::window::RedrawRequest::Wait => {}
         }
         shell.input_method_mut().merge(local.input_method());
-        if events.is_empty() {
-            return;
-        }
+        // The reader acted on the tree she saw, so her events land before
+        // the app's inputs: a body she submitted leaves before a reset
+        // that arrived meanwhile empties the box.
+        let reader_acted = !events.is_empty();
         for event in events {
-            if let Some(submitted) = self.apply(&mut document, event) {
+            if let Some(submitted) = self.apply(&mut slot.document, event) {
                 shell.publish(submitted);
             }
         }
-        self.diff_document(tree, &document);
+        let inputs_taken = take_inputs(&mut slot);
+        let document_changed = reader_acted || inputs_taken;
+        if !document_changed {
+            return;
+        }
+        self.diff_document(tree, &slot.document);
         shell.invalidate_layout();
         shell.request_redraw();
     }
@@ -280,8 +331,8 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        let document = lock();
-        self.build(&document).as_widget().mouse_interaction(
+        let slot = lock();
+        self.build(&slot.document).as_widget().mouse_interaction(
             &tree.children[0],
             layout,
             cursor,
@@ -339,5 +390,106 @@ mod tests {
         assert_eq!(event.kind, "send");
         assert_eq!(event.detail, r#"{"body":"hi"}"#);
         assert!(intent(&Value::Unit).is_none());
+    }
+
+    /// THE APP'S RESET LANDS BETWEEN FRAMES. The words the window laid the
+    /// editor out over stay its words for every walk of that layout — the
+    /// operation, the draw — and the box empties at the next update, under
+    /// the relayout that update runs.
+    #[test]
+    fn a_clear_written_between_frames_waits_for_the_next_update() {
+        use iced::advanced::clipboard;
+        use iced::keyboard;
+        use iced_test::runtime::user_interface::{self, UserInterface};
+
+        struct Walk;
+        impl Operation for Walk {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+        }
+        fn key(character: &str, code: keyboard::key::Code) -> Event {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(character.into()),
+                modified_key: keyboard::Key::Character(character.into()),
+                physical_key: keyboard::key::Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: Some(character.into()),
+                repeat: false,
+            })
+        }
+
+        // the one document is the process's, so the box starts as the
+        // reset leaves it
+        take_inputs(&mut lock());
+        lock().document = Content::new();
+        let composer = Element::<Value>::new(Composer {
+            hint: String::new(),
+            disabled: false,
+        });
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(600.0, 200.0);
+        let mut clipboard = clipboard::Null;
+        let mut published: Vec<Value> = Vec::new();
+        let mut ui =
+            UserInterface::build(composer, size, user_interface::Cache::new(), &mut renderer);
+        let position = iced::Point::new(100.0, 20.0);
+        let cursor = mouse::Cursor::Available(position);
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                key("h", keyboard::key::Code::KeyH),
+                key("i", keyboard::key::Code::KeyI),
+            ],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        assert_eq!(
+            lock().document.text().trim_end(),
+            "hi",
+            "the press focused, the keys typed"
+        );
+
+        // between frames: the app resets the draft
+        clear();
+
+        // every walk of the laid-out tree is over the words it was laid
+        // out for
+        ui.operate(&renderer, &mut Walk);
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            cursor,
+        );
+        assert_eq!(
+            lock().document.text().trim_end(),
+            "hi",
+            "the reset waits for the next update"
+        );
+
+        // the next update takes the reset in and relayouts over it
+        ui.update(
+            &[Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        assert_eq!(lock().document.text().trim_end(), "", "the box emptied");
+        ui.draw(
+            &mut renderer,
+            &iced::Theme::Dark,
+            &renderer::Style::default(),
+            cursor,
+        );
+        assert!(published.is_empty(), "no send");
     }
 }
