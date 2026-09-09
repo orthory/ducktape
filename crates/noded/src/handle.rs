@@ -48,9 +48,32 @@ pub enum NodeCommand {
         frame: Vec<u8>,
         reply: oneshot::Sender<Result<BlockSummary, String>>,
     },
+    /// read committed module state as the NODE ITSELF (`host::Origin::System`)
+    /// — the widest reader there is. Right for the node's own reads and for the
+    /// unauthenticated `/v1/query` lane, whose caller has proven nothing: a
+    /// module that serves protected content refuses System for it.
     Query {
         target: String,
         req: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// read committed module state as an AUTHENTICATED reader
+    /// (`POST /v1/query/reader`). `reader` is the ed25519 key a request's
+    /// data-plane signature proved possession of, and the actor hands it to the
+    /// host as `Origin::External(reader)` — the same field a write's authority
+    /// arrives in.
+    ///
+    /// It is a FIELD ON THIS COMMAND and not a field in `req` on purpose. A
+    /// caller supplies request BYTES; it cannot reach this struct. Any scheme
+    /// that carried the reader inside `req` would be forgeable by anyone who can
+    /// POST the unauthenticated `/v1/query` — the whole reason this variant
+    /// exists.
+    QueryAs {
+        target: String,
+        req: Vec<u8>,
+        /// the VERIFIED signer ([`crate::signed_req::verify_signed_request`]).
+        /// Never a caller-supplied identifier.
+        reader: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
 }
