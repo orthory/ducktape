@@ -59,6 +59,16 @@ const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 /// guest publishes a valid tree, neither pending work nor a later trap
 /// authorizes discarding its state.
 const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
+/// The gap before the first re-attempt at a candidate whose load failed,
+/// and the longest that gap widens to. A load fetches the artifact,
+/// instantiates it, restores the snapshot and verifies the first tree —
+/// and compiles the component too, whenever `compiled_view` does not
+/// already hold it. A deployment that cannot load fails that way every
+/// time, so trying it once a block buys nothing and never stops. Widening
+/// the gap rather than giving up keeps a fetch that failed on the
+/// transport recoverable: nothing is suppressed for good, only spaced out.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 /// How often a tab polls for a component still loading on its thread.
 const LOAD_POLL: Duration = Duration::from_millis(50);
 
@@ -1982,7 +1992,10 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
             // starting over on every block would never let it land
             let waited_for =
                 locked.in_flight && locked.wanted.is_none_or(|wanted| Some(wanted) == active);
-            if waited_for || active == locked.hash {
+            // a candidate that just failed is left alone until its gap is
+            // up: the same bytes fail the same way, so one attempt a block
+            // is unbounded work for a deployment that never lands
+            if waited_for || active == locked.hash || locked.held_off(active) {
                 return None;
             }
             let Some(replacement) = locked.replacement_after_wait() else {
@@ -2034,9 +2047,10 @@ struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
-    /// The deployment the slot answers for — the view drawn, the empty
-    /// slot of a deployment without one, or the one that failed to load —
-    /// so a block moves it only when the active code moved.
+    /// The deployment the slot answers for — the view drawn, or the empty
+    /// slot of a deployment without one — so a block moves it only when the
+    /// active code moved. A load that failed never seated anything, so it
+    /// leaves this alone and is held off by `retry` instead.
     hash: Option<[u8; 32]>,
     /// A load is on its way for `generation`, and the deployment it is
     /// after when a block named one: a block that names it again waits
@@ -2048,6 +2062,35 @@ struct Mounted {
     /// generation instead of opening one per block.
     waiting_since: Option<Instant>,
     replacement: Replacement,
+    /// The candidate a load last failed on, and when the next block may try
+    /// it again. Cleared by any load that comes back, so only a repeated
+    /// failure on the same candidate widens the gap.
+    retry: Option<Retry>,
+}
+
+/// A failed load's hold-off: the candidate it failed on, when the next
+/// attempt at that same candidate is due, and the gap that produced it.
+struct Retry {
+    hash: Option<[u8; 32]>,
+    next: Instant,
+    gap: Duration,
+}
+
+impl Retry {
+    /// The hold-off after a load for `hash` failed: the gap doubles up to
+    /// `RETRY_MAX` while the same candidate keeps failing, and starts over
+    /// at `RETRY_FIRST` for a different one.
+    fn after(previous: Option<&Retry>, hash: Option<[u8; 32]>) -> Retry {
+        let gap = match previous {
+            Some(previous) if previous.hash == hash => (previous.gap * 2).min(RETRY_MAX),
+            _ => RETRY_FIRST,
+        };
+        Retry {
+            hash,
+            next: Instant::now() + gap,
+            gap,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2069,6 +2112,14 @@ impl Mounted {
         let never_valid_expired =
             old.can_recover_without_state() && since.elapsed() >= REPLACEMENT_WAIT;
         never_valid_expired.then_some(Replacement::RecoverNeverValid)
+    }
+
+    /// Whether a block naming `active` is still inside the hold-off a
+    /// failed load for that same candidate left behind.
+    fn held_off(&self, active: Option<[u8; 32]>) -> bool {
+        self.retry
+            .as_ref()
+            .is_some_and(|retry| retry.hash == active && Instant::now() < retry.next)
     }
 
     /// Opens the next generation for a load after `wanted` (None: whatever
@@ -2113,6 +2164,7 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 wanted: None,
                 waiting_since: None,
                 replacement: Replacement::Preserve,
+                retry: None,
             }));
             spawn_load(module, &mounted, 0, snapshot);
             mounted
@@ -2147,9 +2199,15 @@ fn spawn_load(
             slot,
             hash,
             replacement,
+            wanted,
+            retry,
             ..
         } = &mut *locked;
         let replacement = *replacement;
+        // a load that came back at all clears the hold-off; only the error
+        // arm below puts one back, widened against the one taken here
+        let wanted = *wanted;
+        let held_off = retry.take();
         match loaded {
             Ok(Loaded::Fresh(guest)) => {
                 *hash = guest.hash;
@@ -2223,6 +2281,10 @@ fn spawn_load(
                     error = %reason,
                     "module view not loaded"
                 );
+                // the next block leaves this candidate alone until the gap
+                // is up; a transport error is only spaced out, never
+                // suppressed, and any other deployment is unaffected
+                *retry = Some(Retry::after(held_off.as_ref(), wanted));
                 // a view that is there stays, with its hash: the failure is
                 // the replacement's, not its own
                 if !matches!(slot, Slot::Ready(_)) {
@@ -4659,6 +4721,7 @@ pub(crate) mod tests {
                 wanted: None,
                 waiting_since: None,
                 replacement: Replacement::Preserve,
+                retry: None,
             }));
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
@@ -5987,6 +6050,59 @@ pub(crate) mod tests {
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
         let locked = mounted.lock().unwrap();
         assert_eq!((locked.generation, locked.in_flight), (generation, false));
+    }
+
+    /// Blocks keep landing on a deployment whose view cannot load: it is
+    /// tried again, then held off with a widening gap, instead of paying a
+    /// cranelift compile once a block for a candidate that never lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deployment_is_not_retried_by_every_block() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        // bytes that are not a component: every load of them fails alike
+        let bad = deployment(b"not a component", "a.svg");
+        let node = FakeDeployment::serving("forge", &bad);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("forge");
+        join_all(connected(&client));
+        let locked = mounted.lock().unwrap();
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "{}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // the first block names the candidate the reconnect did not: it is
+        // tried once under its own hash, and every block after it is held
+        join_all(deployments_checked().await);
+        let generation = mounted.lock().unwrap().generation;
+        for _ in 0..5 {
+            join_all(deployments_checked().await);
+        }
+        let locked = mounted.lock().unwrap();
+        assert_eq!(
+            locked.generation, generation,
+            "a failed candidate was loaded again on every block"
+        );
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "the failure is still what the tab shows: {}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // nothing is suppressed for good: once the gap is up the same
+        // candidate is tried again, so a load that failed on the transport
+        // still recovers on its own
+        tokio::time::sleep(RETRY_FIRST + Duration::from_millis(100)).await;
+        join_all(deployments_checked().await);
+        assert_eq!(
+            mounted.lock().unwrap().generation,
+            generation + 1,
+            "the hold-off never expired"
+        );
+        registry().lock().unwrap().remove("forge");
     }
 
     /// A removal answered late — the code moved on to C while the
