@@ -3,7 +3,7 @@
 // readings arrive as props, interaction-local state stays here, and only
 // application effects leave as named events the view root turns into intents.
 
-component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, preview_display_clipped:bool, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, display_omitted:i64, preview_display_clipped:bool)
   lifetime retained
   emits
     open_message_link(str)
@@ -17,9 +17,9 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
     fs_delete_submit()
     fs_close_diff()
     fs_show_diff(str)
-    fs_begin_edit()
-    fs_cancel_edit()
-    fs_save_edit()
+    fs_begin_edit(str)
+    fs_cancel_edit(str)
+    fs_save_edit(str)
   state
     history_open = false
   on fs_toggle_history
@@ -443,7 +443,17 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
                             wrap=none
                             @text-caption
                       if !preview_binary && !preview_picture && !editing && !preview_truncated
-                        button "Edit" -> emit(fs_begin_edit)
+                        button "Edit" -> emit(fs_begin_edit, edit_context)
+                          with
+                            disabled=(loading || edit_blocked)
+                            h=22.0
+                            p=4.0
+                            @secondary_action
+                          active bg=surface text=muted border=card_line border-w=1.0 r=6.0
+                          hovered bg=elevated text=fg
+                          pressed bg=subtle
+                      if editing
+                        button "Cancel" -> emit(fs_cancel_edit, edit_context)
                           with
                             h=22.0
                             p=4.0
@@ -452,16 +462,7 @@ component FilesScreen(display_omitted:i64, path:str, listed:bool, entries:[FsEnt
                           hovered bg=elevated text=fg
                           pressed bg=subtle
                       if editing
-                        button "Cancel" -> emit(fs_cancel_edit)
-                          with
-                            h=22.0
-                            p=4.0
-                            @secondary_action
-                          active bg=surface text=muted border=card_line border-w=1.0 r=6.0
-                          hovered bg=elevated text=fg
-                          pressed bg=subtle
-                      if editing
-                        button "Save" -> emit(fs_save_edit)
+                        button "Save" -> emit(fs_save_edit, edit_context)
                           with
                             disabled=loading
                             h=22.0

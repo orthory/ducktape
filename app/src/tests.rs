@@ -6,6 +6,7 @@ use super::*;
 mod canary;
 mod connection;
 mod design;
+mod files_draft;
 mod font_fallback;
 mod forge;
 mod huddle_live;
