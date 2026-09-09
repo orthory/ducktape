@@ -2047,11 +2047,11 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 // ---------- mounting ----------
 
 /// The widget for one module's view, with `props` as the app has them now.
-/// The view is loaded on its own thread, and the tab shows what stage it is
-/// at until then. A load still going or failed when the app points at
-/// another node is started over on that node ([`connected`]); a view that
-/// loaded stays for the process (the swap-in-place on a new deployment is
-/// the next step, behind the `generation` this registry already keeps).
+/// Drawing never starts a load: the view was asked for when its source was
+/// — the staged file at boot ([`booted`]), the node's deployment at connect
+/// ([`connected`]) and at every block that moves it
+/// ([`deployments_checked`]) — on its own thread, and the tab shows what
+/// stage it is at until it is there.
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
     mounted(module).lock().expect("module view lock").props = Some(props);
     drawn(module)
@@ -2090,17 +2090,20 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
 }
 
 /// The node the app is connected to, for the views that come from its
-/// deployments. Told by `backend::connect`; every module view still
-/// loading or failed off the previous node starts over on this one, under
-/// a new generation, so an answer the previous node is still composing
-/// lands nowhere. Returns the loads it started, for a test to wait on.
+/// deployments. Told by `backend::connect`; every module-owned view is
+/// asked of this node, drawn or not: one still loading or failed off the
+/// previous node starts over, under a new generation, so an answer the
+/// previous node is still composing lands nowhere; one seated is reloaded
+/// and swapped in place; one no tab has drawn yet is seated here, so the
+/// tab finds it there or on its way. Returns the loads it started, for a
+/// test to wait on.
 pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
     // THE REGISTRY LOCK FIRST: a connection change and the restart of the
     // views under it are one step. Two callers — `backend::connect` runs on
     // the executor's threads, and two connects can overlap — otherwise
     // interleave into loads asked of one node under the other's revision,
     // every one of which dies at install, and the views stay "Loading".
-    let registry = registry().lock().expect("module views");
+    let mut registry = registry().lock().expect("module views");
     // the client and its revision move as one, and their lock is let go
     // before any view is touched: a load installs under it (see
     // `spawn_load`), and takes the view's own lock inside it. Lock order,
@@ -2112,22 +2115,46 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
         pages_document::source_changed();
         connection.clone()
     };
+    for module in crate::backend::view_source::MODULE_OWNED {
+        registry.entry(module).or_insert_with(Mounted::seat);
+    }
     registry
         .iter()
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
-            let owned = crate::backend::view_source::module_owned(module);
-            match locked.slot {
-                // the desktop's own view is the same on every node
-                Slot::Ready(_) if !owned => return None,
-                // a module-owned view is reloaded from this node's
-                // deployment and swapped in place; the tab keeps showing
-                // the one it has until then
-                Slot::Ready(_) => {}
-                _ => locked.slot = Slot::Loading,
+            let desktop_view = !crate::backend::view_source::module_owned(module);
+            let seated = matches!(locked.slot, Slot::Ready(_));
+            // the desktop's own view is the same on every node: one seated,
+            // or on its way from the staged file, is left alone
+            let left_alone = desktop_view && (seated || locked.in_flight);
+            if left_alone {
+                return None;
+            }
+            // a module-owned view is reloaded from this node's deployment
+            // and swapped in place; the tab keeps showing the one it has
+            // until then
+            if !seated {
+                locked.slot = Slot::Loading;
             }
             let generation = locked.start(None);
             Some(spawn_load(module, mounted, generation, snapshot.clone()))
+        })
+        .collect()
+}
+
+/// The desktop's own views, staged beside the binary: every one is asked
+/// for at boot, on its own thread, so the first draw of any of their tabs
+/// finds the view there or on its way. Told by `main`, before the window.
+/// Returns the loads it started, for a test to wait on.
+pub fn booted() -> Vec<std::thread::JoinHandle<()>> {
+    let mut registry = registry().lock().expect("module views");
+    let snapshot = connection().lock().expect("views rpc").clone();
+    crate::backend::view_source::DESKTOP_OWNED
+        .into_iter()
+        .map(|module| {
+            let mounted = registry.entry(module).or_insert_with(Mounted::seat);
+            let generation = mounted.lock().expect("module view lock").start(None);
+            spawn_load(module, mounted, generation, snapshot.clone())
         })
         .collect()
 }
@@ -2293,6 +2320,22 @@ enum Replacement {
 }
 
 impl Mounted {
+    /// A seat with nothing asked for yet: `Loading` until its source is
+    /// asked, under generation 0, which no load answers for.
+    fn seat() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            slot: Slot::Loading,
+            props: None,
+            generation: 0,
+            hash: None,
+            in_flight: false,
+            wanted: None,
+            waiting_since: None,
+            replacement: Replacement::Preserve,
+            retry: None,
+        }))
+    }
+
     fn replacement_after_wait(&mut self) -> Option<Replacement> {
         let Slot::Ready(old) = &self.slot else {
             return Some(Replacement::Preserve);
@@ -2342,34 +2385,26 @@ fn registry() -> &'static Registry {
     MOUNTED.get_or_init(Mutex::default)
 }
 
+/// The seat of `module`'s view, made on its first ask. Making it asks for
+/// nothing: a load starts at the view's source event, never at a draw, so
+/// a seat a tab is first to ask for waits for the next [`connected`] or
+/// [`deployments_checked`] like every other.
 fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
-    let mut registry = registry().lock().expect("module views");
-    registry
+    registry()
+        .lock()
+        .expect("module views")
         .entry(module)
-        .or_insert_with(|| {
-            let snapshot = connection().lock().expect("views rpc").clone();
-            let mounted = Arc::new(Mutex::new(Mounted {
-                slot: Slot::Loading,
-                props: None,
-                generation: 0,
-                hash: None,
-                in_flight: true,
-                wanted: None,
-                waiting_since: None,
-                replacement: Replacement::Preserve,
-                retry: None,
-            }));
-            spawn_load(module, &mounted, 0, snapshot);
-            mounted
-        })
+        .or_insert_with(Mounted::seat)
         .clone()
 }
 
 /// Loads the view on its own thread — a cold cranelift compile is a second
 /// or more; the window thread shows "Loading" instead of freezing for it —
-/// and installs it only if `mounted` still waits for this very load AND the
-/// app is still on the node it was asked of, both checked under the
-/// connection lock so a move cannot slip between the check and the seat.
+/// and installs it only if `mounted` still waits for this very load AND,
+/// for a module's view, the app is still on the node it was asked of, both
+/// checked under the connection lock so a move cannot slip between the
+/// check and the seat. The desktop's own view is the same on every node:
+/// its load lands wherever the app has moved to meanwhile.
 fn spawn_load(
     module: &'static str,
     mounted: &Arc<Mutex<Mounted>>,
@@ -2385,7 +2420,9 @@ fn spawn_load(
             return;
         }
         locked.in_flight = false;
-        if connection.rev != asked_of.rev {
+        let from_the_node = crate::backend::view_source::module_owned(module);
+        let node_since_left = connection.rev != asked_of.rev;
+        if from_the_node && node_since_left {
             return;
         }
         let Mounted {
@@ -2559,8 +2596,7 @@ fn log_source(module: &str, hash: Option<&[u8; 32]>, state: &str, generation: u6
 /// instance and its `on mount` or restore, `first_frame` the tree a
 /// replacement proves (a fresh view draws its first on the window thread),
 /// `check` the second look at the registry before the seat. `path` is
-/// `tab` for a mount (the tab's first draw), `first` for a load the
-/// connection asked for over an empty slot, `swap` over a view drawn.
+/// `first` for a load over an empty slot, `swap` over a view drawn.
 #[derive(Default)]
 struct LoadTiming {
     path: &'static str,
@@ -2617,8 +2653,7 @@ impl LoadTiming {
 }
 
 /// What the canary runner (`tests::canary`) needs of this registry: the
-/// `view_source` lines as they are logged, the module-owned views mounted
-/// without an app around them, and the hash a slot answers for.
+/// `view_source` lines as they are logged, and the hash a slot answers for.
 #[cfg(test)]
 pub(crate) mod canary {
     use std::sync::{Mutex, mpsc};
@@ -2632,12 +2667,6 @@ pub(crate) mod canary {
         let (sender, receiver) = mpsc::channel();
         TAPS.lock().expect("view_source taps").push(sender);
         receiver
-    }
-
-    pub(crate) fn mount_module_owned() {
-        for module in crate::backend::view_source::MODULE_OWNED {
-            super::mounted(module);
-        }
     }
 
     pub(crate) fn seated_hash(module: &'static str) -> Option<[u8; 32]> {
@@ -2932,9 +2961,7 @@ impl Guest {
             .map_err(|error| error.to_string())?;
         let started = Instant::now();
         let mut timing = LoadTiming {
-            // the mount is the tab's first draw; a later load is one the
-            // connection asked for, over a view drawn or not
-            path: if generation == 0 { "tab" } else { "first" },
+            path: "first",
             ..LoadTiming::default()
         };
         let mut asked = view_source::Asked::default();
@@ -5325,26 +5352,18 @@ pub(crate) mod tests {
     #[test]
     fn a_module_owned_view_never_comes_from_the_staged_file() {
         // a staged file for every one of them, where `views_dir` would look
+        let _turn = blocking_connection_turn();
         let staged = tempfile::tempdir().expect("a staging dir");
         for module in crate::backend::view_source::MODULE_OWNED {
             std::fs::write(staged.path().join(format!("{module}_view.wasm")), b"\0asm")
                 .expect("staged");
         }
-        // SAFETY: the one test that sets this variable; `views_dir` reads it
-        // only for a desktop view, which no test loads through `Guest::load`.
+        // SAFETY: set under the connection turn, the only one a desktop
+        // view — the one reader of this variable — is loaded under;
+        // `every_desktop_view_is_asked_at_boot` sets it too, under its own.
         unsafe { std::env::set_var("DUCKTAPE_VIEWS_DIR", staged.path()) };
         for module in crate::backend::view_source::MODULE_OWNED {
-            let mounted = Arc::new(Mutex::new(Mounted {
-                slot: Slot::Loading,
-                props: None,
-                generation: 0,
-                hash: None,
-                in_flight: true,
-                wanted: None,
-                waiting_since: None,
-                replacement: Replacement::Preserve,
-                retry: None,
-            }));
+            let mounted = Mounted::seat();
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
                 Some("not connected to a node yet"),
@@ -5385,7 +5404,7 @@ pub(crate) mod tests {
         let node_a = node(status(&a), Some(a), Some(hold.clone())).await;
         let node_b = node(status(&b), Some(b), None).await;
 
-        // mounted with no node: fails fast, then A is asked and holds
+        // seated with no node: nothing asked yet; then A is asked and holds
         let mounted = mounted("forge");
         let asked_of_a = connected(&node_a);
         // the app moves to B while A is still composing its answer
@@ -5691,6 +5710,164 @@ pub(crate) mod tests {
         for load in loads {
             load.join().expect("the load");
         }
+    }
+
+    /// A tab's first draw finds its view there or on its way: the connect
+    /// seats and loads every module-owned view, drawn or not, and a draw
+    /// before any node asks for nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_module_owned_view_is_asked_at_connect_not_at_its_tabs_first_draw() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::MODULE_OWNED;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let client = fake_node(FakeDeployment::serving("governance", &a)).await;
+        // a tab drawn before any node: a seat, with nothing on its way
+        drop(drawn("files"));
+        {
+            let seat = mounted("files");
+            let locked = seat.lock().expect("module view lock");
+            assert!(matches!(locked.slot, Slot::Loading));
+            assert!(!locked.in_flight, "the draw started a load");
+            assert_eq!(locked.generation, 0);
+        }
+        let loads = connected(&client);
+        assert_eq!(
+            loads.len(),
+            MODULE_OWNED.len(),
+            "one load per module-owned view, drawn or not"
+        );
+        for module in MODULE_OWNED {
+            let seat = mounted(module);
+            let locked = seat.lock().expect("module view lock");
+            assert_eq!(
+                locked.generation, 1,
+                "{module} was not asked of the node at connect"
+            );
+        }
+        join_all(loads);
+        assert_eq!(slot_assets(&mounted("governance")), ["a.svg"]);
+        for module in MODULE_OWNED {
+            registry().lock().expect("module views").remove(module);
+        }
+    }
+
+    /// The desktop's own views are all asked for at boot, so the first draw
+    /// of any of their tabs finds the view there or on its way — and there,
+    /// once every load is in, for every one of them.
+    #[test]
+    fn every_desktop_view_is_asked_at_boot() {
+        let _turn = blocking_connection_turn();
+        use crate::backend::view_source::DESKTOP_OWNED;
+        let Some(staged) = staged("members") else {
+            return;
+        };
+        // SAFETY: set under the connection turn, the only one a desktop
+        // view is loaded under; `a_module_owned_view_never_comes_from_the_
+        // staged_file` sets it too, under its own turn.
+        unsafe { std::env::set_var("DUCKTAPE_VIEWS_DIR", staged.parent().expect("staging dir")) };
+        let loads = booted();
+        assert_eq!(
+            loads.len(),
+            DESKTOP_OWNED.len(),
+            "one load per desktop view"
+        );
+        for module in DESKTOP_OWNED {
+            let seat = mounted(module);
+            let locked = seat.lock().expect("module view lock");
+            assert_eq!(locked.generation, 1, "{module} was not asked for at boot");
+        }
+        join_all(loads);
+        for module in DESKTOP_OWNED {
+            let seat = mounted(module);
+            let locked = seat.lock().expect("module view lock");
+            assert!(!locked.in_flight, "{module}");
+            match &locked.slot {
+                Slot::Ready(_) => {}
+                Slot::Failed(reason) => panic!("{module} is not there: {reason}"),
+                Slot::Loading | Slot::Empty => panic!("{module}'s load never answered"),
+            }
+        }
+        for module in DESKTOP_OWNED {
+            registry().lock().expect("module views").remove(module);
+        }
+    }
+
+    /// The desktop's own view is the same on every node: its load lands
+    /// though the app moved to a node meanwhile, where a module's view
+    /// asked of the node since left lands nowhere.
+    #[test]
+    fn a_desktop_views_load_lands_after_the_app_moves_where_a_modules_does_not() {
+        let _turn = blocking_connection_turn();
+        let since_left = Connection {
+            client: None,
+            rev: connection().lock().expect("views rpc").rev - 1,
+        };
+        for (module, lands) in [("members", true), ("files", false)] {
+            let seat = Mounted::seat();
+            let generation = seat.lock().expect("module view lock").start(None);
+            spawn_load(module, &seat, generation, since_left.clone())
+                .join()
+                .expect("the load");
+            let locked = seat.lock().expect("module view lock");
+            assert!(!locked.in_flight, "{module}");
+            let landed = !matches!(locked.slot, Slot::Loading);
+            assert_eq!(landed, lands, "{module}");
+        }
+    }
+
+    /// A load starts at a view's source event and never at a draw: the only
+    /// callers of `spawn_load` are the boot, the connect and the block
+    /// check, and the views the shell draws are exactly the ones those ask
+    /// for.
+    #[test]
+    fn a_load_starts_at_a_source_event_never_at_a_draw() {
+        use crate::backend::view_source::{DESKTOP_OWNED, MODULE_OWNED};
+        use std::collections::BTreeSet;
+        let (shell, _tests) = include_str!("module_view.rs")
+            .split_once("\npub(crate) mod tests {")
+            .expect("the tests module");
+        let mut current = "";
+        let mut callers = BTreeSet::new();
+        for line in shell.lines() {
+            let trimmed = line.trim_start();
+            let header = [
+                "pub fn ",
+                "pub(crate) fn ",
+                "pub async fn ",
+                "async fn ",
+                "fn ",
+            ]
+            .into_iter()
+            .find_map(|keyword| trimmed.strip_prefix(keyword));
+            if let Some(header) = header {
+                current = header.split(['(', '<']).next().unwrap_or(header);
+                continue;
+            }
+            if trimmed.contains("spawn_load(") {
+                callers.insert(current);
+            }
+        }
+        assert_eq!(
+            callers,
+            BTreeSet::from(["booted", "connected", "deployments_check"]),
+            "a load started outside the boot, the connect and the block check"
+        );
+        let drawn: BTreeSet<&str> = shell
+            .split("module_view(")
+            .skip(1)
+            .filter_map(|after| after.trim_start().strip_prefix('"'))
+            .filter_map(|name| name.split('"').next())
+            .collect();
+        let asked: BTreeSet<&str> = MODULE_OWNED.into_iter().chain(DESKTOP_OWNED).collect();
+        assert_eq!(
+            drawn, asked,
+            "the views the shell draws are not the views the boot and the connect ask for"
+        );
     }
 
     fn files_facts() -> Option<Vec<u8>> {
