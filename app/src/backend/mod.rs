@@ -411,6 +411,7 @@ pub mod view_source;
 
 pub use agent::*;
 pub use app_dirs::app_log_path;
+pub(crate) use app_dirs::cache_dir;
 pub use bell::*;
 pub use chat::*;
 pub use document::*;
