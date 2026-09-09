@@ -284,12 +284,14 @@ pub(crate) async fn data_plane_signer(
             .key
             .clone()
     };
-    Ok(std::sync::Arc::new(move |method: &str, path: &str, body: &[u8]| {
-        ::node::signed_req::request_headers(&key, method, path, &node_key, body)
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect()
-    }))
+    Ok(std::sync::Arc::new(
+        move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        },
+    ))
 }
 
 /// Take the session seat: the key at `path`, opened under `password`. THE
@@ -329,6 +331,24 @@ pub(crate) async fn seated_request_headers(
         node_key,
         body,
     ))
+}
+
+/// Is a key seated at all? The question a subscription asks BEFORE it builds a
+/// request it would then have to throw away — [`seated_request_headers`] answers
+/// the same thing, but only once there is a path and a node key to sign over.
+pub(crate) async fn can_sign() -> bool {
+    SIGNER.lock().await.is_some()
+}
+
+/// This node's own public key — the bytes a data-plane signature is bound to, so
+/// a proof minted for one node cannot be replayed at another. Read off the
+/// node's own `status`, which is where every other signing caller reads it.
+pub(crate) async fn node_public_key(rpc: &str) -> Result<Vec<u8>, String> {
+    let status = crate::backend::rpc_client(rpc)?
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::backend::hex_decode(&status.public_key)
 }
 
 /// The session seat, when `password` is the one it was taken with. The lock

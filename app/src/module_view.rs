@@ -4646,15 +4646,12 @@ pub(crate) mod tests {
         let [intent] = fired.as_slice() else {
             panic!("one intent, got {fired:?}");
         };
-        assert_eq!(
-            *intent,
-            ModuleViewEvent {
-                kind: "cancel_run".into(),
-                detail: format!(r#"{{"run_id":"{CHIEF_RUN}"}}"#),
-            }
-        );
+        assert_eq!(intent.kind, "cancel_run", "{intent:?}");
         // the app's own half of the seam: the press becomes the intent the
-        // handler signs, carrying the run it names
+        // handler signs, carrying the run it names. Read through the DECODER,
+        // not compared to a JSON string: a run id's separator is an escape on
+        // the wire, so a literal comparison pins the encoder's escaping and
+        // calls it a seam.
         assert!(matches!(chat_intent(intent), crate::ChatIntent::CancelRun));
         assert_eq!(event_text(intent, "run_id"), CHIEF_RUN);
 

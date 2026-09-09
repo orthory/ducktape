@@ -172,6 +172,25 @@ struct Watcher {
     dials: u32,
 }
 
+/// How this device can prove it may read a run's output. ONE discriminant,
+/// decided once per subscription, because the two proofs reach the node by
+/// different routes and a `bool` could not say which to build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// it HOSTS this node: the 0600 service-link token out of the node's own
+    /// workspace, presented on the subscribe frame.
+    Workspace,
+    /// it is pointed at a node it does not host, with the user key unlocked: the
+    /// data-plane signature trio over a `?run=<dispatch>` upgrade. The node
+    /// admits it for that ONE run, and only if that key created it
+    /// (`noded::stream::admit_run_reader`), so a run someone else asked for is
+    /// refused here the same as a stranger's would be.
+    Signed,
+    /// neither. The card still carries the agent, the anchor and a Stop; the
+    /// stdout is out of reach and says so.
+    Nothing,
+}
+
 /// What the poll must do about one pending run's output watcher. ONE tagged
 /// value, because "is there an entry in the map" was the whole question before
 /// and it was the wrong one: a watcher whose socket dropped leaves a FINISHED
@@ -180,8 +199,10 @@ struct Watcher {
 /// of its life.
 #[derive(Debug, PartialEq)]
 enum Dial {
-    /// This device may not read a run's output at all. Never dialed, and never
-    /// re-dialed: it is an entitlement, not a transient failure.
+    /// This device may not read THIS run's output. Never dialed, and never
+    /// re-dialed: it is an entitlement, not a transient failure — whether it was
+    /// settled before the first dial ([`Reach::Nothing`]) or by the node
+    /// refusing the run as another key's.
     Unreadable,
     /// No watcher yet.
     First,
@@ -196,8 +217,13 @@ enum Dial {
 
 /// Decide from the entitlement and the watcher's own LIVENESS — never from its
 /// presence in the map.
-fn dial_for(output_readable: bool, watcher: Option<(bool, u32)>) -> Dial {
-    if !output_readable {
+///
+/// `refused` is the node's answer about THIS run, folded into the row by the
+/// watcher: a proof this device cannot make for this dispatch is as settled as
+/// having no proof at all, so it spends no dials.
+fn dial_for(reach: Reach, refused: bool, watcher: Option<(bool, u32)>) -> Dial {
+    let unreadable = reach == Reach::Nothing || refused;
+    if unreadable {
         return Dial::Unreadable;
     }
     let Some((finished, dials)) = watcher else {
@@ -242,16 +268,20 @@ pub fn chat_live_agents(
             chain_id,
             generation,
         };
-        // WHETHER THIS DEVICE MAY READ A RUN'S STDOUT AT ALL, asked once. The
-        // node's `run-output:<id>` topic is `Admission::Workspace` BY DESIGN
-        // (`noded::stream`: "Write-open / read-gated is deliberate asymmetry"),
-        // so the proof is a token out of the node's own workspace directory —
-        // which an app dialing a REMOTE node does not have. That is not a
-        // transient failure and must not be re-dialed: the pending card still
-        // carries the agent, the room, the anchor and a Stop, and says plainly
-        // that the progress is out of reach. Reading it from a remote app needs
-        // a signed per-run read seam on the node that does not exist yet.
-        let output_readable = workspace_at(&rpc).is_some();
+        // WHICH PROOF THIS DEVICE CAN MAKE, asked once. A device that hosts the
+        // node reads the 0600 token out of its workspace; a device pointed at a
+        // node it does not host signs the upgrade for ONE run, which the node
+        // admits only for the key that created it. With the user key locked
+        // there is no proof to make at all, and that is not a transient failure:
+        // the card still carries the agent, the room, the anchor and a Stop, and
+        // says plainly that the progress is out of reach.
+        let reach = if workspace_at(&rpc).is_some() {
+            Reach::Workspace
+        } else if crate::backend::can_sign().await {
+            Reach::Signed
+        } else {
+            Reach::Nothing
+        };
         let rows: Rows = Arc::default();
         let mut watchers: BTreeMap<String, Watcher> = BTreeMap::new();
         let mut labels: BTreeMap<String, String> = BTreeMap::new();
@@ -297,8 +327,15 @@ pub fn chat_live_agents(
                     .unwrap_or_default()
                     .to_string();
                 seen.push(dispatch.clone());
+                // the node's own answer about this run, as the watcher left it.
+                let refused = rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&dispatch)
+                    .is_some_and(|row| row.status == OUTPUT_UNAVAILABLE);
                 let dial = dial_for(
-                    output_readable,
+                    reach,
+                    refused,
                     watchers
                         .get(&dispatch)
                         .map(|watcher| (watcher.handle.is_finished(), watcher.dials)),
@@ -324,10 +361,9 @@ pub fn chat_live_agents(
                             .get(agent_id)
                             .cloned()
                             .unwrap_or_else(|| agent_id.to_string()),
-                        status: if output_readable {
-                            "Starting".into()
-                        } else {
-                            OUTPUT_UNAVAILABLE.into()
+                        status: match reach {
+                            Reach::Workspace | Reach::Signed => "Starting".into(),
+                            Reach::Nothing => OUTPUT_UNAVAILABLE.into(),
                         },
                         ..LiveAgentRow::default()
                     };
@@ -345,6 +381,7 @@ pub fn chat_live_agents(
                     Watcher {
                         handle: tokio::spawn(watch_live_output(
                             taken.clone(),
+                            reach,
                             dispatch,
                             rows.clone(),
                             sender.clone(),
@@ -406,8 +443,120 @@ async fn agent_labels(client: &RpcClient) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// `/v1/ws?run=<dispatch>` — the signed arm's path AND the exact string its
+/// signature covers. Spelled once: a signature over a different path than the
+/// request carries is a refusal with no diagnosis.
+fn run_reader_path(dispatch: &str) -> String {
+    format!("/v1/ws?run={dispatch}")
+}
+
+/// The upgrade request for one run's output: the ws address this node answers on
+/// plus [`run_reader_path`]'s query, carrying the signature trio as headers.
+///
+/// Built from the same string the signature covered — see the test, and
+/// `app::call::ws_request`, which is this shape for the huddle socket.
+fn run_reader_request(
+    rpc: &str,
+    dispatch: &str,
+    signed: [(&'static str, String); 3],
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut request = format!("{}?run={dispatch}", agent_ws_url(rpc))
+        .into_client_request()
+        .map_err(|error| format!("could not address the node: {error}"))?;
+    for (name, value) in signed {
+        let value = HeaderValue::from_str(&value)
+            .map_err(|error| format!("the signature is not a header value: {error}"))?;
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static(name), value);
+    }
+    Ok(request)
+}
+
+/// Did the node refuse to admit this device as the run's reader, as opposed to
+/// the socket failing?
+///
+/// THE DIFFERENCE DECIDES WHETHER IT IS DIALED AGAIN. A refused upgrade is an
+/// entitlement — asked once, folded as the unavailable status, never re-dialed.
+/// A connection that never got an answer is a flaky socket and is worth the
+/// [`MAX_OUTPUT_DIALS`] budget. Reading both as "unavailable" would have pinned
+/// the card to that message for a node that was merely restarting.
+fn refused_the_reader(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+    matches!(error, Error::Http(response)
+        if response.status() == StatusCode::FORBIDDEN
+            || response.status() == StatusCode::UNAUTHORIZED)
+}
+
+/// Open the node's event socket for ONE run, with whichever proof this device
+/// can make, and subscribe to its output ring.
+///
+/// The two arms present the proof at different moments — the token rides the
+/// subscribe FRAME, the signature rides the UPGRADE — which is why this is one
+/// function over a discriminant and not a token that is sometimes empty.
+async fn open_run_output(
+    rpc: &str,
+    reach: Reach,
+    dispatch: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    let topic = format!("run-output:{dispatch}");
+    let (mut socket, token) = match reach {
+        Reach::Nothing => return Err(OUTPUT_UNAVAILABLE.to_string()),
+        Reach::Workspace => {
+            let (_, workspace) =
+                workspace_at(rpc).ok_or_else(|| "no local workspace for this node".to_string())?;
+            let token = read_link_token(&workspace)?;
+            let (socket, _) = tokio_tungstenite::connect_async(agent_ws_url(rpc))
+                .await
+                .map_err(|error| format!("could not open the node event stream: {error}"))?;
+            (socket, Some(token))
+        }
+        Reach::Signed => {
+            let node_key = crate::backend::node_public_key(rpc).await?;
+            let signed = crate::backend::seated_request_headers(
+                "GET",
+                &run_reader_path(dispatch),
+                &node_key,
+                b"",
+            )
+            .await
+            .ok_or_else(|| OUTPUT_UNAVAILABLE.to_string())?;
+            let request = run_reader_request(rpc, dispatch, signed)?;
+            // THE NODE DECIDES HERE, not on the subscribe: an upgrade it does
+            // not admit as this run's creator is refused as HTTP, so the socket
+            // never opens.
+            let (socket, _) = tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(|error| {
+                    if refused_the_reader(&error) {
+                        OUTPUT_UNAVAILABLE.to_string()
+                    } else {
+                        format!("could not open the node event stream: {error}")
+                    }
+                })?;
+            (socket, None)
+        }
+    };
+    let mut subscribe = serde_json::json!({"op": "subscribe", "topics": [topic]});
+    if let Some(token) = token {
+        subscribe["token"] = serde_json::Value::String(token);
+    }
+    socket
+        .send(Message::Text(subscribe.to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to the agent run: {error}"))?;
+    Ok(socket)
+}
+
 async fn watch_live_output(
     taken: Taken,
+    reach: Reach,
     dispatch: String,
     rows: Rows,
     sender: tokio::sync::mpsc::Sender<LiveAgentNotice>,
@@ -421,18 +570,8 @@ async fn watch_live_output(
         }
     };
     let watch = async {
-        let (_, workspace) =
-            workspace_at(&rpc).ok_or_else(|| "no local workspace for this node".to_string())?;
-        let token = read_link_token(&workspace)?;
-        let (mut socket, _) = tokio_tungstenite::connect_async(agent_ws_url(&rpc))
-            .await
-            .map_err(|error| format!("could not open the node event stream: {error}"))?;
         let topic = format!("run-output:{dispatch}");
-        let subscribe = serde_json::json!({"op": "subscribe", "topics": [topic], "token": token});
-        socket
-            .send(Message::Text(subscribe.to_string()))
-            .await
-            .map_err(|error| format!("could not subscribe to the agent run: {error}"))?;
+        let mut socket = open_run_output(&rpc, reach, &dispatch).await?;
         let mut id = 1i64;
         while let Some(Ok(Message::Text(text))) = socket.next().await {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(text.as_ref()) else {
@@ -464,9 +603,18 @@ async fn watch_live_output(
         Ok::<(), String>(())
     };
     if let Err(message) = watch.await {
+        // AN ENTITLEMENT IS NOT A FAILURE. A node that would not admit this
+        // device as the run's reader leaves the card saying so, in the same
+        // words a device with no proof at all uses — and `dial_for` reads that
+        // status back as settled, so it is asked once and never re-dialed. Every
+        // other failure is an error the reader can act on.
+        let refused = message == OUTPUT_UNAVAILABLE;
         fold(&AgentChatEvent {
             id: 0,
-            kind: "error".into(),
+            // a `status` event IS the row's status line (`live_row_apply`), so
+            // the refusal reads as the working-but-unreadable card; an `error`
+            // keeps its own shape.
+            kind: if refused { "status" } else { "error" }.into(),
             title: message,
             detail: String::new(),
             status: String::new(),
@@ -561,52 +709,144 @@ mod tests {
     /// sat on whatever status it had reached.
     #[test]
     fn a_finished_watcher_is_redialed_until_the_budget_runs_out() {
+        const READABLE: bool = false;
         assert_eq!(
-            dial_for(true, None),
+            dial_for(Reach::Workspace, READABLE, None),
             Dial::First,
             "nothing is watching it yet"
         );
         assert_eq!(
-            dial_for(true, Some((false, 1))),
+            dial_for(Reach::Workspace, READABLE, Some((false, 1))),
             Dial::Watching,
             "a live watcher is left alone — never a second one for one run"
         );
         assert_eq!(
-            dial_for(true, Some((true, 1))),
+            dial_for(Reach::Workspace, READABLE, Some((true, 1))),
             Dial::Again(1),
             "its socket dropped, and the handle sitting in the map said nothing"
         );
         assert_eq!(
-            dial_for(true, Some((true, MAX_OUTPUT_DIALS - 1))),
+            dial_for(
+                Reach::Workspace,
+                READABLE,
+                Some((true, MAX_OUTPUT_DIALS - 1))
+            ),
             Dial::Again(MAX_OUTPUT_DIALS - 1),
             "the last attempt inside the budget"
         );
         assert_eq!(
-            dial_for(true, Some((true, MAX_OUTPUT_DIALS))),
+            dial_for(Reach::Workspace, READABLE, Some((true, MAX_OUTPUT_DIALS))),
             Dial::GaveUp,
             "past the budget the row keeps the failure it last reported"
         );
+        // A REMOTE DEVICE IS DIALED ON THE SAME TERMS. Its proof is a signature
+        // instead of a token, and the node decides per run — so the re-dial
+        // budget is about the socket, exactly as it is for the host device.
+        assert_eq!(
+            dial_for(Reach::Signed, READABLE, None),
+            Dial::First,
+            "a seated key is a proof this device can make"
+        );
+        assert_eq!(
+            dial_for(Reach::Signed, READABLE, Some((true, 1))),
+            Dial::Again(1)
+        );
     }
 
-    /// AN APP WITH NO LOCAL WORKSPACE NEVER DIALS. The node gates
-    /// `run-output:<id>` on a token out of its own workspace directory
-    /// (`Admission::Workspace`, deliberately), so a Mac or any app pointed at a
-    /// REMOTE node cannot read a run's stdout. That is an entitlement, not a
-    /// flaky socket: re-dialing it five times would buy nothing but noise, and
+    /// AN ENTITLEMENT IS ASKED ONCE. Two devices cannot read a run's stdout: one
+    /// with no proof to offer at all (no workspace, key locked), and one whose
+    /// signature the node would not accept for THIS run — it is not the key that
+    /// created it. Neither is a flaky socket, so neither spends a re-dial, and
     /// the card still earns its place from the pending poll alone.
     #[test]
     fn a_device_that_may_not_read_output_never_dials_for_it() {
         for watcher in [None, Some((false, 0)), Some((true, 2))] {
             assert_eq!(
-                dial_for(false, watcher),
+                dial_for(Reach::Nothing, false, watcher),
                 Dial::Unreadable,
-                "no state of a watcher makes an unentitled read dialable"
+                "no state of a watcher makes an unprovable read dialable"
+            );
+            // the node refused this run to a device that CAN sign — someone
+            // else asked for it.
+            assert_eq!(
+                dial_for(Reach::Signed, true, watcher),
+                Dial::Unreadable,
+                "a run that is not this key's stays unread, however the watcher sits"
             );
         }
         assert_eq!(
             OUTPUT_UNAVAILABLE, "Working · progress unavailable from this device",
             "and the row says so, rather than showing a run that looks stalled"
         );
+        // THE REFUSAL IS A STATUS, NOT AN ERROR — that is the byte the poll
+        // reads back to decide it has already asked.
+        let row = live_row_apply(
+            LiveAgentRow::default(),
+            &AgentChatEvent {
+                kind: "status".into(),
+                title: OUTPUT_UNAVAILABLE.into(),
+                ..event("status", "", "")
+            },
+        );
+        assert_eq!(row.status, OUTPUT_UNAVAILABLE);
+    }
+
+    /// THE SIGNATURE COVERS THE PATH THE REQUEST CARRIES. A proof over
+    /// `/v1/ws?run=x` on a request to `/v1/ws` is refused with no diagnosis, so
+    /// the path is spelled ONCE and the request is built from it.
+    #[test]
+    fn a_signed_run_read_carries_the_trio_over_the_exact_path_it_asks_for() {
+        let dispatch = "a".repeat(64);
+        let signed = [
+            ("x-ducktape-key", "k".to_string()),
+            ("x-ducktape-ts", "1".to_string()),
+            ("x-ducktape-sig", "s".to_string()),
+        ];
+        let request =
+            run_reader_request("http://127.0.0.1:8844", &dispatch, signed.clone()).expect("built");
+        assert_eq!(
+            request.uri().to_string(),
+            format!("ws://127.0.0.1:8844/v1/ws?run={dispatch}")
+        );
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            run_reader_path(&dispatch),
+            "the signed string and the asked-for string are one string"
+        );
+        for (name, value) in signed {
+            assert_eq!(request.headers().get(name).unwrap(), value.as_str());
+        }
+    }
+
+    /// A REFUSED UPGRADE AND A DEAD SOCKET ARE DIFFERENT ANSWERS. One is an
+    /// entitlement and is asked once; the other is worth the whole re-dial
+    /// budget. Reading a restarting node as "unavailable from this device" would
+    /// have pinned that message on the card for the rest of the run.
+    #[test]
+    fn only_an_http_refusal_settles_the_entitlement() {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+        let http = |status: StatusCode| {
+            Error::Http(
+                Response::builder()
+                    .status(status)
+                    .body(None)
+                    .expect("built"),
+            )
+        };
+        assert!(refused_the_reader(&http(StatusCode::FORBIDDEN)));
+        assert!(refused_the_reader(&http(StatusCode::UNAUTHORIZED)));
+        assert!(
+            !refused_the_reader(&http(StatusCode::SERVICE_UNAVAILABLE)),
+            "a node that cannot answer yet is not a node that said no"
+        );
+        assert!(
+            !refused_the_reader(&Error::ConnectionClosed),
+            "a dropped socket is re-dialable"
+        );
+        assert!(!refused_the_reader(&Error::Io(std::io::Error::other(
+            "down"
+        ))));
     }
 
     /// THE CONNECTION GUARD, and the endpoint is the WEAKEST third of it. A
