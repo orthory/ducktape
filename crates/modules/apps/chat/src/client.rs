@@ -2198,9 +2198,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_directory_names_programs_and_unifies_a_readers_keys() {
-        let account = |number, name: &str, keys: Vec<Vec<u8>>| identity::AccountView {
+    /// a key-held account as the directory reads it: `keys` is its
+    /// association, one ed25519 key per entry.
+    fn account(number: u64, name: &str, keys: Vec<Vec<u8>>) -> identity::AccountView {
+        identity::AccountView {
             number,
             name: name.into(),
             control: identity::Control::Keys,
@@ -2216,7 +2217,11 @@ mod tests {
             avatar: None,
             bio: None,
             updated_at: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn account_directory_names_programs_and_unifies_a_readers_keys() {
         let human = account(1, "same", vec![vec![1; 32], vec![2; 32]]);
         let mut program = account(2, "bot", Vec::new());
         program.control = identity::Control::Program {

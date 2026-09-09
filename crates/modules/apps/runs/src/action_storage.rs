@@ -177,6 +177,10 @@ impl RunsModule {
         prepared: Prepared,
     ) -> Result<(), Error> {
         let Prepared { message, receipt } = prepared;
+        let lane = match &scope {
+            RequestScope::Session { .. } => LaneKind::Live,
+            RequestScope::Result => LaneKind::Final,
+        };
         let payload = canonical_action_payload(
             sdk::wire::decode(&message.payload).map_err(Error::Module)?,
         );
@@ -249,13 +253,24 @@ impl RunsModule {
         self.receipts.stage(
             item_key(item),
             sdk::wire::encode(&QueueItem {
-                request_id: id,
+                request_id: id.clone(),
                 next: None,
             }),
         )?;
         self.receipts
             .stage(QUEUE_KEY.into(), sdk::wire::encode(&queue))?;
         self.staged_next_action_item = Some(next);
+        // the one writer of a run's actions is the one writer of its `Acted`
+        // facts: whatever lane admitted the request, the journal carries it.
+        self.record(
+            &entry.run_id,
+            RunFact::Acted {
+                request_id: id,
+                lane,
+                operation: record.view.operation.clone(),
+                result: record.view.result.clone(),
+            },
+        );
         Ok(())
     }
 

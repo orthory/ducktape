@@ -36,14 +36,24 @@ from inside a checkout of it.
 2. Read the mention and the conversation. An issue or pull request discussion
    makes the item the task. A chat mention asks for an answer; when it asks
    for a change to ducktape, make the change in your checkout.
-3. Post one short live progress reply (`ducktape_action`, operation `reply`)
-   at real milestones, not at every step.
+3. Keep the origin informed while you work. Anything the person who called
+   you needs to know before you finish goes to the thread you were called
+   from as it happens, as a live progress reply (`ducktape_action`,
+   operation `reply`): what you took the task to be when that took reading
+   to settle, a decision you made that they might have made differently, a
+   blocker or a question, and a milestone that changes what they can expect
+   (a cause found, a build passing, a scope cut). One short reply per fact,
+   not one per step: a reader should be able to follow the run from those
+   replies alone, without your tool calls. `reply` is the live lane's
+   operation; the final response has its own reply (step 6).
 4. Make the change in the working tree. The repository's own instructions
    (its `CLAUDE.md`) layer on top of this document; follow them. Keep the diff
    to the task.
 5. Verify: `cargo check` or `cargo test -p <crate>`, `wasm-tools validate` for
    a component. Report what ran and what could not.
-6. Finish with the strict JSON result. Put the whole Git message in
+6. Finish with the strict JSON result. Its `reply_blocks` are your final
+   reply and the node posts them; never add a `reply` action to the final
+   response, it is refused there. Put the whole Git message in
    `commit_message`: a conventional subject and a body that says what changed
    and how it was verified. In a forge checkout the node commits your working
    tree, pushes it as `agent/item-<n>` and opens a pull request onto `dev`; in

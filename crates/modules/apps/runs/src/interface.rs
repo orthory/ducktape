@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    ActionEnvelope, DelegationRequest, ModelRecord, OperationView, ReplyBlock, ResourceCaps,
+    ActionEnvelope, DelegationRequest, LaneKind, ModelRecord, OperationView, ReplyBlock,
+    ResourceCaps,
 };
 use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
@@ -116,10 +117,16 @@ pub enum RunFact {
         /// lowercase key hex of the lease holder.
         holder: String,
     },
-    /// the bound session admitted one live action.
+    /// the run staged one action: a catalog operation it invoked, or an
+    /// effect this module authored for it (its own reply, its forge sink).
+    /// `lane` says which admission it came through — the session signer
+    /// mid-run, or the delivered response — and `result` is the receipt the
+    /// preparer minted (the destination it resolved, the ids it minted).
     Acted {
         request_id: String,
+        lane: LaneKind,
         operation: String,
+        result: serde_json::Value,
     },
     /// the dispatch plane delivered the run's result: the run is over.
     Settled {
