@@ -138,9 +138,18 @@ view replacement uses the module ceremony, not a changed founding directory.
 
 For a breaking schema/ABI/state change, archive diagnostics and run
 `reset-network --reason "<specific breaking change>"`, then repeat rollout.
-Reset stops all three owned services before removing only their fixed
-`/var/lib/ducktape-view-lane/network` directories. It preserves owner markers,
-release files and the workstation record/journal. It never destroys a CT.
+Reset stops all three owned services, then renames each fixed `network`
+directory to a unique sibling `network-archive-<timestamp>-<uuid>` under
+`/var/lib/ducktape-view-lane`. It never deletes network state, release files,
+owner markers or CTs. Before stopping services it saves an exclusive
+`<record>.before-reset-<token>` copy; the journal records that backup, the remote
+archive path and each verified node rename. Only three successful renames clear
+the active release metadata. On partial failure the old record remains intact.
+
+To roll back, keep all three services stopped, preserve any new network directory,
+and rename each recorded archive back to `network` without overwriting another
+directory. Restore the saved record and its release symlink on each node before
+starting services together. Do not mix nodes from different reset attempts.
 
 Use ordinary SSH forwards through the Proxmox host to each recorded CT's
 `127.0.0.1:8844`, with the public key installed at provision. Keep host-key

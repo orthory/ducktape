@@ -1,3 +1,5 @@
+// This fixture exercises the source registry, not the app navigation consumers.
+#[allow(dead_code, unused_imports)]
 #[path = "../../../../../../app/src/pages/guest_document.rs"]
 mod source_registry;
 // The actual generated guest, driven through its editor transaction handlers.

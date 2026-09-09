@@ -5119,20 +5119,11 @@ pub(crate) mod tests {
         let staged = staged("files").expect("the actual Files Wasm fixture is required");
         let mut guest = Guest::load_from("files", &staged).expect("Files loads");
         let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
-        // THE DRAFT'S BYTES ARE THE SEED'S. This harness admits a keystroke
-        // (the guest hears it and marks the draft unsaved) but cannot replay
-        // it into the held document the way the native widget does — the
-        // runtime keeps that replay to itself — so the retained bytes stay
-        // the seed. That is what the invariant needs: a draft that survived
-        // the reconnect still reads the ORIGINAL seed, not the replacement
-        // the new preview carries.
-        let original_text = facts["preview_text"].as_str().unwrap().to_owned();
+        let original_text = format!("X{}", facts["preview_text"].as_str().unwrap());
         let props = |facts: &serde_json::Value| Some(serde_json::to_vec(facts).unwrap());
-        guest.redraw(&None);
-        guest.redraw(&props(&facts));
+        settle_documents(&mut guest, &None);
+        settle_documents(&mut guest, &props(&facts));
         guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-        // the editor's document must have crossed before a keystroke can
-        // land in it
         settle_documents(&mut guest, &props(&facts));
         let mut editor = None;
         guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
@@ -5142,21 +5133,60 @@ pub(crate) mod tests {
         });
         let (key, reset) = editor.expect("editable document");
         guest.deliver(Output::EditorAction {
-            key,
+            key: key.clone(),
             reset,
             action: iced::widget::text_editor::Action::Edit(
                 iced::widget::text_editor::Edit::Insert('X'),
             ),
         });
+        // EditorAction admits native work; the mounted editor executes it.
+        use iced::advanced::renderer::Headless;
+        use iced_test::runtime::{UserInterface, user_interface};
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let mut ui = UserInterface::build(
+            guest.render(),
+            iced::Size::new(1100.0, 700.0),
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut outputs = Vec::new();
+        ui.update(
+            &[Event::Window(
+                window::Event::RedrawRequested(Instant::now()),
+            )],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut outputs,
+        );
+        drop(ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::EditorBatch(_)))
+        );
+        for output in outputs {
+            guest.deliver(output);
+        }
         settle_documents(&mut guest, &props(&facts));
+        assert_eq!(
+            guest.inputs.editor_document(&key).unwrap().text(),
+            original_text,
+            "the mounted editor must apply X before navigation"
+        );
         let old_save = button_message(&guest, "Save");
         facts["network_scope"] = "network-b".into();
         facts["context"] = "connection-b".into();
         facts["preview_path"] = "/shared/other.md".into();
         facts["preview_text"] = "B source".into();
-        guest.redraw(&props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         guest.deliver(Output::Activate(old_save));
-        guest.redraw(&props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         assert!(guest.intents.is_empty(), "an old Save cannot target B");
         assert!(
             texts(&guest)
@@ -5185,7 +5215,7 @@ pub(crate) mod tests {
         };
         assert_eq!(draft_text(&guest), original_text);
         guest.deliver(Output::Activate(button_message(&guest, "Save")));
-        guest.redraw(&props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         let saves = std::mem::take(&mut guest.intents);
         assert_eq!(saves.len(), 1, "one Save");
         let save = &saves[0];
@@ -5199,7 +5229,7 @@ pub(crate) mod tests {
             "context": payload["context"], "namespace": payload["namespace"], "request": payload["request"],
             "success": false, "message": "The file changed elsewhere. Your edits are kept."
         }], "overflow":""});
-        guest.redraw(&props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         assert_eq!(draft_text(&guest), original_text);
         assert!(
             texts(&guest)

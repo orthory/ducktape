@@ -26,7 +26,7 @@ verify = ["provider-host/verify"]
 
 [dependencies]
 # Static Ice view readiness; no graphics or guest execution.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "925a4fc3612cae0345197f1c11ccefd631a2df75", features = ["manifest"] }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1533d98e9db3ccb3c265c74612271f7ace59067e", features = ["manifest"] }
 wasmtime.workspace = true
 
 node-work = { workspace = true }

@@ -246,7 +246,7 @@ fn an_edit_is_seeded_from_the_message_and_leaves_as_the_edited_text() {
 
 /// What the host will lay out: the frame after the wire's own bounds.
 fn through_the_wire(mut frame: Frame) -> Frame {
-    ui_lang_guest::wire::sanitize(&mut frame).expect("the frame is within the wire's bounds");
+    ui_lang_guest::wire::sanitize(&mut frame).expect("the chat frame satisfies wire bounds");
     frame
 }
 
