@@ -260,6 +260,11 @@ pub type WriteAuth =
 /// the thin public client and depends on no node internals.
 pub const OPERATOR_TOKEN_HEADER: &str = "x-ducktape-admin-token";
 
+/// The authenticated read lane's path — ONE spelling, because a request's
+/// signature binds the path it was minted for. A second spelling is a
+/// signature that verifies against nothing.
+pub const QUERY_READER_PATH: &str = "/v1/query/reader";
+
 #[derive(Serialize)]
 struct QueryRequest<'a, Q> {
     target: &'a str,
@@ -418,6 +423,47 @@ impl Client {
             .send()
             .await
             .map_err(|error| Error::new(format!("{target} query failed: {error}")))?;
+        decode_json(response).await
+    }
+
+    /// Submit one typed module query AS THE HOLDER OF THIS CLIENT'S SIGNING
+    /// KEY (`POST /v1/query/reader`) and decode its typed reply.
+    ///
+    /// [`Client::query`]'s authenticated sibling. The open lane proves nothing
+    /// about who is asking, so a module answering it sees the system origin and
+    /// must refuse protected content; this lane carries the signer's verified
+    /// key to the module as its origin, which is what lets a mailbox or a
+    /// conversation page be served at all.
+    ///
+    /// The signer is REQUIRED, not optional: the operator credential is the
+    /// node's own and would ask as somebody else. Without a [`WriteAuth`] this
+    /// refuses rather than falling back — an anonymous read of protected state
+    /// is a refusal wearing an empty answer's clothes.
+    pub async fn query_as_reader<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        target: &str,
+        query: &Q,
+    ) -> Result<R> {
+        let sign = self.write_auth.as_ref().ok_or_else(|| {
+            Error::new("an authenticated read needs this device's key; unlock it and try again")
+        })?;
+        // serialized ONCE: the bytes that are signed are the bytes that are
+        // sent. Re-serializing for the wire would let map ordering or float
+        // formatting differ from what the signature covered, and the node
+        // would reject a read this caller did in fact authorize.
+        let body = serde_json::to_vec(&QueryRequest { target, query })
+            .map_err(|error| Error::new(format!("{target} query did not encode: {error}")))?;
+        let request = self
+            .http
+            .post(self.url(QUERY_READER_PATH.trim_start_matches('/'))?)
+            .header("content-type", "application/json")
+            .body(body.clone());
+        let response = sign("POST", QUERY_READER_PATH, &body)
+            .into_iter()
+            .fold(request, |request, (name, value)| request.header(name, value))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("{target} authenticated query failed: {error}")))?;
         decode_json(response).await
     }
 
