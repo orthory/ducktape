@@ -3468,7 +3468,10 @@ impl Guest {
             // requests and cancels are still to route
             self.staged = false;
         } else {
-            let quiet = self.ticks > 0 && !self.frame.busy && self.pending.is_empty();
+            let quiet = self.ticks > 0
+                && !self.frame.busy
+                && self.pending.is_empty()
+                && self.inputs.editor_documents_status() != Ok(false);
             if quiet {
                 return false;
             }
@@ -3497,7 +3500,10 @@ impl Guest {
             }
         }
         self.fault.is_none()
-            && (self.frame.busy || !self.pending.is_empty() || self.pages_document.is_some())
+            && (self.frame.busy
+                || !self.pending.is_empty()
+                || self.pages_document.is_some()
+                || self.inputs.editor_documents_status() == Ok(false))
     }
 
     /// Routes one request: the props subscription is answered from what the
@@ -5638,11 +5644,27 @@ pub(crate) mod tests {
                     return;
                 }
             }
-            panic!("Pages document did not settle");
+            panic!(
+                "Pages document did not settle: frame busy={} pending={:?} staged={:?} source_pending={} documents={:?} texts={:?}",
+                guest.frame.busy,
+                guest.pending,
+                guest.staged,
+                guest.pages_document.is_some(),
+                guest.inputs.editor_documents_status(),
+                texts(guest)
+            );
         };
         let mut guest = Guest::load_from("pages", &path).unwrap();
         settle(&mut guest, &props);
-        let document = guest.inputs.editor_document("PagesView/document").unwrap();
+        let mut keys = Vec::new();
+        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+            if let wire::Node::Editor { key, .. } = node {
+                keys.push(key.clone());
+            }
+        });
+        assert_eq!(keys.len(), 1, "Pages has one canonical document editor");
+        let editor_key = keys.pop().unwrap();
+        let document = guest.inputs.editor_document(&editor_key).unwrap();
         assert_eq!(
             document.text(),
             original,
@@ -5666,7 +5688,7 @@ pub(crate) mod tests {
         );
         let before_theme = guest
             .inputs
-            .editor_document("PagesView/document")
+            .editor_document(&editor_key)
             .unwrap()
             .reference();
         facts["dark"] = true.into();
@@ -5677,7 +5699,7 @@ pub(crate) mod tests {
         assert_eq!(
             guest
                 .inputs
-                .editor_document("PagesView/document")
+                .editor_document(&editor_key)
                 .unwrap()
                 .reference(),
             before_theme
@@ -5699,27 +5721,6 @@ pub(crate) mod tests {
             comment_badge,
             "theme/comment props did not rebuild the prepared presentation"
         );
-        for line in [2, 0] {
-            guest.deliver(Output::MoveCaret {
-                key: "PagesView/document".into(),
-                reset: before_theme.reset,
-                line,
-                column: 0,
-            });
-            settle(&mut guest, &props);
-            let document = guest.inputs.editor_document("PagesView/document").unwrap();
-            assert_eq!(document.reference().cursor.position.line, line as u32);
-            assert_eq!(
-                document.text(),
-                original,
-                "caret-only change edited the document"
-            );
-            assert!(
-                !texts(&guest)
-                    .iter()
-                    .any(|text| text.starts_with("Formatting is unavailable"))
-            );
-        }
         guest.intents.clear();
         use iced::advanced::renderer::Headless;
         use iced_test::runtime::{UserInterface, user_interface};
@@ -5736,12 +5737,71 @@ pub(crate) mod tests {
             user_interface::Cache::default(),
             &mut renderer,
         );
-        ui.operate(
-            &renderer,
-            &mut iced::advanced::widget::operation::focusable::focus(
-                iced::widget::Id::from("PagesView/document"),
-            ),
+        struct EditorBounds<'a>(&'a str, Option<Rectangle>, bool);
+        impl Operation for EditorBounds<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from(self.0.to_owned())) {
+                    self.1 = Some(bounds);
+                    self.2 = state.is_focused();
+                }
+            }
+        }
+        let mut bounds = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut bounds);
+        let bounds = bounds.1.expect("Pages document has native editor bounds");
+        // Click inside the first Korean/emoji line, beyond its left padding.
+        let pointer = mouse::Cursor::Available(iced::Point::new(bounds.x + 88.0, bounds.y + 10.0));
+        let mut outputs = Vec::new();
+        ui.update(
+            &[
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            pointer,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut outputs,
         );
+        let mut clicked_focus = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut clicked_focus);
+        assert!(clicked_focus.2, "pointer did not focus the editor");
+        for output in outputs {
+            guest.deliver(output);
+        }
+        settle(&mut guest, &props);
+        let cursor = guest
+            .inputs
+            .editor_document(&editor_key)
+            .unwrap()
+            .reference()
+            .cursor;
+        assert_eq!(
+            cursor.position.line, 0,
+            "pointer missed the first rendered line"
+        );
+        let insertion = cursor.position.column as usize;
+        assert!(
+            insertion > 0 && insertion <= original.find('\n').unwrap(),
+            "pointer left the caret at the origin or another line"
+        );
+        assert!(original.is_char_boundary(insertion));
+        assert!(cursor.selection.is_none());
+        let mut expected = original.clone();
+        expected.insert_str(insertion, "X");
+        guest.intents.clear();
+        // Rebuild after the click: the native caret must survive the guest echo.
+        ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+        let mut rebuilt_focus = EditorBounds(&editor_key, None, false);
+        ui.operate(&renderer, &mut rebuilt_focus);
+        assert!(rebuilt_focus.2, "guest echo lost native editor focus");
         let key = |value: &str, modifiers| {
             Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Character(value.into()),
@@ -5763,14 +5823,32 @@ pub(crate) mod tests {
             &mut iced::advanced::clipboard::Null,
             &mut outputs,
         );
-        assert!(
-            !outputs.is_empty(),
-            "native focused editor did not receive typing"
-        );
-        for output in outputs {
-            guest.deliver(output);
+        // Native redraws replay input queued behind the pointer transaction.
+        // This is the app event loop, not a focus repair or a synthetic edit.
+        for _ in 0..32 {
+            for output in outputs.drain(..) {
+                guest.deliver(output);
+            }
+            settle(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            if !guest.inputs.editor_transactions_pending() {
+                break;
+            }
+            ui.update(
+                &[Event::Window(
+                    window::Event::RedrawRequested(Instant::now()),
+                )],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
         }
-        settle(&mut guest, &props);
+        assert_eq!(
+            guest.inputs.editor_document(&editor_key).unwrap().text(),
+            expected,
+            "native typing did not retain the clicked caret after redraw replay"
+        );
         let delayed = guest
             .intents
             .iter()
@@ -5784,7 +5862,10 @@ pub(crate) mod tests {
             "alpha".into(),
         );
         assert!(accepted.accepted);
-        assert_eq!(accepted.text, format!("X{original}"));
+        assert_eq!(
+            accepted.text, expected,
+            "typing did not retain the clicked caret"
+        );
         assert_eq!(
             pages_document::source(connection, "network-a", "alpha", &accepted.text).unwrap(),
             source,
@@ -5799,11 +5880,7 @@ pub(crate) mod tests {
             };
             settle(old, &props);
             assert!(old.settled(), "notification left a pending task");
-            let reference = old
-                .inputs
-                .editor_document("PagesView/document")
-                .unwrap()
-                .reference();
+            let reference = old.inputs.editor_document(&editor_key).unwrap().reference();
             (old.snapshot().unwrap(), reference)
         };
         let bytes = std::fs::read(&path).unwrap();
@@ -5814,7 +5891,7 @@ pub(crate) mod tests {
         assert_eq!(
             successor
                 .inputs
-                .editor_document("PagesView/document")
+                .editor_document(&editor_key)
                 .unwrap()
                 .reference(),
             reference
@@ -5822,7 +5899,7 @@ pub(crate) mod tests {
         assert_eq!(
             successor
                 .inputs
-                .editor_document("PagesView/document")
+                .editor_document(&editor_key)
                 .unwrap()
                 .text(),
             accepted.text
@@ -5851,11 +5928,7 @@ pub(crate) mod tests {
         };
         settle(restored, &props);
         assert_eq!(
-            restored
-                .inputs
-                .editor_document("PagesView/document")
-                .unwrap()
-                .text(),
+            restored.inputs.editor_document(&editor_key).unwrap().text(),
             accepted.text
         );
         assert!(
@@ -5866,11 +5939,7 @@ pub(crate) mod tests {
         let mut fresh = Guest::load_from("pages", &path).unwrap();
         settle(&mut fresh, &props);
         assert_eq!(
-            fresh
-                .inputs
-                .editor_document("PagesView/document")
-                .unwrap()
-                .text(),
+            fresh.inputs.editor_document(&editor_key).unwrap().text(),
             accepted.text,
             "fresh guest bootstrap discarded unsaved edits"
         );
@@ -5901,11 +5970,7 @@ pub(crate) mod tests {
         }
         settle(restored, &props);
         assert_eq!(
-            restored
-                .inputs
-                .editor_document("PagesView/document")
-                .unwrap()
-                .text(),
+            restored.inputs.editor_document(&editor_key).unwrap().text(),
             original,
             "native Undo after no-init restore must preserve guest history"
         );

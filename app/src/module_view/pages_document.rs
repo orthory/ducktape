@@ -161,7 +161,8 @@ fn accept_inner(
     if guest.pages_instance.as_deref() != Some(envelope.instance.as_str()) {
         return None;
     }
-    let document = guest.inputs.editor_document("PagesView/document")?;
+    let key = editor_key(guest.frame.root.as_ref()?, &reference)?;
+    let document = guest.inputs.editor_document(key)?;
     if document.reference() != reference {
         return None;
     }
@@ -224,4 +225,30 @@ pub(super) fn emit(guest: &mut Guest, id: u64, payload: &[u8]) {
         kind: "edited".into(),
         detail,
     });
+}
+
+/// Match the accepted document, independent of component/slot expansion paths.
+fn editor_key<'a>(
+    root: &'a wire::Node,
+    reference: &wire::editor_document::EditorDocumentRef,
+) -> Option<&'a str> {
+    fn visit<'a>(
+        node: &'a wire::Node,
+        reference: &wire::editor_document::EditorDocumentRef,
+        found: &mut Option<&'a str>,
+    ) -> bool {
+        if let wire::Node::Editor { key, document, .. } = node
+            && document == reference
+            && found.replace(key.as_str()).is_some()
+        {
+            return false;
+        }
+        node.children()
+            .iter()
+            .all(|child| visit(child, reference, found))
+    }
+    let mut found = None;
+    visit(root, reference, &mut found)
+        .then_some(found)
+        .flatten()
 }
