@@ -1509,7 +1509,8 @@ fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_
             actions: vec![action],
             commit_message: None,
         };
-        let result = block_on(m.validate_response(&ctx, &run, &entry, Lane::Settle, response));
+        let result =
+            block_on(m.validate_response(&ctx, &run, &entry, Lane::Session(0), response));
         assert_eq!(result.is_ok(), accepted, "{result:?}");
         if let Err(reason) = result {
             assert!(reason.contains("original job claim"), "{reason}");
@@ -1643,7 +1644,9 @@ fn every_lifecycle_op_stamps_the_facts_it_committed_and_nothing_else() {
             run_id: run.clone(),
             fact: RunFact::Acted {
                 request_id: crate::action_request_id(&run, "ack"),
+                lane: LaneKind::Live,
                 operation: crate::OP_REACT.into(),
+                result: serde_json::json!({"channel_id": "general", "seq": 2, "emoji": "👀"}),
             },
         }]
     );
@@ -1660,19 +1663,35 @@ fn every_lifecycle_op_stamps_the_facts_it_committed_and_nothing_else() {
         &result_event(&run, Err("worker  exploded".into())),
     )
     .unwrap();
+    // the failure reply is an action the run staged, on the final lane: it
+    // enters the journal after the settle fact that produced it.
     assert_eq!(
         ctx.journal(),
-        vec![RunEvent {
-            run_id: run.clone(),
-            fact: RunFact::Settled {
-                outcome: RunOutcome::Failed,
-                reason: Some("worker exploded".into()),
-                degraded: false,
-                executing_node: "unknown".into(),
-                output_ref: None,
-                pr_number: None,
+        vec![
+            RunEvent {
+                run_id: run.clone(),
+                fact: RunFact::Settled {
+                    outcome: RunOutcome::Failed,
+                    reason: Some("worker exploded".into()),
+                    degraded: false,
+                    executing_node: "unknown".into(),
+                    output_ref: None,
+                    pr_number: None,
+                },
             },
-        }]
+            RunEvent {
+                run_id: run.clone(),
+                fact: RunFact::Acted {
+                    request_id: format!("result/{}/0", dispatch_id_for(&run)),
+                    lane: LaneKind::Final,
+                    operation: crate::OP_REPLY.into(),
+                    result: serde_json::json!({
+                        "destination": {"channel_id": "general", "kind": "chat", "thread": 2},
+                        "id": crate::reply_message_id(&run),
+                    }),
+                },
+            },
+        ]
     );
     commit(&mut m);
     assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);

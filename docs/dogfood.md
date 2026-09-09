@@ -306,7 +306,7 @@ The model's final JSON response can include:
 {
   "reply_blocks": [{"kind":"paragraph","text":"Replacement committed; deployment requested."}],
   "commit_message": "Update hello to count by one hundred",
-  "actions": [{"update_module": {
+  "actions": [{"operation": "modules.update", "input": {
     "module_id": "hello",
     "artifact": "hello.module",
     "code_hash": "<canonical artifact SHA-256 in lowercase hex>",

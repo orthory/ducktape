@@ -236,7 +236,7 @@ fn specs() -> Vec<Spec> {
     vec![
         Spec {
             name: OP_REPLY,
-            description: "Reply where this run was called: its chat thread, Pages block or comment thread, or job discussion. Runs resolves the destination from the committed source; a source-less run cannot reply. Chat sources need chat.post, Pages sources pages.comment plus the page in pages_write, job sources jobs.comment.",
+            description: "Reply mid-run where this run was called: its chat thread, Pages block or comment thread, or job discussion. Runs resolves the destination from the committed source; a source-less run cannot reply. Chat sources need chat.post, Pages sources pages.comment plus the page in pages_write, job sources jobs.comment. Live only: the final response's reply_blocks are the run's final reply, posted by runs itself.",
             grant: Grant::Source,
             target: None,
             input: object(json!({"content": content_schema()}), &["content"]),
@@ -244,7 +244,7 @@ fn specs() -> Vec<Spec> {
                 json!({"destination": {"type": "object"}, "id": {"type": "string"}}),
                 &["destination", "id"],
             ),
-            lanes: LIVE_AND_FINAL,
+            lanes: LIVE_ONLY,
         },
         Spec {
             name: OP_REACT,

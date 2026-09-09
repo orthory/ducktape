@@ -94,7 +94,7 @@ pub struct RunView {
     pub requester: RunOrigin,
     pub dispatched: Stamp,
     pub state: RunState,
-    /// live actions the run's sessions were admitted.
+    /// actions the run staged, on either lane.
     pub actions: u64,
     /// the forge PR the run opened or updated, once authenticated.
     pub pr_number: Option<u64>,
@@ -521,7 +521,9 @@ mod tests {
                         RUN,
                         RunFact::Acted {
                             request_id: request.into(),
+                            lane: crate::LaneKind::Live,
                             operation: "chat.react".into(),
+                            result: serde_json::Value::Null,
                         },
                     )],
                 ),
