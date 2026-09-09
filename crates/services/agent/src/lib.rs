@@ -285,7 +285,8 @@ impl Sessions {
             | wire::Command::MsgUnbind { .. }
             | wire::Command::MsgDeliver(_)
             | wire::Command::MsgTime { .. }
-            | wire::Command::MsgRetain { .. }) => {
+            | wire::Command::MsgRetain { .. }
+            | wire::Command::MsgReplay { .. }) => {
                 misrouted(&command);
                 None
             }
@@ -660,6 +661,7 @@ fn misrouted(command: &wire::Command) {
         wire::Command::MsgDeliver(_) => "msg_deliver",
         wire::Command::MsgTime { .. } => "msg_time",
         wire::Command::MsgRetain { .. } => "msg_retain",
+        wire::Command::MsgReplay { .. } => "msg_replay",
         wire::Command::TermCreate(_)
         | wire::Command::TermInput { .. }
         | wire::Command::TermResize { .. }

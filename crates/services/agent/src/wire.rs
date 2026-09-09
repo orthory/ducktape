@@ -100,6 +100,25 @@ pub enum Command {
         conversation: String,
         floor_seq: u64,
     },
+    /// re-report every delivery state this daemon durably holds for one
+    /// binding, oldest sequence first. Answered by one [`Event::MsgDelivery`]
+    /// per tracked item.
+    ///
+    /// A receipt is a fact only this daemon has: the node cannot re-derive one,
+    /// and nothing re-sends it, so a receipt lost between here and the node's
+    /// collaboration half is lost for good — the network would read `Queued`
+    /// forever for a message a provider accepted. This is the reconciliation
+    /// that closes that, and the journal is what makes it possible: the states
+    /// are on disk, so a replay reports what was OBSERVED rather than what
+    /// anyone remembers.
+    ///
+    /// It offers nothing to a provider and changes nothing here. It is a read
+    /// of durable state, and it is idempotent: the receiving side refuses a
+    /// transition already made.
+    MsgReplay {
+        conversation: String,
+        participant: String,
+    },
 }
 
 /// everything the daemon needs to spawn one session. The node has already
@@ -645,6 +664,10 @@ mod tests {
             Command::MsgRetain {
                 conversation: "conv-1".into(),
                 floor_seq: 12,
+            },
+            Command::MsgReplay {
+                conversation: "conv-1".into(),
+                participant: "p-recipient".into(),
             },
         ] {
             let text = serde_json::to_string(&command).expect("encodes");

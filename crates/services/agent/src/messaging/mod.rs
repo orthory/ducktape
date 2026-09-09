@@ -376,6 +376,10 @@ impl Deliveries {
                 conversation,
                 floor_seq,
             } => self.retain(&conversation, floor_seq).await,
+            Messaging::Replay {
+                conversation,
+                participant,
+            } => self.replay(&conversation, &participant).await,
         }
     }
 
@@ -414,6 +418,56 @@ impl Deliveries {
                 %error,
                 "the outbox could not be compacted; it keeps every record it has"
             ),
+        }
+    }
+
+    /// Re-report every delivery state this daemon durably holds for one
+    /// binding, oldest sequence first.
+    ///
+    /// A delivery state is a fact only this process observed. The node cannot
+    /// re-derive one and nothing else re-sends it, so a receipt lost on the way
+    /// there is lost for good — the network reads `Queued` forever for a
+    /// message a provider took. This is how it is recovered, and it reports
+    /// what is ON DISK rather than what anyone remembers.
+    ///
+    /// It offers nothing to a provider, claims nothing and writes nothing. A
+    /// state already committed upstream is refused there as a transition
+    /// already made, so replaying more than was lost costs a refused op and
+    /// never a duplicated instruction.
+    async fn replay(&self, conversation: &str, participant: &str) {
+        let tracked = match self.0.outbox.tracked(conversation, participant).await {
+            Ok(tracked) => tracked,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    conversation = %conversation,
+                    reason = "outbox_unreadable",
+                    %error,
+                    "cannot replay delivery states"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            target: "ducktape::collab",
+            conversation = %conversation,
+            participant = %participant,
+            items = tracked.len(),
+            "replaying durable delivery states"
+        );
+        for (seq, entry) in tracked {
+            self.0
+                .emit(wire::Event::MsgDelivery {
+                    conversation: conversation.to_string(),
+                    participant: entry.participant.clone(),
+                    seq,
+                    binding_generation: entry.binding_generation,
+                    sender: entry.sender.clone(),
+                    message_id: entry.message_id,
+                    state: entry.state,
+                    reason: entry.reason.clone(),
+                })
+                .await;
         }
     }
 
@@ -1041,6 +1095,11 @@ pub enum Messaging {
         conversation: String,
         floor_seq: u64,
     },
+    /// re-report every durable delivery state for one binding.
+    Replay {
+        conversation: String,
+        participant: String,
+    },
 }
 
 /// route one command to its plane.
@@ -1076,6 +1135,13 @@ pub fn route(command: wire::Command) -> Result<Messaging, wire::Command> {
         } => Ok(Messaging::Retain {
             conversation,
             floor_seq,
+        }),
+        wire::Command::MsgReplay {
+            conversation,
+            participant,
+        } => Ok(Messaging::Replay {
+            conversation,
+            participant,
         }),
         terminal @ (wire::Command::TermCreate(_)
         | wire::Command::TermInput { .. }

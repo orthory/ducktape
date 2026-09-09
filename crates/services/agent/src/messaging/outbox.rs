@@ -508,6 +508,37 @@ impl Outbox {
     /// Only TERMINAL, UNCLAIMED items go. An item still in flight, or one
     /// sitting at `DeliveryUnknown` waiting for someone with authority to
     /// decide, is kept whatever the floor says.
+    /// Every item this daemon still tracks for one binding, oldest first.
+    ///
+    /// A READ of durable state and nothing else — no journal write, no claim,
+    /// no offer. It exists because a delivery state is a fact only this process
+    /// holds: the node cannot re-derive one, so a receipt lost on the way there
+    /// is lost for good unless the states on this disk can be re-reported.
+    /// See [`crate::wire::Command::MsgReplay`].
+    ///
+    /// A poisoned journal answers `Err`: its map is no longer something to
+    /// vouch for, and re-reporting out of it would state as observed what may
+    /// not have been.
+    pub async fn tracked(
+        &self,
+        conversation: &str,
+        participant: &str,
+    ) -> Result<Vec<(u64, Entry)>, String> {
+        let journal = self.journal.lock().await;
+        journal.usable()?;
+        Ok(journal
+            .state
+            .iter()
+            .filter(|(key, entry)| {
+                key.conversation == conversation && entry.participant == participant
+            })
+            // BTreeMap over `Key`, whose Ord is (conversation, seq): already
+            // ascending by sequence within one conversation, which is the order
+            // the delivery diagram has to be replayed in.
+            .map(|(key, entry)| (key.seq, entry.clone()))
+            .collect())
+    }
+
     pub async fn retain(&self, conversation: &str, floor_seq: u64) -> Result<usize, String> {
         let mut journal = self.journal.lock().await;
         journal.usable()?;
