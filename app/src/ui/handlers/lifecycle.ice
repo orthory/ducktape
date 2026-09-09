@@ -46,6 +46,7 @@ on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
   fs_generation = fs_generation + 1
   fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
   fs_preview_base = ""
   fs_write_pending = ""

@@ -368,6 +368,7 @@ on welcome_failed(cause)
 on console_opened(id)
   fs_generation = fs_generation + 1
   fs_preview_path = ""
+  fs_preview_entry = no_fs_entry()
   fs_preview_text = ""
   fs_preview_base = ""
   fs_write_pending = ""
