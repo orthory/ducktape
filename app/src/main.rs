@@ -29,6 +29,9 @@ fn main() -> iced::Result {
             "open-file limit left at the inherited default"
         ),
     }
+    // the desktop's own views are on their way before the window is: a
+    // tab's first draw never waits on a load
+    module_view::booted();
     Ducktape::run()
 }
 

@@ -39,7 +39,7 @@ use iced::advanced::{clipboard, mouse, renderer};
 use iced::{Color, Event, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
-use crate::module_view::canary::{drawn, mount_module_owned, seated_hash, tap, texts};
+use crate::module_view::canary::{drawn, seated_hash, tap, texts};
 
 /// A tab as captured: console-sized, one pixel per point.
 const TAB: Size = Size::new(900.0, 600.0);
@@ -102,7 +102,6 @@ fn run(node: &str, out: &Path, steps: usize, markers: bool) -> usize {
     std::fs::create_dir_all(out).expect("the output directory");
     let mut log = std::fs::File::create(out.join("view_source.log")).expect("the log file");
     let lines = tap();
-    mount_module_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -330,7 +329,6 @@ fn a_capture_draws_the_module_it_names() {
          "history": [{"height": 7, "code_hash": chat.hash()}]},
     ]}});
     let client = runtime.block_on(fake_node(node));
-    mount_module_owned();
     // the loads the connection starts, each joined: the seats are in
     for load in crate::module_view::connected(&client) {
         load.join().expect("a view load");

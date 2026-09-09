@@ -23,10 +23,15 @@ use serde::Deserialize;
 
 use super::view_artifact;
 
-/// The modules whose tab is drawn by the view in their own artifact. Every
-/// other view (`members`, `agents`, `node`, `explorer`, `settings`, the
-/// shell's) is the desktop's, staged beside the binary.
+/// The modules whose tab is drawn by the view in their own artifact, asked
+/// of the connected node at connect and again at every block that moves
+/// the deployment.
 pub const MODULE_OWNED: [&str; 5] = ["governance", "files", "pages", "chat", "forge"];
+
+/// The desktop's own views, staged beside the binary and asked for at boot.
+/// With [`MODULE_OWNED`], every view the app draws: a tab's draw never
+/// starts a load, so a view named in neither would never be there.
+pub const DESKTOP_OWNED: [&str; 6] = ["members", "agents", "node", "explorer", "settings", "shell"];
 
 pub fn module_owned(module: &str) -> bool {
     MODULE_OWNED.contains(&module)
