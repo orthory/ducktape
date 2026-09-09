@@ -38,6 +38,9 @@ pub struct FsDiffEntry {
 /// clears the name draft it consumed.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct FilesProps {
+    pub display_omitted: i64,
+    pub display_shortened: bool,
+    pub display_unavailable: bool,
     pub path: String,
     pub listed: bool,
     pub entries: Vec<FsEntry>,
@@ -55,7 +58,11 @@ pub struct FilesProps {
     pub preview_picture: bool,
     pub preview_width: i64,
     pub preview_height: i64,
+    /// Complete source from the host read, used when editing.
     pub preview_text: String,
+    /// A bounded display-only projection; never used as the editor seed.
+    pub preview_display_text: String,
+    pub preview_display_clipped: bool,
     pub dark: bool,
     pub write_refusal: String,
     pub writes: i64,
