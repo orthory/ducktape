@@ -68,6 +68,7 @@ fn open(messages: Vec<MessagingMessage>) -> MessagingProps {
         floor_seq: 0,
         from_seq: 0,
         next_seq: 12,
+        page_size: 24,
         undelivered: 1,
         queued_bytes: 512,
         max_body_bytes: 16 * 1024,
@@ -112,9 +113,10 @@ fn one_intent(frame: &Frame) -> &Request {
 /// The full key of the control whose path ends in `suffix`: the tree's own key
 /// path, so a nesting change moves with the test instead of breaking it.
 fn key_ending(frame: &Frame, suffix: &str) -> String {
+    let bare = suffix.trim_start_matches('/');
     keys(frame)
         .into_iter()
-        .find(|key| key.ends_with(suffix))
+        .find(|key| key.ends_with(suffix) || key == bare)
         .unwrap_or_else(|| panic!("no key ending {suffix:?} in {:?}", keys(frame)))
 }
 

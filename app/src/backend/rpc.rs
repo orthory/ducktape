@@ -319,13 +319,13 @@ pub(crate) enum ReadSigner {
 /// never attached to the cached client, because that client outlives a Lock, an
 /// account switch and a network change, and a signer that outlived any of those
 /// would keep proving an identity this session no longer holds.
-pub(crate) async fn seated_data_plane_signer(rpc: &RpcClient) -> ReadSigner {
-    let node_key = match rpc.status().await {
-        Ok(status) => match hex_decode(&status.public_key) {
-            Ok(key) => key,
-            Err(error) => return ReadSigner::Unavailable(error),
-        },
-        Err(error) => return ReadSigner::Unavailable(error.to_string()),
+/// `node_public_key` is the key the caller ALREADY read off `/v1/status` — the
+/// signature binds to it, so the caller reads the status once, checks the chain
+/// it names, and passes the key it saw there.
+pub(crate) async fn seated_data_plane_signer(node_public_key: &str) -> ReadSigner {
+    let node_key = match hex_decode(node_public_key) {
+        Ok(key) => key,
+        Err(error) => return ReadSigner::Unavailable(error),
     };
     let session = SIGNER.lock().await;
     let Some(signer) = session.as_ref() else {

@@ -61,10 +61,13 @@ const REFERENCE_CHARS: usize = 160;
 /// default, in the network's own `consensus_time` unit.
 const DELIVERY_TTL_SECS: u64 = 24 * 60 * 60;
 
-/// Probes one sequence allocation may spend before it refuses. The search is
-/// exponential-then-binary, so this covers millions of admitted messages; a
-/// walk that needs more has met something this allocator does not model, and
-/// guessing past it would mint a duplicate id.
+/// Probes one sequence allocation may spend before it refuses.
+///
+/// The search doubles and then halves, and BOTH phases spend from this budget:
+/// a credential that has admitted `n` messages costs about `2·log2(n)` probes,
+/// so this covers roughly 2^16 of them. A walk that needs more has met
+/// something this allocator does not model, and guessing past it would mint a
+/// duplicate id.
 const MAX_SEQUENCE_PROBES: u32 = 32;
 
 /// What a spent sequence search says. A refusal, never a guess: handing out a
@@ -148,6 +151,8 @@ pub struct MessagingView {
     pub floor_seq: i64,
     pub from_seq: i64,
     pub next_seq: i64,
+    /// events one page asks for — the step the panel's older/newer move by
+    pub page_size: i64,
     pub more_before: bool,
     pub more_after: bool,
     pub undelivered: i64,
@@ -167,6 +172,7 @@ impl MessagingView {
             participant: participant.to_owned(),
             conversation: conversation.to_owned(),
             max_body_bytes: count_i64(collaboration::MAX_BODY_BYTES),
+            page_size: count_i64_u64(PAGE),
             visibility: VISIBILITY.to_owned(),
             ..Self::default()
         }
@@ -380,14 +386,15 @@ async fn reader_client(rpc: &str, network: &str) -> Result<(RpcClient, String), 
         .status_json()
         .await
         .map_err(|error| error.to_string())?;
-    let serving = node_facts(&status).chain_id;
-    if serving != network {
+    let facts = node_facts(&status);
+    if facts.chain_id != network {
         return Err(format!(
-            "this endpoint now serves network {serving}, not the one this conversation was \
-             opened on — reopen it"
+            "this endpoint now serves network {}, not the one this conversation was opened on \
+             — reopen it",
+            facts.chain_id
         ));
     }
-    match seated_data_plane_signer(&client).await {
+    match seated_data_plane_signer(&facts.public_key).await {
         ReadSigner::Seated { auth, key } => Ok((client.with_write_auth(auth), key)),
         ReadSigner::Locked => {
             Err("this device's key is locked; unlock it to read messages".into())
@@ -673,56 +680,51 @@ async fn submit_message(
     reply_to: i64,
     password: String,
 ) -> Result<(), String> {
-    async {
-        let (client, identity) = reader_client(&rpc, &network).await?;
-        let record = match read(&client, &participant, ProtectedRead::Participant).await? {
-            CollaborationReply::Participant(record) => record,
-            CollaborationReply::Denied(reason) => {
-                return Err(format!(
-                    "this device's key may not act as participant {participant} ({})",
-                    deny_token(reason)
-                ));
-            }
-            other => return Err(unexpected("a participant record", &other)),
-        };
-        if record.revoked {
-            return Err(format!("participant {participant} is revoked and admits nothing"));
+    let (client, identity) = reader_client(&rpc, &network).await?;
+    let record = match read(&client, &participant, ProtectedRead::Participant).await? {
+        CollaborationReply::Participant(record) => record,
+        CollaborationReply::Denied(reason) => {
+            return Err(format!(
+                "this device's key may not act as participant {participant} ({})",
+                deny_token(reason)
+            ));
         }
-        let mut outbox = Outbox::open(&network)?;
-        let request = compose(
-            &client,
-            &mut outbox,
-            &record,
-            &conversation,
-            &kind,
-            &recipient,
-            &body,
-            reply_to,
-        )
-        .await?;
-        // NOTHING IS SIGNED UNDER AN IDENTITY THIS SESSION NO LONGER HOLDS.
-        // Composing took several round trips; a Lock or an account switch
-        // during them must stop the send, not send it as whoever is seated now.
-        still_signing_as(&identity).await?;
-        // THE OUTBOX IS WRITTEN BEFORE THE SUBMIT. A send whose answer never
-        // arrives is ambiguous, and the only safe retry is the SAME id over the
-        // SAME bytes — which is only possible if they were durable first.
-        outbox.stage(&participant, &request)?;
-        let payload = collaboration::encode_msg(&CollaborationMsg::Send(request.clone()));
-        let sent = signed_write(&client, COLLABORATION, payload, password).await;
-        match sent {
-            Ok(_) => {
-                outbox.settle(&participant, request.message_id)?;
-                Ok(())
-            }
-            // LEFT PENDING ON PURPOSE. A refusal we can read and an answer that
-            // never came look the same from here, so the entry stays: the next
-            // send reconciles it against the network's own `SendState` and
-            // either retries these exact bytes or frees the sequence.
-            Err(refusal) => Err(refusal),
-        }
+        other => return Err(unexpected("a participant record", &other)),
+    };
+    if record.revoked {
+        return Err(format!(
+            "participant {participant} is revoked and admits nothing"
+        ));
     }
-    .await
+    let mut outbox = Outbox::open(&network)?;
+    let request = compose(
+        &client,
+        &mut outbox,
+        &record,
+        &conversation,
+        &kind,
+        &recipient,
+        &body,
+        reply_to,
+    )
+    .await?;
+    // NOTHING IS SIGNED UNDER AN IDENTITY THIS SESSION NO LONGER HOLDS.
+    // Composing took several round trips; a Lock or an account switch during
+    // them must stop the send, not send it as whoever is seated now.
+    still_signing_as(&identity).await?;
+    // THE OUTBOX IS WRITTEN BEFORE THE SUBMIT. A send whose answer never
+    // arrives is ambiguous, and the only safe retry is the SAME id over the
+    // SAME bytes — which is only possible if they were durable first.
+    outbox.stage(&record.id, &request)?;
+    let payload = collaboration::encode_msg(&CollaborationMsg::Send(request.clone()));
+    match signed_write(&client, COLLABORATION, payload, password).await {
+        Ok(_) => outbox.settle(&record.id, request.message_id),
+        // LEFT PENDING ON PURPOSE. A refusal we can read and an answer that
+        // never came look the same from here, so the entry stays: the next send
+        // reconciles it against the network's own `SendState` and either
+        // retries these exact bytes or frees the sequence.
+        Err(refusal) => Err(refusal),
+    }
 }
 
 /// The exact request to submit: a pending one retried byte-for-byte, or a

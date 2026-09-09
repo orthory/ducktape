@@ -143,6 +143,9 @@ pub struct MessagingProps {
     pub from_seq: i64,
     /// the conversation's next committed sequence — its live tip
     pub next_seq: i64,
+    /// events one page asks the network for — the step "older" and "newer"
+    /// move by, so the guest never guesses the app's page size
+    pub page_size: i64,
     pub more_before: bool,
     pub more_after: bool,
     pub undelivered: i64,
@@ -772,19 +775,21 @@ pub fn recipients(roster: &[MessagingSeat]) -> Vec<String> {
         .collect()
 }
 
-/// The cursor an "older" page asks for: one page back from what is on screen,
-/// never below the retained floor. The step is the page ON SCREEN, so the app
-/// owns the page size and the guest never guesses it.
-pub fn older_from(from_seq: i64, floor_seq: i64, messages: &[MessagingMessage]) -> i64 {
-    let page = count_i64(messages.len()).max(1);
-    (from_seq - page).max(floor_seq)
+/// The cursor an "older" page asks for: one page of EVENTS back, never below
+/// the retained floor.
+///
+/// The step is the page size the app asked the network for, not the messages
+/// on screen. A page is a page of the committed event stream — delivery and
+/// binding events take sequences in it too — so stepping by the message count
+/// would understep and redraw most of the page it just left.
+pub fn older_from(from_seq: i64, floor_seq: i64, page_size: i64) -> i64 {
+    (from_seq - page_size.max(1)).max(floor_seq)
 }
 
-/// The cursor a "newer" page asks for: just past the last message on screen,
-/// and never past the conversation's tip.
-pub fn newer_from(messages: &[MessagingMessage], next_seq: i64) -> i64 {
-    let after_page = messages.last().map_or(0, |message| message.seq + 1);
-    after_page.min(next_seq).max(0)
+/// The cursor a "newer" page asks for: one page on, and never past the
+/// conversation's tip.
+pub fn newer_from(from_seq: i64, page_size: i64, next_seq: i64) -> i64 {
+    (from_seq + page_size.max(1)).min(next_seq).max(0)
 }
 
 pub fn reply_note(reply_to: i64) -> String {

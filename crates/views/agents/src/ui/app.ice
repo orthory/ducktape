@@ -24,7 +24,7 @@ extern crate::host
   MessagingSeat(participant:str, role:str, you:bool)
   MessagingBinding(present:bool, device:str, credential:str, detached:bool)
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
-  MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
+  MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
   AgentsProps(rows:[AgentRow], capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
@@ -72,8 +72,8 @@ extern crate::host
   pure body_refusal(body:&str, max_body_bytes:i64) -> str
   pure send_ready(may_send:bool, sending:bool, recipient:&str?, kind:&str?, body:&str, max_body_bytes:i64) -> bool
   pure recipients(roster:&[MessagingSeat]) -> [str]
-  pure older_from(from_seq:i64, floor_seq:i64, messages:&[MessagingMessage]) -> i64
-  pure newer_from(messages:&[MessagingMessage], next_seq:i64) -> i64
+  pure older_from(from_seq:i64, floor_seq:i64, page_size:i64) -> i64
+  pure newer_from(from_seq:i64, page_size:i64, next_seq:i64) -> i64
   pure reply_note(reply_to:i64) -> str
   pure same_scope(network:&str, participant:&str, conversation:&str, other_network:&str, other_participant:&str, other_conversation:&str) -> bool
   pure open_conversation(participant:&str, conversation:&str) -> bool
@@ -311,10 +311,10 @@ on submit_message
   sent = send_message(or_empty(msg_kind), or_empty(msg_recipient), msg_body, msg_reply_to)
 
 on page_older
-  sent = page_messages(older_from(messaging.from_seq, messaging.floor_seq, messaging.messages), false)
+  sent = page_messages(older_from(messaging.from_seq, messaging.floor_seq, messaging.page_size), false)
 
 on page_newer
-  sent = page_messages(newer_from(messaging.messages, messaging.next_seq), false)
+  sent = page_messages(newer_from(messaging.from_seq, messaging.page_size, messaging.next_seq), false)
 
 on page_newest
   sent = page_messages(0, true)
@@ -1464,7 +1464,7 @@ view
                         size=12.5
                         @text-meta
                 for message in messaging.messages
-                  col #message
+                  col
                     with
                       w=fill
                       gap=5.0
