@@ -558,6 +558,8 @@ on console_opened(id)
   forge_repo = ""
   forge_repo_phase = ForgePhase.idle
   forge_repo_menu = false
+  forge_branch_menu = false
+  forge_tree_branch = ""
   forge_branches = []
   forge_items = []
   forge_item_number = 0

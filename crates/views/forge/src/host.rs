@@ -12,6 +12,14 @@ pub struct ForgeRepo {
     pub head: String,
 }
 
+/// One born branch of the open repo: its name at the commit its head stood
+/// on when the host read the repo.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForgeBranch {
+    pub name: String,
+    pub head: String,
+}
+
 /// One tracker row. `kind` is `issue` | `pr`; `state` is `open` | `closed`
 /// | `merged`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -137,7 +145,11 @@ pub struct ForgeProps {
     pub open_repo: String,
     pub repo_menu: bool,
     pub repo_phase: String,
-    pub branches: Vec<String>,
+    pub branches: Vec<ForgeBranch>,
+    /// the branch switcher's open state, and the branch the code browse's
+    /// pinned commit is the head of ("" when no branch stands there)
+    pub branch_menu: bool,
+    pub tree_branch: String,
     pub tab: String,
     pub items: Vec<ForgeItem>,
     pub forge_item_number: i64,
@@ -301,6 +313,15 @@ pub fn close_repo() -> bool {
 
 pub fn toggle_repo_menu() -> bool {
     notify("forge.toggle_repo_menu", &())
+}
+
+pub fn toggle_branch_menu() -> bool {
+    notify("forge.toggle_branch_menu", &())
+}
+
+/// `forge.branch` — re-root the code browse at one branch's head.
+pub fn pick_branch(name: &str) -> bool {
+    notify("forge.branch", &Name { name: name.into() })
 }
 
 pub fn pick_tab(tab: &str) -> bool {
@@ -523,6 +544,24 @@ pub fn keep_draft(consumed: bool, draft: &str) -> String {
     } else {
         draft.to_owned()
     }
+}
+
+/// What the branch selector reads: the branch standing at the browse's
+/// commit, else the commit itself abbreviated, else the root read is still
+/// in flight.
+pub fn rev_label(branch: &str, rev: &str) -> String {
+    if !branch.is_empty() {
+        return branch.to_owned();
+    }
+    if rev.is_empty() {
+        return "…".to_owned();
+    }
+    rev.chars().take(12).collect()
+}
+
+/// The switcher row's accessible name: which branch this row browses.
+pub fn browse_branch_label(name: &str) -> String {
+    format!("Browse branch {name}")
 }
 
 /// The seq a fresh landing names, or 0 when the props carried no new one.

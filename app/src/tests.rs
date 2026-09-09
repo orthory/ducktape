@@ -501,12 +501,11 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the page document's reconcile clock: it exists only while a
-            // hydrated page is open (`active_page == buffer_page`), and each
-            // tick reads the guest editor's canonical document before the
-            // dirty test, because the guest can hold edits the app mirror
-            // never saw (a replaced instance's last notification is refused).
-            // At rest, with no page open, it is not subscribed.
+            // the page document's write clock: the guest editor's edits never
+            // pass through a handler, so the app mirror cannot know the buffer
+            // is dirty — the tick reads the canonical document while a page is
+            // open on a connected node and its handler makes the dirty/no-op
+            // call. It exists only while a page is open, and no other tick may.
             "every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick",
         ]
     );

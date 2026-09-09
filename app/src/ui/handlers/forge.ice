@@ -21,8 +21,17 @@ on forge_view_event(event)
       flow
         from done true
         done -> forge_close_repo()
+    // The two switchers share the repo bar; opening one closes the other.
     ForgeIntent.toggle_repo_menu
       forge_repo_menu = !forge_repo_menu
+      forge_branch_menu = false
+    ForgeIntent.toggle_branch_menu
+      forge_branch_menu = !forge_branch_menu
+      forge_repo_menu = false
+    ForgeIntent.branch
+      flow
+        from done event_text(event, "name")
+        done -> forge_pick_branch _
     ForgeIntent.tab
       flow
         from done forge_event_tab(event)
@@ -98,6 +107,8 @@ on forge_open_repo(name)
   invalidate lane=forge_item
   invalidate lane=forge_discussion
   forge_repo_menu = false
+  forge_branch_menu = false
+  forge_tree_branch = ""
   forge_repo = name
   error = ""
   forge_repo_phase = ForgePhase.loading
@@ -165,6 +176,26 @@ on forge_repo_failed(cause)
   return if cause.generation != forge_generation
   forge_repo_phase = ForgePhase.failed
   error = cause.message
+
+// A BRANCH PICK: the browse re-roots at that branch's head — the commit the
+// repo slice last read it at — and every nested read is then pinned there,
+// the same way the root listing pins a freshly opened repo. The listing
+// starts at the root because the picked branch need not hold the open
+// directory. A name the slice no longer holds (the branch was deleted under
+// the open menu) picks nothing; the open file retires through
+// `forge_file_header` as it does on any tree move.
+on forge_pick_branch(name)
+  forge_branch_menu = false
+  return if !connected || empty(forge_repo)
+  let head = forge_branch_head(forge_branches, name)
+  return if empty(head)
+  forge_tree_branch = name
+  forge_tree_rev = head
+  forge_tree_path = ""
+  forge_tree_entries = []
+  forge_tree_truncated = false
+  forge_tree_phase = ForgeTreePhase.loading
+  run replace lane=forge_tree forge_tree(connected_rpc, forge_repo, forge_tree_rev, forge_tree_path) -> forge_tree_loaded _ | forge_tree_failed _
 
 // A DIRECTORY ROW: the listing moves, pinned to the tree's commit. The
 // file opened in the previous directory is retired by the move itself —
@@ -460,6 +491,8 @@ on forge_close_repo
   forge_branches = []
   forge_items = []
   forge_repo_menu = false
+  forge_branch_menu = false
+  forge_tree_branch = ""
   forge_item_number = 0
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
