@@ -41,7 +41,7 @@ pub use ::forge::client::{
     ForgeRefresh, ItemRow as ForgeItem, ReviewCommentRow as ForgeReviewComment,
     ReviewRow as ForgeReview,
 };
-pub use inbox::client::{BellDelta, BellItem, apply_bell_items as fold_bell_items};
+pub use inbox::client::{BellDelta, BellItem};
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the

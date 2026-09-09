@@ -9,11 +9,23 @@ on account_loaded(next)
   // stamps each row's `channel_id`, and all three DM decisions read that one id
   // — so a late or failed account load can no longer scatter DMs into the room
   // list.
+  bell_marking = bell_marking && account_number == next.number
+  bell_items = bell_account_items(bell_items, account_number, next.number)
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, next.number, settings_user_key), bell_presentations, [])
+  bell_unread = bell_unread_count(bell_items, next.number, settings_user_key)
+  bell_error = ""
+  bell_read_through = keep_i64(account_number == next.number, bell_read_through, 0)
+  bell_clear_through = keep_i64(account_number == next.number, bell_clear_through, 0)
+  invalidate lane=bell_context
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  bell_marking = false
   account_number = next.number
   account_name = next.name
   account_bio = next.bio
   account_keys = next.keys
   account_key_rows = next.key_rows
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation next.number _ | bell_failed connect_generation next.number _
 
 on account_failed(cause)
   return if cause.generation != account_generation

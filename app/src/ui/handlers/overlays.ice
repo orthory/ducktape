@@ -69,21 +69,78 @@ on close_palette
 // painted, and left that button with nothing to do.
 on toggle_bell
   bell_open = !bell_open
+  return if !bell_open
+  bell_error = ""
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
+
+on reload_bell
+  bell_error = ""
+  run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
 
 on close_bell
   bell_open = false
 
 on mark_bell_read_submit
-  return if bell_unread <= 0
-  run every mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+  return if bell_unread <= 0 || bell_marking
+  bell_marking = true
+  bell_error = ""
+  run replace lane=bell_mark mark_bell_read(connected_rpc, password, account_number, bell_head(bell_items)) -> bell_marked connect_generation account_number _ | bell_mark_failed connect_generation account_number _
 
-on bell_loaded(next)
-  bell_unread = next.unread
-  bell_items = next.items
+on bell_loaded(generation, account, next)
+  return if generation != connect_generation || account != account_number
+  bell_error = ""
+  bell_items = merge_bell_loaded(bell_items, next.items, bell_read_through, bell_clear_through)
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, next.presentations)
+  bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
 
-on bell_failed(_cause)
+on bell_context_loaded(generation, account, next)
+  return if generation != connect_generation || account != account_number
+  bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, next)
+  bell_error = ""
 
-on bell_marked(_result)
+on bell_failed(generation, account, cause)
+  return if generation != connect_generation || account != account_number
+  bell_error = cause.message
+
+on bell_marked(generation, account, delta)
+  return if generation != connect_generation || account != account_number
+  bell_marking = false
+  bell_read_through = keep_i64(delta.up_to_seq > bell_read_through, delta.up_to_seq, bell_read_through)
+  bell_items = apply_bell(bell_items, delta)
+  bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
+
+on bell_mark_failed(generation, account, cause)
+  return if generation != connect_generation || account != account_number
+  bell_marking = false
+  bell_error = cause.message
+
+on bell_open_item(generation, account, context)
+  return if generation != connect_generation || account != account_number
+  return if context.target == BellTarget.unavailable || empty(context.object)
+  bell_open = false
+  match context.target
+    BellTarget.run
+      shell_tab = ShellTab.agents
+      agents_open_run = context.object
+      agents_journal = empty_run_journal()
+      agents_journal_op = agents_journal_op + 1
+      run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
+    BellTarget.page
+      run replace lane=bell_navigation duck_echo_str(context.object) -> open_page_search_hit(_, context.anchor) | external_url_failed _
+    BellTarget.message
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.forge
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.repo
+      flow
+        from done bell_link(context, network_chain_id)
+        done -> open_message_link _
+    BellTarget.unavailable
+      return if true
 
 on global_key_pressed(event)
   // EVERY VERDICT THIS HANDLER CAN ACT ON, RESOLVED FIRST — then the press

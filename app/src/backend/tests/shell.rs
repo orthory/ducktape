@@ -958,6 +958,15 @@ fn bell_renders_attribution_relation_and_change_actor() {
         read: false,
     };
     assert_eq!(bell_title(&item.reason), "Mention");
-    assert_eq!(bell_detail(&item), "transferred in:7 · account:9");
+    let context = BellPresentation {
+        seq: item.seq,
+        title: "Mention changed · Alice".into(),
+        detail: "Please review the launch checklist.".into(),
+        ..BellPresentation::default()
+    };
+    assert_eq!(
+        bell_presentation(&item, std::slice::from_ref(&context)),
+        context
+    );
     assert_eq!(bell_worst_severity(&[item]), "info");
 }

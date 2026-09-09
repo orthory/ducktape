@@ -19,16 +19,17 @@ pub(super) fn mouse(
         return false;
     };
     if matches!(event, wire::mouse::Event::CursorMoved { .. }) {
-        // One move per frame, at its latest position among discrete events.
-        guest.pending.retain(|event| {
-            !matches!(
-                event,
-                wire::Event::Mouse {
-                    event: wire::mouse::Event::CursorMoved { .. },
-                    ..
-                }
-            )
-        });
+        // Coalesce only consecutive moves. A press/release or routed widget
+        // message is a boundary: its handler needs the preceding position.
+        while matches!(
+            guest.pending.last(),
+            Some(wire::Event::Mouse {
+                event: wire::mouse::Event::CursorMoved { .. },
+                ..
+            })
+        ) {
+            guest.pending.pop();
+        }
     }
     guest.pending.push(wire::Event::Mouse { event, captured });
     true

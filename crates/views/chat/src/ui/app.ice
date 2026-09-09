@@ -244,12 +244,6 @@ on thread_pointer_released(_button)
 on cancel_thread_resize
   thread_dragging = false
 
-on narrow_thread
-  thread_width = thread_width_after_delta(thread_width, -32.0, chat_viewport_width)
-
-on widen_thread
-  thread_width = thread_width_after_delta(thread_width, 32.0, chat_viewport_width)
-
 on props_arrived(item)
   host_error = item.error
   return if !empty(item.error)
@@ -607,8 +601,6 @@ view
         add_channel_member_submit -> add_channel_member_submit
         remove_channel_member_submit -> remove_channel_member_submit _
         start_thread_resize -> start_thread_resize
-        narrow_thread -> narrow_thread
-        widen_thread -> widen_thread
         close_thread -> close_thread
         open_thread_message_actions -> open_thread_message_actions _ _ _
         open_thread_message_reactions -> open_thread_message_reactions _ _ _
