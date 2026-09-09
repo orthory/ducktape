@@ -430,6 +430,7 @@ fn post_commit_hydration_errors_are_not_retryable() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn chat_and_pages_round_trip_over_signed_frames() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
         storage.path(),
@@ -823,6 +824,7 @@ fn hydration_retry_is_capped() {
 /// projection, the Forge seat's live dot with it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_runs_op_asks_the_agents_projection_to_refetch() {
+    let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let update = folded_update(
         "",
         "runs",
