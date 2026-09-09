@@ -3785,7 +3785,8 @@ mod tests {
                     | wire::Command::MsgUnbind { .. }
                     | wire::Command::MsgDeliver(_)
                     | wire::Command::MsgTime { .. }
-                    | wire::Command::MsgRetain { .. } => {}
+                    | wire::Command::MsgRetain { .. }
+                    | wire::Command::MsgReplay { .. } => {}
                 }
             }
         });

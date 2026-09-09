@@ -845,6 +845,9 @@ struct Bridge {
     collab: std::sync::OnceLock<mpsc::Sender<wire::Event>>,
     /// how many daemons have taken the link. See [`TerminalSessions::attach_epoch`].
     attaches: std::sync::atomic::AtomicU64,
+    /// how many receipts the pump was too slow to take. See
+    /// [`TerminalSessions::dropped_receipts`].
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
@@ -1002,6 +1005,7 @@ impl TerminalSessions {
             link_token,
             collab: std::sync::OnceLock::new(),
             attaches: std::sync::atomic::AtomicU64::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -1086,6 +1090,18 @@ impl TerminalSessions {
     /// only says "attached now".
     pub fn attach_epoch(&self) -> u64 {
         self.0.attaches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many collaboration receipts this node dropped for a full pump lane.
+    ///
+    /// Also a counter and not a flag, and for a sharper reason than
+    /// [`Self::attach_epoch`]'s: the pump only observes this AFTER it has
+    /// drained enough of the lane to run a sweep, by which point a flag it
+    /// consumed would race the next overflow. A monotonic count it compares
+    /// against what it last saw cannot lose a drop, only coalesce several into
+    /// one replay — which is all one replay costs.
+    pub fn dropped_receipts(&self) -> u64 {
+        self.0.dropped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Does `presented` match this node's 0600 workspace link secret?
@@ -1185,23 +1201,30 @@ impl TerminalSessions {
     /// `try_send` and not `send`: this runs on the ws READ LOOP, which is also
     /// the only thing draining the daemon's pty output. Awaiting a full pump
     /// lane here would stall every session's output behind one slow chain
-    /// submission. A full lane drops the receipt with a named reason instead —
-    /// the module holds the authoritative record and the daemon's journal is
-    /// durable, so the pump re-reads the state it missed; what it must never do
-    /// is wedge the terminal plane.
+    /// submission, so a full lane drops the receipt instead — what it must
+    /// never do is wedge the terminal plane.
+    ///
+    /// A dropped receipt is NOT recoverable by re-reading the chain: the module
+    /// records what was submitted, and this receipt is precisely the one that
+    /// never was. So the drop is COUNTED ([`Self::dropped_receipts`]) and the
+    /// pump asks the daemon — whose delivery journal is durable and is the only
+    /// remaining witness — to replay it.
     fn receipt(&self, event: wire::Event) {
         let Some(lane) = self.0.collab.get() else {
             return unconsumed(&event);
         };
-        if lane.try_send(event).is_err()
-            && let Some(occurrences) = TERM_WARN.hit("collab_lane_full")
-        {
-            tracing::warn!(
-                target: "ducktape::collab",
-                reason = "collab_lane_full",
-                occurrences,
-                "dropped a collaboration receipt: the pump is not keeping up"
-            );
+        if lane.try_send(event).is_err() {
+            self.0
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(occurrences) = TERM_WARN.hit("collab_lane_full") {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "collab_lane_full",
+                    occurrences,
+                    "dropped a collaboration receipt: the pump is not keeping up"
+                );
+            }
         }
     }
 

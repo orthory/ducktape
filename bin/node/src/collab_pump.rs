@@ -67,14 +67,15 @@ const PAGES_PER_SWEEP: usize = 8;
 /// hide a wedged pump behind.
 const RECEIPT_LANE: usize = 256;
 
-/// How many MESSAGES may owe the chain a receipt at once.
+/// How many MESSAGES may owe the chain a receipt before the pump stops handing
+/// NEW ones to the daemon.
 ///
-/// The bound is backpressure and not a bin: at the ceiling a message that owes
-/// nothing yet is REFUSED with a loud reason, and every message already owing
-/// keeps its whole ordered chain. Dropping an owed transition is never the
-/// answer — the diagram refuses `Stored -> AdapterAccepted`, so a lost `Queued`
-/// makes the acceptance behind it permanently unsubmittable, and a later state
-/// cannot stand in for an earlier one.
+/// Backpressure and not a bin. Nothing owed is ever dropped: the diagram refuses
+/// `Stored -> AdapterAccepted`, so a lost `Queued` makes the acceptance behind
+/// it permanently unsubmittable, and a later state cannot stand in for an
+/// earlier one. The pressure is applied at the only point where there is still
+/// a choice — a delivery not yet made — because by the time a RECEIPT arrives
+/// the daemon has already spent the fact and nobody would re-report it.
 const MAX_OWING_MESSAGES: usize = 4096;
 
 /// How often production sweeps committed state.
@@ -211,6 +212,19 @@ enum Eligible {
     Unresolved,
 }
 
+/// What the committed record says about a receipt the chain did not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Stop carrying it, for a reason READ BACK off the chain.
+    Retire(&'static str),
+    /// The record is behind this transition: `Queued` has to commit before it
+    /// can. The daemon's own `Queued` receipt was lost, and this is the only
+    /// bridge the delivery diagram offers.
+    Bridge,
+    /// Nothing was learned, or the transition is simply still pending. Keep it.
+    Owe,
+}
+
 /// Everything one pump run remembers between sweeps.
 #[derive(Debug, Default)]
 struct Seen {
@@ -219,6 +233,9 @@ struct Seen {
     epoch: u64,
     /// the agreed clock value last sent as a `MsgTime`.
     time: u64,
+    /// how many receipts the term plane had dropped when this pump last looked
+    /// ([`noded::TerminalSessions::dropped_receipts`]).
+    dropped: u64,
     /// keyed by (conversation, participant) — the binding's identity.
     bindings: BTreeMap<(String, String), Announced>,
 }
@@ -312,6 +329,16 @@ impl Pump {
         // a receipt whose submission failed is retried here, before any new
         // delivery: the network learning what already happened comes first.
         self.resubmit().await;
+        // a receipt the term plane could not hand over is GONE, and re-reading
+        // the chain cannot recover it: the module records what was submitted,
+        // and that receipt is precisely the one that never was. The daemon's
+        // delivery journal is the only remaining witness, so it is asked to say
+        // everything it holds again. Its own report is idempotent here — a
+        // transition already owed folds ([`push_once`]) and one already
+        // committed retires on the read ([`Pump::standing`]).
+        let dropped = self.terminals.dropped_receipts();
+        let lost_a_receipt = dropped != seen.dropped;
+        seen.dropped = dropped;
         let now = self.status.current().consensus_time;
         // the daemon owns no clock; this is the only thing that advances the
         // one it judges expiry against. Sent before anything is delivered, so a
@@ -332,6 +359,14 @@ impl Pump {
                 attachment.conversation.clone(),
                 attachment.participant.clone(),
             );
+            if lost_a_receipt {
+                self.terminals
+                    .send(wire::Command::MsgReplay {
+                        conversation: attachment.conversation.clone(),
+                        participant: attachment.participant.clone(),
+                    })
+                    .await;
+            }
             let mut announced = seen.bindings.get(&key).copied().unwrap_or_default();
             self.pump_one(&attachment, &mut announced).await;
             seen.bindings.insert(key, announced);
@@ -506,6 +541,14 @@ impl Pump {
                 self.skip(attachment, "message_pruned");
                 continue;
             };
+            // the bound, applied where there is still a choice: a receipt is
+            // already spent by the time it arrives, but a delivery is not. The
+            // message stays `Stored` in front of the cursor and goes out when
+            // the owed chain drains.
+            if self.overloaded() {
+                keep(seq);
+                continue;
+            }
             match self.eligible(attachment, key, seq).await {
                 Eligible::Deliver => keep(seq),
                 Eligible::No => continue,
@@ -724,7 +767,7 @@ impl Pump {
         let Some(chain) = owed.get_mut(message) else {
             return false;
         };
-        chain.push_back(unsent.clone());
+        push_once(chain, unsent);
         true
     }
 
@@ -745,15 +788,19 @@ impl Pump {
         };
         let key = match crate::collab_keys::load(&self.workspace, binding) {
             Ok(Some(key)) => key,
-            // no key is not transient: nothing here can ever sign it, and no
-            // amount of retrying changes that.
+            // ABSENT is permanent: the operator removed the key, and nothing
+            // here can ever sign for that binding again.
             Ok(None) => {
                 return self.refuse(
                     "receipt_without_key",
                     "a receipt named a binding this device holds no service key for",
                 );
             }
-            Err(error) => return self.refuse("service_key_unreadable", &error),
+            // UNREADABLE is not. A permissions problem or a half-written file is
+            // a local fault that clears, and a fact must not be thrown away
+            // because this process could not open a file for a moment. Owed with
+            // nothing to verify against, because verifying also needs the key.
+            Err(error) => return self.owe(message, unsent, None, &error).await,
         };
         let op = collab::CollaborationMsg::Acknowledge {
             conversation_id: conversation.clone(),
@@ -770,7 +817,7 @@ impl Pump {
                 height,
                 "acknowledged a delivery on-chain"
             ),
-            Err(error) => self.owe(message, unsent, &key, &error).await,
+            Err(error) => self.owe(message, unsent, Some(&key), &error).await,
         }
     }
 
@@ -781,53 +828,99 @@ impl Pump {
     /// There is no attempt counter, deliberately. A count cannot tell a busy
     /// actor from a permanent refusal, so counting means eventually throwing
     /// away a fact that was merely unlucky. The committed record can tell:
-    /// [`settled`] reads it and retires the receipt only on a VERIFIED outcome.
-    /// Everything else is owed, for as long as it takes.
+    /// [`Pump::standing`] reads it and retires the receipt only on a VERIFIED
+    /// outcome. Everything else is owed, for as long as it takes — and when the
+    /// record is merely BEHIND, the missing `Queued` goes in front of it so the
+    /// pair submits in the order the diagram admits.
+    ///
+    /// `verify` is the binding's key when one could be loaded. Without it the
+    /// receipt is simply owed: an unreadable key is exactly the transient fault
+    /// that must not cost a fact, and it is also the thing a verification would
+    /// have needed.
+    ///
+    /// This never turns a receipt away. The daemon has already SPENT the fact by
+    /// reporting it — refusing here would drop it with nobody to re-report it,
+    /// which is the eviction this whole design refuses. The table is instead
+    /// bounded upstream, where the pump still has a choice: it stops handing new
+    /// messages to the daemon while it is this far behind ([`Pump::overloaded`]),
+    /// and a repeated report of a transition already owed is folded rather than
+    /// appended ([`push_once`]), so a daemon replaying its journal cannot grow
+    /// one message's chain past the few transitions the diagram allows.
     async fn owe(
         &self,
         message: &Message,
         unsent: Unsent,
-        key: &commonware_cryptography::ed25519::PrivateKey,
+        verify: Option<&commonware_cryptography::ed25519::PrivateKey>,
         error: &str,
     ) {
-        if let Some(verdict) = self.settled(message, unsent.state, key).await {
-            return self.refuse(verdict, error);
-        }
-        let mut owed = self.owed.lock().expect("collab owed lock poisoned");
-        // BACKPRESSURE, not eviction: a message already owing always takes its
-        // next transition, because dropping one strands every later one behind
-        // it. Only a message owing NOTHING is turned away at the ceiling.
-        let known = owed.contains_key(message);
-        if !known && owed.len() >= MAX_OWING_MESSAGES {
-            return self.refuse(
-                "owed_receipts_full",
-                "refused a receipt: too many messages already owe the chain one",
+        let standing = match verify {
+            Some(key) => self.standing(message, unsent.state, key).await,
+            None => Standing::Owe,
+        };
+        let bridge = match standing {
+            Standing::Retire(reason) => return self.refuse(reason, error),
+            Standing::Bridge => Some(Unsent {
+                // the daemon's generation, not the current one: the bridge is
+                // part of the same report and passes the same fence.
+                credential: unsent.credential,
+                state: wire::State::Queued,
+                // nothing to say about it. The daemon never told us why it
+                // queued this, and inventing a token would put a sentence on
+                // chain that no service ever said.
+                reason: None,
+            }),
+            Standing::Owe => None,
+        };
+        let owing = {
+            let mut owed = self.owed.lock().expect("collab owed lock poisoned");
+            let chain = owed.entry(message.clone()).or_default();
+            if let Some(bridge) = bridge {
+                push_once(chain, &bridge);
+            }
+            push_once(chain, &unsent);
+            owed.len()
+        };
+        if owing >= MAX_OWING_MESSAGES {
+            self.refuse(
+                "owed_receipts_high",
+                "no new message goes to the daemon until the chain catches up",
             );
         }
-        owed.entry(message.clone()).or_default().push_back(unsent);
-        drop(owed);
         self.refuse("acknowledge_retrying", error);
     }
 
-    /// Has the network already settled this transition's question?
+    /// Is the chain so far behind that no NEW message should be handed over?
     ///
-    /// `Some(reason)` retires the receipt, and only on a fact READ BACK off the
-    /// chain:
+    /// This is where the bound is applied, and it is the only place it CAN be: a
+    /// receipt has already been spent by the time it reaches [`Pump::owe`], but
+    /// a delivery has not been made yet. Holding one back costs a sweep; the
+    /// message stays `Stored`, in front of the cursor, and goes out when the
+    /// backlog drains. Nothing is lost and nothing is dropped.
+    fn overloaded(&self) -> bool {
+        self.owed.lock().expect("collab owed lock poisoned").len() >= MAX_OWING_MESSAGES
+    }
+
+    /// Where does the committed record leave this transition?
+    ///
+    /// [`Standing::Retire`] only on a fact READ BACK off the chain:
     ///
     /// * the committed state IS the one being reported — it landed after all
     ///   (a lost reply is indistinguishable from a lost submission from here);
-    /// * the record is TERMINAL and different — the diagram refuses every
-    ///   transition out of a terminal state, so this one can never apply again;
     /// * there is no record — the message was pruned, and nothing will accept a
-    ///   receipt for it.
+    ///   receipt for it;
+    /// * the record can never reach the reported state, by the diagram — every
+    ///   transition out of a terminal state, and the few non-terminal pairs the
+    ///   diagram simply does not join. Carrying one of those forever is a leak
+    ///   with no outcome at the end of it.
     ///
-    /// `None` on every read failure. An unverified receipt is never abandoned.
-    async fn settled(
+    /// [`Standing::Owe`] on every read failure. An unverified receipt is never
+    /// abandoned.
+    async fn standing(
         &self,
         message: &Message,
         state: wire::State,
         key: &commonware_cryptography::ed25519::PrivateKey,
-    ) -> Option<&'static str> {
+    ) -> Standing {
         let (conversation, participant, seq) = message;
         // the device label is not part of a READ — only the participant acting
         // and the conversation its key is scoped to are.
@@ -837,7 +930,7 @@ impl Pump {
             participant: participant.clone(),
             device: String::new(),
         };
-        let collab::CollaborationReply::Receipt(receipt) = self
+        let answer = self
             .read(
                 &attachment,
                 key,
@@ -846,22 +939,30 @@ impl Pump {
                     seq: *seq,
                 },
             )
-            .await?
-        else {
-            // not a receipt: this build cannot read the answer, so it has
-            // verified nothing.
-            return None;
+            .await;
+        // an unreadable answer, or one this build cannot interpret: nothing has
+        // been verified, so nothing is given up.
+        let Some(collab::CollaborationReply::Receipt(receipt)) = answer else {
+            return Standing::Owe;
         };
         let Some(receipt) = receipt else {
-            return Some("receipt_gone");
+            return Standing::Retire("receipt_gone");
         };
-        if receipt.state == delivery_state(state) {
-            return Some("acknowledge_already_landed");
+        let reported = delivery_state(state);
+        if receipt.state == reported {
+            return Standing::Retire("acknowledge_already_landed");
         }
-        receipt
-            .state
-            .is_terminal()
-            .then_some("acknowledge_superseded")
+        // the diagram, asked directly. `Queued` is the ONLY state anything
+        // bridges through — a record still `Stored` because the daemon's queue
+        // receipt was lost cannot take the acceptance that followed it.
+        let directly = receipt.state.may_advance_to(reported);
+        let through_queued = receipt.state.may_advance_to(collab::DeliveryState::Queued)
+            && collab::DeliveryState::Queued.may_advance_to(reported);
+        match (directly, through_queued) {
+            (true, _) => Standing::Owe,
+            (false, true) => Standing::Bridge,
+            (false, false) => Standing::Retire("acknowledge_unreachable"),
+        }
     }
 
     /// Retry what the chain is owed, per message and in reported order.
@@ -1037,6 +1138,27 @@ impl Pump {
 static PUMP_WARN: noded::log::Latch = noded::log::Latch::new(100);
 
 // ---- decisions, made without touching anything -----------------------------
+
+/// Append one owed transition, unless this message already owes exactly it.
+///
+/// A daemon that restarts replays its durable journal, so the SAME
+/// `(credential, state)` can be reported many times over. Appending each would
+/// grow one message's chain without bound and re-submit a transition the module
+/// would refuse as already made. Folding is safe because the pair is the whole
+/// content of the op: two identical entries produce two identical submissions.
+///
+/// The `reason` is deliberately not compared. It is a token about the same
+/// transition, so a second report of it is the same fact told slightly
+/// differently, not a new one.
+fn push_once(chain: &mut std::collections::VecDeque<Unsent>, unsent: &Unsent) {
+    let already = chain
+        .iter()
+        .any(|owed| owed.credential == unsent.credential && owed.state == unsent.state);
+    if already {
+        return;
+    }
+    chain.push_back(unsent.clone());
+}
 
 /// The sequences on this page that admitted a message FOR `participant`.
 ///
@@ -1372,9 +1494,15 @@ mod tests {
         attached: Option<noded::AttachGuard>,
         owner: commonware_cryptography::ed25519::PrivateKey,
         service: commonware_cryptography::ed25519::PrivateKey,
+        /// every `Acknowledge` a [`Fixture::flaky_times`] lane carried, in
+        /// order, INCLUDING the ones it then refused. What landed is readable
+        /// off the chain; only this says what was ATTEMPTED.
+        attempts: Attempts,
         // dropped LAST: the daemon's actor thread closes qmdb on the way out.
         dir: tempfile::TempDir,
     }
+
+    type Attempts = std::sync::Arc<std::sync::Mutex<Vec<collab::DeliveryState>>>;
 
     impl Fixture {
         /// stand the whole lane up, through the real committed ops.
@@ -1442,6 +1570,7 @@ mod tests {
                 attached: Some(attached),
                 owner,
                 service,
+                attempts: Attempts::default(),
                 dir,
             };
             fixture.compose().await;
@@ -1692,9 +1821,13 @@ mod tests {
             use futures::StreamExt as _;
             let (tx, mut rx) = mpsc::channel(16);
             let mut real = self.daemon.commands();
+            let attempts = self.attempts.clone();
             tokio::spawn(async move {
                 let mut left = times;
                 while let Some(command) = rx.next().await {
+                    if let Some(state) = acknowledged(&command) {
+                        attempts.lock().expect("attempts").push(state);
+                    }
                     if left > 0 && fault.matches(&command) {
                         left -= 1;
                         fault.refuse(command);
@@ -1706,6 +1839,16 @@ mod tests {
                 }
             });
             tx
+        }
+
+        /// a command lane that records every acknowledgement and fails none.
+        fn watched(&self) -> mpsc::Sender<noded::NodeCommand> {
+            self.flaky_times(Fault::Eligibility, 0)
+        }
+
+        /// every acknowledgement the pump TRIED to submit, in order.
+        fn attempted(&self) -> Vec<collab::DeliveryState> {
+            self.attempts.lock().expect("attempts").clone()
         }
 
         /// re-attach the "daemon" — the same bindings, a new connection.
@@ -1743,18 +1886,8 @@ mod tests {
                 ),
                 (
                     Fault::AcceptedReceipt | Fault::QueuedReceipt,
-                    noded::NodeCommand::SubmitFrame { frame, .. },
-                ) => {
-                    let Ok((_, msg)) = node::decode_frame(frame) else {
-                        return false;
-                    };
-                    let Ok(collab::CollaborationMsg::Acknowledge { state, .. }) =
-                        collab::decode_msg(&msg.payload).map(|request| request.op)
-                    else {
-                        return false;
-                    };
-                    state == self.acknowledges()
-                }
+                    noded::NodeCommand::SubmitFrame { .. },
+                ) => acknowledged(command) == Some(self.acknowledges()),
                 _ => false,
             }
         }
@@ -2176,14 +2309,30 @@ mod tests {
             ))
             .await;
         }
+        // the state alone cannot show this: an acceptance that DID jump the
+        // queue would be refused out of `Stored` and leave the record reading
+        // `Stored` too. What was ATTEMPTED is the discriminating fact.
+        assert_eq!(
+            fixture.attempted(),
+            vec![collab::DeliveryState::Queued],
+            "only the transition the record can actually take was submitted"
+        );
         assert_eq!(
             fixture.receipt(deliver.seq).await.state,
             collab::DeliveryState::Stored,
-            "the acceptance did not jump the queue: the module would have refused \
-             it out of `Stored`, and the fact would have been lost"
+            "and it was the swallowed one, so nothing committed"
         );
 
         pump.sweep(&mut seen).await;
+        assert_eq!(
+            fixture.attempted(),
+            vec![
+                collab::DeliveryState::Queued,
+                collab::DeliveryState::Queued,
+                collab::DeliveryState::AdapterAccepted,
+            ],
+            "the retry re-submits the earlier one FIRST, then the one behind it"
+        );
         assert_eq!(
             fixture.receipt(deliver.seq).await.state,
             collab::DeliveryState::AdapterAccepted,
@@ -2193,6 +2342,198 @@ mod tests {
             &drained(&mut fixture.link),
             "recovering an ordered chain must not re-offer the message",
         );
+    }
+
+    /// The ceiling on owed receipts is BACKPRESSURE, not eviction: it stops the
+    /// pump handing the daemon anything NEW, and the message it held back is
+    /// still in front of the cursor for the sweep after the backlog drains.
+    ///
+    /// [`Pump::pump_one`] rather than a sweep, because a sweep would first try
+    /// to resubmit all [`MAX_OWING_MESSAGES`] debts against a real chain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pump_this_far_behind_offers_the_daemon_nothing_new() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "not while you are this far behind").await;
+        let pump = fixture.pump();
+        let attachment = Attached {
+            network: NETWORK.into(),
+            conversation: CONVERSATION.into(),
+            participant: RECIPIENT.into(),
+            device: DEVICE.into(),
+        };
+        let mut announced = Announced::default();
+
+        // owed to the ceiling, by messages this one has nothing to do with.
+        {
+            let mut owed = pump.owed.lock().expect("collab owed lock poisoned");
+            for seq in 0..MAX_OWING_MESSAGES as u64 {
+                owed.insert(
+                    (CONVERSATION.into(), RECIPIENT.into(), 1_000_000 + seq),
+                    [Unsent {
+                        credential: 1,
+                        state: wire::State::Queued,
+                        reason: None,
+                    }]
+                    .into(),
+                );
+            }
+        }
+        pump.pump_one(&attachment, &mut announced).await;
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "a pump at the ceiling hands over no new message",
+        );
+
+        // the backlog clears, and the message it held back goes out.
+        pump.owed.lock().expect("collab owed lock poisoned").clear();
+        pump.pump_one(&attachment, &mut announced).await;
+        let sent = drained(&mut fixture.link);
+        assert!(
+            sent.iter()
+                .any(|command| matches!(command, wire::Command::MsgDeliver(_))),
+            "the cursor never passed it, so it is still there to offer: {sent:?}"
+        );
+    }
+
+    /// A daemon replaying its journal reports the same transition again. The
+    /// same fact told twice is one debt, not two — otherwise a replay would
+    /// grow one message's chain without bound, and every copy would be
+    /// submitted separately for the module to refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transition_reported_again_is_owed_once() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "say that again").await;
+        let pump = fixture.pump_behind(fixture.flaky(Fault::QueuedReceipt));
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (bound, deliver) = bind_and_delivery(&drained(&mut fixture.link));
+        for _ in 0..3 {
+            pump.receipt(reported(
+                deliver.seq,
+                bound.generation,
+                deliver.message_id,
+                wire::State::Queued,
+            ))
+            .await;
+        }
+        assert_eq!(
+            owing(&pump, deliver.seq),
+            vec![wire::State::Queued],
+            "three reports of one transition are one debt"
+        );
+        assert_eq!(
+            fixture.attempted(),
+            vec![collab::DeliveryState::Queued],
+            "and one submission, not three"
+        );
+
+        pump.sweep(&mut seen).await;
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::Queued,
+            "it lands once the chain will take it, and the debt is gone"
+        );
+        assert!(owing(&pump, deliver.seq).is_empty(), "nothing left owed");
+    }
+
+    /// A receipt the terminal plane could not hand over is GONE. Re-reading the
+    /// chain cannot recover it — the chain's record is precisely what was never
+    /// written — so the drop is COUNTED, the pump asks the daemon to replay its
+    /// durable journal, and the transition settles on what comes back.
+    ///
+    /// The journal reports a message's CURRENT state, so the replay of a
+    /// message whose `Queued` was the receipt that went missing arrives as an
+    /// `AdapterAccepted` the record cannot take out of `Stored`. The pump reads
+    /// that back and puts the missing `Queued` in front of it: the ONE bridge
+    /// the delivery diagram offers, and no provider is asked for anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_receipt_a_full_lane_dropped_is_recovered_by_a_journal_replay() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "the lane is full").await;
+        let pump = fixture.pump_behind(fixture.watched());
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (bound, deliver) = bind_and_delivery(&drained(&mut fixture.link));
+
+        // a one-deep lane nobody drains. The first receipt occupies it and
+        // never reaches the pump; the second has nowhere at all to go.
+        let (receipts, _undrained) = lane::channel(1);
+        assert!(
+            fixture.terminals.route_collab_to(receipts),
+            "the pump's lane is free"
+        );
+        for state in [wire::State::Queued, wire::State::AdapterAccepted] {
+            fixture.terminals.on_event(reported(
+                deliver.seq,
+                bound.generation,
+                deliver.message_id,
+                state,
+            ));
+        }
+        assert_eq!(
+            fixture.terminals.dropped_receipts(),
+            1,
+            "the acceptance was dropped rather than wedging the pty plane"
+        );
+
+        pump.sweep(&mut seen).await;
+        let asked: Vec<_> = drained(&mut fixture.link)
+            .into_iter()
+            .filter(|command| matches!(command, wire::Command::MsgReplay { .. }))
+            .collect();
+        assert_eq!(
+            asked.len(),
+            1,
+            "the pump noticed the drop and asked for the journal: {asked:?}"
+        );
+
+        // the journal answers with where the message ACTUALLY is.
+        pump.receipt(reported(
+            deliver.seq,
+            bound.generation,
+            deliver.message_id,
+            wire::State::AdapterAccepted,
+        ))
+        .await;
+        assert_eq!(
+            owing(&pump, deliver.seq),
+            vec![wire::State::Queued, wire::State::AdapterAccepted],
+            "the record is behind, so the missing transition goes in front"
+        );
+
+        pump.sweep(&mut seen).await;
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::AdapterAccepted,
+            "and the network holds what the provider actually did"
+        );
+        assert_eq!(
+            fixture.attempted(),
+            vec![
+                collab::DeliveryState::AdapterAccepted,
+                collab::DeliveryState::Queued,
+                collab::DeliveryState::AdapterAccepted,
+            ],
+            "one refused attempt, then the pair in the order the diagram admits"
+        );
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "a replay recovers a receipt; it never re-offers the message",
+        );
+    }
+
+    /// what one message still owes the chain, as states in order.
+    fn owing(pump: &Pump, seq: u64) -> Vec<wire::State> {
+        pump.owed
+            .lock()
+            .expect("collab owed lock poisoned")
+            .get(&(CONVERSATION.into(), RECIPIENT.into(), seq))
+            .into_iter()
+            .flatten()
+            .map(|unsent| unsent.state)
+            .collect()
     }
 
     /// A daemon that dies and redials knows nothing of what the last one was
@@ -2227,6 +2568,22 @@ mod tests {
                 .any(|command| matches!(command, wire::Command::MsgTime { .. })),
             "and the clock, which a fresh daemon also does not have: {sent:?}"
         );
+    }
+
+    /// The delivery state one node command acknowledges, if it acknowledges
+    /// one. `None` for everything else on the lane — reads, and any other
+    /// collaboration op.
+    fn acknowledged(command: &noded::NodeCommand) -> Option<collab::DeliveryState> {
+        let noded::NodeCommand::SubmitFrame { frame, .. } = command else {
+            return None;
+        };
+        let (_, msg) = node::decode_frame(frame).ok()?;
+        let collab::CollaborationMsg::Acknowledge { state, .. } =
+            collab::decode_msg(&msg.payload).ok()?.op
+        else {
+            return None;
+        };
+        Some(state)
     }
 
     /// one delivery state as the daemon reports it.
