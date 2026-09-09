@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ACTION_CHAT_POST_MESSAGE, ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT,
-    ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND, ACTION_MODULES_UPDATE,
+    ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES,
     ModuleUpdateSpec, ReplyBlock,
 };
@@ -345,6 +346,67 @@ fn specs() -> Vec<Spec> {
             lanes: FINAL_ONLY,
         },
         Spec {
+            name: ACTION_COLLABORATION_SEND,
+            description: "Send one message in a collaboration conversation, as a participant this run's account is BOUND to. Live lane only: the message reaches collaboration as this account's program origin, and that module refuses it unless the participant's owner bound this account to the conversation under `credential`. Sequence is yours to choose and must be monotonic per credential; resending identical bytes under the same sequence is the same message, not a second one. Requires collaboration.send.",
+            grant: Grant::Action(ACTION_COLLABORATION_SEND.into()),
+            target: Some(object(
+                json!({
+                    "conversation_id": {"type": "string"},
+                    "participant_id": {"type": "string", "description": "The participant this account is bound to, and the sender."}
+                }),
+                &["conversation_id", "participant_id"],
+            )),
+            input: object(
+                json!({
+                    "credential": {"type": "integer", "description": "The binding's credential; also the generation half of the message id."},
+                    "sequence": {"type": "integer", "description": "Monotonic within this credential."},
+                    "recipient_participant_id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["notice", "question", "task_request", "task_update", "result"]},
+                    "body": {"type": "string"},
+                    "expires_at": {"type": "integer", "description": "ABSOLUTE consensus time; the network's unit, not seconds."},
+                    "reply_to": {"type": ["integer", "null"], "description": "Conversation sequence this answers."},
+                    "task": {"type": ["object", "null"], "properties": {"id": {"type": "string"}, "expected_attempt": {"type": "integer", "minimum": 0}}, "required": ["id", "expected_attempt"], "additionalProperties": false, "description": "Current task attempt; required for task_update."}
+                }),
+                &["credential", "sequence", "recipient_participant_id", "kind", "body", "expires_at"],
+            ),
+            result: object(
+                json!({
+                    "conversation_id": {"type": "string"},
+                    "credential": {"type": "integer"},
+                    "sequence": {"type": "integer"}
+                }),
+                &["conversation_id", "credential", "sequence"],
+            ),
+            lanes: LIVE_ONLY,
+        },
+        Spec {
+            name: ACTION_COLLABORATION_ACKNOWLEDGE,
+            description: "Record what happened to a message this bound participant received: queued, adapter_accepted, held, refused, delivery_unknown. Live lane only, same binding rule as collaboration.send. Which participant is reporting is NOT stated here — collaboration reads it off the binding this account holds. `reason` is a stable snake_case token, never prose. Requires collaboration.acknowledge.",
+            grant: Grant::Action(ACTION_COLLABORATION_ACKNOWLEDGE.into()),
+            target: Some(object(
+                json!({"conversation_id": {"type": "string"}}),
+                &["conversation_id"],
+            )),
+            input: object(
+                json!({
+                    "credential": {"type": "integer"},
+                    "seq": {"type": "integer", "description": "The conversation sequence the message occupies."},
+                    "state": {"type": "string", "enum": ["queued", "adapter_accepted", "held", "refused", "delivery_unknown"]},
+                    "reason": {"type": ["string", "null"], "description": "A stable snake_case token."}
+                }),
+                &["credential", "seq", "state"],
+            ),
+            result: object(
+                json!({
+                    "conversation_id": {"type": "string"},
+                    "seq": {"type": "integer"},
+                    "state": {"type": "string"}
+                }),
+                &["conversation_id", "seq", "state"],
+            ),
+            lanes: LIVE_ONLY,
+        },
+        Spec {
             name: OP_AGENT_CALL,
             description: "Call another registered agent while this run is live. The callee runs with caller ∩ callee authority; the root run's subagent_budget bounds concurrent calls. Collect results with the agent.calls query.",
             grant: Grant::Cap("subagent_budget".into()),
@@ -432,6 +494,25 @@ pub(crate) enum Operation {
         text: String,
         base_snapshot: Option<String>,
     },
+    CollaborationSend {
+        conversation_id: String,
+        participant_id: String,
+        credential: u64,
+        sequence: u64,
+        recipient_participant_id: String,
+        kind: String,
+        body: String,
+        expires_at: u64,
+        reply_to: Option<u64>,
+        task: Option<collaboration::TaskRef>,
+    },
+    CollaborationAcknowledge {
+        conversation_id: String,
+        credential: u64,
+        seq: u64,
+        state: String,
+        reason: Option<String>,
+    },
     ModulesUpdate(ModuleUpdateSpec),
     AgentCall {
         agent_id: String,
@@ -444,6 +525,50 @@ pub(crate) enum Operation {
 #[serde(deny_unknown_fields)]
 struct ContentInput {
     content: Vec<ContentPart>,
+}
+
+/// Which conversation, and which of the caller's participants it acts as.
+/// Neither is an authority: `collaboration` verifies both against the binding
+/// the program origin actually holds.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationTarget {
+    conversation_id: String,
+    participant_id: String,
+}
+
+/// An acknowledgement names only the conversation: the reporting participant
+/// is the one this account's binding names, which only `collaboration` can
+/// resolve.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAckTarget {
+    conversation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationSendInput {
+    credential: u64,
+    sequence: u64,
+    recipient_participant_id: String,
+    kind: String,
+    body: String,
+    expires_at: u64,
+    #[serde(default)]
+    reply_to: Option<u64>,
+    #[serde(default)]
+    task: Option<collaboration::TaskRef>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationAckInput {
+    credential: u64,
+    seq: u64,
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -625,6 +750,33 @@ impl Operation {
                     base_snapshot: input.base_snapshot,
                 })
             }
+            ACTION_COLLABORATION_SEND => {
+                let target: CollaborationTarget = decode_target(envelope)?;
+                let input: CollaborationSendInput = decode_input(envelope)?;
+                Ok(Self::CollaborationSend {
+                    conversation_id: target.conversation_id,
+                    participant_id: target.participant_id,
+                    credential: input.credential,
+                    sequence: input.sequence,
+                    recipient_participant_id: input.recipient_participant_id,
+                    kind: input.kind,
+                    body: input.body,
+                    expires_at: input.expires_at,
+                    reply_to: input.reply_to,
+                    task: input.task,
+                })
+            }
+            ACTION_COLLABORATION_ACKNOWLEDGE => {
+                let target: CollaborationAckTarget = decode_target(envelope)?;
+                let input: CollaborationAckInput = decode_input(envelope)?;
+                Ok(Self::CollaborationAcknowledge {
+                    conversation_id: target.conversation_id,
+                    credential: input.credential,
+                    seq: input.seq,
+                    state: input.state,
+                    reason: input.reason,
+                })
+            }
             ACTION_MODULES_UPDATE => {
                 no_target(envelope)?;
                 let spec: ModuleUpdateSpec = decode_input(envelope)?;
@@ -656,6 +808,8 @@ impl Operation {
             Self::TasksCreate { .. } => ACTION_TASKS_CREATE,
             Self::TasksUpdateStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
             Self::DuckfsWriteText { .. } => ACTION_DUCKFS_WRITE_TEXT,
+            Self::CollaborationSend { .. } => ACTION_COLLABORATION_SEND,
+            Self::CollaborationAcknowledge { .. } => ACTION_COLLABORATION_ACKNOWLEDGE,
             Self::ModulesUpdate(_) => ACTION_MODULES_UPDATE,
             Self::AgentCall { .. } => OP_AGENT_CALL,
         }
@@ -772,6 +926,25 @@ mod tests {
                 OP_AGENT_CALL,
                 Some(json!({"agent_id": "reviewer"})),
                 json!({"instruction": "review", "skills": ["review"]}),
+            ),
+            envelope(
+                ACTION_COLLABORATION_SEND,
+                Some(json!({"conversation_id": "c1", "participant_id": "alice"})),
+                json!({
+                    "credential": 2,
+                    "sequence": 1,
+                    "recipient_participant_id": "bob",
+                    "kind": "notice",
+                    "body": "hi",
+                    "expires_at": 900
+                }),
+            ),
+            // the acknowledgement names no participant: collaboration reads the
+            // reporter off the binding the origin holds.
+            envelope(
+                ACTION_COLLABORATION_ACKNOWLEDGE,
+                Some(json!({"conversation_id": "c1"})),
+                json!({"credential": 2, "seq": 4, "state": "queued"}),
             ),
         ];
         let names: Vec<&str> = cases

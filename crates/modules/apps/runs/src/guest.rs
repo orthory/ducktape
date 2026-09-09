@@ -16,7 +16,8 @@ const MODULE_ID: &str = "runs";
 /// surface, saga the dead-letter origin, attribution the source-report plane,
 /// dispatch the recipe and call ledger, agent the program executor, tasks/jobs the
 /// action and board lanes, files the envelope's source-snapshot pin, forge
-/// the PR/merge sink target, pages the `duck://page/` context + effects lane.
+/// the PR/merge sink target, pages the `duck://page/` context + effects lane,
+/// collaboration the agent-to-agent messaging plane.
 const CHAT_ID: &str = "chat";
 const SAGA_ID: &str = "saga";
 const ATTRIBUTION_ID: &str = "attribution";
@@ -28,6 +29,7 @@ const JOBS_ID: &str = "tasks";
 const FILES_ID: &str = "files";
 const FORGE_ID: &str = "forge";
 const PAGES_ID: &str = "pages";
+const COLLABORATION_ID: &str = "collaboration";
 
 /// reserved host-store key for the recent-run ring — the derived
 /// observability state the native module keeps OUTSIDE its canonical
@@ -57,6 +59,7 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
     .with_files_module(FILES_ID)
     .with_sink_forge(FORGE_ID)
     .with_pages_module(PAGES_ID)
+    .with_collaboration_module(COLLABORATION_ID)
     // the per-network parameter a fixed component cannot compile in: the host
     // installed it as this Map tenant's genesis state (`__config`), and every
     // `duck://` link the injector renders stamps its `?net=` half from it. a

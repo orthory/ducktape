@@ -57,6 +57,11 @@ directory = { workspace = true }
 # (root-continuous cutover — revision stays 1).
 pages = { workspace = true }
 chat = { workspace = true }
+# the collaboration parity proof additionally pins the AUTHENTICATED read
+# lane across the runtimes: that module serves no unauthenticated read, so
+# equal replies prove the wasm port threads the dispatch origin into the
+# guest's query export the way native `query_with` reads it.
+collaboration = { workspace = true }
 index_guest = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }

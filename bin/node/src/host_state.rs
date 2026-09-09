@@ -63,6 +63,13 @@ impl<'a> NetworkBindings<'a> {
         Bindings {
             invite: self.invite,
             chain_id: self.identity_chain_id,
+            // NOT a per-call binding, because it does not vary here: no lane
+            // this binary composes — validator, replica, sync-only — installs
+            // a `ConsensusTimePolicy`, so `consensus_time` IS the height on
+            // every one of them, which is what each reports as its
+            // `consensus_time_unit`. The sim lane, which arms
+            // `ConsensusTimePolicy::Epoch`, binds `Millis` in `bin/simnode`.
+            time_unit: sdk::genesis_config::TimeUnit::Height,
         }
     }
 }
@@ -873,7 +880,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "0a7ec128c09ea8639e1a26707e997bf5433191ca17679da9f5dab7988507a11c";
+        "82b32ae80d025ba247d13b7cd30b51b2ba5ad2712ba7254c422710f2bd2a726a";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`

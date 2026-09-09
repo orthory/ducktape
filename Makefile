@@ -365,7 +365,8 @@ test: wasm-modules-check wasm-embed-check
 BUILDER_MODULES := \
   crates/examples/directory \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
-  crates/modules/apps/automations crates/modules/apps/runs \
+  crates/modules/apps/automations crates/modules/apps/collaboration \
+  crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
   crates/modules/apps/forge \
   crates/modules/system/attribution crates/modules/system/dispatch \
