@@ -1181,6 +1181,7 @@ struct Pending {
 /// purely local counter is wrong the moment anything else sends. This file is
 /// therefore a memory of AMBIGUITY, not a sequence allocator — the allocator
 /// asks the network and only takes this as a floor.
+#[derive(Debug)]
 struct Outbox {
     path: PathBuf,
     state: OutboxFile,

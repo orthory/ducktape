@@ -3661,9 +3661,12 @@ pub(crate) mod tests {
         let reading = crate::backend::MessagingView {
             rpc: "http://127.0.0.1:8844".into(),
             network: "duck-1".into(),
-            link: 3,
-            account: "7".into(),
-            op: 5,
+            // deliberately unmistakable: a bare 3 or 5 could plausibly be a
+            // sequence or a count on this pane, and would make the leak
+            // assertion below say nothing
+            link: 987_654,
+            account: "876543".into(),
+            op: 765_432,
             participant: "claude-a".into(),
             conversation: "standup".into(),
             topic: "release review".into(),
@@ -3714,6 +3717,9 @@ pub(crate) mod tests {
         let props = Some(agents_props(
             false, true, true, "7", 0, &[], &[], &[], &reading, false, false, "", 0,
         ));
+        // the account the app draws in its header is the top-level one, which
+        // is a different field from the scope's `account` the encoder strips
+        assert!(!String::from_utf8_lossy(props.as_ref().expect("props")).contains("876543"));
         guest.redraw(&props);
 
         // THE PANE IS BEHIND ITS OWN TAB: the register is what a reader lands
@@ -3745,9 +3751,9 @@ pub(crate) mod tests {
             "{shown:?}"
         );
         // and the app's own bookkeeping never crossed
-        for leaked in ["http://127.0.0.1:8844", "5", "3"] {
+        for leaked in ["127.0.0.1:8844", "987654", "876543", "765432"] {
             assert!(
-                !shown.iter().any(|text| text == leaked),
+                !shown.iter().any(|text| text.contains(leaked)),
                 "the props encoder leaked {leaked:?}: {shown:?}"
             );
         }
