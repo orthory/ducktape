@@ -937,7 +937,7 @@ fn rejections_match_and_leave_no_trace() {
     deterministic::Runner::default().start(|context| async move {
         let mut native = native_host(&context).await;
         let mut wasm = wasm_host_(&context).await;
-        let (alice, bob) = (key(0xA1), key(0xB2));
+        let alice = key(0xA1);
 
         for host in [&mut native, &mut wasm] {
             host.submit_at(
