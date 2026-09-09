@@ -1490,20 +1490,22 @@ mod tests {
     /// fails here, not under a reader's `@`.
     #[test]
     fn only_a_build_point_takes_the_apps_inputs_in() {
-        fn method<'a>(widget_impl: &'a str, name: &str) -> &'a str {
+        /// Where `fn name` opens at method depth — the whole name, so
+        /// `build` never matches `builder` and `menu` never `menu_key`.
+        fn opens<'a>(source: &'a str, name: &str) -> &'a str {
             let start = [format!("\n    fn {name}("), format!("\n    fn {name}<")]
                 .iter()
-                .find_map(|head| widget_impl.find(head.as_str()))
-                .unwrap_or_else(|| panic!("the widget impl has `fn {name}`"));
-            let rest = &widget_impl[start + 1..];
+                .find_map(|head| source.find(head.as_str()))
+                .unwrap_or_else(|| panic!("a `fn {name}` at method depth"));
+            &source[start + 1..]
+        }
+        fn method<'a>(widget_impl: &'a str, name: &str) -> &'a str {
+            let rest = opens(widget_impl, name);
             let end = rest[4..].find("\n    fn ").map_or(rest.len(), |at| at + 4);
             &rest[..end]
         }
         fn builder<'a>(source: &'a str, name: &str) -> &'a str {
-            let start = source
-                .find(&format!("    fn {name}"))
-                .unwrap_or_else(|| panic!("a `fn {name}` builder"));
-            let rest = &source[start..];
+            let rest = opens(source, name);
             let end = rest.find("\n    }\n").expect("the builder ends");
             &rest[..end]
         }
