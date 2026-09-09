@@ -314,6 +314,116 @@ pub(crate) fn public_hex(key: &ed25519::PrivateKey) -> String {
     crate::config::hex_bytes(key.public_key().as_ref())
 }
 
+// ---- what this device has attached ----------------------------------------
+
+/// The attachments this device has made, one JSON object per line.
+///
+/// Separate from the keys on purpose. [`BindingRef::file_name`] is a DIGEST, so
+/// the key directory cannot be read back into the ids that produced it — which
+/// is the right shape for a secret's name and the wrong one for the node's own
+/// collaboration pump, which has to know which bindings to pump before it can
+/// authenticate a single read.
+///
+/// It discloses nothing new: a reader of this file can read the keys beside it,
+/// which is total control of every binding it lists. And the ids are on-chain
+/// already — the pump would learn them from the module the moment it held a key.
+const ATTACHED: &str = "attached.jsonl";
+
+/// One binding this device holds a key for, and the local session label its
+/// deliveries are aimed at.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct Attached {
+    pub(crate) network: String,
+    pub(crate) conversation: String,
+    pub(crate) participant: String,
+    /// the opaque label the daemon resolves to a local provider session. It is
+    /// the operator's `collab attach --device`, and the network records the same
+    /// string — it names no path, session id or token.
+    pub(crate) device: String,
+}
+
+/// Record that this device attached `binding` to `device`.
+///
+/// Append-only, and called BEFORE the owner-signed `Bind` for the same reason
+/// the key is minted before it: a crash between the two leaves a device that can
+/// still find and re-drive its binding, where the reverse order leaves the pump
+/// blind to a binding the network already holds.
+///
+/// A line for a binding already listed is still appended — [`attached`] keeps
+/// the LAST, so a re-attach to a new device label supersedes the old one without
+/// this having to rewrite a file the pump may be reading.
+pub(crate) fn remember(
+    workspace: &std::path::Path,
+    binding: BindingRef<'_>,
+    device: &str,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    let dir = workspace.join(DIR);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let path = dir.join(ATTACHED);
+    let line = serde_json::to_string(&Attached {
+        network: binding.network.to_string(),
+        conversation: binding.conversation.to_string(),
+        participant: binding.participant.to_string(),
+        device: device.to_string(),
+    })
+    .map_err(|error| format!("attachment record: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    // one write of one short line: the append is atomic on every filesystem
+    // this runs on, so a concurrent `attach` cannot interleave into it.
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The bindings this device has attached on `network`, latest label per binding.
+///
+/// A missing file is an empty list, not an error: a node that has never run
+/// `collab attach` has nothing to pump, which is an ordinary state. An
+/// unparseable LINE is skipped with a warn rather than failing the read — one
+/// torn tail (a crash mid-append) must not blind the pump to every binding
+/// above it.
+pub(crate) fn attached(
+    workspace: &std::path::Path,
+    network: &str,
+) -> Result<Vec<Attached>, String> {
+    let path = workspace.join(DIR).join(ATTACHED);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut latest: std::collections::BTreeMap<(String, String), Attached> = Default::default();
+    let mut unreadable = 0usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<Attached>(line) else {
+            unreadable += 1;
+            continue;
+        };
+        if record.network != network {
+            continue;
+        }
+        latest.insert(
+            (record.conversation.clone(), record.participant.clone()),
+            record,
+        );
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            target: "ducktape::collab",
+            reason = "attachment_record_unreadable",
+            lines = unreadable,
+            "skipped attachment records this build cannot read"
+        );
+    }
+    Ok(latest.into_values().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

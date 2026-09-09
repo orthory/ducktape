@@ -93,8 +93,8 @@ pub use module_code::{
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
 pub use term::{
-    CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
-    TermFeedEvent, TermRing, TerminalSessions,
+    AttachGuard, CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing,
+    TermError, TermFeedEvent, TermRing, TerminalSessions,
 };
 
 pub mod term_remote;

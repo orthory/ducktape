@@ -401,6 +401,11 @@ fn cmd_attach(args: AttachArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> Coll
         participant: &args.participant,
     };
     let service = crate::collab_keys::ensure(&workspace, binding)?;
+    // and record WHICH binding this is, beside the key that cannot say: the key
+    // file is named by a digest, so the node's collaboration pump could never
+    // read the ids back out of it. Before the `Bind` for the same reason the key
+    // is — see `collab_keys::remember`.
+    crate::collab_keys::remember(&workspace, binding, &args.device)?;
     // a scoped SERVICE KEY, not a program account: this device holds a private
     // half, which is what lets it sign its own sends and receipts later.
     let principal = collaboration::BoundPrincipal::ServiceKey(
