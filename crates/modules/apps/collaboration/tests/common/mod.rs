@@ -9,8 +9,8 @@
 #![allow(dead_code)]
 
 use collaboration::{
-    encode_msg, encode_query, CollaborationMsg, CollaborationQuery, CollaborationReply,
-    Collaboration, MessageId, MessageKind, ProtectedRead, Role, SendRequest,
+    encode_msg, encode_query, BoundPrincipal, CollaborationMsg, CollaborationQuery,
+    CollaborationReply, Collaboration, MessageId, MessageKind, ProtectedRead, Role, SendRequest,
 };
 use sdk::{Cause, Env, Error, Module, Msg, Origin};
 use sdk_testkit::{MemStore, TestCtx};
@@ -20,7 +20,9 @@ pub const IDENTITY: &str = "identity";
 pub const TASKS: &str = "tasks";
 /// the height-lane ceiling every test composes with, so a deadline reads in
 /// the same units the assertions use.
-pub const MAX_TTL: u64 = collaboration::HEIGHT_LANE_MAX_DELIVERY_TTL;
+pub const MAX_TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
+/// the network every op in these tests is bound to.
+pub const NETWORK: &str = "test-net";
 
 pub fn module() -> Collaboration {
     Collaboration::new(
@@ -29,6 +31,7 @@ pub fn module() -> Collaboration {
         TASKS,
         Box::new(MemStore::new()),
         MAX_TTL,
+        NETWORK,
     )
 }
 
@@ -41,6 +44,47 @@ pub fn key(byte: u8) -> Vec<u8> {
 /// a ctx at `now`, dispatching as the external key `signer`.
 pub fn at(now: u64, origin: Origin) -> TestCtx {
     with_job(now, origin, None)
+}
+
+/// a ctx whose `identity` sibling knows ONE program account: the shape the
+/// dispatch call lane's `Origin::Program(account)` resolves against. Without
+/// it a program origin cannot resolve to an actor at all, which is a wiring
+/// error, not a refusal.
+pub fn as_program(now: u64, account: sdk::AccountNumber) -> TestCtx {
+    TestCtx::with_env(Env {
+        height: now,
+        consensus_time: now,
+        origin: Origin::Program(account),
+        me: MODULE.into(),
+        cause: Cause::Direct,
+    })
+    .on_query(IDENTITY, move |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            Some(program_account(account)),
+        )))
+    })
+    .on_query(TASKS, |_| {
+        Ok(tasks::encode_job_reply(&tasks::JobsReply::Job(None)))
+    })
+}
+
+/// an ACTIVE program account executed by the `agent` module — what identity
+/// holds for an account the call lane may run.
+pub fn program_account(number: sdk::AccountNumber) -> identity::AccountView {
+    identity::AccountView {
+        number,
+        name: format!("program-{number}"),
+        control: identity::Control::Program {
+            controller: 1,
+            executor: "agent".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        },
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    }
 }
 
 /// a ctx whose `tasks` sibling answers with `job` for every job query — the
@@ -81,10 +125,15 @@ pub fn job(job_id: &str, attempt: u64) -> tasks::Job {
     }
 }
 
+/// wrap an op for THIS network — the binding every op carries.
 pub fn msg(payload: CollaborationMsg) -> Msg {
+    on_network(NETWORK, payload)
+}
+
+pub fn on_network(network: &str, payload: CollaborationMsg) -> Msg {
     Msg {
         target: MODULE.into(),
-        payload: encode_msg(&payload),
+        payload: encode_msg(&collaboration::Request::new(network, payload)),
     }
 }
 
@@ -212,11 +261,27 @@ pub fn bind(
     service_key: Vec<u8>,
     expected_credential: u64,
 ) -> CollaborationMsg {
+    bind_to(
+        conversation_id,
+        participant_id,
+        BoundPrincipal::ServiceKey(service_key),
+        expected_credential,
+    )
+}
+
+/// bind an arbitrary principal — the program-account arm reaches this module
+/// over the dispatch call lane, not over a signature.
+pub fn bind_to(
+    conversation_id: &str,
+    participant_id: &str,
+    principal: BoundPrincipal,
+    expected_credential: u64,
+) -> CollaborationMsg {
     CollaborationMsg::Bind {
         conversation_id: conversation_id.into(),
         participant_id: participant_id.into(),
         device: "laptop".into(),
-        service_key,
+        principal,
         expected_credential,
     }
 }

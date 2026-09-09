@@ -614,6 +614,27 @@ pub fn store_genesis_chain_id(module_label: &str) -> Result<String, host::Error>
     decode_chain_id(&raw, module_label)
 }
 
+/// the [`store_genesis_chain_id`] twin for the `time_unit` parameter: what one
+/// `consensus_time` unit is on THIS network, so a fixed-bytes component can
+/// turn a duration into a deadline. Same wiring-corruption contract — a
+/// missing or malformed value rejects deterministically, because guessing a
+/// scale would silently mean the wrong duration.
+pub fn store_genesis_time_unit(
+    module_label: &str,
+) -> Result<sdk::genesis_config::TimeUnit, host::Error> {
+    let raw = load_store_config().ok_or_else(|| {
+        host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
+    })?;
+    let params = sdk::genesis_config::decode_config(&raw)
+        .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
+    let value =
+        sdk::genesis_config::find(&params, sdk::genesis_config::TIME_UNIT).ok_or_else(|| {
+            host::Error::Rejected(format!("{module_label} genesis config carries no time_unit"))
+        })?;
+    sdk::genesis_config::TimeUnit::decode(value)
+        .map_err(|e| host::Error::Rejected(format!("{module_label} {e}")))
+}
+
 /// decode the `chain_id` parameter out of raw genesis-config bytes — the
 /// shared tail of the two loaders above.
 fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error> {

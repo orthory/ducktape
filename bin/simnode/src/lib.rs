@@ -813,6 +813,9 @@ fn run_sim(
         let bindings = Bindings {
             invite: &invite_binding,
             chain_id: LOCAL_CHAIN_ID,
+            // the sim arms `ConsensusTimePolicy::Epoch`, so its `consensus_time`
+            // is a millisecond clock, not a height.
+            time_unit: sdk::genesis_config::TimeUnit::Millis,
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(

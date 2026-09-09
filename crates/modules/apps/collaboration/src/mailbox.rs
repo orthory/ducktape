@@ -15,7 +15,8 @@ use crate::interface::{
     MAX_SEQUENCE, MAX_UNDELIVERED_PER_SENDER,
 };
 use crate::registry::{
-    self, live_binding, live_participant, require_conversation, roster_role, signed_by, Advanced,
+    self, authenticates, live_binding, live_participant, require_conversation, roster_role,
+    Advanced,
 };
 use crate::store::{self, Admission};
 use crate::{hex, Party};
@@ -166,7 +167,7 @@ pub async fn authenticating_credential(
     }
     let binding = live_binding(staged, conversation_id, &participant.id).await?;
     Ok(binding
-        .filter(|binding| signed_by(origin, &binding.service_key))
+        .filter(|binding| authenticates(origin, &binding.principal))
         .map(|binding| binding.credential))
 }
 
@@ -556,7 +557,7 @@ pub async fn acknowledge(
     }
     let recipient = live_participant(staged, &receipt.recipient).await?;
     let by_owner = crate::controls(&recipient.owner, actor, origin);
-    if !(by_owner || signed_by(origin, &binding.service_key)) {
+    if !(by_owner || authenticates(origin, &binding.principal)) {
         return Err(Error::Module(
             "only the bound service key or the participant's owner may acknowledge".into(),
         ));

@@ -243,6 +243,9 @@ fn run_node(
             // no governance in this set, so nothing reads an invite namespace.
             invite: b"",
             chain_id: LOCAL_CHAIN_ID,
+            // the daemon arms no `ConsensusTimePolicy`, so its clock IS the
+            // height — the same unit it reports as `consensus_time_unit`.
+            time_unit: sdk::genesis_config::TimeUnit::Height,
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(

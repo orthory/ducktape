@@ -77,9 +77,15 @@ pub struct Collaboration {
     /// unit. a constructor parameter and not a constant, because
     /// `consensus_time` is a block height on the validator lanes and a
     /// millisecond epoch clock on the sim lane: one number cannot mean seven
-    /// days in both. [`HEIGHT_LANE_MAX_DELIVERY_TTL`] is the height-lane
-    /// binding.
+    /// days in both. The network states its unit as the `time_unit` genesis
+    /// parameter and [`crate::max_delivery_ttl`] scales
+    /// [`crate::MAX_DELIVERY_TTL_SECONDS`] into it.
     max_delivery_ttl: u64,
+    /// this network's `chain_id`. Every op names the network it was authorized
+    /// for and must name THIS one: a submitted frame's signature covers no
+    /// chain id (`node::frame_preimage`), so without this the same signed
+    /// bytes would replay on every network the signer can reach.
+    network: String,
     /// the host-injected authenticated store plus this block's staging overlay
     /// (read-your-writes; folded into `root()` at `commit_block`).
     staged: StagedStore,
@@ -92,14 +98,33 @@ impl Collaboration {
         tasks: impl Into<ModuleId>,
         store: Box<dyn MerkleStore>,
         max_delivery_ttl: u64,
+        network: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
             identity: identity.into(),
             tasks: tasks.into(),
             max_delivery_ttl,
+            network: network.into(),
             staged: StagedStore::new(store),
         }
+    }
+
+    /// the network binding every op must carry. An EMPTY configured id is not
+    /// a wildcard — it refuses everything, because an empty id matching an
+    /// empty `Request::network` would collapse every network into one.
+    fn check_network(&self, network: &str) -> Result<(), Error> {
+        if self.network.is_empty() {
+            return Err(Error::Module(
+                "this module was composed with a blank chain_id, which binds no network".into(),
+            ));
+        }
+        if network != self.network {
+            return Err(Error::Module(format!(
+                "op is bound to network {network:?}, not this network"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -253,7 +278,7 @@ impl Collaboration {
                 conversation_id,
                 participant_id,
                 device,
-                service_key,
+                principal,
                 expected_credential,
             } => {
                 let advanced = registry::bind(
@@ -264,7 +289,7 @@ impl Collaboration {
                     conversation_id.clone(),
                     participant_id,
                     device,
-                    service_key,
+                    principal,
                     expected_credential,
                 )
                 .await?;
@@ -419,8 +444,12 @@ impl Module for Collaboration {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let msg = decode_msg(&msg.payload).map_err(Error::Module)?;
-        self.on_msg(ctx, msg).await
+        let request = decode_msg(&msg.payload).map_err(Error::Module)?;
+        // the network binding is checked BEFORE anything is read or staged: a
+        // foreign-network op is not a refused write, it is not this network's
+        // op at all.
+        self.check_network(&request.network)?;
+        self.on_msg(ctx, request.op).await
     }
 
     /// there is no unauthenticated read path. `query` has no context, so it
