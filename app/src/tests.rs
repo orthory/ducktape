@@ -8,6 +8,7 @@ mod connection;
 mod design;
 mod font_fallback;
 mod forge;
+mod files_draft;
 mod huddle_live;
 mod messages;
 mod page_autosave_gate;

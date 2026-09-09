@@ -9,6 +9,9 @@ state
   fs_preview_path = ""
   fs_preview_entry:FsEntry = no_fs_entry()
   fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_save_reply:FsSaveHistory = no_fs_save_reply()
   fs_preview_truncated = false
   fs_preview_binary = false
   fs_preview_picture = false

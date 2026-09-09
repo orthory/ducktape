@@ -24,7 +24,10 @@ extern crate::host
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsDiffEntry(path:str, kind:str)
-  FilesProps(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:str, dark:bool, write_refusal:str, writes:i64)
+  SaveReply(namespace:str, context:str, request:i64, success:bool, message:str)
+  SaveHistory(replies:[SaveReply], overflow:str)
+  pure save_answer(history:&SaveHistory, context:&str, namespace:&str, request:i64) -> SaveReply
+  FilesProps(save_namespace:str, network_scope:str, context:str, preview_base:str, save_reply:SaveHistory, path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:str, dark:bool, write_refusal:str, writes:i64)
   PropsItem(next:FilesProps, error:str)
   subscription props() -> PropsItem
   pure open_dir(path:&str) -> bool
@@ -37,11 +40,13 @@ extern crate::host
   pure delete_object() -> bool
   pure close_diff() -> bool
   pure show_diff(id:&str) -> bool
-  pure save(path:&str, text:&str) -> bool
+  pure save(namespace:&str, context:&str, path:&str, base:&str, request:i64, text:&str) -> bool
+  pure edit_token(context:&str, path:&str, base:&str, draft:i64) -> str
   pure open_link(url:&str) -> bool
   pure icon(name:&str) -> bytes
   pure no_fs_entry() -> FsEntry
   pure keep_draft(consumed:bool, draft:&str) -> str
+  pure keep_str(take:bool, next:&str, previous:&str) -> str
   pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure size_label(bytes:i64) -> str
   pure height_label(height:i64) -> str
@@ -53,6 +58,21 @@ extern crate::host
   component agent_markdown(source:str, dark:bool) -> str
 
 state
+  network_scope = ""
+  context = ""
+  preview_base = ""
+  draft_network = ""
+  draft_path = ""
+  draft_base = ""
+  draft_id:i64 = 0
+  save_request:i64 = 0
+  save_context = ""
+  save_namespace = ""
+  pending_namespace = ""
+  reply_overflow = ""
+  pending_overflow = ""
+  save_pending = false
+  draft_error = ""
   active_palette:palette[AppTheme] = AppTheme.app
   path = "/shared"
   listed = false
@@ -84,6 +104,11 @@ state
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
+derived
+  draft_here = editing && draft_path == preview_path && draft_network == network_scope
+  draft_parked = editing && !draft_here
+  edit_context = edit_token(context, preview_path, preview_base, draft_id)
+
 // The facts are the host's: one subscription, one item per change. A
 // subscription, not a mount task, so a replacement restored from this
 // view's state asks for the facts again on its own.
@@ -94,6 +119,17 @@ on props_arrived(item)
   host_error = item.error
   return if !empty(item.error)
   let next = item.next
+  let reply = save_answer(next.save_reply, save_context, pending_namespace, save_request)
+  let answered = save_pending && reply.request == save_request
+  let lost = save_pending && !answered && next.save_reply.overflow != pending_overflow
+  editing = editing && !(answered && reply.success)
+  draft_error = keep_str(lost, "Save confirmation is no longer available. Your edits are still here; check the file before saving again.", keep_str(answered, reply.message, draft_error))
+  save_pending = save_pending && !answered && !lost && next.connected && next.context == context
+  reply_overflow = next.save_reply.overflow
+  save_namespace = next.save_namespace
+  network_scope = next.network_scope
+  context = next.context
+  preview_base = next.preview_base
   path = next.path
   listed = next.listed
   entries = next.entries
@@ -155,65 +191,96 @@ on close_diff_now
 on show_diff_of(id)
   sent = show_diff(id)
 
-on begin_edit
-  return if preview_binary || empty(preview_path)
+on begin_edit(token)
+  return if token != edit_context || editing || loading || !connected || empty(network_scope) || empty(preview_base) || preview_binary || preview_truncated || empty(preview_path)
   editing = true
+  draft_id = draft_id + 1
+  draft_network = network_scope
+  draft_path = preview_path
+  draft_base = preview_base
+  draft_error = ""
   draft = editor(preview_text)
 
-on cancel_edit
+on cancel_edit(token)
+  return if token != edit_context
   editing = false
+  save_pending = false
+  draft_error = ""
+  draft = editor("")
 
-// The body leaves on Save and the pane drops back to the reader at once; the
-// app shows the saved text under the path until the re-read lands.
-on save_edit
-  return if loading || !editing || empty(preview_path)
+on discard_draft(id)
+  return if id != draft_id
   editing = false
-  sent = save(preview_path, editor_text(draft))
+  save_pending = false
+  draft_error = ""
+  draft = editor("")
+
+// Keep the original bytes and base until this exact request is committed.
+on save_edit(token)
+  return if token != edit_context || !draft_here || loading || save_pending || !connected || empty(preview_base)
+  save_request = save_request + 1
+  save_context = context
+  pending_namespace = save_namespace
+  pending_overflow = reply_overflow
+  save_pending = true
+  draft_error = ""
+  sent = save(save_namespace, context, draft_path, draft_base, save_request, editor_text(draft))
 
 on open_link_at(url)
   sent = open_link(url)
 
 view
-  box #root
-    with
-      w=fill
-      h=fill
-      bg=bg
-    FilesScreen new_name<->new_name draft<->draft
+  col w=fill h=fill
+    if draft_parked
+      col w=fill gap=4.0
+        text "Unsaved changes to:" size=13.0
+        text draft_path size=13.0
+        text "Return to this file to continue editing." size=13.0
+        button "Discard unsaved changes" -> discard_draft(draft_id)
+    if !empty(draft_error)
+      text draft_error size=13.0
+    box #root
       with
-        path
-        listed
-        entries
-        directories
-        connected
-        loading
-        preview_path
-        preview_entry
-        delete_target
-        diff_from
-        diff
-        history
-        preview_truncated
-        preview_binary
-        editing
-        preview_text
-        dark
-        preview_picture
-        preview_width
-        preview_height
-        write_refusal
-      events
-        open_message_link -> open_link_at _
-        fs_open_dir -> open_dir_at _
-        fs_open_file -> open_file_at _
-        fs_open_parent -> go_parent
-        fs_mkdir_submit -> mkdir_submit
-        fs_new_file_submit -> new_file_submit
-        fs_arm_delete -> arm_delete_at _
-        fs_disarm_delete -> disarm_delete_now
-        fs_delete_submit -> delete_submit
-        fs_close_diff -> close_diff_now
-        fs_show_diff -> show_diff_of _
-        fs_begin_edit -> begin_edit
-        fs_cancel_edit -> cancel_edit
-        fs_save_edit -> save_edit
+        w=fill
+        h=fill
+        bg=bg
+      FilesScreen new_name<->new_name draft<->draft
+        with
+          path
+          listed
+          entries
+          directories
+          connected
+          loading=(loading || save_pending || (draft_here && empty(preview_base)))
+          preview_path
+          preview_entry
+          delete_target
+          diff_from
+          diff
+          history
+          preview_truncated
+          preview_binary
+          editing=draft_here
+          edit_context
+          edit_blocked=(draft_parked || empty(preview_base) || empty(network_scope))
+          preview_text
+          dark
+          preview_picture
+          preview_width
+          preview_height
+          write_refusal
+        events
+          open_message_link -> open_link_at _
+          fs_open_dir -> open_dir_at _
+          fs_open_file -> open_file_at _
+          fs_open_parent -> go_parent
+          fs_mkdir_submit -> mkdir_submit
+          fs_new_file_submit -> new_file_submit
+          fs_arm_delete -> arm_delete_at _
+          fs_disarm_delete -> disarm_delete_now
+          fs_delete_submit -> delete_submit
+          fs_close_diff -> close_diff_now
+          fs_show_diff -> show_diff_of _
+          fs_begin_edit -> begin_edit _
+          fs_cancel_edit -> cancel_edit _
+          fs_save_edit -> save_edit _
