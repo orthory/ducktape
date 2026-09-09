@@ -1391,8 +1391,8 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
                 Origin::External(carol.clone()),
                 op(&ChatMsg::EditMessage {
                     channel_id: "room".into(),
-                    seq: 1,
-                    blocks: vec![Block::paragraph("hijack")],
+                    seq: 99,
+                    blocks: vec![Block::paragraph("no such message")],
                     base_rev: None,
                 }),
             ),

@@ -372,36 +372,104 @@ fn compiled_thread_resolution_authenticates_queued_program_accounts() {
         let mut p = ResolutionParity::new(&context).await;
         for host in [&mut p.native, &mut p.wasm] {
             host.register(Box::new(ResolutionExecutor));
-            host.register(Box::new(dispatch::DispatchModule::new("dispatch", "saga", "identity", Box::new(sdk_testkit::MemStore::new()))));
+            host.register(Box::new(dispatch::DispatchModule::new(
+                "dispatch",
+                "saga",
+                "identity",
+                Box::new(sdk_testkit::MemStore::new()),
+            )));
         }
         let (alice, bob) = (PrivateKey::from_seed(1), PrivateKey::from_seed(2));
         p.found(&alice, "Alice").await;
         p.found(&bob, "Bob").await;
         for account in [3, 4] {
-            p.identity(Origin::Module("resolution-executor".into()), identity::IdentityMsg::CreateProgram { name: format!("program-{account}"), controller: 1, request: account }).await;
+            p.identity(
+                Origin::Module("resolution-executor".into()),
+                identity::IdentityMsg::CreateProgram {
+                    name: format!("program-{account}"),
+                    controller: 1,
+                    request: account,
+                },
+            )
+            .await;
         }
-        p.page(signed(&bob), PageMsg::CreatePage { page_id: "human-page".into(), title: "Human".into(), blocks: Vec::new(), }).await;
-        let created = p.program_call(3, PageMsg::CreatePage { page_id: "program-page".into(), title: "Program".into(), blocks: Vec::new(), }).await;
+        p.page(
+            signed(&bob),
+            PageMsg::CreatePage {
+                page_id: "human-page".into(),
+                title: "Human".into(),
+                blocks: Vec::new(),
+            },
+        )
+        .await;
+        let created = p
+            .program_call(
+                3,
+                PageMsg::CreatePage {
+                    page_id: "program-page".into(),
+                    title: "Program".into(),
+                    blocks: Vec::new(),
+                },
+            )
+            .await;
         assert_eq!(created.disposition, host::CallDisposition::Applied);
-        p.page(signed(&bob), thread_comment("program-editor", "program-page")).await;
-        let opened = p.program_call(3, thread_comment("program-opener", "human-page")).await;
+        p.page(
+            signed(&bob),
+            thread_comment("program-editor", "program-page"),
+        )
+        .await;
+        let opened = p
+            .program_call(3, thread_comment("program-opener", "human-page"))
+            .await;
         assert_eq!(opened.disposition, host::CallDisposition::Applied);
         for thread in ["program-editor", "program-opener"] {
-            p.resolve(signed(&alice), thread, true, pages::Party::Account(1)).await;
-            p.resolve(Origin::Module("resolution-executor".into()), thread, false, pages::Party::Module("resolution-executor".into())).await;
-            let operation = PageMsg::ResolveThread { thread_id: thread.into(), resolved: true };
+            p.resolve(signed(&alice), thread, true, pages::Party::Account(1))
+                .await;
+            p.resolve(
+                Origin::Module("resolution-executor".into()),
+                thread,
+                false,
+                pages::Party::Module("resolution-executor".into()),
+            )
+            .await;
+            let operation = PageMsg::ResolveThread {
+                thread_id: thread.into(),
+                resolved: true,
+            };
             let relation_root = p.native.module_root("attribution");
             let resolved = p.program_call(4, operation.clone()).await;
             assert_eq!(resolved.disposition, host::CallDisposition::Applied);
-            assert_eq!(p.thread(thread).await.resolved_by, Some(pages::Party::Account(4)));
-            let reopened = p.program_call(4, PageMsg::ResolveThread { thread_id: thread.into(), resolved: false }).await;
+            assert_eq!(
+                p.thread(thread).await.resolved_by,
+                Some(pages::Party::Account(4))
+            );
+            let reopened = p
+                .program_call(
+                    4,
+                    PageMsg::ResolveThread {
+                        thread_id: thread.into(),
+                        resolved: false,
+                    },
+                )
+                .await;
             assert_eq!(reopened.disposition, host::CallDisposition::Applied);
             assert_eq!(p.native.module_root("attribution"), relation_root);
             let resolved = p.program_call(3, operation).await;
             assert_eq!(resolved.disposition, host::CallDisposition::Applied);
-            assert_eq!(p.thread(thread).await.resolved_by, Some(pages::Party::Account(3)));
+            assert_eq!(
+                p.thread(thread).await.resolved_by,
+                Some(pages::Party::Account(3))
+            );
             assert_eq!(p.native.module_root("attribution"), relation_root);
-            let reopened = p.program_call(3, PageMsg::ResolveThread { thread_id: thread.into(), resolved: false }).await;
+            let reopened = p
+                .program_call(
+                    3,
+                    PageMsg::ResolveThread {
+                        thread_id: thread.into(),
+                        resolved: false,
+                    },
+                )
+                .await;
             assert_eq!(reopened.disposition, host::CallDisposition::Applied);
             assert_eq!(p.thread(thread).await.resolved_by, None);
         }

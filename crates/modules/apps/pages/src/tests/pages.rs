@@ -473,7 +473,11 @@ fn any_member_moves_a_page_under_another_members_page() {
         )
         .await;
         assert_eq!(
-            get_block(&p, "mallory-page").await.unwrap().parent.as_deref(),
+            get_block(&p, "mallory-page")
+                .await
+                .unwrap()
+                .parent
+                .as_deref(),
             Some("alice-page")
         );
         assert_eq!(

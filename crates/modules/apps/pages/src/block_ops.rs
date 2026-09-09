@@ -1,6 +1,6 @@
 use super::{
     Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, NewBlock, PageError, PageMsg, Pages,
-    id_is_index_safe, to_page_err,
+    Party, id_is_index_safe, to_page_err,
 };
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
@@ -19,9 +19,9 @@ fn idx_after(children: &[String], after: &Option<String>) -> Result<usize, PageE
 }
 
 impl Pages {
-    /// stage `block` as a new child of `parent` at sibling index `at`, on
-    /// behalf of `authority`'s actor. the caller has already settled the
-    /// parent's edit right and depth and stores the parent afterwards; this
+    /// stage `block` as a new child of `parent` at sibling index `at`,
+    /// authored by `actor`. the caller has already settled the parent's
+    /// depth and stores the parent afterwards; this
     /// owns what is true of the child alone: its id is bounded, index-safe
     /// and absent from the WHOLE store (global uniqueness is what makes a
     /// bare block id addressable without page context), its marks fit its
@@ -31,7 +31,7 @@ impl Pages {
         parent: &mut Block,
         at: usize,
         block: NewBlock,
-        authority: &super::Authority,
+        actor: &Party,
     ) -> Result<(), PageError> {
         if block.id.len() > MAX_BLOCK_ID_BYTES || !id_is_index_safe(&block.id) {
             return Err(PageError::IdTooLarge);
@@ -56,7 +56,7 @@ impl Pages {
             self.index_add(&block.id, Some(parent.page.clone())).await?;
         }
         self.store_block(&Block {
-            author: authority.actor.clone(),
+            author: actor.clone(),
             id: block.id,
             parent: Some(parent.id.clone()),
             page,
@@ -71,7 +71,7 @@ impl Pages {
     pub(super) async fn apply_block_op(
         &mut self,
         msg: PageMsg,
-        authority: &super::Authority,
+        actor: &Party,
     ) -> Result<(), PageError> {
         match msg {
             PageMsg::InsertBlock {
@@ -87,8 +87,7 @@ impl Pages {
                 if parent_depth >= MAX_PAGE_DEPTH {
                     return Err(PageError::PageTooDeep);
                 }
-                self.place_block(&mut parent_blk, i, block, authority)
-                    .await?;
+                self.place_block(&mut parent_blk, i, block, actor).await?;
                 self.store_block(&parent_blk)
             }
             PageMsg::UpdateText {
@@ -203,10 +202,6 @@ impl Pages {
                         if !moves_page && new_parent.page != blk.page {
                             return Err(PageError::CrossPageMove);
                         }
-                        // grafting under `new_parent` mutates ITS page's tree
-                        // (its children list), so a page block moving under a
-                        // different page needs that page's authority too —
-                        // same-page moves recheck the source's own page.
                         let new_parent_depth = if moves_page {
                             self.ancestry_excludes(&parent_id, &block_id).await?;
                             self.page_depth(&new_parent).await?

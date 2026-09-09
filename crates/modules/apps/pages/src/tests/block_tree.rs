@@ -829,9 +829,7 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(boundary_parent.clone()),
                     after: None,
                 },
-                &Authority {
-                    actor: Party::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -850,9 +848,7 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(over_parent.clone()),
                     after: None,
                 },
-                &Authority {
-                    actor: Party::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -900,9 +896,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Authority {
-                    actor: Party::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -941,9 +935,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Authority {
-                    actor: Party::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -1015,9 +1007,7 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
                     anchor: None,
                     mentions: Vec::new(),
                 },
-                &Authority {
-                    actor: Party::Key(b"mallory".to_vec()),
-                },
+                &Party::Key(b"mallory".to_vec()),
                 0,
             )
             .await
@@ -1029,9 +1019,7 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
             PageMsg::RemoveBlock {
                 block_id: "branch".into(),
             },
-            &Authority {
-                actor: Party::System,
-            },
+            &Party::System,
             0,
         )
         .await

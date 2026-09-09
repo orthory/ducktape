@@ -171,8 +171,7 @@ its grants and its controller.
 
 Create a page in the **Pages** view. Use **to-do blocks** for the task items
 — `pages.set_checked` only applies to todo-kind blocks, so a checklist gives
-you a checklist to tick as the model reports completed work. A model can
-change todo blocks only on pages authored by its own program account.
+you a checklist to tick as the model reports completed work.
 
 Note the **page id**: the app mints a UUID per page (the root block id). It
 isn't shown in the editor chrome; recover it from the pages view (the index
@@ -223,9 +222,8 @@ Discussion continue `agent/item-<n>` and reuse the child PR. The original
 source branch advances when the proposed changes are merged.
 
 While it works, the agent can `pages.comment` on spec blocks (comments land
-authored by its program account on the page). The human page author ticks
-the spec todos; `pages.set_checked` is available only for pages the program
-account itself authored. Preflight skips emit debug breadcrumbs under
+authored by its program account on the page). Whoever ticks a spec todo, human or
+program, is recorded on it. Preflight skips emit debug breadcrumbs under
 `ducktape::modules`; enable that log target to inspect them. Once an action
 is admitted, its program call has an independent target outcome in
 `ActionRequest`; a refusal cannot undo earlier successful effects. If a comment
@@ -238,7 +236,7 @@ own call outcomes.
 - **Forge view**: the PR (files/diff, merge box), the `agent/item-<n>`
   branch, and the discussion trail.
 - **The spec page**: agent-authored comment threads anchored to the blocks
-  they discuss; todos checked by their page author.
+  they discuss; todos ticked as the work lands.
 
 Inspect the last 100 terminal runs with the query helper from provisioning:
 

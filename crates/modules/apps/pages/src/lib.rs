@@ -88,14 +88,6 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
-/// The canonical actor an op is recorded under: the current account, or the
-/// signing key of one that has not joined an account. Every member may
-/// write every page and comment; a record's author is who wrote it, not a
-/// gate on who may write it next.
-struct Authority {
-    actor: Party,
-}
-
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
 /// codec bounds a stored value at 1 MiB AT DECODE TIME only (see

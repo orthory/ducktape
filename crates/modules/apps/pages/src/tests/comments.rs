@@ -253,9 +253,7 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
             PageMsg::RemoveBlock {
                 block_id: "target".into(),
             },
-            &Authority {
-                actor: Party::System,
-            },
+            &Party::System,
             0,
         )
         .await

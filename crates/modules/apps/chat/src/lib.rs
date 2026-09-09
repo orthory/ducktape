@@ -1154,8 +1154,8 @@ impl Chat {
 
         // head is last-write-wins under the total order; the prior head moves
         // into the immutable revision history. a stale base_rev is recorded on
-        // the new head (base_rev != prior rev), never rejected — the author
-        // gate makes conflicts same-author multi-device races.
+        // the new head (base_rev != prior rev), never rejected: the recorded
+        // base tells a reader which head the edit was written against.
         self.store(rev_key(channel_id, seq, head.rev), &head);
         let rev = head.rev + 1;
         let new_head = MessageHead {

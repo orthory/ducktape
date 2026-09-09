@@ -1,7 +1,7 @@
 use super::{
     Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
     MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES,
-    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Party, Thread, ThreadView, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -141,9 +141,8 @@ impl Pages {
     }
 
     /// Keep selection anchors attached while a block's text shifts. Implicit
-    /// like the purge above, so ungated for the same reason: it is a
-    /// consequence of an edit to the block and rides that block op's
-    /// authority. This is linear in threads on one target (hard-capped at
+    /// like the purge above: a consequence of an edit to the block. This is
+    /// linear in threads on one target (hard-capped at
     /// 1024); shard the target index only if real documents make that hotspot
     /// measurable.
     pub(super) async fn rebase_comment_anchors(
@@ -170,7 +169,7 @@ impl Pages {
     pub(super) async fn apply_comment_op(
         &mut self,
         msg: PageMsg,
-        authority: &super::Authority,
+        actor: &Party,
         now: u64,
     ) -> Result<(), PageError> {
         match msg {
@@ -200,7 +199,7 @@ impl Pages {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = authority.actor.clone();
+                let author = actor.clone();
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }
@@ -388,7 +387,7 @@ impl Pages {
             } => {
                 // Whoever resolves or reopens a thread is recorded as having
                 // done so.
-                let author = authority.actor.clone();
+                let author = actor.clone();
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
