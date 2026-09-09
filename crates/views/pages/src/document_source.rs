@@ -6,7 +6,6 @@ pub struct DocumentIdentity {
     pub reset: u64,
 }
 
-
 /// Small read-only navigation emitted after the matching editor interaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Navigation {
@@ -20,4 +19,10 @@ pub struct Accepted {
     pub source: Vec<u8>,
     pub reference: Vec<u8>,
     pub navigation: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommentMark {
+    pub line: i64,
+    pub count: i64,
 }

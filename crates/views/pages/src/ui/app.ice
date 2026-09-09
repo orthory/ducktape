@@ -19,7 +19,7 @@ extern crate::host
   PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  PagesProps(document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
+  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
   pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
@@ -59,18 +59,26 @@ extern crate::editor_binding
   pure initial_menu() -> MenuState
   editor-binding keys(history:HistoryState, menu:MenuState) -> EditorUpdate
 
-extern crate::presentation
-  editor-highlighter paint(menu:MenuState, dark:bool, commented:[i64])
+extern crate::document_source
+  CommentMark(line:i64, count:i64)
+
+extern crate::editor_view
+  PreparedPresentation(reference:bytes, data:bytes, notice:str)
+  pure presentation_notice(document:&editor, prepared:&PreparedPresentation) -> str
+  pure empty_presentation() -> PreparedPresentation
+  editor-highlighter paint(prepared:PreparedPresentation)
+  pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark]) -> PreparedPresentation
 
 extern crate::document_ingress
   DocumentSource(reference:bytes)
   DocumentItem(notice:str, source:bytes, text:str, cursor:bytes, error:str)
+  pure source_reference(reference:bytes) -> DocumentSource
   pure empty_source() -> DocumentSource
   pure document_editor(text:str, cursor:bytes) -> editor
   subscription document_source(source:DocumentSource) -> DocumentItem
 
 state
-  formatting_notice = ""
+  document_paint:PreparedPresentation = empty_presentation()
   document:editor = ""
   document_history:HistoryState = initial_history()
   document_menu:MenuState = initial_menu()
@@ -80,6 +88,7 @@ state
   document_source_error = ""
   document_dark = false
   document_commented:[i64] = []
+  document_marks:[CommentMark] = []
   active_palette:palette[AppTheme] = AppTheme.app
   connected = false
   loading = false
@@ -169,10 +178,12 @@ on props_arrived(item)
   seed_rev = next.seed_rev
   page_draft = seeded(moved, next.page_seed, page_draft)
   block_comment_draft = seeded(moved, next.comment_seed, block_comment_draft)
-  document_source_ref = DocumentSource(next.document_source)
+  document_source_ref = source_reference(next.document_source)
   document_source_error = next.document_error
   document_dark = next.dark
   document_commented = next.commented_lines
+  document_marks = next.comment_marks
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
@@ -264,15 +275,15 @@ on document_arrived(item)
   return if item.source != document_source_ref.reference
   document_error = item.error
   return if !empty(item.error)
-  formatting_notice = item.notice
   document = document_editor(item.text, item.cursor)
   document_installed = item.source
   document_menu = initial_menu()
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
 
 on document_committed(next)
-  formatting_notice = next.notice
   document_history = next.history
   document_menu = next.menu
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
   sent = edited(document_installed, next.reference, next.interaction)
 
 view
@@ -337,8 +348,8 @@ view
         copy_to_clipboard -> copy_to_clipboard _ _
       document:
         col w=fill h=fill
-          if !empty(formatting_notice)
-            text formatting_notice @text-muted
+          if !empty(presentation_notice(document, document_paint))
+            text presentation_notice(document, document_paint) @text-muted
           if !empty(document_source_error)
             text document_source_error @text-danger
           if !empty(document_error)
@@ -346,11 +357,12 @@ view
           editor #document <-> document -> document_committed _
             with
               key-binding=keys(document_history, document_menu)
-              highlighter=paint(document_menu, document_dark, document_commented)
-              w=fill
-              h=fill
+              highlighter=paint(document_paint)
               size=14.0
               line-h=1.65
               wrap=word
-              font=display
+              font=ui
+              hint="Write something… `#` for a heading, `-` for a list"
               disabled=(loading || !connected || empty(document_source_ref.reference) || document_installed != document_source_ref.reference)
+            active bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0
+            disabled bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0

@@ -69,12 +69,13 @@ pub struct PageComment {
     pub text: String,
 }
 
-/// The screen's facts, as the app holds them. The document is not here: it
-/// is the app's editor, painted into the slot the view leaves. `seed_rev`
+/// The screen's facts, as the app holds them. Document bytes arrive through a
+/// separate bounded source subscription; props carry only its identity. `seed_rev`
 /// moves when the app wants the view's drafts to BECOME `page_seed` and
 /// `comment_seed` — a recovered draft taken up, a failed post handed back.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PagesProps {
+    pub comment_marks: Vec<crate::document_source::CommentMark>,
     pub document_source: Vec<u8>,
     pub document_error: String,
     pub commented_lines: Vec<i64>,
@@ -432,12 +433,17 @@ pub fn seeded(moved: bool, seed: &str, draft: &str) -> String {
     if moved { seed } else { draft }.to_owned()
 }
 
-
 /// Only the accepted canonical reference crosses back. The app resolves its
 /// bytes from the matching host editor and keeps the ordinary save/CAS path.
 pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>) -> bool {
-    host::notify("pages.edited", &serde_json::to_vec(&crate::document_source::Accepted {
-        source, reference, navigation,
-    }).expect("accepted document metadata"));
+    host::notify(
+        "pages.edited",
+        &serde_json::to_vec(&crate::document_source::Accepted {
+            source,
+            reference,
+            navigation,
+        })
+        .expect("accepted document metadata"),
+    );
     true
 }

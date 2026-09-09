@@ -112,3 +112,7 @@ pub fn document_editor(text: String, cursor: Vec<u8>) -> ui_lang_guest::Editor {
     editor.move_to(cursor);
     editor
 }
+
+pub fn source_reference(reference: Vec<u8>) -> DocumentSource {
+    DocumentSource { reference }
+}

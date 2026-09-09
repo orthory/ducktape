@@ -50,7 +50,10 @@ pub(crate) fn source(
         .checked_add(1)
         .ok_or("Document source exhausted")?;
     let identity = DocumentIdentity {
-        document: format!("pages/{}", hex::encode(wire::encode(&context))),
+        document: format!(
+            "pages/{}",
+            crate::backend::hex_encode(&wire::encode(&context))
+        ),
         reset,
     };
     let marker = session
@@ -115,8 +118,7 @@ pub(super) fn drive(guest: &mut Guest) {
 
 pub(super) type Pending = Option<(u64, Transfer)>;
 
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct AcceptedDocument {
     pub accepted: bool,
     pub text: String,
@@ -128,31 +130,62 @@ pub struct AcceptedDocument {
 /// Resolve only the canonical editor revision named by this accepted intent.
 /// The final app handler supplies its current page/network; a queued old edit
 /// cannot replace the buffer after navigation or a connection replacement.
-pub fn accept_page_document(event: super::ModuleViewEvent, network: String, page: String) -> AcceptedDocument {
+pub fn accept_page_document(
+    event: super::ModuleViewEvent,
+    network: String,
+    page: String,
+) -> AcceptedDocument {
     let Some(next) = accept_inner(&event, &network, &page) else {
         return AcceptedDocument::default();
     };
     next
 }
-fn accept_inner(event: &super::ModuleViewEvent, network: &str, page: &str) -> Option<AcceptedDocument> {
-    if event.kind != "edited" || event.detail.len() > 16 * 1024 { return None; }
+fn accept_inner(
+    event: &super::ModuleViewEvent,
+    network: &str,
+    page: &str,
+) -> Option<AcceptedDocument> {
+    if event.kind != "edited" || event.detail.len() > 16 * 1024 {
+        return None;
+    }
     let envelope: Envelope = serde_json::from_str(&event.detail).ok()?;
     let accepted = envelope.accepted;
-    let reference: wire::editor_document::EditorDocumentRef = wire::decode(&accepted.reference).ok()?;
+    let reference: wire::editor_document::EditorDocumentRef =
+        wire::decode(&accepted.reference).ok()?;
     let registry = super::registry().lock().ok()?;
     let connection = super::connection().lock().ok()?;
     let mounted = registry.get("pages")?.lock().ok()?;
-    let super::Slot::Ready(guest) = &mounted.slot else { return None; };
-    if guest.pages_instance.as_deref() != Some(envelope.instance.as_str()) { return None; }
+    let super::Slot::Ready(guest) = &mounted.slot else {
+        return None;
+    };
+    if guest.pages_instance.as_deref() != Some(envelope.instance.as_str()) {
+        return None;
+    }
     let document = guest.inputs.editor_document("PagesView/document")?;
-    if document.reference() != reference { return None; }
+    if document.reference() != reference {
+        return None;
+    }
     let mut session = session().lock().ok()?;
-    if session.context.as_ref() != Some(&Context { connection: connection.rev, network: network.into(), page: page.into() })
-        || session.marker != accepted.source { return None; }
+    if session.context.as_ref()
+        != Some(&Context {
+            connection: connection.rev,
+            network: network.into(),
+            page: page.into(),
+        })
+        || session.marker != accepted.source
+    {
+        return None;
+    }
     let identity: DocumentIdentity = wire::decode(&accepted.source).ok()?;
-    let navigation = if accepted.navigation.is_empty() { crate::pages::guest_document::Navigation::default() }
-        else { wire::decode(&accepted.navigation).ok()? };
-    session.sources.show(identity, document.text(), reference.cursor).ok()?;
+    let navigation = if accepted.navigation.is_empty() {
+        crate::pages::guest_document::Navigation::default()
+    } else {
+        wire::decode(&accepted.navigation).ok()?
+    };
+    session
+        .sources
+        .show(identity, document.text(), reference.cursor)
+        .ok()?;
     Some(AcceptedDocument {
         accepted: true,
         text: document.text().to_owned(),
@@ -161,7 +194,6 @@ fn accept_inner(event: &super::ModuleViewEvent, network: &str, page: &str) -> Op
         link: navigation.link,
     })
 }
-
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Envelope {
@@ -172,15 +204,24 @@ struct Envelope {
 /// This stamp is added by the host after decoding the guest payload. An old
 /// queued intent cannot impersonate the successor of a same-document reload.
 pub(super) fn emit(guest: &mut Guest, id: u64, payload: &[u8]) {
-    let Some(instance) = guest.pages_instance.as_ref() else { return; };
+    let Some(instance) = guest.pages_instance.as_ref() else {
+        return;
+    };
     let Ok(accepted) = serde_json::from_slice(payload) else {
         guest.reply(id, Err("Invalid document notification".into()));
         return;
     };
-    let detail = serde_json::to_string(&Envelope { instance: instance.clone(), accepted }).expect("document envelope");
+    let detail = serde_json::to_string(&Envelope {
+        instance: instance.clone(),
+        accepted,
+    })
+    .expect("document envelope");
     if detail.len() > 16 * 1024 {
         guest.reply(id, Err("Document notification is too large".into()));
         return;
     }
-    guest.intents.push(super::ModuleViewEvent { kind: "edited".into(), detail });
+    guest.intents.push(super::ModuleViewEvent {
+        kind: "edited".into(),
+        detail,
+    });
 }

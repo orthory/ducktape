@@ -4,37 +4,21 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[workspace]
-
 [lib]
 crate-type = ["cdylib", "rlib"]
 test = false
 
 [dependencies]
 design = { path = "../../../support/design" }
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
+ui-lang-wire = { workspace = true }
 iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
 serde = { version = "1", features = ["derive"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
-ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b", default-features = false }
+ui-lang = { workspace = true }
+ui-lang-guest = { workspace = true }
+ui-lang-runtime = { workspace = true }
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
-[profile.release.package.iced_core]
-debug-assertions = true
-[profile.release.package.iced_graphics]
-debug-assertions = true
-[profile.release.package.iced_renderer]
-debug-assertions = true
+ui-lang-build = { workspace = true }
 
 [features]
 host-verification = ["dep:wasmtime"]

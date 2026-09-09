@@ -18,11 +18,8 @@ pub fn has_unclosed_fence(text: String) -> bool {
     sync::has_unclosed_fence(&text)
 }
 
-/// The block a document LINE sits in — where a new comment anchors. The line
-/// arrives from the ice `editor_cursor_line` inspector, which BORROWS the
-/// buffer: an `editor`-valued sync argument is a `Content::clone`, and that
-/// clone REBUILDS FROM TEXT — the cursor resets to the origin. "" on the
-/// title line (and on unsaved fresh lines) reads as "the page".
+/// Resolve an accepted guest caret line against persisted block anchors.
+/// The title and unsaved fresh lines select the page itself.
 pub fn block_at_line_target(blocks: Vec<crate::backend::PageBlock>, line: i64) -> String {
     let line = usize::try_from(line).unwrap_or(0);
     sync::block_at_line(&blocks, line)
@@ -164,8 +161,7 @@ mod tests {
         // The code block owns lines 2..=5 (fence, two body lines, fence).
         assert_eq!(commented_lines(&blocks, &["a\nb".into()]), vec![2, 3, 4, 5]);
         // A caret line inside the code body anchors a comment on that block —
-        // resolved by LINE (Content::clone resets the cursor, so an
-        // editor-valued sync could never read it).
+        // resolved by the accepted guest cursor line.
         assert_eq!(block_at_line_target(blocks.clone(), 3), "a\nb");
         assert_eq!(block_at_line_target(blocks, 0), "");
     }
@@ -208,7 +204,5 @@ mod tests {
         assert_eq!(comment_marks(&blocks, &[]), Vec::new());
         // A hit naming a block that is gone marks nothing.
         assert_eq!(comment_marks(&blocks, &hits(&["deleted"])), Vec::new());
-
     }
-
 }

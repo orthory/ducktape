@@ -322,10 +322,6 @@ fn restore_composer(scope: &str, blocked: bool) {
     let _ = composer::interact(scope, "message", false, blocked, Interaction::Restore);
 }
 
-fn compose(text: &str) -> iced::widget::text_editor::Content {
-    iced::widget::text_editor::Content::with_text(text)
-}
-
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
     app.page_text.clone()

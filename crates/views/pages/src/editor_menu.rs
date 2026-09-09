@@ -151,7 +151,9 @@ pub fn toggle_todo(document: &Doc, line: usize) -> EditorDecision {
     finish(document, replace(document, start..start + 1, replacement))
 }
 
-fn spans(document: &Doc) -> Vec<Range<usize>> { spans_text(&document.text) }
+fn spans(document: &Doc) -> Vec<Range<usize>> {
+    spans_text(&document.text)
+}
 fn spans_text(text: &str) -> Vec<Range<usize>> {
     let lines: Vec<_> = text.split('\n').collect();
     let mut result = Vec::new();
@@ -252,7 +254,9 @@ pub fn move_block(document: &Doc, line: usize, direction: i32) -> EditorDecision
     finish(document, rebuilt(&next, landing))
 }
 
-pub fn drop_boundaries(document: &Doc) -> Vec<usize> { drop_boundaries_text(&document.text) }
+pub fn drop_boundaries(document: &Doc) -> Vec<usize> {
+    drop_boundaries_text(&document.text)
+}
 pub fn drop_boundaries_text(text: &str) -> Vec<usize> {
     let mut boundaries: Vec<_> = spans_text(text)
         .into_iter()
@@ -337,7 +341,9 @@ impl Menu {
         self.open = None;
     }
 
-    pub fn is_open(&self) -> bool { self.open.is_some() }
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
 
     pub fn current(&self, document: &Doc) -> Option<MenuView> {
         let open = self.open.as_ref()?;

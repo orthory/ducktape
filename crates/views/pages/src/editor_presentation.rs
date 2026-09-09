@@ -51,15 +51,22 @@ pub fn build(
         let mut runs: Vec<(std::ops::Range<usize>, markdown::Mark)> = Vec::new();
         for (range, mark) in highlighter.highlight_line(text) {
             if let Some((tail, _)) = runs.last()
-                && range.start < tail.end {
+                && range.start < tail.end
+            {
                 let (tail, body) = runs.pop().expect("last run");
                 if range.start < tail.start || range.end > tail.end {
                     return Err(PresentationError::Range);
                 }
-                if tail.start < range.start { runs.push((tail.start..range.start, body)); }
+                if tail.start < range.start {
+                    runs.push((tail.start..range.start, body));
+                }
                 runs.push((range.clone(), mark));
-                if range.end < tail.end { runs.push((range.end..tail.end, body)); }
-            } else { runs.push((range, mark)); }
+                if range.end < tail.end {
+                    runs.push((range.end..tail.end, body));
+                }
+            } else {
+                runs.push((range, mark));
+            }
             if runs.len() + result.spans.len() > wire::editor_presentation::MAX_EDITOR_SPANS {
                 return Err(PresentationError::Limit);
             }
@@ -67,7 +74,12 @@ pub fn build(
         let mut links = Vec::new();
         for (range, mark) in runs {
             if matches!(mark, markdown::Mark::Body(style) if style.link) {
-                links.push(EditorHit { line: line as u32, start: range.start as u32, end: range.end as u32, tag: 2 });
+                links.push(EditorHit {
+                    line: line as u32,
+                    start: range.start as u32,
+                    end: range.end as u32,
+                    tag: 2,
+                });
             }
             let format = match formats.get(&mark) {
                 Some(index) => *index,
@@ -196,7 +208,7 @@ fn font(value: iced::Font) -> wire::NamedFont {
         },
     }
 }
-fn convert(
+pub(crate) fn convert(
     value: ui_lang_runtime::editor_format::Format,
 ) -> Result<EditorFormat, PresentationError> {
     Ok(EditorFormat {
@@ -228,13 +240,16 @@ fn convert(
     })
 }
 
-
 fn work_bound(text: &str) -> usize {
-    text.bytes().fold(3usize, |cost, byte| cost.saturating_add(match byte {
-        b'\n' => 3,
-        b'*' | b'_' => 2,
-        _ => 0,
-    })).saturating_add(text.matches("http").count().saturating_mul(2))
+    text.bytes()
+        .fold(3usize, |cost, byte| {
+            cost.saturating_add(match byte {
+                b'\n' => 3,
+                b'*' | b'_' => 2,
+                _ => 0,
+            })
+        })
+        .saturating_add(text.matches("http").count().saturating_mul(2))
 }
 
 /// No full document copy: callers already borrow the installed/accepted text.
@@ -242,6 +257,9 @@ fn work_bound(text: &str) -> usize {
 /// editing before expensive formatting can exhaust a guest tick.
 pub fn format_notice(text: &str) -> String {
     if text.len() > 512 * 1024 || work_bound(text) > 8192 {
-        "Formatting is unavailable for this document. Your text and undo history are preserved.".into()
-    } else { String::new() }
+        "Formatting is unavailable for this document. Your text and undo history are preserved."
+            .into()
+    } else {
+        String::new()
+    }
 }

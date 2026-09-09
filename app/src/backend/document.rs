@@ -46,9 +46,17 @@ pub fn page_document_text(title: String, blocks: Vec<PageBlock>) -> String {
 /// text actually differs. A dirty buffer is the user still typing — dropping
 /// their caret (or their words) to install a remote edit is the worst thing
 /// this surface can do, so a remote change simply waits for the next save.
-pub fn refreshed_page_buffer(document: String, title: String, blocks: Vec<PageBlock>, saved: String) -> String {
+pub fn refreshed_page_buffer(
+    document: String,
+    title: String,
+    blocks: Vec<PageBlock>,
+    saved: String,
+) -> String {
     match refreshed_page_text(&document, &title, &blocks, &saved) {
-        Some(canonical) => { crate::module_view::pages_document::source_changed(); canonical }
+        Some(canonical) => {
+            crate::module_view::pages_document::source_changed();
+            canonical
+        }
         None => document,
     }
 }
@@ -108,7 +116,9 @@ pub fn installed_page_text(document: String, install: bool, canonical: String) -
     if install {
         crate::module_view::pages_document::source_changed();
         canonical
-    } else { document }
+    } else {
+        document
+    }
 }
 
 /// A refused save restores its canonical buffer only while the user has not
