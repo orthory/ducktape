@@ -134,11 +134,13 @@ pub fn members_view(
 /// The Agents tab: the register as the app has it, drawn by the `agents`
 /// view — every record whole, the capability tags the network announces,
 /// the action vocabulary, and the signing account (`account`, its decimal
-/// number) so the view offers the editor to a record's controller. Its
-/// intents come back as `status` (`agent_id`, `paused`), `save` and
-/// `register` (both the whole draft record as JSON, `AgentDraft`). Every
-/// committed write bumps `committed`, which tells the view its drafts were
-/// consumed.
+/// number) so the view offers the editor to a record's controller; beside
+/// it the run tracker, every run off the runs journal and the journal of
+/// the one the reader opened. Its intents come back as `status`
+/// (`agent_id`, `paused`), `save` and `register` (both the whole draft
+/// record as JSON, `AgentDraft`), and `open_run` (`run_id`, "" to close).
+/// Every committed write bumps `committed`, which tells the view its drafts
+/// were consumed.
 /// The messaging panel rides in the same props under `messaging`: the app's
 /// authenticated reading of one conversation, plus the three transient facts
 /// the reading itself cannot carry — a load in flight, a send in flight, and
@@ -152,6 +154,8 @@ pub fn agents_view(
     account: &str,
     committed: i64,
     rows: &[crate::backend::AgentRow],
+    runs: &[crate::backend::RunRow],
+    journal: &crate::backend::RunJournal,
     capabilities: &[String],
     actions: &[String],
     messaging: &crate::backend::MessagingView,
@@ -169,6 +173,8 @@ pub fn agents_view(
             account,
             committed,
             rows,
+            runs,
+            journal,
             capabilities,
             actions,
             messaging,
@@ -190,6 +196,8 @@ pub(crate) fn agents_props(
     account: &str,
     committed: i64,
     rows: &[crate::backend::AgentRow],
+    runs: &[crate::backend::RunRow],
+    journal: &crate::backend::RunJournal,
     capabilities: &[String],
     actions: &[String],
     messaging: &crate::backend::MessagingView,
@@ -198,13 +206,21 @@ pub(crate) fn agents_props(
     messaging_send_error: &str,
     messaging_sent: i64,
 ) -> Vec<u8> {
+    // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
+    // guest draws nothing with, and `link`/`account`/`op` are the fence the app
+    // installs an answer by — a guest cannot check them and has no reason to
+    // see which operation number it is looking at. The reading's error is the
+    // app's banner, not a field the guest re-renders.
+    const APP_ONLY: [&str; 4] = ["rpc", "link", "account", "op"];
+    let mut book = serde_json::to_value(journal).expect("the run journal encodes");
+    if let Some(book) = book.as_object_mut() {
+        for app_only in APP_ONLY.iter().chain(["error"].iter()) {
+            book.remove(*app_only);
+        }
+    }
     let mut panel = serde_json::to_value(messaging).expect("the messaging panel encodes");
     if let Some(panel) = panel.as_object_mut() {
-        // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
-        // guest draws no conversation with, and `link`/`account`/`op` are the
-        // fence the app installs an answer by — a guest cannot check them and
-        // has no reason to see which operation number it is looking at.
-        for app_only in ["rpc", "link", "account", "op"] {
+        for app_only in APP_ONLY {
             panel.remove(app_only);
         }
         panel.insert("loading".into(), messaging_loading.into());
@@ -214,6 +230,8 @@ pub(crate) fn agents_props(
     }
     let props = serde_json::json!({
         "rows": rows,
+        "runs": runs,
+        "journal": book,
         "capabilities": capabilities,
         "actions": actions,
         "account": account,
@@ -230,6 +248,7 @@ pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
         "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
+        "open_run" => crate::AgentsIntent::OpenRun,
         "messaging_open" => crate::AgentsIntent::MessagingOpen,
         "messaging_page" => crate::AgentsIntent::MessagingPage,
         "messaging_send" => crate::AgentsIntent::MessagingSend,
@@ -1731,6 +1750,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "status",
             "save",
             "register",
+            "open_run",
             "messaging_open",
             "messaging_page",
             "messaging_send",
@@ -3328,6 +3348,7 @@ pub(crate) mod tests {
                 "status",
                 "save",
                 "register",
+                "open_run",
                 "messaging_open",
                 "messaging_page",
                 "messaging_send",
@@ -3442,7 +3463,32 @@ pub(crate) mod tests {
                 message = *on_press;
             }
         });
-        message.expect("an enabled button")
+        message.unwrap_or_else(|| {
+            let mut seen = Vec::new();
+            let mut root = guest.frame.root.clone().expect("a tree");
+            root.for_each_mut(&mut |node| {
+                if let wire::Node::Button {
+                    label,
+                    content,
+                    on_press,
+                    ..
+                } = node
+                {
+                    let shown = label.clone().unwrap_or_else(|| match content {
+                        wire::ButtonContent::Label(text) => text.clone(),
+                        _ => "<no label>".to_owned(),
+                    });
+                    seen.push(format!(
+                        "{shown}{}",
+                        if on_press.is_some() { "" } else { " (disabled)" }
+                    ));
+                }
+            });
+            panic!(
+                "no enabled button named {name:?}; the frame has buttons {seen:?} and texts {:?}",
+                texts(guest)
+            )
+        })
     }
 
     /// The bundled component, end to end through the host: it boots on the
@@ -3626,6 +3672,7 @@ pub(crate) mod tests {
                         {"name": "tests", "source_prefix": "/shared/skills/tests", "source_snapshot": "", "always": false}
                     ]
                 }],
+                "runs": [], "journal": {"run_id": "", "entries": []},
                 "capabilities": ["claude", "review"], "actions": ["chat.post", "tasks.create"],
                 "account": "", "committed": 0,
                 "connected": true, "answered": true, "dark": false
@@ -3715,11 +3762,28 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let props = Some(agents_props(
-            false, true, true, "7", 0, &[], &[], &[], &reading, false, false, "", 0,
+            false,
+            true,
+            true,
+            "7",
+            0,
+            &[],
+            &[],
+            &crate::backend::RunJournal::default(),
+            &[],
+            &[],
+            &reading,
+            false,
+            false,
+            "",
+            0,
         ));
         // the account the app draws in its header is the top-level one, which
         // is a different field from the scope's `account` the encoder strips
         assert!(!String::from_utf8_lossy(props.as_ref().expect("props")).contains("876543"));
+        // boot first: the tick that installs the props subscription is the one
+        // that answers it, so the screen it drew is still the offline plate
+        guest.redraw(&None);
         guest.redraw(&props);
 
         // THE PANE IS BEHIND ITS OWN TAB: the register is what a reader lands
@@ -3729,7 +3793,7 @@ pub(crate) mod tests {
             "the messages pane drew itself without being opened: {:?}",
             texts(&guest)
         );
-        guest.deliver(Output::Activate(button_message(&guest, "Show agent messages")));
+        guest.deliver(Output::Activate(button_message(&guest, "Messages")));
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in [

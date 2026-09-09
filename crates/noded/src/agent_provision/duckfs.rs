@@ -25,6 +25,7 @@ use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
 
 use crate::node_link::NodeLink;
+use provider_host::OperatorCredential;
 
 /// materialize the duckfs source at `dir` (plus W6 skill ro mounts under the
 /// sibling `ro_root`) and hand back the live workspace. mount names arrive
@@ -197,6 +198,10 @@ impl ProvisionedWorkspace for NodedWorkspace {
 
     fn context_doc(&self) -> Option<String> {
         self.context_doc.clone()
+    }
+
+    fn operator_credential(&self) -> Option<OperatorCredential> {
+        Some(super::operator_credential(&self.node))
     }
 
     async fn commit(

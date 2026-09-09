@@ -9,6 +9,15 @@ state
   gov_voting = ""
   agents_rows:[AgentRow] = []
   agents_generation:i64 = 0
+  // the run tracker: every run the journal lists, the run the reader has
+  // open, and that run's journal as last read
+  agents_runs:[RunRow] = []
+  agents_open_run = ""
+  agents_journal:RunJournal = empty_run_journal()
+  // the journal read's own name. The run id is its SUBJECT, not its identity:
+  // two networks can carry the same run id, so an answer about A would match
+  // on the way back into A after a switch to B and back. Counts dispatches.
+  agents_journal_op:i64 = 0
   // what the network announces and what a grant may name — the editor's
   // pick lists
   agents_capabilities:[str] = []

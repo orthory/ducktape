@@ -102,8 +102,11 @@ operations: `chat.post_message` (channel_id, optional thread), `pages.comment`
 `chat.post`; `chat.post_message` requires its own grant. Pages comments require
 `pages.comment` and the owning page in `pages_write`. Job comments require
 `jobs.comment`. `tasks.create`, `tasks.update_status`, `pages.set_checked`,
-`duckfs.write_text`, `modules.update` (final only) and `agent.call` (live only)
-complete the catalog. A destination never supplies the author.
+`pages.post` (a new page under the run's `agent/` prefix, which `pages_write`
+must cover), `duckfs.write_text`, `modules.update` (final only) and
+`agent.call` (live only) complete the catalog; `react` and `unreact` mark the
+source message under `chat.post`. A grant of `*` is every action the catalog
+knows now or later. A destination never supplies the author.
 
 The job board stores bounded, immutable comments with their authenticated actor
 and commit height, and exposes them through its point read and index. Comments

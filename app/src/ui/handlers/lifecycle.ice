@@ -241,6 +241,19 @@ on workspace_connected(next)
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
   agents_generation = agents_generation + 1
+  // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. The scope
+  // fences stop a stale ANSWER from being installed; they cannot un-draw one
+  // already on screen, and a run journal or a conversation from the previous
+  // network under the new one's name is exactly the confusion they exist to
+  // prevent. Both go, along with what was open in them.
+  agents_open_run = ""
+  agents_journal = empty_run_journal()
+  messaging = messaging_none()
+  messaging_participant = ""
+  messaging_conversation = ""
+  messaging_send_error = ""
+  messaging_loading = false
+  messaging_sending = false
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
   forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)

@@ -261,12 +261,14 @@ enum RosterIntent
   propose
 
 // what the Agents view asks of the app: an agent's paused state, a record
-// rewritten from the editor's draft, a new agent registered from one, or the
-// messaging panel opening a conversation, paging it, and sending on it
+// rewritten from the editor's draft, a new agent registered from one, the
+// journal of a run the reader opened, or the messaging panel opening a
+// conversation, paging it, and sending on it
 enum AgentsIntent
   status
   save
   register
+  open_run
   messaging_open
   messaging_page
   messaging_send

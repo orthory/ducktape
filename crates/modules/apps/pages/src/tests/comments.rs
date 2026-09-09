@@ -508,6 +508,7 @@ fn resolve_thread_requires_opener_or_page_editor() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "p2 title".into(),
+                blocks: Vec::new(),
             },
             user("carol"),
         )
@@ -573,6 +574,7 @@ fn resolving_old_key_owned_threads_keeps_exact_signer_authority() {
             &PageMsg::CreatePage {
                 page_id: "owned".into(),
                 title: "Owned".into(),
+                blocks: Vec::new(),
             },
             user("alice"),
         )
@@ -633,6 +635,7 @@ fn a_program_can_resolve_only_its_own_thread_or_page() {
             &PageMsg::CreatePage {
                 page_id: "program-page".into(),
                 title: "Program".into(),
+                blocks: Vec::new(),
             },
             sdk::Origin::Program(7),
         )
@@ -742,6 +745,7 @@ fn resolving_with_real_accounts_preserves_source_relations_and_rejection_roots()
             msg(&PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "Page".into(),
+                blocks: Vec::new(),
             }),
         )
         .await
@@ -860,6 +864,7 @@ fn deleting_a_block_purges_its_comment_threads() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "keep".into(),
+                blocks: Vec::new(),
             },
         )
         .await;

@@ -48,6 +48,9 @@ pub(super) struct ReplyPosts {
     standing: BTreeMap<String, bool>,
     page_threads: BTreeMap<String, (String, usize)>,
     page_targets: BTreeMap<String, usize>,
+    /// pages this response has already staged a create for, counted against
+    /// the module's page cap alongside the committed page count.
+    pub(super) pages_created: usize,
     jobs: BTreeMap<String, usize>,
 }
 
@@ -254,7 +257,7 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 
 /// whether the registry granted this agent an action name.
 pub(super) fn allows(agent: &ModelRecord, action: &str) -> bool {
-    agent.allowed_actions.iter().any(|a| a == action)
+    agent.allows(action)
 }
 
 /// the admission half of an `agent.call`: the caller's cap, the callee is not
@@ -483,19 +486,23 @@ impl RunsModule {
             },
             ctx.env().consensus_time,
         );
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::ResultAccepted,
-            degraded: result.status == WireStatus::Degraded,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node: self.executing_node(&*ctx, run_id).await,
-            output_ref,
-            pr_number: None,
-        });
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::ResultAccepted,
+                degraded: result.status == WireStatus::Degraded,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref,
+                pr_number: None,
+            },
+            None,
+        );
     }
 
     async fn fail_delegated_run(
@@ -513,23 +520,27 @@ impl RunsModule {
             DelegationResult {
                 reply_blocks: Vec::new(),
                 output_ref: None,
-                error: Some(reason),
+                error: Some(reason.clone()),
             },
             ctx.env().consensus_time,
         );
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Failed,
-            degraded: false,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node: self.executing_node(&*ctx, run_id).await,
-            output_ref: None,
-            pr_number: None,
-        });
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::Failed,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: None,
+                pr_number: None,
+            },
+            Some(reason),
+        );
     }
 
     fn complete_delegation(
@@ -570,19 +581,22 @@ impl RunsModule {
         self.note(ctx, format!("run {run_id} failed: {reason}"));
         self.emit_failure_reply(ctx, run_id, entry, &reason).await;
         let executing_node = self.executing_node(&*ctx, run_id).await;
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::Failed,
-            degraded: false,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node,
-            output_ref: None,
-            pr_number: None,
-        });
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::Failed,
+                degraded: false,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: None,
+                pr_number: None,
+            },
+            Some(failure_excerpt(&reason)),
+        );
         self.emit_job_finalize_if_current_claimant(ctx, entry, false, reason)
             .await;
     }
@@ -684,19 +698,22 @@ impl RunsModule {
         // record the delivery into the ring AFTER the sink so the record can
         // carry the PR number the sink opened/updated. observation only —
         // every emitted op above is byte-identical with or without it.
-        self.pending_history.push(RunRecord {
-            run_id: run_id.to_string(),
-            agent_id: entry.agent_id.clone(),
-            channel_id: entry.channel_id.clone(),
-            anchor_seq: entry.anchor_seq,
-            outcome: RunOutcome::ResultAccepted,
-            degraded: result.status == WireStatus::Degraded,
-            created_at: entry.created_at,
-            delivered_at: ctx.env().consensus_time,
-            executing_node,
-            output_ref: output_ref_of(&result.workspace_receipt),
-            pr_number,
-        });
+        self.record_settled(
+            RunRecord {
+                run_id: run_id.to_string(),
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.clone(),
+                anchor_seq: entry.anchor_seq,
+                outcome: RunOutcome::ResultAccepted,
+                degraded: result.status == WireStatus::Degraded,
+                created_at: entry.created_at,
+                delivered_at: ctx.env().consensus_time,
+                executing_node,
+                output_ref: output_ref_of(&result.workspace_receipt),
+                pr_number,
+            },
+            None,
+        );
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
     }
@@ -854,6 +871,9 @@ impl RunsModule {
                     )
                     .await?;
                 }
+                Operation::React { .. } | Operation::Unreact { .. } => {
+                    self.reaction_msg(ctx, entry, operation, &mut posts).await?;
+                }
                 Operation::JobsComment { job_id, content } => {
                     self.reply_msg(
                         ctx,
@@ -925,6 +945,7 @@ impl RunsModule {
                 } => validate_agent_call(&agent, entry, agent_id, instruction, skills)?,
                 Operation::PagesComment { .. }
                 | Operation::PagesSetChecked { .. }
+                | Operation::PagesPost { .. }
                 | Operation::DuckfsWriteText { .. } => {
                     unreachable!("degrade-lane operations are skipped above")
                 }
@@ -1716,10 +1737,85 @@ impl RunsModule {
         }
     }
 
-    /// One conversational operation (a reply, a chat post, a job comment, a
-    /// task create or status update) as an emit-ready follow-up, or the reason
-    /// it cannot be prepared. The settle path degrades an `Err` to a
-    /// breadcrumb; the session lane returns it to the submitter.
+    /// A reaction on the message this run was called on, as the chat op the
+    /// program executes, or the reason it cannot be prepared. The reaction is
+    /// held to the same standing as a source reply: a chat source, the
+    /// `chat.post` grant, and a requester who may post there. The emoji is
+    /// bounded by chat's own rule so the follow-up is never rejected at apply.
+    async fn reaction_msg(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+        operation: &Operation,
+        posts: &mut ReplyPosts,
+    ) -> Result<Prepared, String> {
+        let emoji = match operation {
+            Operation::React { emoji } | Operation::Unreact { emoji } => emoji,
+            other => unreachable!("{} is not a reaction", other.name()),
+        };
+        let ReplyDestination::Chat { channel_id, .. } = entry.reply_destination()? else {
+            return Err(format!(
+                "{} needs a chat message to react to; this run was called from elsewhere",
+                operation.name()
+            ));
+        };
+        let agent = self
+            .agent_for_run(ctx, entry)
+            .await?
+            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+        if !allows(&agent, crate::ACTION_CHAT_POST) {
+            return Err(format!(
+                "agent {} is not allowed to {}",
+                entry.agent_id,
+                crate::ACTION_CHAT_POST
+            ));
+        }
+        if emoji.is_empty() {
+            return Err(format!("{} requires an emoji", operation.name()));
+        }
+        if emoji.len() > chat::MAX_EMOJI_BYTES {
+            return Err(format!(
+                "emoji is {} bytes; chat's cap is {}",
+                emoji.len(),
+                chat::MAX_EMOJI_BYTES
+            ));
+        }
+        self.probe_channel_exists(ctx, &channel_id).await?;
+        let may_post = self
+            .requester_may_post(ctx, entry, &channel_id, &mut posts.standing)
+            .await?;
+        if !may_post {
+            return Err(format!(
+                "the run's requester may not post to channel: {channel_id}"
+            ));
+        }
+        let seq = entry.anchor_seq;
+        let msg = match operation {
+            Operation::React { .. } => ChatMsg::AddReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji: emoji.clone(),
+            },
+            _ => ChatMsg::RemoveReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji: emoji.clone(),
+            },
+        };
+        Ok(Prepared::new(
+            Msg {
+                target: self.chat.clone(),
+                payload: chat_encode_msg(&msg),
+            },
+            operation.name(),
+            serde_json::json!({"channel_id": channel_id, "seq": seq, "emoji": emoji}),
+        ))
+    }
+
+    /// One conversational operation (a reply, a reaction, a chat post, a job
+    /// comment, a task create or status update) as an emit-ready follow-up,
+    /// or the reason it cannot be prepared. The settle path degrades an `Err`
+    /// to a breadcrumb; the session lane returns it to the submitter.
     pub(super) async fn conversational_msg(
         &self,
         ctx: &dyn Ctx,
@@ -1741,6 +1837,9 @@ impl RunsModule {
                     posts,
                 )
                 .await
+            }
+            Operation::React { .. } | Operation::Unreact { .. } => {
+                self.reaction_msg(ctx, entry, operation, posts).await
             }
             Operation::JobsComment { job_id, content } => {
                 self.reply_msg(
@@ -1817,6 +1916,7 @@ impl RunsModule {
             }
             Operation::PagesComment { .. }
             | Operation::PagesSetChecked { .. }
+            | Operation::PagesPost { .. }
             | Operation::DuckfsWriteText { .. }
             | Operation::ModulesUpdate(_)
             | Operation::AgentCall { .. } => {

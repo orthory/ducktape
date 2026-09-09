@@ -9094,6 +9094,7 @@ dependencies = [
  "governance",
  "host",
  "identity",
+ "index-guest",
  "modules",
  "node-work",
  "pages",

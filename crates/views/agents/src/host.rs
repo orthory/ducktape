@@ -171,9 +171,61 @@ pub struct MessagingProps {
     pub visibility: String,
 }
 
+/// One run of an agent — a dispatch and what became of it — as the app
+/// read it off the runs journal. Every stamp is pre-rendered: the view
+/// owns no clock and no chain height.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRow {
+    pub run_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    /// what the run answers: a channel message, a job, or a calling run
+    pub origin: String,
+    /// `dispatched`, `running`, `accepted`, `rejected` or `failed`
+    pub state: String,
+    /// the dispatch height, rendered
+    pub dispatched: String,
+    /// the settlement height, rendered; "" while the run is in flight
+    pub settled: String,
+    pub attempt: i64,
+    /// the executing node's key, abbreviated; "" before a session opened
+    pub holder: String,
+    pub actions: i64,
+    pub degraded: bool,
+    /// the failure excerpt of a failed run
+    pub reason: String,
+    pub output_ref: String,
+    /// 0 when the run opened no PR
+    pub pr_number: i64,
+}
+
+/// One journal entry of the run the reader opened.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEntry {
+    /// the commit height, rendered
+    pub height: String,
+    /// the fact's kind: `dispatched`, `session opened`, `acted`, `settled`,
+    /// `result action refused`, `pr linked`
+    pub kind: String,
+    pub summary: String,
+}
+
+/// The journal of one run, as the app last read it. `run_id` names the run
+/// it belongs to, so a journal that arrives after the reader moved on is
+/// told apart from the one they are looking at.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunJournal {
+    pub run_id: String,
+    pub entries: Vec<JournalEntry>,
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsProps {
     pub rows: Vec<AgentRow>,
+    /// every agent's runs, newest dispatch first
+    pub runs: Vec<RunRow>,
+    /// the journal of the run the app has open for the reader
+    pub journal: RunJournal,
     /// every capability tag a node on the network announces
     pub capabilities: Vec<String>,
     /// the action vocabulary a grant draws from
@@ -209,6 +261,35 @@ pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     let working = rows.iter().filter(|row| row.live).count();
     let noun = if rows.len() == 1 { "agent" } else { "agents" };
     format!("{} {noun} · {working} working", rows.len())
+}
+
+/// `12 runs · 2 in flight` — the Runs panel's machine subtitle.
+pub fn runs_summary(runs: &[RunRow]) -> String {
+    if runs.is_empty() {
+        return String::new();
+    }
+    let in_flight = runs
+        .iter()
+        .filter(|run| run.state == "dispatched" || run.state == "running")
+        .count();
+    let noun = if runs.len() == 1 { "run" } else { "runs" };
+    format!("{} {noun} · {in_flight} in flight", runs.len())
+}
+
+/// The run listed under `run_id`; an empty row when the list has none.
+pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
+    runs.iter()
+        .find(|run| run.run_id == run_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn empty_journal() -> RunJournal {
+    RunJournal::default()
+}
+
+pub fn empty_run() -> RunRow {
+    RunRow::default()
 }
 
 /// How many grants a record carries: every cap list, and the budget once
@@ -444,7 +525,12 @@ pub fn pane_note(pane: &str) -> String {
             "Messages are immutable records with a separate delivery state per recipient. A \
              delivery state says what a provider's input interface did with an input — never \
              that a model read it, understood it, acted on it, or that a task was claimed or \
-             finished."
+             finished. Runs is where execution is settled."
+        }
+        "runs" => {
+            "A run is a dispatch and what the network settled about it: who held it, what it \
+             acted on, and how it ended. This is the only execution status on this screen — a \
+             message's delivery state is not one."
         }
         _ => {
             "The registry records who may act, what they may do, and under whose grant — every \
@@ -525,6 +611,22 @@ pub struct Draft {
     pub allowed_actions: Vec<String>,
     pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
+}
+
+/// The run the reader opened, whose journal the app is asked to read; an
+/// empty id closes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRun {
+    pub run_id: String,
+}
+
+pub fn open_run(run_id: &str) -> bool {
+    notify(
+        "agents.open_run",
+        &OpenRun {
+            run_id: run_id.into(),
+        },
+    )
 }
 
 pub fn status(agent_id: &str, paused: bool) -> bool {
@@ -690,6 +792,34 @@ pub fn task_note(task: &str, attempt: i64) -> String {
         return String::new();
     }
     format!("task {task} · attempt {attempt} · execution status not resolved here")
+}
+
+/// The run this message's task reference actually names, or "" — checked
+/// against the runs journal on this same screen, never derived from the id's
+/// shape.
+///
+/// This is the ONLY link from a message to an execution status, and it fails
+/// closed: a task id that is not a run in the journal gets no link and keeps
+/// [`task_note`]'s "not resolved here". A run id is a different identity from
+/// a task id, and pretending one is the other would put a settled state under
+/// a message that never had one.
+pub fn run_for_task(runs: &[RunRow], task: &str) -> String {
+    if task.is_empty() {
+        return String::new();
+    }
+    runs.iter()
+        .find(|run| run.run_id == task)
+        .map(|run| run.run_id.clone())
+        .unwrap_or_default()
+}
+
+/// The label of the link above — the run's own state named, so pressing it is
+/// a choice rather than a guess.
+pub fn run_link_note(runs: &[RunRow], task: &str) -> String {
+    let Some(run) = runs.iter().find(|run| run.run_id == task) else {
+        return String::new();
+    };
+    format!("open run {} · {}", run.run_id, run.state)
 }
 
 /// Why an authenticated read was refused, in the module's own vocabulary.

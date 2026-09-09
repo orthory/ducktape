@@ -97,8 +97,27 @@ on agents_loaded(next)
   return if next.generation != agents_generation
   agents_answered = true
   agents_rows = next.agents
+  agents_runs = next.runs
   agents_capabilities = next.capabilities
   agents_actions = next.actions
+  // the open journal follows the register: the op that moved the register
+  // may have moved the open run too
+  return if empty(agents_open_run)
+  agents_journal_op = agents_journal_op + 1
+  run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
+
+// THE JOURNAL READ, INSTALLED ONLY IN ITS OWN SCOPE. The run id is the
+// subject, not the identity: two networks can carry the same one, and a
+// reconnect to the same endpoint is a different session — so a read started on
+// A, answering after the app moved to B with that run still open, would install
+// A's journal under B. Success AND refusal meet the same fence, which is why
+// the read is infallible and carries its scope in the answer: an error arm has
+// nowhere to put one.
+on agent_journal_loaded(next)
+  return if !journal_in_scope(next, connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run)
+  agents_journal = next
+  return if empty(next.error)
+  error = next.error
 
 on agents_failed(cause)
   return if cause.generation != agents_generation
@@ -190,6 +209,11 @@ on agents_view_event(event)
       run every save_agent(connected_rpc, password, event.detail) -> agent_status_set _ | mutation_failed _
     AgentsIntent.register
       run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.open_run
+      agents_open_run = event_text(event, "run_id")
+      agents_journal = empty_run_journal()
+      agents_journal_op = agents_journal_op + 1
+      run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
     // THE EXPLICIT ASSOCIATION. The reader named a participant and a
     // conversation; the app reads them under this device's key on the network
     // it is connected to. Empty names close the panel, which is the same read

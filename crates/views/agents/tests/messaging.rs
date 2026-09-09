@@ -8,7 +8,7 @@
 
 use agents_view::host::{
     AgentsProps, MessagingBinding, MessagingMessage, MessagingProps, MessagingSeat,
-    OpenConversation, SendMessage,
+    OpenConversation, RunRow, SendMessage,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, keys, pick, press, texts, type_into};
@@ -17,7 +17,7 @@ use ui_lang_guest::wire::{Frame, Node, Request};
 const BODY_HINT: &str = "what to send…";
 const PARTICIPANT_HINT: &str = "the participant id you own…";
 const CONVERSATION_HINT: &str = "the conversation id…";
-const MESSAGES_TAB: &str = "Show agent messages";
+const MESSAGES_TAB: &str = "Messages";
 
 fn seat(participant: &str, role: &str, you: bool) -> MessagingSeat {
     MessagingSeat {
@@ -84,8 +84,14 @@ fn open(messages: Vec<MessagingMessage>) -> MessagingProps {
 }
 
 fn register(messaging: MessagingProps) -> Vec<u8> {
+    register_with_runs(messaging, Vec::new())
+}
+
+fn register_with_runs(messaging: MessagingProps, runs: Vec<RunRow>) -> Vec<u8> {
     serde_json::to_vec(&AgentsProps {
         rows: Vec::new(),
+        runs,
+        journal: Default::default(),
         capabilities: Vec::new(),
         actions: Vec::new(),
         account: "7".into(),
@@ -495,6 +501,117 @@ fn the_binding_names_the_kind_of_principal_it_authorizes() {
              identify."
         ),
         "{:?}",
+        texts(&frame)
+    );
+}
+
+/// The three panels are ONE selector and mutually exclusive: a reader on
+/// Messages is not also on the registry, and the explainer says which screen
+/// settles execution.
+#[test]
+fn the_three_panels_are_one_selector_and_never_overlap() {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let landed = tick_native(vec![item(
+        subscription,
+        &register(open(vec![message(7, "queued")])),
+    )]);
+    // the registry is where a reader lands, and it says what a registry IS
+    assert!(
+        texts(&landed)
+            .iter()
+            .any(|text| text.contains("The registry records who may act")),
+        "{:?}",
+        texts(&landed)
+    );
+    assert!(!has_text(&landed, "standup"), "{:?}", texts(&landed));
+
+    let messages = tick_native(press(&landed, MESSAGES_TAB));
+    assert!(has_text(&messages, "standup"), "{:?}", texts(&messages));
+    // ONE panel at a time: the registry's own explainer is gone with it
+    assert!(
+        !texts(&messages)
+            .iter()
+            .any(|text| text.contains("The registry records who may act")),
+        "two panels drew at once: {:?}",
+        texts(&messages)
+    );
+    // and the messages explainer points at the screen that DOES settle
+    // execution rather than implying this one does
+    assert!(
+        texts(&messages)
+            .iter()
+            .any(|text| text.contains("Runs is where execution is settled")),
+        "{:?}",
+        texts(&messages)
+    );
+
+    let runs = tick_native(press(&messages, "Runs"));
+    assert!(
+        texts(&runs)
+            .iter()
+            .any(|text| text.contains("A run is a dispatch and what the network settled about it")),
+        "{:?}",
+        texts(&runs)
+    );
+    assert!(!has_text(&runs, "standup"), "{:?}", texts(&runs));
+}
+
+/// A message may LINK to a run, and only when the runs journal on this same
+/// screen actually lists that id. A task id is not a run id.
+#[test]
+fn a_message_links_to_a_run_only_when_the_journal_has_one() {
+    let run = |id: &str| RunRow {
+        run_id: id.into(),
+        agent_id: "reviewer-bot".into(),
+        agent_name: "Reviewer Bot".into(),
+        state: "accepted".into(),
+        ..RunRow::default()
+    };
+    let mut carries = message(7, "adapter_accepted");
+    carries.task = "run-42".into();
+    carries.task_attempt = 1;
+
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let props = register_with_runs(open(vec![carries.clone()]), vec![run("run-42")]);
+    let frame = tick_native(vec![item(subscription, &props)]);
+    let frame = tick_native(press(&frame, MESSAGES_TAB));
+    assert!(
+        has_text(&frame, "open run run-42 · accepted"),
+        "{:?}",
+        texts(&frame)
+    );
+    // the link is a LINK, not a claim: the row still says this screen resolves
+    // no execution status of its own
+    assert!(
+        has_text(
+            &frame,
+            "task run-42 · attempt 1 · execution status not resolved here"
+        ),
+        "{:?}",
+        texts(&frame)
+    );
+    // and it opens the canonical run detail rather than repeating it here
+    let frame = tick_native(press(&frame, "open run run-42 · accepted"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "agents.open_run");
+
+    // THE COUNTEREXAMPLE: a task the journal does not list gets NO link. The
+    // ids' shapes are not evidence that one names the other.
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let props = register_with_runs(open(vec![carries]), vec![run("run-99")]);
+    let frame = tick_native(vec![item(subscription, &props)]);
+    let frame = tick_native(press(&frame, MESSAGES_TAB));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.starts_with("open run")),
+        "a message linked to a run the journal never listed: {:?}",
         texts(&frame)
     );
 }

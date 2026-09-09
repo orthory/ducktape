@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT,
-    ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_CHAT_POST_MESSAGE, ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE,
+    ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES,
     ModuleUpdateSpec, ReplyBlock,
 };
@@ -105,6 +105,22 @@ pub fn content_blocks(content: &[ContentPart]) -> Vec<ReplyBlock> {
             },
         })
         .collect()
+}
+
+fn emoji_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": chat::MAX_EMOJI_BYTES,
+        "description": "One emoji, as the room renders it (👀, ✅).",
+    })
+}
+
+fn reaction_result() -> Value {
+    object(
+        json!({"channel_id": {"type": "string"}, "seq": {"type": "integer"}, "emoji": {"type": "string"}}),
+        &["channel_id", "seq", "emoji"],
+    )
 }
 
 fn content_schema() -> Value {
@@ -209,6 +225,10 @@ const LIVE_ONLY: &[LaneKind] = &[LaneKind::Live];
 const FINAL_ONLY: &[LaneKind] = &[LaneKind::Final];
 
 pub const OP_REPLY: &str = "reply";
+/// React to the message this run was called on; source-granted like `reply`.
+pub const OP_REACT: &str = "react";
+/// Take this agent's own reaction off that message again.
+pub const OP_UNREACT: &str = "unreact";
 pub const OP_AGENT_CALL: &str = "agent.call";
 
 fn specs() -> Vec<Spec> {
@@ -223,6 +243,24 @@ fn specs() -> Vec<Spec> {
                 json!({"destination": {"type": "object"}, "id": {"type": "string"}}),
                 &["destination", "id"],
             ),
+            lanes: LIVE_AND_FINAL,
+        },
+        Spec {
+            name: OP_REACT,
+            description: "React with one emoji to the chat message this run was called on — the acknowledgement a room sees before any reply. Idempotent per emoji. Needs the same chat.post grant as reply; a run called from a page or a job has no message to react to.",
+            grant: Grant::Source,
+            target: None,
+            input: object(json!({"emoji": emoji_schema()}), &["emoji"]),
+            result: reaction_result(),
+            lanes: LIVE_AND_FINAL,
+        },
+        Spec {
+            name: OP_UNREACT,
+            description: "Remove this agent's own emoji reaction from the chat message this run was called on; a reaction that is not there is a no-op. Needs chat.post, like react.",
+            grant: Grant::Source,
+            target: None,
+            input: object(json!({"emoji": emoji_schema()}), &["emoji"]),
+            result: reaction_result(),
             lanes: LIVE_AND_FINAL,
         },
         Spec {
@@ -267,6 +305,21 @@ fn specs() -> Vec<Spec> {
             result: object(
                 json!({"block_id": {"type": "string"}, "checked": {"type": "boolean"}}),
                 &["block_id", "checked"],
+            ),
+            lanes: LIVE_AND_FINAL,
+        },
+        Spec {
+            name: ACTION_PAGES_POST,
+            description: "Publish a new top-level page: a title and its body, whole in one write. Requires pages.post and the every-page entry (*) in pages_write; the page id is minted by runs and returned in the result.",
+            grant: Grant::Action(ACTION_PAGES_POST.into()),
+            target: None,
+            input: object(
+                json!({"title": {"type": "string", "minLength": 1, "maxLength": pages::MAX_PAGE_TITLE_LEN}, "content": content_schema()}),
+                &["title", "content"],
+            ),
+            result: object(
+                json!({"page_id": {"type": "string"}, "title": {"type": "string"}}),
+                &["page_id", "title"],
             ),
             lanes: LIVE_AND_FINAL,
         },
@@ -402,6 +455,12 @@ pub(crate) enum Operation {
     Reply {
         content: Vec<ContentPart>,
     },
+    React {
+        emoji: String,
+    },
+    Unreact {
+        emoji: String,
+    },
     ChatPost {
         channel_id: String,
         thread: Option<u64>,
@@ -414,6 +473,10 @@ pub(crate) enum Operation {
     PagesSetChecked {
         block_id: String,
         checked: bool,
+    },
+    PagesPost {
+        title: String,
+        content: Vec<ContentPart>,
     },
     JobsComment {
         job_id: String,
@@ -448,6 +511,12 @@ struct ContentInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EmojiInput {
+    emoji: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatTarget {
     channel_id: String,
     #[serde(default)]
@@ -473,6 +542,13 @@ struct BlockTarget {
 #[serde(deny_unknown_fields)]
 struct CheckedInput {
     checked: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PagePostInput {
+    title: String,
+    content: Vec<ContentPart>,
 }
 
 #[derive(Deserialize)]
@@ -564,6 +640,16 @@ impl Operation {
                     content: input.content,
                 })
             }
+            OP_REACT => {
+                no_target(envelope)?;
+                let input: EmojiInput = decode_input(envelope)?;
+                Ok(Self::React { emoji: input.emoji })
+            }
+            OP_UNREACT => {
+                no_target(envelope)?;
+                let input: EmojiInput = decode_input(envelope)?;
+                Ok(Self::Unreact { emoji: input.emoji })
+            }
             ACTION_CHAT_POST_MESSAGE => {
                 let target: ChatTarget = decode_target(envelope)?;
                 let input: ContentInput = decode_input(envelope)?;
@@ -590,6 +676,14 @@ impl Operation {
                 Ok(Self::PagesSetChecked {
                     block_id: target.block_id,
                     checked: input.checked,
+                })
+            }
+            ACTION_PAGES_POST => {
+                no_target(envelope)?;
+                let input: PagePostInput = decode_input(envelope)?;
+                Ok(Self::PagesPost {
+                    title: input.title,
+                    content: input.content,
                 })
             }
             ACTION_JOBS_COMMENT => {
@@ -649,9 +743,12 @@ impl Operation {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Reply { .. } => OP_REPLY,
+            Self::React { .. } => OP_REACT,
+            Self::Unreact { .. } => OP_UNREACT,
             Self::ChatPost { .. } => ACTION_CHAT_POST_MESSAGE,
             Self::PagesComment { .. } => ACTION_PAGES_COMMENT,
             Self::PagesSetChecked { .. } => ACTION_PAGES_SET_CHECKED,
+            Self::PagesPost { .. } => ACTION_PAGES_POST,
             Self::JobsComment { .. } => ACTION_JOBS_COMMENT,
             Self::TasksCreate { .. } => ACTION_TASKS_CREATE,
             Self::TasksUpdateStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
@@ -662,10 +759,14 @@ impl Operation {
     }
 
     /// The fixed grant this operation needs, or `None` when it is resolved
-    /// from the source (`reply`) or gated by a cap (`agent.call`).
+    /// from the source (`reply`, `react`, `unreact`) or gated by a cap
+    /// (`agent.call`).
     pub(crate) fn fixed_grant(&self) -> Option<&'static str> {
         match self {
-            Self::Reply { .. } | Self::AgentCall { .. } => None,
+            Self::Reply { .. }
+            | Self::React { .. }
+            | Self::Unreact { .. }
+            | Self::AgentCall { .. } => None,
             other => Some(other.name()),
         }
     }
@@ -681,7 +782,10 @@ impl Operation {
     /// pages annotations and duckfs writes fail alone with a breadcrumb rather
     /// than costing the response its reply.
     pub(crate) fn is_pages(&self) -> bool {
-        matches!(self, Self::PagesComment { .. } | Self::PagesSetChecked { .. })
+        matches!(
+            self,
+            Self::PagesComment { .. } | Self::PagesSetChecked { .. } | Self::PagesPost { .. }
+        )
     }
 
     pub(crate) fn is_duckfs(&self) -> bool {
@@ -689,12 +793,14 @@ impl Operation {
     }
 
     /// Whether this operation is a conversational or task write the response
-    /// lane prepares (`emit_response`): a reply, a chat post, a job comment, a
-    /// task create or status update.
+    /// lane prepares (`emit_response`): a reply, a reaction, a chat post, a
+    /// job comment, a task create or status update.
     pub(crate) fn is_conversational(&self) -> bool {
         matches!(
             self,
             Self::Reply { .. }
+                | Self::React { .. }
+                | Self::Unreact { .. }
                 | Self::ChatPost { .. }
                 | Self::JobsComment { .. }
                 | Self::TasksCreate { .. }
@@ -727,6 +833,8 @@ mod tests {
                 None,
                 json!({"content": [{"type": "text", "text": "hi"}]}),
             ),
+            envelope(OP_REACT, None, json!({"emoji": "👀"})),
+            envelope(OP_UNREACT, None, json!({"emoji": "👀"})),
             envelope(
                 ACTION_CHAT_POST_MESSAGE,
                 Some(json!({"channel_id": "general", "thread": 3})),
@@ -746,6 +854,11 @@ mod tests {
                 ACTION_PAGES_SET_CHECKED,
                 Some(json!({"block_id": "b1"})),
                 json!({"checked": true}),
+            ),
+            envelope(
+                ACTION_PAGES_POST,
+                None,
+                json!({"title": "Report", "content": [{"type": "text", "text": "hi"}]}),
             ),
             envelope(
                 ACTION_JOBS_COMMENT,
@@ -840,7 +953,14 @@ mod tests {
             .into_iter()
             .map(|v| v.name)
             .collect();
-        assert_eq!(pages, [ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED]);
+        assert_eq!(
+            pages,
+            [
+                ACTION_PAGES_COMMENT,
+                ACTION_PAGES_SET_CHECKED,
+                ACTION_PAGES_POST
+            ]
+        );
         assert!(catalog(Some("nothing.")).is_empty());
     }
 

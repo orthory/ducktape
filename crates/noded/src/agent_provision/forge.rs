@@ -42,6 +42,7 @@ use compute_service::{
 };
 
 use crate::node_link::NodeLink;
+use provider_host::OperatorCredential;
 
 /// the synthetic domain for agent authorship and attribution. DELIBERATELY in
 /// the network's own `.duck` namespace (duckdns), not a registerable TLD: no
@@ -402,25 +403,6 @@ pub(super) async fn provision(
         spec,
         session.as_ref(),
     );
-    let agent_id = spec
-        .agent
-        .as_ref()
-        .map(|agent| agent.agent_id.as_str())
-        .unwrap_or("agent");
-    let agent_name = sanitize_display_name(
-        spec.agent
-            .as_ref()
-            .map(|agent| agent.display_name.as_str())
-            .unwrap_or(agent_id),
-    );
-    env.insert("GIT_AUTHOR_NAME".into(), agent_name);
-    env.insert(
-        "GIT_AUTHOR_EMAIL".into(),
-        format!(
-            "{}@{AGENT_EMAIL_DOMAIN}",
-            attribution_email_local_part(agent_id)
-        ),
-    );
     env.insert("GIT_COMMITTER_NAME".into(), lane.committer_name.clone());
     env.insert(
         "GIT_COMMITTER_EMAIL".into(),
@@ -696,7 +678,7 @@ fn sanitize_agent_git_control(run_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to install a clean local Git config: {e}"))
 }
 
-fn sanitize_display_name(input: &str) -> String {
+pub(super) fn sanitize_display_name(input: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for c in input.chars() {
@@ -731,6 +713,15 @@ fn sanitize_display_name(input: &str) -> String {
 fn attribution_email_local_part(input: &str) -> String {
     debug_assert!(runs::validate_agent_id(input).is_ok());
     input.to_owned()
+}
+
+/// the address a run's commits are authored under: the agent's id at
+/// [`AGENT_EMAIL_DOMAIN`].
+pub(super) fn agent_email(agent_id: &str) -> String {
+    format!(
+        "{}@{AGENT_EMAIL_DOMAIN}",
+        attribution_email_local_part(agent_id)
+    )
 }
 
 fn commit_message(run_dir: &Path, oid: &str) -> Result<String, String> {
@@ -1005,6 +996,10 @@ impl ProvisionedWorkspace for ForgeWorkspace {
 
     fn context_doc(&self) -> Option<String> {
         self.context_doc.clone()
+    }
+
+    fn operator_credential(&self) -> Option<OperatorCredential> {
+        Some(super::operator_credential(&self.node))
     }
 
     async fn commit(

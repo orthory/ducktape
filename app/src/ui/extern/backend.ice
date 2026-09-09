@@ -397,8 +397,16 @@ extern crate::backend
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
   AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
-  AgentsData(generation:i64, agents:[AgentRow], capabilities:[str], actions:[str])
+  // the run tracker: every run off the runs journal, and the journal of
+  // the one the reader opened
+  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  JournalEntry(height:str, kind:str, summary:str)
+  RunJournal(run_id:str, entries:[JournalEntry], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
+  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
+  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, run_id:str) -> RunJournal
+  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, run_id:&str) -> bool
+  pure empty_run_journal() -> RunJournal
   pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
   // the editor's whole draft record, as the Agents view hands it back

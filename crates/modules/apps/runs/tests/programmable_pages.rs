@@ -47,6 +47,7 @@ async fn configure_pages(network: &mut Network) {
                 &pages::PageMsg::CreatePage {
                     page_id: "spec".into(),
                     title: "Builder review this spec".into(),
+                    blocks: Vec::new(),
                 },
             ),
         )

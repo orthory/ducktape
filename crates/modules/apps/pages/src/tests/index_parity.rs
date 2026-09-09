@@ -134,9 +134,16 @@ fn the_two_lanes_answer_the_same_preorder_for_a_nested_document() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         let script = vec![
+            // the create carries a body: two blocks in document order and a
+            // subpage opened in the same op.
             PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root title".into(),
+                blocks: vec![
+                    para("a1", "born with the page"),
+                    page("born", "born subpage"),
+                    para("a2", "and its sibling"),
+                ],
             },
             // `after: None` twice: b2 lands BEFORE b1.
             PageMsg::InsertBlock {
@@ -180,10 +187,16 @@ fn the_two_lanes_answer_the_same_preorder_for_a_nested_document() {
         ];
         // and the shape itself is what both lanes report, so a future change
         // that broke BOTH identically would still fail here.
-        let map = run_script(&mut p, &script, &["root", "sub", "ghost"]).await;
+        let map = run_script(&mut p, &script, &["root", "sub", "born", "ghost"]).await;
         let walked = assert_lanes_agree(&p, &map, "root", 0).await;
-        assert_eq!(walked, ["root", "b2", "b3", "b1", "c1", "c2", "sub"]);
+        assert_eq!(
+            walked,
+            [
+                "root", "b2", "b3", "b1", "c1", "c2", "sub", "a1", "born", "a2"
+            ]
+        );
         assert_eq!(assert_lanes_agree(&p, &map, "sub", 0).await, ["sub", "s1"]);
+        assert_eq!(assert_lanes_agree(&p, &map, "born", 0).await, ["born"]);
     });
 }
 
@@ -199,6 +212,7 @@ fn the_two_lanes_agree_after_reorders_and_nested_moves() {
             PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root".into(),
+                blocks: Vec::new(),
             },
             PageMsg::InsertBlock {
                 parent: "root".into(),
@@ -272,10 +286,12 @@ fn the_two_lanes_agree_after_subpage_moves_and_subtree_deletes() {
             PageMsg::CreatePage {
                 page_id: "left".into(),
                 title: "left".into(),
+                blocks: Vec::new(),
             },
             PageMsg::CreatePage {
                 page_id: "right".into(),
                 title: "right".into(),
+                blocks: Vec::new(),
             },
             PageMsg::InsertBlock {
                 parent: "left".into(),
@@ -347,6 +363,7 @@ fn the_two_lanes_agree_on_marks_and_checked_state() {
             PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "root".into(),
+                blocks: Vec::new(),
             },
             PageMsg::InsertBlock {
                 parent: "root".into(),
@@ -448,6 +465,7 @@ fn the_byte_budget_cuts_the_two_lanes_at_the_same_block() {
         let mut script = vec![PageMsg::CreatePage {
             page_id: "root".into(),
             title: "root".into(),
+            blocks: Vec::new(),
         }];
         let mut after: Option<String> = None;
         for n in 0..10 {
