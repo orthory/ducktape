@@ -292,6 +292,70 @@ pub(crate) async fn data_plane_signer(
     }))
 }
 
+/// What asking for a read signer produced — THREE different things to do next,
+/// as one discriminant rather than an `Option` that says "no" to all of them.
+///
+/// Collapsing these was a real defect: a node that could not be reached, and a
+/// node whose status carried a key we cannot parse, both read as "your key is
+/// locked" — which sends a person to unlock a key that is already open.
+pub(crate) enum ReadSigner {
+    /// signed by the key seated under `key` (its public key, hex)
+    Seated {
+        auth: ducktape_rpc::WriteAuth,
+        key: String,
+    },
+    /// no key is seated in this session: unlock it
+    Locked,
+    /// the node could not be asked which key to bind the signature to
+    Unavailable(String),
+}
+
+/// The person's proof for a data-plane READ (`/v1/query/reader`), signed by the
+/// key ALREADY SEATED — no password, because the seat was opened by the
+/// ceremony that unlocked it, exactly as [`seated_request_headers`] works.
+///
+/// The returned hook holds a CLONE of the seated key for ONE operation: the
+/// caller attaches it to a client it owns for that read and drops both. It is
+/// never attached to the cached client, because that client outlives a Lock, an
+/// account switch and a network change, and a signer that outlived any of those
+/// would keep proving an identity this session no longer holds.
+pub(crate) async fn seated_data_plane_signer(rpc: &RpcClient) -> ReadSigner {
+    let node_key = match rpc.status().await {
+        Ok(status) => match hex_decode(&status.public_key) {
+            Ok(key) => key,
+            Err(error) => return ReadSigner::Unavailable(error),
+        },
+        Err(error) => return ReadSigner::Unavailable(error.to_string()),
+    };
+    let session = SIGNER.lock().await;
+    let Some(signer) = session.as_ref() else {
+        return ReadSigner::Locked;
+    };
+    let key = signer.key.clone();
+    let identity = hex_encode(signer.key.public_key().as_ref());
+    ReadSigner::Seated {
+        auth: std::sync::Arc::new(move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        }),
+        key: identity,
+    }
+}
+
+/// The public key this session is seated with, hex — or `None` while locked.
+///
+/// The identity half of a scope: an operation snapshots it before its first
+/// read and checks it again before installing the answer, so a Lock or an
+/// account switch mid-read cannot land under the identity that replaced it.
+pub(crate) async fn seated_public_key() -> Option<String> {
+    let session = SIGNER.lock().await;
+    session
+        .as_ref()
+        .map(|signer| hex_encode(signer.key.public_key().as_ref()))
+}
+
 /// Take the session seat: the key at `path`, opened under `password`. THE
 /// one place a key is opened for signing — the wallet ceremonies call it with
 /// the workspace's key file, having just proved the password on it — so a
