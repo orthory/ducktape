@@ -80,7 +80,7 @@
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
 //! separated, and repeatable) appends the kv/valset/acl/governance/modules
-//! system modules AFTER the default 15, seeding the validator set with the given
+//! system modules AFTER the default 16, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
@@ -148,7 +148,7 @@ use serde::{Deserialize, Serialize};
 use topology::TOPOLOGY;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
-// single-source `topology` — noded's exact 15-module default plus the
+// single-source `topology` — noded's exact 16-module default plus the
 // opt-in 5 system modules. changing the daemon set changes the topology, which
 // re-pins here and at node/demo. the composer below builds exactly those ids,
 // the same way bin/node does.
@@ -316,7 +316,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 15-module set (`topology::SIM_BASE`) alone.
+    /// => the default 16-module set (`topology::SIM_BASE`) alone.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -387,7 +387,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     };
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 15-module set `daemon_e2e` pins
+    // keys; the default path stays the exact 16-module set `daemon_e2e` pins
     // against noded.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
         topology::SIM_BASE.to_vec()
@@ -813,6 +813,9 @@ fn run_sim(
         let bindings = Bindings {
             invite: &invite_binding,
             chain_id: LOCAL_CHAIN_ID,
+            // the sim arms `ConsensusTimePolicy::Epoch`, so its `consensus_time`
+            // is a millisecond clock, not a height.
+            time_unit: sdk::genesis_config::TimeUnit::Millis,
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(

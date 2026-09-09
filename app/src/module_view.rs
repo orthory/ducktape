@@ -59,6 +59,16 @@ const MAX_PAYLOAD_BYTES: usize = 1 << 20;
 /// guest publishes a valid tree, neither pending work nor a later trap
 /// authorizes discarding its state.
 const REPLACEMENT_WAIT: Duration = Duration::from_secs(30);
+/// The gap before the first re-attempt at a candidate whose load failed,
+/// and the longest that gap widens to. A load fetches the artifact,
+/// instantiates it, restores the snapshot and verifies the first tree —
+/// and compiles the component too, whenever `compiled_view` does not
+/// already hold it. A deployment that cannot load fails that way every
+/// time, so trying it once a block buys nothing and never stops. Widening
+/// the gap rather than giving up keeps a fetch that failed on the
+/// transport recoverable: nothing is suppressed for good, only spaced out.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 /// How often a tab polls for a component still loading on its thread.
 const LOAD_POLL: Duration = Duration::from_millis(50);
 
@@ -468,6 +478,14 @@ pub fn settings_view(
         "settings",
         serde_json::to_vec(&props).expect("props encode"),
     )
+}
+
+/// Test seam: Ice reads extern structs but cannot construct one, and a scenario
+/// that presses a view's control has no view to press it in. The `kind` is the
+/// same string the guest emits, so a scenario names the act and not an enum the
+/// intent mapping could drift from.
+pub fn view_event(kind: String, detail: String) -> ModuleViewEvent {
+    ModuleViewEvent { kind, detail }
 }
 
 pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
@@ -1129,6 +1147,9 @@ struct ChatProps<'a> {
     copy_head_seq: i64,
     copy_surface: &'static str,
     sent_serial: i64,
+    /// THIS ROOM'S runs only: the reading is taken for the whole node, and
+    /// [`encode_chat_props`] narrows it to `active_channel` on the way out.
+    live_agents: std::borrow::Cow<'a, [crate::backend::LiveAgentRow]>,
 }
 
 /// The Chat tab: the room list, the stream, the rail and the drawer as the
@@ -1194,6 +1215,7 @@ pub fn chat_view(
     copy_head_seq: i64,
     copy_surface: crate::CopySurface,
     sent_serial: i64,
+    live_agents: &[crate::backend::LiveAgentRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = ChatProps {
         dark,
@@ -1249,6 +1271,7 @@ pub fn chat_view(
         copy_head_seq,
         copy_surface: copy_surface_name(copy_surface),
         sent_serial,
+        live_agents: std::borrow::Cow::Borrowed(live_agents),
     };
     module_view("chat", encode_chat_props(props))
 }
@@ -1260,13 +1283,36 @@ pub fn chat_view(
 /// rail) lives in the headroom.
 const TIMELINE_TEXT_BUDGET: usize = 48 << 10;
 
+/// Bytes the live agent cards may take out of [`TIMELINE_TEXT_BUDGET`]. They
+/// draw INSIDE the stream, under their anchors, so they spend the timeline's
+/// budget rather than the chrome's headroom — and this ceiling is what keeps a
+/// room with a great many runs in flight from blanking the messages they sit
+/// under.
+const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
+
 /// The facts encoded for the view, the timelines held to
 /// [`TIMELINE_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
 /// first, and a clipped stream says so through `has_older_history` (the
 /// thread through `thread_has_more`, its root always kept) so the view still
 /// offers what was left behind as history.
+///
+/// The live agent rows are narrowed to `active_channel` here, and THIS IS THE
+/// ONLY PLACE a run is matched to a room: the reading covers the whole node, so
+/// a row from a room the reader left cannot reach the screen no matter which of
+/// the eight handlers that move `active_channel` she got here through.
 fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
-    let (stream, stream_clipped) = newest_within(props.messages, TIMELINE_TEXT_BUDGET);
+    let live = live_agents_within(
+        &props.live_agents,
+        props.active_channel,
+        LIVE_AGENT_TEXT_BUDGET,
+    );
+    // THE LIVE CARDS ARE SERVED FIRST. A run in flight is the most perishable
+    // thing on the frame and the one the reader is waiting on, so it takes its
+    // bytes before the scrollback it sits in does.
+    let timelines =
+        TIMELINE_TEXT_BUDGET.saturating_sub(live.iter().map(live_text_bytes).sum::<usize>());
+    props.live_agents = std::borrow::Cow::Owned(live);
+    let (stream, stream_clipped) = newest_within(props.messages, timelines);
     let stream_spent: usize = stream.iter().map(text_bytes).sum();
     props.messages = stream;
     props.has_older_history |= stream_clipped;
@@ -1279,7 +1325,7 @@ fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
     );
     let (replies, thread_clipped) = newest_within(
         &thread[root..],
-        TIMELINE_TEXT_BUDGET
+        timelines
             .saturating_sub(stream_spent + thread[..root].iter().map(text_bytes).sum::<usize>()),
     );
     if thread_clipped {
@@ -1293,6 +1339,46 @@ fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
 /// The bytes a message puts on the wire as text.
 fn text_bytes(message: &crate::backend::ChatMessage) -> usize {
     message.body.len() + message.author.len() + message.meta.len()
+}
+
+/// The bytes a live agent card puts on the wire as text.
+fn live_text_bytes(row: &crate::backend::LiveAgentRow) -> usize {
+    row.agent.len()
+        + row.status.len()
+        + row.answer_preview.len()
+        + row
+            .activity
+            .iter()
+            .map(|activity| activity.label.len())
+            .sum::<usize>()
+}
+
+/// The runs anchored in `channel_id` whose text fits `budget`, newest anchor
+/// kept first — those are the ones at the tail the reader is looking at — and
+/// handed back in anchor order so the list does not churn the guest's timeline
+/// memo when two runs start in the same poll.
+fn live_agents_within(
+    rows: &[crate::backend::LiveAgentRow],
+    channel_id: &str,
+    budget: usize,
+) -> Vec<crate::backend::LiveAgentRow> {
+    let mut here: Vec<&crate::backend::LiveAgentRow> = rows
+        .iter()
+        .filter(|row| row.channel_id == channel_id)
+        .collect();
+    here.sort_by_key(|row| std::cmp::Reverse(row.anchor_seq));
+    let mut spent = 0;
+    let mut kept = Vec::new();
+    for row in here {
+        let cost = live_text_bytes(row);
+        if spent + cost > budget {
+            break;
+        }
+        spent += cost;
+        kept.push(row.clone());
+    }
+    kept.sort_by_key(|row| row.anchor_seq);
+    kept
 }
 
 /// The newest tail of `messages` whose text fits `budget`, and whether
@@ -1394,6 +1480,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "thread_edit" => Intent::ThreadEdit,
         "thread_delete" => Intent::ThreadDelete,
         "load_thread" => Intent::LoadThread,
+        "cancel_run" => Intent::CancelRun,
         "composer" => Intent::Composer,
         _ => Intent::ClearSelection,
     }
@@ -1760,6 +1847,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "thread_edit",
             "thread_delete",
             "load_thread",
+            "cancel_run",
         ],
         "forge" => &[
             "open_repo",
@@ -1982,7 +2070,10 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
             // starting over on every block would never let it land
             let waited_for =
                 locked.in_flight && locked.wanted.is_none_or(|wanted| Some(wanted) == active);
-            if waited_for || active == locked.hash {
+            // a candidate that just failed is left alone until its gap is
+            // up: the same bytes fail the same way, so one attempt a block
+            // is unbounded work for a deployment that never lands
+            if waited_for || active == locked.hash || locked.held_off(active) {
                 return None;
             }
             let Some(replacement) = locked.replacement_after_wait() else {
@@ -2034,9 +2125,10 @@ struct Mounted {
     slot: Slot,
     props: Option<Vec<u8>>,
     generation: u64,
-    /// The deployment the slot answers for — the view drawn, the empty
-    /// slot of a deployment without one, or the one that failed to load —
-    /// so a block moves it only when the active code moved.
+    /// The deployment the slot answers for — the view drawn, or the empty
+    /// slot of a deployment without one — so a block moves it only when the
+    /// active code moved. A load that failed never seated anything, so it
+    /// leaves this alone and is held off by `retry` instead.
     hash: Option<[u8; 32]>,
     /// A load is on its way for `generation`, and the deployment it is
     /// after when a block named one: a block that names it again waits
@@ -2048,6 +2140,35 @@ struct Mounted {
     /// generation instead of opening one per block.
     waiting_since: Option<Instant>,
     replacement: Replacement,
+    /// The candidate a load last failed on, and when the next block may try
+    /// it again. Cleared by any load that comes back, so only a repeated
+    /// failure on the same candidate widens the gap.
+    retry: Option<Retry>,
+}
+
+/// A failed load's hold-off: the candidate it failed on, when the next
+/// attempt at that same candidate is due, and the gap that produced it.
+struct Retry {
+    hash: Option<[u8; 32]>,
+    next: Instant,
+    gap: Duration,
+}
+
+impl Retry {
+    /// The hold-off after a load for `hash` failed: the gap doubles up to
+    /// `RETRY_MAX` while the same candidate keeps failing, and starts over
+    /// at `RETRY_FIRST` for a different one.
+    fn after(previous: Option<&Retry>, hash: Option<[u8; 32]>) -> Retry {
+        let gap = match previous {
+            Some(previous) if previous.hash == hash => (previous.gap * 2).min(RETRY_MAX),
+            _ => RETRY_FIRST,
+        };
+        Retry {
+            hash,
+            next: Instant::now() + gap,
+            gap,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2069,6 +2190,14 @@ impl Mounted {
         let never_valid_expired =
             old.can_recover_without_state() && since.elapsed() >= REPLACEMENT_WAIT;
         never_valid_expired.then_some(Replacement::RecoverNeverValid)
+    }
+
+    /// Whether a block naming `active` is still inside the hold-off a
+    /// failed load for that same candidate left behind.
+    fn held_off(&self, active: Option<[u8; 32]>) -> bool {
+        self.retry
+            .as_ref()
+            .is_some_and(|retry| retry.hash == active && Instant::now() < retry.next)
     }
 
     /// Opens the next generation for a load after `wanted` (None: whatever
@@ -2113,6 +2242,7 @@ fn mounted(module: &'static str) -> Arc<Mutex<Mounted>> {
                 wanted: None,
                 waiting_since: None,
                 replacement: Replacement::Preserve,
+                retry: None,
             }));
             spawn_load(module, &mounted, 0, snapshot);
             mounted
@@ -2147,9 +2277,15 @@ fn spawn_load(
             slot,
             hash,
             replacement,
+            wanted,
+            retry,
             ..
         } = &mut *locked;
         let replacement = *replacement;
+        // a load that came back at all clears the hold-off; only the error
+        // arm below puts one back, widened against the one taken here
+        let wanted = *wanted;
+        let held_off = retry.take();
         match loaded {
             Ok(Loaded::Fresh(guest)) => {
                 *hash = guest.hash;
@@ -2223,6 +2359,10 @@ fn spawn_load(
                     error = %reason,
                     "module view not loaded"
                 );
+                // the next block leaves this candidate alone until the gap
+                // is up; a transport error is only spaced out, never
+                // suppressed, and any other deployment is unaffected
+                *retry = Some(Retry::after(held_off.as_ref(), wanted));
                 // a view that is there stays, with its hash: the failure is
                 // the replacement's, not its own
                 if !matches!(slot, Slot::Ready(_)) {
@@ -3736,8 +3876,12 @@ pub(crate) mod tests {
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert_eq!(intents_of("agents"), ["status", "save", "register"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 43);
+        assert_eq!(chat.len(), 44);
         assert!(chat.contains(&"choose_channel"));
+        assert!(
+            chat.contains(&"cancel_run"),
+            "stopping an anchored agent run is an act the screen offers"
+        );
         assert!(
             !chat.contains(&"composer"),
             "a submit reaches the app only through the composer surface it was typed in"
@@ -3821,6 +3965,26 @@ pub(crate) mod tests {
             }
         });
         message.expect("an enabled button")
+    }
+
+    /// Whether a button showing `name` is on the frame at all.
+    ///
+    /// A BUTTON'S LABEL IS NOT A TEXT NODE, so `texts()` never contains it and
+    /// asserting over that list says nothing about a button either way — an
+    /// `any(== "Stop")` fails on a button that is plainly there, and the
+    /// `!any(== "Stop")` twin passes whether it is there or not.
+    fn button_shown(guest: &Guest, name: &str) -> bool {
+        let mut root = guest.frame.root.clone().expect("a tree");
+        let mut found = false;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::Button { label, content, .. } = node
+                && (label.as_deref() == Some(name)
+                    || matches!(content, wire::ButtonContent::Label(text) if text == name))
+            {
+                found = true;
+            }
+        });
+        found
     }
 
     /// The bundled component, end to end through the host: it boots on the
@@ -4659,6 +4823,7 @@ pub(crate) mod tests {
                 wanted: None,
                 waiting_since: None,
                 replacement: Replacement::Preserve,
+                retry: None,
             }));
             assert_eq!(
                 Guest::load(module, None, 0, &mounted).err().as_deref(),
@@ -5040,6 +5205,18 @@ pub(crate) mod tests {
         messages: &[crate::backend::ChatMessage],
         thread: &[crate::backend::ChatMessage],
     ) -> Option<Vec<u8>> {
+        chat_facts_in("channel-a", messages, thread, &[])
+    }
+
+    /// The same, reading `room` and carrying the node's live agent rows — the
+    /// two facts the live cards are decided by. Always the WHOLE node's rows:
+    /// narrowing them to `room` is what the host is on the hook for.
+    fn chat_facts_in(
+        room: &'static str,
+        messages: &[crate::backend::ChatMessage],
+        thread: &[crate::backend::ChatMessage],
+        live: &[crate::backend::LiveAgentRow],
+    ) -> Option<Vec<u8>> {
         let general = crate::backend::ChatChannel {
             id: "channel-a".into(),
             name: "general".into(),
@@ -5076,7 +5253,7 @@ pub(crate) mod tests {
             connected: true,
             loading: false,
             busy: false,
-            active_channel: "channel-a",
+            active_channel: room,
             active_dm_peer: "",
             active_dm: &crate::backend::DmPeer::default(),
             active_channel_name: "general",
@@ -5114,6 +5291,7 @@ pub(crate) mod tests {
             copy_head_seq: 0,
             copy_surface: "nowhere",
             sent_serial: 0,
+            live_agents: std::borrow::Cow::Borrowed(live),
         };
         Some(encode_chat_props(props))
     }
@@ -5483,6 +5661,251 @@ pub(crate) mod tests {
             seq,
             ..first_light()
         }
+    }
+
+    const CHIEF_RUN: &str = "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck";
+
+    /// One pending run of `agent`, anchored at seq 2 of `room`.
+    fn live_run(room: &str, agent: &str, status: &str) -> crate::backend::LiveAgentRow {
+        crate::backend::LiveAgentRow {
+            channel_id: room.into(),
+            anchor_seq: 2,
+            run_id: CHIEF_RUN.into(),
+            agent: agent.into(),
+            status: status.into(),
+            ..Default::default()
+        }
+    }
+
+    fn anchored_pair() -> [crate::backend::ChatMessage; 2] {
+        [first_light_at(1), first_light_at(2)]
+    }
+
+    /// A RUN IN FLIGHT, THROUGH THE REAL WIRE. The card draws under the message
+    /// that summoned it, and the NEXT reading of the same run repaints it: only
+    /// `live_agents` moves between the two frames, so this is the test that
+    /// fails if the timeline memo keys on the messages alone (`host::Timeline`)
+    /// — the card would sit on "Starting" for the whole run.
+    #[test]
+    fn a_run_in_flight_draws_under_its_anchor_and_repaints_as_it_works() {
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        let messages = anchored_pair();
+        let starting = live_run("channel-a", "Chief Duck", "Starting");
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&chat_facts_in(
+            "channel-a",
+            &messages,
+            &[],
+            std::slice::from_ref(&starting),
+        ));
+        let shown = texts(&guest);
+        for expected in ["Chief Duck", "AGENT", "Starting"] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected:?} (fault {:?}) in {shown:?}",
+                guest.fault
+            );
+        }
+
+        let working = crate::backend::LiveAgentRow {
+            status: "Reading the repo".into(),
+            activity: vec![
+                crate::backend::LiveActivity {
+                    label: "Command: cargo test".into(),
+                    done: true,
+                },
+                crate::backend::LiveActivity {
+                    label: "Reasoning".into(),
+                    done: false,
+                },
+            ],
+            answer_preview: "the files crate builds clean".into(),
+            ..starting
+        };
+        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &[working]));
+        let shown = texts(&guest);
+        for expected in [
+            "Reading the repo",
+            "Command: cargo test",
+            "Reasoning",
+            "the files crate builds clean",
+        ] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "the run's progress never reached the frame: missing {expected:?} in {shown:?}"
+            );
+        }
+        assert!(
+            !shown.iter().any(|text| text == "Starting"),
+            "the stale status is still drawn: {shown:?}"
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// STOP LEAVES AS A CANCEL, AND A SETTLED RUN TAKES ITS CARD WITH IT. The
+    /// row lives exactly as long as the run is pending in `runs`, so the block
+    /// that posts the reply is the block that prunes it — cancelled and
+    /// completed reconcile through that one path, and nothing of the run is
+    /// left on the frame beside the committed message.
+    #[test]
+    fn stopping_a_run_leaves_as_a_cancel_and_a_settled_run_drops_its_card() {
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        let messages = anchored_pair();
+        let live = live_run("channel-a", "Chief Duck", "Reading the repo");
+        let facts = chat_facts_in("channel-a", &messages, &[], std::slice::from_ref(&live));
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&facts);
+        assert!(
+            button_shown(&guest, "Stop"),
+            "no way to stop the run (fault {:?}): {:?}",
+            guest.fault,
+            texts(&guest)
+        );
+
+        guest.deliver(Output::Activate(button_message(&guest, "Stop")));
+        guest.redraw(&facts);
+        let fired = std::mem::take(&mut guest.intents);
+        let [intent] = fired.as_slice() else {
+            panic!("one intent, got {fired:?}");
+        };
+        assert_eq!(intent.kind, "cancel_run", "{intent:?}");
+        // the app's own half of the seam: the press becomes the intent the
+        // handler signs, carrying the run it names. Read through the DECODER,
+        // not compared to a JSON string: a run id's separator is an escape on
+        // the wire, so a literal comparison pins the encoder's escaping and
+        // calls it a seam.
+        assert!(matches!(chat_intent(intent), crate::ChatIntent::CancelRun));
+        assert_eq!(event_text(intent, "run_id"), CHIEF_RUN);
+
+        // THE RUN SETTLED: its pending entry pruned in the block that posted
+        // the reply, so the reading no longer carries it.
+        let mut reply = first_light_at(3);
+        reply.body = "the files crate builds clean".into();
+        reply.blocks = crate::backend::paragraph_blocks(&reply.body);
+        reply.author = "Chief Duck".into();
+        reply.avatar_kind = "agent".into();
+        let settled = [messages[0].clone(), messages[1].clone(), reply];
+        guest.redraw(&chat_facts_in("channel-a", &settled, &[], &[]));
+        let shown = texts(&guest);
+        assert!(
+            !button_shown(&guest, "Stop"),
+            "the settled run left its Stop behind: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Reading the repo"),
+            "the settled run left its status behind: {shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|text| text == "the files crate builds clean"),
+            "the committed reply did not take the card's place: {shown:?}"
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// ROOM ISOLATION, DECIDED BY THE HOST. The reading covers the whole node,
+    /// so the room on screen is the only thing that picks rows out of it — and
+    /// it is picked at encode time, which is why no handler that moves
+    /// `active_channel` has to remember this lane exists. Asserted on the
+    /// PRODUCTION PROPS as well as the frame: a row the encoder kept would
+    /// reach a guest that happened not to draw it today.
+    #[test]
+    fn the_room_on_screen_decides_which_of_the_nodes_runs_are_drawn() {
+        let messages = anchored_pair();
+        let reading = [
+            live_run("channel-a", "Chief Duck", "Reading the repo"),
+            live_run("channel-b", "Ops Duck", "Draining the queue"),
+        ];
+
+        let here = String::from_utf8(
+            chat_facts_in("channel-a", &messages, &[], &reading).expect("props encode"),
+        )
+        .unwrap();
+        assert!(here.contains("Chief Duck"), "this room's run is missing");
+        assert!(
+            !here.contains("Ops Duck"),
+            "another room's run crossed to the view: {here}"
+        );
+
+        let there = String::from_utf8(
+            chat_facts_in("channel-b", &messages, &[], &reading).expect("props encode"),
+        )
+        .unwrap();
+        assert!(there.contains("Ops Duck"), "that room's run is missing");
+        assert!(
+            !there.contains("Chief Duck"),
+            "the room she left kept its run on the frame: {there}"
+        );
+
+        let Some(staged) = staged("chat") else {
+            return;
+        };
+        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &reading));
+        let shown = texts(&guest);
+        assert!(
+            shown.iter().any(|text| text == "Reading the repo"),
+            "(fault {:?}) {shown:?}",
+            guest.fault
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Draining the queue"),
+            "{shown:?}"
+        );
+        // the same reading, the other room on screen
+        guest.redraw(&chat_facts_in("channel-b", &messages, &[], &reading));
+        let shown = texts(&guest);
+        assert!(
+            shown.iter().any(|text| text == "Draining the queue"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Reading the repo"),
+            "the room she left kept its card: {shown:?}"
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// A room full of runs cannot blank the messages they sit under: the cards
+    /// spend [`LIVE_AGENT_TEXT_BUDGET`] and the newest anchors are the ones
+    /// kept, because those are the ones at the tail she is looking at.
+    #[test]
+    fn the_live_cards_are_held_to_their_slice_of_the_frame_budget() {
+        let crowd: Vec<_> = (1..=60)
+            .map(|seq| crate::backend::LiveAgentRow {
+                channel_id: "channel-a".into(),
+                anchor_seq: seq,
+                run_id: format!("run-{seq}"),
+                agent: format!("agent-{seq}"),
+                status: "x".repeat(400),
+                ..Default::default()
+            })
+            .collect();
+        let kept = live_agents_within(&crowd, "channel-a", LIVE_AGENT_TEXT_BUDGET);
+        let spent: usize = kept.iter().map(live_text_bytes).sum();
+        assert!(
+            spent <= LIVE_AGENT_TEXT_BUDGET,
+            "{spent} bytes past the {LIVE_AGENT_TEXT_BUDGET} byte ceiling"
+        );
+        assert!(kept.len() < crowd.len(), "nothing was held back");
+        assert_eq!(
+            kept.last().map(|row| row.anchor_seq),
+            Some(60),
+            "the newest anchor is the one that must survive"
+        );
+        assert!(
+            kept.windows(2)
+                .all(|pair| pair[0].anchor_seq < pair[1].anchor_seq),
+            "the kept rows are handed back in anchor order"
+        );
     }
 
     /// The budget keeps the newest, drops the oldest, says so; the thread
@@ -5989,6 +6412,59 @@ pub(crate) mod tests {
         assert_eq!((locked.generation, locked.in_flight), (generation, false));
     }
 
+    /// Blocks keep landing on a deployment whose view cannot load: it is
+    /// tried again, then held off with a widening gap, instead of paying a
+    /// cranelift compile once a block for a candidate that never lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deployment_is_not_retried_by_every_block() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        // bytes that are not a component: every load of them fails alike
+        let bad = deployment(b"not a component", "a.svg");
+        let node = FakeDeployment::serving("forge", &bad);
+        let client = fake_node(node.clone()).await;
+        let mounted = fresh("forge");
+        join_all(connected(&client));
+        let locked = mounted.lock().unwrap();
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "{}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // the first block names the candidate the reconnect did not: it is
+        // tried once under its own hash, and every block after it is held
+        join_all(deployments_checked().await);
+        let generation = mounted.lock().unwrap().generation;
+        for _ in 0..5 {
+            join_all(deployments_checked().await);
+        }
+        let locked = mounted.lock().unwrap();
+        assert_eq!(
+            locked.generation, generation,
+            "a failed candidate was loaded again on every block"
+        );
+        assert!(
+            matches!(locked.slot, Slot::Failed(_)),
+            "the failure is still what the tab shows: {}",
+            slot_name(&locked.slot)
+        );
+        drop(locked);
+
+        // nothing is suppressed for good: once the gap is up the same
+        // candidate is tried again, so a load that failed on the transport
+        // still recovers on its own
+        tokio::time::sleep(RETRY_FIRST + Duration::from_millis(100)).await;
+        join_all(deployments_checked().await);
+        assert_eq!(
+            mounted.lock().unwrap().generation,
+            generation + 1,
+            "the hold-off never expired"
+        );
+        registry().lock().unwrap().remove("forge");
+    }
+
     /// A removal answered late — the code moved on to C while the
     /// verified "no view" for B was on its way — does not empty the slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6193,7 +6669,20 @@ pub(crate) mod tests {
             let locked = mounted.lock().unwrap();
             assert_eq!((locked.hash, locked.in_flight), (Some(a.hash()), false));
         }
-        // the next block's candidate, drawing its first tree, is seated
+        // a first frame that trapped is a property of those bytes, so the
+        // very next block does not pay for the same candidate again
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "B is held off, not retried at once"
+        );
+        // once its gap is up the candidate is tried again, and this time
+        // its first tree draws
+        let mut locked = mounted.lock().unwrap();
+        let retry = locked.retry.as_mut().expect("B left a hold-off");
+        retry.next = Instant::now();
+        drop(locked);
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }

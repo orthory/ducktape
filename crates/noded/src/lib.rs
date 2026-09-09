@@ -145,8 +145,8 @@ pub mod testkit;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -1255,14 +1255,45 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
     .await
 }
 
-async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
+/// what a ws upgrade may ask for before it has a socket.
+#[derive(serde::Deserialize)]
+struct WsParams {
+    /// one dispatch id, to be admitted as its creator
+    /// ([`stream::admit_run_reader`]). Absent on every other client, which is
+    /// why this surface stays open in `signed_req::required_authority`: the
+    /// proof is demanded by the ASK, not by the route.
+    run: Option<String>,
+}
+
+async fn ws(
+    State(handle): State<NodeHandle>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Query(params): Query<WsParams>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    // A RUN ASK IS PROVED BEFORE THE UPGRADE. An unadmitted caller gets an HTTP
+    // refusal and no socket — it never reaches a state where a subscribe could
+    // be tried, and it learns nothing about whether the run exists.
+    let reader_of = match params.run {
+        None => None,
+        Some(run) => {
+            let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
+            if let Err(refused) =
+                stream::admit_run_reader(&handle, &run, &headers, path_and_query).await
+            {
+                return refused;
+            }
+            Some(run)
+        }
+    };
     // unauthenticated surface: cap the frame/message tungstenite otherwise
     // defaults to 64 MiB, so a single frame cannot force a large buffer before
     // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
     upgrade
         .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| stream::stream_session(socket, handle))
+        .on_upgrade(move |socket| stream::stream_session(socket, handle, reader_of))
 }
 
 #[cfg(test)]
