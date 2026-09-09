@@ -78,6 +78,7 @@ fn native_runs() -> RunsModule {
     .with_files_module("files")
     .with_sink_forge("forge")
     .with_pages_module("pages")
+    .with_collaboration_module("collaboration")
     .with_chain_id(PARITY_CHAIN_ID)
 }
 

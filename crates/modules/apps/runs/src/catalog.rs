@@ -922,6 +922,25 @@ mod tests {
                 Some(json!({"agent_id": "reviewer"})),
                 json!({"instruction": "review", "skills": ["review"]}),
             ),
+            envelope(
+                ACTION_COLLABORATION_SEND,
+                Some(json!({"conversation_id": "c1", "participant_id": "alice"})),
+                json!({
+                    "credential": 2,
+                    "sequence": 1,
+                    "recipient_participant_id": "bob",
+                    "kind": "notice",
+                    "body": "hi",
+                    "expires_at": 900
+                }),
+            ),
+            // the acknowledgement names no participant: collaboration reads the
+            // reporter off the binding the origin holds.
+            envelope(
+                ACTION_COLLABORATION_ACKNOWLEDGE,
+                Some(json!({"conversation_id": "c1"})),
+                json!({"credential": 2, "seq": 4, "state": "queued"}),
+            ),
         ];
         let names: Vec<&str> = cases
             .iter()

@@ -75,6 +75,7 @@ const MODULES: &[ModuleSpec] = &[
     wasm("automations"),
     wasm("capability"),
     wasm_indexed("chat"),
+    wasm("collaboration"),
     wasm("dispatch"),
     wasm("files"),
     wasm("forge"),
@@ -91,7 +92,7 @@ const MODULES: &[ModuleSpec] = &[
     wasm("valset"),
 ];
 
-/// Default founding set (19). An operator may compose a different set with
+/// Default founding set (20). An operator may compose a different set with
 /// `node init --modules`; each network pins the resulting deployments.
 pub const PRODUCTION: &[&str] = &[
     "pages",
@@ -116,6 +117,10 @@ pub const PRODUCTION: &[&str] = &[
     "files",
     "agent",
     "runs",
+    // the agent-to-agent messaging plane runs' `collaboration.*` operations
+    // target. It follows `runs` because a run's prepared send is the only thing
+    // in this set that names it.
+    "collaboration",
 ];
 
 /// the DEFAULT set (15) simnode and the noded daemon compose at genesis —
@@ -180,7 +185,7 @@ mod tests {
     /// here. Counts AND membership, so neither a stray add nor a silent drop slips.
     #[test]
     fn selections_pin_to_todays_sets() {
-        assert_eq!(PRODUCTION.len(), 19, "production is the 19-module set");
+        assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
         assert_eq!(SIM_BASE.len(), 15, "sim_base is the default 15-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
 
@@ -193,6 +198,7 @@ mod tests {
                 "automations",
                 "capability",
                 "chat",
+                "collaboration",
                 "dispatch",
                 "files",
                 "forge",
