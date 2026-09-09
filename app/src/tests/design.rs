@@ -230,9 +230,16 @@ fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     assert!(!components.contains("component DocumentBlock"));
     // The one overlay the surface still raises is the page-delete confirm.
     assert!(view.contains("overlay when=page_delete_armed"));
-    // The document column opens directly on the one editor — the app's,
-    // painted by the host into the slot the view leaves.
-    assert!(view.contains("extern page_document() #document"));
+    // The screen leaves a slot, and the guest app owns the single editor,
+    // its transaction binding and its presentation. No native Pages Surface
+    // may take over that document again.
+    let guest = inlined(include_str!("../../../crates/views/pages/src/ui/app.ice"));
+    assert!(view.contains("slot document"));
+    assert_eq!(guest.matches("editor #document <-> document").count(), 1);
+    assert!(guest.contains("key-binding=keys(document_history, document_menu)"));
+    assert!(guest.contains("highlighter=paint(document_paint)"));
+    assert!(!view.contains("extern page_document"));
+    assert!(!guest.contains("extern page_document"));
 }
 
 #[test]
