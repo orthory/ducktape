@@ -30,16 +30,51 @@ pub struct MembersData {
 /// every read of the identity roster ([`read_accounts`]) rewrites it whole —
 /// on each chat load, before a row renders, and on every identity op the live
 /// stream delivers.
-static NAME_DIRECTORY: std::sync::RwLock<NameDirectory> =
-    std::sync::RwLock::new(NameDirectory::empty());
+static NAME_DIRECTORY: std::sync::RwLock<Names> = std::sync::RwLock::new(Names {
+    generation: 0,
+    directory: NameDirectory::empty(),
+});
+
+/// The directory with the generation of the read that seated it, so a
+/// holder of a snapshot can tell when the directory has moved on without
+/// cloning it again.
+struct Names {
+    generation: u64,
+    directory: NameDirectory,
+}
+
+fn read_names() -> std::sync::RwLockReadGuard<'static, Names> {
+    NAME_DIRECTORY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seats a freshly read directory as the one every surface reads.
+fn seat_names(directory: NameDirectory) {
+    let mut names = NAME_DIRECTORY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    names.generation += 1;
+    names.directory = directory;
+}
 
 /// The directory as last read — a snapshot the caller owns, so a loader can
 /// lend it across its awaits and the update thread can read it without one.
 pub(crate) fn names() -> NameDirectory {
-    NAME_DIRECTORY
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    read_names().directory.clone()
+}
+
+/// The generation the directory is at: it moves on every read that seats
+/// one, so a holder of [`names_at`]'s snapshot compares generations instead
+/// of directories.
+pub(crate) fn names_generation() -> u64 {
+    read_names().generation
+}
+
+/// The directory and the generation it is at, read together.
+pub(crate) fn names_at() -> (u64, NameDirectory) {
+    let names = read_names();
+    (names.generation, names.directory.clone())
 }
 
 /// Every identity account, paged the way the module serves them: numbered
@@ -73,9 +108,7 @@ pub(crate) async fn read_accounts(client: &RpcClient) -> Result<Vec<AccountView>
         }
         from = last + 1;
     }
-    *NAME_DIRECTORY
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory_of(&accounts);
+    seat_names(directory_of(&accounts));
     Ok(accounts)
 }
 
@@ -107,9 +140,7 @@ pub(crate) struct SeededNames {
 impl SeededNames {
     /// Replace the seated directory, the turn kept.
     pub(crate) fn seat(&self, directory: NameDirectory) {
-        *NAME_DIRECTORY
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+        seat_names(directory);
     }
 }
 
