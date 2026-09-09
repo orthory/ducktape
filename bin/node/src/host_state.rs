@@ -63,6 +63,13 @@ impl<'a> NetworkBindings<'a> {
         Bindings {
             invite: self.invite,
             chain_id: self.identity_chain_id,
+            // NOT a per-call binding, because it does not vary here: no lane
+            // this binary composes — validator, replica, sync-only — installs
+            // a `ConsensusTimePolicy`, so `consensus_time` IS the height on
+            // every one of them, which is what each reports as its
+            // `consensus_time_unit`. The sim lane, which arms
+            // `ConsensusTimePolicy::Epoch`, binds `Millis` in `bin/simnode`.
+            time_unit: sdk::genesis_config::TimeUnit::Height,
         }
     }
 }
@@ -474,6 +481,13 @@ pub(super) async fn restore_host(
     .await
     .map_err(|e| format!("restore compose: {e}"))?;
     wire(&mut host, context, &substrates, &net, index)?;
+    // the committed clock an authenticated read is answered against. This path
+    // applies no block, so without it a node reopened at height 40 000 answers
+    // reads with time 0 until its next commit — and an expiry check against 0
+    // reads as "nothing has expired", fail-open, in the restart window.
+    // `consensus_time` IS the height on this lane (recovery's own `BlockContext`
+    // builds it that way), which is why one number serves both.
+    host.restore_committed(height, height);
     Ok(host)
 }
 
@@ -858,6 +872,10 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         )));
     }
     wire(&mut host, context, &canonical_substrates, &net, index)?;
+    // same reason as the checkpoint reopen: a joiner that synced to this
+    // boundary applied no block, so its committed clock has to be set from the
+    // boundary it just proved rather than left at genesis.
+    host.restore_committed(manifest.height, manifest.height);
     Ok(host)
 }
 

@@ -107,6 +107,54 @@ pub(crate) fn query(
     Ok(serde_json::from_str(&body)?)
 }
 
+/// the authenticated read lane's path — the one spelling, shared by the client
+/// here and the signature it mints (the bytes bind the path, so a second
+/// spelling is a signature that verifies against nothing).
+pub(crate) const QUERY_READER_PATH: &str = "/v1/query/reader";
+
+/// Read committed module state over `POST /v1/query/reader` AS `signer`.
+///
+/// [`query`]'s authenticated sibling. The plain lane proves nothing about who
+/// is asking, so a module answering it sees `Origin::System` and must refuse
+/// protected content; this lane carries the signer's verified key to the module
+/// as its `Env::origin`, which is how a mailbox or a conversation page can be
+/// served at all.
+///
+/// `node_key` MUST come from [`pinned_node_key`], never [`node_public_key`]:
+/// the signature binds to it, so letting the dialled endpoint choose it is
+/// letting a proxy choose what the operator signed for (#1824).
+pub(crate) fn query_as_reader(
+    base: &str,
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    node_key: &[u8],
+    target: &str,
+    query: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    // serialized ONCE: the bytes that are signed are the bytes that are sent.
+    // Re-serializing for the wire would let map ordering or float formatting
+    // differ from what the digest covered, and the node would reject a request
+    // this operator did in fact authorize.
+    let body = serde_json::to_vec(&serde_json::json!({ "target": target, "query": query }))?;
+    let mut request = client()?
+        .post(format!("{base}{QUERY_READER_PATH}"))
+        .header("content-type", "application/json")
+        .body(body.clone());
+    for (name, value) in
+        noded::signed_req::request_headers(signer, "POST", QUERY_READER_PATH, node_key, &body)
+    {
+        request = request.header(name, value);
+    }
+    let resp = request
+        .send()
+        .map_err(|error| transport_failure(QUERY_READER_PATH, &error).to_string())?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{QUERY_READER_PATH} rejected ({status}): {text}").into());
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
 /// This node's own consensus key, read from a plain, unauthenticated
 /// `GET /v1/status`.
 ///

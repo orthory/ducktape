@@ -381,6 +381,18 @@ fn run_actor(mut host: Host, status_modules: Vec<String>, io: ActorIo) {
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());
                     let _ = reply.send(result);
                 }
+                NodeCommand::QueryAs {
+                    target,
+                    req,
+                    reader,
+                    reply,
+                } => {
+                    let result = host
+                        .query_as(&target, &req, sdk::Origin::External(reader))
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                }
             }
         }
     });

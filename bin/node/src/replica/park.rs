@@ -1171,6 +1171,22 @@ pub(super) async fn park(
                                 };
                                 let _ = reply.send(result);
                             }
+                            noded::NodeCommand::QueryAs {
+                                target,
+                                req,
+                                reader,
+                                reply,
+                            } => {
+                                let result = match &serving {
+                                    Some((_, node_r)) => node_r
+                                        .host()
+                                        .query_as(&target, &req, sdk::Origin::External(reader))
+                                        .await
+                                        .map_err(|e| e.to_string()),
+                                    None => Err(not_serving(resident_standing)),
+                                };
+                                let _ = reply.send(result);
+                            }
                         }
                     }
                     // a validator's answer for a frame we relayed: match it

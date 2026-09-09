@@ -1787,6 +1787,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "collaboration"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "attribution",
+ "commonware-runtime",
+ "ducktape-module-sdk",
+ "futures",
+ "host",
+ "identity",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "sha2 0.10.9",
+ "statesync",
+ "tasks",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6630,6 +6649,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "chat",
  "clap",
+ "collaboration",
  "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
