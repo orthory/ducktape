@@ -3,9 +3,9 @@
 //!
 //! Both are the module's only inputs for a protected read. `collaboration`
 //! refuses `Origin::System` outright (the unauthenticated `/v1/query` lane
-//! lands there) and decides delivery eligibility against `consensus_time`, so a
-//! wrong value in either is not a cosmetic defect — it is a disclosure or an
-//! expired message that still looks deliverable.
+//! lands there). Deadline-sensitive readers also need the committed
+//! `consensus_time`: a wrong clock makes a past deadline look future. This
+//! harness probes that context; it does not implement collaboration eligibility.
 //!
 //! The clock is the subtler half. It advances ONLY at a committed block, and it
 //! has to survive the two ways a host reaches a boundary without applying one:
@@ -195,4 +195,51 @@ fn a_failed_commit_does_not_advance_the_clock() {
         (3, 300),
         "the clock must still name the last block that COMMITTED"
     );
+}
+
+/// Reopening uses bytes written at the previous host's committed boundary,
+/// not constants supplied only to the new instance. This exercises the host
+/// clock and authenticated query context; it does not boot `node::restore_host`
+/// or claim a collaboration delivery-eligibility API exists.
+#[test]
+fn a_fresh_host_reads_at_the_persisted_committed_boundary() {
+    use std::io::Write as _;
+
+    for (height, consensus_time, deadline) in [
+        (40_000, 40_000, 39_999),
+        (7, 1_700_000_000_000, 1_699_999_999_999),
+    ] {
+        let directory = tempfile::tempdir().expect("isolated checkpoint directory");
+        let checkpoint = directory.path().join("committed-clock.json");
+        let reader = Origin::External(vec![0xab; 32]);
+        let mut previous = host_with(vec![Box::new(EnvProbe)]);
+        block_on(previous.submit_block(block(height, consensus_time), Vec::new()))
+            .expect("the boundary commits");
+        let (_, committed_height, committed_time) = read(&previous, reader.clone());
+        let encoded = serde_json::to_vec(&(committed_height, committed_time)).unwrap();
+        let mut file = std::fs::File::create(&checkpoint).unwrap();
+        file.write_all(&encoded).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(previous);
+
+        let persisted: (u64, u64) =
+            serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+        let mut reopened = host_with(vec![Box::new(EnvProbe)]);
+        assert_eq!(probe(&reopened), ("system".into(), 0, 0));
+        reopened.restore_committed(persisted.0, persisted.1);
+        // No new block is applied: this is the first authenticated read after
+        // restoration, exactly when a missing restore otherwise exposes zero.
+        let (who, restored_height, restored_time) = read(&reopened, reader);
+        assert_eq!(who, format!("external:{}", hex(&[0xab; 32])));
+        assert!(
+            restored_time >= deadline,
+            "a past deadline must not look future after reopening the committed clock"
+        );
+        assert_eq!(
+            (restored_height, restored_time),
+            (height, consensus_time),
+            "the first read must use the persisted boundary without another block"
+        );
+    }
 }
