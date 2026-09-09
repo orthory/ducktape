@@ -4402,7 +4402,9 @@ pub(crate) mod tests {
         let editor_text = |guest: &Guest| {
             let mut text = None;
             guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { text: value, .. } = node { text = Some(value.clone()); }
+                if let wire::Node::Editor { text: value, .. } = node {
+                    text = Some(value.clone());
+                }
             });
             text
         };
@@ -4456,7 +4458,10 @@ pub(crate) mod tests {
             facts["save_reply"]["replies"][0]["namespace"] = save["namespace"].clone();
             facts["loading"] = false.into();
             guest.redraw(&props(&facts));
-            assert!(editor_text(&guest).is_none(), "its own confirmation closes the editor");
+            assert!(
+                editor_text(&guest).is_none(),
+                "its own confirmation closes the editor"
+            );
             assert!(guest.fault.is_none());
         }
     }
