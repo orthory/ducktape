@@ -19,11 +19,12 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![Tool {
         name: "ducktape_action",
         description: "Propose one write as this run's program account. operation names an entry \
-                      of the catalog ducktape_actions lists (reply, chat.post_message, \
-                      tasks.create, tasks.update_status, pages.comment, pages.set_checked, \
-                      jobs.comment, duckfs.write_text, agent.call); target and input follow that \
-                      entry's schemas — reply takes no target and answers where this run was \
-                      called. request_id is your idempotency key within this run: the same id \
+                      of the catalog ducktape_actions lists (reply, react, unreact, \
+                      chat.post_message, tasks.create, tasks.update_status, pages.comment, \
+                      pages.set_checked, pages.post, jobs.comment, duckfs.write_text, \
+                      agent.call); target and input follow that entry's schemas — reply, react \
+                      and unreact take no target and act on the message this run was called \
+                      from. request_id is your idempotency key within this run: the same id \
                       with the same bytes returns the same receipt, the same id with different \
                       bytes is refused. Ducktape validates the grant and caps on every \
                       validator and returns the committed receipt; a refusal names what you \

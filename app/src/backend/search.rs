@@ -190,10 +190,10 @@ pub async fn search_workspace(rpc: String, text: String) -> ExplorerResults {
                     kind: "run".into(),
                     code: "ag".into(),
                     title: format!("{} · {}", run.run_id, run.agent_id),
-                    snippet: run.outcome,
-                    // `created_at` is the creation BLOCK, so it prints as a
-                    // height — this search has no tip to count back from.
-                    meta: format!("agent · {}", height_label_short(run.created_at)),
+                    snippet: format!("{} · {}", run.state, run.origin),
+                    // the dispatch BLOCK, already rendered as a height — this
+                    // search has no tip to count back from.
+                    meta: format!("agent · {}", run.dispatched),
                     target: run.run_id,
                 }),
         ),

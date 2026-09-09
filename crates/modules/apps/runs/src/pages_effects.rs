@@ -6,10 +6,13 @@
 use crate::CapRequest;
 
 use super::action_requests::Prepared;
-use super::catalog::{Operation, PageAnchor};
+use super::catalog::{ContentPart, Operation, PageAnchor};
 use super::response::{ReplyPosts, allows};
 use super::{Ctx, Lane, ModelRecord, Msg, PendingState, ReplyDestination, RunsModule};
-use pages::{PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg, encode_query as pages_encode_query};
+use pages::{
+    BlockKind, NewBlock, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
+    encode_query as pages_encode_query,
+};
 
 /// deterministic ids for an agent comment: derived from the run id and the
 /// action's [`Lane`] slot — its index in the validated response on the settle
@@ -27,6 +30,37 @@ pub(super) fn page_thread_id(run_id: &str, slot: &str) -> String {
 }
 pub(super) fn page_comment_id(run_id: &str, slot: &str) -> String {
     format!("agent/{}/comment/{slot}", crate::dispatch_id_for(run_id))
+}
+/// the page a `pages.post` operation mints, one per run and lane slot: a
+/// replay mints the identical id, and pages treats a re-create of an existing
+/// id as a no-op, so a retried slot never doubles the page.
+pub(super) fn page_post_id(run_id: &str, slot: &str) -> String {
+    format!("agent/{}/page/{slot}", crate::dispatch_id_for(run_id))
+}
+
+/// the body a page post carries: one block per content part, text as a
+/// paragraph and code as a code block, each id minted under the page in
+/// document order. blank parts are dropped, as a reply drops blank blocks.
+fn page_body(page_id: &str, content: &[ContentPart]) -> Vec<NewBlock> {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => {
+                let text = text.trim();
+                (!text.is_empty()).then(|| (BlockKind::Paragraph, text.to_string()))
+            }
+            ContentPart::Code { text, .. } => {
+                (!text.trim().is_empty()).then(|| (BlockKind::Code, text.clone()))
+            }
+        })
+        .enumerate()
+        .map(|(index, (kind, text))| NewBlock {
+            id: format!("{page_id}/b{index}"),
+            kind,
+            text,
+            marks: Vec::new(),
+        })
+        .collect()
 }
 
 /// the explicit destination a `pages.comment` operation names.
@@ -148,8 +182,79 @@ impl RunsModule {
                     serde_json::json!({"block_id": block_id, "checked": checked}),
                 ))
             }
+            Operation::PagesPost { title, content } => {
+                let name = operation.name();
+                if !allows(agent, name) {
+                    return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
+                }
+                let pages = self
+                    .pages
+                    .as_deref()
+                    .ok_or("no pages module is configured")?;
+                let page_id = page_post_id(run_id, slot);
+                self.check_pages_write(agent, &page_id)?;
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err(format!("{name} requires a non-empty title"));
+                }
+                if title.len() > pages::MAX_PAGE_TITLE_LEN {
+                    return Err(format!(
+                        "page title is {} bytes; pages' cap is {}",
+                        title.len(),
+                        pages::MAX_PAGE_TITLE_LEN
+                    ));
+                }
+                let blocks = page_body(&page_id, content);
+                // pages refuses a block record over its size cap and a page
+                // past its page cap; both probed here so the emitted op
+                // cannot abort the delivery block.
+                if let Some(block) = blocks.iter().find(|b| b.text.len() > pages::MAX_BLOCK_LEN) {
+                    return Err(format!(
+                        "page block {} is {} bytes; pages' cap is {}",
+                        block.id,
+                        block.text.len(),
+                        pages::MAX_BLOCK_LEN
+                    ));
+                }
+                self.reserve_page_slot(ctx, pages, posts).await?;
+                Ok(Prepared::new(
+                    Msg {
+                        target: pages.to_string(),
+                        payload: pages_encode_msg(&PageMsg::CreatePage {
+                            page_id: page_id.clone(),
+                            title: title.to_string(),
+                            blocks,
+                        }),
+                    },
+                    name,
+                    serde_json::json!({"page_id": page_id, "title": title}),
+                ))
+            }
             _ => unreachable!("only pages operations reach this lane"),
         }
+    }
+
+    /// count one more page against pages' cap: the committed page count plus
+    /// every create this same block has already staged.
+    async fn reserve_page_slot(
+        &self,
+        ctx: &dyn Ctx,
+        pages: &str,
+        posts: &mut ReplyPosts,
+    ) -> Result<(), String> {
+        let reply = ctx
+            .query(pages, &pages_encode_query(&PageQuery::PageCount))
+            .await
+            .map_err(|e| format!("pages page count failed: {e}"))?;
+        let Ok(PageReply::PageCount(count)) = pages::decode_reply(&reply) else {
+            return Err("unexpected pages reply for a page count".into());
+        };
+        let full = count as usize + posts.pages_created >= pages::MAX_PAGES;
+        if full {
+            return Err("pages is full".into());
+        }
+        posts.pages_created += 1;
+        Ok(())
     }
 
     /// the D3 cap gate: pages_write is page-id scoped with `"*"` allowed.

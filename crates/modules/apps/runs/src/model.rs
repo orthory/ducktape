@@ -138,6 +138,11 @@ pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
 pub const ACTION_JOBS_COMMENT: &str = "jobs.comment";
 /// Permission to flip a todo block's checked state (the `pages.set_checked` operation).
 pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
+/// Permission to publish a new top-level page with its body (the
+/// `pages.post` operation). A fresh page has an id no owner could have
+/// listed, so the cap side of the gate is the [`EVERY`] entry in
+/// `pages_write`.
+pub const ACTION_PAGES_POST: &str = "pages.post";
 /// permission to write a small UTF-8 text file under a granted duckfs prefix
 /// (the `duckfs.write_text` operation).
 pub const ACTION_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
@@ -167,7 +172,7 @@ pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 /// always means something.
 ///
 /// Each action requires an explicit grant in the model configuration.
-pub const KNOWN_ACTIONS: [&str; 11] = [
+pub const KNOWN_ACTIONS: [&str; 12] = [
     ACTION_CHAT_POST,
     ACTION_JOBS_COMMENT,
     ACTION_CHAT_POST_MESSAGE,
@@ -175,6 +180,7 @@ pub const KNOWN_ACTIONS: [&str; 11] = [
     ACTION_TASKS_UPDATE_STATUS,
     ACTION_PAGES_COMMENT,
     ACTION_PAGES_SET_CHECKED,
+    ACTION_PAGES_POST,
     ACTION_DUCKFS_WRITE_TEXT,
     ACTION_MODULES_UPDATE,
     ACTION_COLLABORATION_SEND,
@@ -182,6 +188,11 @@ pub const KNOWN_ACTIONS: [&str; 11] = [
 ];
 
 // ---- runtime identity ---------------------------------------------------------
+
+/// The literal entry in an opaque-id cap list (forge repos, page ids) that
+/// grants every id: an owner names "all" without enumerating a set that
+/// grows after the grant was written.
+pub const EVERY: &str = "*";
 
 /// The resource-capability grant a model carries. Every list is a
 /// canonical SORTED + DEDUPED set (the write path canonicalizes, the committed
@@ -194,10 +205,12 @@ pub const KNOWN_ACTIONS: [&str; 11] = [
 )]
 #[serde(deny_unknown_fields)]
 pub struct ResourceCaps {
-    /// forge repos this agent may READ.
+    /// forge repos this agent may READ. repo names are opaque, so matching is
+    /// exact, with the one literal entry [`EVERY`] granting every repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forge_read: Vec<String>,
-    /// forge repos this agent may PUSH to (implies read).
+    /// forge repos this agent may PUSH to (implies read); [`EVERY`] grants
+    /// every repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forge_push: Vec<String>,
     /// duckfs workspace-relative path prefixes this agent may READ (ro).
@@ -215,7 +228,7 @@ pub struct ResourceCaps {
     pub secrets: Vec<String>,
     /// page ids this agent may WRITE (comment on / check off). page ids are
     /// opaque, so matching is exact — no prefix containment — with the one
-    /// literal entry `"*"` granting every page.
+    /// literal entry [`EVERY`] granting every page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages_write: Vec<String>,
     /// concurrent peer-call ceiling; 0 = none. completed calls release their
@@ -369,7 +382,9 @@ pub struct ModelRecord {
     pub display_name: String,
     /// the capability registry tag this agent's runs are dispatched on.
     pub capability: String,
-    /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
+    /// granted action names, sorted and deduped: each from [`KNOWN_ACTIONS`],
+    /// or the single [`EVERY`] entry naming all of them — the ones the
+    /// vocabulary gains after the grant was written included.
     pub allowed_actions: Vec<String>,
     pub status: ModelStatus,
     #[serde(default, skip_serializing_if = "role_is_default")]
@@ -395,30 +410,41 @@ fn role_is_default(role: &ModelRole) -> bool {
 }
 
 impl ModelRecord {
+    /// whether this agent holds `action`: by name, or through the [`EVERY`]
+    /// grant. THE grant predicate, shared by every lane that admits an
+    /// operation.
+    pub fn allows(&self, action: &str) -> bool {
+        self.allowed_actions
+            .iter()
+            .any(|granted| granted == action || granted == EVERY)
+    }
+
     /// The capability gate for preparing actions and opening sinks. Empty caps
-    /// deny every request; peer calls require a positive budget. Forge/tool/
-    /// secret use exact membership; duckfs uses path-PREFIX containment (a
-    /// prefix grants itself and any child path, but never a sibling that merely
-    /// shares a textual prefix — `src` does not grant `srcx`); pages use exact
-    /// membership with the literal `"*"` entry granting every page (ids are
-    /// opaque — never a prefix). budget
+    /// deny every request; peer calls require a positive budget. Tool and
+    /// secret use exact membership; forge repos and pages use exact
+    /// membership with the literal [`EVERY`] entry granting every one (ids
+    /// are opaque — never a prefix); duckfs uses path-PREFIX containment (a
+    /// prefix grants itself and any child path, but never a sibling that
+    /// merely shares a textual prefix — `src` does not grant `srcx`). budget
     /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     pub fn permits(&self, req: &CapRequest) -> bool {
         let c = &self.caps;
         let has = |v: &[String], x: &str| v.iter().any(|s| s == x);
+        // an opaque-id list: the exact entry, or the literal `*` naming all.
+        let names = |v: &[String], x: &str| has(v, EVERY) || has(v, x);
         let under = |v: &[String], p: &str| {
             v.iter().any(|pre| {
                 p == pre || pre == "/" && p.starts_with('/') || p.starts_with(&format!("{pre}/"))
             })
         };
         match req {
-            CapRequest::ForgeRead(r) => has(&c.forge_read, r) || has(&c.forge_push, r),
-            CapRequest::ForgePush(r) => has(&c.forge_push, r),
+            CapRequest::ForgeRead(r) => names(&c.forge_read, r) || names(&c.forge_push, r),
+            CapRequest::ForgePush(r) => names(&c.forge_push, r),
             CapRequest::DuckfsWrite(p) => under(&c.duckfs_write, p),
             CapRequest::DuckfsRead(p) => under(&c.duckfs_read, p) || under(&c.duckfs_write, p),
             CapRequest::Tool(t) => has(&c.tools, t),
             CapRequest::Secret(s) => has(&c.secrets, s),
-            CapRequest::PagesWrite(p) => has(&c.pages_write, "*") || has(&c.pages_write, p),
+            CapRequest::PagesWrite(p) => names(&c.pages_write, p),
             CapRequest::SpawnSubagent => c.subagent_budget > 0,
         }
     }
@@ -447,9 +473,7 @@ impl ModelRecord {
     /// the caller check prevents a call from widening that access.
     pub fn scoped_for_call(&self, callee: &ModelRecord) -> ModelRecord {
         let mut scoped = callee.clone();
-        scoped
-            .allowed_actions
-            .retain(|action| self.allowed_actions.binary_search(action).is_ok());
+        scoped.allowed_actions = every_or_exact(&self.allowed_actions, &callee.allowed_actions);
         scoped.caps = self.caps.intersection(&callee.caps);
         let caller = self;
         scoped
@@ -457,6 +481,24 @@ impl ModelRecord {
             .retain(|skill| caller.permits(&CapRequest::DuckfsRead(&skill.source_prefix)));
         scoped
     }
+}
+
+/// the intersection of two sorted opaque-name grants, where the [`EVERY`]
+/// entry on either side stands for the whole of the other side's list. an
+/// action list and the forge and pages cap lists all narrow this way.
+pub(crate) fn every_or_exact(left: &[String], right: &[String]) -> Vec<String> {
+    let left_names_all = left.iter().any(|name| name == EVERY);
+    let right_names_all = right.iter().any(|name| name == EVERY);
+    if left_names_all {
+        return right.to_vec();
+    }
+    if right_names_all {
+        return left.to_vec();
+    }
+    left.iter()
+        .filter(|value| right.binary_search(value).is_ok())
+        .cloned()
+        .collect()
 }
 
 impl ResourceCaps {
@@ -509,21 +551,14 @@ impl ResourceCaps {
             values
         }
 
-        let pages_write = if self.pages_write.iter().any(|page| page == "*") {
-            other.pages_write.clone()
-        } else if other.pages_write.iter().any(|page| page == "*") {
-            self.pages_write.clone()
-        } else {
-            exact(&self.pages_write, &other.pages_write)
-        };
         Self {
-            forge_read: exact(&forge_readable(self), &forge_readable(other)),
-            forge_push: exact(&self.forge_push, &other.forge_push),
+            forge_read: every_or_exact(&forge_readable(self), &forge_readable(other)),
+            forge_push: every_or_exact(&self.forge_push, &other.forge_push),
             duckfs_read: prefixes(&readable(self), &readable(other)),
             duckfs_write: prefixes(&self.duckfs_write, &other.duckfs_write),
             tools: exact(&self.tools, &other.tools),
             secrets: exact(&self.secrets, &other.secrets),
-            pages_write,
+            pages_write: every_or_exact(&self.pages_write, &other.pages_write),
             subagent_budget: self.subagent_budget.min(other.subagent_budget),
         }
     }

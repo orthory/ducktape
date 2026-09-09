@@ -481,6 +481,13 @@ pub(super) async fn restore_host(
     .await
     .map_err(|e| format!("restore compose: {e}"))?;
     wire(&mut host, context, &substrates, &net, index)?;
+    // the committed clock an authenticated read is answered against. This path
+    // applies no block, so without it a node reopened at height 40 000 answers
+    // reads with time 0 until its next commit — and an expiry check against 0
+    // reads as "nothing has expired", fail-open, in the restart window.
+    // `consensus_time` IS the height on this lane (recovery's own `BlockContext`
+    // builds it that way), which is why one number serves both.
+    host.restore_committed(height, height);
     Ok(host)
 }
 
@@ -865,6 +872,10 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         )));
     }
     wire(&mut host, context, &canonical_substrates, &net, index)?;
+    // same reason as the checkpoint reopen: a joiner that synced to this
+    // boundary applied no block, so its committed clock has to be set from the
+    // boundary it just proved rather than left at genesis.
+    host.restore_committed(manifest.height, manifest.height);
     Ok(host)
 }
 
@@ -880,7 +891,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "82b32ae80d025ba247d13b7cd30b51b2ba5ad2712ba7254c422710f2bd2a726a";
+        "f4c3dbcc1c58f5653b8deab0d42cb21fef1a67ad89d75da15dd9ed0c4f70106e";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`

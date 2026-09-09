@@ -1,4 +1,10 @@
 /target
+# a worktree's own cargo target dirs, when one is used instead of the shared
+# one (the views workspace is a separate workspace, and its wasm bundler is a
+# third target). Rooted, so nothing named `target-*` deeper in the tree is
+# swept by accident.
+/target-views
+/target-views-wasm
 # labs is a standalone workspace (excluded from the root), so its build output
 # lands outside the root-anchored /target above.
 /crates/labs/target

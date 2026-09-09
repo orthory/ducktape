@@ -79,6 +79,7 @@ fn staged_writes_are_visible_within_one_block() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -143,6 +144,7 @@ fn oversized_block_is_rejected_before_staging() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -184,6 +186,7 @@ fn oversized_page_title_is_rejected_on_every_write_path() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: over_cap.clone(),
+                blocks: Vec::new(),
             },
             "page title too large",
         )
@@ -194,6 +197,7 @@ fn oversized_page_title_is_rejected_on_every_write_path() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: at_cap.clone(),
+                blocks: Vec::new(),
             },
         )
         .await;
@@ -255,6 +259,7 @@ fn corrupt_stored_block_errors_as_corruption_not_absence() {
             &PageMsg::CreatePage {
                 page_id: "blk1".into(),
                 title: "steal".into(),
+                blocks: Vec::new(),
             },
             "corrupt",
         )

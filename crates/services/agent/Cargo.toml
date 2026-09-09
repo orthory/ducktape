@@ -15,12 +15,30 @@ provider-host = { workspace = true }
 # on the ws `term:<id>` topic and the mesh chunk event.
 base64 = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+# the collaboration plane's wire: the outbox journal is one json object per
+# line, and both provider input interfaces speak json (a uds inbox frame, an
+# app-server JSON-RPC request).
+serde_json = { workspace = true }
+# `messaging::claude` derives a session's inbox key file name from the sha256
+# of its socket path — the name the session itself publishes it under.
+sha2 = { workspace = true }
+# "net" is the unix socket both halves of the Claude inbox need (writing to a
+# session's, listening on our own receipt address); "process" runs `codex
+# queue` and the app-server child; "fs" is the outbox journal's append+fsync.
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 # the stub Provider the session-lifetime tests drive, so a pty session's
 # workdir lifetime is exercisable without booting a VM.
 async-trait = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["process", "rt", "macros", "time", "test-util"] }

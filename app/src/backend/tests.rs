@@ -109,11 +109,10 @@ const SEARCH_LANES: &[(&str, &str, &str)] = &[
         r#"{"tasks":{"tasks":[{"title":"needle task","task_id":"task-1","created_by":"user:aa","updated_height":2}]}}"#,
     ),
     (
-        "pending_runs",
+        "/v1/index/runs/view",
         "runs",
-        r#"{"pending_runs":[{"run_id":"needle-run","agent_id":"agent-1","created_at":1,"channel_id":"c1"}]}"#,
+        r#"{"runs":[{"run_id":"needle-run","dispatch_id":"d1","agent_id":"agent-1","channel_id":"c1","anchor_seq":1,"job_id":null,"delegation_id":null,"requester":"System","dispatched":{"height":1,"time":1},"state":"dispatched","actions":0,"pr_number":null}]}"#,
     ),
-    ("recent_runs", "runs", r#"{"recent_runs":[]}"#),
 ];
 
 /// The lane one raw HTTP request belongs to. `None` = a request this stub does
@@ -128,7 +127,7 @@ fn search_lane_of(request: &str) -> Option<&'static (&'static str, &'static str,
 /// tagged with the leg it belongs to, as seen by the stub node below.
 ///
 /// Requests, not legs — a set of leg names cannot see a leg serializing its own
-/// round trips (tasks reads three status pages, runs reads two queries), and
+/// round trips (tasks reads three status pages), and
 /// "the six legs overlapped" stays true while the work inside them is a chain.
 /// Counting arrivals makes the multiplicity part of the answer.
 #[derive(Default)]

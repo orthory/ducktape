@@ -4085,6 +4085,16 @@ mod tests {
                         let _ = seen_tx.send(format!("resize:{cols}x{rows}")).await;
                     }
                     wire::Command::TermClose { .. } => {}
+                    // this fake daemon serves the PTY plane. The collaboration
+                    // commands ride the same link and are the pump's, which
+                    // these tests do not stand up — named rather than
+                    // wildcarded so a new pty command still fails the build.
+                    wire::Command::MsgBind(_)
+                    | wire::Command::MsgUnbind { .. }
+                    | wire::Command::MsgDeliver(_)
+                    | wire::Command::MsgTime { .. }
+                    | wire::Command::MsgRetain { .. }
+                    | wire::Command::MsgReplay { .. } => {}
                 }
             }
         });

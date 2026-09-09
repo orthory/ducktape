@@ -598,6 +598,7 @@ fn assert_bounded_allocation_span(label: &str, samples: &[(i64, u64)], headroom:
 
 #[test]
 fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     // The generated view wants a deep stack — the same 4 MiB
     // `full_view_fits_a_four_mib_stack` pins — and its own thread keeps the
     // per-thread counter clear of the rest of the suite.
@@ -611,6 +612,7 @@ fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
 
 #[test]
 fn chat_keystroke_cost_does_not_grow_with_retained_history() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_chat_keystroke_slope)
@@ -654,6 +656,7 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
 
 #[test]
 fn a_loading_flip_leaves_the_timeline_memo_alone() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_loading_flip)
@@ -746,6 +749,7 @@ fn flip_loading_under(label: &'static str, mut app: Ducktape, console: iced::win
 
 #[test]
 fn remote_post_bursts_publish_reduce_and_rebuild_once_per_bounded_batch() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_remote_post_bursts)
@@ -947,6 +951,7 @@ fn remote_post_burst_allocations(history_rows: i64, burst_rows: usize) -> u64 {
 
 #[test]
 fn large_screens_stay_under_their_allocation_ceilings() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_large_screens)
@@ -1303,6 +1308,7 @@ const CHANNEL_SWITCH_FRAME_ALLOCATION_CEILING: u64 = 12_000;
 
 #[test]
 fn a_channel_switch_stays_under_its_allocation_ceiling() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_channel_switch)
@@ -1313,6 +1319,7 @@ fn a_channel_switch_stays_under_its_allocation_ceiling() {
 
 #[test]
 fn channel_switch_loading_frame_is_low_and_does_not_grow_with_loaded_history() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(probe_channel_switch_slope)

@@ -9,9 +9,9 @@
 //! rather than a boundary.
 //!
 //! So the tunnel terminates HERE instead: a loopback proxy bound to ONE run,
-//! holding that run's agent id, in front of the node's listener. It is the
+//! holding that run's agent and run ids, in front of the node's listener. It is the
 //! run's whole node surface, so it is deliberately a thin pass-through with
-//! three exceptions:
+//! these exceptions:
 //!
 //! * a duckfs read is admitted only if the run's committed record permits
 //!   `CapRequest::DuckfsRead` for the path it names — the SAME predicate, on
@@ -23,6 +23,15 @@
 //!   cap-check it, so it is not the lane's to pass.
 //! * `/v1/ws` is refused. It takes no credential of any kind and carries the
 //!   `logs` topic — this operator's log ring — to whoever opens it.
+//! * a git transport request under `/forge/{repo}/…` is admitted under the
+//!   run's committed forge cap for that repo: a fetch (`git-upload-pack`)
+//!   under `CapRequest::ForgeRead`, a push (`git-receive-pack`) under
+//!   `CapRequest::ForgePush`. An admitted push is forwarded carrying this
+//!   node's operator credential — the proof forge's receive-pack asks for,
+//!   which the guest never holds — so a stock `git push` from inside the run
+//!   lands under exactly the grant the owner wrote. A guest-supplied copy of
+//!   that header is dropped on every route: the lane is the only thing that
+//!   may speak with the operator's authority.
 //! * everything else passes through byte-for-byte. The reads the plane exists
 //!   for (`/v1/query`, `/v1/status`, `/v1/peers`, `/v1/blocks`, `/v1/index/*`,
 //!   `/metrics`), the self-authenticating `/v1/submit/frame`, the volatile
@@ -32,7 +41,9 @@
 //! The record is fetched per gated request, off the node's own `/v1/query`,
 //! rather than snapshotted at boot: caps are committed state, and a run whose
 //! grant is narrowed mid-flight must feel it on the next call. It is one
-//! loopback query and only a duckfs read pays it.
+//! pair of loopback queries for gated duckfs and forge requests. The live
+//! standing record is intersected with the committed run authority, so a
+//! delegated run never inherits the callee's broader standing grant.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -40,10 +51,12 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 use runs::{CapRequest, ModelRecord};
+
+use crate::OperatorCredential;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -73,7 +86,15 @@ enum PathSource {
     Prefix,
 }
 
-/// what the lane does with one request, decided from its path alone.
+/// the two halves of git's smart-HTTP transport, each named by the service a
+/// request speaks: a fetch reads the repo, a push writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitService {
+    UploadPack,
+    ReceivePack,
+}
+
+/// what the lane does with one request, decided from its path and query alone.
 enum Route {
     /// forward verbatim.
     Pass,
@@ -85,6 +106,9 @@ enum Route {
         source: PathSource,
         rows: Option<&'static str>,
     },
+    /// a git transport request on the named forge repo, admitted under the
+    /// forge cap its service needs.
+    Forge { repo: String, service: GitService },
 }
 
 /// the two query params the capped routes name a path in. A struct rather than
@@ -105,6 +129,12 @@ struct Lane {
     /// the run's agent id, or `None` for a run provisioned without one, whose
     /// every duckfs read is refused (there is no record to cap it by).
     agent_id: Option<String>,
+    /// Captured from the host-provisioned environment before the guest boots.
+    /// Missing identity refuses gated requests; it never implies a general grant.
+    run_id: Option<String>,
+    /// this node's operator credential, lent to an admitted push; `None`
+    /// refuses every push (there is no proof to lend).
+    credential: Option<OperatorCredential>,
     client: reqwest::Client,
     /// reasons already logged for this run: a refusal is a per-request event
     /// and an agent in a retry loop would otherwise evict the log ring.
@@ -120,7 +150,12 @@ impl ReadLane {
     pub(crate) async fn start(
         envs: &mut [(String, String)],
         agent_id: Option<String>,
+        credential: Option<OperatorCredential>,
     ) -> Result<Option<Self>, String> {
+        let run_id = envs
+            .iter()
+            .find(|(key, _)| key == "DUCKTAPE_RUN_ID")
+            .map(|(_, value)| value.clone());
         let Some(node) = envs.iter_mut().find(|(key, _)| key == crate::NODE_URL_ENV) else {
             return Ok(None);
         };
@@ -134,6 +169,8 @@ impl ReadLane {
         let lane = Arc::new(Lane {
             upstream: node.1.trim_end_matches('/').to_string(),
             agent_id,
+            run_id,
+            credential,
             client: reqwest::Client::builder()
                 // a loopback daemon is never behind a corporate proxy.
                 .no_proxy()
@@ -161,14 +198,15 @@ impl ReadLane {
 /// ONE dispatch: the request's path decides its route, and each arm is one
 /// delegation. Nothing before it, nothing after it.
 async fn handle(State(lane): State<Arc<Lane>>, req: Request) -> Response {
-    match classify(req.uri().path()) {
+    match classify(req.uri().path(), req.uri().query().unwrap_or_default()) {
         Route::Pass => lane.forward(req).await,
         Route::Refuse(reason) => lane.refuse(reason),
         Route::Capped { source, rows } => lane.capped(req, source, rows).await,
+        Route::Forge { repo, service } => lane.forge(req, &repo, service).await,
     }
 }
 
-/// the lane's whole policy, as a function of the request path.
+/// the lane's whole policy, as a function of the request path and query.
 ///
 /// Deny-by-default INSIDE the duckfs read family and pass-through outside it:
 /// a `/v1/files/*` GET route that names no path (`history` is commit metadata,
@@ -178,7 +216,10 @@ async fn handle(State(lane): State<Arc<Lane>>, req: Request) -> Response {
 /// `watch`, the object facade's PUT/DELETE) pass: their authority is the
 /// per-request signature the files module checks, which a guest can only
 /// present for a key that is authorized on-chain.
-fn classify(path: &str) -> Route {
+fn classify(path: &str, query: &str) -> Route {
+    if let Some(rest) = path.strip_prefix("/forge/") {
+        return classify_forge(rest, query);
+    }
     let files_read_with_no_path = matches!(
         path,
         "/v1/files/history" | "/v1/files/refs" | "/v1/files/diff" | "/v1/files/has-chunks"
@@ -213,7 +254,76 @@ fn classify(path: &str) -> Route {
     }
 }
 
+/// the git smart-HTTP routes under `/forge/{repo}/…`, each named by the
+/// service it speaks: the two POST endpoints by their path, the ref
+/// advertisement by its `service=` query. Deny-by-default inside the forge
+/// family too: any other path under the prefix has no cap to check.
+fn classify_forge(rest: &str, query: &str) -> Route {
+    let Some((repo, tail)) = rest.split_once('/') else {
+        return Route::Refuse("forge_route_unknown");
+    };
+    let service = match tail {
+        "git-upload-pack" => Some(GitService::UploadPack),
+        "git-receive-pack" => Some(GitService::ReceivePack),
+        "info/refs" => advertised_service(query),
+        _ => None,
+    };
+    match service {
+        Some(service) => Route::Forge {
+            repo: repo.to_string(),
+            service,
+        },
+        None => Route::Refuse("forge_route_unknown"),
+    }
+}
+
+/// the service a smart-HTTP ref advertisement asks for, from its query.
+fn advertised_service(query: &str) -> Option<GitService> {
+    let service = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("service="))?;
+    match service {
+        "git-upload-pack" => Some(GitService::UploadPack),
+        "git-receive-pack" => Some(GitService::ReceivePack),
+        _ => None,
+    }
+}
+
 impl Lane {
+    /// a git transport request, admitted under this run's committed forge cap
+    /// for the repo it names. A push carries this node's operator credential
+    /// upstream: forge's receive-pack wants proof, and the run's proof IS the
+    /// owner's grant, which only this lane can vouch for.
+    async fn forge(&self, req: Request, repo: &str, service: GitService) -> Response {
+        let Some(record) = self.record().await else {
+            return self.refuse("run_record_unavailable");
+        };
+        match service {
+            GitService::UploadPack => {
+                if !record.permits(&CapRequest::ForgeRead(repo)) {
+                    return self.refuse("forge_read_uncapped");
+                }
+                self.forward(req).await
+            }
+            GitService::ReceivePack => {
+                if !record.permits(&CapRequest::ForgePush(repo)) {
+                    return self.refuse("forge_push_uncapped");
+                }
+                let Some(proof) = self.operator_proof() else {
+                    return self.refuse("forge_push_uncredentialed");
+                };
+                self.forward_as(req, Some(proof)).await
+            }
+        }
+    }
+
+    /// the operator header an admitted push carries, as of now.
+    fn operator_proof(&self) -> Option<(HeaderName, HeaderValue)> {
+        let credential = self.credential.as_ref()?;
+        let value = HeaderValue::from_str(&credential.value()?).ok()?;
+        Some((HeaderName::from_static(credential.header_name()), value))
+    }
+
     /// a duckfs read, admitted only under this run's committed cap.
     async fn capped(
         &self,
@@ -265,32 +375,59 @@ impl Lane {
         (parts.status, axum::Json(reply)).into_response()
     }
 
-    /// this run's committed record, read off the node's own `/v1/query` — the
-    /// same query `bin/node`'s MCP `Run::record` makes.
+    /// The same live standing-record/committed-ceiling intersection as the
+    /// MCP read plane. Neither a missing run nor an unrecognized response
+    /// establishes an ordinary run's unconstrained authority.
     async fn record(&self) -> Option<ModelRecord> {
         let agent_id = self.agent_id.as_deref()?;
-        let body = json!({
-            "target": "runs",
-            "query": {"model": {"query": {"agent": {"agent_id": agent_id}}}},
-        });
-        let reply: Value = self
-            .client
+        let run_id = self.run_id.as_deref()?;
+        let reply = self
+            .query(json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}))
+            .await?;
+        let standing: ModelRecord =
+            serde_json::from_value(reply.get("model")?.get("agent")?.clone()).ok()?;
+        if standing.agent_id != agent_id {
+            return None;
+        }
+        let reply = self
+            .query(json!({"run_authority": {"run_id": run_id}}))
+            .await?;
+        let value = reply.get("run_authority")?;
+        // Option's serde default must not turn an omitted field into proof
+        // that this run has no admission ceiling. Explicit null is ordinary.
+        value.get("authority")?;
+        let view: runs::RunAuthorityView = serde_json::from_value(value.clone()).ok()?;
+        if view.run_id != run_id || view.agent_id != agent_id {
+            return None;
+        }
+        Some(match view.authority {
+            Some(ceiling) => ceiling.apply(&standing),
+            None => standing,
+        })
+    }
+
+    async fn query(&self, query: Value) -> Option<Value> {
+        self.client
             .post(format!("{}/v1/query", self.upstream))
-            .json(&body)
+            .json(&json!({"target": "runs", "query": query}))
             .send()
             .await
             .ok()?
+            .error_for_status()
+            .ok()?
             .json()
             .await
-            .ok()?;
-        // ModelReply::Agent(Option<ModelRecord>) — externally tagged, so the
-        // record sits under "agent" and is null for an id the registry does not
-        // hold.
-        serde_json::from_value(reply.get("model")?.get("agent")?.clone()).ok()
+            .ok()
     }
 
     /// pass a request to the node's listener and stream its answer back.
     async fn forward(&self, req: Request) -> Response {
+        self.forward_as(req, None).await
+    }
+
+    /// [`Self::forward`], carrying `proof` — the operator header an admitted
+    /// push presents — in place of anything the guest sent under that name.
+    async fn forward_as(&self, req: Request, proof: Option<(HeaderName, HeaderValue)>) -> Response {
         let (parts, body) = req.into_parts();
         let path_and_query = parts
             .uri
@@ -301,12 +438,21 @@ impl Lane {
             .client
             .request(parts.method, format!("{}{path_and_query}", self.upstream))
             .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+        let operator_header = self
+            .credential
+            .as_ref()
+            .map(|credential| HeaderName::from_static(credential.header_name()));
         for (name, value) in parts.headers.iter() {
             // the lane's own authority is not the node's: HOST names this
-            // loopback port and would be a lie upstream.
-            if name != header::HOST {
+            // loopback port and would be a lie upstream, and the operator
+            // header is the lane's to present, never the guest's.
+            let guest_claims_operator = operator_header.as_ref() == Some(name);
+            if name != header::HOST && !guest_claims_operator {
                 out = out.header(name, value);
             }
+        }
+        if let Some((name, value)) = proof {
+            out = out.header(name, value);
         }
         let upstream = match out.send().await {
             Ok(upstream) => upstream,
@@ -355,7 +501,8 @@ impl Lane {
             axum::Json(json!({
                 "error": format!(
                     "this run's node lane refused the request ({reason}); duckfs reads are \
-                     limited to your agent's duckfs_read caps"
+                     limited to your agent's duckfs_read caps, forge fetches to its \
+                     forge_read caps and forge pushes to its forge_push caps"
                 )
             })),
         )
@@ -393,16 +540,75 @@ mod tests {
         }
     }
 
-    /// a node stand-in: answers the runs model query with `record`, and every
-    /// files route with a fixed grep page whose second hit is out of cap.
+    /// a record whose forge grant is exactly `read` and `push`.
+    fn forge_capped_record(read: &[&str], push: &[&str]) -> ModelRecord {
+        let mut record = team_capped_record();
+        record.caps.forge_read = read.iter().map(|repo| (*repo).to_string()).collect();
+        record.caps.forge_push = push.iter().map(|repo| (*repo).to_string()).collect();
+        record
+    }
+
+    /// the credential a test node lends, under the header name the real node
+    /// reads; `None` is a node with nothing to lend.
+    fn operator(token: Option<&'static str>) -> Option<OperatorCredential> {
+        token.map(|token| {
+            OperatorCredential::new("x-test-operator", move || Some(token.to_string()))
+        })
+    }
+
+    /// what the stand-in forge routes answer: the service they were asked
+    /// for and the operator header they saw, if any.
+    async fn forge_echo(req: Request) -> axum::Json<Value> {
+        let operator = req
+            .headers()
+            .get("x-test-operator")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        axum::Json(json!({
+            "path": req.uri().path(),
+            "query": req.uri().query().unwrap_or_default(),
+            "operator": operator,
+        }))
+    }
+
+    /// a node stand-in: answers the runs model query with `record`, the forge
+    /// transport routes with an echo of what reached them, and every files
+    /// route with a fixed grep page whose second hit is out of cap.
     async fn fake_node(record: ModelRecord) -> String {
+        fake_node_with_authority(
+            record,
+            Arc::new(Mutex::new(json!({
+                "run_id": "run-a", "agent_id": "bot", "authority": null,
+            }))),
+        )
+        .await
+    }
+
+    async fn fake_node_with_authority(record: ModelRecord, authority: Arc<Mutex<Value>>) -> String {
         let app = Router::new()
             .route(
                 "/v1/query",
-                axum::routing::post(move || {
+                axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
                     let record = record.clone();
-                    async move { axum::Json(json!({"model": {"agent": record}})) }
+                    let authority = authority.clone();
+                    async move {
+                        if request["query"].get("run_authority").is_some() {
+                            assert_eq!(request["query"]["run_authority"]["run_id"], "run-a");
+                            axum::Json(json!({"run_authority": authority.lock().unwrap().clone()}))
+                        } else {
+                            axum::Json(json!({"model": {"agent": record}}))
+                        }
+                    }
                 }),
+            )
+            .route("/forge/{repo}/info/refs", axum::routing::get(forge_echo))
+            .route(
+                "/forge/{repo}/git-upload-pack",
+                axum::routing::post(forge_echo),
+            )
+            .route(
+                "/forge/{repo}/git-receive-pack",
+                axum::routing::post(forge_echo),
             )
             .route(
                 "/v1/status",
@@ -435,13 +641,41 @@ mod tests {
 
     /// the lane in front of that node, plus the url the guest would be handed.
     async fn lane_for(record: ModelRecord) -> (ReadLane, String) {
+        lane_with(record, None).await
+    }
+
+    /// [`lane_for`] on a node lending `credential`.
+    async fn lane_with(
+        record: ModelRecord,
+        credential: Option<OperatorCredential>,
+    ) -> (ReadLane, String) {
         let node = fake_node(record).await;
-        let mut envs = vec![(crate::NODE_URL_ENV.to_string(), node)];
-        let lane = ReadLane::start(&mut envs, Some("bot".into()))
+        let mut envs = vec![
+            (crate::NODE_URL_ENV.to_string(), node),
+            ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+        ];
+        let lane = ReadLane::start(&mut envs, Some("bot".into()), credential)
             .await
             .unwrap()
             .expect("a lane for a node url");
         (lane, envs[0].1.clone())
+    }
+
+    /// one request through the lane with the guest's own headers.
+    async fn send(
+        base: &str,
+        method: reqwest::Method,
+        path_and_query: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut request = reqwest::Client::new().request(method, format!("{base}{path_and_query}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.json().await.unwrap_or(Value::Null);
+        (StatusCode::from_u16(status.as_u16()).unwrap(), body)
     }
 
     async fn get(base: &str, path_and_query: &str) -> (StatusCode, Value) {
@@ -453,6 +687,146 @@ mod tests {
         let status = response.status();
         let body = response.json().await.unwrap_or(Value::Null);
         (StatusCode::from_u16(status.as_u16()).unwrap(), body)
+    }
+
+    #[tokio::test]
+    async fn delegated_reads_and_pushes_stay_inside_the_callers_live_ceiling() {
+        let standing = forge_capped_record(&[], &["a", "b"]);
+        let authority = Arc::new(Mutex::new(json!({
+            "run_id": "run-a", "agent_id": "bot", "authority": {
+                "allowed_actions": [], "caps": runs::ResourceCaps {
+                    forge_push: vec!["a".into()],
+                    duckfs_read: vec!["/shared/team/public".into()],
+                    ..Default::default()
+                }
+            }
+        })));
+        let node = fake_node_with_authority(standing, authority.clone()).await;
+        let mut envs = vec![
+            (crate::NODE_URL_ENV.to_string(), node),
+            ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+        ];
+        let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+            .await
+            .unwrap()
+            .unwrap();
+        let base = &envs[0].1;
+        for service in ["git-receive-pack", "git-upload-pack"] {
+            let (status, _) = send(
+                base,
+                reqwest::Method::POST,
+                &format!("/forge/b/{service}"),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "delegation must not lend repo b authority: {service}"
+            );
+            let (status, body) = send(
+                base,
+                reqwest::Method::POST,
+                &format!("/forge/a/{service}"),
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["operator"],
+                if service == "git-receive-pack" {
+                    json!("secret")
+                } else {
+                    Value::Null
+                }
+            );
+        }
+        assert_eq!(
+            get(base, "/v1/files/read?path=/shared/team/private")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(base, "/v1/files/read?path=/shared/team/public/a")
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Authority is checked per request, including a run no longer in flight.
+        *authority.lock().unwrap() = Value::Null;
+        assert_eq!(
+            send(
+                base,
+                reqwest::Method::POST,
+                "/forge/a/git-receive-pack",
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn unestablished_run_authority_never_falls_back_to_standing_grants() {
+        for view in [
+            Value::Null,
+            json!({"run_id": "another-run", "agent_id": "bot", "authority": null}),
+            json!({"run_id": "run-a", "agent_id": "another-agent", "authority": null}),
+            json!({"run_id": "run-a", "agent_id": "bot"}),
+            json!({"run_id": "run-a", "agent_id": "bot", "authority": "invalid"}),
+        ] {
+            let node = fake_node_with_authority(
+                forge_capped_record(&[], &["a"]),
+                Arc::new(Mutex::new(view.clone())),
+            )
+            .await;
+            let mut envs = vec![
+                (crate::NODE_URL_ENV.to_string(), node),
+                ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+            ];
+            let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+                .await
+                .unwrap()
+                .unwrap();
+            let base = &envs[0].1;
+            assert_eq!(
+                send(
+                    base,
+                    reqwest::Method::POST,
+                    "/forge/a/git-receive-pack",
+                    &[]
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN,
+                "{view}"
+            );
+            assert_eq!(
+                get(base, "/v1/files/read?path=/shared/team/a").await.0,
+                StatusCode::FORBIDDEN,
+                "{view}"
+            );
+        }
+        let node = fake_node(forge_capped_record(&[], &["a"])).await;
+        let mut envs = vec![(crate::NODE_URL_ENV.to_string(), node)];
+        let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            send(
+                &envs[0].1,
+                reqwest::Method::POST,
+                "/forge/a/git-receive-pack",
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN,
+            "a missing run identity is not an ordinary run"
+        );
     }
 
     #[tokio::test]
@@ -539,6 +913,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_fetch_needs_forge_read_and_a_push_needs_forge_push() {
+        let (_lane, base) =
+            lane_with(forge_capped_record(&["docs"], &[]), operator(Some("t"))).await;
+        let fetches = [
+            (
+                reqwest::Method::GET,
+                "/forge/docs/info/refs?service=git-upload-pack",
+            ),
+            (reqwest::Method::POST, "/forge/docs/git-upload-pack"),
+        ];
+        for (method, path) in fetches {
+            let (status, body) = send(&base, method, path, &[]).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(body["operator"], Value::Null, "a fetch lends no credential");
+        }
+        let refused = [
+            (
+                reqwest::Method::GET,
+                "/forge/docs/info/refs?service=git-receive-pack",
+            ),
+            (reqwest::Method::POST, "/forge/docs/git-receive-pack"),
+            (
+                reqwest::Method::GET,
+                "/forge/other/info/refs?service=git-upload-pack",
+            ),
+            (reqwest::Method::POST, "/forge/other/git-upload-pack"),
+            // no service named, or a path that is not a transport endpoint
+            (reqwest::Method::GET, "/forge/docs/info/refs"),
+            (reqwest::Method::GET, "/forge/docs/HEAD"),
+        ];
+        for (method, path) in refused {
+            let (status, _) = send(&base, method, path, &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admitted_push_carries_the_operator_credential_the_guest_never_holds() {
+        let (_lane, base) = lane_with(
+            forge_capped_record(&[], &["app"]),
+            operator(Some("node-secret")),
+        )
+        .await;
+        let (status, body) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-receive-pack",
+            // a guest claiming the operator header is overwritten, never relayed
+            &[("x-test-operator", "forged")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["operator"], json!("node-secret"));
+        let (status, body) = send(
+            &base,
+            reqwest::Method::GET,
+            "/forge/app/info/refs?service=git-receive-pack",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["operator"], json!("node-secret"));
+        // push implies read: the same record fetches
+        let (status, body) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-upload-pack",
+            &[("x-test-operator", "forged")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["operator"],
+            Value::Null,
+            "a guest's claim is dropped on every route"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_on_a_node_with_no_credential_to_lend_is_refused() {
+        let (_lane, base) = lane_with(forge_capped_record(&[], &["app"]), None).await;
+        let (status, _) = send(
+            &base,
+            reqwest::Method::POST,
+            "/forge/app/git-receive-pack",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

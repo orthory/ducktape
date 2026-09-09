@@ -60,6 +60,9 @@ mod boot;
 mod cli;
 mod cli_args;
 mod code_plane;
+mod collab_cli;
+mod collab_keys;
+mod collab_pump;
 mod compute;
 mod config;
 mod constants;
@@ -292,6 +295,8 @@ enum Family {
     /// sandboxed provider sessions (pty attach, sched runs) and run control
     /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
+    /// cross-device agent collaboration: authenticated reads of a conversation
+    Collab(collab_cli::CollabArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]
     Module(module_cli::ModuleCmd),
@@ -324,6 +329,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Account(args) => account_cli::run(args),
         Family::Wallet(args) => wallet_cli::run(args),
         Family::Agent(args) => agent_cli::run(args),
+        Family::Collab(args) => collab_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
         Family::Module(cmd) => module_cli::run(cmd),
@@ -641,6 +647,20 @@ fn run_node(
         // only warning (#1309). Off the node's task by construction — a walk
         // of a directory holding one file per op must never ride the loop.
         noded::spawn_store_footprint_sampler(metrics.clone(), storage_for_sync.clone());
+        // the collaboration half of the agent link: it reads committed
+        // conversations as each binding's own scoped key and hands the daemon
+        // what it may still deliver, then commits what the daemon reports back.
+        // Here rather than inside a role loop because it is neither — it holds
+        // no host and only ever talks to one over the same command lane the
+        // http surface uses, so a promotion re-exec restarts it like any other
+        // surface task.
+        collab_pump::spawn(
+            gateway_commands.clone(),
+            status.clone(),
+            terminals.as_ref(),
+            workspace.clone(),
+            &chain_id,
+        );
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
         // `/v1/invite` — the daemon mints its own invites. Minting FOLDS this

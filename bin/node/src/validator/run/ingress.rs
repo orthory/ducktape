@@ -591,6 +591,20 @@ impl ValidatorRuntime<'_> {
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
+            noded::NodeCommand::QueryAs {
+                target,
+                req,
+                reader,
+                reply,
+            } => {
+                let result = self
+                    .node
+                    .host()
+                    .query_as(&target, &req, sdk::Origin::External(reader))
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
         }
     }
 }

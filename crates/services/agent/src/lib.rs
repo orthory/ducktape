@@ -47,6 +47,7 @@ use provider_host::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+pub mod messaging;
 pub mod wire;
 
 /// the per-daemon concurrent-session cap. a terminal is arbitrary code
@@ -274,6 +275,19 @@ impl Sessions {
             } => self.enqueue(&session, Drive::Resize { cols, rows }),
             wire::Command::TermClose { session } => {
                 self.finish(&session).await;
+                None
+            }
+            // the collaboration plane's, and routed there by
+            // `messaging::route` before anything reaches here. Named rather
+            // than swept into a `_` so a new command still fails the build
+            // until somebody decides which plane owns it.
+            command @ (wire::Command::MsgBind(_)
+            | wire::Command::MsgUnbind { .. }
+            | wire::Command::MsgDeliver(_)
+            | wire::Command::MsgTime { .. }
+            | wire::Command::MsgRetain { .. }
+            | wire::Command::MsgReplay { .. }) => {
+                misrouted(&command);
                 None
             }
         }
@@ -636,6 +650,29 @@ impl Inner {
             );
         }
     }
+}
+
+/// a collaboration command that reached the terminal plane. Only possible if a
+/// caller bypassed [`messaging::route`], so it is a wiring bug, not traffic.
+fn misrouted(command: &wire::Command) {
+    let plane = match command {
+        wire::Command::MsgBind(_) => "msg_bind",
+        wire::Command::MsgUnbind { .. } => "msg_unbind",
+        wire::Command::MsgDeliver(_) => "msg_deliver",
+        wire::Command::MsgTime { .. } => "msg_time",
+        wire::Command::MsgRetain { .. } => "msg_retain",
+        wire::Command::MsgReplay { .. } => "msg_replay",
+        wire::Command::TermCreate(_)
+        | wire::Command::TermInput { .. }
+        | wire::Command::TermResize { .. }
+        | wire::Command::TermClose { .. } => "term",
+    };
+    tracing::warn!(
+        target: "ducktape::term",
+        reason = "misrouted_command",
+        command = plane,
+        "a collaboration command reached the terminal plane"
+    );
 }
 
 /// write raw bytes to a pty. Bad base64 or a failed write is a no-op + `warn`

@@ -630,6 +630,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                 &pages::PageMsg::CreatePage {
                     page_id: "inline".into(),
                     title: "Quackbot review this".into(),
+                    blocks: Vec::new(),
                 }
             ),
         )

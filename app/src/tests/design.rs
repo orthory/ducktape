@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn full_view_fits_the_default_test_stack() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
     std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {

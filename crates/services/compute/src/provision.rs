@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use provider_host::RunContext;
+use provider_host::{OperatorCredential, RunContext};
 use serde::{Deserialize, Serialize};
 
 use crate::workspace_source::WorkspaceSource;
@@ -240,6 +240,12 @@ pub trait ProvisionedWorkspace: Send + Sync {
     fn context_doc(&self) -> Option<String> {
         None
     }
+    /// the node's operator credential the run's node lane lends to a forge
+    /// push the committed grant admits → `ctx.operator_credential`. `None`
+    /// (the default, for an embedder with no node) refuses every push.
+    fn operator_credential(&self) -> Option<OperatorCredential> {
+        None
+    }
     /// commit ONLY the rw source; `audit_message` is host-only receipt context
     /// while `proposal` is the agent-authored Git message. Implementations must
     /// never turn the audit string into public Git history.
@@ -265,6 +271,7 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.env.extend(ws.env());
     ctx.path_entries = ws.path_entries();
     ctx.context_doc = ws.context_doc();
+    ctx.operator_credential = ws.operator_credential();
 }
 
 // ---- runner result ----------------------------------------------------------

@@ -88,6 +88,13 @@ impl RunsModule {
             )));
         }
         let actions = previous.map_or(0, |open| open.actions);
+        self.record(
+            &run_id,
+            crate::RunFact::SessionOpened {
+                attempt: lease.attempt,
+                holder: crate::hex(&lease.holder),
+            },
+        );
         // the agent id comes from the run's COMMITTED entry, never from the
         // payload — identity is never a submitter's to assert.
         self.pending_sessions.insert(
@@ -178,6 +185,13 @@ impl RunsModule {
             prepared,
         )
         .await?;
+        self.record(
+            &run_id,
+            crate::RunFact::Acted {
+                request_id: id.clone(),
+                operation: envelope.operation.clone(),
+            },
+        );
         // spend the budget. the counter is committed state: it is both the audit
         // record and the id salt the NEXT action mints from, so it must move on
         // every applied action and on no refused one (a refusal is an `Err`, and
@@ -231,7 +245,9 @@ impl RunsModule {
         // sibling op's post is already committed and visible to the probes.
         let mut posts = ReplyPosts::default();
         let prepared = match &operation {
-            Operation::PagesComment { .. } | Operation::PagesSetChecked { .. } => {
+            Operation::PagesComment { .. }
+            | Operation::PagesSetChecked { .. }
+            | Operation::PagesPost { .. } => {
                 let agent = self.registered_agent(ctx, entry).await?;
                 self.pages_operation_msg(ctx, &agent, entry, run_id, &slot, &operation, &mut posts)
                     .await
@@ -246,6 +262,8 @@ impl RunsModule {
                 skills,
             } => Ok(self.agent_call_msg(run_id, request_id, agent_id, instruction, skills)),
             Operation::Reply { .. }
+            | Operation::React { .. }
+            | Operation::Unreact { .. }
             | Operation::ChatPost { .. }
             | Operation::JobsComment { .. }
             | Operation::TasksCreate { .. }

@@ -999,6 +999,7 @@ pub async fn create_page(
             pages::encode_msg(&PageMsg::CreatePage {
                 page_id: page_id.clone(),
                 title: title.clone(),
+                blocks: Vec::new(),
             }),
             password,
         )

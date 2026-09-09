@@ -434,6 +434,13 @@ impl Module for Pages {
                     &PageReply::TargetThreadCount(ids.len() as u64),
                 ))
             }
+            PageQuery::PageCount => {
+                let index = self
+                    .load_index()
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::PageCount(index.len() as u64)))
+            }
         }
     }
 

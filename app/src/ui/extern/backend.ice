@@ -49,6 +49,20 @@ extern crate::backend
   pure bell_detail(item:&BellItem) -> str
   pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str) -> BellData ! AppError
+  // THE AGENT-MESSAGING PANEL. One authenticated reading of ONE conversation,
+  // and one send under the participant's owner credential. Both carry the
+  // endpoint and chain they ran under: neither is installed after the app has
+  // moved to another network, participant or conversation.
+  MessagingSeat(participant:str, role:str, you:bool)
+  MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
+  MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
+  MessagingView(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, answered:bool, visibility:str)
+  MessagingSend(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, refusal:str)
+  pure messaging_none() -> MessagingView
+  pure messaging_in_scope(view:&MessagingView, rpc:&str, network:&str, link:i64, account:&str, op:i64, participant:&str, conversation:&str) -> bool
+  pure messaging_send_in_scope(send:&MessagingSend, rpc:&str, network:&str, link:i64, account:&str, op:i64, participant:&str, conversation:&str) -> bool
+  load_messaging(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, from_seq:i64, newest:bool) -> MessagingView
+  send_agent_message(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, kind:str, recipient:str, body:str, reply_to:i64, password:str) -> MessagingSend
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
@@ -393,8 +407,16 @@ extern crate::backend
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
   AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
-  AgentsData(generation:i64, agents:[AgentRow], capabilities:[str], actions:[str])
+  // the run tracker: every run off the runs journal, and the journal of
+  // the one the reader opened
+  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  JournalEntry(height:str, kind:str, summary:str)
+  RunJournal(run_id:str, entries:[JournalEntry], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
+  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
+  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, run_id:str) -> RunJournal
+  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, run_id:&str) -> bool
+  pure empty_run_journal() -> RunJournal
   pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
   // the editor's whole draft record, as the Agents view hands it back
