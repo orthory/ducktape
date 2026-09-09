@@ -16,6 +16,8 @@
 //! that holds none of them cannot leak one — and a view that traps shows why
 //! in its place instead of taking the window with it.
 
+mod display_budget;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -546,6 +548,7 @@ struct ForgeProps<'a> {
     comment_cap_reached: bool,
     discussion: &'a [crate::backend::ChatMessage],
     linked_note: &'a [crate::backend::ChatMessage],
+    discussion_clipped: bool,
     landed_seq: i64,
     landed_tick: i64,
     tree_path: &'a str,
@@ -692,6 +695,7 @@ pub fn forge_view(
         comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
         discussion,
         linked_note: linked_note.as_slice(),
+        discussion_clipped: false,
         landed_seq,
         landed_tick,
         tree_path,
@@ -724,7 +728,10 @@ pub fn forge_view(
         note_scope,
         note_blocked,
     };
-    module_view("forge", serde_json::to_vec(&props).expect("props encode"))
+    module_view(
+        "forge",
+        display_budget::forge(serde_json::to_value(&props).expect("props encode")),
+    )
 }
 
 fn forge_phase_word(phase: crate::ForgePhase) -> &'static str {
@@ -1242,7 +1249,7 @@ pub fn chat_view(
     module_view("chat", encode_chat_props(props))
 }
 
-/// Body bytes the two timelines may put on one frame together: the wire
+/// Text bytes a guest's big list or blob may put on one frame: the wire
 /// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
 /// newest messages come last — a busy room's hot window (256 rows) drew its
 /// newest messages blank. The rest of the frame (rooms, names, times, the
@@ -1297,6 +1304,19 @@ fn newest_within(
         start -= 1;
     }
     (&messages[start..], start > 0)
+}
+
+/// The head of `text` that fits `budget`, cut on a char boundary, and
+/// whether anything was cut.
+fn head_within(text: &str, budget: usize) -> (&str, bool) {
+    if text.len() <= budget {
+        return (text, false);
+    }
+    let mut end = budget;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
 }
 
 fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
@@ -1464,7 +1484,7 @@ pub fn files_view(
         "write_refusal": write_refusal,
         "writes": writes,
     });
-    module_view("files", serde_json::to_vec(&props).expect("props encode"))
+    module_view("files", display_budget::files(props))
 }
 
 pub fn files_intent(event: &ModuleViewEvent) -> crate::FilesIntent {
@@ -4527,6 +4547,8 @@ pub(crate) mod tests {
             "preview_truncated": false, "preview_binary": false, "preview_picture": false,
             "preview_width": 0, "preview_height": 0,
             "preview_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "preview_display_text": "# Hello\n\n[a link](https://duck.example/x)\n",
+            "preview_display_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
             "dark": false, "write_refusal": "", "writes": 0
         }))
         .expect("props encode"),
@@ -4574,9 +4596,9 @@ pub(crate) mod tests {
           "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
           "forge_item_merge_oid": "", "forge_item_source_oid": "",
           "forge_item_approvals": 0, "forge_item_change_requests": 0,
-          "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-          "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-          "comment_cap_reached": false, "discussion": [], "linked_note": [],
+          "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+          "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
+          "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
           "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
           "tree_entries": [], "tree_born": false, "tree_truncated": false,
           "tree_phase": "loading", "file_path": "", "file_text": "",
@@ -4696,6 +4718,175 @@ pub(crate) mod tests {
         Some(encode_chat_props(props))
     }
 
+    /// Inspect the guest frame before the host sanitizer, not its already
+    /// sanitized held tree. Resync prevents patch application hiding a loss.
+    fn assert_display_projection_survives_wire(
+        module: &'static str,
+        props: &[u8],
+        expected: &str,
+        actions: &[&str],
+    ) {
+        let path = staged(module).expect("build the actual budget fixture with make views");
+        let mut guest = Guest::load_from(module, &path).expect("actual guest loads");
+        guest.redraw(&None);
+        let supplied = Some(props.to_vec());
+        guest.redraw(&supplied);
+        for action in actions {
+            guest.deliver(Output::Activate(button_message(&guest, action)));
+            guest.redraw(&supplied);
+        }
+        guest.pending.push(wire::Event::Resync);
+        let events = std::mem::take(&mut guest.pending);
+        arm(&mut guest.store);
+        let (bytes,) = guest
+            .tick
+            .call(&mut guest.store, (wire::encode(&events),))
+            .expect("guest full frame");
+        let frame: wire::Frame = wire::decode(&bytes).expect("wire frame");
+        assert!(frame.root.is_some(), "resync emits a full tree");
+        let mut observed = frame.root.clone().unwrap();
+        let supplied: serde_json::Value = serde_json::from_slice(props).unwrap();
+        let omitted = supplied["display_omitted"].as_i64().unwrap();
+        let omitted_text = omitted.to_string();
+        let mut omitted_seen = omitted == 0;
+        let mut expected_seen = false;
+        observed.for_each_mut(&mut |node| {
+            if let wire::Node::Text { key, content, .. } = node {
+                expected_seen |= content.starts_with(expected);
+                omitted_seen |= key.ends_with("/display-omitted") && *content == omitted_text;
+            }
+        });
+        assert!(
+            expected_seen,
+            "{module}: expected actual projected content {expected:?}"
+        );
+        assert!(
+            omitted_seen,
+            "{module}: omitted row count is not rendered as a number"
+        );
+        let mut sanitized = frame.clone();
+        wire::sanitize(&mut sanitized);
+        assert_eq!(
+            frame.root, sanitized.root,
+            "{module}: sanitizer changed the production projection"
+        );
+    }
+
+    #[test]
+    fn files_display_projection_bounds_preview_rows_and_preserves_the_edit_source() {
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        let source = "한글 preview ".repeat(5_000);
+        facts["preview_text"] = source.clone().into();
+        let entries: Vec<_> = (0..80).map(|n| serde_json::json!({
+            "key": n + 100, "path": format!("/shared/{n}"), "name": format!("entry-{n}-{}", "한".repeat(300)),
+            "kind": "dir", "size": 1, "object": format!("object-{n}")
+        })).collect();
+        facts["entries"] = entries.clone().into();
+        facts["directories"] = entries.into();
+        facts["history"] = (0..80).map(|n| serde_json::json!({"id": format!("s{n}"), "short_id": format!("s{n}"), "author": "duck", "height": n, "message": "history".repeat(300)})).collect::<Vec<_>>().into();
+        facts["diff_from"] = "s0".into();
+        facts["diff"] = (0..80)
+            .map(|n| serde_json::json!({"path": format!("/shared/{n}"), "kind": "added"}))
+            .collect::<Vec<_>>()
+            .into();
+        let bytes = display_budget::files(facts.clone());
+        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(projected["preview_text"], source);
+        assert_eq!(projected["preview_truncated"], false);
+        assert_eq!(projected["preview_display_clipped"], true);
+        assert!(
+            projected["preview_display_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("한글 preview")
+        );
+        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert_display_projection_survives_wire(
+            "files",
+            &bytes,
+            "Preview shortened for display.",
+            &[],
+        );
+        facts["entries"] = Vec::<serde_json::Value>::new().into();
+        facts["directories"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "".into();
+        let history = display_budget::files(facts.clone());
+        assert_display_projection_survives_wire("files", &history, "historyhistory", &["History"]);
+        facts["history"] = Vec::<serde_json::Value>::new().into();
+        facts["diff_from"] = "s0".into();
+        facts["diff"] = (0..80).map(|n| serde_json::json!({"path": format!("/shared/{n}-{}", "long".repeat(200)), "kind": "added"})).collect::<Vec<_>>().into();
+        let diff = display_budget::files(facts);
+        assert_display_projection_survives_wire("files", &diff, "/shared/0-long", &["History"]);
+    }
+
+    #[test]
+    fn forge_display_projection_bounds_body_diff_and_newest_notes_together() {
+        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
+        facts["open_repo"] = "core".into();
+        facts["forge_item_number"] = 7.into();
+        facts["item_phase"] = "ready".into();
+        facts["forge_item_kind"] = "pr".into();
+        facts["forge_item_state"] = "open".into();
+        facts["forge_item_source_oid"] = "source-oid".into();
+        facts["forge_item_body"] = "body".repeat(16_000).into();
+        facts["forge_item_blocks"] =
+            serde_json::to_value(crate::backend::paragraph_blocks(&format!(
+                "**{}**\n\n{}",
+                "rich body ".repeat(3_000),
+                "plain body ".repeat(3_000)
+            )))
+            .unwrap();
+        facts["discussion"] = (1..=40)
+            .map(|n| {
+                let body = format!("latest-{n} {}", "한글".repeat(400));
+                serde_json::to_value(crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(n)
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into();
+        facts["diff_rows"] = serde_json::to_value(crate::backend::diff_lines(&format!(
+            "--- a/main\n+++ b/main\n@@ -1 +1 @@\n-{}\n+{}\n",
+            "old".repeat(10_000),
+            "new".repeat(10_000)
+        )))
+        .unwrap();
+        facts["staged_comments"] = (0..64).map(|n| serde_json::json!({"anchor": format!("a{n}{}", "x".repeat(12_000)), "path": "main", "line": "1", "side": "new", "body": "comment".repeat(2_000)})).collect::<Vec<_>>().into();
+        facts["merge_conflicts"] = vec!["conflict-path".repeat(8_000)].into();
+        let bytes = display_budget::forge(facts);
+        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            projected["discussion"].as_array().unwrap().last().unwrap()["seq"],
+            40
+        );
+        assert_eq!(projected["has_staged_comments"], true);
+        assert_display_projection_survives_wire("forge", &bytes, "latest-40", &[]);
+        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
+        assert!(projected["staged_comments"].as_array().unwrap().is_empty());
+        assert!(projected["merge_conflicts"].as_array().unwrap().is_empty());
+        let path = staged("forge").expect("actual forge wasm");
+        let mut guest = Guest::load_from("forge", &path).unwrap();
+        guest.redraw(&None);
+        let props = Some(bytes);
+        guest.redraw(&props);
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|text| text.starts_with("Merge conflicts —"))
+        );
+        guest.deliver(Output::Activate(button_message(&guest, "Submit review")));
+        guest.redraw(&props);
+        assert!(
+            guest
+                .intents
+                .iter()
+                .any(|event| event.kind == "review_submit")
+        );
+    }
+
     /// A busy room's whole hot window through the real wire: the newest
     /// message must still read, and the clipped older ones are offered as
     /// history.
@@ -4740,6 +4931,149 @@ pub(crate) mod tests {
             "the clip is history"
         );
         assert!(guest.fault.is_none());
+    }
+
+    /// The forge discussion has the chat stream's shape: 40 notes of 2 KB
+    /// are past the frame's text budget, and the newest note — drawn last —
+    /// must still read; the landing note above the list stays whole.
+    #[test]
+    fn the_newest_discussion_note_still_reads_through_the_wire() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        const ROWS: i64 = 40;
+        let notes: Vec<_> = (1..=ROWS)
+            .map(|seq| {
+                let body = format!("n{seq} {}", "x".repeat(2_000));
+                crate::backend::ChatMessage {
+                    blocks: crate::backend::paragraph_blocks(&body),
+                    body,
+                    ..first_light_at(seq)
+                }
+            })
+            .collect();
+        let landing = crate::backend::ChatMessage {
+            body: "the note a link landed on".into(),
+            blocks: crate::backend::paragraph_blocks("the note a link landed on"),
+            ..first_light_at(1_000)
+        };
+        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
+        facts["open_repo"] = "core".into();
+        facts["forge_item_number"] = 7.into();
+        facts["item_phase"] = "ready".into();
+        facts["discussion"] = serde_json::to_value(&notes).unwrap();
+        facts["linked_note"] = serde_json::to_value([&landing]).unwrap();
+        let props = Some(display_budget::forge(facts));
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let newest = format!("n{ROWS} ");
+        assert!(
+            shown.iter().any(|text| text.starts_with(&newest)),
+            "the newest note is blank (fault {:?}): last texts {:?}",
+            guest.fault,
+            shown
+                .iter()
+                .rev()
+                .take(6)
+                .map(|text| &text[..text.len().min(24)])
+                .collect::<Vec<_>>()
+        );
+        assert!(shown.iter().any(|text| text == "the note a link landed on"));
+        assert!(
+            shown
+                .iter()
+                .any(|text| text == "Older comments are not shown.")
+        );
+        assert!(guest.fault.is_none());
+    }
+
+    /// A 60 KB file preview: the reader either sees all of it or is told
+    /// it is cut — never a silently shortened text.
+    #[test]
+    fn a_long_file_preview_says_where_it_is_cut() {
+        let Some(staged) = staged("files") else {
+            return;
+        };
+        let text = format!("{}END-MARK", "y".repeat(60_000));
+        let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
+        facts["preview_text"] = text.clone().into();
+        let props = Some(display_budget::files(facts));
+        let projected: serde_json::Value = serde_json::from_slice(props.as_ref().unwrap()).unwrap();
+        assert_eq!(projected["preview_text"], text);
+        assert_eq!(projected["preview_truncated"], false);
+        assert_eq!(projected["preview_display_clipped"], true);
+        let mut guest = Guest::load_from("files", &staged).expect("the view loads");
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        let whole = shown.iter().any(|text| text.ends_with("END-MARK"));
+        let told = shown
+            .iter()
+            .any(|text| text == "Preview shortened for display.");
+        assert!(
+            whole || told,
+            "the preview is cut without a word (fault {:?}): {} texts, longest {}",
+            guest.fault,
+            shown.len(),
+            shown.iter().map(String::len).max().unwrap_or(0)
+        );
+        assert!(guest.fault.is_none());
+        // Display clipping does not hide Edit or replace its authoritative seed.
+        guest.deliver(Output::Activate(button_message(&guest, "Edit")));
+        guest.redraw(&props);
+        let mut root = guest.frame.root.clone().expect("editing tree");
+        let mut editor_source = None;
+        root.for_each_mut(&mut |node| {
+            if let wire::Node::Editor { text, .. } = node {
+                editor_source = Some(text.clone());
+            }
+        });
+        assert_eq!(editor_source.as_deref(), Some(text.as_str()));
+        // An oversized identity only hides rendering: it must not reseed or
+        // consume this draft. Returning to the same facts restores the editor.
+        let mut unavailable: serde_json::Value =
+            serde_json::from_slice(props.as_ref().unwrap()).unwrap();
+        unavailable["path"] = "x".repeat(20_000).into();
+        guest.redraw(&Some(display_budget::files(unavailable)));
+        assert!(
+            texts(&guest)
+                .iter()
+                .any(|line| line.starts_with("Too much display data."))
+        );
+        guest.redraw(&props);
+        guest.deliver(Output::Activate(button_message(&guest, "Save")));
+        guest.redraw(&props);
+        let saved = guest
+            .intents
+            .iter()
+            .find(|event| event.kind == "save")
+            .expect("save intent");
+        let payload: serde_json::Value = serde_json::from_str(&saved.detail).unwrap();
+        assert_eq!(payload["text"], text);
+        assert_eq!(payload["path"], "/shared/README.md");
+    }
+
+    /// `head_within` never cuts inside a char; the discussion budget keeps
+    /// the landing note whole and the newest notes.
+    #[test]
+    fn the_text_head_and_the_discussion_split_hold_their_budgets() {
+        assert_eq!(head_within("abc", 3), ("abc", false));
+        // "한" is 3 bytes: a 4-byte budget cuts before the second char
+        assert_eq!(head_within("한글", 4), ("한", true));
+        assert_eq!(head_within("한글", 6), ("한글", false));
+        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
+            author: String::new(),
+            meta: String::new(),
+            body: "x".repeat(bytes),
+            ..first_light_at(seq)
+        };
+        let landing = row(9, 100);
+        let notes = [row(1, 100), row(2, 100), row(3, 100)];
+        let (kept, clipped) = newest_within(&notes, 300usize.saturating_sub(text_bytes(&landing)));
+        assert_eq!(kept.iter().map(|m| m.seq).collect::<Vec<_>>(), [2, 3]);
+        assert!(clipped);
     }
 
     fn first_light_at(seq: i64) -> crate::backend::ChatMessage {
@@ -5283,9 +5617,9 @@ pub(crate) mod tests {
               "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
               "forge_item_merge_oid": "", "forge_item_source_oid": "",
               "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [],
-              "comment_cap_reached": false, "discussion": [], "linked_note": [],
+              "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
+              "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
+              "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
               "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
               "tree_entries": [], "tree_born": false, "tree_truncated": false,
               "tree_phase": "loading", "file_path": "", "file_text": "",
