@@ -57,19 +57,54 @@ fn the_unauthenticated_public_lane_reads_nothing() {
     });
 }
 
+/// A MODULE origin names the module in the middle of a follow-up, not a
+/// caller: no binding can name it, so it never gets past the shape gate.
 #[test]
-fn a_module_or_program_origin_is_not_a_reader_either() {
+fn a_module_origin_is_not_a_reader() {
     block_on(async {
         let scene = scene("c1").await;
-        for origin in [Origin::Module("chat".into()), Origin::Program(7)] {
-            let ctx = at(9, origin.clone());
-            let reply = read(&scene.module, &ctx, "alice", None, ProtectedRead::Participant).await;
+        let ctx = at(9, Origin::Module("chat".into()));
+        for build in EVERY_READ {
+            let reply = read(&scene.module, &ctx, "alice", None, build()).await;
             assert_eq!(
                 reply,
                 CollaborationReply::Denied(DenyReason::Unauthenticated),
-                "{origin:?} holds no key and reads as nobody"
+                "a module origin reads as nobody"
             );
         }
+    });
+}
+
+/// A PROGRAM origin is a principal a binding CAN name — dispatch's call lane
+/// mints it for an account identity holds as a program — so it gets past the
+/// shape gate and is then judged on committed state like any other caller.
+/// One that nobody bound reads nothing.
+#[test]
+fn an_unbound_program_account_reads_nothing() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let ctx = as_program(9, 7);
+        assert_eq!(
+            read(&scene.module, &ctx, "alice", None, ProtectedRead::Participant).await,
+            CollaborationReply::Denied(DenyReason::NotReader),
+            "the participant-wide record is the owner's"
+        );
+        assert_eq!(
+            read(
+                &scene.module,
+                &ctx,
+                "alice",
+                Some("c1"),
+                ProtectedRead::Events {
+                    conversation_id: "c1".into(),
+                    from_seq: 1,
+                    limit: 8,
+                },
+            )
+            .await,
+            CollaborationReply::Denied(DenyReason::NotReader),
+            "no binding names account 7, so it reads no conversation"
+        );
     });
 }
 
