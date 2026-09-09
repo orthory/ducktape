@@ -1126,6 +1126,15 @@ impl TerminalSessions {
             } => self.refused(&session, reason, detail),
             wire::Event::TermOutput { session, chunk_b64 } => self.output(&session, chunk_b64),
             wire::Event::TermEnded { session } => self.ended(&session),
+            // the collaboration plane's receipts. They ride the same link
+            // because the daemon holds one connection, and they belong to the
+            // node's collaboration half — which is a separate piece of work.
+            // Named rather than swept into a `_` so the day that half lands,
+            // this is a compile error at the exact seam it has to be wired
+            // into, and not three receipts silently going nowhere.
+            collaboration @ (wire::Event::MsgBound { .. }
+            | wire::Event::MsgBindRefused { .. }
+            | wire::Event::MsgDelivery { .. }) => unconsumed(&collaboration),
         }
     }
 
@@ -1535,6 +1544,33 @@ impl TerminalSessions {
             .expect("term sessions lock poisoned")
             .get_mut(id)
             .and_then(|live| live.reply.take())
+    }
+}
+
+/// a collaboration receipt reached a node with no collaboration half yet.
+///
+/// It is DROPPED, and said so: the daemon's delivery record is durable and the
+/// module holds the authoritative receipt, so nothing is lost by not consuming
+/// one here — but a receipt going nowhere silently is exactly the kind of gap
+/// that gets discovered from a delivery that never appears to advance.
+fn unconsumed(event: &wire::Event) {
+    let kind = match event {
+        wire::Event::MsgBound { .. } => "msg_bound",
+        wire::Event::MsgBindRefused { .. } => "msg_bind_refused",
+        wire::Event::MsgDelivery { .. } => "msg_delivery",
+        wire::Event::TermCreated { .. }
+        | wire::Event::TermRefused { .. }
+        | wire::Event::TermOutput { .. }
+        | wire::Event::TermEnded { .. } => "term",
+    };
+    if let Some(occurrences) = TERM_WARN.hit("collab_receipt_unconsumed") {
+        tracing::warn!(
+            target: "ducktape::collab",
+            reason = "collab_receipt_unconsumed",
+            event = kind,
+            occurrences,
+            "dropped a collaboration receipt: this node has no collaboration plane"
+        );
     }
 }
 
