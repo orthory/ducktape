@@ -280,3 +280,217 @@ pub fn drop_move(document: &Doc, line: usize, boundary: usize) -> EditorDecision
     lines.splice(landing..landing, block);
     finish(document, rebuilt(&lines, landing))
 }
+
+/// Menu state belongs to the guest snapshot. Proposed edits return a successor;
+/// callers adopt it only after Commit (or the read-only interaction callback).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Menu {
+    open: Option<Open>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Open {
+    kind: Kind,
+    selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Kind {
+    Slash {
+        line: usize,
+        strip: usize,
+        slashed: bool,
+    },
+    Block {
+        line: usize,
+    },
+    Turn {
+        line: usize,
+    },
+}
+
+pub struct MenuView {
+    /// None anchors at the caret; Some anchors at the specified document line.
+    pub line: Option<usize>,
+    pub items: Vec<(&'static str, &'static str)>,
+    pub selected: usize,
+}
+
+const BLOCK_ITEMS: &[(&str, &str)] = &[
+    ("turn", "Turn into…"),
+    ("duplicate", "Duplicate"),
+    ("move-up", "Move up"),
+    ("move-down", "Move down"),
+    ("delete", "Delete"),
+];
+
+impl Menu {
+    fn opened(kind: Kind) -> Self {
+        Self {
+            open: Some(Open { kind, selected: 0 }),
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.open = None;
+    }
+
+    pub fn current(&self, document: &Doc) -> Option<MenuView> {
+        let open = self.open.as_ref()?;
+        let (line, items) = match open.kind {
+            Kind::Slash {
+                line,
+                strip,
+                slashed,
+            } => (
+                None,
+                turn_items(slash_filter(document, line, strip, slashed)?),
+            ),
+            Kind::Block { line } => (Some(line), block_items(document, line)?),
+            Kind::Turn { line } => (Some(line), turn_items("")),
+        };
+        if items.is_empty() {
+            return None;
+        }
+        let selected = open.selected.min(items.len() - 1);
+        Some(MenuView {
+            line,
+            items,
+            selected,
+        })
+    }
+
+    pub fn block(&mut self, document: &Doc, line: usize) {
+        if document.line(line).is_some() && line > 0 {
+            *self = Self::opened(Kind::Block { line });
+        }
+    }
+
+    pub fn select(&mut self, document: &Doc, selected: usize) {
+        if let Some(view) = self.current(document)
+            && let Some(open) = self.open.as_mut()
+        {
+            open.selected = selected.min(view.items.len() - 1);
+        }
+    }
+
+    /// Called only for an accepted text edit. Caret/navigation and source
+    /// replacement call close instead; a paste containing '/' does not open.
+    pub fn after_edit(&mut self, document: &Doc, inserted_slash: bool) {
+        let kind = self.open.as_ref().map(|open| open.kind);
+        match kind {
+            None => self.after_closed_edit(document, inserted_slash),
+            Some(Kind::Slash { .. }) => self.retain_filter(document),
+            Some(Kind::Block { .. } | Kind::Turn { .. }) => self.close(),
+        }
+    }
+
+    fn after_closed_edit(&mut self, document: &Doc, inserted_slash: bool) {
+        if inserted_slash && let Some(strip) = document.cursor.position.column.checked_sub(1) {
+            let line = document.cursor.position.line as usize;
+            let strip = strip as usize;
+            if slash_filter(document, line, strip, true).is_some() {
+                *self = Self::opened(Kind::Slash {
+                    line,
+                    strip,
+                    slashed: true,
+                });
+            }
+        }
+    }
+
+    fn retain_filter(&mut self, document: &Doc) {
+        match self.current(document) {
+            Some(view) => self.select(document, view.selected),
+            None => self.close(),
+        }
+    }
+
+    pub fn plus(&self, document: &Doc, line: usize) -> (EditorDecision, Self) {
+        let decision = insert_below(document, line);
+        let next = match &decision {
+            EditorDecision::Apply { cursor, .. } => Self::opened(Kind::Slash {
+                line: cursor.position.line as usize,
+                strip: cursor.position.column as usize,
+                slashed: false,
+            }),
+            _ => self.clone(),
+        };
+        (decision, next)
+    }
+
+    pub fn pick(&self, document: &Doc, tag: &str) -> (EditorDecision, Self) {
+        let offered = self
+            .current(document)
+            .is_some_and(|view| view.items.iter().any(|item| item.0 == tag));
+        if !offered {
+            return (EditorDecision::Noop, self.clone());
+        }
+        let Some(open) = self.open.as_ref() else {
+            return (EditorDecision::Noop, self.clone());
+        };
+        match open.kind {
+            Kind::Slash {
+                line,
+                strip,
+                slashed,
+            } => (
+                turn_from_slash(document, line, strip, slashed, tag),
+                Self::default(),
+            ),
+            Kind::Turn { line } => (turn(document, line, tag), Self::default()),
+            Kind::Block { line } => self.pick_block(document, line, tag),
+        }
+    }
+
+    fn pick_block(&self, document: &Doc, line: usize, tag: &str) -> (EditorDecision, Self) {
+        if tag == "turn" {
+            return (EditorDecision::Noop, Self::opened(Kind::Turn { line }));
+        }
+        let decision = match tag {
+            "duplicate" => duplicate(document, line),
+            "move-up" => move_block(document, line, -1),
+            "move-down" => move_block(document, line, 1),
+            "delete" => delete(document, line),
+            _ => return (EditorDecision::Noop, self.clone()),
+        };
+        (decision, Self::default())
+    }
+}
+
+fn slash_filter(document: &Doc, line: usize, strip: usize, slashed: bool) -> Option<&str> {
+    let cursor = document.cursor.position;
+    if cursor.line as usize != line {
+        return None;
+    }
+    let text = document.line(line)?;
+    if slashed && !text.get(strip..)?.starts_with('/') {
+        return None;
+    }
+    text.get(strip.checked_add(usize::from(slashed))?..cursor.column as usize)
+}
+
+fn turn_items(filter: &str) -> Vec<(&'static str, &'static str)> {
+    let filter = filter.to_ascii_lowercase();
+    TURNS
+        .iter()
+        .filter(|(tag, label, _)| {
+            label.to_ascii_lowercase().contains(&filter) || tag.contains(&filter)
+        })
+        .map(|(tag, label, _)| (*tag, *label))
+        .collect()
+}
+
+fn block_items(document: &Doc, line: usize) -> Option<Vec<(&'static str, &'static str)>> {
+    let on_fence = document
+        .line(line)?
+        .trim_start_matches([' ', '\t'])
+        .starts_with("```");
+    Some(
+        BLOCK_ITEMS
+            .iter()
+            .copied()
+            .filter(|(tag, _)| !(on_fence && *tag == "turn"))
+            .collect(),
+    )
+}
