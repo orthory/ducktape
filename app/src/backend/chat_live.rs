@@ -155,6 +155,63 @@ struct Taken {
     generation: i64,
 }
 
+/// How many times a dropped output stream is re-dialed before the row keeps the
+/// failure it last reported and stops trying. The pending poll is the clock, so
+/// the attempts are one poll apart — a re-dial is never a second concurrent
+/// watcher for the same run.
+const MAX_OUTPUT_DIALS: u32 = 5;
+
+/// What the screen says about a run whose progress this device is not entitled
+/// to read. The run IS working — `runs` says so — and the card still carries the
+/// agent, the anchor and a Stop; it is the stdout that is out of reach.
+const OUTPUT_UNAVAILABLE: &str = "Working · progress unavailable from this device";
+
+/// One run's output watcher and how many times it has been dialed.
+struct Watcher {
+    handle: tokio::task::JoinHandle<()>,
+    dials: u32,
+}
+
+/// What the poll must do about one pending run's output watcher. ONE tagged
+/// value, because "is there an entry in the map" was the whole question before
+/// and it was the wrong one: a watcher whose socket dropped leaves a FINISHED
+/// handle in the map, and a `contains_key` reads that as "being watched" — so a
+/// single transient websocket failure left the run with no watcher for the rest
+/// of its life.
+#[derive(Debug, PartialEq)]
+enum Dial {
+    /// This device may not read a run's output at all. Never dialed, and never
+    /// re-dialed: it is an entitlement, not a transient failure.
+    Unreadable,
+    /// No watcher yet.
+    First,
+    /// A live watcher is on it — never a second one for one run.
+    Watching,
+    /// Its watcher finished early; dial again, this many times tried so far.
+    Again(u32),
+    /// It has been dialed [`MAX_OUTPUT_DIALS`] times. The row keeps the failure
+    /// its last attempt folded in, which is what the reader needs to see.
+    GaveUp,
+}
+
+/// Decide from the entitlement and the watcher's own LIVENESS — never from its
+/// presence in the map.
+fn dial_for(output_readable: bool, watcher: Option<(bool, u32)>) -> Dial {
+    if !output_readable {
+        return Dial::Unreadable;
+    }
+    let Some((finished, dials)) = watcher else {
+        return Dial::First;
+    };
+    if !finished {
+        return Dial::Watching;
+    }
+    if dials < MAX_OUTPUT_DIALS {
+        return Dial::Again(dials);
+    }
+    Dial::GaveUp
+}
+
 fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
     let rows = rows.lock().unwrap_or_else(|e| e.into_inner());
     LiveAgentNotice {
@@ -185,8 +242,18 @@ pub fn chat_live_agents(
             chain_id,
             generation,
         };
+        // WHETHER THIS DEVICE MAY READ A RUN'S STDOUT AT ALL, asked once. The
+        // node's `run-output:<id>` topic is `Admission::Workspace` BY DESIGN
+        // (`noded::stream`: "Write-open / read-gated is deliberate asymmetry"),
+        // so the proof is a token out of the node's own workspace directory —
+        // which an app dialing a REMOTE node does not have. That is not a
+        // transient failure and must not be re-dialed: the pending card still
+        // carries the agent, the room, the anchor and a Stop, and says plainly
+        // that the progress is out of reach. Reading it from a remote app needs
+        // a signed per-run read seam on the node that does not exist yet.
+        let output_readable = workspace_at(&rpc).is_some();
         let rows: Rows = Arc::default();
-        let mut watchers: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+        let mut watchers: BTreeMap<String, Watcher> = BTreeMap::new();
         let mut labels: BTreeMap<String, String> = BTreeMap::new();
         let ask = serde_json::json!("pending_runs");
         while !sender.is_closed() {
@@ -230,46 +297,76 @@ pub fn chat_live_agents(
                     .unwrap_or_default()
                     .to_string();
                 seen.push(dispatch.clone());
-                if watchers.contains_key(&dispatch) {
-                    continue;
-                }
-                let agent_id = record["agent_id"].as_str().unwrap_or_default();
-                let row = LiveAgentRow {
-                    channel_id: record["channel_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    anchor_seq: record["anchor_seq"].as_i64().unwrap_or(0),
-                    thread_root: record["thread_root"].as_i64().unwrap_or(0),
-                    run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
-                    agent: labels
-                        .get(agent_id)
-                        .cloned()
-                        .unwrap_or_else(|| agent_id.to_string()),
-                    status: "Starting".into(),
-                    ..LiveAgentRow::default()
-                };
-                rows.lock()
+                let dial = dial_for(
+                    output_readable,
+                    watchers
+                        .get(&dispatch)
+                        .map(|watcher| (watcher.handle.is_finished(), watcher.dials)),
+                );
+                // SEATED ONCE AND THEN LEFT ALONE: a re-dial must not discard
+                // the activity the dropped watcher already folded in, and an
+                // unwatched row must not be rewritten every poll.
+                let unseated = !rows
+                    .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(dispatch.clone(), row);
+                    .contains_key(&dispatch);
+                if unseated {
+                    let agent_id = record["agent_id"].as_str().unwrap_or_default();
+                    let row = LiveAgentRow {
+                        channel_id: record["channel_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        anchor_seq: record["anchor_seq"].as_i64().unwrap_or(0),
+                        thread_root: record["thread_root"].as_i64().unwrap_or(0),
+                        run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                        agent: labels
+                            .get(agent_id)
+                            .cloned()
+                            .unwrap_or_else(|| agent_id.to_string()),
+                        status: if output_readable {
+                            "Starting".into()
+                        } else {
+                            OUTPUT_UNAVAILABLE.into()
+                        },
+                        ..LiveAgentRow::default()
+                    };
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(dispatch.clone(), row);
+                }
+                let dials = match dial {
+                    Dial::Unreadable | Dial::Watching | Dial::GaveUp => continue,
+                    Dial::First => 1,
+                    Dial::Again(tried) => tried + 1,
+                };
                 watchers.insert(
                     dispatch.clone(),
-                    tokio::spawn(watch_live_output(
-                        taken.clone(),
-                        dispatch,
-                        rows.clone(),
-                        sender.clone(),
-                    )),
+                    Watcher {
+                        handle: tokio::spawn(watch_live_output(
+                            taken.clone(),
+                            dispatch,
+                            rows.clone(),
+                            sender.clone(),
+                        )),
+                        dials,
+                    },
                 );
             }
-            let gone: Vec<String> = watchers
+            // WHAT LEFT THE PENDING SET, read off the ROWS and not off the
+            // watchers. A device that may not read output has no watchers at
+            // all, so a sweep over their keys would have left every settled
+            // run's card standing on screen for the life of the session.
+            let gone: Vec<String> = rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .keys()
                 .filter(|dispatch| !seen.contains(dispatch))
                 .cloned()
                 .collect();
             for dispatch in gone {
-                if let Some(handle) = watchers.remove(&dispatch) {
-                    handle.abort();
+                if let Some(watcher) = watchers.remove(&dispatch) {
+                    watcher.handle.abort();
                 }
                 rows.lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -280,8 +377,8 @@ pub fn chat_live_agents(
             }
             tokio::time::sleep(PENDING_POLL).await;
         }
-        for handle in watchers.into_values() {
-            handle.abort();
+        for watcher in watchers.into_values() {
+            watcher.handle.abort();
         }
     });
     iced::futures::stream::unfold(receiver, |mut receiver| async move {
@@ -455,6 +552,61 @@ mod tests {
             },
         );
         assert!(row.answer_preview.len() <= MAX_LIVE_PREVIEW_BYTES + '…'.len_utf8());
+    }
+
+    /// A DROPPED OUTPUT STREAM IS RE-DIALED, and the presence of a handle is not
+    /// evidence that anything is watching. `contains_key` was the whole test
+    /// before, and a finished task stays in the map — so one transient websocket
+    /// failure left the run unwatched for the rest of its life while the card
+    /// sat on whatever status it had reached.
+    #[test]
+    fn a_finished_watcher_is_redialed_until_the_budget_runs_out() {
+        assert_eq!(
+            dial_for(true, None),
+            Dial::First,
+            "nothing is watching it yet"
+        );
+        assert_eq!(
+            dial_for(true, Some((false, 1))),
+            Dial::Watching,
+            "a live watcher is left alone — never a second one for one run"
+        );
+        assert_eq!(
+            dial_for(true, Some((true, 1))),
+            Dial::Again(1),
+            "its socket dropped, and the handle sitting in the map said nothing"
+        );
+        assert_eq!(
+            dial_for(true, Some((true, MAX_OUTPUT_DIALS - 1))),
+            Dial::Again(MAX_OUTPUT_DIALS - 1),
+            "the last attempt inside the budget"
+        );
+        assert_eq!(
+            dial_for(true, Some((true, MAX_OUTPUT_DIALS))),
+            Dial::GaveUp,
+            "past the budget the row keeps the failure it last reported"
+        );
+    }
+
+    /// AN APP WITH NO LOCAL WORKSPACE NEVER DIALS. The node gates
+    /// `run-output:<id>` on a token out of its own workspace directory
+    /// (`Admission::Workspace`, deliberately), so a Mac or any app pointed at a
+    /// REMOTE node cannot read a run's stdout. That is an entitlement, not a
+    /// flaky socket: re-dialing it five times would buy nothing but noise, and
+    /// the card still earns its place from the pending poll alone.
+    #[test]
+    fn a_device_that_may_not_read_output_never_dials_for_it() {
+        for watcher in [None, Some((false, 0)), Some((true, 2))] {
+            assert_eq!(
+                dial_for(false, watcher),
+                Dial::Unreadable,
+                "no state of a watcher makes an unentitled read dialable"
+            );
+        }
+        assert_eq!(
+            OUTPUT_UNAVAILABLE, "Working · progress unavailable from this device",
+            "and the row says so, rather than showing a run that looks stalled"
+        );
     }
 
     /// THE CONNECTION GUARD, and the endpoint is the WEAKEST third of it. A
