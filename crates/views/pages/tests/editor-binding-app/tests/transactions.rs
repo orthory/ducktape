@@ -1,5 +1,7 @@
-//! The actual generated guest, driven through its editor transaction handlers.
-//! Native editor layout/painting is owned by the runtime's separate host tests.
+#[path = "../../../../../../app/src/pages/guest_document.rs"]
+mod source_registry;
+// The actual generated guest, driven through its editor transaction handlers.
+// Native editor layout/painting is owned by the runtime's separate host tests.
 use pages_editor_binding_fixture::{boot_native, restore_native, snapshot_native, tick_native};
 use ui_lang_guest::{testing, wire};
 use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
@@ -12,6 +14,7 @@ struct Guest {
     root: Node,
     text: String,
     sequence: u64,
+    pending_origin: Option<(EditorTransactionId, wire::EditorRequestInput)>,
 }
 impl Guest {
     fn boot() -> Self {
@@ -21,6 +24,7 @@ impl Guest {
             root,
             text: "- 한글".into(),
             sequence: 0,
+            pending_origin: None,
         }
     }
     fn tick(&mut self, events: Vec<Event>) -> Frame {
@@ -88,13 +92,17 @@ impl Guest {
             "host would claim this key"
         );
         let id = self.id();
-        let frame = self.tick(vec![Event::EditorKeyRequest {
+        let input = wire::EditorRequestInput::Key {
+            key: state_key,
+            repeat: false,
+        };
+        self.pending_origin = Some((id.clone(), input.clone()));
+        let frame = self.tick(vec![Event::EditorRequest {
             handler: binding.on_request,
-            request: wire::EditorKeyRequest {
+            request: wire::EditorRequest {
                 id,
                 state,
-                key: state_key,
-                repeat: false,
+                input,
                 input_time_ms: self.sequence * 1000,
             },
         }]);
@@ -102,6 +110,50 @@ impl Guest {
             panic!("one decision: {frame:?}")
         };
         response.clone()
+    }
+    fn interaction(
+        &mut self,
+        action: wire::editor_presentation::EditorInteraction,
+    ) -> wire::EditorResponse {
+        let (state, binding) = self.editor();
+        let id = self.id();
+        let input = wire::EditorRequestInput::Interaction { action };
+        self.pending_origin = Some((id.clone(), input.clone()));
+        let frame = self.tick(vec![Event::EditorRequest {
+            handler: binding.on_request,
+            request: wire::EditorRequest {
+                id,
+                state,
+                input,
+                input_time_ms: self.sequence * 1000,
+            },
+        }]);
+        let [response] = frame.editor_decisions.as_slice() else {
+            panic!("one interaction decision: {frame:?}")
+        };
+        response.clone()
+    }
+    fn menu(&self) -> Option<wire::editor_presentation::EditorMenu> {
+        let frame = Frame {
+            root: Some(self.root.clone()),
+            ..Default::default()
+        };
+        let Some(Node::Editor { options, .. }) =
+            testing::find(&frame, "PagesEditorFixture/document")
+        else {
+            panic!("editor")
+        };
+        options
+            .presentation
+            .as_ref()
+            .and_then(|paint| paint.affordances.menu.clone())
+    }
+    fn cancel(&mut self, id: EditorTransactionId) {
+        let (state, binding) = self.editor();
+        self.tick(vec![Event::EditorTransaction {
+            handler: binding.on_event,
+            event: EditorTransactionEvent::Cancelled { id, state },
+        }]);
     }
     fn commit(
         &mut self,
@@ -119,10 +171,16 @@ impl Guest {
         after.byte_len = text.len() as u32;
         let patches = wire::editor_document::editor_changed_span(&self.text, &text)
             .expect("native-representable patch");
+        let origin = self
+            .pending_origin
+            .take()
+            .filter(|(pending, _)| pending == &id)
+            .map(|(_, input)| input);
         self.tick(vec![Event::EditorTransaction {
             handler: binding.on_event,
             event: EditorTransactionEvent::Commit {
                 id,
+                origin,
                 before,
                 after,
                 patches,
@@ -286,7 +344,16 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
         .iter()
         .find(|request| request.kind == "pages.document")
         .expect("document subscription");
-    let source: wire::editor_document::EditorDocumentRef = wire::decode(&request.payload).unwrap();
+    let identity: pages_editor_binding_fixture::document_source::DocumentIdentity =
+        wire::decode(&request.payload).unwrap();
+    let source = wire::editor_document::EditorDocumentRef {
+        document: identity.document.clone(),
+        reset: identity.reset,
+        text_revision: 0,
+        revision: 0,
+        cursor: EditorCursor::default(),
+        byte_len: MAX_EDITOR_DOCUMENT_BYTES as u32,
+    };
     let first_request = request.id;
     let text = format!(
         "{}{}",
@@ -319,7 +386,7 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
         .iter()
         .find(|request| request.kind == "pages.document")
         .expect("restored subscription asks from Begin");
-    assert_eq!(request.payload, wire::encode(&source));
+    assert_eq!(request.payload, wire::encode(&identity));
     let resumed_id = request.id;
     let id = EditorTransferId {
         instance: 2,
@@ -426,4 +493,164 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
         handler,
         message: EditorDocumentMessage::Acknowledged { id },
     }]);
+}
+
+#[test]
+fn actual_menu_edit_commits_after_accept_and_undo_survives_restore() {
+    use wire::editor_presentation::{EditorGutterButton, EditorInteraction, EditorMenuAnchor};
+    let mut guest = Guest::boot();
+    let plus = || EditorInteraction::Gutter {
+        line: 0,
+        button: EditorGutterButton::Plus,
+    };
+    let cancelled = guest.interaction(plus());
+    assert!(
+        guest.menu().is_none(),
+        "a proposal cannot open its future menu"
+    );
+    guest.cancel(cancelled.id);
+    assert_eq!(guest.text, "- 한글");
+    assert!(
+        guest.menu().is_none(),
+        "cancelled plus must not open a menu"
+    );
+    let accepted = guest.interaction(plus());
+    guest.apply(accepted);
+    assert_eq!(guest.text, "- 한글\n");
+    let menu = guest.menu().expect("accepted plus opens the caret menu");
+    assert_eq!(menu.anchor, EditorMenuAnchor::Caret);
+    assert_eq!(menu.items.len(), 12);
+    let pick = || EditorInteraction::MenuPick { tag: "h1".into() };
+    let cancelled = guest.interaction(pick());
+    assert!(
+        guest.menu().is_some(),
+        "a pending pick keeps its current menu"
+    );
+    guest.cancel(cancelled.id);
+    assert!(guest.menu().is_some(), "cancelled pick keeps the menu");
+    let accepted = guest.interaction(pick());
+    guest.apply(accepted);
+    assert_eq!(guest.text, "- 한글\n# ");
+    assert!(guest.menu().is_none());
+    let snapshot = snapshot_native().unwrap();
+    restore_native(&snapshot, false).unwrap();
+    guest.tick(vec![]);
+    let undo = guest.request(Key::Character("z".into()), false);
+    guest.apply(undo);
+    assert_eq!(
+        guest.text, "- 한글\n",
+        "pick was one undo group, not an authoritative reset"
+    );
+    let undo = guest.request(Key::Character("z".into()), false);
+    guest.apply(undo);
+    assert_eq!(guest.text, "- 한글");
+}
+
+#[test]
+fn fresh_guest_receives_latest_unsaved_source_but_restored_guest_keeps_its_editor() {
+    use source_registry::{DocumentIdentity, SourceStore};
+    let mut sources = SourceStore::default();
+    let identity = DocumentIdentity {
+        document: "network-a/page-a/source-1".into(),
+        reset: 1,
+    };
+    let original_marker = sources
+        .show(identity.clone(), "old saved text", at(0, 0))
+        .unwrap();
+    let text = "unsaved 한글 👍🏽";
+    let cursor = EditorCursor {
+        position: EditorPosition {
+            line: 0,
+            column: text.len() as u32,
+        },
+        selection: Some(EditorPosition { line: 0, column: 8 }),
+    };
+    let marker = sources.show(identity, text, cursor).unwrap();
+    assert_eq!(
+        marker, original_marker,
+        "typing must not replace the installed source identity"
+    );
+    let mut guest = Guest::boot();
+    let shown = Frame {
+        root: Some(guest.root.clone()),
+        ..Default::default()
+    };
+    let frame = guest.tick(testing::press(&shown, "Load document"));
+    let request = frame
+        .requests
+        .iter()
+        .find(|r| r.kind == "pages.document")
+        .unwrap();
+    assert_eq!(request.payload, marker);
+    let request_id = request.id;
+    let mut transfer = sources.transfer(&request.payload, 9, request_id).unwrap();
+    while let Some(frame) = transfer.next(&sources).unwrap() {
+        guest.tick(vec![testing::item(request_id, &wire::encode(&frame))]);
+    }
+    guest.text = text.into();
+    assert_eq!(guest.editor().0.cursor, cursor);
+    let frame = Frame {
+        root: Some(guest.root.clone()),
+        ..Default::default()
+    };
+    assert!(
+        testing::has_text(&frame, text),
+        "fresh instance must use unsaved host mirror, not original saved bytes"
+    );
+    let snapshot = snapshot_native().unwrap();
+    let before = guest.editor().0;
+    restore_native(&snapshot, false).unwrap();
+    let frame = guest.tick(vec![]);
+    assert_eq!(guest.editor().0, before);
+    assert!(
+        frame.requests.iter().all(|r| r.kind != "pages.document"),
+        "restore must not re-bootstrap a completed source"
+    );
+}
+
+#[test]
+fn source_change_during_transfer_keeps_the_previous_guest_document() {
+    use source_registry::{DocumentIdentity, SourceStore};
+    let mut sources = SourceStore::default();
+    let identity = DocumentIdentity {
+        document: "network-a/page-a/source-1".into(),
+        reset: 1,
+    };
+    sources
+        .show(identity, &"x".repeat(100_000), at(0, 0))
+        .unwrap();
+    let mut guest = Guest::boot();
+    let before = guest.editor().0;
+    let shown = Frame {
+        root: Some(guest.root.clone()),
+        ..Default::default()
+    };
+    let frame = guest.tick(testing::press(&shown, "Load document"));
+    let request = frame
+        .requests
+        .iter()
+        .find(|r| r.kind == "pages.document")
+        .unwrap();
+    let request_id = request.id;
+    let mut transfer = sources.transfer(&request.payload, 10, request_id).unwrap();
+    for _ in 0..2 {
+        let frame = transfer.next(&sources).unwrap().unwrap();
+        guest.tick(vec![testing::item(request_id, &wire::encode(&frame))]);
+    }
+    sources.clear(); // connection/navigation invalidates the live source immediately
+    let frame = transfer.next(&sources).unwrap().unwrap();
+    assert!(matches!(
+        frame,
+        wire::editor_document::EditorTransfer::Abort { .. }
+    ));
+    guest.tick(vec![testing::item(request_id, &wire::encode(&frame))]);
+    assert_eq!(guest.editor().0, before);
+    let frame = Frame {
+        root: Some(guest.root.clone()),
+        ..Default::default()
+    };
+    assert!(testing::has_text(
+        &frame,
+        "Document transfer could not be completed"
+    ));
 }

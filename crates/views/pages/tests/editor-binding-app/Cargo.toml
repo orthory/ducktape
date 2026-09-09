@@ -11,14 +11,16 @@ crate-type = ["cdylib", "rlib"]
 test = false
 
 [dependencies]
+design = { path = "../../../support/design" }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
 iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
 serde = { version = "1", features = ["derive"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
-ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97", default-features = false }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
+ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b", default-features = false }
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "fa96b3a69e051633794686c139f7de5827a6ce8b" }
 
 [profile.release]
 opt-level = 3
@@ -33,3 +35,16 @@ debug-assertions = true
 debug-assertions = true
 [profile.release.package.iced_renderer]
 debug-assertions = true
+
+[features]
+host-verification = ["dep:wasmtime"]
+
+[dependencies.wasmtime]
+version = "46"
+optional = true
+default-features = false
+features = ["cranelift", "runtime", "cache", "parallel-compilation", "component-model"]
+
+[[test]]
+name = "wasm"
+required-features = ["host-verification"]

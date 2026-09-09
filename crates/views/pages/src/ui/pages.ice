@@ -563,7 +563,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 // header. It is never disabled while connected: a page you
                 // can read is a page you can type in. It FILLS the column
                 // and scrolls itself.
-                extern page_document() #document
+                slot document
                 // Subpages: navigation, listed rather than typed.
                 if !empty(subpages)
                   // The 46px inset matches the editor's hover-gutter strip, so

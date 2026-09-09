@@ -38,7 +38,7 @@ fn page_autosave_gate_borrows_the_open_page_instead_of_reshaping_it() {
         }))
         .collect();
     let text = lines.join("\n");
-    app.page_editor = compose(&text);
+    app.page_text = (&text).to_string();
     // Clean: the at-rest state every unrelated update pays the gate in.
     app.page_saved_text = text;
     assert!(app.connected);

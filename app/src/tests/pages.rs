@@ -83,7 +83,7 @@ selected_message_seq > 0 || message_action != MessageAction.editing)"
     ));
     // A live resync must never install remote text over a buffer the user is
     // still typing in; the buffer and its dirty baseline move on ONE decision.
-    assert!(lifecycle.contains("page_editor = refreshed_page_editor("));
+    assert!(lifecycle.contains("page_text = refreshed_page_buffer("));
     assert!(lifecycle.contains("page_saved_text = resynced_saved"));
     // the comment rail is scoped to the PAGE it hangs off, so its draft
     // survives moving the cursor between blocks and dies with the page.
@@ -171,7 +171,7 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     app.active_page = "page".into();
     // The buffer is this page's — the tick refuses one that is not.
     app.buffer_page = "page".into();
-    app.page_editor = compose("Title\nfresh body");
+    app.page_text = ("Title\nfresh body").to_string();
     app.page_saved_text = "Title\nstale".into();
     app.block_autosave_status = AutosaveStatus::Saving;
 
@@ -183,7 +183,7 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     );
 
     app.block_autosave_status = AutosaveStatus::Idle;
-    app.page_editor = compose("Title\n```\nstill typing");
+    app.page_text = ("Title\n```\nstill typing").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
         app.block_autosave_status,
@@ -191,7 +191,7 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
         "fence guard"
     );
 
-    app.page_editor = compose("Title\n```\ndone\n```");
+    app.page_text = ("Title\n```\ndone\n```").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(app.block_autosave_status, AutosaveStatus::Saving);
 }
@@ -234,7 +234,7 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
     app.active_page = "page".into();
     app.buffer_page = "page".into();
     // she is mid-sentence; her line 0 is the OLD name and she never touched it.
-    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_text = ("Old Name\nbody mid-sentence").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     // WHAT THE TICK ACTUALLY SUBMITTED. The correction reads this, not the live
     // buffer, so leaving it at its default empty string would hand the baseline
@@ -297,14 +297,14 @@ fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
     app.connected = true;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
-    app.page_editor = compose("Notes\nhello");
+    app.page_text = ("Notes\nhello").to_string();
     app.page_saved_text = "Notes\nhello".into();
 
     // the tick submits what it can see.
     app.page_inflight_text = "Notes \nhello".into();
 
     // SHE FINISHES THE WORD while the save is in flight.
-    app.page_editor = compose("Notes A\nhello");
+    app.page_text = ("Notes A\nhello").to_string();
 
     // the save was a no-op — the trimmed title still matched the node.
     let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
@@ -347,7 +347,7 @@ fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
     app.connected = true;
     app.active_page = "page".into();
     app.buffer_page = "page".into();
-    app.page_editor = compose("Old Name\nbody typed on");
+    app.page_text = ("Old Name\nbody typed on").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     app.page_inflight_text = "Old Name\nbody typed".into();
 
@@ -407,7 +407,7 @@ fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
         "no load landed, so the buffer belongs to no page"
     );
 
-    app.page_editor = compose("h");
+    app.page_text = ("h").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
 
     // The tick must refuse: the buffer is not Beta's.
@@ -462,7 +462,7 @@ fn a_page_click_repaints_before_the_load_lands() {
 #[test]
 fn the_landing_document_installs_when_the_page_actually_moved() {
     let mut app = reading_alpha();
-    app.page_editor = compose("Alpha\nalpha body, still typing");
+    app.page_text = ("Alpha\nalpha body, still typing").to_string();
 
     let _ = app.__update(__DucktapeMessage::CloseDocTab("alpha".into()));
     assert_eq!(app.active_page, "beta", "the tab close moved the selection");
@@ -489,7 +489,7 @@ fn the_landing_document_installs_when_the_page_actually_moved() {
 #[test]
 fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     let mut app = reading_alpha();
-    app.page_editor = compose("Alpha\nalpha body, still typing");
+    app.page_text = ("Alpha\nalpha body, still typing").to_string();
 
     let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
         "alpha",
@@ -639,7 +639,7 @@ fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
     app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
     app.blocks = vec![page_block("b1", "page", "body")];
     // A CLEAN buffer: baseline and buffer agree, so the rebuild is allowed.
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
     let before = app.hydration_generation;
 
@@ -688,7 +688,7 @@ fn a_folded_rename_never_overwrites_a_dirty_buffer() {
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
     // DIRTY: she has typed since the last save.
-    app.page_editor = compose("Old Name\nbody mid-sentence");
+    app.page_text = ("Old Name\nbody mid-sentence").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -811,7 +811,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     // Someone inserts a block: the structural delta buys the debounced resync.
@@ -912,7 +912,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -1003,7 +1003,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
     app.active_page_title = "Doc".into();
     app.pages = vec![page_item("page", "Doc")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Doc\nbody");
+    app.page_text = ("Doc\nbody").to_string();
     app.page_saved_text = "Doc\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -1084,7 +1084,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
     app.active_page_title = "Old Name".into();
     app.pages = vec![page_item("page", "Old Name")];
     app.blocks = vec![page_block("b1", "page", "body")];
-    app.page_editor = compose("Old Name\nbody");
+    app.page_text = ("Old Name\nbody").to_string();
     app.page_saved_text = "Old Name\nbody".into();
 
     // The rename folds FIRST, then a structural delta buys the resync: the
@@ -1340,20 +1340,18 @@ fn block_comment_recovery_always_unlocks_mutations() {
 /// buffer down.
 #[test]
 fn an_armed_page_delete_answers_escape_and_seals_the_document() {
-    crate::pages::history::reset();
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.shell_tab = ShellTab::Pages;
     app.active_page = "alpha".into();
-    app.page_editor = compose("one");
-    crate::pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    app.page_text = ("one").to_string();
     app.page_delete_armed = true;
 
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
     assert_eq!(
-        app.page_editor.text(),
+        app.page_text.clone(),
         "one",
         "the scrim seals the document behind it"
     );
@@ -1365,6 +1363,5 @@ fn an_armed_page_delete_answers_escape_and_seals_the_document() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
-    assert_eq!(app.page_editor.text(), "");
-    crate::pages::history::reset();
+    assert_eq!(app.page_text.clone(), "one", "Undo belongs to the guest binding");
 }

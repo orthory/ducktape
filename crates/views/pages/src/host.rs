@@ -75,6 +75,9 @@ pub struct PageComment {
 /// `comment_seed` — a recovered draft taken up, a failed post handed back.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PagesProps {
+    pub document_source: Vec<u8>,
+    pub document_error: String,
+    pub commented_lines: Vec<i64>,
     pub dark: bool,
     pub connected: bool,
     pub loading: bool,
@@ -427,4 +430,14 @@ pub fn initials_of(name: &str) -> String {
 /// the reader's own text otherwise.
 pub fn seeded(moved: bool, seed: &str, draft: &str) -> String {
     if moved { seed } else { draft }.to_owned()
+}
+
+
+/// Only the accepted canonical reference crosses back. The app resolves its
+/// bytes from the matching host editor and keeps the ordinary save/CAS path.
+pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>) -> bool {
+    host::notify("pages.edited", &serde_json::to_vec(&crate::document_source::Accepted {
+        source, reference, navigation,
+    }).expect("accepted document metadata"));
+    true
 }

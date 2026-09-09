@@ -353,7 +353,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.message_action = MessageAction::Editing;
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
-    app.page_editor = compose("node a page body");
+    app.page_text = ("node a page body").to_string();
     app.page_saved_text = "node a page body".into();
     app.block_comments_open = true;
     app.block_comments_target = "same-id".into();

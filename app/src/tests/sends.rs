@@ -743,15 +743,8 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     let guard = body
         .find("  return if empty(escape_key)")
         .expect("the inert-press guard");
-    // The composer marks left this handler with the descent — the widget
-    // claims its own chord (ducktape-ui#711) — so the page buffer's undo/redo
-    // is the one take the subscription still performs.
-    let take = "page_editor = page_history_key(";
-    let at = body.find(take).expect(take);
-    assert!(
-        guard < at,
-        "`{take}…` takes the editor, so it must sit BELOW the inert-press guard"
-    );
+    assert!(guard > 0);
+    assert!(!body.contains("page_history_key("), "Pages owns undo in its guest binding");
 
     fn plain(code: iced::keyboard::key::Code, key: iced::keyboard::Key) -> __IceKeyPress {
         __IceKeyPress {
@@ -813,17 +806,15 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
 
     // The pages chord is the third take, so it is driven too.
     app.shell_tab = ShellTab::Pages;
-    app.page_editor = iced::widget::text_editor::Content::with_text("one");
-    crate::pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    app.page_text = ("one").to_string();
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
     assert_eq!(
-        app.page_editor.text(),
-        "",
-        "Cmd+Z on the pages tab still reaches the buffer"
+        app.page_text.clone(),
+        "one",
+        "the global handler cannot mutate the guest-owned undo buffer"
     );
-    crate::pages::history::reset();
 }
 
 /// A FAILED SEND HANDS THE WORDS BACK THROUGH THE PLATE, not silently into

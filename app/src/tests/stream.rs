@@ -899,7 +899,7 @@ fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
         message: "node blip".into(),
         committed: false,
     }));
-    app.page_editor = compose("h");
+    app.page_text = ("h").to_string();
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
         app.block_autosave_status,

@@ -18,6 +18,8 @@
 
 mod display_budget;
 
+pub(crate) mod pages_document;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -953,14 +955,8 @@ fn shell_terminal() -> &'static Mutex<Option<crate::backend::AgentTerminalSessio
 
 // ---------- the pages seat ----------
 
-/// The Pages tab: the facts the app holds, drawn by the `pages` view. The
-/// document is NOT among them — it is the app's editor, stashed for the
-/// `page_document` surface the view leaves a slot for (`crate::pages::surface`)
-/// and painted there by the host. Its intents come back one per act
-/// (`pages_intent`); the drafts the view holds cross only with the act that
-/// reads them, and `seed_rev` moving tells the view to take `page_draft` /
-/// `block_comment_draft` back as its own (a recovered comment, a refused
-/// post or create handed back).
+/// Pages supplies metadata and a stable source identity. Document bytes use
+/// bounded chunks, and accepted guest edits feed the existing app save buffer.
 #[allow(
     clippy::too_many_arguments,
     reason = "the Ice extern hands the screen's facts one by one"
@@ -991,7 +987,8 @@ pub fn pages_view(
     caret_comment_target: &str,
     active_thread_anchor: &str,
     orphaned_comment_drafts: &[String],
-    page_editor: &iced::widget::text_editor::Content,
+    page_text: &str,
+    buffer_page: &str,
     block_comments_open: bool,
     thread_total: i64,
     threads: &[crate::backend::PageCommentThread],
@@ -1003,13 +1000,16 @@ pub fn pages_view(
     comments_loading: bool,
     comments_has_more: bool,
 ) -> Element<'static, ModuleViewEvent> {
-    crate::pages::surface::show(
-        page_editor,
-        dark,
-        loading || !connected,
-        blocks,
-        commented_block_hits,
-    );
+    let source = if loading || active_page.is_empty() || buffer_page != active_page {
+        Ok(Vec::new())
+    } else {
+        pages_document::source(connection().lock().expect("views rpc").rev, network_chain_id, active_page, page_text)
+
+    };
+    let (source, source_error) = match source {
+        Ok(source) => (source, String::new()),
+        Err(error) => (Vec::new(), error.to_owned()),
+    };
     let autosave = match autosave {
         crate::AutosaveStatus::Idle => "idle",
         crate::AutosaveStatus::Saving => "saving",
@@ -1021,6 +1021,9 @@ pub fn pages_view(
         .map(|block| serde_json::json!({ "id": block.id, "title": block.text }))
         .collect();
     let props = serde_json::json!({
+        "document_source": source,
+        "document_error": source_error,
+        "commented_lines": crate::pages::commented_lines(blocks, commented_block_hits),
         "dark": dark,
         "connected": connected,
         "loading": loading,
@@ -1763,9 +1766,6 @@ fn surfaces_of(module: &str) -> Surfaces {
             }),
         );
     }
-    if module == "pages" {
-        surfaces.insert("page_document".into(), crate::pages::surface::provider());
-    }
     surfaces
 }
 
@@ -1995,6 +1995,7 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
         let mut connection = connection().lock().expect("views rpc");
         connection.rev += 1;
         connection.client = Some(client.clone());
+        pages_document::source_changed();
         connection.clone()
     };
     registry
@@ -2602,6 +2603,8 @@ struct Guest {
     /// The guest's `<module>.props` subscription, once it asked, and the
     /// props it was last given on it.
     props_subscription: Option<u64>,
+    pages_document: pages_document::Pending,
+    pages_instance: Option<String>,
     props_sent: Option<Vec<u8>>,
     /// Separates Files save acknowledgements across fresh guest instances.
     files_save_namespace: Option<String>,
@@ -3209,6 +3212,8 @@ impl Guest {
             pictures: Pictures::default(),
             surfaces: surfaces_of(module),
             props_subscription: None,
+            pages_document: None,
+            pages_instance: (module == "pages").then(|| crate::backend::fresh_operation_id("pages-view".into())),
             props_sent: None,
             files_save_namespace: (module == "files")
                 .then(|| crate::backend::fresh_operation_id("files-view".into())),
@@ -3306,6 +3311,7 @@ impl Guest {
             return false;
         }
         self.sync_props(props);
+        pages_document::drive(self);
         if self.staged {
             // a replacement's first tree is already here; only its
             // requests and cancels are still to route
@@ -3328,11 +3334,19 @@ impl Guest {
             }
         }
         for id in std::mem::take(&mut self.frame.cancels) {
+            if self
+                .pages_document
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+            {
+                self.pages_document = None;
+            }
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
         }
-        self.fault.is_none() && (self.frame.busy || !self.pending.is_empty())
+        self.fault.is_none()
+            && (self.frame.busy || !self.pending.is_empty() || self.pages_document.is_some())
     }
 
     /// Routes one request: the props subscription is answered from what the
@@ -3351,11 +3365,13 @@ impl Guest {
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
+            ("pages", "document") if own => pages_document::request(self, id, &payload),
             _ if own && operation == "props" => {
                 self.props_subscription = Some(id);
                 self.props_sent = None;
                 self.sync_props(props);
             }
+            ("pages", "edited") if own => pages_document::emit(self, id, &payload),
             _ if declared_intent => self.intents.push(ModuleViewEvent {
                 kind: operation.to_owned(),
                 detail: String::from_utf8_lossy(&payload).into_owned(),
@@ -4275,12 +4291,12 @@ pub(crate) mod tests {
     /// document slot the host paints — what the reader does in it comes back
     /// as the `edited` intent rather than going to the guest.
     #[test]
-    fn the_staged_pages_view_boots_takes_the_facts_and_leaves_the_document_to_the_host() {
+    fn the_staged_pages_view_boots_takes_the_facts_and_owns_the_document() {
         let Some(staged) = staged("pages") else {
             return;
         };
         let mut guest = Guest::load_from("pages", &staged).expect("the view loads");
-        assert!(guest.surfaces.contains_key("page_document"));
+        assert!(!guest.surfaces.contains_key("page_document"));
         guest.redraw(&None);
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
@@ -4296,7 +4312,7 @@ pub(crate) mod tests {
                 "missing {expected:?} in {shown:?}"
             );
         }
-        assert_eq!(surface_names(&guest), ["page_document"]);
+        assert!(surface_names(&guest).is_empty());
 
         guest.deliver(Output::Activate(button_message(&guest, "Beta")));
         guest.redraw(&props);
@@ -4308,19 +4324,6 @@ pub(crate) mod tests {
             }]
         );
 
-        // what the reader does in the host's document never reaches the guest
-        guest.deliver(Output::Surface {
-            handler: None,
-            value: wire::SurfaceValue::Unit,
-        });
-        assert!(guest.pending.is_empty());
-        assert_eq!(
-            guest.intents,
-            [ModuleViewEvent {
-                kind: "edited".into(),
-                detail: String::new(),
-            }]
-        );
         assert!(guest.fault.is_none());
     }
 
@@ -5123,6 +5126,7 @@ pub(crate) mod tests {
     fn pages_facts() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
+                "document_source": [], "document_error": "", "commented_lines": [],
                 "dark": false, "connected": true, "loading": false, "busy": false,
                 "page_link": "duck://pages/alpha",
                 "pages": [

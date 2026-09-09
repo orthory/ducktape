@@ -10,7 +10,7 @@
 //! TWO THINGS THE REFERENCE DOES THAT THIS DELIBERATELY DOES NOT:
 //!   * `pulldown-cmark` for the inline grammar. Pages must agree with the CHAT
 //!     renderer, not with CommonMark — a `_word_` that italicises in a message
-//!     has to italicise here. [`crate::editor::inline_marks`] IS that grammar,
+//!     has to italicise here. [`super::inline::inline_marks`] IS that grammar,
 //!     already tested against `chat::client::inline_spans`, so it is the parser
 //!     for both surfaces and no dependency is added.
 //!   * `iced_highlighter` language tokens inside fences. `PageBlock` carries no
@@ -25,9 +25,9 @@ use iced::advanced::text::{Highlight as TextHighlight, Highlighter, LineHeight};
 use iced::font::{Family, Style as FontStyle, Weight};
 use iced::{Border, Color, Font, Padding, Pixels};
 use std::ops::Range;
-use ui_lang_runtime::rich_text_editor::Format;
+use ui_lang_runtime::editor_format::Format;
 
-use crate::editor::{Inline, inline_marks};
+use super::inline::{Inline, inline_marks};
 
 pub const BODY_SIZE: f32 = 14.0;
 pub const BODY_LINE_HEIGHT: f32 = 1.65;
@@ -79,7 +79,7 @@ pub struct Caret {
 
 /// One painted run. `Marker` is the markdown syntax itself; every other variant
 /// is content wearing the shape that syntax declared.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mark {
     Title,
     Marker {
@@ -104,7 +104,7 @@ pub enum Mark {
 }
 
 /// The shape a line's prefix declared, plus the inline marks inside it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub heading: Option<u8>,
     pub quote: bool,
@@ -314,7 +314,7 @@ fn highlight(
         divider: prefix == Prefix::Divider,
         commented,
         done: ticked_done,
-        indent: super::sync::split_indent(line).0.min(u8::MAX.into()) as u8,
+        indent: super::indent::split_indent(line).0.min(u8::MAX.into()) as u8,
         ..Style::default()
     };
 
@@ -490,14 +490,20 @@ fn body_font(weight: Weight, style: FontStyle) -> Font {
     Font {
         weight,
         style,
-        ..crate::Ducktape::default_font()
+        ..Font {
+            family: Family::Name(design::fonts::FAMILY_UI),
+            ..Font::DEFAULT
+        }
     }
 }
 
 fn code_font() -> Font {
     Font {
         family: Family::Name(design::fonts::FAMILY_MONO),
-        ..crate::Ducktape::default_font()
+        ..Font {
+            family: Family::Name(design::fonts::FAMILY_UI),
+            ..Font::DEFAULT
+        }
     }
 }
 
