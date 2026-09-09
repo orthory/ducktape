@@ -635,6 +635,12 @@ pub fn copy_range_label(count: i64) -> String {
     }
 }
 
+pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    // Keep the channel list, divider and a readable conversation alongside it.
+    let maximum = (viewport - 236.0 - 6.0 - 320.0).clamp(280.0, 640.0);
+    (width + delta).clamp(280.0, maximum)
+}
+
 pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
     let below = (pointer_y - 4.0).max(0.0);
     let below_fits = below + 190.0 <= viewport_height;
