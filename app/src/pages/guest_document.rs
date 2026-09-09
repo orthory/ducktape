@@ -102,6 +102,16 @@ impl SourceStore {
         })
     }
 
+    /// Check the installed editor against the exact source bytes we served.
+    pub fn matches(&self, source: &[u8], text: &str) -> bool {
+        let Ok(identity) = wire::decode::<DocumentIdentity>(source) else {
+            return false;
+        };
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.identity == identity && current.text.as_ref() == text)
+    }
+
     pub fn clear(&mut self) {
         self.current = None;
     }

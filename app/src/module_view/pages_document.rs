@@ -228,10 +228,10 @@ pub(super) fn emit(guest: &mut Guest, id: u64, payload: &[u8]) {
 }
 
 /// Require one authored projection; never guess a component expansion path.
-fn projection<'a>(
-    root: &'a wire::Node,
+fn projection(
+    root: &wire::Node,
     matches: impl Fn(&wire::editor_document::EditorDocumentRef) -> bool,
-) -> Option<(&'a str, &'a wire::editor_document::EditorDocumentRef)> {
+) -> Option<(&str, &wire::editor_document::EditorDocumentRef)> {
     fn visit<'a>(
         node: &'a wire::Node,
         matches: &impl Fn(&wire::editor_document::EditorDocumentRef) -> bool,
@@ -294,6 +294,10 @@ pub(super) fn verify_installed(guest: &mut Guest) {
         return;
     };
     if document.reference() != *expected {
+        return;
+    }
+    let session = session().lock().unwrap();
+    if ack.source != session.marker || !session.sources.matches(&ack.source, document.text()) {
         return;
     }
     guest.pages_source.verified = Some((ack.source.clone(), expected.clone()));

@@ -5800,7 +5800,7 @@ pub(crate) mod tests {
         assert!(original.is_char_boundary(insertion));
         assert!(cursor.selection.is_none());
         let mut expected = original.clone();
-        expected.insert_str(insertion, "X");
+        expected.insert(insertion, 'X');
         guest.intents.clear();
         // Rebuild after the click: the native caret must survive the guest echo.
         ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
@@ -7344,13 +7344,14 @@ pub(crate) mod tests {
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
         join_all(connected(&client));
-        let locked = mounted.lock().unwrap();
-        assert!(
-            matches!(locked.slot, Slot::Failed(_)),
-            "{}",
-            slot_name(&locked.slot)
-        );
-        drop(locked);
+        {
+            let locked = mounted.lock().unwrap();
+            assert!(
+                matches!(locked.slot, Slot::Failed(_)),
+                "{}",
+                slot_name(&locked.slot)
+            );
+        }
 
         // the first block names the candidate the reconnect did not: it is
         // tried once under its own hash, and every block after it is held
@@ -7359,17 +7360,18 @@ pub(crate) mod tests {
         for _ in 0..5 {
             join_all(deployments_checked().await);
         }
-        let locked = mounted.lock().unwrap();
-        assert_eq!(
-            locked.generation, generation,
-            "a failed candidate was loaded again on every block"
-        );
-        assert!(
-            matches!(locked.slot, Slot::Failed(_)),
-            "the failure is still what the tab shows: {}",
-            slot_name(&locked.slot)
-        );
-        drop(locked);
+        {
+            let locked = mounted.lock().unwrap();
+            assert_eq!(
+                locked.generation, generation,
+                "a failed candidate was loaded again on every block"
+            );
+            assert!(
+                matches!(locked.slot, Slot::Failed(_)),
+                "the failure is still what the tab shows: {}",
+                slot_name(&locked.slot)
+            );
+        }
 
         // nothing is suppressed for good: once the gap is up the same
         // candidate is tried again, so a load that failed on the transport
@@ -7598,10 +7600,11 @@ pub(crate) mod tests {
         );
         // once its gap is up the candidate is tried again, and this time
         // its first tree draws
-        let mut locked = mounted.lock().unwrap();
-        let retry = locked.retry.as_mut().expect("B left a hold-off");
-        retry.next = Instant::now();
-        drop(locked);
+        {
+            let mut locked = mounted.lock().unwrap();
+            let retry = locked.retry.as_mut().expect("B left a hold-off");
+            retry.next = Instant::now();
+        }
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
