@@ -21,7 +21,8 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 
 const MODULE: &str = "collaboration";
-const TTL: u64 = collaboration::HEIGHT_LANE_MAX_DELIVERY_TTL;
+const TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
+const NETWORK: &str = "test-net";
 
 fn as_user(byte: u8, height: u64) -> BlockContext {
     BlockContext {
@@ -34,7 +35,7 @@ fn as_user(byte: u8, height: u64) -> BlockContext {
 fn msg(payload: CollaborationMsg) -> Msg {
     Msg {
         target: MODULE.into(),
-        payload: encode_msg(&payload),
+        payload: encode_msg(&collaboration::Request::new(NETWORK, payload)),
     }
 }
 
@@ -112,6 +113,7 @@ async fn genesis(context: commonware_runtime::deterministic::Context, prober: Pr
             "tasks",
             Box::new(store),
             TTL,
+            NETWORK,
         )),
         Box::new(identity_stub()),
         Box::new(tasks_stub()),

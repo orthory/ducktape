@@ -18,6 +18,7 @@
 //!   starting at sequence 1 never collide.
 
 pub use attribution::Actor as Party;
+use sdk::genesis_config::TimeUnit;
 use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -39,6 +40,10 @@ pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_LABEL_BYTES: usize = 256;
 /// Most participants one conversation roster holds.
 pub const MAX_ROSTER: usize = 64;
+/// Longest bound service key. Wide enough for every public key an
+/// `Origin::External` carries today and for a certificate-sized one, narrow
+/// enough that a binding record stays bounded.
+pub const MAX_SERVICE_KEY_BYTES: usize = 128;
 /// Undelivered messages one participant mailbox holds, checked at admission
 /// INCLUDING while that participant is disconnected. Replacing a binding does
 /// not reset it.
@@ -52,18 +57,25 @@ pub const MAX_UNDELIVERED_PER_SENDER: u64 = 64;
 /// Longest event page one [`ProtectedRead::Events`] answers.
 pub const MAX_PAGE_LIMIT: u64 = 64;
 
-/// The delivery-deadline ceiling for a network whose `consensus_time` is the
-/// block height — the validator and replica lanes, heartbeating at about one
-/// block a second, so this is roughly the spec's seven days.
+/// The spec's longest delivery deadline, in SECONDS: seven days.
 ///
-/// It is NOT a constant of this module. `consensus_time` carries a
-/// per-network unit (`noded::ConsensusTimeUnit`: height here, a millisecond
-/// epoch clock on the sim lane), and one number cannot mean seven days in
-/// both. So the ceiling is a CONSTRUCTOR parameter in consensus-time units,
-/// and a sender states an ABSOLUTE `expires_at` computed from the unit its
-/// node reports — the same split `bin/node`'s `expiry_from_clock` already uses
-/// for identity consents. This value is the height-lane binding of it.
-pub const HEIGHT_LANE_MAX_DELIVERY_TTL: u64 = 604_800;
+/// Seconds, because a deadline is a duration and `consensus_time` is not —
+/// it carries a per-network unit (block height on the validator and replica
+/// lanes, a millisecond epoch clock on the sim lane), so one raw number cannot
+/// mean seven days on both. The network states its unit as the `time_unit`
+/// genesis parameter, and [`max_delivery_ttl`] turns this duration into that
+/// lane's ceiling. A sender states an ABSOLUTE `expires_at` in the same unit —
+/// the split `bin/node`'s `expiry_from_clock` already uses for identity
+/// consents.
+pub const MAX_DELIVERY_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// [`MAX_DELIVERY_TTL_SECONDS`] in `unit`'s consensus-time units: the ceiling
+/// [`crate::Collaboration::new`] takes. Seven days is 604_800 height units at
+/// a one-block-per-second heartbeat and 604_800_000 millisecond ones, and
+/// neither overflows.
+pub const fn max_delivery_ttl(unit: TimeUnit) -> u64 {
+    MAX_DELIVERY_TTL_SECONDS * unit.per_second()
+}
 
 /// A credential's number inside one participant. Allocated monotonically and
 /// never reused, so a replaced binding's credential can never come back.
@@ -137,6 +149,50 @@ pub struct Conversation {
     pub updated_at: u64,
 }
 
+/// WHO a binding authorizes. A CLOSED set, and `Origin::Module` is
+/// deliberately not in it: a module origin names the module in the middle, not
+/// a principal, so admitting one would let every caller inside that module act
+/// as any participant that had ever bound it.
+///
+/// Each arm is matched against the ORIGIN the host minted, never against
+/// anything on the wire:
+///
+/// * [`BoundPrincipal::ServiceKey`] ← `Origin::External(key)`. The
+///   owner-issued, conversation-scoped key a local adapter signs with. It is
+///   deliberately NOT the owner's account key, so the messaging agent never
+///   needs that key on the device.
+/// * [`BoundPrincipal::Program`] ← `Origin::Program(account)`. Only the
+///   dispatch CALL lane mints that origin, and only after `identity` proves
+///   the account is `Control::Program { executor }` executed by the requesting
+///   module at an unmoved generation. So an agent reaching this module carries
+///   TWO independent authorizations — identity's, and the owner's binding —
+///   and neither of them is a module vouching for itself.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum BoundPrincipal {
+    ServiceKey(Vec<u8>),
+    Program(AccountNumber),
+}
+
+/// A principal as a READ exposes it. A service key is a credential its holder
+/// already has and nobody reads back, so it is reported by SHAPE only; a
+/// program account is a public number and is named.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PrincipalView {
+    ServiceKey,
+    Program(AccountNumber),
+}
+
+impl From<&BoundPrincipal> for PrincipalView {
+    fn from(principal: &BoundPrincipal) -> Self {
+        match principal {
+            BoundPrincipal::ServiceKey(_) => Self::ServiceKey,
+            BoundPrincipal::Program(account) => Self::Program(*account),
+        }
+    }
+}
+
 /// A participant's connection to ONE local provider session on ONE device, for
 /// ONE conversation. Two devices cannot both hold it: a replacement must name
 /// the credential it expects to replace.
@@ -150,12 +206,10 @@ pub struct Binding {
     /// across every conversation the participant is attached to: two devices
     /// both starting at sequence 1 write different dedup keys.
     pub credential: Credential,
-    /// The SCOPED SERVICE KEY this attachment authorizes: the public key the
-    /// attached service signs its sends, acknowledgements and reads with. It
-    /// is deliberately NOT the owner's account key — an attached session holds
-    /// a conversation-scoped credential, so the messaging agent never needs
-    /// the owner's key on the device.
-    pub service_key: Vec<u8>,
+    /// WHO this attachment authorizes to send, acknowledge and read under
+    /// [`Binding::credential`] — a scoped service key, or a program account
+    /// reached over the call lane. See [`BoundPrincipal`].
+    pub principal: BoundPrincipal,
     /// An opaque operator-chosen device label. NEVER a socket path, a URL, a
     /// provider session id or any credential — those stay local by
     /// construction.
@@ -166,14 +220,15 @@ pub struct Binding {
     pub detached: bool,
 }
 
-/// A binding as a READ exposes it — without the scoped service key. The key is
-/// a credential: its holder already has it, and nobody reads it back.
+/// A binding as a READ exposes it — never the scoped service key itself. The
+/// key is a credential: its holder already has it, and nobody reads it back.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BindingView {
     pub conversation_id: String,
     pub participant_id: String,
     pub credential: Credential,
+    pub principal: PrincipalView,
     pub device: String,
     pub attached_at: u64,
     pub detached: bool,
@@ -185,6 +240,7 @@ impl From<&Binding> for BindingView {
             conversation_id: binding.conversation_id.clone(),
             participant_id: binding.participant_id.clone(),
             credential: binding.credential,
+            principal: PrincipalView::from(&binding.principal),
             device: binding.device.clone(),
             attached_at: binding.attached_at,
             detached: binding.detached,
@@ -503,22 +559,22 @@ pub enum CollaborationMsg {
         role: Option<Role>,
     },
     /// Claim the participant's ONE input binding in this conversation and
-    /// authorize `service_key` under a FRESH credential.
+    /// authorize `principal` under a FRESH credential.
     /// `expected_credential` is the credential being replaced — 0 for the
     /// first attachment. A mismatch is refused, so two devices cannot both
     /// claim it. Replacing a binding on one conversation leaves the same
     /// participant's bindings on other conversations untouched.
     ///
-    /// The participant's owner issues this; the attached service then sends,
-    /// acknowledges and reads under `service_key` alone.
+    /// The participant's owner issues this; the attached principal then sends,
+    /// acknowledges and reads under its own origin alone — never the owner's.
     Bind {
         conversation_id: String,
         participant_id: String,
         device: String,
-        service_key: Vec<u8>,
+        principal: BoundPrincipal,
         expected_credential: Credential,
     },
-    /// Release the binding. The owner or the bound service key; the credential
+    /// Release the binding. The owner or the bound principal; the credential
     /// number is spent either way.
     Unbind {
         conversation_id: String,
@@ -711,12 +767,45 @@ pub enum CollaborationAssigned {
     },
 }
 
+/// One op, BOUND TO THE NETWORK it was authorized for.
+///
+/// A submitted frame's signed preimage is `(scheme, origin, seq, target,
+/// payload)` under the global namespace `ducktape:op-frame:v1`
+/// (`node::frame_preimage`) — it binds no chain id. So the same signed bytes
+/// are valid on every network where that key may submit, and a `Send` alice
+/// authorized on one network would otherwise replay on another where the same
+/// key is bound.
+///
+/// The binding therefore lives here, in the PAYLOAD the signature covers, and
+/// it wraps every op rather than the one that looked risky: a caller cannot
+/// leave it off the op that mattered. It protects every principal equally —
+/// an owner-credential send exactly as much as a scoped service key's or a
+/// program account's — because it constrains the BYTES, not the signer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    /// The `chain_id` of the network this op is for. Must equal the one this
+    /// module was composed with; both being empty is refused, never matched
+    /// (an empty id on both sides would collapse every network into one).
+    pub network: String,
+    pub op: CollaborationMsg,
+}
+
+impl Request {
+    pub fn new(network: impl Into<String>, op: CollaborationMsg) -> Self {
+        Self {
+            network: network.into(),
+            op,
+        }
+    }
+}
+
 // ---- codecs ---------------------------------------------------------------
 
-pub fn encode_msg(m: &CollaborationMsg) -> Vec<u8> {
+pub fn encode_msg(m: &Request) -> Vec<u8> {
     sdk::wire::encode(m)
 }
-pub fn decode_msg(b: &[u8]) -> Result<CollaborationMsg, String> {
+pub fn decode_msg(b: &[u8]) -> Result<Request, String> {
     sdk::wire::decode(b)
 }
 pub fn encode_query(q: &CollaborationQuery) -> Vec<u8> {

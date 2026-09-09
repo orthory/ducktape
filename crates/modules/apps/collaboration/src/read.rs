@@ -21,6 +21,13 @@
 //! query seam carrying `Origin::External(verified_key)` starts working here
 //! with no change to this file.
 //!
+//! An `Origin::Program(account)` reads on the same terms as a service key: it
+//! is a principal a binding can name (dispatch's call lane mints it only for
+//! an account identity holds as a program at an unmoved generation), so an
+//! agent reads exactly the conversation its participant's owner bound it to.
+//! `Origin::Module` reads NOTHING — it names the module in the middle of a
+//! follow-up, not a caller.
+//!
 //! What this is NOT: confidentiality. Committed module state is replicated in
 //! plaintext to every validator, which reads its own store directly. This
 //! bounds the RPC read lane.
@@ -32,7 +39,7 @@ use crate::interface::{
     Credential, DenyReason, EventBody, EventPage, Message, Participant, ProtectedRead, Role,
     SendState, MAX_PAGE_LIMIT,
 };
-use crate::registry::{live_binding, roster_role, signed_by};
+use crate::registry::{authenticates, live_binding, roster_role};
 use crate::store;
 
 /// how far the caller's credential reaches.
@@ -91,12 +98,17 @@ async fn authenticate(
     participant_id: &str,
     via: Option<&str>,
 ) -> Result<Result<Reader, DenyReason>, Error> {
-    // system is the unauthenticated public lane; a module or program origin
-    // holds no key. none of them may read as somebody.
-    let Origin::External(key) = origin else {
-        return Ok(Err(DenyReason::Unauthenticated));
+    // WHICH ORIGINS NAME A PRINCIPAL AT ALL. one match, no wildcard: `System`
+    // is the unauthenticated public lane and `Module` names the module in the
+    // middle of a follow-up, not a caller — neither may read as somebody.
+    let names_a_principal = match origin {
+        Origin::External(key) => !key.is_empty(),
+        // minted only by dispatch's call lane, for an account identity holds
+        // as a program at an unmoved generation.
+        Origin::Program(_) => true,
+        Origin::Module(_) | Origin::System => false,
     };
-    if key.is_empty() {
+    if !names_a_principal {
         return Ok(Err(DenyReason::Unauthenticated));
     }
     // an unknown participant and one the caller may not read answer the SAME
@@ -104,8 +116,15 @@ async fn authenticate(
     let Some(participant) = store::participant(staged, participant_id).await? else {
         return Ok(Err(DenyReason::NotReader));
     };
-    let actor = crate::actor_from_origin(ctx, identity).await?;
-    if crate::controls(&participant.owner, &actor, origin) {
+    // an origin that cannot resolve to an actor — a program account identity
+    // no longer holds, an unreachable identity sibling — is simply NOT the
+    // owner. it may still be a bound principal, and either way a read denies
+    // rather than erroring the query.
+    let owns = match crate::actor_from_origin(ctx, identity).await {
+        Ok(actor) => crate::controls(&participant.owner, &actor, origin),
+        Err(_) => false,
+    };
+    if owns {
         // the owner still reads a revoked participant's history — revocation
         // fences the future, it does not rewrite the past.
         let credential = participant.owner_credential;
@@ -126,7 +145,7 @@ async fn authenticate(
     let Some(binding) = live_binding(staged, via, &participant.id).await? else {
         return Ok(Err(DenyReason::NotReader));
     };
-    if !signed_by(origin, &binding.service_key) {
+    if !authenticates(origin, &binding.principal) {
         return Ok(Err(DenyReason::NotReader));
     }
     Ok(Ok(Reader {
