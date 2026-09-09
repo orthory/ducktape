@@ -4868,7 +4868,6 @@ dependencies = [
  "borsh",
  "capability",
  "chat",
- "collaboration",
  "commonware-cryptography",
  "commonware-runtime",
  "directory",
