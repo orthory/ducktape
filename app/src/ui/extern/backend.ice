@@ -541,6 +541,9 @@ extern crate::backend
   cancel_agent_run(rpc:str, password:str, run_id:str) -> bool ! AppError
   stream chat_live_agents(rpc:str, chain_id:str, generation:i64, signer_key:str) -> LiveAgentNotice
   pure live_agents_stale(notice:&LiveAgentNotice, rpc:&str, chain_id:&str, generation:i64, signer_key:&str) -> bool
+  // Test seam: Ice reads extern structs but cannot construct one, so a scenario
+  // that needs a run already on screen has no other way to seat one.
+  pure live_agent_row(channel_id:str, anchor_seq:i64, run_id:str, agent:str, status:str) -> LiveAgentRow
   search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError

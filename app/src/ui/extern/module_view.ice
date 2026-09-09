@@ -6,6 +6,9 @@
 // signs it. The guest sees no key, no endpoint and no clock.
 extern crate::module_view
   ModuleViewEvent(kind:str, detail:str)
+  // Test seam: Ice reads extern structs but cannot construct one, and a
+  // scenario that presses a view's control has no view to press it in.
+  pure view_event(kind:str, detail:str) -> ModuleViewEvent
   component governance_view(dark:bool, connected:bool, admin:bool, answered:bool, voting:&str, rows:&[ProposalRow]) -> ModuleViewEvent
   pure gov_intent(event:&ModuleViewEvent) -> GovIntent
   pure gov_event_proposal(event:&ModuleViewEvent) -> str

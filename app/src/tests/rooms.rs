@@ -1240,6 +1240,16 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
             "{file}: `{seam}` seats a key without naming it — the live agent \
              lane keys on `signer_key`"
         );
+        // AND DROPS THE ROWS IN THE SAME ARM. Re-keying the lane only fences
+        // what arrives next, and the new lane's first notice waits on a `runs`
+        // query — so a seam that moves the seat without clearing leaves the
+        // previous key's private output on screen for as long as that query
+        // takes, or forever if it never answers.
+        assert!(
+            arm.contains("live_agents = []"),
+            "{file}: `{seam}` moves the seat and leaves the previous key's rows \
+             on screen until a fresh notice arrives"
+        );
     }
     // and the teardown clears it, in the arm that retires the signer.
     let lock = node
@@ -1250,8 +1260,11 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
         .expect("the next intent")
         .0;
     assert!(
-        lock.contains("signer_key = \"\"") && lock.contains("lock_signer()"),
-        "node.ice: the arm that retires the signer must clear `signer_key` too: {lock}"
+        lock.contains("signer_key = \"\"")
+            && lock.contains("live_agents = []")
+            && lock.contains("lock_signer()"),
+        "node.ice: the arm that retires the signer must clear `signer_key` and \
+         the rows it could read: {lock}"
     );
     assert!(
         onboarding.contains("signer_key = \"\""),

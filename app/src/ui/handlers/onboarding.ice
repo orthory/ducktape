@@ -73,6 +73,7 @@ on unlock_submit(pw)
 on key_unlocked(pubkey)
   onboarding_error = ""
   signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -130,6 +131,7 @@ on confirm_phrase_submit(answer)
 on phrase_confirmed(pubkey)
   onboarding_error = ""
   signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -166,6 +168,7 @@ on key_restored(pubkey)
   restore_words = ""
   onboarding_error = ""
   signer_key = pubkey
+  live_agents = []
   parallel
     run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
     run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
@@ -744,6 +747,7 @@ on onboarding_reopened(id)
   hub_wallet_selected = ""
   // the seat goes with the network, and every lane keyed on it re-keys.
   signer_key = ""
+  live_agents = []
   parallel
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)

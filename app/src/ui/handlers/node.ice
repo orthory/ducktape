@@ -156,6 +156,7 @@ on settings_view_event(event)
     SettingsIntent.lock
       password = ""
       signer_key = ""
+      live_agents = []
       flow
         from run lock_signer()
         discard
@@ -275,6 +276,12 @@ on settings_unlocked(pubkey)
   // agent lane keys on it, because its entitlement to a run's output is this
   // key's and an unlock in place bumps no `connect_generation`.
   signer_key = pubkey
+  // AND THE ROWS GO WITH IT, HERE, not when the re-keyed lane next speaks. Its
+  // first notice arrives only after a `runs` query answers; a node that is slow,
+  // unreachable or refusing leaves the PREVIOUS key's private output on screen
+  // until it does. Re-keying the lane is not the same act as dropping what the
+  // old key read.
+  live_agents = []
 
 on settings_unlock_failed(cause)
   password = ""

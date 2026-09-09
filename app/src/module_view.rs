@@ -461,6 +461,14 @@ pub fn settings_view(
     )
 }
 
+/// Test seam: Ice reads extern structs but cannot construct one, and a scenario
+/// that presses a view's control has no view to press it in. The `kind` is the
+/// same string the guest emits, so a scenario names the act and not an enum the
+/// intent mapping could drift from.
+pub fn view_event(kind: String, detail: String) -> ModuleViewEvent {
+    ModuleViewEvent { kind, detail }
+}
+
 pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
     use crate::SettingsIntent as Intent;
     match event.kind.as_str() {
