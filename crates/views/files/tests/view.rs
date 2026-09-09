@@ -2,10 +2,15 @@
 //! and every write leaves as an intent carrying what the reader chose or
 //! typed, and a committed write the host reports consumes the name draft.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use files_view::host::{FilesProps, FsEntry, Name, Path, Save, SaveHistory, SaveReply};
 use files_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{edit, find, has_text, item, keys, press, texts, type_into};
-use ui_lang_guest::wire::{Frame, Node};
+use ui_lang_guest::wire::editor_document::{
+    EditorDocumentMessage, EditorTransferId, EditorTransferReceiver,
+};
+use ui_lang_guest::wire::{Event, Frame, Node};
 
 fn entry(key: i64, path: &str, kind: &str, size: i64) -> FsEntry {
     FsEntry {
@@ -218,14 +223,66 @@ fn a_save_queued_before_navigation_never_targets_the_new_file() {
     }
 }
 
-fn draft_text(frame: &Frame) -> String {
+/// The draft as the host reads it: the editor node carries only a document
+/// reference, so the bytes come through a document request on the editor's
+/// route, answered by a transfer that spans frames. Returns the frame the
+/// transfer ended on, which is the one later events address.
+fn draft(frame: &Frame) -> (String, Frame) {
+    static SERIAL: AtomicU64 = AtomicU64::new(1);
     let key = keys(frame)
         .into_iter()
         .find(|key| key.ends_with("/fs-editor"))
         .expect("editor present");
-    match find(frame, &key) {
-        Some(Node::Editor { text, .. }) => text.clone(),
-        other => panic!("expected editor, got {other:?}"),
+    let Some(Node::Editor {
+        document,
+        on_document,
+        ..
+    }) = find(frame, &key)
+    else {
+        panic!("expected editor, got {:?}", find(frame, &key));
+    };
+    let handler = *on_document;
+    let id = EditorTransferId {
+        instance: 1,
+        document: document.document.clone(),
+        reset: document.reset,
+        serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+        attempt: 0,
+    };
+    let mut receiver =
+        EditorTransferReceiver::new(id.clone(), document.clone()).expect("transfer target");
+    let request = EditorDocumentMessage::Request {
+        id: id.clone(),
+        target: document.clone(),
+    };
+    let mut frame = tick_native(vec![Event::EditorDocument {
+        handler,
+        message: request,
+    }]);
+    loop {
+        assert!(
+            !frame.editor_documents.is_empty(),
+            "the transfer stalled before completing"
+        );
+        let mut complete = None;
+        for message in &frame.editor_documents {
+            let EditorDocumentMessage::Transfer(transfer) = message else {
+                panic!("expected a transfer, got {message:?}");
+            };
+            if let Some(text) = receiver.receive(transfer).expect("transfer") {
+                complete = Some(text);
+            }
+        }
+        let Some(text) = complete else {
+            frame = tick_native(Vec::new());
+            continue;
+        };
+        let acknowledged = EditorDocumentMessage::Acknowledged { id };
+        let frame = tick_native(vec![Event::EditorDocument {
+            handler,
+            message: acknowledged,
+        }]);
+        return (text, frame);
     }
 }
 
@@ -238,7 +295,12 @@ fn parked_draft_returns_with_its_original_bytes_and_snapshot_after_reconnect() {
         .into_iter()
         .find(|key| key.ends_with("/fs-editor"))
         .unwrap();
-    let editing = tick_native(edit(&editing, &editor_key, "unsaved A — 한글"));
+    let editing = tick_native(edit(
+        &editing,
+        &editor_key,
+        &original.preview_text,
+        "unsaved A — 한글",
+    ));
     let stale_save = press(&editing, "Save");
     let other = FilesProps {
         network_scope: "network-b".into(),
@@ -258,7 +320,8 @@ fn parked_draft_returns_with_its_original_bytes_and_snapshot_after_reconnect() {
         ..facts()
     };
     let frame = tick_native(vec![item(subscription, &encoded(&returned))]);
-    assert_eq!(draft_text(&frame), "unsaved A — 한글");
+    let (kept_draft, frame) = draft(&frame);
+    assert_eq!(kept_draft, "unsaved A — 한글");
     let frame = tick_native(press(&frame, "Save"));
     let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
     assert_eq!(saved.context, returned.context);
@@ -276,7 +339,8 @@ fn parked_draft_returns_with_its_original_bytes_and_snapshot_after_reconnect() {
         ..returned
     };
     let frame = tick_native(vec![item(subscription, &encoded(&refused))]);
-    assert_eq!(draft_text(&frame), "unsaved A — 한글");
+    let (kept_draft, frame) = draft(&frame);
+    assert_eq!(kept_draft, "unsaved A — 한글");
     assert!(has_text(
         &frame,
         "The file changed elsewhere. Your edits are kept."
@@ -330,7 +394,8 @@ fn an_old_save_acknowledgement_cannot_consume_a_new_draft() {
         }
     });
     assert!(pending, "B remains pending");
-    assert_eq!(draft_text(&frame), "B source");
+    let (draft_of_b, _) = draft(&frame);
+    assert_eq!(draft_of_b, "B source");
 }
 
 #[test]
@@ -355,7 +420,12 @@ fn a_fresh_guest_never_consumes_the_previous_instances_save_reply() {
             .into_iter()
             .find(|key| key.ends_with("/fs-editor"))
             .unwrap();
-        let frame = tick_native(edit(&frame, &key, "new unsaved text"));
+        let frame = tick_native(edit(
+            &frame,
+            &key,
+            &initial.preview_text,
+            "new unsaved text",
+        ));
         let frame = tick_native(press(&frame, "Save"));
         let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
         assert_eq!(saved.namespace, "guest-new");
@@ -369,7 +439,8 @@ fn a_fresh_guest_never_consumes_the_previous_instances_save_reply() {
             has_text(&frame, "Save"),
             "a previous instance's success cannot consume the fresh draft"
         );
-        assert_eq!(draft_text(&frame), "new unsaved text");
+        let (fresh_draft, _) = draft(&frame);
+        assert_eq!(fresh_draft, "new unsaved text");
         let confirmed = FilesProps {
             save_reply: SaveReply {
                 namespace: saved.namespace,
@@ -394,7 +465,12 @@ fn lost_confirmation_never_discards_the_draft_or_waits_forever() {
         .into_iter()
         .find(|key| key.ends_with("/fs-editor"))
         .unwrap();
-    let frame = tick_native(edit(&frame, &key, "unsaved bytes after history overflow"));
+    let frame = tick_native(edit(
+        &frame,
+        &key,
+        &facts().preview_text,
+        "unsaved bytes after history overflow",
+    ));
     let frame = tick_native(press(&frame, "Save"));
     assert_eq!(one_intent(&frame).kind, "files.save");
     let overflowed = FilesProps {
@@ -405,7 +481,8 @@ fn lost_confirmation_never_discards_the_draft_or_waits_forever() {
         ..facts()
     };
     let frame = tick_native(vec![item(subscription, &encoded(&overflowed))]);
-    assert_eq!(draft_text(&frame), "unsaved bytes after history overflow");
+    let (kept_draft, frame) = draft(&frame);
+    assert_eq!(kept_draft, "unsaved bytes after history overflow");
     assert!(has_text(
         &frame,
         "Save confirmation is no longer available. Your edits are still here; check the file before saving again."
