@@ -753,7 +753,7 @@ fn build_command(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -
         // Explicit CLI selection wins over inherited CARGO_TARGET_DIR and
         // Cargo configuration, matching the artifact lookup below.
         .arg("--target-dir")
-        .arg(scratch.join("target"))
+        .arg("target")
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         // the encoded form wins over the plain one, but an inherited
         // `RUSTFLAGS` would be a confusing dead passenger.
@@ -911,19 +911,23 @@ mod tests {
 
     #[test]
     fn build_and_componentization_use_the_same_explicit_target_directory() {
-        let root = Path::new("/checkout/target/guest-builder/collaboration");
-        let command = build_command(root, "collaboration", GuestKind::Component, "");
-        let args: Vec<_> = command.get_args().collect();
-        let index = args
-            .iter()
-            .position(|arg| *arg == "--target-dir")
-            .expect("an inherited CARGO_TARGET_DIR must not redirect compilation");
-        let target = Path::new(args[index + 1]);
-        assert_eq!(
-            cdylib_path(root, "collaboration", GuestKind::Component),
-            target.join("wasm32-unknown-unknown/release/collaboration_component.wasm"),
-            "componentization must read the artifact just compiled"
-        );
+        for root in [
+            Path::new("/checkout/target/guest-builder/collaboration"),
+            Path::new("relative/scratch"),
+        ] {
+            let command = build_command(root, "collaboration", GuestKind::Component, "");
+            let args: Vec<_> = command.get_args().collect();
+            let index = args
+                .iter()
+                .position(|arg| *arg == "--target-dir")
+                .expect("an inherited CARGO_TARGET_DIR must not redirect compilation");
+            let target = command.get_current_dir().unwrap().join(args[index + 1]);
+            assert_eq!(
+                cdylib_path(root, "collaboration", GuestKind::Component),
+                target.join("wasm32-unknown-unknown/release/collaboration_component.wasm"),
+                "componentization must read the artifact just compiled"
+            );
+        }
     }
 
     fn scratch() -> tempfile::TempDir {
