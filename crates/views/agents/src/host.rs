@@ -426,6 +426,27 @@ pub fn empty_messaging() -> MessagingProps {
     MessagingProps::default()
 }
 
+/// What the pane on screen IS, stated where a reader lands rather than
+/// discovered by using it. The messages sentence is the one this whole panel
+/// exists not to blur: a delivery state is about an input interface, and
+/// nothing here reads it as work.
+pub fn pane_note(pane: &str) -> String {
+    match pane {
+        "messages" => {
+            "Messages are immutable records with a separate delivery state per recipient. A \
+             delivery state says what a provider's input interface did with an input — never \
+             that a model read it, understood it, acted on it, or that a task was claimed or \
+             finished."
+        }
+        _ => {
+            "The registry records who may act, what they may do, and under whose grant — every \
+             entry here is on chain. The acting itself is recorded separately, as each agent's \
+             runs."
+        }
+    }
+    .to_owned()
+}
+
 pub fn pick_int(condition: bool, then: i64, or: i64) -> i64 {
     if condition { then } else { or }
 }
@@ -604,7 +625,9 @@ pub fn delivery_note(state: &str) -> String {
             "The provider's input interface accepted it — not that the model read it, understood \
              it, acted on it, or claimed a task."
         }
-        "held" => "A provider or local approval barrier is holding it. This view does not override that.",
+        "held" => {
+            "A provider or local approval barrier is holding it. This view does not override that."
+        }
         "refused" => "Delivery was refused.",
         "expired" => {
             "The delivery deadline passed. Expiry stops further delivery; it does not undo work \
@@ -620,8 +643,13 @@ pub fn delivery_note(state: &str) -> String {
 }
 
 /// A delivery state whose plate warns rather than reassures.
+///
+/// Named by what it is NOT: the three states that are ordinary progress. A
+/// token this screen does not know — including the empty one the app leaves
+/// when it could not read the receipt — warns, because the alternative is a
+/// reassuring plate under a state nobody established.
 pub fn delivery_unsettled(state: &str) -> bool {
-    matches!(state, "held" | "refused" | "expired" | "delivery_unknown")
+    !matches!(state, "stored" | "queued" | "adapter_accepted")
 }
 
 pub fn kind_label(kind: &str) -> String {
@@ -642,9 +670,7 @@ pub fn body_note(body_bytes: i64, shown_bytes: i64) -> String {
     if shown_bytes >= body_bytes {
         return String::new();
     }
-    format!(
-        "showing {shown_bytes} of {body_bytes} bytes — the stored message is unchanged"
-    )
+    format!("showing {shown_bytes} of {body_bytes} bytes — the stored message is unchanged")
 }
 
 /// A message's task reference, and the limit on what this screen knows about
@@ -667,9 +693,7 @@ pub fn denied_note(denied: &str) -> String {
         "not_reader" => {
             "This device's key is neither this participant's owner nor its bound service key."
         }
-        "not_permitted" => {
-            "This participant is revoked, or is not on this conversation's roster."
-        }
+        "not_permitted" => "This participant is revoked, or is not on this conversation's roster.",
         "" => "",
         _ => "The network refused this read.",
     }
@@ -745,7 +769,9 @@ pub fn body_refusal(body: &str, max_body_bytes: i64) -> String {
     if max_body_bytes <= 0 || bytes <= max_body_bytes {
         return String::new();
     }
-    format!("this message is {bytes} bytes; the network admits at most {max_body_bytes} — shorten it")
+    format!(
+        "this message is {bytes} bytes; the network admits at most {max_body_bytes} — shorten it"
+    )
 }
 
 /// Whether the send button may fire: a roster seat that sends, a recipient, a

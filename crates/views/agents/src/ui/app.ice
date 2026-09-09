@@ -56,6 +56,7 @@ extern crate::host
   pure pick_skills(condition:bool, then:&[AgentSkill], or:&[AgentSkill]) -> [AgentSkill]
   pure valid_agent_id(id:&str) -> bool
   pure empty_messaging() -> MessagingProps
+  pure pane_note(pane:&str) -> str
   pure pick_int(condition:bool, then:i64, or:i64) -> i64
   pure delivery_label(state:&str) -> str
   pure delivery_note(state:&str) -> str
@@ -395,18 +396,11 @@ view
           px=22.0
           pt=12.0
           pb=10.0
-        if agents_pane == "register"
-          text "The registry records who may act, what they may do, and under whose grant — every entry here is on chain. The acting itself is recorded separately, as each agent's runs."
-            with
-              w=fill
-              size=12.0
-              @text-caption
-        if agents_pane == "messages"
-          text "Messages are immutable records with a separate delivery state per recipient. A delivery state says what a provider's input interface did with an input — never that a model read it, understood it, acted on it, or that a task was claimed or finished."
-            with
-              w=fill
-              size=12.0
-              @text-caption
+        text pane_note(agents_pane)
+          with
+            w=fill
+            size=12.0
+            @text-caption
       box
         with
           w=fill
@@ -1352,7 +1346,7 @@ view
                     size=12.0
                     @text-danger
             if messaging.loading
-              text "Reading…" #loading size=11.5 @text-hint @font-mono
+              text "Reading…" #loading size=11.5 @text-hint
             // WHO IS ON IT, WHAT THIS DEVICE HOLDS, AND WHAT IS QUEUED.
             if !empty(messaging.conversation) && messaging.may_read
               col w=fill gap=6.0

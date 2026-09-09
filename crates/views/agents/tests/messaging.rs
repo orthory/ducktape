@@ -7,8 +7,8 @@
 //! were the whole conversation.
 
 use agents_view::host::{
-    AgentsProps, MessagingBinding, MessagingMessage, MessagingProps, MessagingSeat, OpenConversation,
-    SendMessage,
+    AgentsProps, MessagingBinding, MessagingMessage, MessagingProps, MessagingSeat,
+    OpenConversation, SendMessage,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, keys, pick, press, texts, type_into};
@@ -55,7 +55,10 @@ fn open(messages: Vec<MessagingMessage>) -> MessagingProps {
         conversation: "standup".into(),
         network: "duck-1".into(),
         topic: "release review".into(),
-        roster: vec![seat("claude-a", "member", true), seat("codex-b", "member", false)],
+        roster: vec![
+            seat("claude-a", "member", true),
+            seat("codex-b", "member", false),
+        ],
         binding: MessagingBinding {
             present: true,
             device: "laptop".into(),
@@ -132,7 +135,10 @@ fn a_refused_read_is_a_refusal_and_never_an_empty_conversation() {
     };
     let (_, frame) = opened(refused);
     assert!(
-        has_text(&frame, "This participant is revoked, or is not on this conversation's roster."),
+        has_text(
+            &frame,
+            "This participant is revoked, or is not on this conversation's roster."
+        ),
         "{:?}",
         texts(&frame)
     );
@@ -141,7 +147,10 @@ fn a_refused_read_is_a_refusal_and_never_an_empty_conversation() {
     // THE COUNTEREXAMPLE: a panel that drew its empty-list plate whenever the
     // message list is empty would say this conversation has no messages in it.
     assert!(
-        !has_text(&frame, "No messages in the retained range this page covers."),
+        !has_text(
+            &frame,
+            "No messages in the retained range this page covers."
+        ),
         "a refusal was drawn as an empty conversation: {:?}",
         texts(&frame)
     );
@@ -156,15 +165,17 @@ fn an_accepted_delivery_never_claims_the_model_read_it_or_the_task_ran() {
     let (_, frame) = opened(open(vec![accepted]));
     assert!(has_text(&frame, "ACCEPTED"), "{:?}", texts(&frame));
     assert!(
-        texts(&frame).iter().any(|text| text.contains(
-            "not that the model read it, understood it, acted on it, or claimed a task"
-        )),
+        texts(&frame).iter().any(|text| text
+            .contains("not that the model read it, understood it, acted on it, or claimed a task")),
         "{:?}",
         texts(&frame)
     );
     // a task reference is a reference: this screen resolves no execution state
     assert!(
-        has_text(&frame, "task job-19 · attempt 2 · execution status not resolved here"),
+        has_text(
+            &frame,
+            "task job-19 · attempt 2 · execution status not resolved here"
+        ),
         "{:?}",
         texts(&frame)
     );
@@ -184,6 +195,30 @@ fn a_receipt_this_app_could_not_read_is_unknown_rather_than_stored() {
     assert!(!has_text(&frame, "STORED"), "{:?}", texts(&frame));
 }
 
+/// Which plate a state draws on, both sides of it. The plate itself is a
+/// colour the wire does not carry a claim about, so the classification is
+/// asserted where it is decided.
+#[test]
+fn only_ordinary_progress_draws_on_the_settled_plate() {
+    use agents_view::host::delivery_unsettled;
+    for settled in ["stored", "queued", "adapter_accepted"] {
+        assert!(
+            !delivery_unsettled(settled),
+            "{settled} is ordinary progress"
+        );
+    }
+    for unsettled in ["held", "refused", "expired", "delivery_unknown"] {
+        assert!(
+            delivery_unsettled(unsettled),
+            "{unsettled} needs the warning plate"
+        );
+    }
+    // the empty token is what the app leaves when it could not read the
+    // receipt: an unknown state must not reassure
+    assert!(delivery_unsettled(""));
+    assert!(delivery_unsettled("something_new"));
+}
+
 #[test]
 fn the_composer_sends_exactly_what_was_typed() {
     let (_, frame) = opened(open(vec![message(7, "queued")]));
@@ -193,7 +228,11 @@ fn the_composer_sends_exactly_what_was_typed() {
     let frame = tick_native(pick(&frame, &kind, "question"));
     // trailing space and newline included: a body is submitted as written
     let frame = tick_native(type_into(&frame, BODY_HINT, "please review \n"));
-    assert!(frame.requests.is_empty(), "a draft leaves nothing: {:?}", frame.requests);
+    assert!(
+        frame.requests.is_empty(),
+        "a draft leaves nothing: {:?}",
+        frame.requests
+    );
 
     let frame = tick_native(press(&frame, "Send message"));
     let intent = one_intent(&frame);
@@ -220,7 +259,11 @@ fn a_reply_names_the_message_it_answers_and_offers_the_result_kind() {
     assert_eq!(options.as_slice(), ["notice", "question", "task_request"]);
 
     let frame = tick_native(press(&frame, "Reply to this message"));
-    assert!(has_text(&frame, "replying to sequence 7"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "replying to sequence 7"),
+        "{:?}",
+        texts(&frame)
+    );
     let Some(Node::PickList { options, .. }) = ui_lang_guest::testing::find(&frame, &kind) else {
         panic!("no kind pick in {:?}", keys(&frame));
     };
@@ -233,8 +276,7 @@ fn a_reply_names_the_message_it_answers_and_offers_the_result_kind() {
     let frame = tick_native(pick(&frame, &recipient, "codex-b"));
     let frame = tick_native(type_into(&frame, BODY_HINT, "it does"));
     let frame = tick_native(press(&frame, "Send message"));
-    let sent: SendMessage =
-        serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
+    let sent: SendMessage = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
     assert_eq!(sent.reply_to, 7);
 }
 
@@ -254,7 +296,11 @@ fn a_refused_send_keeps_the_draft_and_an_admitted_one_clears_it() {
         ..open(vec![message(7, "queued")])
     };
     let frame = tick_native(vec![item(subscription, &register(refused))]);
-    assert!(has_text(&frame, "ship it"), "the draft was lost: {:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "ship it"),
+        "the draft was lost: {:?}",
+        texts(&frame)
+    );
     assert!(
         has_text(&frame, "the mailbox is full — retry later"),
         "{:?}",
@@ -321,7 +367,10 @@ fn a_history_gap_offers_a_resync_instead_of_a_page() {
 fn an_observer_seat_is_told_why_it_cannot_send() {
     let observing = MessagingProps {
         may_send: false,
-        roster: vec![seat("claude-a", "observer", true), seat("codex-b", "member", false)],
+        roster: vec![
+            seat("claude-a", "observer", true),
+            seat("codex-b", "member", false),
+        ],
         ..open(vec![message(7, "queued")])
     };
     let (_, frame) = opened(observing);
@@ -333,9 +382,17 @@ fn an_observer_seat_is_told_why_it_cannot_send() {
         "{:?}",
         texts(&frame)
     );
-    assert!(has_text(&frame, "observer · subscribes, does not send"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "observer · subscribes, does not send"),
+        "{:?}",
+        texts(&frame)
+    );
     // the messages still read — an observer subscribes
-    assert!(has_text(&frame, "does the review cover the migration?"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "does the review cover the migration?"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(!has_text(&frame, BODY_HINT), "{:?}", texts(&frame));
 }
 
@@ -359,8 +416,16 @@ fn opening_a_conversation_names_the_participant_and_conversation_the_reader_type
 #[test]
 fn the_panel_discloses_the_binding_the_roster_and_the_networks_visibility() {
     let (_, frame) = opened(open(vec![message(7, "queued")]));
-    assert!(has_text(&frame, "Bound to laptop under credential 4."), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "1 undelivered · 512 bytes queued"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "Bound to laptop under credential 4."),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, "1 undelivered · 512 bytes queued"),
+        "{:?}",
+        texts(&frame)
+    );
     assert!(has_text(&frame, "duck-1"), "{:?}", texts(&frame));
     assert!(
         has_text(
@@ -371,5 +436,9 @@ fn the_panel_discloses_the_binding_the_roster_and_the_networks_visibility() {
         texts(&frame)
     );
     // the page is shown against the conversation's own tip: no silent tail
-    assert!(has_text(&frame, "1 shown · sequences 7–7 of 12"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "1 shown · sequences 7–7 of 12"),
+        "{:?}",
+        texts(&frame)
+    );
 }
