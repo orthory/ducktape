@@ -227,28 +227,180 @@ pub(super) fn emit(guest: &mut Guest, id: u64, payload: &[u8]) {
     });
 }
 
-/// Match the accepted document, independent of component/slot expansion paths.
-fn editor_key<'a>(
+/// Require one authored projection; never guess a component expansion path.
+fn projection<'a>(
     root: &'a wire::Node,
-    reference: &wire::editor_document::EditorDocumentRef,
-) -> Option<&'a str> {
+    matches: impl Fn(&wire::editor_document::EditorDocumentRef) -> bool,
+) -> Option<(&'a str, &'a wire::editor_document::EditorDocumentRef)> {
     fn visit<'a>(
         node: &'a wire::Node,
-        reference: &wire::editor_document::EditorDocumentRef,
-        found: &mut Option<&'a str>,
+        matches: &impl Fn(&wire::editor_document::EditorDocumentRef) -> bool,
+        found: &mut Option<(&'a str, &'a wire::editor_document::EditorDocumentRef)>,
     ) -> bool {
         if let wire::Node::Editor { key, document, .. } = node
-            && document == reference
-            && found.replace(key.as_str()).is_some()
+            && matches(document)
+            && found.replace((key, document)).is_some()
         {
             return false;
         }
         node.children()
             .iter()
-            .all(|child| visit(child, reference, found))
+            .all(|child| visit(child, matches, found))
     }
     let mut found = None;
-    visit(root, reference, &mut found)
-        .then_some(found)
-        .flatten()
+    visit(root, &matches, &mut found).then_some(found).flatten()
+}
+fn editor_key<'a>(
+    root: &'a wire::Node,
+    reference: &wire::editor_document::EditorDocumentRef,
+) -> Option<&'a str> {
+    projection(root, |document| document == reference).map(|(key, _)| key)
+}
+
+#[derive(Default)]
+pub(super) struct InstalledSource {
+    pending: Option<crate::pages::guest_document::Installed>,
+    verified: Option<(Vec<u8>, wire::editor_document::EditorDocumentRef)>,
+}
+
+pub(super) fn installed(guest: &mut Guest, payload: &[u8]) {
+    let Ok(ack) = serde_json::from_slice::<crate::pages::guest_document::Installed>(payload) else {
+        return;
+    };
+    if ack.source.len() > 2048 || ack.source != session().lock().unwrap().marker {
+        return;
+    }
+    guest.pages_source.pending = Some(ack);
+    verify_installed(guest);
+}
+
+pub(super) fn verify_installed(guest: &mut Guest) {
+    let Some(ack) = &guest.pages_source.pending else {
+        return;
+    };
+    if ack.source != session().lock().unwrap().marker {
+        guest.pages_source.pending = None;
+        return;
+    }
+    let Some((key, expected)) = guest
+        .frame
+        .root
+        .as_ref()
+        .and_then(|root| projection(root, |reference| ack.matches(reference)))
+    else {
+        return;
+    };
+    let Some(document) = guest.inputs.editor_document(key) else {
+        return;
+    };
+    if document.reference() != *expected {
+        return;
+    }
+    guest.pages_source.verified = Some((ack.source.clone(), expected.clone()));
+    guest.pages_source.pending = None;
+}
+
+pub(super) fn retain_source(old: &Guest, fresh: &mut Guest) {
+    let Some((source, reference)) = &old.pages_source.verified else {
+        return;
+    };
+    let Some(root) = &old.frame.root else {
+        return;
+    };
+    let Some((key, _)) = projection(root, |document| {
+        document.document == reference.document && document.reset == reference.reset
+    }) else {
+        return;
+    };
+    let Some(current) = old.inputs.editor_document(key) else {
+        return;
+    };
+    let current = current.reference();
+    let Some(key) = fresh
+        .frame
+        .root
+        .as_ref()
+        .and_then(|root| editor_key(root, &current))
+    else {
+        return;
+    };
+    if fresh
+        .inputs
+        .editor_document(key)
+        .is_some_and(|document| document.reference() == current)
+    {
+        fresh.pages_source.verified = Some((source.clone(), current));
+    }
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct CurrentDocument {
+    pub ready: bool,
+    pub text: String,
+}
+
+/// Refresh the app's save mirror from the current instance, never an old source.
+pub fn current_page_document(network: String, page: String, fallback: String) -> CurrentDocument {
+    let unavailable = CurrentDocument {
+        ready: false,
+        text: fallback,
+    };
+    let registry = super::registry().lock().unwrap();
+    let connection = super::connection().lock().unwrap();
+    let Some(mounted) = registry.get("pages") else {
+        return CurrentDocument {
+            ready: true,
+            ..unavailable
+        };
+    };
+    let mounted = mounted.lock().unwrap();
+    let super::Slot::Ready(guest) = &mounted.slot else {
+        return unavailable;
+    };
+    let Some((source, associated)) = &guest.pages_source.verified else {
+        return unavailable;
+    };
+    let mut session = session().lock().unwrap();
+    if session.context.as_ref()
+        != Some(&Context {
+            connection: connection.rev,
+            network,
+            page,
+        })
+        || &session.marker != source
+    {
+        return unavailable;
+    }
+    let Some((key, _)) = guest.frame.root.as_ref().and_then(|root| {
+        projection(root, |document| {
+            document.document == associated.document && document.reset == associated.reset
+        })
+    }) else {
+        return unavailable;
+    };
+    let Some(document) = guest.inputs.editor_document(key) else {
+        return unavailable;
+    };
+    let reference = document.reference();
+    if reference.document != associated.document || reference.reset != associated.reset {
+        return unavailable;
+    }
+    let Ok(identity) = wire::decode(source) else {
+        return unavailable;
+    };
+    if session
+        .sources
+        .show(identity, document.text(), reference.cursor)
+        .is_err()
+    {
+        return unavailable;
+    }
+    CurrentDocument {
+        ready: true,
+        text: if document.text() == unavailable.text {
+            unavailable.text
+        } else {
+            document.text().to_owned()
+        },
+    }
 }

@@ -3161,6 +3161,7 @@ dependencies = [
  "ui-lang-build",
  "ui-lang-guest",
  "ui-lang-runtime",
+ "ui-lang-wire",
 ]
 
 [[package]]

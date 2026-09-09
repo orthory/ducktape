@@ -447,3 +447,21 @@ pub fn edited(source: Vec<u8>, reference: Vec<u8>, navigation: Vec<u8>) -> bool 
     );
     true
 }
+
+/// This notification binds the app source to the installed editor revision.
+pub fn installed(document: &ui_lang_guest::Editor, source: Vec<u8>) -> bool {
+    let state = document.state_view();
+    host::notify(
+        "pages.installed",
+        &serde_json::to_vec(&crate::document_source::Installed {
+            source,
+            reset: state.reset,
+            revision: state.revision,
+            text_revision: state.text_revision,
+            byte_len: state.text.len() as u32,
+            cursor: state.cursor,
+        })
+        .expect("installed document metadata"),
+    );
+    true
+}

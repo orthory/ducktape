@@ -8,7 +8,7 @@ use wire::editor_document::{
 
 #[path = "../../../crates/views/pages/src/document_source.rs"]
 mod identity;
-pub use identity::{Accepted, CommentMark, DocumentIdentity, Navigation};
+pub use identity::{Accepted, CommentMark, DocumentIdentity, Installed, Navigation};
 
 #[derive(Default)]
 pub struct SourceStore {

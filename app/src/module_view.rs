@@ -2437,6 +2437,7 @@ fn spawn_load(
                     log_source(module, fresh.hash.as_ref(), "Failed", generation, reason);
                     return;
                 }
+                pages_document::retain_source(old, &mut fresh);
                 fresh.pictures = std::mem::take(&mut old.pictures);
                 if let Some(root) = &mut fresh.frame.root {
                     fresh.pictures.adopt(root);
@@ -2713,6 +2714,7 @@ struct Guest {
     /// props it was last given on it.
     props_subscription: Option<u64>,
     pages_document: pages_document::Pending,
+    pages_source: pages_document::InstalledSource,
     pages_instance: Option<String>,
     props_sent: Option<Vec<u8>>,
     /// Separates Files save acknowledgements across fresh guest instances.
@@ -3363,6 +3365,7 @@ impl Guest {
             surfaces: surfaces_of(module),
             props_subscription: None,
             pages_document: None,
+            pages_source: Default::default(),
             pages_instance: (module == "pages")
                 .then(|| crate::backend::fresh_operation_id("pages-view".into())),
             props_sent: None,
@@ -3529,6 +3532,7 @@ impl Guest {
                 self.sync_props(props);
             }
             ("pages", "edited") if own => pages_document::emit(self, id, &payload),
+            ("pages", "installed") if own => pages_document::installed(self, &payload),
             _ if declared_intent => self.intents.push(ModuleViewEvent {
                 kind: operation.to_owned(),
                 detail: String::from_utf8_lossy(&payload).into_owned(),
@@ -3644,6 +3648,7 @@ impl Guest {
                     }
                 }
                 self.frame = frame;
+                pages_document::verify_installed(self);
             }
             Err(trap) => {
                 let reason = panic_message(&mut self.store).unwrap_or(trap);
@@ -5856,18 +5861,9 @@ pub(crate) mod tests {
             .unwrap()
             .clone();
         mounted.lock().unwrap().slot = Slot::Ready(Box::new(guest));
-        let accepted = pages_document::accept_page_document(
-            delayed.clone(),
-            "network-a".into(),
-            "alpha".into(),
-        );
-        assert!(accepted.accepted);
+        // Hold the edit intent: the app mirror has not observed these words.
         assert_eq!(
-            accepted.text, expected,
-            "typing did not retain the clicked caret"
-        );
-        assert_eq!(
-            pages_document::source(connection, "network-a", "alpha", &accepted.text).unwrap(),
+            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
             source,
             "autosave echo must not replace the guest document source"
         );
@@ -5902,7 +5898,7 @@ pub(crate) mod tests {
                 .editor_document(&editor_key)
                 .unwrap()
                 .text(),
-            accepted.text
+            expected
         );
         {
             let mut locked = mounted.lock().unwrap();
@@ -5913,6 +5909,7 @@ pub(crate) mod tests {
                 .inputs
                 .retain_restored_projections(&old.inputs, successor.frame.root.as_ref().unwrap())
                 .unwrap();
+            pages_document::retain_source(old, &mut successor);
             locked.slot = Slot::Ready(Box::new(successor));
         }
         let refused =
@@ -5929,18 +5926,67 @@ pub(crate) mod tests {
         settle(restored, &props);
         assert_eq!(
             restored.inputs.editor_document(&editor_key).unwrap().text(),
-            accepted.text
+            expected
         );
         assert!(
             restored.pages_document.is_none(),
             "completed source was retransferred after restore"
         );
         drop(locked);
+        let make_app = || {
+            let (mut app, _) = crate::Ducktape::__boot();
+            app.connected = true;
+            app.loading = false;
+            app.network_chain_id = "network-a".into();
+            app.active_page = "alpha".into();
+            app.buffer_page = "alpha".into();
+            app.page_text = original.clone();
+            app.page_saved_text = original.clone();
+            app.page_inflight_text = original.clone();
+            app.block_autosave_status = crate::AutosaveStatus::Saving;
+            app
+        };
+        let mut refused_app = make_app();
+        let _ = refused_app.__update(crate::__DucktapeMessage::PageDocumentSaved(
+            crate::backend::DocumentSaveResult {
+                written: false,
+                refusal: "The submitted edit was refused".into(),
+                document: original.clone(),
+                data: crate::backend::PagesData {
+                    pages: Vec::new(),
+                    blocks: Vec::new(),
+                    active_page: "alpha".into(),
+                    active_page_title: "한글 👍🏽".into(),
+                    active_page_parent: String::new(),
+                    comment_thread_total: 0,
+                    commented_block_hits: Vec::new(),
+                },
+            },
+        ));
+        assert_eq!(
+            refused_app.page_text, expected,
+            "late refusal rolled back unobserved canonical typing"
+        );
+        assert_eq!(
+            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
+            source,
+            "refusal replaced the source despite newer canonical typing"
+        );
+        let mut polled_app = make_app();
+        let _ = polled_app.__update(crate::__DucktapeMessage::PageAutosaveTick);
+        assert_eq!(
+            polled_app.page_text, expected,
+            "restored edit never reached autosave without another key"
+        );
+        assert_eq!(
+            polled_app.page_inflight_text, original,
+            "the existing write was replaced"
+        );
         let mut fresh = Guest::load_from("pages", &path).unwrap();
         settle(&mut fresh, &props);
         assert_eq!(
             fresh.inputs.editor_document(&editor_key).unwrap().text(),
-            accepted.text,
+            expected,
             "fresh guest bootstrap discarded unsaved edits"
         );
         let mut locked = mounted.lock().unwrap();
@@ -5974,6 +6020,19 @@ pub(crate) mod tests {
             original,
             "native Undo after no-init restore must preserve guest history"
         );
+        drop(locked);
+        pages_document::source_changed();
+        pages_document::source(connection, "network-a", "alpha", "replacement source").unwrap();
+        let deferred = pages_document::current_page_document(
+            "network-a".into(),
+            "alpha".into(),
+            "new mirror".into(),
+        );
+        assert!(
+            !deferred.ready,
+            "old canonical editor was treated as a newly installed source"
+        );
+        assert_eq!(deferred.text, "new mirror");
     }
 
     fn pages_facts() -> Option<Vec<u8>> {

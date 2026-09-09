@@ -556,15 +556,11 @@ fn block_comments_dock_a_rail_beside_the_document() {
     // thread opened with the page id is refused by the node.
     assert!(handlers.contains("on open_block_comment_thread(event)"));
     assert!(handlers.contains("let target = event_text(event, \"target\")"));
-    // The document wears its comment story: washes from the load, resolve
-    // available from the open thread. The editor is handed the BLOCKS and the
-    // raw hit list rather than a precomputed line set, because the chip in the
-    // margin spells how many threads sit on the line and the count is the
-    // repetition in `commented_block_hits` — a precomputed `[i64]` of lines
-    // has already thrown it away.
-    // The editor is the app's, painted by the host into the view's slot
-    // (`crate::pages::surface`) with the blocks and the raw hit list.
-    assert!(pages.contains("extern page_document() #document"));
+    // The guest editor shares the screen's document slot and keeps comment
+    // counts in its declarative presentation, beside the existing rail.
+    let guest = inlined(include_str!("../../../crates/views/pages/src/ui/app.ice"));
+    assert!(guest.contains("editor #document <-> document -> document_committed _"));
+    assert!(guest.contains("document_marks = next.comment_marks"));
     let view = inlined(include_str!("../ui/view.ice"));
     assert!(view.contains(", blocks, commented_block_hits, caret_comment_target,"));
     assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
@@ -1363,5 +1359,9 @@ fn an_armed_page_delete_answers_escape_and_seals_the_document() {
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
-    assert_eq!(app.page_text.clone(), "one", "Undo belongs to the guest binding");
+    assert_eq!(
+        app.page_text.clone(),
+        "one",
+        "Undo belongs to the guest binding"
+    );
 }

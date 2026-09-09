@@ -548,7 +548,9 @@ on pages_updated(next)
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -594,7 +596,9 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let page_install = (buffer_page != next.active_page || observed.ready) && install_decision(page_text, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -729,6 +733,9 @@ on page_autosave_tick
   // had: the page the reader never got to see would be destroyed by the act of
   // failing to open it.
   return if active_page != buffer_page
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  return if !observed.ready
   // One op chain at a time: a multi-op save routinely outlives the 900ms
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
@@ -769,7 +776,9 @@ on page_document_saved(next)
   // since the tick submitted. Otherwise the buffer is kept (the newest words
   // must survive), the baseline moves to the node's text, and the still-dirty
   // buffer re-plans on the next tick with the refusal line explaining why.
-  let untouched = page_text == page_inflight_text
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let untouched = observed.ready && page_text == page_inflight_text
   page_text = rolled_back_text(page_text, untouched, next.document)
   // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
   // round trip, and `untouched` above exists because of it. Adopting her

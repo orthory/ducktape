@@ -26,3 +26,23 @@ pub struct CommentMark {
     pub line: i64,
     pub count: i64,
 }
+
+/// A source installation is acknowledged without copying document bytes.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Installed {
+    pub source: Vec<u8>,
+    pub reset: u64,
+    pub revision: u64,
+    pub text_revision: u64,
+    pub byte_len: u32,
+    pub cursor: ui_lang_wire::EditorCursor,
+}
+impl Installed {
+    pub fn matches(&self, reference: &ui_lang_wire::editor_document::EditorDocumentRef) -> bool {
+        self.reset == reference.reset
+            && self.revision == reference.revision
+            && self.text_revision == reference.text_revision
+            && self.byte_len == reference.byte_len
+            && self.cursor == reference.cursor
+    }
+}

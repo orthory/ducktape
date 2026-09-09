@@ -594,8 +594,8 @@ extern crate::backend
   // A live resync replaces the buffer ONLY when it is clean and the node's
   // text differs; both read the same decision so buffer and baseline move
   // together.
-  sync refreshed_page_buffer(document:str, title:str, blocks:[PageBlock], saved:str) -> str
-  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str) -> str
+  sync refreshed_page_buffer(document:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
+  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
   pure saved_baseline(written:bool, canonical:str, submitted:str) -> str
   pure baseline_at_submitted_title(canonical:str, submitted:str) -> str
   pure install_decision(text:str, current_page:str, next_page:str, saved:str, canonical:str) -> bool

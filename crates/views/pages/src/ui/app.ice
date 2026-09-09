@@ -23,6 +23,7 @@ extern crate::host
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
   pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
+  pure installed(document:&editor, source:bytes) -> bool
   pure toggle_create() -> bool
   pure create(title:&str, comment_draft:&str) -> bool
   pure choose(id:&str, comment_draft:&str) -> bool
@@ -277,6 +278,7 @@ on document_arrived(item)
   return if !empty(item.error)
   document = document_editor(item.text, item.cursor)
   document_installed = item.source
+  sent = installed(document, document_installed)
   document_menu = initial_menu()
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
 

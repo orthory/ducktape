@@ -51,7 +51,11 @@ pub fn refreshed_page_buffer(
     title: String,
     blocks: Vec<PageBlock>,
     saved: String,
+    ready: bool,
 ) -> String {
+    if !ready {
+        return document;
+    }
     match refreshed_page_text(&document, &title, &blocks, &saved) {
         Some(canonical) => {
             crate::module_view::pages_document::source_changed();
@@ -64,17 +68,18 @@ pub fn refreshed_page_buffer(
 /// The saved-baseline mirror of [`refreshed_page_buffer`] — the SAME decision
 /// on the SAME inputs, so the buffer and its dirty baseline move together.
 ///
-/// Takes the buffer's TEXT (`editor_text(page_editor)` at the call site), not
-/// the editor: a by-value `editor` at the extern boundary is a `Content::clone`,
-/// and iced's clone is `with_text(&self.text())` — a whole second cosmic-text
-/// buffer shaped under a WRITE lock on the process-global font system, per
-/// live delta.
+/// Both projections require a verified source: an uninstalled or replaced
+/// guest must not authorize replacing the app's last known save buffer.
 pub fn refreshed_page_saved(
     text: String,
     title: String,
     blocks: Vec<PageBlock>,
     saved: String,
+    ready: bool,
 ) -> String {
+    if !ready {
+        return saved;
+    }
     refreshed_page_text(&text, &title, &blocks, &saved).unwrap_or(saved)
 }
 

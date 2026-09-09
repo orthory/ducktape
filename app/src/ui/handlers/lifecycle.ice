@@ -356,8 +356,10 @@ on live_updated(next)
       blocks = apply_page_text(blocks, next.pages)
       block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
       active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-      let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text)
-      page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text)
+      let observed = current_page_document(network_chain_id, buffer_page, page_text)
+      page_text = observed.text
+      let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+      page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
       page_saved_text = folded_saved
       return if !next.load_pages
       hydration_generation = hydration_generation + 1
@@ -605,8 +607,10 @@ on live_resynced(next)
   // canonical text only replaces the buffer when the editor is CLEAN and the
   // text actually differs — a rebuilt `Content` throws the cursor to the
   // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text)
-  page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text)
+  let observed = current_page_document(network_chain_id, buffer_page, page_text)
+  page_text = observed.text
+  let resynced_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
+  page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
   page_saved_text = resynced_saved
   // The buffer's own page follows the buffer, and only when this resync
   // actually carried page news AND the buffer moved with it.
