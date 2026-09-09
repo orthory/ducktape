@@ -296,17 +296,11 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        editor: &Party,
         title: Option<String>,
         body: Option<String>,
         now: u64,
     ) -> Result<(), Error> {
         let item = self.item_mut(repo, number)?;
-        if &item.author != editor {
-            return Err(Error::Module(
-                "forge: only the item author may edit it".into(),
-            ));
-        }
         if let Some(t) = title {
             check_title(&t)?;
             item.title = t;
@@ -481,28 +475,6 @@ impl Tracker {
             item.source_branch.clone().unwrap_or_default(),
             item.target_branch.clone().unwrap_or_default(),
         ))
-    }
-
-    /// a PR's author — the merge-authorization input
-    /// `ForgeState::require_merge_authorized` reads for an unprotected target.
-    /// unlike [`Self::pr_branches`] this does not require the PR still be
-    /// open: a merge's tracker-side gate already runs `pr_branches` first, and
-    /// the same author owns a re-check without a second open-state error.
-    ///
-    /// `SubmitReview` has no standing gate of its own (any account may review
-    /// any PR, #1760) and forge carries no collaborator/member list, so a
-    /// submitted review's author is NOT sound merge standing — a stranger's
-    /// self-filed review must never unlock `MergePr`. reviews are still
-    /// stored and shown (`ItemDetail::reviews`); they just no longer feed
-    /// authorization.
-    pub fn pr_author(&self, repo: &str, number: u64) -> Result<Party, Error> {
-        let item = self.item(repo, number)?;
-        if item.kind != ItemKind::Pr {
-            return Err(Error::Module(format!(
-                "forge: item #{number} is an issue, not a pull request"
-            )));
-        }
-        Ok(item.author.clone())
     }
 
     /// mint the next system-message id for an item's discussion channel.
@@ -935,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_is_author_only() {
+    fn edit_item_rewrites_title_and_body() {
         let mut t = Tracker::default();
         t.open_item(
             "demo",
@@ -947,14 +919,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(
-            t.edit_item("demo", 1, &user(2), Some("x".into()), None, 2)
-                .is_err()
-        );
         t.edit_item(
             "demo",
             1,
-            &user(1),
             Some("new title".into()),
             Some("new body".into()),
             3,

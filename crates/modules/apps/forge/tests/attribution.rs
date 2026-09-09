@@ -503,7 +503,7 @@ fn failed_multi_ref_cas_restores_incoming_staging() {
 }
 
 #[test]
-fn historical_key_item_authorship_keeps_only_the_original_signers_rights() {
+fn item_authorship_records_the_signers_canonical_actor() {
     block_on(async {
         let base = Directory::new("key-rights");
         let mut forge = Forge::init("forge", base.0.clone())
@@ -551,17 +551,8 @@ fn historical_key_item_authorship_keeps_only_the_original_signers_rights() {
                 title: Some(format!("edit {index}")),
                 body: None,
             };
-            let before = forge.root();
-            assert!(
-                forge
-                    .execute(&mut context(10, account), &message("forge", &edit))
-                    .await
-                    .is_err(),
-                "sibling keys cannot inherit exact-key item authorship"
-            );
-            assert_eq!(forge.root(), before);
             forge
-                .execute(&mut context(9, account), &message("forge", &edit))
+                .execute(&mut context(10, account), &message("forge", &edit))
                 .await
                 .unwrap();
             forge

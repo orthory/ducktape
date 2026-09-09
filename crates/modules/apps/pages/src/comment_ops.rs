@@ -1,7 +1,7 @@
 use super::{
     Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
     MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES,
-    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Party, Thread, ThreadView, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -117,18 +117,9 @@ impl Pages {
     /// to `target` — called when the target block/page is deleted so comment
     /// records never dangle in the reserved keyspace with no reachable target.
     ///
-    /// deliberately NOT author-gated on its own, and that is the module's
-    /// rule rather than an omission: this is an IMPLICIT mutation, a
-    /// consequence of removing the block, and it rides that `RemoveBlock`
-    /// op's OWN [`Pages::may_edit`] check, already passed by the time this
-    /// runs — a per-comment check on top would only make a block undeletable
-    /// once anyone else commented on it, while adding no authority the module
-    /// does not already have. What bounds the purge is aim, not permission: it
-    /// reaches
-    /// exactly the threads anchored to the subtree being removed, which is why
-    /// [`Pages::apply_comment_op`]'s `MoveCommentThread` must stay
-    /// opener-gated — that op is the only way to aim it at a thread that was
-    /// never on your block. Same rule as [`Self::rebase_comment_anchors`].
+    /// an IMPLICIT mutation, a consequence of removing the block. What bounds
+    /// the purge is aim: it reaches exactly the threads anchored to the
+    /// subtree being removed. Same rule as [`Self::rebase_comment_anchors`].
     pub(super) async fn purge_comments_for_target(
         &mut self,
         target: &str,
@@ -150,9 +141,8 @@ impl Pages {
     }
 
     /// Keep selection anchors attached while a block's text shifts. Implicit
-    /// like the purge above, so ungated for the same reason: it is a
-    /// consequence of an edit to the block and rides that block op's
-    /// authority. This is linear in threads on one target (hard-capped at
+    /// like the purge above: a consequence of an edit to the block. This is
+    /// linear in threads on one target (hard-capped at
     /// 1024); shard the target index only if real documents make that hotspot
     /// measurable.
     pub(super) async fn rebase_comment_anchors(
@@ -179,7 +169,7 @@ impl Pages {
     pub(super) async fn apply_comment_op(
         &mut self,
         msg: PageMsg,
-        authority: &super::Authority,
+        actor: &Party,
         now: u64,
     ) -> Result<(), PageError> {
         match msg {
@@ -209,7 +199,7 @@ impl Pages {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = authority.actor.clone();
+                let author = actor.clone();
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }
@@ -299,22 +289,10 @@ impl Pages {
                 target,
                 anchor,
             } => {
-                // WHO first, then WHAT: an explicit re-home rewrites the
-                // anchor its OPENER placed, so it carries the same
-                // stored-author rule as `EditComment`/`DeleteComment` — and
-                // the resolved-author boundary refuses the empty (pre-consensus)
-                // origin here exactly as it does on its four siblings.
-                // Ungated, this was also the aiming device for the comment
-                // purge: re-home a stranger's thread onto a throwaway block,
-                // `RemoveBlock` it, and their comments are hard-deleted past
-                // the very author check `DeleteComment` enforces.
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
-                if !authority.owns(&thread.opener) {
-                    return Err(PageError::NotAuthor);
-                }
                 if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(&target) {
                     return Err(PageError::IdTooLarge);
                 }
@@ -361,9 +339,6 @@ impl Pages {
                 if c.deleted {
                     return Err(PageError::CommentNotFound);
                 }
-                if !authority.owns(&c.author) {
-                    return Err(PageError::NotAuthor);
-                }
                 c.text = text;
                 c.mentions = mentions;
                 c.edited_at = Some(now);
@@ -376,9 +351,6 @@ impl Pages {
                     .ok_or(PageError::CommentNotFound)?;
                 if c.deleted {
                     return Ok(()); // idempotent
-                }
-                if !authority.owns(&c.author) {
-                    return Err(PageError::NotAuthor);
                 }
                 c.deleted = true;
                 c.text = String::new();
@@ -413,24 +385,13 @@ impl Pages {
                 thread_id,
                 resolved,
             } => {
-                // The opener and the target page's editors may resolve or
-                // reopen a thread. Preserve exact signed-key authority for
-                // records created before that key joined an account.
-                let author = authority.actor.clone();
+                // Whoever resolves or reopens a thread is recorded as having
+                // done so.
+                let author = actor.clone();
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
-                let block = self
-                    .load_block(&thread.target)
-                    .await
-                    .map_err(|_| PageError::Corrupt)?
-                    .ok_or(PageError::Corrupt)?;
-                let may_resolve =
-                    authority.owns(&thread.opener) || self.may_edit(&block.page, authority).await?;
-                if !may_resolve {
-                    return Err(PageError::NotAuthor);
-                }
                 thread.resolved = resolved;
                 thread.resolved_by = if resolved { Some(author) } else { None };
                 self.store_thread(&thread)

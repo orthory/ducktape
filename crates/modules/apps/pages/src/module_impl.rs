@@ -350,11 +350,7 @@ impl Module for Pages {
         let checkpoint = self.staged.checkpoint();
         let now = ctx.env().consensus_time;
         let reports = async {
-            let authority = super::Authority {
-                actor: actor.clone(),
-                origin: ctx.env().origin.clone(),
-            };
-            self.apply(m, &authority, now)
+            self.apply(m, &actor, now)
                 .await
                 .map_err(|error| Error::Module(error.to_string()))?;
             self.attribution_reports(&actor, &checkpoint).await

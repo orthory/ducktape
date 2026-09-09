@@ -1146,9 +1146,6 @@ impl Chat {
                 "cannot edit a deleted message: {channel_id}/{seq}"
             )));
         }
-        if !authority.owns(&head.author) {
-            return Err(Error::Module("only the author may edit a message".into()));
-        }
         if head.rev >= MAX_REVISIONS - 1 {
             return Err(Error::Module(format!(
                 "revision cap reached: {channel_id}/{seq}"
@@ -1157,8 +1154,8 @@ impl Chat {
 
         // head is last-write-wins under the total order; the prior head moves
         // into the immutable revision history. a stale base_rev is recorded on
-        // the new head (base_rev != prior rev), never rejected — the author
-        // gate makes conflicts same-author multi-device races.
+        // the new head (base_rev != prior rev), never rejected: the recorded
+        // base tells a reader which head the edit was written against.
         self.store(rev_key(channel_id, seq, head.rev), &head);
         let rev = head.rev + 1;
         let new_head = MessageHead {
@@ -1184,21 +1181,13 @@ impl Chat {
         ))
     }
 
-    async fn stage_delete(
-        &mut self,
-        authority: &Authority,
-        channel_id: &str,
-        seq: u64,
-    ) -> Result<Report, Error> {
+    async fn stage_delete(&mut self, channel_id: &str, seq: u64) -> Result<Report, Error> {
         require_non_empty("channel_id", channel_id)?;
         let head = self.require_head(channel_id, seq).await?;
         if head.deleted {
             return Err(Error::Module(format!(
                 "message already deleted: {channel_id}/{seq}"
             )));
-        }
-        if !authority.owns(&head.author) {
-            return Err(Error::Module("only the author may delete a message".into()));
         }
 
         // clear reactions; the emoji index says which records exist.
@@ -1753,7 +1742,7 @@ impl Chat {
                 Ok(())
             }
             ChatMsg::DeleteMessage { channel_id, seq } => {
-                let report = self.stage_delete(&authority, &channel_id, seq).await?;
+                let report = self.stage_delete(&channel_id, seq).await?;
                 self.report(ctx, &party, report);
                 Ok(())
             }

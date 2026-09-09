@@ -829,10 +829,7 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(boundary_parent.clone()),
                     after: None,
                 },
-                &Authority {
-                    actor: Party::System,
-                    origin: sdk::Origin::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -851,10 +848,7 @@ fn page_move_ancestry_stops_before_the_wasm_read_ceiling() {
                     parent: Some(over_parent.clone()),
                     after: None,
                 },
-                &Authority {
-                    actor: Party::System,
-                    origin: sdk::Origin::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -902,10 +896,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Authority {
-                    actor: Party::System,
-                    origin: sdk::Origin::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -944,10 +935,7 @@ fn subtree_removal_preflights_every_read_before_staging() {
                 PageMsg::RemoveBlock {
                     block_id: "branch".into(),
                 },
-                &Authority {
-                    actor: Party::System,
-                    origin: sdk::Origin::System,
-                },
+                &Party::System,
                 0,
             )
             .await
@@ -970,13 +958,10 @@ fn subtree_removal_preflights_every_read_before_staging() {
 
 #[test]
 fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads() {
-    // #1686: without an aggregate per-target cap, an unprivileged account
-    // (mallory) can open enough threads on someone else's block to push
-    // `preflight_subtree_removal`'s shared work budget over the top, and the
-    // block's real author has no author-gated way to shed those threads
-    // (DeleteComment/MoveCommentThread are stored-author/opener-gated). The
-    // fix caps a target's AGGREGATE thread+comment work directly, so the
-    // flood is refused long before it could ever exhaust the removal budget.
+    // a target's AGGREGATE thread+comment work is capped directly, so a
+    // flood of threads on someone else's block is refused long before it
+    // could push `preflight_subtree_removal`'s shared work budget over the
+    // top and leave the block unremovable.
     deterministic::Runner::default().start(|_context| async move {
         let mut p = Pages::new("agg", Box::new(sdk_testkit::MemStore::new()));
         seed_wide_branch(&mut p, 1).await;
@@ -1022,10 +1007,7 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
                     anchor: None,
                     mentions: Vec::new(),
                 },
-                &Authority {
-                    actor: Party::Key(b"mallory".to_vec()),
-                    origin: sdk::Origin::External(b"mallory".to_vec()),
-                },
+                &Party::Key(b"mallory".to_vec()),
                 0,
             )
             .await
@@ -1037,10 +1019,7 @@ fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads(
             PageMsg::RemoveBlock {
                 block_id: "branch".into(),
             },
-            &Authority {
-                actor: Party::System,
-                origin: sdk::Origin::System,
-            },
+            &Party::System,
             0,
         )
         .await

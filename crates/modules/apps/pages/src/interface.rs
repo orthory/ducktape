@@ -173,13 +173,10 @@ pub enum PageMsg {
         parent: Option<String>,
         after: Option<String>,
     },
-    /// remove a block AND its whole subtree. Author-gated like every other
-    /// block op (the page's recorded author, or the containing page's author
-    /// too when the removed block is a nested subpage parented under a
-    /// different page). Removing a `Page` also removes every nested page from
-    /// the enumeration index, and purges the comment threads anchored to
-    /// every block that goes — an implicit mutation that rides the already-
-    /// checked authority of THIS op (see `purge_comments_for_target`).
+    /// remove a block AND its whole subtree. Removing a `Page` also removes
+    /// every nested page from the enumeration index, and purges the comment
+    /// threads anchored to every block that goes — an implicit mutation, a
+    /// consequence of this op (see `purge_comments_for_target`).
     RemoveBlock { block_id: String },
 
     // ── comments ──
@@ -204,18 +201,13 @@ pub enum PageMsg {
     },
     /// Move a thread with text that crossed a block boundary during split or
     /// merge. The replacement anchor is validated against the new target.
-    /// Stored-author authority, the same rule as `EditComment`/`DeleteComment`:
-    /// only the thread's `opener` may re-home it. An ungated move was also how
-    /// a stranger aimed `RemoveBlock`'s comment purge at someone else's
-    /// comments — re-home the thread onto a throwaway block, remove it, and
-    /// the author check on `DeleteComment` is bypassed.
     MoveCommentThread {
         thread_id: String,
         target: String,
         #[serde(default)]
         anchor: Option<RelativeAnchor>,
     },
-    /// replace a comment's text; stored-author-only. rejected on a tombstone.
+    /// replace a comment's text; rejected on a tombstone.
     /// `mentions` replaces the complete mention set; retained relations do
     /// not produce new attribution events.
     EditComment {
@@ -224,7 +216,7 @@ pub enum PageMsg {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<sdk::AccountNumber>,
     },
-    /// tombstone a comment; stored-author-only. when it was the thread's last
+    /// tombstone a comment; when it was the thread's last
     /// live comment, the whole thread record is removed.
     DeleteComment { comment_id: String },
     /// toggle a thread's resolved flag; records the resolver as origin.

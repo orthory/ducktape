@@ -1,12 +1,13 @@
 use super::{
-    Block, BlockKind, MAX_PAGE_ID_BYTES, PageError, PageMsg, Pages, id_is_index_safe, to_page_err,
+    Block, BlockKind, MAX_PAGE_ID_BYTES, PageError, PageMsg, Pages, Party, id_is_index_safe,
+    to_page_err,
 };
 
 impl Pages {
     pub(super) async fn apply_page_op(
         &mut self,
         msg: PageMsg,
-        authority: &super::Authority,
+        actor: &Party,
     ) -> Result<(), PageError> {
         match msg {
             PageMsg::CreatePage {
@@ -28,7 +29,7 @@ impl Pages {
                     None => {
                         self.index_add(&page_id, None).await?;
                         let mut page = Block {
-                            author: authority.actor.clone(),
+                            author: actor.clone(),
                             id: page_id.clone(),
                             parent: None,
                             page: page_id,
@@ -42,7 +43,7 @@ impl Pages {
                         // appended after the one before it. a fresh root is
                         // at depth zero, so no nesting bound can bind here.
                         for (at, block) in blocks.into_iter().enumerate() {
-                            self.place_block(&mut page, at, block, authority).await?;
+                            self.place_block(&mut page, at, block, actor).await?;
                         }
                         self.store_block(&page)
                     }

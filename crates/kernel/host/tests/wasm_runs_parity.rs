@@ -654,6 +654,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
         .await;
         pair.drain().await;
         for target in ["inline", "inline-todo"] {
+            let checked = target == "inline";
             pair.submit(
                 alice(),
                 op!(
@@ -688,7 +689,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                 runs_op(&RunsMsg::AgentAction {
                     run_id: run.clone(),
                     request_id: "tick".into(),
-                    action: set_page_checked("inline-todo", true),
+                    action: set_page_checked("inline-todo", checked),
                 }),
             )
             .await;
@@ -696,7 +697,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
             assert!(matches!(
                 pair.action(&runs::action_request_id(run, "tick")).await.status,
                 runs::ActionStatus::Completed {
-                    outcome: dispatch::CallOutcomeSummary::Rejected { .. },
+                    outcome: dispatch::CallOutcomeSummary::Applied { .. },
                     ..
                 }
             ));
@@ -736,7 +737,7 @@ fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
                 panic!("source todo");
             };
             assert_eq!(todo.author, pages::Party::Account(1));
-            assert!(!todo.checked);
+            assert_eq!(todo.checked, checked);
             assert!(pending_run_ids(&pair.native).await.is_empty());
         }
     });

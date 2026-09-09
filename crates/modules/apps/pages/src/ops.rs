@@ -1,17 +1,17 @@
-use super::{PageError, PageMsg, Pages};
+use super::{PageError, PageMsg, Pages, Party};
 
 impl Pages {
     /// apply one decoded [`PageMsg`] to the staged overlay. pure tree surgery
     /// over per-block/-comment records. The caller restores its incoming staging
-    /// on error. `actor` is already resolved: the comment ops gate on
-    /// stored comment/thread authorship, `CreatePage` records the creating
-    /// party as the page's author, and every other page/block op is gated by
-    /// [`Pages::may_edit`] against that recorded author. `now` is consulted
-    /// only by the comment ops (their stored timestamps).
+    /// on error. `actor` is the canonical party the op is recorded under (the
+    /// current account, or the signing key of one that has not joined an
+    /// account): `CreatePage` records it as the page's author and the comment
+    /// ops record it on what they write; no op gates on a recorded author.
+    /// `now` is consulted only by the comment ops (their stored timestamps).
     pub(super) async fn apply(
         &mut self,
         msg: PageMsg,
-        authority: &super::Authority,
+        actor: &Party,
         now: u64,
     ) -> Result<(), PageError> {
         // no client-minted id may live in the reserved (NUL-prefixed) keyspace:
@@ -66,11 +66,11 @@ impl Pages {
                 | PageMsg::DeleteComment { .. }
                 | PageMsg::ResolveThread { .. }
         ) {
-            return self.apply_comment_op(msg, authority, now).await;
+            return self.apply_comment_op(msg, actor, now).await;
         }
         if matches!(&msg, PageMsg::CreatePage { .. }) {
-            return self.apply_page_op(msg, authority).await;
+            return self.apply_page_op(msg, actor).await;
         }
-        self.apply_block_op(msg, authority).await
+        self.apply_block_op(msg, actor).await
     }
 }

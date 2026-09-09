@@ -88,24 +88,6 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
-/// The current account is a canonical actor, while an original signed key
-/// retains authority over records it created before joining an account.
-struct Authority {
-    actor: Party,
-    origin: sdk::Origin,
-}
-
-impl Authority {
-    fn owns(&self, owner: &Party) -> bool {
-        match owner {
-            Party::Key(key) => {
-                matches!(&self.origin, sdk::Origin::External(signer) if signer == key)
-            }
-            Party::Account(_) | Party::Module(_) | Party::System => owner == &self.actor,
-        }
-    }
-}
-
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
 /// codec bounds a stored value at 1 MiB AT DECODE TIME only (see

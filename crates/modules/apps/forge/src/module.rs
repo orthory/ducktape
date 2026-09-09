@@ -2923,13 +2923,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // an UNPROTECTED target used to accept a merge from anyone at all: a
-    // stranger with no standing on the PR must not be able to force it into
-    // the terminal `Merged` state, and — since `SubmitReview` has no standing
-    // gate of its own (#1760) — filing a review first grants no standing
-    // either. only the PR's author or the repo owner may merge it.
+    // an UNPROTECTED target accepts a merge from any member: a stranger, a
+    // reviewer, the owner. reviews are stored and shown and change nothing
+    // about who may merge.
     #[test]
-    fn merging_onto_an_unprotected_target_requires_standing() {
+    fn merging_onto_an_unprotected_target_is_any_members() {
         let base = tmp_base("unprotected-merge");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let digest = vec![9u8; 32];
@@ -2982,27 +2980,15 @@ mod tests {
             pack_digest: hex(&digest),
         };
 
-        // a stranger — not the author, not a reviewer, not the owner — is
-        // refused, and the PR stays open for a legitimate merge later.
+        // a stranger — not the author, not a reviewer, not the owner — merges.
         open_pr(&mut forge, "one", 2);
         let mut stranger = ctx_with_origin(3, user_origin(9));
-        let err = exec(&mut forge, &mut stranger, &merge_of("one"))
-            .expect_err("a stranger may not merge");
-        assert!(err.to_string().contains("author or the owner"), "{err}");
-        futures::executor::block_on(forge.abort_block()).unwrap();
-
-        // the PR's own author merges it.
-        let mut author = ctx_with_origin(4, user_origin(2));
-        exec_commit(&mut forge, &mut author, &merge_of("one"));
+        exec_commit(&mut forge, &mut stranger, &merge_of("one"));
         assert_eq!(forge.state.repos["one"].refs["release"], oid('c'));
 
-        // the INVERSION #1760 fixes: a stranger reviews first, then tries to
-        // merge on the strength of that review alone. the review is still
-        // accepted and stored (`SubmitReview` itself is unauthenticated by
-        // standing, on purpose — anyone may comment), but it grants no merge
-        // standing: the very next op from the same key is still refused.
+        // a reviewer's review is stored, and the reviewer merges like anyone.
         open_pr(&mut forge, "two", 2);
-        let mut reviewer = ctx_with_origin(5, user_origin(3));
+        let mut reviewer = ctx_with_origin(4, user_origin(3));
         exec_commit(
             &mut forge,
             &mut reviewer,
@@ -3015,17 +3001,10 @@ mod tests {
                 comments: vec![],
             },
         );
-        let err = exec(&mut forge, &mut reviewer, &merge_of("two"))
-            .expect_err("a stranger reviewing first must not authorize a merge");
-        assert!(err.to_string().contains("author or the owner"), "{err}");
-        futures::executor::block_on(forge.abort_block()).unwrap();
-
-        // the PR author still merges "two" normally.
-        let mut author2 = ctx_with_origin(6, user_origin(2));
-        exec_commit(&mut forge, &mut author2, &merge_of("two"));
+        exec_commit(&mut forge, &mut reviewer, &merge_of("two"));
         assert_eq!(forge.state.repos["two"].refs["release"], oid('c'));
 
-        // the repo owner (neither author nor reviewer) may always merge.
+        // the repo owner merges too.
         open_pr(&mut forge, "three", 2);
         exec_commit(&mut forge, &mut owner, &merge_of("three"));
         assert_eq!(forge.state.repos["three"].refs["release"], oid('c'));
