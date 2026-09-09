@@ -111,7 +111,7 @@ const SEARCH_LANES: &[(&str, &str, &str)] = &[
     (
         "/v1/index/runs/view",
         "runs",
-        r#"{"runs":[{"run_id":"needle-run","dispatch_id":"d1","agent_id":"agent-1","channel_id":"c1","anchor_seq":1,"job_id":null,"delegation_id":null,"requester":"System","dispatched":{"height":1,"time":1},"state":"dispatched","actions":0,"pr_number":null}]}"#,
+        r#"{"runs":[{"run_id":"needle-run","dispatch_id":"d1","agent_id":"agent-1","channel_id":"c1","anchor_seq":1,"job_id":null,"delegation_id":null,"requester":"System","dispatched":{"height":1,"time":1},"state":"dispatched","actions":0,"origin":null,"places":[]}]}"#,
     ),
 ];
 

@@ -558,8 +558,9 @@ fn block_comments_dock_a_rail_beside_the_document() {
     assert!(handlers.contains("let target = event_text(event, \"target\")"));
     // The guest editor shares the screen's document slot and keeps comment
     // counts in its declarative presentation, beside the existing rail.
-    let guest = inlined(include_str!("../../../crates/views/pages/src/ui/app.ice"));
-    assert!(guest.contains("editor #document <-> document -> document_committed _"));
+    let guest_source = include_str!("../../../crates/views/pages/src/ui/app.ice");
+    assert!(guest_source.contains("editor #document <-> document -> document_committed _"));
+    let guest = inlined(guest_source);
     assert!(guest.contains("document_marks = next.comment_marks"));
     let view = inlined(include_str!("../ui/view.ice"));
     assert!(view.contains(", blocks, commented_block_hits, caret_comment_target,"));

@@ -1352,20 +1352,10 @@ pub struct RunLink {
 
 /// The longest a chip's label runs; a page's opening line or an output ref
 /// past it is clipped with an ellipsis.
-const CHIP_LABEL_CHARS: usize = 40;
-
+/// A chip's label is one line: the text's words, single-spaced. How much of
+/// it a chip shows is the view's call, not a count picked here.
 fn chip_label(text: &str) -> String {
-    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let fits = words.chars().count() <= CHIP_LABEL_CHARS;
-    if fits {
-        return words;
-    }
-    let clipped: String = words.chars().take(CHIP_LABEL_CHARS - 1).collect();
-    format!("{}…", clipped.trim_end())
-}
-
-fn short_dispatch(dispatch_id: &str) -> String {
-    dispatch_id.chars().take(8).collect()
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A page block as a chip names it: the page's opening line, then the
@@ -1487,7 +1477,7 @@ async fn run_link(
         ),
         RunPlace::Run { dispatch_id } => link(
             "run",
-            format!("run {}", short_dispatch(&dispatch_id)),
+            format!("run {}", short_pubkey(&dispatch_id)),
             duck_run_link(dispatch_id, chain.to_owned()),
         ),
         RunPlace::ForgeItem { repo, number } => link(
