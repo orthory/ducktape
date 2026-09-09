@@ -6309,7 +6309,20 @@ pub(crate) mod tests {
             let locked = mounted.lock().unwrap();
             assert_eq!((locked.hash, locked.in_flight), (Some(a.hash()), false));
         }
-        // the next block's candidate, drawing its first tree, is seated
+        // a first frame that trapped is a property of those bytes, so the
+        // very next block does not pay for the same candidate again
+        join_all(deployments_checked().await);
+        assert_eq!(
+            slot_assets(&mounted),
+            ["a.svg"],
+            "B is held off, not retried at once"
+        );
+        // once its gap is up the candidate is tried again, and this time
+        // its first tree draws
+        let mut locked = mounted.lock().unwrap();
+        let retry = locked.retry.as_mut().expect("B left a hold-off");
+        retry.next = Instant::now();
+        drop(locked);
         join_all(deployments_checked().await);
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
