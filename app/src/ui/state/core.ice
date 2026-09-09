@@ -28,6 +28,16 @@ state
   block_height:i64 = -1
   hydration_generation:i64 = 0
   connect_generation:i64 = 0
+  // The public key SEATED for signing right now, hex, and "" while the seat is
+  // locked. Nothing draws it: it is an identity a subscription keys on.
+  //
+  // A connection is named by endpoint + chain + connect attempt, and NONE of
+  // those moves when a seat does — Settings unlocks and locks in place
+  // (`handlers/node.ice` SettingsIntent.unlock/.lock), and `unlock_user_key`
+  // opens whichever wallet is ACTIVE. So a lane whose entitlement depends on
+  // the seated key must key on this too, or a locked→unlocked device never
+  // recovers and a key SWITCH leaves the previous key's reading on screen.
+  signer_key:str = ""
   hydration_retry_attempt:i64 = 0
   mutation_phase:MutationPhase = MutationPhase.idle
   error = ""

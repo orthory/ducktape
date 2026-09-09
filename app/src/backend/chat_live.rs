@@ -72,6 +72,8 @@ pub struct LiveAgentNotice {
     pub rpc: String,
     pub chain_id: String,
     pub generation: i64,
+    /// the key seated for signing when this reading was asked for, "" for none.
+    pub signer_key: String,
     pub rows: Vec<LiveAgentRow>,
 }
 
@@ -86,13 +88,25 @@ pub struct LiveAgentNotice {
 /// current — the same trap `live_resynced` names `chain_left_behind`, one plane
 /// over. `chain_id` is the node's own pushed status and `generation` is the
 /// connect attempt, so the three together name THIS connection to THIS chain.
+///
+/// AND THE SEAT IS PART OF THE IDENTITY. On a device that does not host the
+/// node, what a reading was entitled to read is the SEATED KEY's
+/// (`Reach::Signed`) — and a Settings unlock or lock moves that seat with the
+/// endpoint, the chain and the connect attempt all unchanged
+/// (`handlers/node.ice` SettingsIntent.unlock/.lock bump no generation). Without
+/// this term, a reading taken under the previous key stays "current" across a
+/// key switch.
 pub fn live_agents_stale(
     notice: &LiveAgentNotice,
     rpc: &str,
     chain_id: &str,
     generation: i64,
+    signer_key: &str,
 ) -> bool {
-    notice.rpc != rpc || notice.chain_id != chain_id || notice.generation != generation
+    notice.rpc != rpc
+        || notice.chain_id != chain_id
+        || notice.generation != generation
+        || notice.signer_key != signer_key
 }
 
 /// Fold one parsed output event into the row. Status lines replace the status;
@@ -153,6 +167,9 @@ struct Taken {
     rpc: String,
     chain_id: String,
     generation: i64,
+    /// the seat this reading's entitlement belongs to — see
+    /// [`live_agents_stale`].
+    signer_key: String,
 }
 
 /// How many times a dropped output stream is re-dialed before the row keeps the
@@ -244,6 +261,7 @@ fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
         rpc: taken.rpc.clone(),
         chain_id: taken.chain_id.clone(),
         generation: taken.generation,
+        signer_key: taken.signer_key.clone(),
         rows: rows.values().cloned().collect(),
     }
 }
@@ -256,17 +274,13 @@ pub fn chat_live_agents(
     rpc: String,
     chain_id: String,
     generation: i64,
+    signer_key: String,
 ) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
     use iced::futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
         let Ok(client) = rpc_client(&rpc) else {
             return;
-        };
-        let taken = Taken {
-            rpc: rpc.clone(),
-            chain_id,
-            generation,
         };
         // WHICH PROOF THIS DEVICE CAN MAKE, asked once. A device that hosts the
         // node reads the 0600 token out of its workspace; a device pointed at a
@@ -275,12 +289,24 @@ pub fn chat_live_agents(
         // there is no proof to make at all, and that is not a transient failure:
         // the card still carries the agent, the room, the anchor and a Stop, and
         // says plainly that the progress is out of reach.
+        //
+        // READ OFF THE SUBSCRIPTION'S OWN ARGUMENT, never from the process's
+        // signer: `signer_key` is what this lane is KEYED on, so deciding the
+        // entitlement from anything else would let the two disagree — a seat
+        // taken after this subscription started would be a proof this task
+        // believes in while no restart ever arrives to use it.
         let reach = if workspace_at(&rpc).is_some() {
             Reach::Workspace
-        } else if crate::backend::can_sign().await {
-            Reach::Signed
-        } else {
+        } else if signer_key.is_empty() {
             Reach::Nothing
+        } else {
+            Reach::Signed
+        };
+        let taken = Taken {
+            rpc: rpc.clone(),
+            chain_id,
+            generation,
+            signer_key,
         };
         let rows: Rows = Arc::default();
         let mut watchers: BTreeMap<String, Watcher> = BTreeMap::new();
@@ -414,6 +440,11 @@ pub fn chat_live_agents(
             }
             tokio::time::sleep(PENDING_POLL).await;
         }
+        // THE LANE IS GONE, SO ARE ITS SOCKETS. The loop ends when the
+        // subscription is dropped — a reconnect, a network switch, or the SEAT
+        // changing, all of which re-key it — and a `JoinHandle` dropped is not a
+        // task stopped. Without this, a socket admitted under the previous key
+        // would stay open until its next output line.
         for watcher in watchers.into_values() {
             watcher.handle.abort();
         }
@@ -858,10 +889,12 @@ mod tests {
     #[test]
     fn a_reading_from_a_connection_she_has_left_is_refused() {
         let here = "http://127.0.0.1:8844";
+        let mine = "aa11";
         let notice = LiveAgentNotice {
             rpc: here.into(),
             chain_id: "testnet#abcd".into(),
             generation: 7,
+            signer_key: mine.into(),
             rows: vec![LiveAgentRow {
                 channel_id: "general".into(),
                 anchor_seq: 2,
@@ -870,21 +903,33 @@ mod tests {
             }],
         };
         assert!(
-            !live_agents_stale(&notice, here, "testnet#abcd", 7),
+            !live_agents_stale(&notice, here, "testnet#abcd", 7, mine),
             "the reading for the connection on screen stands"
         );
         assert!(
-            live_agents_stale(&notice, "http://127.0.0.1:9844", "testnet#abcd", 7),
+            live_agents_stale(&notice, "http://127.0.0.1:9844", "testnet#abcd", 7, mine),
             "another endpoint"
         );
         assert!(
-            live_agents_stale(&notice, here, "othernet#0f0f", 7),
+            live_agents_stale(&notice, here, "othernet#0f0f", 7, mine),
             "SAME URL, NEW CHAIN — a workspace switch keeps the port, so the \
              url alone would have called this reading current"
         );
         assert!(
-            live_agents_stale(&notice, here, "testnet#abcd", 8),
+            live_agents_stale(&notice, here, "testnet#abcd", 8, mine),
             "same url and chain, but a reconnect has happened since"
+        );
+        // THE SEAT MOVES WITHOUT THE CONNECTION MOVING. Settings unlocks and
+        // locks in place and bumps no `connect_generation`, so a reading taken
+        // under the previous key would otherwise still be "current" — on a
+        // remote device that reading's entitlement WAS that key's.
+        assert!(
+            live_agents_stale(&notice, here, "testnet#abcd", 7, "bb22"),
+            "same connection, a different key seated since"
+        );
+        assert!(
+            live_agents_stale(&notice, here, "testnet#abcd", 7, ""),
+            "same connection, the seat has been locked since"
         );
     }
 }

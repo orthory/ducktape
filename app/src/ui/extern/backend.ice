@@ -67,7 +67,7 @@ extern crate::backend
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
-  LiveAgentNotice(rpc:str, chain_id:str, generation:i64, rows:[LiveAgentRow])
+  LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
@@ -539,8 +539,8 @@ extern crate::backend
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   cancel_agent_run(rpc:str, password:str, run_id:str) -> bool ! AppError
-  stream chat_live_agents(rpc:str, chain_id:str, generation:i64) -> LiveAgentNotice
-  pure live_agents_stale(notice:&LiveAgentNotice, rpc:&str, chain_id:&str, generation:i64) -> bool
+  stream chat_live_agents(rpc:str, chain_id:str, generation:i64, signer_key:str) -> LiveAgentNotice
+  pure live_agents_stale(notice:&LiveAgentNotice, rpc:&str, chain_id:&str, generation:i64, signer_key:&str) -> bool
   search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError

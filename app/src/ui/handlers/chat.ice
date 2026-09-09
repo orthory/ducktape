@@ -807,7 +807,7 @@ on channel_created(next)
 // current reading installed a moment ago, until the next two-second poll put
 // them back.
 on live_agents_event(next)
-  return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation)
+  return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)
   live_agents = next.rows
 
 on live_cancel_acked(_ok)

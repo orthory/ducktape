@@ -333,13 +333,6 @@ pub(crate) async fn seated_request_headers(
     ))
 }
 
-/// Is a key seated at all? The question a subscription asks BEFORE it builds a
-/// request it would then have to throw away — [`seated_request_headers`] answers
-/// the same thing, but only once there is a path and a node key to sign over.
-pub(crate) async fn can_sign() -> bool {
-    SIGNER.lock().await.is_some()
-}
-
 /// This node's own public key — the bytes a data-plane signature is bound to, so
 /// a proof minted for one node cannot be replayed at another. Read off the
 /// node's own `status`, which is where every other signing caller reads it.

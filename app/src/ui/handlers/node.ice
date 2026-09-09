@@ -155,6 +155,7 @@ on settings_view_event(event)
     // opened for.
     SettingsIntent.lock
       password = ""
+      signer_key = ""
       flow
         from run lock_signer()
         discard
@@ -268,8 +269,12 @@ on settings_view_event(event)
       desktop_notifications = event_flag(event, "enabled")
       run replace lane=notify_save save_desktop_notifications(desktop_notifications) -> desktop_notifications_saved _
 
-on settings_unlocked(_pubkey)
+on settings_unlocked(pubkey)
   error = ""
+  // THE SEAT MOVED WITHOUT THE CONNECTION MOVING. Nothing draws this; the live
+  // agent lane keys on it, because its entitlement to a run's output is this
+  // key's and an unlock in place bumps no `connect_generation`.
+  signer_key = pubkey
 
 on settings_unlock_failed(cause)
   password = ""

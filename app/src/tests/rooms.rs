@@ -1189,16 +1189,17 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
     assert_eq!(
         statements,
         [
-            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation)",
+            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation, signer_key)",
             "live_agents = next.rows",
         ],
         "the guard RETURNS, and it stands before the only assignment"
     );
 
-    // ALL THREE IDENTITIES REACH THE LANE, or the guard above cannot ask. The
+    // ALL FOUR IDENTITIES REACH THE LANE, or the guard above cannot ask. The
     // endpoint is the weakest of them: a workspace switch brings the node back
     // on the same loopback port, which is the same trap `live_resynced` names
-    // `chain_left_behind`.
+    // `chain_left_behind`. The seat is the one that does not move with the
+    // connection at all — see the seams pinned below.
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
     let lane: Vec<&str> = lifecycle
         .lines()
@@ -1208,9 +1209,53 @@ fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
     assert_eq!(
         lane,
         [
-            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation) when connected -> live_agents_event _"
+            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _"
         ],
-        "one lane, for the node, keyed on the whole connection"
+        "one lane, for the node, keyed on the whole connection AND the seat"
+    );
+
+    // EVERY SEAM THAT MOVES THE SEAT WRITES `signer_key`, or the lane is keyed
+    // on a lie. A Settings unlock and lock change what this device may read and
+    // bump NO `connect_generation` (`node.ice` SettingsIntent.unlock/.lock), so
+    // a missed seam here is a device that never recovers from a lock — or one
+    // that keeps the previous key's output after a switch.
+    let node = inlined(include_str!("../ui/handlers/node.ice"));
+    let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
+    for (file, source, seam) in [
+        // seated: the handler that fires when a key is opened carries its pubkey
+        ("node.ice", &node, "on settings_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_unlocked(pubkey)"),
+        ("onboarding.ice", &onboarding, "on phrase_confirmed(pubkey)"),
+        ("onboarding.ice", &onboarding, "on key_restored(pubkey)"),
+    ] {
+        let arm = source
+            .split_once(seam)
+            .unwrap_or_else(|| panic!("{file} must still carry `{seam}`"))
+            .1
+            .split_once("\non ")
+            .expect("the handler ends")
+            .0;
+        assert!(
+            arm.contains("signer_key = pubkey"),
+            "{file}: `{seam}` seats a key without naming it — the live agent \
+             lane keys on `signer_key`"
+        );
+    }
+    // and the teardown clears it, in the arm that retires the signer.
+    let lock = node
+        .split_once("SettingsIntent.lock")
+        .expect("the Lock intent")
+        .1
+        .split_once("    SettingsIntent.")
+        .expect("the next intent")
+        .0;
+    assert!(
+        lock.contains("signer_key = \"\"") && lock.contains("lock_signer()"),
+        "node.ice: the arm that retires the signer must clear `signer_key` too: {lock}"
+    );
+    assert!(
+        onboarding.contains("signer_key = \"\""),
+        "onboarding.ice: leaving a network must clear the seat it was taken in"
     );
 
     // AND NO ROOM OWES IT ANYTHING. Eight handlers move `active_channel`; the

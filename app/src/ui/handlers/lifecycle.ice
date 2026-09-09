@@ -1040,7 +1040,13 @@ subscribe
   // Gated on `connected` ALONE, not on the chat tab: a run she started and
   // walked away from must still be running under its anchor when she comes
   // back, and the poll is one bounded `runs` read every two seconds.
-  run chat_live_agents(connected_rpc, network_chain_id, connect_generation) when connected -> live_agents_event _
+  // KEYED ON THE SEAT TOO (`signer_key`). A remote device's entitlement to a
+  // run's output IS its seated key, and a Settings unlock or lock moves that
+  // seat in place — no endpoint, chain or connect attempt changes with it. Left
+  // out, a device that unlocked after connecting would say "progress
+  // unavailable" for the life of the connection, and a key SWITCH would leave
+  // the previous key's reading on screen.
+  run chat_live_agents(connected_rpc, network_chain_id, connect_generation, signer_key) when connected -> live_agents_event _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
