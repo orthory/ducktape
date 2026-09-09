@@ -55,14 +55,19 @@ pub struct Substrates {
 const ODB_SUBSTRATES: &[&str] = &["files", "forge"];
 
 /// the per-network values every composition binds into module state: the
-/// invite namespace governance verifies tokens and join proofs against, and
-/// the identity chain id identity/gateway/runs scope their records to. a
-/// network-bound module's `__config` record is made of these. needed on
-/// EVERY path, not just genesis: a module admitted after a checkpoint starts
-/// fresh at restore and seeds its config then, exactly as it did live.
+/// invite namespace governance verifies tokens and join proofs against, the
+/// identity chain id identity/gateway/runs scope their records to, and the
+/// unit this network's `consensus_time` advances in. a network-bound module's
+/// `__config` record is made of these. needed on EVERY path, not just
+/// genesis: a module admitted after a checkpoint starts fresh at restore and
+/// seeds its config then, exactly as it did live.
 pub struct Bindings<'a> {
     pub invite: &'a [u8],
     pub chain_id: &'a str,
+    /// what one `consensus_time` unit IS here — height on the validator and
+    /// replica lanes, milliseconds on the sim lane. A module that turns a
+    /// duration into a deadline reads it; one that does not, ignores it.
+    pub time_unit: sdk::genesis_config::TimeUnit,
 }
 
 /// how the composed host comes up.
@@ -492,13 +497,16 @@ fn config_value<'a>(id: &str, key: &str, bindings: &Bindings<'a>) -> Result<&'a 
     match key {
         sdk::genesis_config::INVITE => Ok(bindings.invite),
         sdk::genesis_config::CHAIN_ID => Ok(bindings.chain_id.as_bytes()),
+        sdk::genesis_config::TIME_UNIT => Ok(bindings.time_unit.encode()),
         other => Err(unbound_config_key(id, other)),
     }
 }
 
 /// the keys [`config_value`] resolves, checked without a binding in hand.
 fn require_config_key(id: &str, key: &str) -> Result<(), String> {
-    let known = key == sdk::genesis_config::INVITE || key == sdk::genesis_config::CHAIN_ID;
+    let known = key == sdk::genesis_config::INVITE
+        || key == sdk::genesis_config::CHAIN_ID
+        || key == sdk::genesis_config::TIME_UNIT;
     if known {
         return Ok(());
     }
@@ -507,9 +515,10 @@ fn require_config_key(id: &str, key: &str) -> Result<(), String> {
 
 fn unbound_config_key(id: &str, key: &str) -> String {
     format!(
-        "module {id} declares config key {key:?}, which no network binds (known: {:?}, {:?})",
+        "module {id} declares config key {key:?}, which no network binds (known: {:?}, {:?}, {:?})",
         sdk::genesis_config::CHAIN_ID,
-        sdk::genesis_config::INVITE
+        sdk::genesis_config::INVITE,
+        sdk::genesis_config::TIME_UNIT
     )
 }
 
@@ -524,6 +533,7 @@ pub struct Admissions {
     substrates: Substrates,
     invite: Vec<u8>,
     chain_id: String,
+    time_unit: sdk::genesis_config::TimeUnit,
 }
 
 impl Admissions {
@@ -543,6 +553,7 @@ impl Admissions {
             substrates: substrates.clone(),
             invite: bindings.invite.to_vec(),
             chain_id: bindings.chain_id.to_string(),
+            time_unit: bindings.time_unit,
         }
     }
 }
@@ -559,6 +570,7 @@ impl host::ModuleFactory for Admissions {
         };
         let bindings = Bindings {
             invite: &self.invite,
+            time_unit: self.time_unit,
             chain_id: &self.chain_id,
         };
         let mut stores = crate::bundle::qmdb_stores(&self.context);
