@@ -966,7 +966,7 @@ fn agent_response_text(bytes: &[u8]) -> Result<String, String> {
     Ok(result.response_text)
 }
 
-fn provider_output_event(provider: &str, line: &str, id: i64) -> Option<AgentChatEvent> {
+pub(crate) fn provider_output_event(provider: &str, line: &str, id: i64) -> Option<AgentChatEvent> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     if provider == "claude" && value["type"].as_str() == Some("result") {
         let answer = value["result"].as_str()?.to_string();
@@ -1266,7 +1266,7 @@ fn dispatch_id_from_saga(saga_id: &str) -> Result<String, String> {
     Ok(dispatch_id.to_ascii_lowercase())
 }
 
-fn agent_ws_url(rpc: &str) -> String {
+pub(crate) fn agent_ws_url(rpc: &str) -> String {
     let base = if let Some(rest) = rpc.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = rpc.strip_prefix("http://") {
@@ -1294,7 +1294,7 @@ pub(crate) fn read_link_token(workspace: &Path) -> Result<String, String> {
     Ok(token)
 }
 
-fn subscription_refusal(value: &serde_json::Value) -> Option<String> {
+pub(crate) fn subscription_refusal(value: &serde_json::Value) -> Option<String> {
     let is_refusal =
         value["type"].as_str() == Some("refused") || value["type"].as_str() == Some("error");
     if !is_refusal {
@@ -1325,7 +1325,7 @@ fn json_text(value: Option<&serde_json::Value>) -> String {
     }
 }
 
-fn clip_text(text: &str, limit: usize) -> String {
+pub(crate) fn clip_text(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }

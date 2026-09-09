@@ -79,6 +79,8 @@ pub struct BoundAccount {
 pub struct NameDirectory {
     accounts: BTreeMap<String, BoundAccount>,
     by_account: BTreeMap<u64, String>,
+    /// the program-controlled accounts: software, drawn with the AGENT plate.
+    programs: BTreeSet<u64>,
 }
 
 /// The directory a reader with no network in frame renders through: every
@@ -94,6 +96,7 @@ impl NameDirectory {
         Self {
             accounts,
             by_account,
+            programs: BTreeSet::new(),
         }
     }
 
@@ -103,6 +106,7 @@ impl NameDirectory {
         Self {
             accounts: BTreeMap::new(),
             by_account: BTreeMap::new(),
+            programs: BTreeSet::new(),
         }
     }
 
@@ -161,6 +165,9 @@ impl NameDirectory {
             names
                 .by_account
                 .insert(account.number, account.name.clone());
+            if matches!(account.control, identity::Control::Program { .. }) {
+                names.programs.insert(account.number);
+            }
             for key in &account.keys {
                 names.accounts.insert(
                     hex_encode(&key.pubkey),
@@ -1301,7 +1308,7 @@ pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
         thread_seq: number_i64(row.thread.unwrap_or(0)),
         show_author: true,
         initial: avatar_initial(&row.author, reader.names),
-        avatar_kind: avatar_kind(&row.author).into(),
+        avatar_kind: avatar_kind(&row.author, reader.names).into(),
         height: number_i64(row.height),
         time: number_i64(row.time),
         reactions: row
@@ -1570,9 +1577,15 @@ fn avatar_initial(author: &str, names: &NameDirectory) -> String {
     initial_of(&avatar_source(author, names))
 }
 
-fn avatar_kind(author: &str) -> &'static str {
+/// A person's key or account is `human`; a program account (an agent's) and
+/// every module or system author is `agent`.
+fn avatar_kind(author: &str, names: &NameDirectory) -> &'static str {
     match author.split_once(':') {
-        Some(("user" | "acct", _)) => "human",
+        Some(("user", _)) => "human",
+        Some(("acct", number)) => match number.parse::<u64>() {
+            Ok(number) if names.programs.contains(&number) => "agent",
+            _ => "human",
+        },
         Some(_) | None => "agent",
     }
 }
@@ -3007,9 +3020,24 @@ mod tests {
 
     #[test]
     fn avatars_distinguish_humans_from_software_authors() {
-        assert_eq!(avatar_kind("user:deadbeef"), "human");
+        let human = account(1, "same", vec![vec![1; 32]]);
+        let mut program = account(2, "bot", Vec::new());
+        program.control = identity::Control::Program {
+            controller: 1,
+            executor: "agent".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        };
+        let names = NameDirectory::from_accounts([&human, &program]);
+        assert_eq!(avatar_kind("user:deadbeef", &names), "human");
+        assert_eq!(avatar_kind("acct:1", &names), "human");
+        assert_eq!(
+            avatar_kind("acct:2", &names),
+            "agent",
+            "a program account is software"
+        );
         for author in ["module:reviewer", "module:forge", "system"] {
-            assert_eq!(avatar_kind(author), "agent");
+            assert_eq!(avatar_kind(author, &names), "agent");
         }
     }
 
