@@ -187,7 +187,7 @@ views: ice-tool $(WASM_TOOLS_BIN)
 
 ## rebuild the committed view sources in two isolated roots and compare bytes
 views-repro-check: ice-tool $(WASM_TOOLS_BIN)
-	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)"
+	bash ops/views-repro-check.sh "$(ICE_BIN)" "$(WASM_TOOLS_ROOT)" "$(ICE_ROOT)"
 
 ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed

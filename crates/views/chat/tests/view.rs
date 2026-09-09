@@ -244,6 +244,204 @@ fn an_edit_is_seeded_from_the_message_and_leaves_as_the_edited_text() {
     });
 }
 
+/// What the host will lay out: the frame after the wire's own bounds.
+fn through_the_wire(mut frame: Frame) -> Frame {
+    ui_lang_guest::wire::sanitize(&mut frame);
+    frame
+}
+
+#[test]
+fn the_more_button_opens_the_menu_and_the_heart_opens_the_grid() {
+    on_a_deep_stack(|| {
+        let (subscription, frame) = shown(&facts());
+        let frame = tick_native(press(&frame, "More message actions"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.message_actions");
+        assert_eq!(
+            serde_json::from_slice::<Selection>(&intent.payload).expect("decodes"),
+            Selection {
+                seq: 1,
+                body: "first light".into(),
+                rev: 1
+            }
+        );
+        let menu = ChatProps {
+            selected_message_seq: 1,
+            selected_message_rev: 1,
+            message_action: "more".into(),
+            ..facts()
+        };
+        let frame = through_the_wire(tick_native(vec![item(subscription, &encoded(&menu))]));
+        for expected in ["Add reaction", "Reply in thread", "Edit message"] {
+            assert!(
+                has_text(&frame, expected),
+                "missing {expected:?} in {:?}",
+                texts(&frame)
+            );
+        }
+        let frame = tick_native(press(&frame, "Manage reactions"));
+        assert_eq!(one_intent(&frame).kind, "chat.message_reactions");
+        let grid = ChatProps {
+            message_action: "reactions".into(),
+            ..menu
+        };
+        let frame = through_the_wire(tick_native(vec![item(subscription, &encoded(&grid))]));
+        assert!(has_text(&frame, "🦆"), "{:?}", texts(&frame));
+        fn emoji_button(node: &Node) -> Option<u32> {
+            if let Node::Button {
+                description,
+                on_press,
+                ..
+            } = node
+                && description.as_deref() == Some("🦆")
+            {
+                return *on_press;
+            }
+            node.children().iter().find_map(emoji_button)
+        }
+        let message = emoji_button(frame.root.as_ref().unwrap()).expect("duck reaction button");
+        let frame = tick_native(vec![ui_lang_guest::wire::Event::Message(message)]);
+        assert_eq!(one_intent(&frame).kind, "chat.reaction_submit");
+    });
+}
+
+#[test]
+fn a_copy_range_stays_above_the_scroller_and_clear_routes_to_the_host() {
+    on_a_deep_stack(|| {
+        let (subscription, _) = shown(&facts());
+        let ranged = ChatProps {
+            copy_anchor_seq: 1,
+            copy_head_seq: 2,
+            copy_surface: "timeline".into(),
+            ..facts()
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&ranged))]);
+        let shown = texts(&frame);
+        let at = |needle: &str| {
+            shown
+                .iter()
+                .position(|text| text == needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {shown:?}"))
+        };
+        assert!(
+            at("2 messages selected") < at("first light"),
+            "the bar reads above the messages: {shown:?}"
+        );
+        assert!(at("Copy") < at("first light") && at("Clear") < at("first light"));
+        assert!(!has_text(&frame, "⇧-click another message to extend"));
+        node_ending(&frame, "/timeline-selection/root");
+        fn assert_bar_outside_scrollers(node: &Node) {
+            fn has_bar(node: &Node) -> bool {
+                node.key()
+                    .is_some_and(|key| key.contains("/timeline-selection/"))
+                    || node.children().iter().any(has_bar)
+            }
+            if let Node::Scroll { content, .. } = node {
+                assert!(
+                    !has_bar(content),
+                    "selection controls must stay outside the scroller"
+                );
+            }
+            for child in node.children() {
+                assert_bar_outside_scrollers(child);
+            }
+        }
+        assert_bar_outside_scrollers(frame.root.as_ref().unwrap());
+        let frame = tick_native(press(&frame, "Clear"));
+        assert_eq!(one_intent(&frame).kind, "chat.clear_range");
+    });
+}
+
+#[test]
+fn a_thread_drag_tracks_the_pointer_until_release_and_buttons_also_resize() {
+    on_a_deep_stack(|| {
+        use ui_lang_guest::wire::{Event, Length, mouse};
+        let props = ChatProps {
+            active_thread_seq: 1,
+            thread_messages: vec![message(1, "first light")],
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
+        let width = |frame: &Frame| {
+            let node = node_ending(frame, "/thread-pane");
+            let Node::Container {
+                width: Some(Length::Fixed(width)),
+                ..
+            } = node
+            else {
+                panic!("fixed thread width: {node:?}")
+            };
+            *width
+        };
+        assert_eq!(width(&frame), 330.0);
+        assert!(frame.mouse_interest);
+        let movement = |x| Event::Mouse {
+            event: mouse::Event::CursorMoved { x, y: 30.0 },
+            captured: true,
+        };
+        let frame = tick_native(vec![movement(700.0)]);
+        let handle = node_ending(&frame, "/thread-resize");
+        let Node::MouseArea {
+            on_press: Some(handler),
+            ..
+        } = handle
+        else {
+            panic!("a routed handle")
+        };
+        let frame = tick_native(vec![Event::Message(*handler), movement(620.0)]);
+        assert_eq!(width(&frame), 410.0);
+        let frame = tick_native(vec![
+            Event::Mouse {
+                event: mouse::Event::ButtonReleased(mouse::Button::Left),
+                captured: true,
+            },
+            movement(500.0),
+        ]);
+        assert_eq!(
+            width(&frame),
+            410.0,
+            "release ends the drag outside the handle"
+        );
+        let frame = tick_native(press(&frame, "Narrow thread"));
+        assert_eq!(width(&frame), 378.0);
+        let frame = tick_native(press(&frame, "Widen thread"));
+        assert_eq!(width(&frame), 410.0);
+    });
+}
+
+fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
+    fn walk<'a>(node: &'a Node, suffix: &str) -> Option<&'a Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node);
+        }
+        node.children().iter().find_map(|node| walk(node, suffix))
+    }
+    walk(frame.root.as_ref().expect("a tree"), suffix).expect("an identified node")
+}
+
+#[test]
+fn a_thread_selection_does_not_add_a_second_bar_to_the_channel() {
+    on_a_deep_stack(|| {
+        let props = ChatProps {
+            active_thread_seq: 1,
+            thread_messages: vec![message(1, "first light"), message(2, "a reply")],
+            copy_anchor_seq: 1,
+            copy_head_seq: 2,
+            copy_surface: "thread".into(),
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
+        assert_eq!(
+            texts(&frame)
+                .iter()
+                .filter(|text| *text == "2 messages selected")
+                .count(),
+            1
+        );
+        node_ending(&frame, "/thread-selection/root");
+    });
+}
+
 fn live_run(anchor_seq: i64) -> LiveAgentRow {
     LiveAgentRow {
         anchor_seq,

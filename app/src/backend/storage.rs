@@ -56,6 +56,7 @@ pub struct FsListing {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct FsPreview {
+    pub base_snapshot: String,
     pub generation: i64,
     pub path: String,
     pub text: String,
@@ -166,8 +167,18 @@ pub async fn files_preview(
 
 /// The text preview: the first 64 KiB, branded binary on a control byte.
 async fn files_text(rpc: &RpcClient, path: String, generation: i64) -> Result<FsPreview, String> {
+    let base_snapshot = files_head(rpc)
+        .await?
+        .ok_or("The file has no committed snapshot")?;
     let reply = rpc
-        .files_get("read", &[("path", path.as_str()), ("len", "65536")])
+        .files_get(
+            "read",
+            &[
+                ("path", path.as_str()),
+                ("len", "65536"),
+                ("snapshot", base_snapshot.as_str()),
+            ],
+        )
         .await?;
     let b64 = reply["b64"].as_str().unwrap_or_default();
     let eof = reply["eof"].as_bool().unwrap_or(true);
@@ -183,6 +194,7 @@ async fn files_text(rpc: &RpcClient, path: String, generation: i64) -> Result<Fs
         _ => (format!("{} binary bytes", bytes.len()), true),
     };
     Ok(FsPreview {
+        base_snapshot,
         generation,
         path,
         text,
@@ -214,6 +226,7 @@ async fn files_picture(
     let size = bytes.len();
     match store_picture(FILES_SURFACE, path.clone(), bytes).await {
         Ok((width, height)) => Ok(FsPreview {
+            base_snapshot: String::new(),
             generation,
             path,
             text: String::new(),
@@ -268,6 +281,7 @@ pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option
 
 fn binary_preview(generation: i64, path: String, text: String) -> FsPreview {
     FsPreview {
+        base_snapshot: String::new(),
         generation,
         path,
         text,
@@ -331,14 +345,7 @@ async fn files_commit_one(
     change: serde_json::Value,
 ) -> Result<(), String> {
     let head = files_head(rpc).await?;
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "commit": {
-            "base_snapshot": head,
-            "message": message,
-            "changes": [change],
-        }
-    }))
-    .map_err(|error| format!("files commit does not serialize: {error}"))?;
+    let payload = files_commit_payload(head, message, change)?;
     signed_write(rpc, "files", payload, password).await?;
     Ok(())
 }
@@ -611,4 +618,118 @@ pub fn fs_parent(path: String) -> String {
         Some(0) | None => "/".to_string(),
         Some(cut) => path[..cut].to_string(),
     }
+}
+
+#[cfg(test)]
+#[path = "storage_edit_tests.rs"]
+mod edit_tests;
+
+fn files_commit_payload(
+    head: Option<String>,
+    message: String,
+    change: serde_json::Value,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&serde_json::json!({
+        "commit": {
+            "base_snapshot": head,
+            "message": message,
+            "changes": [change],
+        }
+    }))
+    .map_err(|error| format!("files commit does not serialize: {error}"))
+}
+
+/// An unsaved draft belongs to a network, across reconnections to that network.
+pub fn files_network_scope(rpc: String, chain: String) -> String {
+    if chain.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(&(rpc, chain)).expect("string tuple serializes")
+}
+
+/// A delivered operation additionally belongs to one connection occurrence.
+pub fn files_context(rpc: String, chain: String, connection: i64) -> String {
+    serde_json::to_string(&(rpc, chain, connection)).expect("string tuple serializes")
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct FsSaveReply {
+    pub context: String,
+    pub namespace: String,
+    pub request: i64,
+    pub success: bool,
+    pub message: String,
+}
+
+/// A bounded set of terminal replies. Old refusals cannot erase a newer save's result.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct FsSaveHistory {
+    pub replies: Vec<FsSaveReply>,
+    /// Changes only when an unconsumed identity may have left the bounded history.
+    pub overflow: String,
+}
+
+pub fn no_fs_save_reply() -> FsSaveHistory {
+    FsSaveHistory::default()
+}
+
+pub fn fs_save_reply(
+    context: String,
+    namespace: String,
+    request: i64,
+    success: bool,
+    mut message: String,
+    mut previous: FsSaveHistory,
+) -> FsSaveHistory {
+    if request == 0 {
+        return previous;
+    }
+    if let Some(reply) = previous
+        .replies
+        .iter_mut()
+        .find(|reply| reply.namespace == namespace)
+    {
+        let obsolete =
+            reply.request > request || (reply.request == request && (reply.success || !success));
+        if obsolete {
+            return previous;
+        }
+        // A newer request from this same guest proves it no longer waits for the old one.
+        previous
+            .replies
+            .retain(|reply| reply.namespace != namespace);
+    }
+    message.truncate(message.floor_char_boundary(512));
+    previous.replies.push(FsSaveReply {
+        context,
+        namespace,
+        request,
+        success,
+        message,
+    });
+    if previous.replies.len() > 8 {
+        previous.replies.remove(0);
+        previous.overflow = fresh_operation_id("files-save-history".into());
+    }
+    previous
+}
+
+/// Edit the exact snapshot whose text was read, never silently rebase a draft.
+pub async fn files_save_text(
+    rpc: String,
+    password: String,
+    path: String,
+    base: String,
+    text: String,
+) -> Result<bool, AppError> {
+    async {
+        if base.is_empty() { return Err("Return to the original file before saving.".to_string()); }
+        let rpc = rpc_client(&rpc)?;
+        let payload = files_commit_payload(Some(base), format!("write {path}"), serde_json::json!({
+            "put": { "path": path, "exec": false, "meta": {}, "content": { "inline": { "b64": base64_encode(text.as_bytes()) } } }
+        }))?;
+        signed_write(&rpc, "files", payload, password).await?;
+        Ok(())
+    }.await.map_err(app_error)?;
+    Ok(true)
 }

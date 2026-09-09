@@ -44,6 +44,12 @@ on desktop_notifications_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
+  fs_generation = fs_generation + 1
+  fs_preview_path = ""
+  fs_preview_text = ""
+  fs_preview_base = ""
+  fs_write_pending = ""
+  fs_loading = false
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
   account_busy = account_busy && empty(account_ceremony_phase)

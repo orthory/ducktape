@@ -1368,16 +1368,20 @@ on thread_reply_sent(next)
 // `MessageCard`) — a drag that followed the cursor from row to row would need
 // an enter route and a full rebuild per row crossed, which is the per-hover
 // round trip `DiffRow` refuses by name. So the gesture is the one every
-// desktop list already answers: click an end, shift-click the other.
+// desktop list already answers: shift-click an end, then shift-click the other.
 // ============================================================================
 
-// A press on a message's prose, in either surface. Plain, it starts a
-// one-message range here; with ⇧ held it keeps the anchor and moves the far
-// end. `shift_held` comes off the modifier stream because a press carries no
-// modifiers of its own, and the surface rides along so a shift-click in the
-// rail cannot draw a range that spans both lists.
+// A press on a message's prose, in either surface. Plain, it is only a press
+// — a reader clicking around a room must not keep lighting a one-message
+// range and its bar. With ⇧ held it starts a range here, or keeps the anchor
+// and moves the far end of the one already open. `shift_held` comes off the
+// modifier stream because a press carries no modifiers of its own (the guest
+// never sees them either), and the surface rides along so a shift-click in
+// the rail cannot draw a range that spans both lists. Esc and the bar's
+// Clear end a range.
 on press_message(seq, surface)
-  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface, shift_held)
+  return if !shift_held
+  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface)
   copy_anchor_seq = range.anchor
   copy_head_seq = range.head
   copy_surface = range.surface

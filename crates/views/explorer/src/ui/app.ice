@@ -30,6 +30,7 @@ extern crate::host
   pure icon(name:&str) -> bytes
   pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
   pure height_label(height:i64) -> str
+  pure hex(digest:&str) -> str
   pure plural(count:i64, one:&str, many:&str) -> str
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
 
@@ -427,6 +428,38 @@ view
                       w=fill
                       h=fill
                     col w=fill gap=6.0
+                      // THE BLOCK'S OWN KEYS. The list prints the frame id
+                      // beside its height; this names both of the block's
+                      // digests and puts a copy on each — the commit hash
+                      // (the state root the block sealed) appears nowhere
+                      // else on the screen.
+                      for block in blocks
+                        if block.height == selected
+                          box
+                            with
+                              w=fill
+                              p=8.0
+                              bg=surface
+                              border=fg/10
+                              border-w=1.0
+                              r=9.0
+                            col w=fill gap=3.0
+                              DigestRow
+                                with
+                                  name="block"
+                                  digest=block.hash
+                                  copied="Block hash copied"
+                                  action="Copy block hash"
+                                events
+                                  copy_to_clipboard -> copy_to_clipboard _ _
+                              DigestRow
+                                with
+                                  name="commit"
+                                  digest=block.commit
+                                  copied="Commit hash copied"
+                                  action="Copy commit hash"
+                                events
+                                  copy_to_clipboard -> copy_to_clipboard _ _
                       for op in explorer_ops_at(ops, selected)
                         box
                           with
@@ -470,55 +503,29 @@ view
                             //
                             // The hash is FULL and lives on its OWN row: it is
                             // the blob key (QA: the explorer never exposed the
-                            // whole thing), and 64 code chars at 12.0 are
-                            // ~461px against the pane's 532px minimum (1040 −
+                            // whole thing), and 66 code chars at 12.0 are
+                            // ~475px against the pane's 532px minimum (1040 −
                             // 74 rail − 48 screen padding − 340 list − 10 gap
                             // − 18 box − 18 card) — too wide to share a row
-                            // with the target, wide enough to own one.
-                            // `word-or-glyph` wraps rather than clips anything
-                            // narrower. Clicking it copies the key whole.
-                            row
+                            // with the target, wide enough to own one. The
+                            // same shape as the block's own keys above, so
+                            // both read and copy identically.
+                            DigestRow
                               with
-                                w=fill
-                                gap=8.0
-                                align=center
-                              text "hash"
-                                with
-                                  size=11.0
-                                  wrap=none
-                                  font=code_medium
-                                  @text-muted
-                              button -> copy_to_clipboard(op.op_hash, "Op hash copied")
-                                with
-                                  label="Copy op hash"
-                                  p=2.0
-                                  @ghost_action
-                                text op.op_hash
-                                  with
-                                    size=12.0
-                                    wrap=word-or-glyph
-                                    font=code
-                                    @text-muted
-                                active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
-                                hovered bg=row_hover text=fg
-                                pressed bg=accent
-                            row
+                                name="hash"
+                                digest=op.op_hash
+                                copied="Op hash copied"
+                                action="Copy op hash"
+                              events
+                                copy_to_clipboard -> copy_to_clipboard _ _
+                            DigestRow
                               with
-                                w=fill
-                                gap=8.0
-                                align=center
-                              text "by"
-                                with
-                                  size=11.0
-                                  wrap=none
-                                  font=code_medium
-                                  @text-muted
-                              text op.proposer
-                                with
-                                  size=12.0
-                                  wrap=none
-                                  font=code
-                                  @text-muted
+                                name="by"
+                                digest=op.proposer
+                                copied="Proposer copied"
+                                action="Copy proposer"
+                              events
+                                copy_to_clipboard -> copy_to_clipboard _ _
                             // `chat(+0m/+0e)` sat here naked. `dispatch` is the
                             // word this screen's own "Select a block" plate
                             // already uses for it ("Its operations and dispatch
@@ -554,6 +561,44 @@ view
                                 wrap=word-or-glyph
                                 font=code
                                 @text-fg
+
+// A labelled digest, whole, in the code face. `word-or-glyph` wraps a 66-char
+// `0x…` hash instead of clipping it.
+//
+// THE PROP IS THE CANONICAL DIGEST — bare, exactly as the node published it —
+// and the `0x` is put on for the EYE only, at the one `text` below. The copy
+// carries the prop: `GET /v1/files/blob/{op_hash}` and every CLI that takes a
+// digest want the bare form, and a paste that has to be hand-trimmed first is
+// a copy button that does not work. The prefix is what tells a reader the run
+// of digits is hex; it is not part of the key.
+component DigestRow(name:str, digest:str, copied:str, action:str)
+  emits
+    copy_to_clipboard(str, str)
+  row #root
+    with
+      w=fill
+      gap=8.0
+      align=center
+    text name
+      with
+        size=11.0
+        wrap=none
+        font=code_medium
+        @text-muted
+    button -> emit(copy_to_clipboard, digest, copied)
+      with
+        label=action
+        p=2.0
+        @ghost_action
+      text hex(digest)
+        with
+          size=12.0
+          wrap=word-or-glyph
+          font=code
+          @text-muted
+      active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
+      hovered bg=row_hover text=fg
+      pressed bg=accent
 
 component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
   emits
@@ -598,11 +643,15 @@ component ExplorerBlockFace(block:ExplorerBlock)
         wrap=none
         font=code
         @text-fg
-    text block.hash
+    // THE KEY, NOT A LANDMARK. Twelve chars and an ellipsis identify a block
+    // to the eye and to nothing else — it cannot be pasted at a node, matched
+    // against a log line, or compared with the commit hash beside it. The row
+    // wraps to hold all of it (`wrap=none` clips at this column's width).
+    text hex(block.hash)
       with
         w=fill
         size=12.0
-        wrap=none
+        wrap=word-or-glyph
         font=code
         @text-muted
     // `1 op` / `3 ops`, not a bare `1`. The three columns carry no header, and

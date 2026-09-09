@@ -129,7 +129,7 @@ extern crate::backend
   pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
   pure copy_range_label(count:i64) -> str
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
-  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
+  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface) -> CopyRange
   pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
@@ -151,10 +151,12 @@ extern crate::backend
   HubState(networks:[HubNetwork], preselect:str)
   hub_state() -> HubState
   // THE PICKED NETWORK'S KEYSTORE. A wallet is an identity on one network,
-  // kept in that network's workspace, so the rows are loaded on the pick —
-  // and the load settles the session's identity to that workspace's active
-  // wallet (read without a password). `keystore` is false for an endpoint
-  // this device holds no workspace for: a remote, read-only.
+  // kept in that network's keystore on this device (the node's workspace
+  // when this device hosts it, else a per-chain directory under the ducktape
+  // home), so the rows are loaded on the pick — and the load settles the
+  // session's identity to that keystore's active wallet (read without a
+  // password). `keystore` is false only when a remote's node never answered
+  // which network it serves, so no keystore could be named.
   WalletList(wallets:[WalletInfo], error:str, keystore:bool)
   load_wallets(rpc:str) -> WalletList
   pure wallet_door(list:&WalletList) -> WalletDoor
@@ -235,7 +237,7 @@ extern crate::backend
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
-  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
+  FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
@@ -258,6 +260,13 @@ extern crate::backend
   files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
   files_remove(rpc:str, password:str, path:str) -> bool ! AppError
   files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError
+  files_save_text(rpc:str, password:str, path:str, base:str, text:str) -> bool ! AppError
+  pure files_network_scope(rpc:str, chain:str) -> str
+  pure files_context(rpc:str, chain:str, connection:i64) -> str
+  FsSaveReply(context:str, namespace:str, request:i64, success:bool, message:str)
+  FsSaveHistory(replies:[FsSaveReply], overflow:str)
+  pure no_fs_save_reply() -> FsSaveHistory
+  pure fs_save_reply(context:str, namespace:str, request:i64, success:bool, message:str, previous:FsSaveHistory) -> FsSaveHistory
   files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   FsDiffEntry(path:str, kind:str)
   FsDiff(generation:i64, from:str, entries:[FsDiffEntry])

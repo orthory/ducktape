@@ -563,14 +563,67 @@ pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String
         .unwrap_or_default()
 }
 
-/// The workspace behind an endpoint, or the refusal a keystore verb gives a
-/// remote: a wallet is an identity ON a network, kept in that network's
-/// workspace, so an endpoint this device holds no workspace for has none.
-pub(crate) fn workspace_for(rpc: &str) -> Result<PathBuf, String> {
-    workspace_at(rpc).map(|(_, dir)| dir).ok_or_else(|| {
-        "this endpoint has no workspace on this device — a remote node is read-only here"
-            .to_string()
-    })
+/// WHERE A NETWORK'S WALLETS LIVE ON THIS DEVICE. A wallet is an identity ON
+/// a network, so its keystore is keyed by the network — and every network
+/// this device talks to has one, whether or not it also runs that network's
+/// node here:
+///
+/// - a network this device hosts keeps its keys in the node's workspace, as
+///   the CLI does (`<workspace>/keys/`);
+/// - a network reached only through a remote endpoint keeps them under
+///   `<ducktape home>/remotes/<chain id>/keys/` — the chain id, not the
+///   endpoint, because the same network dialled through a different tunnel or
+///   port is the same identity.
+///
+/// The keystore used to be the workspace and nothing else, which made a device
+/// that hosts no node a device that can hold no key: it dropped into the
+/// console read-only, silently, with no way to create or unlock anything. The
+/// launch window's key screens now open for a remote exactly as for a local
+/// network.
+///
+/// A remote's chain id is what its `/v1/status` says; [`note_remote_chain`]
+/// records it when the launch window loads the keystore, and until it has,
+/// the root is a refusal — "not yet reached", never a guess.
+pub(crate) fn keystore_root(rpc: &str) -> Result<PathBuf, String> {
+    if let Some((_, workspace)) = workspace_at(rpc) {
+        return Ok(workspace);
+    }
+    let endpoint = canonical_endpoint(rpc.to_string());
+    let chain_id = remote_chains()
+        .get(&endpoint)
+        .cloned()
+        .ok_or_else(|| "this node has not answered which network it serves yet".to_string())?;
+    remote_keystore_root(&workspace_config::ducktape_home()?, &chain_id)
+}
+
+/// `<home>/remotes/<chain id>`. The chain id is a `--name` plus a hash and may
+/// carry a path separator; it is made inert the way
+/// `workspace_config::default_workspace_dir` does for workspaces.
+pub(crate) fn remote_keystore_root(home: &Path, chain_id: &str) -> Result<PathBuf, String> {
+    let name = chain_id.replace(std::path::MAIN_SEPARATOR, "-");
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("chain id {chain_id:?} is not a directory name"));
+    }
+    Ok(home.join("remotes").join(name))
+}
+
+/// Endpoint → chain id, for the remotes this session has reached. Learned
+/// once per endpoint from the node's own status, at the keystore load.
+static REMOTE_CHAINS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+fn remote_chains() -> std::sync::MutexGuard<'static, BTreeMap<String, String>> {
+    REMOTE_CHAINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record which network `rpc` serves, so [`keystore_root`] can name its
+/// keystore. An empty chain id (a node serving no chain yet) records nothing.
+pub(crate) fn note_remote_chain(rpc: &str, chain_id: &str) {
+    if chain_id.is_empty() {
+        return;
+    }
+    remote_chains().insert(canonical_endpoint(rpc.to_string()), chain_id.to_string());
 }
 
 /// One named wallet's key file inside a workspace's keystore — THE join, so
@@ -591,19 +644,19 @@ pub(crate) fn active_wallet_name(workspace: &Path) -> String {
 }
 
 /// The signing key file a session on `rpc` reads its identity off: the
-/// explicit `DUCKTAPE_USER_KEY` override, else the active wallet of the
-/// workspace serving that endpoint. No workspace, or no active wallet, is a
-/// refusal, not a guess — the launch window is where one is picked.
+/// explicit `DUCKTAPE_USER_KEY` override, else the active wallet of that
+/// network's keystore ([`keystore_root`]). No active wallet is a refusal, not
+/// a guess — the launch window is where one is picked.
 pub(crate) fn session_key_path(rpc: &str) -> Result<PathBuf, String> {
     if let Some(path) = env_user_key() {
         return Ok(path);
     }
-    let workspace = workspace_for(rpc)?;
-    let name = active_wallet_name(&workspace);
+    let root = keystore_root(rpc)?;
+    let name = active_wallet_name(&root);
     if name.is_empty() {
         return Err("no active wallet — pick one in the launch window".to_string());
     }
-    keystore_key_path(&workspace, &name)
+    keystore_key_path(&root, &name)
 }
 
 /// The rig override: `DUCKTAPE_USER_KEY` names a key file outright, and no

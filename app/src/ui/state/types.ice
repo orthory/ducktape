@@ -65,11 +65,15 @@ enum HubStep
   account
 
 // The door a picked network's keystore opens: its rows unlock, an empty
-// keystore mints the device key, no keystore at all (a remote) is read-only.
+// keystore mints the device key, and a keystore that could not be NAMED (a
+// remote whose node never said which network it serves) keeps the pick on
+// screen with the error. A remote has a keystore like any network — under the
+// ducktape home, by chain id — so there is no read-only door here; the only
+// read-only entry is the button on the key screens.
 enum WalletDoor
   wallets
   password
-  read_only
+  unreached
 
 // Open-or-raise for a window whose open state means "put it in front of me",
 // nothing more — the huddle's call window. The status item's own "Open" row
