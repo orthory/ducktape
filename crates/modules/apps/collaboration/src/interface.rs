@@ -679,6 +679,47 @@ pub enum ProtectedRead {
     },
     /// One message's delivery record.
     Receipt { conversation_id: String, seq: u64 },
+    /// Whether a NEW delivery attempt for one message may still be made — the
+    /// question a bound service asks BEFORE handing it to a provider. Answered
+    /// for the CALLER as recipient; a sender asking about somebody else's
+    /// mailbox is refused.
+    DeliveryEligibility { conversation_id: String, seq: u64 },
+}
+
+/// The answer to [`ProtectedRead::DeliveryEligibility`], computed against the
+/// block's AGREED time — never a caller's clock.
+///
+/// This is deliberately NOT the receipt. A receipt is a truthful log of what a
+/// bound service observed, so a late but honest `adapter_accepted` stays
+/// readable there and is never relabelled. Eligibility is the forward-looking
+/// question, and the deadline decides it alone: past `expires_at` there is no
+/// new submission to make, whatever the log says. A historical acceptance is a
+/// fact, not an authorization to deliver again.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeliveryEligibility {
+    /// Deliver it. `state` is where the record stands, `expires_at` the
+    /// deadline this answer was computed against and `asked_at` the agreed
+    /// time it was computed at — so the caller sees how much window is left
+    /// without a second read.
+    Eligible {
+        state: DeliveryState,
+        expires_at: u64,
+        asked_at: u64,
+    },
+    /// The deadline has passed. Nothing further is delivered under it.
+    Expired { expires_at: u64, asked_at: u64 },
+    /// Already settled: accepted, refused or expired. Not work.
+    Settled { state: DeliveryState },
+    /// The service could not establish whether input was accepted, and the
+    /// spec is explicit that such a record MUST NOT be replayed automatically.
+    /// A human or an explicit operator decision resolves it.
+    NotReplayable,
+    /// Nobody is bound to carry it: the participant has no live binding on
+    /// this conversation.
+    Unbound,
+    /// No such message, or its body has been pruned out from under the query.
+    Unknown,
 }
 
 /// A read on behalf of `participant_id`.
@@ -735,6 +776,7 @@ pub enum CollaborationReply {
     Access(ConversationAccess),
     Events(EventPage),
     Receipt(Option<Receipt>),
+    Eligibility(DeliveryEligibility),
     SendState(SendState),
     Mailbox(MailboxUsage),
     /// The authenticated read was refused. The only answer a caller that is

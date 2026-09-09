@@ -3,7 +3,7 @@
 // readings arrive as props, interaction-local state stays here, and only
 // application effects leave as named events the view root turns into intents.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, display_omitted:i64, preview_display_clipped:bool)
   lifetime retained
   emits
     open_message_link(str)
@@ -17,9 +17,9 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     fs_delete_submit()
     fs_close_diff()
     fs_show_diff(str)
-    fs_begin_edit()
-    fs_cancel_edit()
-    fs_save_edit()
+    fs_begin_edit(str)
+    fs_cancel_edit(str)
+    fs_save_edit(str)
   state
     history_open = false
   on fs_toggle_history
@@ -228,7 +228,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
               // THIS path there is nothing to read — the node is down, or the
               // rows still describe the directory you just left — and the main
               // pane already says so.
-              if connected && listed && empty(directories)
+              if connected && listed && empty(directories) && display_omitted == 0
                 box
                   with
                     w=fill
@@ -302,7 +302,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                       active bg=surface text=muted border=card_line border-w=1.0 r=6.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle
-                  if empty(diff)
+                  if empty(diff) && display_omitted == 0
                     text "No differences." size=12.5 @text-caption
                   for entry in diff
                     row
@@ -331,7 +331,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                   // failed. Same trade as the "No differences." arm above.
                   if !empty(history)
                     GroupLabel label="SNAPSHOTS"
-                  if empty(history)
+                  if empty(history) && display_omitted == 0
                     text "No snapshots yet." size=12.5 @text-caption
                   for snapshot in history
                     box
@@ -386,7 +386,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             // plate that said "Empty directory" or a list of the previous
             // directory's objects would each be a claim about a path nobody
             // has answered for yet.
-            if listed && empty(entries)
+            if listed && empty(entries) && display_omitted == 0
               box w=fill p=22.0
                 EmptyPlate message="Empty directory — nothing is committed under this path."
             if listed && !empty(entries)
@@ -436,8 +436,24 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                             size=12.5
                             wrap=none
                             @text-caption
+                      if preview_display_clipped && !editing
+                        text "Preview shortened for display."
+                          with
+                            size=12.5
+                            wrap=none
+                            @text-caption
                       if !preview_binary && !preview_picture && !editing && !preview_truncated
-                        button "Edit" -> emit(fs_begin_edit)
+                        button "Edit" -> emit(fs_begin_edit, edit_context)
+                          with
+                            disabled=(loading || edit_blocked)
+                            h=22.0
+                            p=4.0
+                            @secondary_action
+                          active bg=surface text=muted border=card_line border-w=1.0 r=6.0
+                          hovered bg=elevated text=fg
+                          pressed bg=subtle
+                      if editing
+                        button "Cancel" -> emit(fs_cancel_edit, edit_context)
                           with
                             h=22.0
                             p=4.0
@@ -446,16 +462,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                           hovered bg=elevated text=fg
                           pressed bg=subtle
                       if editing
-                        button "Cancel" -> emit(fs_cancel_edit)
-                          with
-                            h=22.0
-                            p=4.0
-                            @secondary_action
-                          active bg=surface text=muted border=card_line border-w=1.0 r=6.0
-                          hovered bg=elevated text=fg
-                          pressed bg=subtle
-                      if editing
-                        button "Save" -> emit(fs_save_edit)
+                        button "Save" -> emit(fs_save_edit, edit_context)
                           with
                             disabled=loading
                             h=22.0

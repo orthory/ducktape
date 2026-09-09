@@ -36,8 +36,8 @@ use sdk::{Ctx, Error, Origin, StagedStore};
 
 use crate::interface::{
     BindingView, CollaborationReply, Conversation, ConversationAccess, ConversationEvent,
-    Credential, DenyReason, EventBody, EventPage, Message, Participant, ProtectedRead, Role,
-    SendState, MAX_PAGE_LIMIT,
+    Credential, DeliveryEligibility, DeliveryState, DenyReason, EventBody, EventPage, Message,
+    Participant, ProtectedRead, Role, SendState, MAX_PAGE_LIMIT,
 };
 use crate::registry::{authenticates, live_binding, roster_role};
 use crate::store;
@@ -259,7 +259,81 @@ pub async fn serve(
                 store::receipt(staged, &conversation_id, seq).await?,
             ))
         }
+        ProtectedRead::DeliveryEligibility {
+            conversation_id,
+            seq,
+        } => {
+            if reachable(staged, &reader, &conversation_id).await?.is_none() {
+                return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
+            }
+            // Revocation preserves owner history access, never authorization
+            // for a new provider submission under a still-retained binding.
+            if reader.participant.revoked {
+                return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
+            }
+            Ok(CollaborationReply::Eligibility(
+                eligibility(staged, ctx, &reader, &conversation_id, seq).await?,
+            ))
+        }
     }
+}
+
+/// may a NEW delivery attempt be made for this message?
+///
+/// The time input is `ctx.env().consensus_time` — the block's AGREED time, the
+/// same value admission measured `expires_at` against. It is never a caller's
+/// clock, and it never reaches here unauthenticated: the public lane builds
+/// `Origin::System` (whose `consensus_time` is 0), and `authenticate` has
+/// already refused that before this runs.
+async fn eligibility(
+    staged: &StagedStore,
+    ctx: &dyn Ctx,
+    reader: &Reader,
+    conversation_id: &str,
+    seq: u64,
+) -> Result<DeliveryEligibility, Error> {
+    let (Some(message), Some(receipt)) = (
+        store::message(staged, conversation_id, seq).await?,
+        store::receipt(staged, conversation_id, seq).await?,
+    ) else {
+        return Ok(DeliveryEligibility::Unknown);
+    };
+    // the question is the RECIPIENT's: "may I still hand my participant's
+    // message to a provider". A sender reading its own conversation learns
+    // nothing about somebody else's mailbox here.
+    if receipt.recipient != reader.participant.id {
+        return Ok(DeliveryEligibility::Unknown);
+    }
+    if receipt.state.is_terminal() {
+        return Ok(DeliveryEligibility::Settled {
+            state: receipt.state,
+        });
+    }
+    if receipt.state == DeliveryState::DeliveryUnknown {
+        return Ok(DeliveryEligibility::NotReplayable);
+    }
+    if live_binding(staged, conversation_id, &reader.participant.id)
+        .await?
+        .is_none()
+    {
+        return Ok(DeliveryEligibility::Unbound);
+    }
+    // THE DEADLINE, and it is the only thing that decides this. `expire`
+    // becomes admissible at exactly `expires_at`, so eligibility ends at
+    // exactly `expires_at` — the two agree about one moment.
+    let asked_at = ctx.env().consensus_time;
+    let expires_at = message.expires_at;
+    if asked_at >= expires_at {
+        return Ok(DeliveryEligibility::Expired {
+            expires_at,
+            asked_at,
+        });
+    }
+    Ok(DeliveryEligibility::Eligible {
+        state: receipt.state,
+        expires_at,
+        asked_at,
+    })
 }
 
 /// the conversation, if the caller's CREDENTIAL reaches it and its participant

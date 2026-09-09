@@ -122,6 +122,9 @@ pub struct DiffLine {
 /// landed on `landed_seq` in the discussion.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForgeProps {
+    pub display_omitted: i64,
+    pub display_shortened: bool,
+    pub display_unavailable: bool,
     pub dark: bool,
     pub connected: bool,
     pub org: String,
@@ -157,13 +160,16 @@ pub struct ForgeProps {
     pub forge_item_change_requests: i64,
     pub forge_item_reviews: Vec<ForgeReview>,
     pub merge_conflicts: Vec<String>,
+    pub has_merge_conflicts: bool,
     pub merge_busy: bool,
     pub review_verdict: String,
     pub review_busy: bool,
     pub staged_comments: Vec<ForgeDraftComment>,
+    pub has_staged_comments: bool,
     pub comment_cap_reached: bool,
     pub discussion: Vec<ChatMessage>,
     pub linked_note: Vec<ChatMessage>,
+    pub discussion_clipped: bool,
     pub landed_seq: i64,
     pub landed_tick: i64,
     pub tree_path: String,

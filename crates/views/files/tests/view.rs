@@ -2,9 +2,9 @@
 //! and every write leaves as an intent carrying what the reader chose or
 //! typed, and a committed write the host reports consumes the name draft.
 
-use files_view::host::{FilesProps, FsEntry, Name, Path, Save};
+use files_view::host::{FilesProps, FsEntry, Name, Path, Save, SaveHistory, SaveReply};
 use files_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{find, has_text, item, keys, press, texts, type_into};
+use ui_lang_guest::testing::{edit, find, has_text, item, keys, press, texts, type_into};
 use ui_lang_guest::wire::{Frame, Node};
 
 fn entry(key: i64, path: &str, kind: &str, size: i64) -> FsEntry {
@@ -22,6 +22,11 @@ fn facts() -> FilesProps {
     let docs = entry(1, "/shared/docs", "dir", 2);
     let readme = entry(2, "/shared/README.md", "file", 421_888);
     FilesProps {
+        save_namespace: "guest-a".into(),
+        network_scope: "network-a".into(),
+        context: "connection-a".into(),
+        preview_base: "snapshot-a".into(),
+        save_reply: SaveHistory::default(),
         path: "/shared".into(),
         listed: true,
         entries: vec![docs.clone(), readme.clone()],
@@ -40,9 +45,12 @@ fn facts() -> FilesProps {
         preview_width: 0,
         preview_height: 0,
         preview_text: "# Hello\n".into(),
+        preview_display_text: "# Hello\n".into(),
+        preview_display_clipped: false,
         dark: false,
         write_refusal: String::new(),
         writes: 0,
+        ..FilesProps::default()
     }
 }
 
@@ -145,8 +153,8 @@ fn a_committed_write_consumes_the_name_it_read() {
 }
 
 #[test]
-fn the_edited_body_leaves_on_save_and_the_pane_drops_back_to_the_reader() {
-    let (_, frame) = shown(&facts());
+fn the_edited_body_stays_until_its_exact_save_is_committed() {
+    let (subscription, frame) = shown(&facts());
     let frame = tick_native(press(&frame, "Edit"));
     assert!(frame.requests.is_empty(), "editing is the view's own");
     assert!(has_text(&frame, "Save"), "{:?}", texts(&frame));
@@ -156,9 +164,269 @@ fn the_edited_body_leaves_on_save_and_the_pane_drops_back_to_the_reader() {
     assert_eq!(
         serde_json::from_slice::<Save>(&intent.payload).expect("decodes"),
         Save {
+            namespace: "guest-a".into(),
+            context: "connection-a".into(),
+            base: "snapshot-a".into(),
+            request: 1,
             path: "/shared/README.md".into(),
             text: "# Hello\n".into()
         }
     );
-    assert!(!has_text(&frame, "Save"), "{:?}", texts(&frame));
+    assert!(
+        has_text(&frame, "Save"),
+        "unacknowledged edits stay in the editor"
+    );
+    let committed = FilesProps {
+        // Restore keeps the pending request even when the new host instance supplies a new namespace.
+        save_namespace: "guest-replacement".into(),
+        save_reply: SaveReply {
+            namespace: "guest-a".into(),
+            context: "connection-a".into(),
+            request: 1,
+            success: true,
+            message: String::new(),
+        }
+        .into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&committed))]);
+    assert!(!has_text(&frame, "Save"));
+}
+
+#[test]
+fn a_save_queued_before_navigation_never_targets_the_new_file() {
+    let original = facts();
+    let (subscription, frame) = shown(&original);
+    let editing = tick_native(press(&frame, "Edit"));
+    let queued_save = press(&editing, "Save");
+    let next = FilesProps {
+        preview_path: "/shared/other.md".into(),
+        preview_entry: entry(3, "/shared/other.md", "file", 4),
+        preview_text: "other file".into(),
+        ..facts()
+    };
+    tick_native(vec![item(subscription, &encoded(&next))]);
+    let after = tick_native(queued_save);
+    for request in &after.requests {
+        if request.kind == "files.save" {
+            let save: Save = serde_json::from_slice(&request.payload).unwrap();
+            assert_eq!(
+                save.path, original.preview_path,
+                "a queued Save must never retarget the old draft to a new file"
+            );
+        }
+    }
+}
+
+fn draft_text(frame: &Frame) -> String {
+    let key = keys(frame)
+        .into_iter()
+        .find(|key| key.ends_with("/fs-editor"))
+        .expect("editor present");
+    match find(frame, &key) {
+        Some(Node::Editor { text, .. }) => text.clone(),
+        other => panic!("expected editor, got {other:?}"),
+    }
+}
+
+#[test]
+fn parked_draft_returns_with_its_original_bytes_and_snapshot_after_reconnect() {
+    let original = facts();
+    let (subscription, frame) = shown(&original);
+    let editing = tick_native(press(&frame, "Edit"));
+    let editor_key = keys(&editing)
+        .into_iter()
+        .find(|key| key.ends_with("/fs-editor"))
+        .unwrap();
+    let editing = tick_native(edit(&editing, &editor_key, "unsaved A — 한글"));
+    let stale_save = press(&editing, "Save");
+    let other = FilesProps {
+        network_scope: "network-b".into(),
+        context: "connection-b".into(),
+        preview_text: "B source".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&other))]);
+    assert!(has_text(&frame, "Unsaved changes to:"));
+    assert!(!has_text(&frame, "Save"));
+    let frame = tick_native(stale_save);
+    assert!(frame.requests.is_empty());
+    let returned = FilesProps {
+        context: "connection-a-reconnected".into(),
+        preview_base: "snapshot-new".into(),
+        preview_text: "external edit".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&returned))]);
+    assert_eq!(draft_text(&frame), "unsaved A — 한글");
+    let frame = tick_native(press(&frame, "Save"));
+    let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_eq!(saved.context, returned.context);
+    assert_eq!(saved.base, original.preview_base);
+    assert_eq!(saved.text, "unsaved A — 한글");
+    let refused = FilesProps {
+        save_reply: SaveReply {
+            namespace: "guest-a".into(),
+            context: returned.context.clone(),
+            request: saved.request,
+            success: false,
+            message: "The file changed elsewhere. Your edits are kept.".into(),
+        }
+        .into(),
+        ..returned
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&refused))]);
+    assert_eq!(draft_text(&frame), "unsaved A — 한글");
+    assert!(has_text(
+        &frame,
+        "The file changed elsewhere. Your edits are kept."
+    ));
+}
+
+#[test]
+fn an_old_save_acknowledgement_cannot_consume_a_new_draft() {
+    let (subscription, frame) = shown(&facts());
+    let frame = tick_native(press(&frame, "Edit"));
+    let frame = tick_native(press(&frame, "Save"));
+    let a: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    let other = FilesProps {
+        network_scope: "network-b".into(),
+        context: "connection-b".into(),
+        preview_text: "B source".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&other))]);
+    let frame = tick_native(press(&frame, "Discard unsaved changes"));
+    let frame = tick_native(press(&frame, "Edit"));
+    let frame = tick_native(press(&frame, "Save"));
+    let b: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+    assert_ne!(a.request, b.request);
+    let late = FilesProps {
+        save_reply: SaveReply {
+            namespace: "guest-a".into(),
+            context: a.context,
+            request: a.request,
+            success: true,
+            message: String::new(),
+        }
+        .into(),
+        ..other
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&late))]);
+    assert!(
+        has_text(&frame, "Save"),
+        "an old acknowledgement cannot close B's editor"
+    );
+    let mut pending = false;
+    frame.root.clone().unwrap().for_each_mut(&mut |node| {
+        if let Node::Button {
+            content: ui_lang_guest::wire::ButtonContent::Label(label),
+            on_press,
+            ..
+        } = node
+            && label == "Save"
+        {
+            pending = on_press.is_none();
+        }
+    });
+    assert!(pending, "B remains pending");
+    assert_eq!(draft_text(&frame), "B source");
+}
+
+#[test]
+fn a_fresh_guest_never_consumes_the_previous_instances_save_reply() {
+    let old_success = SaveReply {
+        namespace: "guest-old".into(),
+        context: "connection-a".into(),
+        request: 1,
+        success: true,
+        message: String::new(),
+    };
+    // A retained reply and a reply still in flight when the old guest died.
+    for initial_reply in [old_success.clone(), SaveReply::default()] {
+        let initial = FilesProps {
+            save_namespace: "guest-new".into(),
+            save_reply: initial_reply.into(),
+            ..facts()
+        };
+        let (subscription, frame) = shown(&initial);
+        let frame = tick_native(press(&frame, "Edit"));
+        let key = keys(&frame)
+            .into_iter()
+            .find(|key| key.ends_with("/fs-editor"))
+            .unwrap();
+        let frame = tick_native(edit(&frame, &key, "new unsaved text"));
+        let frame = tick_native(press(&frame, "Save"));
+        let saved: Save = serde_json::from_slice(&one_intent(&frame).payload).unwrap();
+        assert_eq!(saved.namespace, "guest-new");
+        assert_eq!(saved.request, 1, "fresh guest restarts its local counter");
+        let late = FilesProps {
+            save_reply: old_success.clone().into(),
+            ..initial
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&late))]);
+        assert!(
+            has_text(&frame, "Save"),
+            "a previous instance's success cannot consume the fresh draft"
+        );
+        assert_eq!(draft_text(&frame), "new unsaved text");
+        let confirmed = FilesProps {
+            save_reply: SaveReply {
+                namespace: saved.namespace,
+                ..old_success.clone()
+            }
+            .into(),
+            ..late
+        };
+        let frame = tick_native(vec![item(subscription, &encoded(&confirmed))]);
+        assert!(
+            !has_text(&frame, "Save"),
+            "the new save's own reply consumes it"
+        );
+    }
+}
+
+#[test]
+fn lost_confirmation_never_discards_the_draft_or_waits_forever() {
+    let (subscription, frame) = shown(&facts());
+    let frame = tick_native(press(&frame, "Edit"));
+    let key = keys(&frame)
+        .into_iter()
+        .find(|key| key.ends_with("/fs-editor"))
+        .unwrap();
+    let frame = tick_native(edit(&frame, &key, "unsaved bytes after history overflow"));
+    let frame = tick_native(press(&frame, "Save"));
+    assert_eq!(one_intent(&frame).kind, "files.save");
+    let overflowed = FilesProps {
+        save_reply: SaveHistory {
+            replies: Vec::new(),
+            overflow: "new-overflow".into(),
+        },
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&overflowed))]);
+    assert_eq!(draft_text(&frame), "unsaved bytes after history overflow");
+    assert!(has_text(
+        &frame,
+        "Save confirmation is no longer available. Your edits are still here; check the file before saving again."
+    ));
+    assert!(
+        !press(&frame, "Save").is_empty(),
+        "the editor is not stranded waiting for an evicted reply"
+    );
+}
+
+#[test]
+fn omitted_rows_are_a_number_not_literal_template_text() {
+    let (_, frame) = shown(&FilesProps {
+        display_omitted: 12_345,
+        ..facts()
+    });
+    let key = keys(&frame)
+        .into_iter()
+        .find(|key| key.ends_with("/display-omitted"))
+        .expect("the omission count has its own identity");
+    assert!(matches!(find(&frame, &key), Some(Node::Text { content, .. }) if content == "12345"));
+    assert!(has_text(&frame, "rows are not shown."));
+    assert!(has_text(&frame, "Edit"));
 }

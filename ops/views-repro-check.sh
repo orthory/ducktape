@@ -5,6 +5,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ice=$1
 wasm_tools_root=$2
+ice_root=$3
 work="$repo/target/views-repro"
 rm -rf "$work"
 mkdir -p "$work"
@@ -17,7 +18,7 @@ for place in here there; do
   else
     view_target="$work/outside-target"
   fi
-  CARGO_TARGET_DIR="$view_target" make -C "$work/$place" views ICE_BIN="$ice" WASM_TOOLS_ROOT="$wasm_tools_root"
+  CARGO_TARGET_DIR="$view_target" make -C "$work/$place" views ICE_BIN="$ice" ICE_ROOT="$ice_root" WASM_TOOLS_ROOT="$wasm_tools_root"
   (cd "$work/$place/target/views" && printf '%s\n' *.wasm | sort) > "$work/$place.names"
 done
 cmp "$work/here.names" "$work/there.names"

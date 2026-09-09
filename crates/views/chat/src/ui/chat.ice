@@ -174,7 +174,7 @@ component CopyRangeBar(count:i64)
       bg=brand_wash
       border=card_line
       border-w=1.0
-      r=9.0
+      r=0.0
     row
       with
         w=fill
@@ -186,13 +186,7 @@ component CopyRangeBar(count:i64)
           wrap=none
           font=code_medium
           @text-secondary_fg
-      // The hint is the whole discoverability of the gesture: nothing else on
-      // the row says a second click can widen what you are about to lift.
-      text "⇧-click another message to extend"
-        with
-          w=fill
-          size=11.0
-          @text-muted
+      space w=fill
       button "Clear" -> emit(clear_copy_range)
         with
           h=26.0
@@ -204,7 +198,7 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
     press_message(i64, CopySurface)
@@ -242,6 +236,9 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     add_channel_member_submit()
     remove_channel_member_submit(str)
     close_thread()
+    start_thread_resize()
+    narrow_thread()
+    widen_thread()
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
     begin_thread_message_edit(i64, str, i64)
@@ -670,6 +667,11 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   h=1.0
                   bg=separator
                 space w=1.0 h=1.0
+          if copy_surface == CopySurface.timeline && copy_range_count(messages, copy_anchor_seq, copy_head_seq) > 0
+            CopyRangeBar count=copy_range_count(messages, copy_anchor_seq, copy_head_seq) #timeline-selection
+              forward
+                clear_copy_range
+                copy_selected_messages
           stack w=fill h=fill
             col
               with
@@ -1344,21 +1346,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                 pr=18.0
                 pt=12.0
               ComposerGate reason=post_refusal
-          // THE COPY BAR, over the composer where the reader's eye already is.
-          // It is gated on a count and not on the two seqs, so it appears in
-          // the ONE surface whose list the range actually resolves in — the
-          // rail's copy of this bar is gated the same way on `thread_messages`.
-          if copy_range_count(messages, copy_anchor_seq, copy_head_seq) > 0
-            box
-              with
-                w=fill
-                pl=18.0
-                pr=18.0
-                pt=8.0
-              CopyRangeBar count=copy_range_count(messages, copy_anchor_seq, copy_head_seq)
-                forward
-                  clear_copy_range
-                  copy_selected_messages
           box
             with
               w=fill
@@ -1614,19 +1601,12 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                         p=6.0
                         @secondary_action
         if active_thread_seq > 0 && !channel_settings_open
-          box
+          mouse #thread-resize press=emit(start_thread_resize)
+            box w=6.0 h=fill bg=separator
+              space w=6.0 h=1.0
+          box #thread-pane
             with
-              w=1.0
-              h=fill
-              bg=separator
-            space w=1.0 h=1.0
-          // THE RAIL IS A PANE, NOT A CARD: the artifact's 330px sidebar-toned
-          // plate with a 50px header bar and 16px body insets, mirroring the
-          // details drawer one `if` up — the old 300px muted_bg card with its
-          // own 12px air read as a third surface family.
-          box
-            with
-              w=330.0
+              w=thread_width
               h=fill
               bg=sidebar
             stack w=fill h=fill
@@ -1681,6 +1661,20 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             wrap=none
                             @text-caption
                       space w=fill
+                      button "−" -> emit(narrow_thread)
+                        with
+                          label="Narrow thread"
+                          w=24.0
+                          h=24.0
+                          p=0.0
+                          @icon_action
+                      button "+" -> emit(widen_thread)
+                        with
+                          label="Widen thread"
+                          w=24.0
+                          h=24.0
+                          p=0.0
+                          @icon_action
                       button -> emit(close_thread)
                         with
                           label="Close thread"
@@ -1705,6 +1699,11 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                       h=1.0
                       bg=separator
                     space w=1.0 h=1.0
+                  if copy_surface == CopySurface.thread && copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq) > 0
+                    CopyRangeBar count=copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq) #thread-selection
+                      forward
+                        clear_copy_range
+                        copy_selected_messages
                   // STAYS TOP-ANCHORED, unlike the channel timeline. A thread
                   // is read from its ROOT down; pushing a short thread to the
                   // bottom of the rail would strand the message it is about in
@@ -1807,19 +1806,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   // on it either — a term in the guard that the button does not
                   // wear is a dead control. The reason SENTENCE stays mounted once,
                   // over the stream's plate: 330px has no room to say it twice.
-                  // The rail's own copy bar, gated on the RAIL's list — so a
-                  // range drawn in the stream behind it leaves this empty.
-                  if copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq) > 0
-                    box
-                      with
-                        w=fill
-                        pl=16.0
-                        pr=16.0
-                        pt=10.0
-                      CopyRangeBar count=copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq)
-                        forward
-                          clear_copy_range
-                          copy_selected_messages
                   box
                     with
                       w=fill

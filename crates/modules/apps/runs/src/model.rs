@@ -144,6 +144,21 @@ pub const ACTION_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
 
 /// Deploy the component committed by this run after its program accepts the request.
 pub const ACTION_MODULES_UPDATE: &str = "modules.update";
+/// permission to send one collaboration message as a bound participant (the
+/// `collaboration.send` operation).
+///
+/// NECESSARY, NOT SUFFICIENT. This grant is one half of an intersection: the
+/// action reaches `collaboration` on the live lane as
+/// `Origin::Program(account)`, and that module then applies its OWN check —
+/// the participant's owner must have bound that account to that conversation
+/// under a live credential. A model granted this still sends nothing until a
+/// human has bound it, and a bound account still sends nothing without this
+/// grant.
+pub const ACTION_COLLABORATION_SEND: &str = "collaboration.send";
+/// permission to record a delivery state for a message the bound participant
+/// received (the `collaboration.acknowledge` operation). Same intersection as
+/// [`ACTION_COLLABORATION_SEND`].
+pub const ACTION_COLLABORATION_ACKNOWLEDGE: &str = "collaboration.acknowledge";
 /// maximum UTF-8 text payload accepted by the `duckfs.write_text` operation.
 pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 
@@ -152,7 +167,7 @@ pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 /// always means something.
 ///
 /// Each action requires an explicit grant in the model configuration.
-pub const KNOWN_ACTIONS: [&str; 9] = [
+pub const KNOWN_ACTIONS: [&str; 11] = [
     ACTION_CHAT_POST,
     ACTION_JOBS_COMMENT,
     ACTION_CHAT_POST_MESSAGE,
@@ -162,6 +177,8 @@ pub const KNOWN_ACTIONS: [&str; 9] = [
     ACTION_PAGES_SET_CHECKED,
     ACTION_DUCKFS_WRITE_TEXT,
     ACTION_MODULES_UPDATE,
+    ACTION_COLLABORATION_SEND,
+    ACTION_COLLABORATION_ACKNOWLEDGE,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
