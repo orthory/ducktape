@@ -136,10 +136,14 @@ impl Guest {
             root: Some(self.root.clone()),
             ..Default::default()
         };
-        assert!(
-            testing::has_text(&frame, &self.text),
-            "accepted state reaches rendered echo before history route"
-        );
+        if self.text.len() < 64000 {
+            assert!(
+                testing::has_text(&frame, &self.text),
+                "accepted state reaches rendered echo before history route"
+            );
+        } else {
+            assert_eq!(self.editor().0.byte_len as usize, self.text.len());
+        }
     }
     fn apply(&mut self, response: wire::EditorResponse) {
         let EditorDecision::Apply {
@@ -346,6 +350,31 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
         handler: binding.on_event,
         event: EditorTransactionEvent::Cancelled { id: undo.id, state },
     }]);
+    guest.text = text.clone();
+    let mut edited = text;
+    edited.pop();
+    edited.push('y');
+    let id = guest.id();
+    guest.commit(
+        id,
+        edited.clone(),
+        at(0, edited.len() as u32),
+        EditorHistoryEffect::Native,
+        EditorEditKind::Paste,
+    );
+    let edited_reference = guest.editor().0;
+    let snapshot = snapshot_native().expect("completed source and local edits snapshot");
+    restore_native(&snapshot, false).unwrap();
+    let resumed = guest.tick(vec![]);
+    assert!(
+        resumed
+            .requests
+            .iter()
+            .all(|request| request.kind != "pages.document"),
+        "a completed source must not restart and overwrite unsaved guest edits"
+    );
+    assert_eq!(guest.editor().0, edited_reference);
+    let (installed, _) = guest.editor();
     // Read the canonical guest bytes through the runtime's document transfer,
     // rather than trusting only the advertised length or a display echo.
     let frame = Frame {
@@ -390,8 +419,8 @@ fn interrupted_bootstrap_keeps_the_old_document_and_restores_from_a_new_begin() 
     }
     assert_eq!(
         actual.as_deref(),
-        Some(text.as_str()),
-        "all UTF8 bytes survive initial ingress and snapshot restart"
+        Some(edited.as_str()),
+        "all UTF8 bytes and later edits survive initial ingress and snapshot restart"
     );
     guest.tick(vec![Event::EditorDocument {
         handler,

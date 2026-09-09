@@ -1,7 +1,9 @@
 //! Atomic Pages document bootstrap through the existing bounded editor transfer.
 //! Only source metadata lives in Ice state. The subscription owns its partial
 //! receiver, so restoring a guest restarts from Begin and preserves the last
-//! installed Editor until the new stream completes.
+//! installed Editor until the new stream completes. The consumer snapshots an
+//! installed-source marker and subscribes only while desired != installed;
+//! replaying an already completed source would overwrite later local edits.
 
 use iced::futures::{StreamExt, future};
 use ui_lang_guest::{host, wire};

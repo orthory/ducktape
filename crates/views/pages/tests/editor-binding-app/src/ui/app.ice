@@ -31,10 +31,11 @@ state
   document:editor = editor("- 한글")
   history:HistoryState = initial_history()
   source:DocumentSource = empty_source()
+  installed_source:bytes = bytes()
   load_error = ""
 
 subscribe
-  document_source(source) when !empty(source.reference) -> document_arrived _
+  document_source(source) when !empty(source.reference) && source.reference != installed_source -> document_arrived _
 
 on load
   source = large_source()
@@ -44,6 +45,7 @@ on document_arrived(item)
   load_error = item.error
   return if !empty(item.error)
   document = editor(item.text)
+  installed_source = item.source
 
 on committed(next)
   history = next
