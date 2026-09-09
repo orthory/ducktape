@@ -4351,6 +4351,13 @@ pub(crate) mod tests {
 
     #[test]
     fn fresh_files_wasm_instances_reject_retained_and_late_old_save_successes() {
+        let editor_text = |guest: &Guest| {
+            let mut text = None;
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { text: value, .. } = node { text = Some(value.clone()); }
+            });
+            text
+        };
         let staged = staged("files").expect("actual Files Wasm fixture required");
         let mut old = Guest::load_from("files", &staged).unwrap();
         let old_props = files_facts();
@@ -4393,14 +4400,15 @@ pub(crate) mod tests {
             // A changed loading prop forces delivery even when the old success was already retained.
             facts["loading"] = true.into();
             guest.redraw(&props(&facts));
-            assert!(
-                texts(&guest).iter().any(|text| text == "Save"),
+            assert_eq!(
+                editor_text(&guest),
+                Some(facts["preview_text"].as_str().unwrap().to_owned()),
                 "old instance completion must not close the fresh editor"
             );
             facts["save_reply"]["replies"][0]["namespace"] = save["namespace"].clone();
             facts["loading"] = false.into();
             guest.redraw(&props(&facts));
-            assert!(!texts(&guest).iter().any(|text| text == "Save"));
+            assert!(editor_text(&guest).is_none(), "its own confirmation closes the editor");
             assert!(guest.fault.is_none());
         }
     }

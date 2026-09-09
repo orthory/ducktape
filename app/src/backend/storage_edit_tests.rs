@@ -111,16 +111,16 @@ fn a_retained_file_base_refuses_an_external_edit_of_the_same_path() {
     );
     let changes: Vec<Change> =
         serde_json::from_value(payload["commit"]["changes"].clone()).unwrap();
-    let error = fs
-        .commit(
-            &authority,
-            3,
-            3,
-            serde_json::from_value(payload["commit"]["base_snapshot"].clone()).unwrap(),
-            "draft".into(),
-            changes,
-        )
-        .unwrap_err();
+    let Err(error) = fs.commit(
+        &authority,
+        3,
+        3,
+        serde_json::from_value(payload["commit"]["base_snapshot"].clone()).unwrap(),
+        "draft".into(),
+        changes,
+    ) else {
+        panic!("the original snapshot must conflict with the external edit");
+    };
     assert!(error.contains("changed since base"), "{error}");
     assert_eq!(
         *fs.pending_refs(),
