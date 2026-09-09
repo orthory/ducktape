@@ -162,7 +162,13 @@ pub fn agents_view(
 ) -> Element<'static, ModuleViewEvent> {
     let mut panel = serde_json::to_value(messaging).expect("the messaging panel encodes");
     if let Some(panel) = panel.as_object_mut() {
-        panel.remove("rpc");
+        // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
+        // guest draws no conversation with, and `link`/`account`/`op` are the
+        // fence the app installs an answer by — a guest cannot check them and
+        // has no reason to see which operation number it is looking at.
+        for app_only in ["rpc", "link", "account", "op"] {
+            panel.remove(app_only);
+        }
         panel.insert("loading".into(), messaging_loading.into());
         panel.insert("sending".into(), messaging_sending.into());
         panel.insert("send_error".into(), messaging_send_error.into());

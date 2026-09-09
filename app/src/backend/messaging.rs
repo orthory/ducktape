@@ -137,6 +137,16 @@ pub struct MessagingMessage {
 pub struct MessagingView {
     pub rpc: String,
     pub network: String,
+    /// the connection revision this read started under — a reconnect to the
+    /// SAME endpoint on the SAME chain is still a different link, and an answer
+    /// from the old one is about a session this app no longer holds
+    pub link: i64,
+    /// the account seated when this read started
+    pub account: String,
+    /// this read's own nonce. Two reads of the same conversation on the same
+    /// link are still two operations, and the older one finishing last must not
+    /// overwrite the newer one's answer.
+    pub op: i64,
     pub participant: String,
     pub conversation: String,
     pub topic: String,
@@ -165,10 +175,13 @@ pub struct MessagingView {
 impl MessagingView {
     /// The panel's scope with nothing read yet — the shape every refusal
     /// below keeps, so a refused read still says WHAT was refused.
-    fn scoped(rpc: &str, network: &str, participant: &str, conversation: &str) -> Self {
+    fn scoped(scope: &Scope, participant: &str, conversation: &str) -> Self {
         Self {
-            rpc: rpc.to_owned(),
-            network: network.to_owned(),
+            rpc: scope.rpc.clone(),
+            network: scope.network.clone(),
+            link: scope.link,
+            account: scope.account.clone(),
+            op: scope.op,
             participant: participant.to_owned(),
             conversation: conversation.to_owned(),
             max_body_bytes: count_i64(collaboration::MAX_BODY_BYTES),
@@ -189,10 +202,28 @@ impl MessagingView {
 pub struct MessagingSend {
     pub rpc: String,
     pub network: String,
+    pub link: i64,
+    pub account: String,
+    pub op: i64,
     pub participant: String,
     pub conversation: String,
     /// "" when the network admitted the message
     pub refusal: String,
+}
+
+/// What an operation was started under, carried through it and back out.
+///
+/// Internal glue: Ice constructs no struct, so the extern entry points take the
+/// fields flat and build this once. It exists so the fence is one value the
+/// whole operation carries rather than five arguments a call site can forget a
+/// field of.
+#[derive(Clone, Debug, Default)]
+struct Scope {
+    rpc: String,
+    network: String,
+    link: i64,
+    account: String,
+    op: i64,
 }
 
 /// Test and state seam: Ice reads extern structs but cannot construct one.
@@ -208,29 +239,50 @@ pub fn messaging_none() -> MessagingView {
 /// switch, a participant change or a conversation change answers into an app
 /// that has moved on, and installing it would show one conversation's messages
 /// under another's name.
+///
+/// The ids alone are NOT the fence. Leaving A for B and coming back to A
+/// restores every id, so A's first answer would match on the way back in and
+/// overwrite what the second read found. `link`, `account` and `op` are what
+/// make the comparison identify the OPERATION rather than its subject: a
+/// reconnect moves `link`, a seat change moves `account`, and each dispatch
+/// mints a fresh `op`.
+#[allow(clippy::too_many_arguments)]
 pub fn messaging_in_scope(
     view: &MessagingView,
     rpc: &str,
     network: &str,
+    link: i64,
+    account: &str,
+    op: i64,
     participant: &str,
     conversation: &str,
 ) -> bool {
     view.rpc == rpc
         && view.network == network
+        && view.link == link
+        && view.account == account
+        && view.op == op
         && view.participant == participant
         && view.conversation == conversation
 }
 
 /// [`messaging_in_scope`] for a send's outcome.
+#[allow(clippy::too_many_arguments)]
 pub fn messaging_send_in_scope(
     send: &MessagingSend,
     rpc: &str,
     network: &str,
+    link: i64,
+    account: &str,
+    op: i64,
     participant: &str,
     conversation: &str,
 ) -> bool {
     send.rpc == rpc
         && send.network == network
+        && send.link == link
+        && send.account == account
+        && send.op == op
         && send.participant == participant
         && send.conversation == conversation
 }
@@ -243,15 +295,26 @@ pub fn messaging_send_in_scope(
 /// failure is a field in it. A `Result` here would split the refusal display
 /// across two handler routes, and the branch that forgot one would show an
 /// empty conversation.
+#[allow(clippy::too_many_arguments)]
 pub async fn load_messaging(
     rpc: String,
     network: String,
+    link: i64,
+    account: String,
+    op: i64,
     participant: String,
     conversation: String,
     from_seq: i64,
     newest: bool,
 ) -> MessagingView {
-    let view = MessagingView::scoped(&rpc, &network, &participant, &conversation);
+    let scope = Scope {
+        rpc,
+        network,
+        link,
+        account,
+        op,
+    };
+    let view = MessagingView::scoped(&scope, &participant, &conversation);
     // nothing is open: the panel's own closed state, not a refusal
     if participant.is_empty() || conversation.is_empty() {
         return view;
@@ -635,6 +698,9 @@ fn unexpected(what: &str, reply: &CollaborationReply) -> String {
 pub async fn send_agent_message(
     rpc: String,
     network: String,
+    link: i64,
+    account: String,
+    op: i64,
     participant: String,
     conversation: String,
     kind: String,
@@ -646,6 +712,9 @@ pub async fn send_agent_message(
     let scope = MessagingSend {
         rpc: rpc.clone(),
         network: network.clone(),
+        link,
+        account,
+        op,
         participant: participant.clone(),
         conversation: conversation.clone(),
         refusal: String::new(),
@@ -868,8 +937,11 @@ async fn allocate_sequence(
         if probes > MAX_SEQUENCE_PROBES {
             return Err(SEQUENCE_EXHAUSTED.into());
         }
-        low = high + 1;
-        high = high.saturating_mul(2);
+        // A CREDENTIAL WHOSE SPACE IS FULL HAS NO NEXT SEQUENCE. Wrapping to 0
+        // here would hand out a sequence that is certainly taken, so the walk
+        // refuses instead of overflowing.
+        low = high.checked_add(1).ok_or(SEQUENCE_EXHAUSTED)?;
+        high = high.checked_mul(2).unwrap_or(u64::MAX);
     }
     // narrow onto the first free one in [low, high]
     while low < high {
@@ -879,11 +951,15 @@ async fn allocate_sequence(
         }
         let middle = low + (high - low) / 2;
         match used(client, record, generation, middle).await? {
-            true => low = middle + 1,
+            true => low = middle.checked_add(1).ok_or(SEQUENCE_EXHAUSTED)?,
             false => high = middle,
         }
     }
-    Ok(low.max(outbox.high_water(&record.id, generation) + 1))
+    let floor = outbox
+        .high_water(&record.id, generation)
+        .checked_add(1)
+        .ok_or(SEQUENCE_EXHAUSTED)?;
+    Ok(low.max(floor))
 }
 
 /// Whether one sequence is spoken for: admitted, or pruned below the replay
@@ -913,6 +989,98 @@ async fn used(
 
 // ---- the outbox -------------------------------------------------------------
 
+/// The largest outbox this app will read. A pending entry carries a whole
+/// `SendRequest`, so `MAX_OUTBOX_PENDING` bodies at `MAX_BODY_BYTES` plus JSON
+/// overhead is the honest ceiling; anything past it is not an outbox this app
+/// wrote, and it is refused rather than parsed.
+const MAX_OUTBOX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ambiguous sends this device tracks at once. Each one costs a `SendState`
+/// round trip on the NEXT send's reconcile, so an unbounded list is an
+/// unbounded reconcile.
+const MAX_OUTBOX_PENDING: usize = 64;
+
+/// Participant+credential pairs whose high-water mark this device remembers.
+const MAX_OUTBOX_MARKS: usize = 256;
+
+/// Take the outbox's exclusive advisory lock, or refuse.
+///
+/// Non-blocking on purpose: this runs on the async executor, a blocking
+/// `flock` would park the whole runtime behind another process's send, and
+/// "another window is sending as this device — try again" is a true sentence a
+/// person can act on. The lock is a SEPARATE file because the outbox itself is
+/// replaced by rename, which would hand the next opener a lock on an unlinked
+/// inode.
+fn lock_exclusive(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("the outbox lock at {} is not writable: {error}", path.display()))?;
+    // SAFETY: a live fd this function owns, and an operation that only takes an
+    // advisory lock on it.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken != 0 {
+        let error = std::io::Error::last_os_error();
+        let busy = matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        );
+        return Err(match busy {
+            true => "another window or device process is sending as this device right now — \
+                     wait for it to finish and send again"
+                .to_owned(),
+            false => format!("this device's outbox could not be locked ({error}); nothing is sent \
+                              while its state is unknown"),
+        });
+    }
+    Ok(file)
+}
+
+/// The outbox's bytes as state, or the reason this device will not send.
+fn read_outbox(
+    bytes: &[u8],
+    network: &str,
+    path: &std::path::Path,
+) -> Result<OutboxFile, String> {
+    let unreadable = |why: String| {
+        format!(
+            "this device's outbox at {} is unusable ({why}); it may hold sends whose outcome is \
+             unknown, so nothing is sent until it is repaired or removed",
+            path.display()
+        )
+    };
+    if bytes.len() > MAX_OUTBOX_BYTES {
+        return Err(unreadable(format!(
+            "{} bytes, past the {MAX_OUTBOX_BYTES} this app writes",
+            bytes.len()
+        )));
+    }
+    let state: OutboxFile =
+        serde_json::from_slice(bytes).map_err(|error| unreadable(error.to_string()))?;
+    if state.chain_id != network {
+        return Err(unreadable(format!(
+            "it names chain {} and this node is on {network}",
+            state.chain_id
+        )));
+    }
+    if state.pending.len() > MAX_OUTBOX_PENDING {
+        return Err(unreadable(format!(
+            "{} pending sends, past the {MAX_OUTBOX_PENDING} this app stages",
+            state.pending.len()
+        )));
+    }
+    if state.high_water.len() > MAX_OUTBOX_MARKS {
+        return Err(unreadable(format!(
+            "{} high-water marks, past the {MAX_OUTBOX_MARKS} this app keeps",
+            state.high_water.len()
+        )));
+    }
+    Ok(state)
+}
+
 /// One message this device staged but has not seen settled.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Pending {
@@ -936,6 +1104,12 @@ struct Pending {
 struct Outbox {
     path: PathBuf,
     state: OutboxFile,
+    /// The exclusive advisory lock, held from [`Outbox::open`] until this value
+    /// is dropped — which is after the submit and its settle. Read-modify-write
+    /// plus a network sequence probe is not atomic, so without it a second app
+    /// process interleaves between the probe and the stage and both take the
+    /// same sequence. Dropping the file releases the lock.
+    _lock: std::fs::File,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -957,9 +1131,17 @@ struct HighWater {
 }
 
 impl Outbox {
-    /// This network's outbox. The file is named by a DIGEST of the chain id:
-    /// a chain id is not a path component, and an empty one is refused rather
-    /// than used as a namespace — an empty fence is not a fence.
+    /// This network's outbox, locked for the caller.
+    ///
+    /// The file is named by a DIGEST of the chain id: a chain id is not a path
+    /// component, and an empty one is refused rather than used as a namespace —
+    /// an empty fence is not a fence.
+    ///
+    /// EVERY failure to read an EXISTING outbox refuses the send. Only a file
+    /// that is not there may start an empty one: a permission error, a short
+    /// read, unparsable bytes or a chain id that is not this one all mean this
+    /// device may be holding ambiguous sends it cannot see, and starting empty
+    /// would re-allocate their sequences and mint duplicates.
     fn open(network: &str) -> Result<Self, String> {
         if network.is_empty() {
             return Err("this node has not named its network yet — an unnamed chain is not a \
@@ -967,18 +1149,31 @@ impl Outbox {
                 .into());
         }
         let digest = hex_encode(&Sha256::digest(network.as_bytes()));
-        let path = super::app_dirs::state_dir()?
-            .join("messaging")
-            .join(format!("outbox-{}.json", &digest[..16]));
-        let state = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<OutboxFile>(&bytes).ok())
-            .filter(|state| state.chain_id == network)
-            .unwrap_or_else(|| OutboxFile {
+        let directory = super::app_dirs::state_dir()?.join("messaging");
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            format!("the outbox directory {} is not writable: {error}", directory.display())
+        })?;
+        let path = directory.join(format!("outbox-{}.json", &digest[..16]));
+        let lock = lock_exclusive(&path.with_extension("lock"))?;
+        let state = match std::fs::read(&path) {
+            Ok(bytes) => read_outbox(&bytes, network, &path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => OutboxFile {
                 chain_id: network.to_owned(),
                 ..OutboxFile::default()
-            });
-        Ok(Self { path, state })
+            },
+            Err(error) => {
+                return Err(format!(
+                    "this device's outbox at {} could not be read ({error}); it may hold sends \
+                     whose outcome is unknown, so nothing is sent until it can be",
+                    path.display()
+                ));
+            }
+        };
+        Ok(Self {
+            path,
+            state,
+            _lock: lock,
+        })
     }
 
     fn high_water(&self, participant: &str, credential: u64) -> u64 {
@@ -1031,9 +1226,19 @@ impl Outbox {
             entry.participant == participant && entry.request.message_id == request.message_id
         });
         if !already {
+            // AN OUTBOX THAT ONLY GROWS IS A RECONCILE THAT ONLY GROWS. Every
+            // entry costs a `SendState` round trip on the next send, and this
+            // many unresolved sends means something upstream is wrong — say so
+            // rather than staging one more onto a pile nothing drains.
+            if self.state.pending.len() >= MAX_OUTBOX_PENDING {
+                return Err(format!(
+                    "this device is already holding {MAX_OUTBOX_PENDING} sends whose outcome it \
+                     could not resolve — reconnect and let them settle before sending more"
+                ));
+            }
             self.state.pending.push(staged);
         }
-        self.raise(participant, request.message_id);
+        self.raise(participant, request.message_id)?;
         self.write()
     }
 
@@ -1042,22 +1247,31 @@ impl Outbox {
         self.state
             .pending
             .retain(|entry| !(entry.participant == participant && entry.request.message_id == id));
-        self.raise(participant, id);
+        self.raise(participant, id)?;
         self.write()
     }
 
-    fn raise(&mut self, participant: &str, id: MessageId) {
+    fn raise(&mut self, participant: &str, id: MessageId) -> Result<(), String> {
         let mark = self.state.high_water.iter_mut().find(|mark| {
             mark.participant == participant && mark.credential == id.generation
         });
         match mark {
             Some(mark) => mark.sequence = mark.sequence.max(id.sequence),
-            None => self.state.high_water.push(HighWater {
-                participant: participant.to_owned(),
-                credential: id.generation,
-                sequence: id.sequence,
-            }),
+            None => {
+                if self.state.high_water.len() >= MAX_OUTBOX_MARKS {
+                    return Err(format!(
+                        "this device's outbox already tracks {MAX_OUTBOX_MARKS} credentials on \
+                         this network — remove it to start a fresh one"
+                    ));
+                }
+                self.state.high_water.push(HighWater {
+                    participant: participant.to_owned(),
+                    credential: id.generation,
+                    sequence: id.sequence,
+                });
+            }
         }
+        Ok(())
     }
 
     /// Ask the NETWORK what became of every ambiguous send of this
@@ -1147,12 +1361,16 @@ impl Outbox {
             file.sync_all().map_err(|error| error.to_string())?;
         }
         std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
-        // the rename itself has to reach the disk, or the new file can be
-        // present with no directory entry naming it
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        // THE RENAME ITSELF HAS TO REACH THE DISK, or the new file can be
+        // present with no directory entry naming it. This error is raised, not
+        // swallowed: a write that returns `Ok` is what tells the caller it may
+        // submit, and submitting on a record that might not survive a crash is
+        // exactly the duplicate this file exists to prevent.
+        let directory = std::fs::File::open(parent)
+            .map_err(|error| format!("the outbox directory did not open to sync: {error}"))?;
+        directory
+            .sync_all()
+            .map_err(|error| format!("the outbox rename did not reach the disk: {error}"))
     }
 }
 
@@ -1212,29 +1430,51 @@ mod tests {
         }
     }
 
-    /// A reading belongs to ONE endpoint, chain, participant and conversation.
-    /// Anything else is an answer about something the reader has left.
+    /// An outbox over a temporary directory, holding its own lock — the shape
+    /// `Outbox::open` produces, without the app's real state directory.
+    fn held(directory: &tempfile::TempDir, state: OutboxFile) -> Outbox {
+        let path = directory.path().join("outbox.json");
+        let lock = lock_exclusive(&path.with_extension("lock")).expect("a fresh lock");
+        Outbox {
+            path,
+            state,
+            _lock: lock,
+        }
+    }
+
+    /// A reading belongs to ONE endpoint, chain, link, account, operation,
+    /// participant and conversation. Anything else is an answer about something
+    /// the reader has left.
     #[test]
     fn a_reading_installs_only_in_the_scope_it_was_read_in() {
         let view = MessagingView {
             rpc: "http://node".into(),
             network: "duck-1".into(),
+            link: 4,
+            account: "7".into(),
+            op: 11,
             participant: "claude-a".into(),
             conversation: "standup".into(),
             ..MessagingView::default()
         };
-        assert!(messaging_in_scope(
-            &view,
-            "http://node",
-            "duck-1",
-            "claude-a",
-            "standup"
-        ));
-        // the four ways a late answer stops being about what is on screen
-        assert!(!messaging_in_scope(&view, "http://other", "duck-1", "claude-a", "standup"));
-        assert!(!messaging_in_scope(&view, "http://node", "duck-2", "claude-a", "standup"));
-        assert!(!messaging_in_scope(&view, "http://node", "duck-1", "codex-b", "standup"));
-        assert!(!messaging_in_scope(&view, "http://node", "duck-1", "claude-a", "release"));
+        let live = |rpc, network, link, account, op, participant, conversation| {
+            messaging_in_scope(&view, rpc, network, link, account, op, participant, conversation)
+        };
+        assert!(live("http://node", "duck-1", 4, "7", 11, "claude-a", "standup"));
+        // every way a late answer stops being about what is on screen
+        assert!(!live("http://other", "duck-1", 4, "7", 11, "claude-a", "standup"));
+        assert!(!live("http://node", "duck-2", 4, "7", 11, "claude-a", "standup"));
+        assert!(!live("http://node", "duck-1", 4, "7", 11, "codex-b", "standup"));
+        assert!(!live("http://node", "duck-1", 4, "7", 11, "claude-a", "release"));
+        // A RECONNECT TO THE SAME PLACE IS A DIFFERENT LINK. Every id above
+        // still matches; the session this answer was read over does not exist.
+        assert!(!live("http://node", "duck-1", 5, "7", 11, "claude-a", "standup"));
+        // A SEAT CHANGE READS AS SOMEONE ELSE, at the same endpoint and chain.
+        assert!(!live("http://node", "duck-1", 4, "8", 11, "claude-a", "standup"));
+        // THE A -> B -> A RETURN. The reader left standup, came back, and the
+        // panel read it again: the ids are identical and only the operation
+        // number tells the first answer from the second.
+        assert!(!live("http://node", "duck-1", 4, "7", 12, "claude-a", "standup"));
     }
 
     /// A send's outcome carries its own scope for the same reason: a refusal about
@@ -1245,24 +1485,34 @@ mod tests {
         let sent = MessagingSend {
             rpc: "http://node".into(),
             network: "duck-1".into(),
+            link: 4,
+            account: "7".into(),
+            op: 2,
             participant: "claude-a".into(),
             conversation: "standup".into(),
             refusal: String::new(),
         };
-        assert!(messaging_send_in_scope(
-            &sent,
-            "http://node",
-            "duck-1",
-            "claude-a",
-            "standup"
-        ));
-        assert!(!messaging_send_in_scope(
-            &sent,
-            "http://node",
-            "duck-1",
-            "claude-a",
-            "release"
-        ));
+        let live = |link, account, op, conversation| {
+            messaging_send_in_scope(
+                &sent,
+                "http://node",
+                "duck-1",
+                link,
+                account,
+                op,
+                "claude-a",
+                conversation,
+            )
+        };
+        assert!(live(4, "7", 2, "standup"));
+        assert!(!live(4, "7", 2, "release"));
+        assert!(!live(5, "7", 2, "standup"));
+        assert!(!live(4, "8", 2, "standup"));
+        // THE ADMISSION THAT WOULD CLEAR A NEWER DRAFT. This outcome is an
+        // admission (`refusal` is empty), and installing it bumps the counter
+        // the composer clears its draft on. Send #2 finishing after send #3 was
+        // written must not throw #3's text away.
+        assert!(!live(4, "7", 3, "standup"));
     }
 
     /// The panel bounds what it DRAWS. The stored message is not altered, and the
@@ -1364,21 +1614,19 @@ mod tests {
     #[test]
     fn a_retry_of_the_same_draft_reuses_the_pending_id_and_bytes() {
         let pending = request(8, "ship it", 90_000);
-        let outbox = Outbox {
-            path: std::path::PathBuf::from("/nonexistent/outbox.json"),
-            state: OutboxFile {
-                chain_id: "duck-1".into(),
-                high_water: vec![HighWater {
-                    participant: "claude-a".into(),
-                    credential: 4,
-                    sequence: 8,
-                }],
-                pending: vec![Pending {
-                    participant: "claude-a".into(),
-                    request: pending.clone(),
-                }],
-            },
-        };
+        let directory = tempfile::tempdir().expect("a temporary state directory");
+        let outbox = held(&directory, OutboxFile {
+            chain_id: "duck-1".into(),
+            high_water: vec![HighWater {
+                participant: "claude-a".into(),
+                credential: 4,
+                sequence: 8,
+            }],
+            pending: vec![Pending {
+                participant: "claude-a".into(),
+                request: pending.clone(),
+            }],
+        });
         let matched = outbox
             .pending_match(
                 "claude-a",
@@ -1432,19 +1680,81 @@ mod tests {
         assert!(refused.contains("has not named its network"), "{refused}");
     }
 
+    /// An outbox this app cannot read is a set of sends whose outcome it cannot
+    /// see. Starting empty would re-allocate their sequences and mint duplicates,
+    /// so every failure to read an EXISTING file refuses the send instead.
+    #[test]
+    fn an_unreadable_outbox_refuses_the_send_rather_than_starting_empty() {
+        let path = std::path::Path::new("/state/messaging/outbox-abc.json");
+        let good = serde_json::to_vec(&OutboxFile {
+            chain_id: "duck-1".into(),
+            ..OutboxFile::default()
+        })
+        .expect("json");
+        assert!(read_outbox(&good, "duck-1", path).is_ok());
+
+        // truncated, half-written, or someone else's file entirely
+        let torn = read_outbox(b"{\"chain_id\":\"duck-", "duck-1", path)
+            .expect_err("unparsable bytes are not an empty outbox");
+        assert!(torn.contains("unusable"), "{torn}");
+
+        // THE PATH IS A DIGEST OF THE CHAIN ID, so a mismatch is a collision or
+        // a tampered file — not a reason to overwrite what is there.
+        let elsewhere = serde_json::to_vec(&OutboxFile {
+            chain_id: "duck-2".into(),
+            ..OutboxFile::default()
+        })
+        .expect("json");
+        let moved = read_outbox(&elsewhere, "duck-1", path)
+            .expect_err("another chain's outbox is not this one's");
+        assert!(moved.contains("duck-2"), "{moved}");
+
+        let huge = vec![b'x'; MAX_OUTBOX_BYTES + 1];
+        let refused = read_outbox(&huge, "duck-1", path).expect_err("an oversized file is refused");
+        assert!(refused.contains("past the"), "{refused}");
+
+        // an unbounded pending list is an unbounded reconcile on the next send
+        let piled = serde_json::to_vec(&OutboxFile {
+            chain_id: "duck-1".into(),
+            pending: (0..=MAX_OUTBOX_PENDING)
+                .map(|seq| Pending {
+                    participant: "claude-a".into(),
+                    request: request(seq as u64 + 1, "x", 90_000),
+                })
+                .collect(),
+            ..OutboxFile::default()
+        })
+        .expect("json");
+        let refused = read_outbox(&piled, "duck-1", path).expect_err("too many pending is refused");
+        assert!(refused.contains("pending sends"), "{refused}");
+    }
+
+    /// Two app processes share one state directory and one owner credential, and
+    /// read-modify-probe-submit is not atomic. The second one is told to wait
+    /// rather than allowed to allocate against a sequence space the first is in
+    /// the middle of taking from.
+    #[test]
+    fn a_second_holder_of_the_outbox_is_refused_rather_than_queued() {
+        let directory = tempfile::tempdir().expect("a temporary state directory");
+        let path = directory.path().join("outbox.lock");
+        let first = lock_exclusive(&path).expect("the first holder takes the lock");
+        let refused = lock_exclusive(&path).expect_err("the second is refused, not blocked");
+        assert!(refused.contains("sending as this device right now"), "{refused}");
+        // and the lock is released with the file, so the next opener gets it
+        drop(first);
+        lock_exclusive(&path).expect("released with its holder");
+    }
+
     /// The staged entry survives a settle of a DIFFERENT id, and leaves on its
     /// own: a retry window that closed on the wrong entry would resend a message
     /// that already landed.
     #[test]
     fn settling_one_id_leaves_the_others_pending() {
         let directory = tempfile::tempdir().expect("a temporary state directory");
-        let mut outbox = Outbox {
-            path: directory.path().join("outbox.json"),
-            state: OutboxFile {
-                chain_id: "duck-1".into(),
-                ..OutboxFile::default()
-            },
-        };
+        let mut outbox = held(&directory, OutboxFile {
+            chain_id: "duck-1".into(),
+            ..OutboxFile::default()
+        });
         outbox
             .stage("claude-a", &request(8, "first", 90_000))
             .expect("staged");

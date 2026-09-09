@@ -43,6 +43,10 @@ design.workspace = true
 ducktape-rpc.workspace = true
 module-artifact.workspace = true
 sha2.workspace = true
+# `flock` on the messaging outbox: two app processes share one state directory
+# and one owner credential, so the read-modify-submit window needs an exclusive
+# lock the OS releases when a process dies.
+libc.workspace = true
 forge.workspace = true
 gateway.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's
