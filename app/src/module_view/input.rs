@@ -112,13 +112,9 @@ impl overlay::Overlay<ModuleViewEvent, iced::Theme, iced::Renderer> for InputOve
         self.content
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, clipboard, &mut local);
-        if local.is_event_captured() {
+        let captured = local.is_event_captured();
+        if captured {
             shell.capture_event();
-            if let Event::Mouse(event) = event
-                && mouse(guest, *event, self.origin, true)
-            {
-                shell.request_redraw();
-            }
         }
         if local.is_layout_invalid() {
             shell.invalidate_layout();
@@ -132,6 +128,13 @@ impl overlay::Overlay<ModuleViewEvent, iced::Theme, iced::Renderer> for InputOve
             for output in outputs {
                 guest.deliver(output);
             }
+            shell.request_redraw();
+        }
+        // Keep the base widget's ordering: routed output before observation.
+        if captured
+            && let Event::Mouse(event) = event
+            && mouse(guest, *event, self.origin, true)
+        {
             shell.request_redraw();
         }
     }

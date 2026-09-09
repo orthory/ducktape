@@ -70,6 +70,14 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
         ("reactions", "🦆", "reaction_submit"),
     ] {
         let mounted = seated(action);
+        {
+            let mut locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut locked.slot else {
+                unreachable!()
+            };
+            // Exercise the host's opt-in observation contract on the actual menu.
+            guest.frame.mouse_interest = true;
+        }
         // The guest already emitted the menu; exposing its native overlay is
         // the missing host behavior, not a props or wire-tree setup failure.
         let mut content = view(&mounted);
@@ -123,8 +131,44 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
                 Event::Mouse(mouse::Event::CursorMoved { position: point }),
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                Event::Window(window::Event::RedrawRequested(iced::time::Instant::now())),
             ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        {
+            let locked = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &locked.slot else {
+                unreachable!()
+            };
+            let routed = guest
+                .pending
+                .iter()
+                .position(|event| matches!(event, wire::Event::Message(_)))
+                .expect("the clicked popup queues its route");
+            let observed = guest
+                .pending
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        wire::Event::Mouse {
+                            event: wire::mouse::Event::ButtonReleased(wire::mouse::Button::Left),
+                            ..
+                        }
+                    )
+                })
+                .expect("a captured release is observed when opted in");
+            assert!(
+                routed < observed,
+                "popup route must precede its release observation"
+            );
+        }
+        ui.update(
+            &[Event::Window(window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            ))],
             mouse::Cursor::Available(point),
             &mut renderer,
             &mut clipboard::Null,
