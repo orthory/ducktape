@@ -843,6 +843,8 @@ struct Bridge {
     /// the pump is wired once at boot and never replaced: a second setter would
     /// be two consumers racing for one receipt.
     collab: std::sync::OnceLock<mpsc::Sender<wire::Event>>,
+    /// how many daemons have taken the link. See [`TerminalSessions::attach_epoch`].
+    attaches: std::sync::atomic::AtomicU64,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
@@ -999,6 +1001,7 @@ impl TerminalSessions {
             link: Mutex::new(None),
             link_token,
             collab: std::sync::OnceLock::new(),
+            attaches: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -1061,8 +1064,28 @@ impl TerminalSessions {
         }
         let (tx, rx) = mpsc::channel(COMMAND_LANE);
         *link = Some(tx);
+        // a NEW daemon, and this is what says so. See [`Self::attach_epoch`].
+        self.0
+            .attaches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tracing::info!(target: "ducktape::term", "agent service attached");
         Some((AttachGuard(self.clone()), rx))
+    }
+
+    /// How many daemons have attached over this node's life. `0` = none ever.
+    ///
+    /// The collaboration pump caches what it has already told the daemon —
+    /// which bindings, which clock, which retention floor — and a RESTARTED
+    /// daemon knows none of it. "Is one attached" cannot answer that: a daemon
+    /// that dies and redials with the same bindings looks identical to one that
+    /// never left, and the pump would then never re-send a bind, leaving a live
+    /// binding on the network that this node's daemon has never heard of.
+    ///
+    /// A counter and not a flag, because the pump may not observe the gap: a
+    /// detach and a re-attach between two sweeps is invisible to any state that
+    /// only says "attached now".
+    pub fn attach_epoch(&self) -> u64 {
+        self.0.attaches.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Does `presented` match this node's 0600 workspace link secret?

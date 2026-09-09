@@ -67,6 +67,15 @@ const PAGES_PER_SWEEP: usize = 8;
 /// hide a wedged pump behind.
 const RECEIPT_LANE: usize = 256;
 
+/// Sweeps one receipt is re-submitted over before it is abandoned with a loud
+/// reason. A transport failure clears in one; a module refusal never clears, and
+/// the error string cannot tell them apart.
+const ACK_TRIES: u32 = 5;
+
+/// How many un-submitted receipts to hold. Past this the OLDEST goes — a later
+/// transition is the more truthful statement about where a delivery stands.
+const MAX_PENDING_ACKS: usize = 1024;
+
 /// How often production sweeps committed state.
 ///
 /// The sweep is what notices mail; the receipts come back on their own lane and
@@ -157,6 +166,25 @@ pub(crate) struct Pump {
     /// the chain id every op is bound to and every key is scoped by. Taken from
     /// the workspace at boot: a node serves exactly one network.
     network: String,
+    /// receipts the chain has not taken yet, oldest first. See
+    /// [`Pump::commit_receipt`]. `std::sync::Mutex`: every critical section
+    /// takes what it needs and drops the guard before any `.await`.
+    pending: std::sync::Mutex<std::collections::VecDeque<Unsent>>,
+}
+
+/// one receipt the daemon reported and the chain has not taken.
+#[derive(Debug, Clone)]
+struct Unsent {
+    conversation: String,
+    participant: String,
+    seq: u64,
+    /// the generation the daemon reported, carried VERBATIM through every
+    /// retry. Substituting the current one would let a stale device's receipt
+    /// pass the module's fence on the second attempt.
+    credential: collab::Credential,
+    state: wire::State,
+    reason: Option<String>,
+    tries: u32,
 }
 
 /// What the daemon has already been told about one binding.
@@ -170,9 +198,25 @@ struct Announced {
     cursor: u64,
 }
 
+/// What one eligibility question answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Eligible {
+    /// The network says a new attempt may be made, and this record is the one
+    /// this pump owns.
+    Deliver,
+    /// The network answered, and the answer is no. Settled; nothing to revisit.
+    No,
+    /// The question could not be ASKED. Nothing is known, so nothing is done —
+    /// and the message stays in front of the cursor for the next sweep.
+    Unresolved,
+}
+
 /// Everything one pump run remembers between sweeps.
 #[derive(Debug, Default)]
 struct Seen {
+    /// which daemon this was learned about. A different one knows none of it
+    /// ([`noded::TerminalSessions::attach_epoch`]).
+    epoch: u64,
     /// the agreed clock value last sent as a `MsgTime`.
     time: u64,
     /// keyed by (conversation, participant) — the binding's identity.
@@ -194,6 +238,7 @@ impl Pump {
             terminals,
             workspace,
             network,
+            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -245,6 +290,28 @@ impl Pump {
         if !self.terminals.has_sandbox() {
             return;
         }
+        // a DIFFERENT daemon knows none of what was told to the last one, and
+        // "is one attached" cannot tell the two apart — a daemon that dies and
+        // redials with the same bindings looks identical to one that never left,
+        // and its epoch is what says otherwise. Everything cached is forgotten:
+        // the binds, the clock, the floors and the cursors all get re-sent, and
+        // the daemon's own dedup journal absorbs anything it already had.
+        let epoch = self.terminals.attach_epoch();
+        if epoch != seen.epoch {
+            tracing::info!(
+                target: "ducktape::collab",
+                epoch,
+                reason = "daemon_reattached",
+                "re-announcing every binding to a new agent daemon"
+            );
+            *seen = Seen {
+                epoch,
+                ..Default::default()
+            };
+        }
+        // a receipt whose submission failed is retried here, before any new
+        // delivery: the network learning what already happened comes first.
+        self.resubmit().await;
         let now = self.status.current().consensus_time;
         // the daemon owns no clock; this is the only thing that advances the
         // one it judges expiry against. Sent before anything is delivered, so a
@@ -389,11 +456,13 @@ impl Pump {
                 .offer_page(attachment, key, announced.credential, &events, &messages)
                 .await
             {
-                // this page handed something over. STOP: the cursor stays on the
-                // first one delivered, and the sweep after the daemon's receipts
-                // commit reads it again and walks past.
-                Some(offered) => {
-                    announced.cursor = offered;
+                // this page handed something over, or could not establish what
+                // to do with something on it. STOP, with the cursor ON that
+                // message: the next sweep reads the page again and either walks
+                // past the receipt that has since committed, or retries the read
+                // that failed.
+                Some(hold) => {
+                    announced.cursor = hold;
                     return;
                 }
                 None => announced.cursor = next_seq,
@@ -405,14 +474,21 @@ impl Pump {
     }
 
     /// Hand every message on one page that is admitted for this participant to
-    /// the daemon. Answers the sequence of the FIRST one handed over, or `None`
-    /// when the page produced no delivery.
+    /// the daemon. Answers the FIRST sequence the cursor must not advance past,
+    /// or `None` when every message on the page was resolved and none delivered.
     ///
-    /// The cursor stops there rather than advancing past it. A delivered message
-    /// stays `Stored` until the daemon's `Queued` receipt commits a block later,
-    /// and a cursor past it would be a message nothing looks at again if the
-    /// link died between the two. Re-reading one page until the receipt lands is
-    /// the whole cost of never losing one.
+    /// Two things hold the cursor, and both must:
+    ///
+    /// * a message handed over — it stays `Stored` until the daemon's `Queued`
+    ///   receipt commits a block later, and a cursor past it is a message
+    ///   nothing looks at again if the link died between the two;
+    /// * a message whose eligibility could not be ESTABLISHED — a dropped actor
+    ///   lane, a refused read, a reply this build cannot decode. Walking past
+    ///   one silently drops a queued message on a transient failure, which is
+    ///   the same loss with none of the evidence.
+    ///
+    /// Later messages on the page are still offered either way: one unresolved
+    /// read must not stall the mail behind it.
     async fn offer_page(
         &self,
         attachment: &Attached,
@@ -421,7 +497,8 @@ impl Pump {
         events: &[collab::ConversationEvent],
         messages: &[collab::Message],
     ) -> Option<u64> {
-        let mut offered = None;
+        let mut hold: Option<u64> = None;
+        let mut keep = |seq: u64| hold = Some(hold.map_or(seq, |first: u64| first.min(seq)));
         for seq in admitted_for(&attachment.participant, events) {
             let Some(message) = messages.iter().find(|message| message.seq == seq) else {
                 // the event survives its message: the body was pruned out from
@@ -429,10 +506,14 @@ impl Pump {
                 self.skip(attachment, "message_pruned");
                 continue;
             };
-            if !self.eligible(attachment, key, seq).await {
-                continue;
+            match self.eligible(attachment, key, seq).await {
+                Eligible::Deliver => keep(seq),
+                Eligible::No => continue,
+                Eligible::Unresolved => {
+                    keep(seq);
+                    continue;
+                }
             }
-            offered = Some(offered.map_or(seq, |first: u64| first.min(seq)));
             self.terminals
                 .send(wire::Command::MsgDeliver(Box::new(deliver(
                     message,
@@ -447,7 +528,7 @@ impl Pump {
                 "offered a message to the daemon"
             );
         }
-        offered
+        hold
     }
 
     /// May a NEW delivery attempt be made for this message, right now?
@@ -455,13 +536,19 @@ impl Pump {
     /// Asked immediately before the handover and answered against the block's
     /// agreed time. Only a `Stored` record is work: every other state either
     /// belongs to a durable record this pump does not own, or is settled.
+    ///
+    /// Three answers and not two. "The network says no" and "I could not ask"
+    /// are different facts: the first is settled and the message is finished
+    /// with, the second is a transient failure whose message must be looked at
+    /// again. Collapsing them into one `false` is how a queued message gets
+    /// walked past and never delivered.
     async fn eligible(
         &self,
         attachment: &Attached,
         key: &commonware_cryptography::ed25519::PrivateKey,
         seq: u64,
-    ) -> bool {
-        let Some(collab::CollaborationReply::Eligibility(verdict)) = self
+    ) -> Eligible {
+        let answer = self
             .read(
                 attachment,
                 key,
@@ -470,14 +557,19 @@ impl Pump {
                     seq,
                 },
             )
-            .await
-        else {
-            // a refused, undecodable or unanswered read is NOT permission. It
-            // reads as ineligible, which costs a re-read next sweep.
-            return false;
-        };
-        let Err(reason) = admits_delivery(&verdict) else {
-            return true;
+            .await;
+        let reason = match answer {
+            Some(collab::CollaborationReply::Eligibility(verdict)) => {
+                let Err(reason) = admits_delivery(&verdict) else {
+                    return Eligible::Deliver;
+                };
+                reason
+            }
+            // NOT permission, and not a refusal either: the module was never
+            // heard from, or answered something this build cannot read as an
+            // eligibility. `read` has already named which.
+            None => return self.unresolved(attachment, seq, "read_failed"),
+            Some(_) => return self.unresolved(attachment, seq, "unexpected_reply"),
         };
         tracing::debug!(
             target: "ducktape::collab",
@@ -486,7 +578,23 @@ impl Pump {
             reason,
             "not offering a message to the daemon"
         );
-        false
+        Eligible::No
+    }
+
+    /// the eligibility question could not be asked. Latched, because whatever
+    /// stopped it stops every message behind it in the same sweep.
+    fn unresolved(&self, attachment: &Attached, seq: u64, reason: &'static str) -> Eligible {
+        if let Some(occurrences) = PUMP_WARN.hit(reason) {
+            tracing::warn!(
+                target: "ducktape::collab",
+                conversation = %attachment.conversation,
+                seq,
+                reason,
+                occurrences,
+                "could not establish whether a message may be delivered; holding it"
+            );
+        }
+        Eligible::Unresolved
     }
 
     // ---- the daemon's receipts -> committed state ---------------------------
@@ -592,13 +700,36 @@ impl Pump {
         state: wire::State,
         reason: Option<String>,
     ) {
+        self.commit_receipt(Unsent {
+            conversation: conversation.to_string(),
+            participant: participant.to_string(),
+            seq,
+            credential: binding_generation,
+            state,
+            reason,
+            tries: 0,
+        })
+        .await;
+    }
+
+    /// Submit one receipt, and REMEMBER it if the submission did not land.
+    ///
+    /// A dropped acknowledgement is not self-healing. Once `Queued` commits, the
+    /// eligibility read answers `already_queued` forever, so the pump never
+    /// re-offers the message and the daemon never re-reports it: a failed
+    /// `AdapterAccepted` submission would leave the network reading `Queued` for
+    /// a message a provider took, with no operator action short of re-binding
+    /// able to correct it. So it is queued for [`Pump::resubmit`] and retried on
+    /// the next sweeps, in the order the daemon reported the transitions.
+    async fn commit_receipt(&self, unsent: Unsent) {
         let binding = crate::collab_keys::BindingRef {
             network: &self.network,
-            conversation,
-            participant,
+            conversation: &unsent.conversation,
+            participant: &unsent.participant,
         };
         let key = match crate::collab_keys::load(&self.workspace, binding) {
             Ok(Some(key)) => key,
+            // no key is not transient: nothing here can ever sign it.
             Ok(None) => {
                 return self.refuse(
                     "receipt_without_key",
@@ -608,27 +739,65 @@ impl Pump {
             Err(error) => return self.refuse("service_key_unreadable", &error),
         };
         let op = collab::CollaborationMsg::Acknowledge {
-            conversation_id: conversation.to_string(),
-            seq,
-            binding_credential: binding_generation,
-            state: delivery_state(state),
-            reason,
+            conversation_id: unsent.conversation.clone(),
+            seq: unsent.seq,
+            binding_credential: unsent.credential,
+            state: delivery_state(unsent.state),
+            reason: unsent.reason.clone(),
         };
         match self.submit(&key, op).await {
             Ok(height) => tracing::debug!(
                 target: "ducktape::collab",
-                conversation = %conversation,
-                seq,
+                conversation = %unsent.conversation,
+                seq = unsent.seq,
                 height,
                 "acknowledged a delivery on-chain"
             ),
-            // NOT retried. The module refuses a transition that is not in the
-            // delivery diagram and a credential that is not current, and both
-            // refusals are permanent: re-submitting the identical op produces
-            // the identical refusal. A transport failure is re-derivable — the
-            // daemon's journal is durable and its state is re-reported on the
-            // next bind.
-            Err(error) => self.refuse("acknowledge_refused", &error),
+            Err(error) => self.remember_unsent(unsent, &error),
+        }
+    }
+
+    /// Keep a receipt the chain did not take, up to [`ACK_TRIES`].
+    ///
+    /// Bounded, because a refusal can also be PERMANENT: the module rejects a
+    /// transition outside the delivery diagram and a credential that is no
+    /// longer current, and re-submitting the identical op produces the identical
+    /// refusal forever. The retry cannot tell the two apart from the error
+    /// string, so it gives up after a few sweeps and says so loudly rather than
+    /// retrying one op for the life of the process.
+    fn remember_unsent(&self, mut unsent: Unsent, error: &str) {
+        unsent.tries += 1;
+        if unsent.tries >= ACK_TRIES {
+            return self.refuse("acknowledge_abandoned", error);
+        }
+        let mut pending = self.pending.lock().expect("collab pending lock poisoned");
+        if pending.len() >= MAX_PENDING_ACKS {
+            // the oldest goes, not the newest: a later transition is the more
+            // truthful statement about where the delivery stands.
+            pending.pop_front();
+            self.refuse(
+                "pending_acks_full",
+                "dropped the oldest unsent receipt to make room",
+            );
+        }
+        pending.push_back(unsent);
+        self.refuse("acknowledge_retrying", error);
+    }
+
+    /// Retry every receipt the chain has not taken, oldest first.
+    ///
+    /// Order is preserved on purpose: the module's diagram admits
+    /// `Queued -> Held -> AdapterAccepted` and refuses transitions taken out of
+    /// order, so replaying them as they were reported is what makes the retry a
+    /// recovery rather than a second way to lose the record. A retry that fails
+    /// again goes back on the queue with its count raised.
+    async fn resubmit(&self) {
+        let queued: Vec<Unsent> = {
+            let mut pending = self.pending.lock().expect("collab pending lock poisoned");
+            pending.drain(..).collect()
+        };
+        for unsent in queued {
+            self.commit_receipt(unsent).await;
         }
     }
 
@@ -1103,7 +1272,8 @@ mod tests {
         /// what the "agent daemon" receives. The real one is a ws connection;
         /// this is the same lane, taken by the same `attach`.
         link: tokio::sync::mpsc::Receiver<wire::Command>,
-        _attached: noded::AttachGuard,
+        /// dropping it detaches the daemon, which is how a reconnect is staged.
+        attached: Option<noded::AttachGuard>,
         owner: commonware_cryptography::ed25519::PrivateKey,
         service: commonware_cryptography::ed25519::PrivateKey,
         // dropped LAST: the daemon's actor thread closes qmdb on the way out.
@@ -1173,7 +1343,7 @@ mod tests {
                 daemon,
                 terminals,
                 link,
-                _attached: attached,
+                attached: Some(attached),
                 owner,
                 service,
                 dir,
@@ -1397,13 +1567,109 @@ mod tests {
         }
 
         fn pump(&self) -> Pump {
+            self.pump_behind(self.daemon.commands())
+        }
+
+        fn pump_behind(&self, commands: mpsc::Sender<noded::NodeCommand>) -> Pump {
             Pump::new(
-                self.daemon.commands(),
+                commands,
                 self.daemon.status(),
                 self.terminals.clone(),
                 self.dir.path().to_path_buf(),
                 NETWORK.to_string(),
             )
+        }
+
+        /// A command lane that swallows the FIRST command matching `fault` and
+        /// answers it as a failure, then forwards everything, including every
+        /// retry of the swallowed one.
+        ///
+        /// The node stays real: this is the actor lane going wrong, which is
+        /// exactly the transient class the pump has to survive — a dropped
+        /// reply, a busy actor, a submission that did not land.
+        fn flaky(&self, fault: Fault) -> mpsc::Sender<noded::NodeCommand> {
+            use futures::StreamExt as _;
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut real = self.daemon.commands();
+            tokio::spawn(async move {
+                let mut armed = true;
+                while let Some(command) = rx.next().await {
+                    if armed && fault.matches(&command) {
+                        armed = false;
+                        fault.refuse(command);
+                        continue;
+                    }
+                    if real.send(command).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            tx
+        }
+
+        /// re-attach the "daemon" — the same bindings, a new connection.
+        fn reconnect(&mut self) {
+            self.attached.take();
+            let (attached, link) = self
+                .terminals
+                .attach(LINK_TOKEN)
+                .expect("the link is free once the last daemon let go");
+            self.attached = Some(attached);
+            self.link = link;
+        }
+    }
+
+    /// which one command a [`Fixture::flaky`] lane fails.
+    #[derive(Debug, Clone, Copy)]
+    enum Fault {
+        /// the eligibility question itself cannot be asked.
+        Eligibility,
+        /// the acknowledgement of an accepted delivery does not land.
+        AcceptedReceipt,
+    }
+
+    impl Fault {
+        fn matches(self, command: &noded::NodeCommand) -> bool {
+            match (self, command) {
+                (Fault::Eligibility, noded::NodeCommand::QueryAs { req, .. }) => matches!(
+                    collab::decode_query(req),
+                    Ok(collab::CollaborationQuery::Read {
+                        read: collab::ProtectedRead::DeliveryEligibility { .. },
+                        ..
+                    })
+                ),
+                (Fault::AcceptedReceipt, noded::NodeCommand::SubmitFrame { frame, .. }) => {
+                    let Ok((_, msg)) = node::decode_frame(frame) else {
+                        return false;
+                    };
+                    matches!(
+                        collab::decode_msg(&msg.payload).map(|request| request.op),
+                        Ok(collab::CollaborationMsg::Acknowledge {
+                            state: collab::DeliveryState::AdapterAccepted,
+                            ..
+                        })
+                    )
+                }
+                _ => false,
+            }
+        }
+
+        /// answer the swallowed command the way a node under strain does.
+        fn refuse(self, command: noded::NodeCommand) {
+            match command {
+                noded::NodeCommand::QueryAs { reply, .. } => {
+                    let _ = reply.send(Err("the actor is busy".to_string()));
+                }
+                noded::NodeCommand::Query { reply, .. } => {
+                    let _ = reply.send(Err("the actor is busy".to_string()));
+                }
+                noded::NodeCommand::SubmitFrame { reply, .. } => {
+                    let _ = reply.send(Err("the block was not produced".to_string()));
+                }
+                noded::NodeCommand::Submit { reply, .. } => {
+                    let _ = reply.send(Err("the block was not produced".to_string()));
+                }
+            }
         }
     }
 
@@ -1642,6 +1908,123 @@ mod tests {
             bound.unwrap_or_else(|| panic!("a binding is announced, got {sent:?}")),
             delivered.unwrap_or_else(|| panic!("the message is handed over, got {sent:?}")),
         )
+    }
+
+    /// An eligibility read that fails is NOT a refusal. The message stays in
+    /// front of the cursor and the next sweep asks again — otherwise a busy
+    /// actor for one round trip silently loses a queued message forever, because
+    /// nothing ever reads that sequence a second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_whose_eligibility_cannot_be_read_is_held_and_delivered_next_sweep() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "did the read land?").await;
+        let pump = fixture.pump_behind(fixture.flaky(Fault::Eligibility));
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "an unanswered eligibility read is not permission to deliver",
+        );
+
+        // the very next sweep, with nothing else changed: no re-bind, no new
+        // message, no operator action.
+        pump.sweep(&mut seen).await;
+        let sent = drained(&mut fixture.link);
+        let delivered = sent
+            .iter()
+            .find_map(|command| match command {
+                wire::Command::MsgDeliver(deliver) => Some(deliver),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the held message comes back, got {sent:?}"));
+        assert_eq!(
+            delivered.body, "did the read land?",
+            "the held message is the one that comes back"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|command| matches!(command, wire::Command::MsgBind(_))),
+            "and no re-bind: nothing about the binding changed, only the read"
+        );
+    }
+
+    /// A receipt the chain did not take is retried, and the retry needs no
+    /// provider re-delivery and no re-bind.
+    ///
+    /// Without it the network reads `Queued` forever for a message a provider
+    /// accepted: `Queued` is committed, so eligibility answers `already_queued`
+    /// and the pump never re-offers it, and the daemon has no reason to report
+    /// it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acknowledgement_the_chain_did_not_take_is_retried_on_the_next_sweep() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "please accept me").await;
+        let pump = fixture.pump_behind(fixture.flaky(Fault::AcceptedReceipt));
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (bound, deliver) = bind_and_delivery(&drained(&mut fixture.link));
+        for state in [wire::State::Queued, wire::State::AdapterAccepted] {
+            pump.receipt(reported(
+                deliver.seq,
+                bound.generation,
+                deliver.message_id,
+                state,
+            ))
+            .await;
+        }
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::Queued,
+            "the acceptance did not land; the record still says what did"
+        );
+
+        pump.sweep(&mut seen).await;
+        assert_eq!(
+            fixture.receipt(deliver.seq).await.state,
+            collab::DeliveryState::AdapterAccepted,
+            "the sweep re-submits it, with no provider and no binding involved"
+        );
+        assert_no_delivery(
+            &drained(&mut fixture.link),
+            "recovering a receipt must not re-offer the message it is about",
+        );
+    }
+
+    /// A daemon that dies and redials knows nothing of what the last one was
+    /// told. "Is one attached" cannot see that — the two look identical — so the
+    /// pump keys its cache on WHICH daemon, and re-announces everything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnecting_daemon_is_told_everything_again() {
+        let mut fixture = Fixture::start().await;
+        fixture.send(1, "hello").await;
+        let pump = fixture.pump();
+        let mut seen = Seen::default();
+
+        pump.sweep(&mut seen).await;
+        let (first, _) = bind_and_delivery(&drained(&mut fixture.link));
+
+        // the daemon goes away and comes back. Same bindings, same credential,
+        // same conversation — nothing on the NETWORK changed.
+        fixture.reconnect();
+        pump.sweep(&mut seen).await;
+        let sent = drained(&mut fixture.link);
+        let (second, redelivered) = bind_and_delivery(&sent);
+        assert_eq!(
+            second.generation, first.generation,
+            "the credential did not change; the daemon did"
+        );
+        assert_eq!(
+            redelivered.body, "hello",
+            "a message the last daemon was told about is told to this one"
+        );
+        assert!(
+            sent.iter()
+                .any(|command| matches!(command, wire::Command::MsgTime { .. })),
+            "and the clock, which a fresh daemon also does not have: {sent:?}"
+        );
     }
 
     /// one delivery state as the daemon reports it.

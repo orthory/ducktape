@@ -178,6 +178,12 @@ fn spawn_session_actor(
                     ));
                     let _ = reply.send(Ok(committed_block()));
                 }
+                // the provision plane reads as the NODE. An authenticated read
+                // belongs to a caller-facing route, and one arriving here would
+                // be the plane having quietly grown one.
+                NodeCommand::QueryAs { .. } => {
+                    panic!("the provision plane reads as the node, not as a caller")
+                }
             }
         }
     });
@@ -658,6 +664,9 @@ fn spawn_receipt_actor(
                         query => panic!("unexpected receipt query {query:?}"),
                     };
                     let _ = reply.send(Ok(runs::encode_reply(&response)));
+                }
+                NodeCommand::QueryAs { .. } => {
+                    panic!("the receipt lane reads as the node, not as a caller")
                 }
             }
         }
