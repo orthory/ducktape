@@ -104,6 +104,7 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
     let offered = providers.capabilities().len();
 
     let (events, event_rx) = tokio::sync::mpsc::channel(link::EVENT_LANE);
+    let events_for_collab = events.clone();
     let sessions = Arc::new(agent_service::Sessions::new(
         providers,
         provider_host::execution_node_id(&node_key),
@@ -111,11 +112,23 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
         events,
     ));
 
+    // the collaboration delivery plane, beside the terminal one and sharing
+    // its event lane — but NOT its lifetime. A pty dies with the link that
+    // made it; a binding names a provider session this daemon did not start
+    // and must not end, so nothing about a disconnect reaches this plane.
+    //
+    // A daemon whose outbox will not open serves no messaging rather than
+    // serving it without a durable record — the record is what makes a crash
+    // reportable instead of replayable, so running without one is worse than
+    // not running it.
+    let deliveries = collab_plane(&service, events_for_collab).await;
+
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
         capabilities = offered,
         cap = agent_service::MAX_TERM_SESSIONS,
+        messaging = deliveries.is_some(),
         "agent daemon serving"
     );
 
@@ -125,7 +138,7 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
     // and its container is taken down by the teardown below rather than left
     // running under a service that is about to go.
     tokio::select! {
-        () = link::attach(ws_url(&http_base), workspace, sessions, event_rx) => {}
+        () = link::attach(ws_url(&http_base), workspace, sessions, deliveries, event_rx) => {}
         () = stop => {}
     }
     // Nothing to tear down. Every live run's VMM is a child of this process
@@ -137,6 +150,82 @@ async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn st
         "agent daemon stopped"
     );
     Ok(())
+}
+
+/// build the collaboration delivery plane, or serve without one.
+///
+/// `None` is an operational state, not a failure to start: a daemon whose
+/// outbox will not open still serves terminals, and answers no binding at all
+/// rather than answering one it cannot record. The node hears about it either
+/// way — a bind simply gets no reply, exactly as it does from a node with no
+/// daemon attached.
+async fn collab_plane(
+    service: &config::ServiceConfig,
+    events: tokio::sync::mpsc::Sender<agent_service::wire::Event>,
+) -> Option<Arc<agent_service::messaging::Deliveries>> {
+    // the receipt address is best-effort by design. Without it every Claude
+    // delivery settles `DeliveryUnknown` — degraded, and honest, which is the
+    // right trade against reclaiming an address that may belong to a live
+    // session.
+    let receipts = match claude_sockets_dir() {
+        Some(dir) => match agent_service::messaging::claude::Receipts::bind(&dir).await {
+            Ok(receipts) => Some(receipts),
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "no_receipt_address",
+                    %error,
+                    "provider holds and refusals will not be observable; deliveries settle unknown"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let plane = agent_service::messaging::Deliveries::open(
+        &service.storage_dir.join("collab"),
+        // the chain id, which is what this network IS. A directory that has
+        // been pointed at a second network holds a delivery record whose
+        // conversation ids and sequences belong to the first, and reading it
+        // would answer a fresh message from another network's history.
+        &service.chain_id,
+        service.storage_dir.join("attachments.json"),
+        claude_registry()?,
+        std::path::PathBuf::from("codex"),
+        receipts,
+        events,
+    )
+    .await;
+    match plane {
+        Ok(plane) => Some(Arc::new(plane)),
+        Err(error) => {
+            tracing::error!(
+                target: "ducktape::collab",
+                reason = "outbox_unavailable",
+                %error,
+                "serving without messaging: a delivery record that cannot be written \
+                 makes a crash replayable instead of reportable"
+            );
+            None
+        }
+    }
+}
+
+/// where Claude publishes its session registry: `$CLAUDE_CONFIG_DIR/sessions`,
+/// or `$HOME/.claude/sessions`.
+fn claude_registry() -> Option<std::path::PathBuf> {
+    let home = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+    };
+    Some(home.join("sessions"))
+}
+
+/// where the per-session inboxes live, and where this daemon binds the address
+/// a recipient answers verdicts to.
+fn claude_sockets_dir() -> Option<std::path::PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    Some(std::path::PathBuf::from(runtime).join("cc-socks"))
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.

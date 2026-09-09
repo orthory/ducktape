@@ -837,6 +837,17 @@ struct Bridge {
     /// becoming this node's interactive plane, which is not a capability to hand
     /// out on the strength of dialing loopback.
     link_token: Option<String>,
+    /// where the collaboration receipts go. The daemon's messaging half rides
+    /// the same link as the pty half, but its events belong to the node's
+    /// collaboration pump, which acknowledges them on-chain. `OnceLock` because
+    /// the pump is wired once at boot and never replaced: a second setter would
+    /// be two consumers racing for one receipt.
+    collab: std::sync::OnceLock<mpsc::Sender<wire::Event>>,
+    /// how many daemons have taken the link. See [`TerminalSessions::attach_epoch`].
+    attaches: std::sync::atomic::AtomicU64,
+    /// how many receipts the pump was too slow to take. See
+    /// [`TerminalSessions::dropped_receipts`].
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 /// everything the host needs to spawn a session on behalf of a mesh peer: the
@@ -992,7 +1003,23 @@ impl TerminalSessions {
             sessions: Mutex::new(HashMap::new()),
             link: Mutex::new(None),
             link_token,
+            collab: std::sync::OnceLock::new(),
+            attaches: std::sync::atomic::AtomicU64::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    /// Route the daemon's collaboration receipts to the node's collaboration
+    /// pump. Until this is called they are dropped with a named reason
+    /// ([`unconsumed`]) — a node can run the pty plane and no collaboration
+    /// plane at all.
+    ///
+    /// Returns whether the lane was taken. A second call is refused rather than
+    /// silently ignored: two consumers of one receipt would each submit an
+    /// `Acknowledge` for it, and the second would be refused on-chain for a
+    /// transition already made — a confusing failure with no local cause.
+    pub fn route_collab_to(&self, lane: mpsc::Sender<wire::Event>) -> bool {
+        self.0.collab.set(lane).is_ok()
     }
 
     // ---- the daemon's attachment ------------------------------------------
@@ -1041,8 +1068,40 @@ impl TerminalSessions {
         }
         let (tx, rx) = mpsc::channel(COMMAND_LANE);
         *link = Some(tx);
+        // a NEW daemon, and this is what says so. See [`Self::attach_epoch`].
+        self.0
+            .attaches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tracing::info!(target: "ducktape::term", "agent service attached");
         Some((AttachGuard(self.clone()), rx))
+    }
+
+    /// How many daemons have attached over this node's life. `0` = none ever.
+    ///
+    /// The collaboration pump caches what it has already told the daemon —
+    /// which bindings, which clock, which retention floor — and a RESTARTED
+    /// daemon knows none of it. "Is one attached" cannot answer that: a daemon
+    /// that dies and redials with the same bindings looks identical to one that
+    /// never left, and the pump would then never re-send a bind, leaving a live
+    /// binding on the network that this node's daemon has never heard of.
+    ///
+    /// A counter and not a flag, because the pump may not observe the gap: a
+    /// detach and a re-attach between two sweeps is invisible to any state that
+    /// only says "attached now".
+    pub fn attach_epoch(&self) -> u64 {
+        self.0.attaches.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many collaboration receipts this node dropped for a full pump lane.
+    ///
+    /// Also a counter and not a flag, and for a sharper reason than
+    /// [`Self::attach_epoch`]'s: the pump only observes this AFTER it has
+    /// drained enough of the lane to run a sweep, by which point a flag it
+    /// consumed would race the next overflow. A monotonic count it compares
+    /// against what it last saw cannot lose a drop, only coalesce several into
+    /// one replay — which is all one replay costs.
+    pub fn dropped_receipts(&self) -> u64 {
+        self.0.dropped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Does `presented` match this node's 0600 workspace link secret?
@@ -1126,6 +1185,46 @@ impl TerminalSessions {
             } => self.refused(&session, reason, detail),
             wire::Event::TermOutput { session, chunk_b64 } => self.output(&session, chunk_b64),
             wire::Event::TermEnded { session } => self.ended(&session),
+            // the collaboration plane's receipts. They ride the same link
+            // because the daemon holds one connection, but they belong to the
+            // node's collaboration pump, which turns each into an on-chain
+            // `Acknowledge`. Named rather than swept into a `_` so a new
+            // receipt fails the build here.
+            collaboration @ (wire::Event::MsgBound { .. }
+            | wire::Event::MsgBindRefused { .. }
+            | wire::Event::MsgDelivery { .. }) => self.receipt(collaboration),
+        }
+    }
+
+    /// hand one collaboration receipt to the pump.
+    ///
+    /// `try_send` and not `send`: this runs on the ws READ LOOP, which is also
+    /// the only thing draining the daemon's pty output. Awaiting a full pump
+    /// lane here would stall every session's output behind one slow chain
+    /// submission, so a full lane drops the receipt instead — what it must
+    /// never do is wedge the terminal plane.
+    ///
+    /// A dropped receipt is NOT recoverable by re-reading the chain: the module
+    /// records what was submitted, and this receipt is precisely the one that
+    /// never was. So the drop is COUNTED ([`Self::dropped_receipts`]) and the
+    /// pump asks the daemon — whose delivery journal is durable and is the only
+    /// remaining witness — to replay it.
+    fn receipt(&self, event: wire::Event) {
+        let Some(lane) = self.0.collab.get() else {
+            return unconsumed(&event);
+        };
+        if lane.try_send(event).is_err() {
+            self.0
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(occurrences) = TERM_WARN.hit("collab_lane_full") {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "collab_lane_full",
+                    occurrences,
+                    "dropped a collaboration receipt: the pump is not keeping up"
+                );
+            }
         }
     }
 
@@ -1403,10 +1502,18 @@ impl TerminalSessions {
         .await;
     }
 
-    /// the single writer to the daemon. A missing or closed link drops the
-    /// command with a named reason — never a panic; the session is ending
-    /// anyway, and [`AttachGuard`] is what tells the client so.
-    async fn send(&self, command: wire::Command) {
+    /// THE single writer to the daemon, for both halves of the link.
+    ///
+    /// The pty half has the three wrappers above; the collaboration half builds
+    /// its own frames and calls this, because its five commands carry no session
+    /// id and share no shape worth wrapping. No authority is widened by it being
+    /// public — `close`/`input`/`resize` already reach every pty this node owns.
+    ///
+    /// A missing or closed link drops the command with a named reason — never a
+    /// panic; the session is ending anyway, and [`AttachGuard`] is what tells
+    /// the client so. For the collaboration half a drop is also survivable: the
+    /// module holds the authoritative record and the pump re-reads it.
+    pub async fn send(&self, command: wire::Command) {
         let Some(link) = self.link() else {
             if let Some(occurrences) = TERM_WARN.hit("no_agent_service") {
                 tracing::warn!(
@@ -1535,6 +1642,33 @@ impl TerminalSessions {
             .expect("term sessions lock poisoned")
             .get_mut(id)
             .and_then(|live| live.reply.take())
+    }
+}
+
+/// a collaboration receipt reached a node with no collaboration pump wired.
+///
+/// It is DROPPED, and said so: the daemon's delivery record is durable and the
+/// module holds the authoritative receipt, so nothing is lost by not consuming
+/// one here — but a receipt going nowhere silently is exactly the kind of gap
+/// that gets discovered from a delivery that never appears to advance.
+fn unconsumed(event: &wire::Event) {
+    let kind = match event {
+        wire::Event::MsgBound { .. } => "msg_bound",
+        wire::Event::MsgBindRefused { .. } => "msg_bind_refused",
+        wire::Event::MsgDelivery { .. } => "msg_delivery",
+        wire::Event::TermCreated { .. }
+        | wire::Event::TermRefused { .. }
+        | wire::Event::TermOutput { .. }
+        | wire::Event::TermEnded { .. } => "term",
+    };
+    if let Some(occurrences) = TERM_WARN.hit("collab_receipt_unconsumed") {
+        tracing::warn!(
+            target: "ducktape::collab",
+            reason = "collab_receipt_unconsumed",
+            event = kind,
+            occurrences,
+            "dropped a collaboration receipt: this node has no collaboration plane"
+        );
     }
 }
 

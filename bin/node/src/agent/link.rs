@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use agent_service::{Sessions, wire};
+use agent_service::{Sessions, messaging, wire};
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::sync::mpsc;
 
@@ -49,6 +49,7 @@ pub(crate) async fn attach(
     ws_url: String,
     workspace: std::path::PathBuf,
     sessions: Arc<Sessions>,
+    deliveries: Option<Arc<messaging::Deliveries>>,
     mut events: mpsc::Receiver<wire::Event>,
 ) {
     // two causes, two counters: a node that will not answer, and a node that
@@ -68,10 +69,17 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                let end = pump(socket, &workspace, &sessions, &mut events).await;
+                let end = pump(socket, &workspace, &sessions, &deliveries, &mut events).await;
                 // the connection is gone, and with it every session: the node
                 // forgot them the moment this link dropped, so a surviving pty
                 // would be a container nobody can reach, feed or close.
+                //
+                // `deliveries` is deliberately NOT swept here. Its bindings
+                // name provider sessions this daemon did not start and does
+                // not own, and a reconnecting node expects them still
+                // attached — the whole point of the disconnect case is that a
+                // message queued while it was away is delivered when it comes
+                // back, in sequence, without a second session being spawned.
                 sessions.close_all().await;
                 match end {
                     // a link that lived and dropped is the ordinary case, and
@@ -158,6 +166,7 @@ async fn pump<S>(
     socket: S,
     workspace: &std::path::Path,
     sessions: &Arc<Sessions>,
+    deliveries: &Option<Arc<messaging::Deliveries>>,
     events: &mut mpsc::Receiver<wire::Event>,
 ) -> LinkEnd
 where
@@ -196,7 +205,7 @@ where
     loop {
         tokio::select! {
             frame = rx.next() => {
-                if let Some(end) = serve_frame(frame, sessions).await {
+                if let Some(end) = serve_frame(frame, sessions, deliveries).await {
                     return end;
                 }
             }
@@ -216,7 +225,7 @@ where
     // the event lane is closed for the daemon's lifetime; commands in, nothing
     // out, until the socket itself ends.
     loop {
-        if let Some(end) = serve_frame(rx.next().await, sessions).await {
+        if let Some(end) = serve_frame(rx.next().await, sessions, deliveries).await {
             return end;
         }
     }
@@ -229,6 +238,7 @@ async fn serve_frame(
         Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
     >,
     sessions: &Arc<Sessions>,
+    deliveries: &Option<Arc<messaging::Deliveries>>,
 ) -> Option<LinkEnd> {
     use tokio_tungstenite::tungstenite::Message;
     let Some(Ok(Message::Text(text))) = frame else {
@@ -240,7 +250,7 @@ async fn serve_frame(
     match classify(&text) {
         Incoming::Ignore => None,
         Incoming::Command(command) => {
-            execute(sessions, command).await;
+            execute(sessions, deliveries, command).await;
             None
         }
         // the only errors this connection can earn are refusals of its claim,
@@ -315,6 +325,11 @@ fn classify(text: &str) -> Incoming {
 /// anywhere else on this plane.
 static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
 
+/// how many `command_lane_full` drops pass between log lines after the first.
+/// Latched for the same reason `input_lane_full` is: one per refused command,
+/// and an unlatched line evicts the ring that holds the evidence.
+static COLLAB_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
+
 /// Perform one command, on this task or its own.
 ///
 /// The link must never stop reading, so nothing slow may run on it:
@@ -331,7 +346,42 @@ static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
 ///   bounded (frame count and pending bytes both), so a refusal is ordinary
 ///   under load, not a bug: it is warned, latched, and the frame is dropped —
 ///   never buffered, and never blocks this task.
-async fn execute(sessions: &Arc<Sessions>, command: wire::Command) {
+async fn execute(
+    sessions: &Arc<Sessions>,
+    deliveries: &Option<Arc<messaging::Deliveries>>,
+    command: wire::Command,
+) {
+    // the collaboration half goes to its own plane, on its own ordered lane.
+    // `enqueue` is a `try_send`, so a bind that starts a child process and a
+    // delivery that fsyncs never happen on this task — while staying in the
+    // order they arrived, which a spawn per command would lose.
+    let command = match messaging::route(command) {
+        Ok(collab) => {
+            let Some(deliveries) = deliveries else {
+                // this daemon serves no messaging (no durable outbox). The
+                // node hears nothing back, exactly as from a node with no
+                // daemon attached — never a fabricated acknowledgement.
+                tracing::debug!(
+                    target: "ducktape::collab",
+                    reason = "messaging_unavailable",
+                    "dropped a collaboration command: this daemon serves no messaging"
+                );
+                return;
+            };
+            if !deliveries.enqueue(collab)
+                && let Some(occurrences) = COLLAB_LANE_FULL.hit("collab_lane_full")
+            {
+                tracing::warn!(
+                    target: "ducktape::collab",
+                    reason = "collab_lane_full",
+                    occurrences,
+                    "collaboration command dropped: the delivery plane is behind"
+                );
+            }
+            return;
+        }
+        Err(terminal) => terminal,
+    };
     let touches_a_container = matches!(
         command,
         wire::Command::TermCreate(_) | wire::Command::TermClose { .. }
@@ -392,6 +442,46 @@ mod tests {
             panic!("an error frame is a refusal");
         };
         assert!(detail.contains("service-link token"), "{detail}");
+    }
+
+    /// A collaboration command arrives on the SAME link as a keystroke and is
+    /// routed to the other plane — the two share a connection and nothing else.
+    #[test]
+    fn a_collaboration_command_decodes_and_routes_to_the_delivery_plane() {
+        let frame = serde_json::json!({
+            "type": "service_command",
+            "command": {
+                "op": "msg_bind",
+                "conversation": "conv-1",
+                "participant": "p-recipient",
+                "generation": 3,
+                "device": "laptop-a",
+            },
+        })
+        .to_string();
+        let Incoming::Command(command) = classify(&frame) else {
+            panic!("a msg_bind frame must decode to its command");
+        };
+        let Ok(messaging::Messaging::Bind(bind)) = messaging::route(command) else {
+            panic!("a bind belongs to the delivery plane, not the terminal one");
+        };
+        assert_eq!(bind.generation, 3);
+        assert_eq!(bind.device, "laptop-a");
+
+        // and a pty command still goes the other way.
+        let Incoming::Command(term) = classify(
+            &serde_json::json!({
+                "type": "service_command",
+                "command": { "op": "term_close", "session": "abc" },
+            })
+            .to_string(),
+        ) else {
+            panic!("a term_close frame must decode");
+        };
+        assert!(
+            messaging::route(term).is_err(),
+            "a pty command must stay with the terminal plane"
+        );
     }
 
     #[test]
