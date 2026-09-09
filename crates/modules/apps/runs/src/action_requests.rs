@@ -237,7 +237,8 @@ impl RunsModule {
         let Some(invocation) = &request.invocation else {
             return Ok(());
         };
-        let current = crate::operation_view(&request.view.operation).map(|view| view.schema_digest);
+        let current = crate::operation_view(&request.view.operation)
+            .map(|view| view.schema_digest);
         if current.as_deref() != Some(invocation.schema_digest.as_str()) {
             return Err(Error::Module(
                 "operation schema changed since this action was proposed".into(),

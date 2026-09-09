@@ -684,7 +684,10 @@ fn an_action_outside_the_grant_is_refused_and_emits_nothing() {
     let err = exec(
         &mut m,
         &mut ctx,
-        &act(&run_id, create_task("t1", "ship it")),
+        &act(
+            &run_id,
+            create_task("t1", "ship it"),
+        ),
     )
     .unwrap_err();
     assert!(
@@ -1140,7 +1143,15 @@ fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
         commit(&mut m);
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
             .with_transcript("general", messages);
-        exec(&mut m, &mut ctx, &act(&run, reply("Working on it"))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                reply("Working on it"),
+            ),
+        )
+        .unwrap();
         assert_eq!(
             ctx.chat_msgs(),
             vec![ChatMsg::PostMessage {
@@ -1242,7 +1253,15 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
     ] {
         let (mut m, registry, run) = with_open_session(&grants, &[]);
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
-        let error = exec(&mut m, &mut ctx, &act(&run, reply(text))).unwrap_err();
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                reply(text),
+            ),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, Error::Module(ref reason) if reason.contains(expected)),
             "{error:?}"
@@ -1255,7 +1274,15 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
         entry.channel_id.clear();
         entry.anchor_seq = 0;
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
-        let error = exec(&mut m, &mut ctx, &act(&run, reply("hello"))).unwrap_err();
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                reply("hello"),
+            ),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, Error::Module(ref reason) if reason.contains("no reply destination")),
             "{error:?}"
@@ -1324,7 +1351,17 @@ fn returning_to_a_previous_holder_does_not_revive_its_old_key() {
         exec(&mut m, &mut ctx, &open_attempt(&run, attempt, &key)).unwrap();
         commit(&mut m);
         ctx.env.origin = Origin::External(SESSION_KEY.to_vec());
-        assert!(exec(&mut m, &mut ctx, &act(&run, reply("stale"))).is_err());
+        assert!(
+            exec(
+                &mut m,
+                &mut ctx,
+                &act(
+                    &run,
+                    reply("stale")
+                )
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1336,7 +1373,15 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
             &crate::sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run)),
             &ASSIGNEE,
         );
-    let error = exec(&mut m, &mut ctx, &act(&run, reply("too late"))).unwrap_err();
+    let error = exec(
+        &mut m,
+        &mut ctx,
+        &act(
+            &run,
+            reply("too late"),
+        ),
+    )
+    .unwrap_err();
     assert!(
         matches!(error, Error::Module(ref reason) if reason.contains("no execution lease")),
         "{error:?}"
@@ -1349,10 +1394,7 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
 #[test]
 fn explicit_destinations_enforce_their_own_grants_and_caps() {
     for (action, expected) in [
-        (
-            post_message("general", "hello", Some(1)),
-            "chat.post_message",
-        ),
+        (post_message("general", "hello", Some(1)), "chat.post_message"),
         (page_comment("b-p", "hello"), "pages.comment"),
         (job_comment("job-1", "hello"), "jobs.comment"),
     ] {
@@ -1430,11 +1472,7 @@ fn envelopes_are_decoded_against_the_catalog_in_the_module() {
             "not a catalog operation",
         ),
         (
-            envelope(
-                crate::OP_REPLY,
-                Some(serde_json::json!({"channel_id": "general"})),
-                text_content("hello"),
-            ),
+            envelope(crate::OP_REPLY, Some(serde_json::json!({"channel_id": "general"})), text_content("hello")),
             "takes no target",
         ),
         (
@@ -1471,7 +1509,8 @@ fn default_job_replies_require_the_original_claim_but_explicit_posts_choose_the_
             actions: vec![action],
             commit_message: None,
         };
-        let result = block_on(m.validate_response(&ctx, &run, &entry, Lane::Session(0), response));
+        let result =
+            block_on(m.validate_response(&ctx, &run, &entry, Lane::Session(0), response));
         assert_eq!(result.is_ok(), accepted, "{result:?}");
         if let Err(reason) = result {
             assert!(reason.contains("original job claim"), "{reason}");
@@ -1503,8 +1542,14 @@ fn a_callee_result_cannot_stage_a_module_update() {
         actions: vec![update],
         commit_message: None,
     };
-    let reason = block_on(m.validate_response(&ctx, &run, &entry, Lane::DelegatedSettle, response))
-        .unwrap_err();
+    let reason = block_on(m.validate_response(
+        &ctx,
+        &run,
+        &entry,
+        Lane::DelegatedSettle,
+        response,
+    ))
+    .unwrap_err();
     assert!(reason.contains("run's own final response"), "{reason}");
 }
 

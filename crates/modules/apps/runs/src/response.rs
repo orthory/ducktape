@@ -5,11 +5,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::action_requests::Prepared;
-use super::catalog::Operation;
 use super::facets::{
     WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of,
 };
+use super::action_requests::Prepared;
+use super::catalog::Operation;
 use super::{
     AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult,
     DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error, FilesChange, FilesContent,
@@ -867,7 +867,9 @@ impl RunsModule {
             if operation.is_pages() || operation.is_duckfs() {
                 continue;
             }
-            let missing_grant = operation.fixed_grant().filter(|name| !allows(&agent, name));
+            let missing_grant = operation
+                .fixed_grant()
+                .filter(|name| !allows(&agent, name));
             if let Some(name) = missing_grant {
                 return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
             }
@@ -1179,8 +1181,7 @@ impl RunsModule {
             crate::OP_REPLY
         };
         let destination_json = serde_json::to_value(&resolved).expect("destinations serialize");
-        let source_result =
-            |id: &str| serde_json::json!({"destination": destination_json, "id": id});
+        let source_result = |id: &str| serde_json::json!({"destination": destination_json, "id": id});
         match resolved {
             ReplyDestination::Chat { channel_id, thread } => {
                 let message_id = match slot {
@@ -1768,10 +1769,7 @@ impl RunsModule {
                 Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(
                     ctx,
-                    format!(
-                        "run {run_id} {} action {index} skipped: {why}",
-                        operation.name()
-                    ),
+                    format!("run {run_id} {} action {index} skipped: {why}", operation.name()),
                 ),
             }
         }
@@ -1920,7 +1918,9 @@ impl RunsModule {
                 ))
             }
             Operation::TasksCreate { task_id, title } => {
-                let task_id = task_id.clone().unwrap_or_else(|| task_id_for(run_id, slot));
+                let task_id = task_id
+                    .clone()
+                    .unwrap_or_else(|| task_id_for(run_id, slot));
                 Ok(Prepared::new(
                     Msg {
                         target: self.task_target(),
@@ -1938,8 +1938,8 @@ impl RunsModule {
                 ))
             }
             Operation::TasksUpdateStatus { task_id, status } => {
-                let status_value =
-                    task_status(status).ok_or_else(|| format!("unknown task status: {status}"))?;
+                let status_value = task_status(status)
+                    .ok_or_else(|| format!("unknown task status: {status}"))?;
                 Ok(Prepared::new(
                     Msg {
                         target: self.task_target(),
@@ -1997,8 +1997,8 @@ impl RunsModule {
                 reply_to,
                 task,
             } => {
-                let kind =
-                    message_kind(kind).ok_or_else(|| format!("unknown message kind: {kind}"))?;
+                let kind = message_kind(kind)
+                    .ok_or_else(|| format!("unknown message kind: {kind}"))?;
                 Ok(Prepared::new(
                     Msg {
                         target,

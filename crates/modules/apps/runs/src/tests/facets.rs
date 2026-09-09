@@ -582,7 +582,11 @@ fn job_finalize_is_a_delivery_receipt_with_output_ref() {
     });
     // the prose carries the task write (the production path — the oracle never
     // lifts effects; a job run with no action would fail validation).
-    let prose = String::from_utf8(response_json(&[], vec![create_task("t1", "todo")])).unwrap();
+    let prose = String::from_utf8(response_json(
+        &[],
+        vec![create_task("t1", "todo")],
+    ))
+    .unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -697,7 +701,11 @@ fn job_finalize_output_ref_carries_forge_coordinates() {
         },
     });
     // the prose carries the action (job runs with no action fail validation).
-    let prose = String::from_utf8(response_json(&[], vec![create_task("t1", "todo")])).unwrap();
+    let prose = String::from_utf8(response_json(
+        &[],
+        vec![create_task("t1", "todo")],
+    ))
+    .unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()

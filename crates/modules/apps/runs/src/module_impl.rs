@@ -212,9 +212,9 @@ impl Module for RunsModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
-            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(crate::catalog(
-                filter.as_deref(),
-            )))),
+            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(
+                crate::catalog(filter.as_deref()),
+            ))),
             RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
                 self.next_module_update().await?,
             ))),

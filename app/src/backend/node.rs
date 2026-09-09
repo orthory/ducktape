@@ -1350,8 +1350,6 @@ pub struct RunLink {
     pub url: String,
 }
 
-/// The longest a chip's label runs; a page's opening line or an output ref
-/// past it is clipped with an ellipsis.
 /// A chip's label is one line: the text's words, single-spaced. How much of
 /// it a chip shows is the view's call, not a count picked here.
 fn chip_label(text: &str) -> String {
@@ -1398,7 +1396,7 @@ async fn view_block(
         .await?;
     match reply {
         ::pages::index::PagesViewReply::Block(block) => Ok(block),
-        _ => Ok(None),
+        _ => Err("the pages index returned the wrong reply to a block read".into()),
     }
 }
 
@@ -1415,12 +1413,15 @@ async fn view_thread_target(client: &RpcClient, thread_id: &str) -> Result<Optio
         .await?;
     match reply {
         ::pages::index::PagesViewReply::Thread(thread) => Ok(thread.map(|thread| thread.target)),
-        _ => Ok(None),
+        _ => Err("the pages index returned the wrong reply to a thread read".into()),
     }
 }
 
 /// The chip for one place. Chat, forge, page and run places carry an
 /// address; the rest name what they are until the protocol addresses them.
+/// A page place whose block the index no longer holds, or whose read failed,
+/// names its id and carries no address: the run's journal still opens, one
+/// chip short of a link.
 async fn run_link(
     client: &RpcClient,
     chain: &str,
@@ -1676,10 +1677,7 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
             lane,
             operation,
             result,
-        } => (
-            "acted",
-            action_summary(lane, &operation, &result, &request_id),
-        ),
+        } => ("acted", action_summary(lane, &operation, &result, &request_id)),
         runs::RunFact::Settled {
             outcome,
             reason,
@@ -3058,10 +3056,7 @@ mod qr_ceremony_tests {
             loop {
                 let mut line = String::new();
                 let read = socket.read_line(&mut line).await.unwrap();
-                assert_ne!(
-                    read, 0,
-                    "the request must reach the relay before cancellation"
-                );
+                assert_ne!(read, 0, "the request must reach the relay before cancellation");
                 let headers_complete = line == "\r\n";
                 if headers_complete {
                     return socket;
@@ -3069,7 +3064,9 @@ mod qr_ceremony_tests {
             }
         };
         let mut socket = {
-            let consume = async { while stream.next().await.is_some() {} };
+            let consume = async {
+                while stream.next().await.is_some() {}
+            };
             tokio::select! {
                 socket = receive_request => socket,
                 () = consume => panic!("the unanswered ceremony ended before cancellation"),
@@ -3243,10 +3240,7 @@ mod run_journal_scope_tests {
         };
         assert!(live("duck-a", 4, 9), "its own scope installs");
         // the SAME run id, the SAME endpoint, the SAME account — another chain
-        assert!(
-            !live("duck-b", 4, 9),
-            "network A's journal installed under B"
-        );
+        assert!(!live("duck-b", 4, 9), "network A's journal installed under B");
         // a reconnect to the same endpoint is a different session
         assert!(!live("duck-a", 5, 9));
         // and a second read of the same run on the same link is a second
@@ -3300,14 +3294,6 @@ mod run_journal_scope_tests {
         .await;
         assert!(closed.entries.is_empty());
         assert!(closed.error.is_empty(), "a close is not a failure");
-        assert!(journal_in_scope(
-            &closed,
-            "http://node",
-            "duck-a",
-            4,
-            "7",
-            9,
-            ""
-        ));
+        assert!(journal_in_scope(&closed, "http://node", "duck-a", 4, "7", 9, ""));
     }
 }
