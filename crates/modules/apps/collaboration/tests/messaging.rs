@@ -1043,3 +1043,145 @@ fn a_cursor_below_the_retained_floor_gets_an_explicit_history_gap() {
         );
     });
 }
+
+/// `reply_to` names a MESSAGE. Every committed change takes an event sequence —
+/// a roster change, a delivery advance — so a range check would let a
+/// `SetRoster` event be the parent of a reply, and a reader threading by
+/// `reply_to` would find no message there at all.
+#[test]
+fn a_reply_answers_a_message_not_any_event_sequence() {
+    block_on(async {
+        let (mut module, alice_key, _bob_key, seq) = one_message().await;
+        let mut alice = at(6, Origin::External(alice_key));
+
+        // the sequence just below the first message is the roster event that
+        // seated bob — a real, retained, in-range event that is not a message.
+        let roster_event = seq - 1;
+        let refusal = apply(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(collaboration::SendRequest {
+                reply_to: Some(roster_event),
+                ..note("c1", "alice", "bob", 1, 2, 100)
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("not a retained message"),
+            "{refusal:?}"
+        );
+
+        // the message itself is a parent.
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(collaboration::SendRequest {
+                reply_to: Some(seq),
+                ..note("c1", "alice", "bob", 1, 2, 100)
+            }),
+        )
+        .await;
+    });
+}
+
+/// `ExpireMessage` is permissionless BECAUSE it checks the clock: every caller
+/// asking gets the same answer. Reaching the same terminal state through an
+/// acknowledgement would route around that check — a bound service, or the
+/// participant's own owner, could settle a still-live message and free its
+/// queue slot early.
+///
+/// A LATE report is a different thing and stays admissible (see
+/// [`a_late_authentic_acceptance_beats_the_sweeper_and_is_not_relabelled`]):
+/// the deadline bounds the resource, not the truth.
+#[test]
+fn expiry_is_never_reported_by_a_service() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner_b = at(2, Origin::External(scene.owner_b.clone()));
+        ok(&mut module, &mut owner_b, bind("c1", "bob", key(20), 0)).await;
+        let mut alice = at(5, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, 100)),
+        )
+        .await;
+        let seq = admitted_seq(&module, &alice, "alice", 1, 1).await;
+        let credential = credential_of(&module, &owner_b, "bob", "c1").await;
+        let claim_expired = |seq, credential| CollaborationMsg::Acknowledge {
+            conversation_id: "c1".into(),
+            seq,
+            binding_credential: credential,
+            state: DeliveryState::Expired,
+            reason: None,
+        };
+
+        // before, exactly at, and after the deadline: the reporter never owns
+        // this state, so the answer does not depend on the clock at all.
+        for (now, when) in [(6, "before"), (100, "at"), (150, "after")] {
+            let mut service = at(now, Origin::External(key(20)));
+            let refusal = apply(&mut module, &mut service, claim_expired(seq, credential))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{refusal:?}").contains("expiry is not reported"),
+                "a service {when} the deadline must not claim expiry: {refusal:?}"
+            );
+        }
+        // the owner is no shortcut either: it authorizes the report, it does
+        // not authorize skipping the clock.
+        let mut owner = at(6, Origin::External(scene.owner_b.clone()));
+        let refusal = apply(&mut module, &mut owner, claim_expired(seq, credential))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("expiry is not reported"),
+            "{refusal:?}"
+        );
+
+        // a timely report still advances, and the record is still open.
+        let mut service = at(7, Origin::External(key(20)));
+        ok(
+            &mut module,
+            &mut service,
+            CollaborationMsg::Acknowledge {
+                conversation_id: "c1".into(),
+                seq,
+                binding_credential: credential,
+                state: DeliveryState::Queued,
+                reason: None,
+            },
+        )
+        .await;
+
+        // and the ONE lawful path to Expired opens at exactly the deadline.
+        let mut sweeper = at(100, Origin::External(key(77)));
+        ok(
+            &mut module,
+            &mut sweeper,
+            CollaborationMsg::ExpireMessage {
+                conversation_id: "c1".into(),
+                seq,
+            },
+        )
+        .await;
+        let bob = at(101, Origin::External(scene.owner_b));
+        let CollaborationReply::Receipt(Some(receipt)) = read(
+            &module,
+            &bob,
+            "bob",
+            None,
+            ProtectedRead::Receipt {
+                conversation_id: "c1".into(),
+                seq,
+            },
+        )
+        .await
+        else {
+            panic!("receipt")
+        };
+        assert_eq!(receipt.state, DeliveryState::Expired);
+    });
+}
