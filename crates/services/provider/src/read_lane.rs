@@ -9,7 +9,7 @@
 //! rather than a boundary.
 //!
 //! So the tunnel terminates HERE instead: a loopback proxy bound to ONE run,
-//! holding that run's agent id, in front of the node's listener. It is the
+//! holding that run's agent and run ids, in front of the node's listener. It is the
 //! run's whole node surface, so it is deliberately a thin pass-through with
 //! these exceptions:
 //!
@@ -41,7 +41,9 @@
 //! The record is fetched per gated request, off the node's own `/v1/query`,
 //! rather than snapshotted at boot: caps are committed state, and a run whose
 //! grant is narrowed mid-flight must feel it on the next call. It is one
-//! loopback query and only a duckfs read pays it.
+//! pair of loopback queries for gated duckfs and forge requests. The live
+//! standing record is intersected with the committed run authority, so a
+//! delegated run never inherits the callee's broader standing grant.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -127,6 +129,9 @@ struct Lane {
     /// the run's agent id, or `None` for a run provisioned without one, whose
     /// every duckfs read is refused (there is no record to cap it by).
     agent_id: Option<String>,
+    /// Captured from the host-provisioned environment before the guest boots.
+    /// Missing identity refuses gated requests; it never implies a general grant.
+    run_id: Option<String>,
     /// this node's operator credential, lent to an admitted push; `None`
     /// refuses every push (there is no proof to lend).
     credential: Option<OperatorCredential>,
@@ -147,6 +152,10 @@ impl ReadLane {
         agent_id: Option<String>,
         credential: Option<OperatorCredential>,
     ) -> Result<Option<Self>, String> {
+        let run_id = envs
+            .iter()
+            .find(|(key, _)| key == "DUCKTAPE_RUN_ID")
+            .map(|(_, value)| value.clone());
         let Some(node) = envs.iter_mut().find(|(key, _)| key == crate::NODE_URL_ENV) else {
             return Ok(None);
         };
@@ -160,6 +169,7 @@ impl ReadLane {
         let lane = Arc::new(Lane {
             upstream: node.1.trim_end_matches('/').to_string(),
             agent_id,
+            run_id,
             credential,
             client: reqwest::Client::builder()
                 // a loopback daemon is never behind a corporate proxy.
@@ -365,28 +375,49 @@ impl Lane {
         (parts.status, axum::Json(reply)).into_response()
     }
 
-    /// this run's committed record, read off the node's own `/v1/query` — the
-    /// same query `bin/node`'s MCP `Run::record` makes.
+    /// The same live standing-record/committed-ceiling intersection as the
+    /// MCP read plane. Neither a missing run nor an unrecognized response
+    /// establishes an ordinary run's unconstrained authority.
     async fn record(&self) -> Option<ModelRecord> {
         let agent_id = self.agent_id.as_deref()?;
-        let body = json!({
-            "target": "runs",
-            "query": {"model": {"query": {"agent": {"agent_id": agent_id}}}},
-        });
-        let reply: Value = self
-            .client
+        let run_id = self.run_id.as_deref()?;
+        let reply = self
+            .query(json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}))
+            .await?;
+        let standing: ModelRecord =
+            serde_json::from_value(reply.get("model")?.get("agent")?.clone()).ok()?;
+        if standing.agent_id != agent_id {
+            return None;
+        }
+        let reply = self
+            .query(json!({"run_authority": {"run_id": run_id}}))
+            .await?;
+        let value = reply.get("run_authority")?;
+        // Option's serde default must not turn an omitted field into proof
+        // that this run has no admission ceiling. Explicit null is ordinary.
+        value.get("authority")?;
+        let view: runs::RunAuthorityView = serde_json::from_value(value.clone()).ok()?;
+        if view.run_id != run_id || view.agent_id != agent_id {
+            return None;
+        }
+        Some(match view.authority {
+            Some(ceiling) => ceiling.apply(&standing),
+            None => standing,
+        })
+    }
+
+    async fn query(&self, query: Value) -> Option<Value> {
+        self.client
             .post(format!("{}/v1/query", self.upstream))
-            .json(&body)
+            .json(&json!({"target": "runs", "query": query}))
             .send()
             .await
             .ok()?
+            .error_for_status()
+            .ok()?
             .json()
             .await
-            .ok()?;
-        // ModelReply::Agent(Option<ModelRecord>) — externally tagged, so the
-        // record sits under "agent" and is null for an id the registry does not
-        // hold.
-        serde_json::from_value(reply.get("model")?.get("agent")?.clone()).ok()
+            .ok()
     }
 
     /// pass a request to the node's listener and stream its answer back.
@@ -544,12 +575,30 @@ mod tests {
     /// transport routes with an echo of what reached them, and every files
     /// route with a fixed grep page whose second hit is out of cap.
     async fn fake_node(record: ModelRecord) -> String {
+        fake_node_with_authority(
+            record,
+            Arc::new(Mutex::new(json!({
+                "run_id": "run-a", "agent_id": "bot", "authority": null,
+            }))),
+        )
+        .await
+    }
+
+    async fn fake_node_with_authority(record: ModelRecord, authority: Arc<Mutex<Value>>) -> String {
         let app = Router::new()
             .route(
                 "/v1/query",
-                axum::routing::post(move || {
+                axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
                     let record = record.clone();
-                    async move { axum::Json(json!({"model": {"agent": record}})) }
+                    let authority = authority.clone();
+                    async move {
+                        if request["query"].get("run_authority").is_some() {
+                            assert_eq!(request["query"]["run_authority"]["run_id"], "run-a");
+                            axum::Json(json!({"run_authority": authority.lock().unwrap().clone()}))
+                        } else {
+                            axum::Json(json!({"model": {"agent": record}}))
+                        }
+                    }
                 }),
             )
             .route("/forge/{repo}/info/refs", axum::routing::get(forge_echo))
@@ -601,7 +650,10 @@ mod tests {
         credential: Option<OperatorCredential>,
     ) -> (ReadLane, String) {
         let node = fake_node(record).await;
-        let mut envs = vec![(crate::NODE_URL_ENV.to_string(), node)];
+        let mut envs = vec![
+            (crate::NODE_URL_ENV.to_string(), node),
+            ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+        ];
         let lane = ReadLane::start(&mut envs, Some("bot".into()), credential)
             .await
             .unwrap()
@@ -635,6 +687,146 @@ mod tests {
         let status = response.status();
         let body = response.json().await.unwrap_or(Value::Null);
         (StatusCode::from_u16(status.as_u16()).unwrap(), body)
+    }
+
+    #[tokio::test]
+    async fn delegated_reads_and_pushes_stay_inside_the_callers_live_ceiling() {
+        let standing = forge_capped_record(&[], &["a", "b"]);
+        let authority = Arc::new(Mutex::new(json!({
+            "run_id": "run-a", "agent_id": "bot", "authority": {
+                "allowed_actions": [], "caps": runs::ResourceCaps {
+                    forge_push: vec!["a".into()],
+                    duckfs_read: vec!["/shared/team/public".into()],
+                    ..Default::default()
+                }
+            }
+        })));
+        let node = fake_node_with_authority(standing, authority.clone()).await;
+        let mut envs = vec![
+            (crate::NODE_URL_ENV.to_string(), node),
+            ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+        ];
+        let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+            .await
+            .unwrap()
+            .unwrap();
+        let base = &envs[0].1;
+        for service in ["git-receive-pack", "git-upload-pack"] {
+            let (status, _) = send(
+                base,
+                reqwest::Method::POST,
+                &format!("/forge/b/{service}"),
+                &[],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "delegation must not lend repo b authority: {service}"
+            );
+            let (status, body) = send(
+                base,
+                reqwest::Method::POST,
+                &format!("/forge/a/{service}"),
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["operator"],
+                if service == "git-receive-pack" {
+                    json!("secret")
+                } else {
+                    Value::Null
+                }
+            );
+        }
+        assert_eq!(
+            get(base, "/v1/files/read?path=/shared/team/private")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(base, "/v1/files/read?path=/shared/team/public/a")
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Authority is checked per request, including a run no longer in flight.
+        *authority.lock().unwrap() = Value::Null;
+        assert_eq!(
+            send(
+                base,
+                reqwest::Method::POST,
+                "/forge/a/git-receive-pack",
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn unestablished_run_authority_never_falls_back_to_standing_grants() {
+        for view in [
+            Value::Null,
+            json!({"run_id": "another-run", "agent_id": "bot", "authority": null}),
+            json!({"run_id": "run-a", "agent_id": "another-agent", "authority": null}),
+            json!({"run_id": "run-a", "agent_id": "bot"}),
+            json!({"run_id": "run-a", "agent_id": "bot", "authority": "invalid"}),
+        ] {
+            let node = fake_node_with_authority(
+                forge_capped_record(&[], &["a"]),
+                Arc::new(Mutex::new(view.clone())),
+            )
+            .await;
+            let mut envs = vec![
+                (crate::NODE_URL_ENV.to_string(), node),
+                ("DUCKTAPE_RUN_ID".into(), "run-a".into()),
+            ];
+            let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+                .await
+                .unwrap()
+                .unwrap();
+            let base = &envs[0].1;
+            assert_eq!(
+                send(
+                    base,
+                    reqwest::Method::POST,
+                    "/forge/a/git-receive-pack",
+                    &[]
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN,
+                "{view}"
+            );
+            assert_eq!(
+                get(base, "/v1/files/read?path=/shared/team/a").await.0,
+                StatusCode::FORBIDDEN,
+                "{view}"
+            );
+        }
+        let node = fake_node(forge_capped_record(&[], &["a"])).await;
+        let mut envs = vec![(crate::NODE_URL_ENV.to_string(), node)];
+        let _lane = ReadLane::start(&mut envs, Some("bot".into()), operator(Some("secret")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            send(
+                &envs[0].1,
+                reqwest::Method::POST,
+                "/forge/a/git-receive-pack",
+                &[]
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN,
+            "a missing run identity is not an ordinary run"
+        );
     }
 
     #[tokio::test]
