@@ -40,15 +40,25 @@ extern crate::backend
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   BellItem(seq:i64, change_seq:i64, source:str, reason:str, kind:str, actor:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
-  BellData(unread:i64, items:[BellItem])
+  BellPresentation(seq:i64, title:str, detail:str, target:BellTarget, object:str, number:i64, anchor:str)
+  BellData(unread:i64, items:[BellItem], presentations:[BellPresentation])
   pure apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
-  pure bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
+  pure bell_account_items(items:[BellItem], old:&str, next:&str) -> [BellItem]
+  pure bell_unread_count(items:&[BellItem], account:&str, key:&str) -> i64
+  pure bell_visible_items(items:&[BellItem], account:&str, key:&str) -> [BellItem]
+  pure merge_bell_loaded(current:[BellItem], loaded:[BellItem], read:i64, cleared:i64) -> [BellItem]
+  pure merge_bell_presentations(items:[BellItem], current:[BellPresentation], loaded:[BellPresentation]) -> [BellPresentation]
+  pure bell_link(context:&BellPresentation, chain:str) -> str
+  pure bell_missing_items(items:[BellItem], contexts:&[BellPresentation]) -> [BellItem]
+  pure bell_label(item:&BellItem, presentations:&[BellPresentation]) -> str
+  pure bell_openable(item:&BellItem, presentations:&[BellPresentation]) -> bool
+  pure bell_presentation(item:&BellItem, presentations:&[BellPresentation]) -> BellPresentation
+  load_bell_presentations(rpc:str, items:[BellItem]) -> [BellPresentation] ! AppError
   pure bell_head(items:[BellItem]) -> i64
   pure bell_severity(kind:&str) -> str
   pure bell_title(kind:&str) -> str
-  pure bell_detail(item:&BellItem) -> str
   pure bell_worst_severity(items:&[BellItem]) -> str
-  load_bell(rpc:str) -> BellData ! AppError
+  load_bell(rpc:str, expected_account:str) -> BellData ! AppError
   // THE AGENT-MESSAGING PANEL. One authenticated reading of ONE conversation,
   // and one send under the participant's owner credential. Both carry the
   // endpoint and chain they ran under: neither is installed after the app has
@@ -63,7 +73,7 @@ extern crate::backend
   pure messaging_send_in_scope(send:&MessagingSend, rpc:&str, network:&str, link:i64, account:&str, op:i64, participant:&str, conversation:&str) -> bool
   load_messaging(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, from_seq:i64, newest:bool) -> MessagingView
   send_agent_message(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, kind:str, recipient:str, body:str, reply_to:i64, password:str) -> MessagingSend
-  mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
+  mark_bell_read(rpc:str, password:str, expected_account:str, up_to_seq:i64) -> BellDelta ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
   ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, forge_discussion:[ChatMessage], refresh_chat:bool)

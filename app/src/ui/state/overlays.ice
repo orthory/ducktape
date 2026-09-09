@@ -3,6 +3,11 @@ state
   bell_open = false
   bell_unread:i64 = 0
   bell_items:[BellItem] = []
+  bell_presentations:[BellPresentation] = []
+  bell_read_through:i64 = 0
+  bell_clear_through:i64 = 0
+  bell_marking = false
+  bell_error = ""
   palette_draft = ""
   // The chat float's discriminant, honest here for the same reason a captured
   // query is unnecessary: `palette_changed` runs on EVERY keystroke and moves
