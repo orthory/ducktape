@@ -25,7 +25,23 @@ env:
   CARGO_BUILD_JOBS: 3
 
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/ci-scope.py --self-test
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python3 .github/ci-scope.py "$BASE_SHA" >> "$GITHUB_OUTPUT"
+
   wasm-modules-check:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -49,6 +65,8 @@ jobs:
   # here on bytes that are correct. `refs/pull/N/head` is on this repository,
   # a fork PR included, so the fetch resolves either way.
   wasm-rebuild-check:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -63,6 +81,8 @@ jobs:
       - run: make wasm-rebuild-check
 
   genesis-pin:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -83,6 +103,8 @@ jobs:
   # unnoticed. Measured ~1 min for `--tests` warm-cache locally, plus the
   # ~2-3 min host-crate compile; 30 min matches the other host-crate jobs.
   host-parity:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -112,6 +134,8 @@ jobs:
   # production boot behavior is unchanged. The dir lives under `target/` so
   # Swatinem/rust-cache's `cache-directories` persists it across runs.
   simnode-suite:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -136,6 +160,8 @@ jobs:
   # bind real sockets and belong with the other integration jobs above, not
   # this fast unit lane.
   net-unit:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -147,6 +173,8 @@ jobs:
       - run: cargo test --locked -p reachability -p nat-traversal -p coordinator-bin --lib -j 4
 
   clippy:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -158,6 +186,8 @@ jobs:
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
 
   view-artifact:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -173,6 +203,7 @@ jobs:
   # workspace gates above never see them: their wire tests and lints run
   # here, natively — the wasm bundle itself is `make views`, a build step.
   module-views:
+    needs: scope
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -181,14 +212,15 @@ jobs:
         with:
           workspaces: crates/views
       - run: rustup show
-      - run: cargo test --locked --manifest-path crates/views/Cargo.toml
-      - run: cargo clippy --locked --manifest-path crates/views/Cargo.toml --tests --no-deps -- -D warnings
       # Format the views workspace, including its shared design source; the
       # desktop host workspace is checked independently.
       - run: rustfmt --edition 2024 --check $(git ls-files 'crates/views/*.rs')
+      - run: cargo test --locked --manifest-path crates/views/Cargo.toml
+      - run: cargo clippy --locked --manifest-path crates/views/Cargo.toml --tests --no-deps -- -D warnings
       # the default workspace build never enables airlock's `verify` feature
       # (#1302 — dcap-qvl/sev/a second reqwest-0.13 stack are opt-in), so the
       # attested-path code (crates/services/broker/src/attested.rs,
       # bin/node/src/cred_seal.rs) needs its own compile check or it rots
       # unnoticed between the rare `--features verify` runs.
-      - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings
+      - if: needs.scope.outputs.full == 'true'
+        run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings
