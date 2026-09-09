@@ -1,0 +1,35 @@
+[package]
+name = "pages-editor-binding-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+
+[dependencies]
+iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+serde = { version = "1", features = ["derive"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
+ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97", default-features = false }
+
+[build-dependencies]
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "078a1492deb98ff2af4d943310d0a3063b21ad97" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package.iced_core]
+debug-assertions = true
+[profile.release.package.iced_graphics]
+debug-assertions = true
+[profile.release.package.iced_renderer]
+debug-assertions = true
