@@ -723,7 +723,7 @@ pub fn copy_range_label(count: i64) -> String {
 
 pub fn thread_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     // Keep the channel list, divider and a readable conversation alongside it.
-    let maximum = (viewport - 236.0 - 6.0 - 320.0).clamp(280.0, 640.0);
+    let maximum = (viewport - 236.0 - 10.0 - 320.0).clamp(280.0, 640.0);
     (width + delta).clamp(280.0, maximum)
 }
 

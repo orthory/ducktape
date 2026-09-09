@@ -353,7 +353,7 @@ fn a_copy_range_stays_above_the_scroller_and_clear_routes_to_the_host() {
 }
 
 #[test]
-fn a_thread_drag_tracks_the_pointer_until_release_and_buttons_also_resize() {
+fn a_thread_drag_tracks_the_pointer_until_release_without_step_buttons() {
     on_a_deep_stack(|| {
         use ui_lang_guest::wire::{Event, Length, mouse};
         let props = ChatProps {
@@ -402,10 +402,14 @@ fn a_thread_drag_tracks_the_pointer_until_release_and_buttons_also_resize() {
             410.0,
             "release ends the drag outside the handle"
         );
-        let frame = tick_native(press(&frame, "Narrow thread"));
-        assert_eq!(width(&frame), 378.0);
-        let frame = tick_native(press(&frame, "Widen thread"));
-        assert_eq!(width(&frame), 410.0);
+        fn has_step_button(node: &Node) -> bool {
+            matches!(node, Node::Button { label: Some(label), .. } if label == "Narrow thread" || label == "Widen thread")
+                || node.children().iter().any(has_step_button)
+        }
+        assert!(
+            !has_step_button(frame.root.as_ref().unwrap()),
+            "resize uses the divider, not step buttons"
+        );
     });
 }
 

@@ -295,68 +295,161 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
         &mut renderer,
     );
     assert_eq!(width(), 330.0);
-    let mut messages = Vec::new();
-    let mut send = |ui: &mut Ui, position: iced::Point, events: Vec<Event>| {
-        ui.update(
-            &events,
-            mouse::Cursor::Available(position),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
-        ui.update(
-            &[Event::Window(window::Event::RedrawRequested(
-                iced::time::Instant::now(),
-            ))],
-            mouse::Cursor::Available(position),
-            &mut renderer,
-            &mut clipboard::Null,
-            &mut messages,
-        );
+    struct DividerBounds {
+        key: iced::widget::Id,
+        bounds: Option<Rectangle>,
+    }
+    impl Operation for DividerBounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+            if id == Some(&self.key) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    fn divider_key(node: &wire::Node) -> Option<String> {
+        if node
+            .key()
+            .is_some_and(|key| key.ends_with("/thread-divider"))
+        {
+            return node.key().map(str::to_owned);
+        }
+        node.children().iter().find_map(divider_key)
+    }
+    let key = {
+        let locked = mounted.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            unreachable!()
+        };
+        divider_key(guest.frame.root.as_ref().unwrap()).unwrap()
     };
-    // The pane occupies the rightmost 330px; its 6px divider is immediately before it.
-    let start = iced::Point::new(867.0, 100.0);
-    send(
-        &mut ui,
-        start,
-        vec![Event::Mouse(mouse::Event::CursorMoved { position: start })],
+    let mut divider = DividerBounds {
+        key: iced::widget::Id::from(key),
+        bounds: None,
+    };
+    ui.operate(&renderer, &mut divider);
+    let divider = divider.bounds.expect("actual thread divider layout");
+    assert_eq!(divider.width, 10.0);
+    let start = iced::Point::new(divider.center_x(), divider.y + 100.0);
+    let end = iced::Point::new(start.x - 100.0, start.y);
+    let mut messages = Vec::new();
+    {
+        let mut dispatch = |ui: &mut Ui, position: iced::Point, event: Event, redraw: bool| {
+            ui.update(
+                &[event],
+                mouse::Cursor::Available(position),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            if redraw {
+                ui.update(
+                    &[Event::Window(window::Event::RedrawRequested(
+                        iced::time::Instant::now(),
+                    ))],
+                    mouse::Cursor::Available(position),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+            }
+        };
+        // All three native events arrive before one frame. Coalescing must retain
+        // the pre-press pointer baseline, not initialize this drag from zero.
+        dispatch(
+            &mut ui,
+            start,
+            Event::Mouse(mouse::Event::CursorMoved { position: start }),
+            false,
+        );
+        dispatch(
+            &mut ui,
+            start,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            false,
+        );
+        dispatch(
+            &mut ui,
+            end,
+            Event::Mouse(mouse::Event::CursorMoved { position: end }),
+            true,
+        );
+        assert_eq!(
+            width(),
+            430.0,
+            "same-frame native border drag keeps its press baseline"
+        );
+        let across = iced::Point::new(start.x + 30.0, start.y);
+        dispatch(
+            &mut ui,
+            across,
+            Event::Mouse(mouse::Event::CursorMoved { position: across }),
+            true,
+        );
+        assert_eq!(
+            width(),
+            300.0,
+            "drag crosses back over the original divider"
+        );
+        let left = iced::Point::new(0.0, start.y);
+        dispatch(
+            &mut ui,
+            left,
+            Event::Mouse(mouse::Event::CursorMoved { position: left }),
+            true,
+        );
+        assert_eq!(
+            width(),
+            634.0,
+            "channel/sidebar and the 10px divider retain their minimum widths"
+        );
+        let right = iced::Point::new(1190.0, start.y);
+        dispatch(
+            &mut ui,
+            right,
+            Event::Mouse(mouse::Event::CursorMoved { position: right }),
+            true,
+        );
+        assert_eq!(width(), 280.0, "thread retains its minimum width");
+        dispatch(
+            &mut ui,
+            right,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            true,
+        );
+        dispatch(
+            &mut ui,
+            left,
+            Event::Mouse(mouse::Event::CursorMoved { position: left }),
+            true,
+        );
+        assert_eq!(width(), 280.0, "release outside the divider ends the drag");
+    }
+    let mut ui = UserInterface::build(
+        view(&mounted),
+        Size::new(1200.0, 800.0),
+        ui.into_cache(),
+        &mut renderer,
     );
-    send(
-        &mut ui,
-        start,
-        vec![Event::Mouse(mouse::Event::ButtonPressed(
-            mouse::Button::Left,
-        ))],
+    assert!(bounds(&mut ui, &renderer, "−").is_none());
+    assert!(bounds(&mut ui, &renderer, "+").is_none());
+    ui.draw(
+        &mut renderer,
+        &iced::Theme::Light,
+        &renderer::Style {
+            text_color: iced::Color::BLACK,
+        },
+        mouse::Cursor::Unavailable,
     );
-    let end = iced::Point::new(767.0, 100.0);
-    send(
-        &mut ui,
-        end,
-        vec![Event::Mouse(mouse::Event::CursorMoved { position: end })],
-    );
-    assert_eq!(
-        width(),
-        430.0,
-        "native handle press and global move must reach the guest"
-    );
-    send(
-        &mut ui,
-        end,
-        vec![Event::Mouse(mouse::Event::ButtonReleased(
-            mouse::Button::Left,
-        ))],
-    );
-    let later = iced::Point::new(600.0, 100.0);
-    send(
-        &mut ui,
-        later,
-        vec![Event::Mouse(mouse::Event::CursorMoved { position: later })],
-    );
-    assert_eq!(
-        width(),
-        430.0,
-        "released drag must not follow later pointer motion"
-    );
+    let rgba = renderer.screenshot(Size::new(1200, 800), 1.0, iced::Color::WHITE);
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/chat-input-evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    image::RgbaImage::from_raw(1200, 800, rgba)
+        .unwrap()
+        .save(directory.join("thread-border-drag.png"))
+        .unwrap();
 }
 
 #[test]
@@ -380,6 +473,7 @@ fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
         origin,
         true
     ));
+    assert!(input::mouse(guest, movement(55.0, 65.0), origin, false));
     assert!(input::mouse(guest, movement(60.0, 70.0), origin, false));
     assert!(input::mouse(
         guest,
@@ -390,6 +484,10 @@ fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
     assert_eq!(
         guest.pending,
         vec![
+            wire::Event::Mouse {
+                event: wire::mouse::Event::CursorMoved { x: 5.0, y: 5.0 },
+                captured: false
+            },
             wire::Event::Mouse {
                 event: wire::mouse::Event::ButtonPressed(wire::mouse::Button::Left),
                 captured: true
