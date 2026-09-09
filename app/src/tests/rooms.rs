@@ -1161,3 +1161,63 @@ fn another_members_dm_is_not_a_channel_of_mine() {
         "no derived DM id is a CHANNELS row — not mine, and not theirs"
     );
 }
+
+/// THE LIVE-RUN READING IS REFUSED, NEVER FOLDED. Its rows are the node's whole
+/// pending set, and the reading is stamped with the connection it was taken over
+/// — so a reading that crossed with a reconnect has to be DROPPED. Folding it in
+/// would assign its emptiness and blank the cards the current connection just
+/// installed, until the next two-second poll put them back.
+///
+/// Pinned as statements, not as a substring: the comment above that handler
+/// NAMES the blanking it refuses to do, and a `contains` over the arm would read
+/// the prose as the code.
+#[test]
+fn a_stale_live_run_reading_is_dropped_rather_than_folded() {
+    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
+    let arm = chat
+        .split_once("on live_agents_event(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("it ends")
+        .0;
+    let statements: Vec<&str> = arm
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && !line.is_empty())
+        .collect();
+    assert_eq!(
+        statements,
+        [
+            "return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation)",
+            "live_agents = next.rows",
+        ],
+        "the guard RETURNS, and it stands before the only assignment"
+    );
+
+    // ALL THREE IDENTITIES REACH THE LANE, or the guard above cannot ask. The
+    // endpoint is the weakest of them: a workspace switch brings the node back
+    // on the same loopback port, which is the same trap `live_resynced` names
+    // `chain_left_behind`.
+    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
+    let lane: Vec<&str> = lifecycle
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("run chat_live_agents("))
+        .collect();
+    assert_eq!(
+        lane,
+        [
+            "run chat_live_agents(connected_rpc, network_chain_id, connect_generation) when connected -> live_agents_event _"
+        ],
+        "one lane, for the node, keyed on the whole connection"
+    );
+
+    // AND NO ROOM OWES IT ANYTHING. Eight handlers move `active_channel`; the
+    // room is chosen in `encode_chat_props`, so none of them may carry a
+    // per-room launch or teardown for this lane.
+    assert!(
+        !chat.contains("lane=live_agents"),
+        "a per-room lane is back, and five of the eight movers will forget it"
+    );
+}

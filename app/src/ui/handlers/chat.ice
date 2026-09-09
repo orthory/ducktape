@@ -795,13 +795,20 @@ on channel_created(next)
 // when the frame is built — so no handler that moves `active_channel` owes this
 // lane anything, and none of them can forget.
 //
-// THE NODE IS THE ONE THING THE FOLD STILL HAS TO ASK. A reading in flight when
-// she reconnects elsewhere names the node she left, and room ids are not unique
-// across networks: `general` on the node she left would otherwise have drawn
-// its runs under `general` on the node she is on. `live_agents_of` drops such a
-// reading whole.
+// THE CONNECTION IS THE ONE THING THE FOLD STILL HAS TO ASK. Room ids are not
+// unique across networks, so `general` on the connection she left would
+// otherwise have drawn its runs under `general` on the one she is on — and the
+// endpoint alone does not settle it, because a workspace switch brings the node
+// back on the same port (see `live_resynced`'s `chain_left_behind`).
+//
+// REFUSED, NOT ASSIGNED. The guard is a `return`, like every other generation
+// guard in this file, because a stale reading's emptiness is not a fact about
+// the connection she IS on: folding it in would have blanked the cards the
+// current reading installed a moment ago, until the next two-second poll put
+// them back.
 on live_agents_event(next)
-  live_agents = live_agents_of(next, connected_rpc)
+  return if live_agents_stale(next, connected_rpc, network_chain_id, connect_generation)
+  live_agents = next.rows
 
 on live_cancel_acked(_ok)
   error = ""

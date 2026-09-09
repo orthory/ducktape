@@ -11,10 +11,14 @@
 //! a filter on `channel_id` (`module_view::encode_chat_props`) rather than a
 //! stream that has to be torn down and relaunched on every room switch — the
 //! eight handlers that move `active_channel` would each have had to remember
-//! to, and the one that forgot would have drawn another room's runs. The
-//! reading also names the NODE it was taken from, because two networks can
-//! both have a room called `general`: a reading from the node she just left is
-//! dropped whole (`live_agents_of`).
+//! to, and the one that forgot would have drawn another room's runs.
+//!
+//! A reading is stamped with the CONNECTION it was taken over — endpoint, chain
+//! id and connect attempt — because room ids are not unique across networks and
+//! the endpoint is not unique across chains. A reading that crossed with a
+//! reconnect is DROPPED by the handler (`live_agents_stale`), never assigned:
+//! its emptiness describes a connection nobody is on, and writing it would
+//! blank the cards the current one just installed.
 
 use super::*;
 use iced::futures::SinkExt as _;
@@ -60,22 +64,35 @@ pub struct LiveAgentRow {
     pub answer_preview: String,
 }
 
-/// One reading of the node's pending runs, and the node it was read from.
+/// One reading of the node's pending runs, stamped with the connection it was
+/// taken over: the endpoint, the chain that endpoint was serving, and the
+/// connect attempt.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct LiveAgentNotice {
     pub rpc: String,
+    pub chain_id: String,
+    pub generation: i64,
     pub rows: Vec<LiveAgentRow>,
 }
 
-/// The rows of a reading taken from the node on screen. A reading that crossed
-/// with a reconnect names the node she LEFT, and its rooms are not hers: it is
-/// dropped whole rather than filtered, because room ids are not unique across
-/// networks.
-pub fn live_agents_of(notice: &LiveAgentNotice, rpc: &str) -> Vec<LiveAgentRow> {
-    if notice.rpc != rpc {
-        return Vec::new();
-    }
-    notice.rows.clone()
+/// Whether this reading describes a connection that is no longer the one on
+/// screen. A caller that gets `true` must DROP the reading and leave the rows
+/// it already has alone — a stale reading is not evidence that nothing is
+/// running, and assigning its (empty) rows would blank the cards the CURRENT
+/// connection just installed until the next poll.
+///
+/// THE ENDPOINT IS NOT AN IDENTITY. A workspace switch brings the node back on
+/// the same loopback port, so the url alone would call a new chain's reading
+/// current — the same trap `live_resynced` names `chain_left_behind`, one plane
+/// over. `chain_id` is the node's own pushed status and `generation` is the
+/// connect attempt, so the three together name THIS connection to THIS chain.
+pub fn live_agents_stale(
+    notice: &LiveAgentNotice,
+    rpc: &str,
+    chain_id: &str,
+    generation: i64,
+) -> bool {
+    notice.rpc != rpc || notice.chain_id != chain_id || notice.generation != generation
 }
 
 /// Fold one parsed output event into the row. Status lines replace the status;
@@ -128,10 +145,22 @@ pub(crate) fn live_row_apply(mut row: LiveAgentRow, event: &AgentChatEvent) -> L
 /// reader can act on.
 type Rows = Arc<Mutex<BTreeMap<String, LiveAgentRow>>>;
 
-fn snapshot(rpc: &str, rows: &Rows) -> LiveAgentNotice {
+/// The connection a reading is stamped with, carried verbatim from the
+/// subscription's own arguments — this task never learns it for itself, so a
+/// reading cannot claim a connection the app was not on when it was asked for.
+#[derive(Clone)]
+struct Taken {
+    rpc: String,
+    chain_id: String,
+    generation: i64,
+}
+
+fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
     let rows = rows.lock().unwrap_or_else(|e| e.into_inner());
     LiveAgentNotice {
-        rpc: rpc.to_string(),
+        rpc: taken.rpc.clone(),
+        chain_id: taken.chain_id.clone(),
+        generation: taken.generation,
         rows: rows.values().cloned().collect(),
     }
 }
@@ -140,12 +169,21 @@ fn snapshot(rpc: &str, rows: &Rows) -> LiveAgentNotice {
 /// pending set and keeps one output watcher per run; a run leaving the pending
 /// set takes its row with it, which is how a completed, failed or cancelled
 /// run reconciles — the committed reply (or nothing) stands alone afterwards.
-pub fn chat_live_agents(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
+pub fn chat_live_agents(
+    rpc: String,
+    chain_id: String,
+    generation: i64,
+) -> iced::futures::stream::BoxStream<'static, LiveAgentNotice> {
     use iced::futures::StreamExt as _;
     let (sender, receiver) = tokio::sync::mpsc::channel::<LiveAgentNotice>(64);
     tokio::spawn(async move {
         let Ok(client) = rpc_client(&rpc) else {
             return;
+        };
+        let taken = Taken {
+            rpc: rpc.clone(),
+            chain_id,
+            generation,
         };
         let rows: Rows = Arc::default();
         let mut watchers: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
@@ -217,7 +255,7 @@ pub fn chat_live_agents(rpc: String) -> iced::futures::stream::BoxStream<'static
                 watchers.insert(
                     dispatch.clone(),
                     tokio::spawn(watch_live_output(
-                        rpc.clone(),
+                        taken.clone(),
                         dispatch,
                         rows.clone(),
                         sender.clone(),
@@ -237,7 +275,7 @@ pub fn chat_live_agents(rpc: String) -> iced::futures::stream::BoxStream<'static
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&dispatch);
             }
-            if sender.send(snapshot(&rpc, &rows)).await.is_err() {
+            if sender.send(snapshot(&taken, &rows)).await.is_err() {
                 break;
             }
             tokio::time::sleep(PENDING_POLL).await;
@@ -272,11 +310,12 @@ async fn agent_labels(client: &RpcClient) -> BTreeMap<String, String> {
 }
 
 async fn watch_live_output(
-    rpc: String,
+    taken: Taken,
     dispatch: String,
     rows: Rows,
     sender: tokio::sync::mpsc::Sender<LiveAgentNotice>,
 ) {
+    let rpc = taken.rpc.clone();
     use iced::futures::StreamExt as _;
     let fold = |event: &AgentChatEvent| {
         let mut rows = rows.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,7 +359,7 @@ async fn watch_live_output(
             if let Some(event) = provider_output_event("claude", line, id) {
                 id += 1;
                 fold(&event);
-                if sender.send(snapshot(&rpc, &rows)).await.is_err() {
+                if sender.send(snapshot(&taken, &rows)).await.is_err() {
                     return Ok(());
                 }
             }
@@ -337,7 +376,7 @@ async fn watch_live_output(
             answer: String::new(),
             saga_id: String::new(),
         });
-        let _ = sender.send(snapshot(&rpc, &rows)).await;
+        let _ = sender.send(snapshot(&taken, &rows)).await;
     }
 }
 
@@ -418,28 +457,42 @@ mod tests {
         assert!(row.answer_preview.len() <= MAX_LIVE_PREVIEW_BYTES + '…'.len_utf8());
     }
 
-    /// THE NETWORK GUARD. A reading in flight when the reader reconnects
-    /// elsewhere names the node she left, and room ids are not unique across
-    /// networks — so it is dropped whole rather than filtered by room.
+    /// THE CONNECTION GUARD, and the endpoint is the WEAKEST third of it. A
+    /// workspace switch brings the node back on the same loopback port, so a
+    /// reading still in flight from the chain she left carries the url she is
+    /// on — it has to be refused on the chain id or the connect attempt, and a
+    /// caller that refuses it must leave the current rows alone rather than
+    /// assign its emptiness.
     #[test]
-    fn a_reading_from_another_node_is_dropped_whole() {
+    fn a_reading_from_a_connection_she_has_left_is_refused() {
+        let here = "http://127.0.0.1:8844";
         let notice = LiveAgentNotice {
-            rpc: "http://127.0.0.1:8844".into(),
+            rpc: here.into(),
+            chain_id: "testnet#abcd".into(),
+            generation: 7,
             rows: vec![LiveAgentRow {
                 channel_id: "general".into(),
                 anchor_seq: 2,
-                agent: "ferris".into(),
+                agent: "Chief Duck".into(),
                 ..LiveAgentRow::default()
             }],
         };
-        assert_eq!(
-            live_agents_of(&notice, "http://127.0.0.1:8844").len(),
-            1,
-            "her own node's reading stands"
+        assert!(
+            !live_agents_stale(&notice, here, "testnet#abcd", 7),
+            "the reading for the connection on screen stands"
         );
         assert!(
-            live_agents_of(&notice, "http://127.0.0.1:9844").is_empty(),
-            "another node's rooms are not hers, however they are named"
+            live_agents_stale(&notice, "http://127.0.0.1:9844", "testnet#abcd", 7),
+            "another endpoint"
+        );
+        assert!(
+            live_agents_stale(&notice, here, "othernet#0f0f", 7),
+            "SAME URL, NEW CHAIN — a workspace switch keeps the port, so the \
+             url alone would have called this reading current"
+        );
+        assert!(
+            live_agents_stale(&notice, here, "testnet#abcd", 8),
+            "same url and chain, but a reconnect has happened since"
         );
     }
 }
