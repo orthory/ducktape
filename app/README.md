@@ -78,6 +78,14 @@ and the reader's links come back to the view's own handler. Forge's
 discussion note composer is the chat composer as a host surface
 (`forge_composer`) over the item's channel, so a note's words stay in the
 app and only its send crosses.
+Forge and Files project large read-only text and lists before sending props.
+The display counts omitted rows and labels shortened text; routing identifiers
+are kept intact. If the fixed metadata itself is too large, the view shows a
+bounded explanation instead of a partial, ambiguous browser. Files keeps the
+complete read separately as its editor seed: shortening the preview neither
+marks the read truncated nor disables Edit. These projections budget incoming
+facts, not arbitrary editor or input drafts.
+
 A view whose screen needs a widget
 the tree wire does not carry leaves that widget to the host too: the Chat
 view declares `chat_composer` as a host surface per room and per thread,

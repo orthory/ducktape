@@ -27,7 +27,7 @@ extern crate::host
   SaveReply(namespace:str, context:str, request:i64, success:bool, message:str)
   SaveHistory(replies:[SaveReply], overflow:str)
   pure save_answer(history:&SaveHistory, context:&str, namespace:&str, request:i64) -> SaveReply
-  FilesProps(save_namespace:str, network_scope:str, context:str, preview_base:str, save_reply:SaveHistory, path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:str, dark:bool, write_refusal:str, writes:i64)
+  FilesProps(save_namespace:str, network_scope:str, context:str, preview_base:str, save_reply:SaveHistory, path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:str, dark:bool, write_refusal:str, writes:i64, display_omitted:i64, display_shortened:bool, display_unavailable:bool, preview_display_text:str, preview_display_clipped:bool)
   PropsItem(next:FilesProps, error:str)
   subscription props() -> PropsItem
   pure open_dir(path:&str) -> bool
@@ -73,6 +73,9 @@ state
   pending_overflow = ""
   save_pending = false
   draft_error = ""
+  display_omitted:i64 = 0
+  display_shortened = false
+  display_unavailable = false
   active_palette:palette[AppTheme] = AppTheme.app
   path = "/shared"
   listed = false
@@ -92,6 +95,8 @@ state
   preview_width:i64 = 0
   preview_height:i64 = 0
   preview_text = ""
+  preview_display_text = ""
+  preview_display_clipped = false
   dark = false
   write_refusal = ""
   // the last write the app reported: a count that moves once per commit
@@ -130,6 +135,9 @@ on props_arrived(item)
   network_scope = next.network_scope
   context = next.context
   preview_base = next.preview_base
+  display_omitted = next.display_omitted
+  display_shortened = next.display_shortened
+  display_unavailable = next.display_unavailable
   path = next.path
   listed = next.listed
   entries = next.entries
@@ -148,6 +156,8 @@ on props_arrived(item)
   preview_width = next.preview_width
   preview_height = next.preview_height
   preview_text = next.preview_text
+  preview_display_text = next.preview_display_text
+  preview_display_clipped = next.preview_display_clipped
   dark = next.dark
   write_refusal = next.write_refusal
   // A COMMITTED WRITE CONSUMES THE NAME IT READ: the count says one landed
@@ -239,48 +249,60 @@ view
         button "Discard unsaved changes" -> discard_draft(draft_id)
     if !empty(draft_error)
       text draft_error size=13.0
-    box #root
-      with
-        w=fill
-        h=fill
-        bg=bg
-      FilesScreen new_name<->new_name draft<->draft
-        with
-          path
-          listed
-          entries
-          directories
-          connected
-          loading=(loading || save_pending || (draft_here && empty(preview_base)))
-          preview_path
-          preview_entry
-          delete_target
-          diff_from
-          diff
-          history
-          preview_truncated
-          preview_binary
-          editing=draft_here
-          edit_context
-          edit_blocked=(draft_parked || empty(preview_base) || empty(network_scope))
-          preview_text
-          dark
-          preview_picture
-          preview_width
-          preview_height
-          write_refusal
-        events
-          open_message_link -> open_link_at _
-          fs_open_dir -> open_dir_at _
-          fs_open_file -> open_file_at _
-          fs_open_parent -> go_parent
-          fs_mkdir_submit -> mkdir_submit
-          fs_new_file_submit -> new_file_submit
-          fs_arm_delete -> arm_delete_at _
-          fs_disarm_delete -> disarm_delete_now
-          fs_delete_submit -> delete_submit
-          fs_close_diff -> close_diff_now
-          fs_show_diff -> show_diff_of _
-          fs_begin_edit -> begin_edit _
-          fs_cancel_edit -> cancel_edit _
-          fs_save_edit -> save_edit _
+    if display_unavailable
+      text "Too much display data. Open a smaller directory or item." size=13.0
+    if !display_unavailable
+      col w=fill h=fill
+        if display_omitted > 0
+          row gap=4.0
+            text display_omitted #display-omitted size=12.5
+            text "rows are not shown." size=12.5
+        if display_shortened
+          text "Some content is shortened for display." size=12.5
+        box #root
+          with
+            w=fill
+            h=fill
+            bg=bg
+          FilesScreen new_name<->new_name draft<->draft
+            with
+              display_omitted
+              path
+              listed
+              entries
+              directories
+              connected
+              loading=(loading || save_pending || (draft_here && empty(preview_base)))
+              preview_path
+              preview_entry
+              delete_target
+              diff_from
+              diff
+              history
+              preview_truncated
+              preview_binary
+              editing=draft_here
+              edit_context
+              edit_blocked=(draft_parked || empty(preview_base) || empty(network_scope))
+              preview_text=preview_display_text
+              preview_display_clipped
+              dark
+              preview_picture
+              preview_width
+              preview_height
+              write_refusal
+            events
+              open_message_link -> open_link_at _
+              fs_open_dir -> open_dir_at _
+              fs_open_file -> open_file_at _
+              fs_open_parent -> go_parent
+              fs_mkdir_submit -> mkdir_submit
+              fs_new_file_submit -> new_file_submit
+              fs_arm_delete -> arm_delete_at _
+              fs_disarm_delete -> disarm_delete_now
+              fs_delete_submit -> delete_submit
+              fs_close_diff -> close_diff_now
+              fs_show_diff -> show_diff_of _
+              fs_begin_edit -> begin_edit _
+              fs_cancel_edit -> cancel_edit _
+              fs_save_edit -> save_edit _

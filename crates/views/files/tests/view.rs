@@ -45,9 +45,12 @@ fn facts() -> FilesProps {
         preview_width: 0,
         preview_height: 0,
         preview_text: "# Hello\n".into(),
+        preview_display_text: "# Hello\n".into(),
+        preview_display_clipped: false,
         dark: false,
         write_refusal: String::new(),
         writes: 0,
+        ..FilesProps::default()
     }
 }
 
@@ -411,4 +414,19 @@ fn lost_confirmation_never_discards_the_draft_or_waits_forever() {
         !press(&frame, "Save").is_empty(),
         "the editor is not stranded waiting for an evicted reply"
     );
+}
+
+#[test]
+fn omitted_rows_are_a_number_not_literal_template_text() {
+    let (_, frame) = shown(&FilesProps {
+        display_omitted: 12_345,
+        ..facts()
+    });
+    let key = keys(&frame)
+        .into_iter()
+        .find(|key| key.ends_with("/display-omitted"))
+        .expect("the omission count has its own identity");
+    assert!(matches!(find(&frame, &key), Some(Node::Text { content, .. }) if content == "12345"));
+    assert!(has_text(&frame, "rows are not shown."));
+    assert!(has_text(&frame, "Edit"));
 }

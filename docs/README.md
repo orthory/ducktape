@@ -4,8 +4,9 @@ One line per document, grouped by the question it answers, so an agent or an
 operator loads the one file that answers it instead of the tree. The rule for
 what lives here is `AGENTS.md` § "Docs Are Not a Record": `docs/` holds what
 an operator executes and the few references code or a skill cites by path.
-Nothing here is a plan, a status page, or a decision record, and a document
-nothing cites is deleted, not archived.
+Operational references describe implemented behavior. Explicitly labeled protocol
+proposals are listed separately for review and do not imply shipped support. A
+document nothing cites is deleted, not archived.
 
 ## Start here
 
@@ -40,6 +41,12 @@ nothing cites is deleted, not archived.
 | The reachability plane: control mesh beside data tunnel, the tunnel-first invite and its fronts, cold restart, rendezvous | [`records/architecture/reachability.md`](records/architecture/reachability.md) | `crates/networking/reachability` |
 | The ordering contract agents get and the module architecture that keeps it | [`records/architecture/agent-collaboration-design.md`](records/architecture/agent-collaboration-design.md) | `saga` |
 | Writing, building and live-updating a wasm module | [`records/architecture/wasm-module-authoring.md`](records/architecture/wasm-module-authoring.md) | the module-dev skill |
+
+## Proposed protocols
+
+| Question | Read |
+| --- | --- |
+| How should Claude and Codex sessions collaborate across devices, with explicit delivery and task ownership | [`records/specs/agent-messaging.md`](records/specs/agent-messaging.md) |
 
 ## Agent runbooks (`skills/`)
 
