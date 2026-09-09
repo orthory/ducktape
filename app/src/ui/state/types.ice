@@ -444,3 +444,11 @@ enum CeremonyRetirement
   keep
   welcome
   account
+
+enum BellTarget
+  unavailable
+  message
+  page
+  forge
+  repo
+  run

@@ -247,7 +247,7 @@ component EmptyPlate(message:str)
       r=12.0
     text message size=13.0 @text-meta
 
-component BellRow(item:BellItem)
+component BellRow(item:BellItem, context:BellPresentation)
   col #root w=fill
     if item.read
       box
@@ -259,7 +259,7 @@ component BellRow(item:BellItem)
           pb=10.0
           r=9.0
           bg=transparent
-        BellBody item=item
+        BellBody item=item context=context
     if !item.read
       box
         with
@@ -270,9 +270,9 @@ component BellRow(item:BellItem)
           pb=10.0
           r=9.0
           bg=unread_wash
-        BellBody item=item
+        BellBody item=item context=context
 
-component BellBody(item:BellItem)
+component BellBody(item:BellItem, context:BellPresentation)
   row #root
     with
       w=fill
@@ -292,34 +292,13 @@ component BellBody(item:BellItem)
           w=fill
           gap=7.0
           align=center
-        text bell_title(item.reason)
+        text context.title
           with
             w=fill
             size=12.0
             wrap=none
             @text-primary
-        if item.height > 0
-          text height_label_short(item.height)
-            with
-              size=9.5
-              wrap=none
-              font=code_medium
-              @text-hint
-        box
-          with
-            px=4.0
-            py=1.0
-            bg=info_bg
-            border=info_line
-            border-w=1.0
-            r=4.0
-          text item.source
-            with
-              size=9.0
-              wrap=none
-              font=code_semibold
-              @text-info
-      text bell_detail(item)
+      text context.detail
         with
           w=fill
           size=12.0

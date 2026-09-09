@@ -336,9 +336,9 @@ view
                               wrap=none
                               @text-meta
                         space w=fill
-                        button "Mark all read" -> mark_bell_read_submit
+                        button "Mark all read" #mark-bell-read -> mark_bell_read_submit
                           with
-                            disabled=(bell_unread <= 0)
+                            disabled=(bell_unread <= 0 || bell_marking)
                             h=22.0
                             p=4.0
                             @ghost_action
@@ -351,24 +351,34 @@ view
                         h=1.0
                         bg=separator
                       space w=1.0 h=1.0
-                    if empty(bell_items)
+                    if !empty(bell_error)
+                      col gap=4.0 p=9.0
+                        text bell_error size=12.0 @text-danger
+                        button "Retry" @ghost_action -> reload_bell
+                    if empty(bell_visible_items(bell_items, account_number, settings_user_key))
                       box
                         with
                           w=fill
                           p=26.0
                           align-x=center
                         text "Nothing yet — mentions and deliveries land here." size=12.0 @text-meta
-                    if !empty(bell_items)
+                    if !empty(bell_visible_items(bell_items, account_number, settings_user_key))
                       scroll
                         with
                           dir=vertical
                           w=fill
                           h=290.0
                           anchor-y=keep
-                        keyed item in bell_items by=item.seq
+                        keyed item in bell_visible_items(bell_items, account_number, settings_user_key) by=item.seq
                           with
-                            virtual-row=58.0
                             w=fill
                             p=5.0
                             gap=1.0
-                          BellRow item=item
+                          button #open-notification -> bell_open_item(connect_generation, account_number, bell_presentation(item, bell_presentations))
+                            with
+                              label=bell_label(item, bell_presentations)
+                              w=fill
+                              p=0.0
+                              disabled=!bell_openable(item, bell_presentations)
+                              @ghost_action
+                            BellRow item=item context=bell_presentation(item, bell_presentations)

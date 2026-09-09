@@ -167,6 +167,17 @@ on reconnect
   palette_search_phase = SearchPhase.idle
   error = ""
   status = "Connecting…"
+  bell_marking = false
+  bell_error = ""
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  invalidate lane=bell_load
+  invalidate lane=bell_context
+  bell_items = []
+  bell_presentations = []
+  bell_unread = 0
+  bell_read_through = 0
+  bell_clear_through = 0
   connect_generation = connect_generation + 1
   run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
@@ -276,7 +287,7 @@ on workspace_connected(next)
     run replace lane=doc_tabs_load load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
-    run replace lane=bell_load load_bell(connected_rpc) -> bell_loaded _ | bell_failed _
+    run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
@@ -344,8 +355,13 @@ on live_updated(next)
       hydration_retry_attempt = 0
       run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.bell
-      bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
-      bell_items = apply_bell(bell_items, next.bell)
+      bell_read_through = keep_i64(next.bell.kind == "read" && next.bell.up_to_seq > bell_read_through, next.bell.up_to_seq, bell_read_through)
+      bell_clear_through = keep_i64(next.bell.kind == "cleared" && next.bell.up_to_seq > bell_clear_through, next.bell.up_to_seq, bell_clear_through)
+      bell_items = merge_bell_loaded(apply_bell(bell_items, next.bell), [], bell_read_through, bell_clear_through)
+      bell_unread = bell_unread_count(bell_items, account_number, settings_user_key)
+      bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, [])
+      return if next.bell.kind != "delivered"
+      run replace lane=bell_context load_bell_presentations(connected_rpc, bell_missing_items(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations)) -> bell_context_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     LiveKind.pages
       // Text deltas fold locally. Structural deltas fold what they can, then
       // resync Pages once; no chat, bell, forge, or plane reducer participates.
@@ -1305,6 +1321,17 @@ on connect_failed(cause)
   // two interleaved retry series 5.2s and 10.8s apart, summing to one 16s cap.
   return if cause.generation != connect_generation
   hydration_generation = hydration_generation + 1
+  bell_marking = false
+  bell_error = ""
+  invalidate lane=bell_mark
+  invalidate lane=bell_navigation
+  invalidate lane=bell_load
+  invalidate lane=bell_context
+  bell_items = []
+  bell_presentations = []
+  bell_unread = 0
+  bell_read_through = 0
+  bell_clear_through = 0
   connect_generation = connect_generation + 1
   hydration_retry_attempt = hydration_retry_attempt + 1
   loading = false

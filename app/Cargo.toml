@@ -80,6 +80,7 @@ commonware-cryptography.workspace = true
 dispatch.workspace = true
 run-envelope.workspace = true
 runs.workspace = true
+tasks.workspace = true
 # the 32 random bytes of a fresh dispatch id.
 rand.workspace = true
 pages.workspace = true
