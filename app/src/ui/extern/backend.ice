@@ -90,7 +90,9 @@ extern crate::backend
   AgentChatEntry(id:i64, role:str, body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity], steps_label:str)
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   LiveActivity(label:str, done:bool)
-  LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
+  pure live_run_for(rows:&[LiveAgentRow], dispatch_id:&str) -> LiveRun
   LiveAgentNotice(rpc:str, chain_id:str, generation:i64, signer_key:str, rows:[LiveAgentRow])
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
@@ -263,7 +265,7 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, block:str, dispatch:str, channel:str, path:str, rev:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
   pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
   pure duck_page_link(page:str, chain_id:str) -> str
@@ -422,13 +424,14 @@ extern crate::backend
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
-  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
   JournalEntry(height:str, kind:str, summary:str)
-  RunJournal(run_id:str, entries:[JournalEntry], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
+  RunLink(relation:str, kind:str, label:str, url:str)
+  RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
   AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, run_id:str) -> RunJournal
-  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, run_id:&str) -> bool
+  load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
+  pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
   pure empty_run_journal() -> RunJournal
   pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError

@@ -960,7 +960,11 @@ on open_message_link(url)
     DuckKind.web
       run every open_external_url(url) -> external_url_opened _ | external_url_failed _
     DuckKind.page
-      run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
+      run every duck_echo_str(link.page) -> open_page_search_hit(_, link.block) | external_url_failed _
+    DuckKind.run
+      flow
+        from done link.dispatch
+        done -> open_run_panel _
     DuckKind.files
       fs_focus_path = link.path
       invalidate lane=account_ceremony
@@ -1596,6 +1600,12 @@ on chat_view_event(event)
         done -> load_more_thread()
     ChatIntent.cancel_run
       run every cancel_agent_run(connected_rpc, password, event_text(event, "run_id")) -> live_cancel_acked _ | mutation_failed _
+    // "VIEW RUN" ON A LIVE HINT, or the run chip on a message a run posted:
+    // the run panel, on that run.
+    ChatIntent.open_run
+      flow
+        from done event_text(event, "dispatch_id")
+        done -> open_run_panel _
     ChatIntent.composer
       let kind = chat_event_kind(event)
       let id = event_text(event, "id")

@@ -313,61 +313,57 @@ pub fn bell_link(entry: &BellPresentation, chain: String) -> String {
     match entry.target {
         BellTarget::Message => duck_channel_message_link(entry.object.clone(), entry.number, chain),
         BellTarget::Page => duck_page_link(entry.object.clone(), chain),
-        BellTarget::Forge => format!(
-            "duck://forge/{}/{}{}",
-            entry.object,
-            entry.number,
-            ::chat::client::duck_net_query(&chain)
-        ),
-        BellTarget::Repo => format!(
-            "duck://forge/{}{}",
-            entry.object,
-            ::chat::client::duck_net_query(&chain)
-        ),
-        BellTarget::Unavailable | BellTarget::Run => String::new(),
+        BellTarget::Forge => duck_forge_item_link(entry.object.clone(), entry.number, chain),
+        BellTarget::Repo => duck_forge_repo_link(entry.object.clone(), chain),
+        BellTarget::Run => duck_run_link(entry.object.clone(), chain),
+        BellTarget::Unavailable => String::new(),
     }
 }
 
+/// The page a bell entry names, read off pages' VIEW lane: the block's page
+/// opens and the block anchors, titled by the page's opening line.
 async fn bell_page(
     rpc: &RpcClient,
     block_id: String,
     entry: &mut BellPresentation,
 ) -> Result<(), String> {
-    let reply: ::pages::PageReply = rpc
-        .query(
-            "pages",
-            &::pages::PageQuery::GetBlock {
-                block_id: block_id.clone(),
-            },
-        )
-        .await?;
-    let ::pages::PageReply::Block(Some(block)) = reply else {
+    let Some(block) = view_block(rpc, &block_id).await? else {
         entry.detail = "Page content not found".into();
         return Ok(());
     };
-    if block.id != block_id {
+    if block.block_id != block_id {
         return Err("wrong page block".into());
     }
     entry.detail = bell_preview(&block.text);
     entry.target = BellTarget::Page;
-    entry.object = block.page.clone();
-    entry.anchor = block.id.clone();
-    if block.page != block.id {
-        let root: ::pages::PageReply = rpc
-            .query(
-                "pages",
-                &::pages::PageQuery::GetBlock {
-                    block_id: block.page.clone(),
-                },
-            )
-            .await?;
-        if let ::pages::PageReply::Block(Some(root)) = root
-            && root.id == block.page
-        {
-            entry.detail = format!("{} · {}", bell_preview(&root.text), entry.detail);
-        }
+    entry.object = block.page_id.clone();
+    entry.anchor = block.block_id.clone();
+    if block.page_id != block.block_id
+        && let Some(root) = view_block(rpc, &block.page_id).await?
+        && root.block_id == block.page_id
+    {
+        entry.detail = format!("{} · {}", bell_preview(&root.text), entry.detail);
     }
     Ok(())
+}
+
+/// One block off pages' view lane; `None` for an id the index does not hold.
+async fn view_block(
+    rpc: &RpcClient,
+    block_id: &str,
+) -> Result<Option<::pages::index::PageBlockRow>, String> {
+    let reply: ::pages::index::PagesViewReply = rpc
+        .view(
+            "pages",
+            &::pages::index::PagesViewQuery::GetBlock {
+                block_id: block_id.to_owned(),
+            },
+        )
+        .await?;
+    match reply {
+        ::pages::index::PagesViewReply::Block(block) => Ok(block),
+        _ => Ok(None),
+    }
 }
 
 async fn bell_source(
@@ -411,36 +407,28 @@ async fn bell_source(
         }
         ("pages", "block") => bell_page(rpc, object.into(), entry).await?,
         ("pages", "comment") => {
-            let reply: ::pages::PageReply = rpc
-                .query(
+            // The comment's thread, off pages' VIEW lane: the comment's
+            // text is in it and the thread's target is the page to open.
+            let reply: ::pages::index::PagesViewReply = rpc
+                .view(
                     "pages",
-                    &::pages::PageQuery::GetComment {
+                    &::pages::index::PagesViewQuery::ThreadOfComment {
                         comment_id: object.into(),
                     },
                 )
                 .await?;
-            let ::pages::PageReply::Comment(Some(comment)) = reply else {
+            let ::pages::index::PagesViewReply::Thread(Some(thread)) = reply else {
                 entry.detail = "Comment not found".into();
                 return Ok(());
             };
-            if comment.id != object {
+            let Some(comment) = thread.comments.iter().find(|comment| comment.id == object) else {
                 return Err("wrong comment".into());
-            }
+            };
             if comment.deleted {
                 entry.detail = "Comment deleted".into();
                 return Ok(());
             }
-            let head: ::pages::PageReply = rpc
-                .query(
-                    "pages",
-                    &::pages::PageQuery::CommentThreadHead {
-                        thread_id: comment.thread_id,
-                    },
-                )
-                .await?;
-            if let ::pages::PageReply::CommentThreadHead(Some(head)) = head {
-                bell_page(rpc, head.target, entry).await?;
-            }
+            bell_page(rpc, thread.target.clone(), entry).await?;
             entry.detail = bell_preview(&comment.text);
         }
         ("forge", "item" | "review") => {
@@ -581,7 +569,7 @@ async fn bell_source(
                 request.target
             );
             entry.target = BellTarget::Run;
-            entry.object = request.run_id;
+            entry.object = ::runs::dispatch_id_for(&request.run_id);
         }
         _ => {}
     }

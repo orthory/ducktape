@@ -273,7 +273,7 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
         };
         records
             .into_iter()
-            .find(|record| record.run_id == deployment.request.run_id && record.pr_number.is_some())
+            .find(|record| record.run_id == deployment.request.run_id && record.pr.is_some())
     });
     assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
     assert_eq!(

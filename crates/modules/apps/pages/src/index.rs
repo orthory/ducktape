@@ -217,6 +217,14 @@ pub enum PagesViewQuery {
     /// one call a page render makes with all visible block ids + the page
     /// id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
     ThreadsForTargets { targets: Vec<String> },
+    /// one block by id: the page it belongs to and its text, for a link that
+    /// names a block and has to say which page opens and what to call it.
+    GetBlock { block_id: String },
+    /// one comment thread by id, with the block it is anchored to.
+    GetThread { thread_id: String },
+    /// the thread one comment belongs to, comments included — a link that
+    /// names a comment needs its text and the block its thread anchors to.
+    ThreadOfComment { comment_id: String },
     Search {
         text: String,
         #[serde(default)]
@@ -243,6 +251,10 @@ pub enum PagesViewReply {
     },
     /// live threads grouped per requested target, request order.
     Threads(Vec<TargetThreadsRow>),
+    /// one block, `None` for an id this index does not hold.
+    Block(Option<PageBlockRow>),
+    /// one thread, `None` for an id this index does not hold.
+    Thread(Option<ThreadRow>),
     /// search hits, newest first.
     Hits(Vec<PageBlockRow>),
 }
@@ -1038,6 +1050,15 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             }
             reply_json(&PagesViewReply::Threads(groups))
         }
+        PagesViewQuery::GetBlock { block_id } => {
+            reply_json(&PagesViewReply::Block(read_row(read, &block_id)?))
+        }
+        PagesViewQuery::GetThread { thread_id } => {
+            reply_json(&PagesViewReply::Thread(read_thread(read, &thread_id)?))
+        }
+        PagesViewQuery::ThreadOfComment { comment_id } => reply_json(&PagesViewReply::Thread(
+            thread_of_comment(read, &comment_id)?,
+        )),
         PagesViewQuery::Search {
             text,
             page_id,
@@ -1576,6 +1597,68 @@ mod tests {
         let groups = threads(&map, &["b1", "b2"]);
         assert_eq!(names(&groups[0]), ["t1", "t3"]);
         assert!(groups[1].threads.is_empty());
+    }
+
+    /// A LINK THAT NAMES A BLOCK OR A THREAD resolves on this lane: the
+    /// block's page and text, the thread's target block. An id this index
+    /// never folded answers `None`, never a refusal — a run's journal can
+    /// name a block the mirror has not caught up to yet.
+    #[test]
+    fn a_block_and_a_thread_read_by_id_on_the_view_lane() {
+        let mut map = Map::new();
+        apply(
+            &mut map,
+            1,
+            &[
+                create("notes", "Release notes", None),
+                insert("notes", "b1", "ship it"),
+                add("t1", "c1", "b1", "not yet"),
+            ],
+        );
+        let block = serde_json::to_vec(&PagesViewQuery::GetBlock {
+            block_id: "b1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &block).expect("answers")).unwrap();
+        let PagesViewReply::Block(Some(row)) = reply else {
+            panic!("expected the block, got {reply:?}");
+        };
+        assert_eq!(
+            (row.page_id.as_str(), row.text.as_str()),
+            ("notes", "ship it")
+        );
+
+        let thread = serde_json::to_vec(&PagesViewQuery::GetThread {
+            thread_id: "t1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &thread).expect("answers")).unwrap();
+        let PagesViewReply::Thread(Some(row)) = reply else {
+            panic!("expected the thread, got {reply:?}");
+        };
+        assert_eq!(row.target, "b1");
+
+        let of_comment = serde_json::to_vec(&PagesViewQuery::ThreadOfComment {
+            comment_id: "c1".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &of_comment).expect("answers")).unwrap();
+        let PagesViewReply::Thread(Some(row)) = reply else {
+            panic!("expected the comment's thread, got {reply:?}");
+        };
+        assert_eq!(row.id, "t1");
+        assert_eq!(row.comments[0].text, "not yet");
+
+        let unknown = serde_json::to_vec(&PagesViewQuery::GetBlock {
+            block_id: "nope".into(),
+        })
+        .unwrap();
+        let reply: PagesViewReply =
+            serde_json::from_slice(&serve_view(&map, &unknown).expect("answers")).unwrap();
+        assert!(matches!(reply, PagesViewReply::Block(None)), "{reply:?}");
     }
 
     #[test]

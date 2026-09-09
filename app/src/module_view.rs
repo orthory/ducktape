@@ -156,10 +156,13 @@ pub fn members_view(
 /// view — every record whole, the capability tags the network announces,
 /// the action vocabulary, and the signing account (`account`, its decimal
 /// number) so the view offers the editor to a record's controller; beside
-/// it the run tracker, every run off the runs journal and the journal of
-/// the one the reader opened. Its intents come back as `status`
-/// (`agent_id`, `paused`), `save` and `register` (both the whole draft
-/// record as JSON, `AgentDraft`), and `open_run` (`run_id`, "" to close).
+/// it the run tracker, every run off the runs journal, the journal of the
+/// one the reader opened (`open_run`, its dispatch id) with the chips of
+/// every place it touched, and that run's live progress while it works.
+/// Its intents come back as `status` (`agent_id`, `paused`), `save` and
+/// `register` (both the whole draft record as JSON, `AgentDraft`),
+/// `open_run` (`dispatch_id`, "" to close) and `open_link` (`url`, a chip's
+/// duck:// address for the open plane).
 /// Every committed write bumps `committed`, which tells the view its drafts
 /// were consumed.
 /// The messaging panel rides in the same props under `messaging`: the app's
@@ -176,7 +179,9 @@ pub fn agents_view(
     committed: i64,
     rows: &[crate::backend::AgentRow],
     runs: &[crate::backend::RunRow],
+    open_run: &str,
     journal: &crate::backend::RunJournal,
+    live: &crate::backend::LiveRun,
     capabilities: &[String],
     actions: &[String],
     messaging: &crate::backend::MessagingView,
@@ -195,7 +200,9 @@ pub fn agents_view(
             committed,
             rows,
             runs,
+            open_run,
             journal,
+            live,
             capabilities,
             actions,
             messaging,
@@ -218,7 +225,9 @@ pub(crate) fn agents_props(
     committed: i64,
     rows: &[crate::backend::AgentRow],
     runs: &[crate::backend::RunRow],
+    open_run: &str,
     journal: &crate::backend::RunJournal,
+    live: &crate::backend::LiveRun,
     capabilities: &[String],
     actions: &[String],
     messaging: &crate::backend::MessagingView,
@@ -252,7 +261,9 @@ pub(crate) fn agents_props(
     let props = serde_json::json!({
         "rows": rows,
         "runs": runs,
+        "open_run": open_run,
         "journal": book,
+        "live": live,
         "capabilities": capabilities,
         "actions": actions,
         "account": account,
@@ -270,6 +281,7 @@ pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
         "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
         "open_run" => crate::AgentsIntent::OpenRun,
+        "open_link" => crate::AgentsIntent::OpenLink,
         "messaging_open" => crate::AgentsIntent::MessagingOpen,
         "messaging_page" => crate::AgentsIntent::MessagingPage,
         "messaging_send" => crate::AgentsIntent::MessagingSend,
@@ -1248,9 +1260,10 @@ struct ChatProps<'a> {
     copy_head_seq: i64,
     copy_surface: &'static str,
     sent_serial: i64,
-    /// THIS ROOM'S runs only: the reading is taken for the whole node, and
-    /// [`encode_chat_props`] narrows it to `active_channel` on the way out.
-    live_agents: std::borrow::Cow<'a, [crate::backend::LiveAgentRow]>,
+    /// THIS ROOM'S runs only, as hints: the reading is taken for the whole
+    /// node, and [`encode_chat_props`] cuts it to `active_channel` on the way
+    /// out.
+    live_agents: Vec<crate::backend::LiveRunHint>,
 }
 
 /// The Chat tab: the room list, the stream, the rail and the drawer as the
@@ -1372,9 +1385,9 @@ pub fn chat_view(
         copy_head_seq,
         copy_surface: copy_surface_name(copy_surface),
         sent_serial,
-        live_agents: std::borrow::Cow::Borrowed(live_agents),
+        live_agents: Vec::new(),
     };
-    module_view("chat", encode_chat_props(props))
+    module_view("chat", encode_chat_props(props, live_agents))
 }
 
 /// Text bytes a guest's big list or blob may put on one frame: the wire
@@ -1401,18 +1414,17 @@ const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
 /// ONLY PLACE a run is matched to a room: the reading covers the whole node, so
 /// a row from a room the reader left cannot reach the screen no matter which of
 /// the eight handlers that move `active_channel` she got here through.
-fn encode_chat_props(mut props: ChatProps<'_>) -> Vec<u8> {
-    let live = live_agents_within(
-        &props.live_agents,
-        props.active_channel,
-        LIVE_AGENT_TEXT_BUDGET,
-    );
-    // THE LIVE CARDS ARE SERVED FIRST. A run in flight is the most perishable
+fn encode_chat_props(
+    mut props: ChatProps<'_>,
+    live_rows: &[crate::backend::LiveAgentRow],
+) -> Vec<u8> {
+    let live = live_agents_within(live_rows, props.active_channel, LIVE_AGENT_TEXT_BUDGET);
+    // THE LIVE HINTS ARE SERVED FIRST. A run in flight is the most perishable
     // thing on the frame and the one the reader is waiting on, so it takes its
     // bytes before the scrollback it sits in does.
     let timelines =
         TIMELINE_TEXT_BUDGET.saturating_sub(live.iter().map(live_text_bytes).sum::<usize>());
-    props.live_agents = std::borrow::Cow::Owned(live);
+    props.live_agents = live;
     let (stream, stream_clipped) = newest_within(props.messages, timelines);
     let stream_spent: usize = stream.iter().map(text_bytes).sum();
     props.messages = stream;
@@ -1442,19 +1454,12 @@ fn text_bytes(message: &crate::backend::ChatMessage) -> usize {
     message.body.len() + message.author.len() + message.meta.len()
 }
 
-/// The bytes a live agent card puts on the wire as text.
-fn live_text_bytes(row: &crate::backend::LiveAgentRow) -> usize {
-    row.agent.len()
-        + row.status.len()
-        + row.answer_preview.len()
-        + row
-            .activity
-            .iter()
-            .map(|activity| activity.label.len())
-            .sum::<usize>()
+/// The bytes a live run hint puts on the wire as text.
+fn live_text_bytes(hint: &crate::backend::LiveRunHint) -> usize {
+    hint.agent.len() + hint.status.len()
 }
 
-/// The runs anchored in `channel_id` whose text fits `budget`, newest anchor
+/// The runs anchored in `channel_id` whose hints fit `budget`, newest anchor
 /// kept first — those are the ones at the tail the reader is looking at — and
 /// handed back in anchor order so the list does not churn the guest's timeline
 /// memo when two runs start in the same poll.
@@ -1462,23 +1467,24 @@ fn live_agents_within(
     rows: &[crate::backend::LiveAgentRow],
     channel_id: &str,
     budget: usize,
-) -> Vec<crate::backend::LiveAgentRow> {
-    let mut here: Vec<&crate::backend::LiveAgentRow> = rows
+) -> Vec<crate::backend::LiveRunHint> {
+    let mut here: Vec<crate::backend::LiveRunHint> = rows
         .iter()
         .filter(|row| row.channel_id == channel_id)
+        .map(crate::backend::LiveRunHint::from)
         .collect();
-    here.sort_by_key(|row| std::cmp::Reverse(row.anchor_seq));
+    here.sort_by_key(|hint| std::cmp::Reverse(hint.anchor_seq));
     let mut spent = 0;
     let mut kept = Vec::new();
-    for row in here {
-        let cost = live_text_bytes(row);
+    for hint in here {
+        let cost = live_text_bytes(&hint);
         if spent + cost > budget {
             break;
         }
         spent += cost;
-        kept.push(row.clone());
+        kept.push(hint);
     }
-    kept.sort_by_key(|row| row.anchor_seq);
+    kept.sort_by_key(|hint| hint.anchor_seq);
     kept
 }
 
@@ -1582,6 +1588,7 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "thread_delete" => Intent::ThreadDelete,
         "load_thread" => Intent::LoadThread,
         "cancel_run" => Intent::CancelRun,
+        "open_run" => Intent::OpenRun,
         "composer" => Intent::Composer,
         _ => Intent::ClearSelection,
     }
@@ -1954,6 +1961,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "thread_delete",
             "load_thread",
             "cancel_run",
+            "open_run",
         ],
         "forge" => &[
             "open_repo",
@@ -4119,7 +4127,7 @@ pub(crate) mod tests {
             ]
         );
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 44);
+        assert_eq!(chat.len(), 45);
         assert!(chat.contains(&"choose_channel"));
         assert!(
             chat.contains(&"cancel_run"),
@@ -4361,6 +4369,29 @@ pub(crate) mod tests {
 
     /// The staged path for `module`, or None with a note when `make views`
     /// has not run.
+    /// Redraw until the view is quiet and every editor document it draws
+    /// has crossed the transfer: an editor node carries a document
+    /// reference, and its bytes arrive over frames, so a test that reads
+    /// the document right after the redraw that mounted the editor reads
+    /// nothing. The pump is bounded by the frames a transfer can take.
+    fn settle_documents(guest: &mut Guest, props: &Option<Vec<u8>>) {
+        for _ in 0..128 {
+            let busy = guest.redraw(props);
+            assert!(guest.fault.is_none(), "{:?}", guest.fault);
+            if !busy && guest.inputs.editor_documents_status() == Ok(true) {
+                return;
+            }
+        }
+        panic!(
+            "the view did not settle: frame busy={} pending={:?} staged={:?} documents={:?} texts={:?}",
+            guest.frame.busy,
+            guest.pending,
+            guest.staged,
+            guest.inputs.editor_documents_status(),
+            texts(guest)
+        );
+    }
+
     fn staged(module: &str) -> Option<std::path::PathBuf> {
         let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../target/views/{module}_view.wasm"));
@@ -4464,7 +4495,9 @@ pub(crate) mod tests {
                         {"name": "tests", "source_prefix": "/shared/skills/tests", "source_snapshot": "", "always": false}
                     ]
                 }],
-                "runs": [], "journal": {"run_id": "", "entries": []},
+                "runs": [], "open_run": "",
+                "journal": {"dispatch_id": "", "entries": [], "links": []},
+                "live": {"present": false, "status": "", "activity": [], "answer_preview": ""},
                 "capabilities": ["claude", "review"], "actions": ["chat.post", "tasks.create"],
                 "account": "", "committed": 0,
                 "connected": true, "answered": true, "dark": false
@@ -4561,7 +4594,9 @@ pub(crate) mod tests {
             0,
             &[],
             &[],
+            "",
             &crate::backend::RunJournal::default(),
+            &crate::backend::LiveRun::default(),
             &[],
             &[],
             &reading,
@@ -5094,20 +5129,10 @@ pub(crate) mod tests {
         let mut facts: serde_json::Value = serde_json::from_slice(&files_facts().unwrap()).unwrap();
         let original_text = format!("X{}", facts["preview_text"].as_str().unwrap());
         let props = |facts: &serde_json::Value| Some(serde_json::to_vec(facts).unwrap());
-        fn settle(guest: &mut Guest, props: &Option<Vec<u8>>) {
-            for _ in 0..128 {
-                let busy = guest.redraw(props);
-                assert!(guest.fault.is_none(), "{:?}", guest.fault);
-                if !busy && guest.inputs.editor_documents_status() == Ok(true) {
-                    return;
-                }
-            }
-            panic!("Files document transfer must settle");
-        }
-        settle(&mut guest, &None);
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &None);
+        settle_documents(&mut guest, &props(&facts));
         guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         let mut editor = None;
         guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
             if let wire::Node::Editor { key, document, .. } = node {
@@ -5156,7 +5181,7 @@ pub(crate) mod tests {
         for output in outputs {
             guest.deliver(output);
         }
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         assert_eq!(
             guest.inputs.editor_document(&key).unwrap().text(),
             original_text,
@@ -5167,9 +5192,9 @@ pub(crate) mod tests {
         facts["context"] = "connection-b".into();
         facts["preview_path"] = "/shared/other.md".into();
         facts["preview_text"] = "B source".into();
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         guest.deliver(Output::Activate(old_save));
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         assert!(guest.intents.is_empty(), "an old Save cannot target B");
         assert!(
             texts(&guest)
@@ -5183,7 +5208,7 @@ pub(crate) mod tests {
         facts["preview_path"] = "/shared/README.md".into();
         facts["preview_base"] = "external-new-snapshot".into();
         facts["preview_text"] = "external replacement".into();
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         let draft_text = |guest: &Guest| {
             let mut value = None;
             guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
@@ -5198,7 +5223,7 @@ pub(crate) mod tests {
         };
         assert_eq!(draft_text(&guest), original_text);
         guest.deliver(Output::Activate(button_message(&guest, "Save")));
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         let saves = std::mem::take(&mut guest.intents);
         assert_eq!(saves.len(), 1, "one Save");
         let save = &saves[0];
@@ -5212,7 +5237,7 @@ pub(crate) mod tests {
             "context": payload["context"], "namespace": payload["namespace"], "request": payload["request"],
             "success": false, "message": "The file changed elsewhere. Your edits are kept."
         }], "overflow":""});
-        settle(&mut guest, &props(&facts));
+        settle_documents(&mut guest, &props(&facts));
         assert_eq!(draft_text(&guest), original_text);
         assert!(
             texts(&guest)
@@ -5277,7 +5302,7 @@ pub(crate) mod tests {
             facts["save_reply"] = success;
             // A changed loading prop forces delivery even when the old success was already retained.
             facts["loading"] = true.into();
-            guest.redraw(&props(&facts));
+            settle_documents(&mut guest, &props(&facts));
             assert_eq!(
                 editor_text(&guest),
                 Some(facts["preview_text"].as_str().unwrap().to_owned()),
@@ -5544,17 +5569,32 @@ pub(crate) mod tests {
         connection.rev += 1;
     }
 
-    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
-        let turn = connection_turn_lock().lock().await;
+    /// One test's turn over the seats: taken with them retired, and
+    /// retiring them again when it ends, so a test outside a turn never
+    /// inherits what a deployment left seated — a pages test reads the
+    /// `pages` seat through `current_page_document`, and a seat another
+    /// test left behind is a document it never staged.
+    pub(crate) struct ConnectionTurn {
+        _held: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ConnectionTurn {
+        fn drop(&mut self) {
+            reset_connection_turn();
+        }
+    }
+
+    pub(crate) async fn connection_turn() -> ConnectionTurn {
+        let held = connection_turn_lock().lock().await;
         reset_connection_turn();
-        turn
+        ConnectionTurn { _held: held }
     }
 
     /// Hold this outside allocation measurement until the render thread joins.
-    pub(crate) fn blocking_connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
-        let turn = connection_turn_lock().blocking_lock();
+    pub(crate) fn blocking_connection_turn() -> ConnectionTurn {
+        let held = connection_turn_lock().blocking_lock();
         reset_connection_turn();
-        turn
+        ConnectionTurn { _held: held }
     }
 
     #[test]
@@ -6323,9 +6363,9 @@ pub(crate) mod tests {
             copy_head_seq: 0,
             copy_surface: "nowhere",
             sent_serial: 0,
-            live_agents: std::borrow::Cow::Borrowed(live),
+            live_agents: Vec::new(),
         };
-        Some(encode_chat_props(props))
+        Some(encode_chat_props(props, live))
     }
 
     /// Inspect the guest frame before the host sanitizer, not its already
@@ -6632,7 +6672,7 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
         // Display clipping does not hide Edit or replace its authoritative seed.
         guest.deliver(Output::Activate(button_message(&guest, "Edit")));
-        guest.redraw(&props);
+        settle_documents(&mut guest, &props);
         let mut root = guest.frame.root.clone().expect("editing tree");
         let mut editor_source = None;
         root.for_each_mut(&mut |node| {
@@ -6716,11 +6756,13 @@ pub(crate) mod tests {
         [first_light_at(1), first_light_at(2)]
     }
 
-    /// A RUN IN FLIGHT, THROUGH THE REAL WIRE. The card draws under the message
+    /// A RUN IN FLIGHT, THROUGH THE REAL WIRE. The hint draws under the message
     /// that summoned it, and the NEXT reading of the same run repaints it: only
     /// `live_agents` moves between the two frames, so this is the test that
     /// fails if the timeline memo keys on the messages alone (`host::Timeline`)
-    /// — the card would sit on "Starting" for the whole run.
+    /// — the hint would sit on "Starting" for the whole run. The hint is a
+    /// hint: the run's activity and its answer preview belong to the run
+    /// panel and never enter the stream.
     #[test]
     fn a_run_in_flight_draws_under_its_anchor_and_repaints_as_it_works() {
         let Some(staged) = staged("chat") else {
@@ -6762,17 +6804,26 @@ pub(crate) mod tests {
         };
         guest.redraw(&chat_facts_in("channel-a", &messages, &[], &[working]));
         let shown = texts(&guest);
-        for expected in [
-            "Reading the repo",
+        assert!(
+            shown.iter().any(|text| text == "Reading the repo"),
+            "the run's status never reached the frame: {shown:?}"
+        );
+        for progress in [
             "Command: cargo test",
             "Reasoning",
             "the files crate builds clean",
         ] {
             assert!(
-                shown.iter().any(|text| text == expected),
-                "the run's progress never reached the frame: missing {expected:?} in {shown:?}"
+                !shown.iter().any(|text| text == progress),
+                "the run's progress is the run panel's, not the stream's: {progress:?} in {shown:?}"
             );
         }
+        assert!(
+            button_shown(&guest, "View run"),
+            "no way from the hint to the run panel (fault {:?}): {:?}",
+            guest.fault,
+            texts(&guest)
+        );
         assert!(
             !shown.iter().any(|text| text == "Starting"),
             "the stale status is still drawn: {shown:?}"
@@ -7028,15 +7079,8 @@ pub(crate) mod tests {
                     panic!("{module}: the view of A");
                 };
                 // the view draws, takes facts that are not its initial
-                // state, and settles
-                assert!(
-                    (0..128).any(|_| {
-                        let busy = guest.redraw(&props);
-                        assert!(guest.fault.is_none(), "{module}: {:?}", guest.fault);
-                        !busy && guest.inputs.editor_documents_status() == Ok(true)
-                    }),
-                    "{module}: initial document transfer must settle"
-                );
+                // state, and settles — its editor's document included
+                settle_documents(guest, &props);
                 assert!(guest.settled(), "{module} fault: {:?}", guest.fault);
                 assert!(guest.props_subscription.is_some(), "{module}");
                 assert!(

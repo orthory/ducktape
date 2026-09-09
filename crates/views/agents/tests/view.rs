@@ -3,12 +3,12 @@
 //! only things that leave are the writes the reader asked for.
 
 use agents_view::host::{
-    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, OpenRun, RunJournal, RunRow,
-    Status,
+    AgentCaps, AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, LiveActivity, LiveRun,
+    OpenLink, OpenRun, RunJournal, RunLink, RunRow, Status,
 };
 use agents_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, texts, toggle, type_into};
-use ui_lang_guest::wire::{Frame, Request};
+use ui_lang_guest::wire::{Frame, Node, Request};
 
 /// Inputs are found by placeholder and pick lists by key.
 const AGENT_ID_HINT: &str = "a-dns-label, e.g. chiefduck";
@@ -56,6 +56,7 @@ fn agent(name: &str, status: &str, live: bool) -> AgentRow {
 fn run(run_id: &str, agent: &str, state: &str) -> RunRow {
     RunRow {
         run_id: run_id.into(),
+        dispatch_id: format!("dispatch-of-{}", run_id.replace('\x1f', "-")),
         agent_id: agent.to_lowercase(),
         agent_name: agent.into(),
         origin: "#general · msg 12".into(),
@@ -73,20 +74,50 @@ fn run(run_id: &str, agent: &str, state: &str) -> RunRow {
 }
 
 fn register(rows: Vec<AgentRow>, account: &str, committed: i64) -> Vec<u8> {
-    register_with_runs(rows, Vec::new(), RunJournal::default(), account, committed)
+    register_with_runs(
+        rows,
+        Vec::new(),
+        "",
+        RunJournal::default(),
+        account,
+        committed,
+    )
 }
 
 fn register_with_runs(
     rows: Vec<AgentRow>,
     runs: Vec<RunRow>,
+    open_run: &str,
     journal: RunJournal,
+    account: &str,
+    committed: i64,
+) -> Vec<u8> {
+    register_with_live(
+        rows,
+        runs,
+        open_run,
+        journal,
+        LiveRun::default(),
+        account,
+        committed,
+    )
+}
+
+fn register_with_live(
+    rows: Vec<AgentRow>,
+    runs: Vec<RunRow>,
+    open_run: &str,
+    journal: RunJournal,
+    live: LiveRun,
     account: &str,
     committed: i64,
 ) -> Vec<u8> {
     serde_json::to_vec(&AgentsProps {
         rows,
         runs,
+        open_run: open_run.into(),
         journal,
+        live,
         capabilities: vec!["claude".into(), "codex".into()],
         actions: vec!["chat.post".into(), "tasks.create".into()],
         account: account.into(),
@@ -117,6 +148,17 @@ fn one_intent(frame: &Frame) -> &Request {
         panic!("one intent, got {:?}", frame.requests);
     };
     intent
+}
+
+/// Whether a button with this accessible name is on the frame. A chip's
+/// text is on the frame whether or not it is offered as a link, so the
+/// difference is a button node, not a text.
+fn frame_has_button(frame: &Frame, name: &str) -> bool {
+    fn walk(node: &Node, name: &str) -> bool {
+        let named = matches!(node, Node::Button { label, .. } if label.as_deref() == Some(name));
+        named || node.children().iter().any(|child| walk(child, name))
+    }
+    frame.root.as_ref().is_some_and(|root| walk(root, name))
 }
 
 #[test]
@@ -324,6 +366,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         &register_with_runs(
             vec![agent("Reviewer", "active", true)],
             vec![running.clone(), failed.clone()],
+            "",
             RunJournal::default(),
             "7",
             0,
@@ -351,14 +394,14 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     }
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
-    // opening a run asks the app for its journal, by run id
+    // opening a run asks the app for its journal, by the run's address
     let frame = tick_native(press(&frame, &failed.run_id));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "agents.open_run");
     assert_eq!(
         serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
         OpenRun {
-            run_id: failed.run_id.clone()
+            dispatch_id: failed.dispatch_id.clone()
         }
     );
     assert!(
@@ -368,9 +411,10 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     );
     assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
 
-    // the journal lands under the open run's id and reads fact by fact
+    // the journal lands under the open run's address and reads fact by fact
     let journal = RunJournal {
-        run_id: failed.run_id.clone(),
+        dispatch_id: failed.dispatch_id.clone(),
+        links: Vec::new(),
         entries: vec![
             JournalEntry {
                 height: "h 84,912".into(),
@@ -389,6 +433,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         &register_with_runs(
             vec![agent("Reviewer", "active", true)],
             vec![running, failed.clone()],
+            &failed.dispatch_id,
             journal,
             "7",
             0,
@@ -417,12 +462,147 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     assert_eq!(
         serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
         OpenRun {
-            run_id: String::new()
+            dispatch_id: String::new()
         }
     );
     assert!(
         !has_text(&frame, "for reviewer from #general · msg 9"),
         "{:?}",
+        texts(&frame)
+    );
+}
+
+/// THE APP OWNS WHICH RUN IS OPEN. A chat hint, a bell or a duck://run link
+/// opens a run from another tab, so the register's `open_run` opens the
+/// panel here without a press — and the panel it opens is keyed by the
+/// run's address, which is also the key its journal and live reading carry.
+#[test]
+fn the_register_opens_the_run_the_app_names() {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_runs(
+            vec![agent("Reviewer", "active", true)],
+            vec![running.clone()],
+            &running.dispatch_id,
+            RunJournal::default(),
+            "7",
+            0,
+        ),
+    )]);
+    let frame = tick_native(press(&frame, "Runs"));
+    assert!(
+        has_text(&frame, "Reading the journal…"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(
+        has_text(&frame, &running.dispatch_id),
+        "the open panel names the run's address: {:?}",
+        texts(&frame)
+    );
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+}
+
+/// THE RUN AS IT RUNS, AND EVERYTHING IT TOUCHED. The live reading draws in
+/// the panel — the chat stream only hints — and the journal's places draw as
+/// chips: a chip with an address opens it through the app's open plane, a
+/// place the protocol cannot address yet is a label alone.
+#[test]
+fn the_open_run_draws_its_progress_and_its_places_as_chips() {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
+    let journal = RunJournal {
+        dispatch_id: running.dispatch_id.clone(),
+        entries: vec![JournalEntry {
+            height: "h 84,912".into(),
+            kind: "dispatched".into(),
+            summary: "for reviewer from #general · msg 12".into(),
+        }],
+        links: vec![
+            RunLink {
+                relation: "from".into(),
+                kind: "chat".into(),
+                label: "#general · msg 12".into(),
+                url: "duck://channel/general/12?net=duck-1".into(),
+            },
+            RunLink {
+                relation: "touched".into(),
+                kind: "page".into(),
+                label: "Release notes".into(),
+                url: "duck://page/p-9?net=duck-1".into(),
+            },
+            RunLink {
+                relation: "touched".into(),
+                kind: "task".into(),
+                label: "task t-4".into(),
+                url: String::new(),
+            },
+        ],
+    };
+    let live = LiveRun {
+        present: true,
+        status: "Reading the repo".into(),
+        activity: vec![
+            LiveActivity {
+                label: "Command: cargo test".into(),
+                done: true,
+            },
+            LiveActivity {
+                label: "Reasoning".into(),
+                done: false,
+            },
+        ],
+        answer_preview: "The notes are drafted".into(),
+    };
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_live(
+            vec![agent("Reviewer", "active", true)],
+            vec![running.clone()],
+            &running.dispatch_id,
+            journal,
+            live,
+            "7",
+            0,
+        ),
+    )]);
+    let frame = tick_native(press(&frame, "Runs"));
+    for expected in [
+        "Reading the repo",
+        "Command: cargo test",
+        "Reasoning",
+        "The notes are drafted",
+        "Relevant",
+        "#general · msg 12",
+        "Release notes",
+        "task t-4",
+    ] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+    // a chip with an address is a link the app's open plane follows
+    let frame = tick_native(press(&frame, "Release notes"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "agents.open_link");
+    assert_eq!(
+        serde_json::from_slice::<OpenLink>(&intent.payload).expect("decodes"),
+        OpenLink {
+            url: "duck://page/p-9?net=duck-1".into()
+        }
+    );
+    // a place without an address is drawn, not offered
+    assert!(
+        !frame_has_button(&frame, "task t-4"),
+        "an unaddressed place was offered as a link: {:?}",
         texts(&frame)
     );
 }

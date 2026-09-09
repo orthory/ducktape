@@ -414,7 +414,7 @@ fn a_blind_agent_repairs_and_deploys_from_symptoms() {
     let record = cluster.await_committed(0, "the model's committed PR", FINALIZE, || {
         recent(&cluster)
             .into_iter()
-            .find(|record| record.run_id == deployment.request.run_id && record.pr_number.is_some())
+            .find(|record| record.run_id == deployment.request.run_id && record.pr.is_some())
     });
     assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
     assert!(!record.degraded);

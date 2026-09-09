@@ -29,6 +29,10 @@ use ::chat::client::{chain_digest, duck_net_query as net_query, is_chain_digest}
 
 /// One classified link. Only the fields its `kind` names are meaningful;
 /// the rest are empty / zero.
+///
+/// The module table: `page/<id>[#<block>]`, `files/<path>`, `forge/<repo>`,
+/// `forge/<repo>/<n>[#<seq>]`, `forge/<repo>/blob/<path>[@<oid>]`,
+/// `channel/<id>[#<seq>]`, `run/<dispatch_id>`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuckLink {
     pub kind: DuckKind,
@@ -41,6 +45,10 @@ pub struct DuckLink {
     pub seq: i64,
     /// `page`: the page id.
     pub page: String,
+    /// `page`: the block the link lands on, or "" for the page's top.
+    pub block: String,
+    /// `run`: the run's dispatch id.
+    pub dispatch: String,
     /// `channel` / `channel_message`: the channel id.
     pub channel: String,
     /// `files`: the absolute duckfs path; `forge_blob`: the repo-relative path.
@@ -61,6 +69,8 @@ impl DuckLink {
             number: 0,
             seq: 0,
             page: String::new(),
+            block: String::new(),
+            dispatch: String::new(),
             channel: String::new(),
             path: String::new(),
             rev: String::new(),
@@ -109,6 +119,7 @@ pub fn classify_duck_link(url: String) -> DuckLink {
         "files" => classify_files(path, &segments, rev, fragment),
         "forge" => classify_forge(&segments, rev, fragment),
         "channel" => classify_channel(&segments, rev, fragment),
+        "run" => classify_run(&segments, rev, fragment),
         _ => DuckLink::unknown(),
     };
     // An `Unknown` addresses nothing, so it belongs to no network either.
@@ -163,6 +174,28 @@ pub fn duck_page_link(page: String, chain_id: String) -> String {
     format!("duck://page/{page}{}", net_query(&chain_id))
 }
 
+/// `duck://page/<id>?net=…#<block>` — one block of a page: the page opens
+/// and the block is the landing. The query precedes the fragment.
+pub fn duck_page_block_link(page: String, block: String, chain_id: String) -> String {
+    format!("duck://page/{page}{}#{block}", net_query(&chain_id))
+}
+
+/// `duck://run/<dispatch_id>?net=…` — one agent run, by the dispatch id that
+/// addresses it everywhere outside the runs module.
+pub fn duck_run_link(dispatch_id: String, chain_id: String) -> String {
+    format!("duck://run/{dispatch_id}{}", net_query(&chain_id))
+}
+
+/// `duck://forge/<repo>/<number>?net=…` — one tracker item, issue or PR.
+pub fn duck_forge_item_link(repo: String, number: i64, chain_id: String) -> String {
+    format!("duck://forge/{repo}/{number}{}", net_query(&chain_id))
+}
+
+/// `duck://forge/<repo>?net=…` — one repository.
+pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
+    format!("duck://forge/{repo}{}", net_query(&chain_id))
+}
+
 /// `duck://channel/<id>?net=…` — likewise the only handle on a channel.
 pub fn duck_channel_link(channel: String, chain_id: String) -> String {
     format!("duck://channel/{channel}{}", net_query(&chain_id))
@@ -213,17 +246,40 @@ fn positive(digits: &str) -> Option<i64> {
     digits.parse::<i64>().ok().filter(|number| *number > 0)
 }
 
+/// `/page/<id>[#<block>]`: a page is not versioned, so `@rev` is refused; the
+/// fragment, when present, is the block the link lands on.
 fn classify_page(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
     let [id] = segments else {
         return DuckLink::unknown();
     };
-    let plain = rev.is_empty() && fragment.is_empty();
-    if !plain {
+    if !rev.is_empty() {
         return DuckLink::unknown();
     }
     DuckLink {
         page: (*id).to_owned(),
+        block: fragment.to_owned(),
         ..DuckLink::of(DuckKind::Page)
+    }
+}
+
+/// `/run/<dispatch_id>`: a dispatch id is the run id's hex sha256 — exactly 64
+/// lowercase hex — and a run is neither versioned nor anchored.
+fn classify_run(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
+    let [dispatch] = segments else {
+        return DuckLink::unknown();
+    };
+    let plain = rev.is_empty() && fragment.is_empty();
+    let is_dispatch_id = dispatch.len() == 64
+        && dispatch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let named = plain && is_dispatch_id;
+    if !named {
+        return DuckLink::unknown();
+    }
+    DuckLink {
+        dispatch: (*dispatch).to_owned(),
+        ..DuckLink::of(DuckKind::Run)
     }
 }
 
@@ -371,9 +427,34 @@ mod tests {
     #[test]
     fn the_module_table_classifies_every_row_and_refuses_the_rest() {
         let page = classify_duck_link("duck://page/pg-1".into());
-        assert_eq!((page.kind, page.page.as_str()), (DuckKind::Page, "pg-1"));
+        assert_eq!(
+            (page.kind, page.page.as_str(), page.block.as_str()),
+            (DuckKind::Page, "pg-1", "")
+        );
+        let block = classify_duck_link("duck://page/pg-1#blk-7".into());
+        assert_eq!(
+            (block.kind, block.page.as_str(), block.block.as_str()),
+            (DuckKind::Page, "pg-1", "blk-7")
+        );
+        assert_eq!(kind("duck://page/pg-1@v2"), DuckKind::Unknown);
         assert_eq!(kind("duck://page/a/b"), DuckKind::Unknown);
         assert_eq!(kind("duck://page/"), DuckKind::Unknown);
+
+        let dispatch = "ab".repeat(32);
+        let run = classify_duck_link(format!("duck://run/{dispatch}"));
+        assert_eq!(
+            (run.kind, run.dispatch.as_str()),
+            (DuckKind::Run, dispatch.as_str())
+        );
+        assert_eq!(kind("duck://run/agent/abc"), DuckKind::Unknown);
+        assert_eq!(kind("duck://run/abc"), DuckKind::Unknown, "not a digest");
+        assert_eq!(
+            kind(&format!("duck://run/{}", "AB".repeat(32))),
+            DuckKind::Unknown,
+            "lowercase only"
+        );
+        assert_eq!(kind(&format!("duck://run/{dispatch}#1")), DuckKind::Unknown);
+        assert_eq!(kind("duck://run/"), DuckKind::Unknown);
 
         let file = classify_duck_link("duck://files/shared/attachments/u1/doc.pdf".into());
         assert_eq!(

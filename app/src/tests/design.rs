@@ -1521,6 +1521,12 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
+        // The bell: one inbox read per reload, filtered and cut to its window
+        // by `bell_visible_items`, inside a fixed-height scroll.
+        (
+            "ui/view.ice",
+            "keyed item in bell_visible_items(bell_items, account_number, settings_user_key) by=item.seq w=fill p=5.0 gap=1.0",
+        ),
     ];
 
     let mut unculled: Vec<String> = Vec::new();

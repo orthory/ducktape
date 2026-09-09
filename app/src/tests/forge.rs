@@ -503,7 +503,8 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     );
     for route in [
         "run every open_external_url(url)",
-        "-> open_page_search_hit(_, \"\")",
+        "-> open_page_search_hit(_, link.block)",
+        "-> open_run_panel _",
         "-> fs_open_dir _",
         "-> forge_open_repo _",
         "-> choose_channel _",

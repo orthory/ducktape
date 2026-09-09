@@ -304,7 +304,11 @@ async fn awaiting_pr_with_actions(
         network.step().await;
     }
     assert_eq!(
-        history(&network, &run.run_id).await.unwrap().pr_number,
+        history(&network, &run.run_id)
+            .await
+            .unwrap()
+            .pr
+            .map(|pr| pr.number),
         None
     );
     assert!(
@@ -342,7 +346,11 @@ fn history_links_the_actual_program_allocation_after_another_item_wins_the_next_
         assert_eq!(reply.head.origin, sdk::Origin::Program(2));
         assert_eq!(reply.head.thread, Some(1));
         assert_eq!(
-            history(&network, &run.run_id).await.unwrap().pr_number,
+            history(&network, &run.run_id)
+                .await
+                .unwrap()
+                .pr
+                .map(|pr| pr.number),
             Some(3)
         );
         let opened = item(&network, 3).await.unwrap();
@@ -456,7 +464,11 @@ fn a_rejected_program_target_never_links_a_predicted_pr() {
             .await;
         network.drain().await;
         assert_eq!(
-            history(&network, &run.run_id).await.unwrap().pr_number,
+            history(&network, &run.run_id)
+                .await
+                .unwrap()
+                .pr
+                .map(|pr| pr.number),
             None
         );
         assert!(item(&network, 2).await.is_none());
@@ -493,7 +505,11 @@ fn a_program_that_omits_the_target_leaves_the_pr_link_empty() {
         let (mut network, run) = awaiting_pr(&directory, program).await;
         network.drain().await;
         assert_eq!(
-            history(&network, &run.run_id).await.unwrap().pr_number,
+            history(&network, &run.run_id)
+                .await
+                .unwrap()
+                .pr
+                .map(|pr| pr.number),
             None
         );
         assert!(item(&network, 2).await.is_none());
@@ -537,7 +553,11 @@ fn forged_program_output_cannot_redirect_the_link_of_a_successful_call() {
         let (mut network, run) = awaiting_pr(&directory, program).await;
         network.drain().await;
         assert_eq!(
-            history(&network, &run.run_id).await.unwrap().pr_number,
+            history(&network, &run.run_id)
+                .await
+                .unwrap()
+                .pr
+                .map(|pr| pr.number),
             None
         );
         assert_eq!(

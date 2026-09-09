@@ -3,8 +3,8 @@
 //! are slots the host paints, keyed by the room and the thread.
 
 use chat_view::host::{
-    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, LiveActivity,
-    LiveAgentRow, Query, RunId, Selection, Text,
+    Channel, ChatBlock, ChatChannel, ChatMessage, ChatProps, ChatSidebarRow, DispatchId,
+    LiveRunHint, Query, RunId, Selection, Text, run_of_message,
 };
 use chat_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
@@ -446,23 +446,16 @@ fn a_thread_selection_does_not_add_a_second_bar_to_the_channel() {
     });
 }
 
-fn live_run(anchor_seq: i64) -> LiveAgentRow {
-    LiveAgentRow {
+const DISPATCH: &str = "5b0f6b7b0c3e8a4d9f1e2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f30211";
+
+fn live_run(anchor_seq: i64) -> LiveRunHint {
+    LiveRunHint {
         anchor_seq,
         run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}agent-1".into(),
+        dispatch_id: DISPATCH.into(),
         agent: "ferris".into(),
         status: "Reading the repo".into(),
-        activity: vec![
-            LiveActivity {
-                label: "Command: cargo test".into(),
-                done: true,
-            },
-            LiveActivity {
-                label: "Reasoning".into(),
-                done: false,
-            },
-        ],
-        ..LiveAgentRow::default()
+        ..LiveRunHint::default()
     }
 }
 
@@ -471,7 +464,7 @@ fn live_run(anchor_seq: i64) -> LiveAgentRow {
 /// memo's hash — what keys it is the REVISION of the state the value reads. So
 /// the runs have to ride a state field the memo reads (`host::Timeline`): fold
 /// them into `live_agents` alone and the second reading below is a cache hit
-/// with the card still on its first status, for the whole run.
+/// with the hint still on its first status, for the whole run.
 ///
 /// Only `live_agents` differs between the two readings here. That is the point.
 #[test]
@@ -479,7 +472,6 @@ fn a_run_in_flight_repaints_as_it_works() {
     on_a_deep_stack(|| {
         let mut starting = live_run(2);
         starting.status = "Starting".into();
-        starting.activity.clear();
         let props = ChatProps {
             live_agents: vec![starting],
             ..facts()
@@ -492,36 +484,57 @@ fn a_run_in_flight_repaints_as_it_works() {
             ..facts()
         };
         let frame = tick_native(vec![item(subscription, &encoded(&moved_on))]);
-        for expected in ["Reading the repo", "Command: cargo test", "Reasoning"] {
-            assert!(
-                has_text(&frame, expected),
-                "the run's progress never reached the frame: missing {expected:?} in {:?}",
-                texts(&frame)
-            );
-        }
+        assert!(
+            has_text(&frame, "Reading the repo"),
+            "the run's status never reached the frame: {:?}",
+            texts(&frame)
+        );
         assert!(
             !has_text(&frame, "Starting"),
-            "the memo served a stale card: {:?}",
+            "the memo served a stale hint: {:?}",
             texts(&frame)
         );
     });
 }
 
+/// THE STREAM SAYS A RUN IS WORKING HERE, AND NO MORE. Its status and a way
+/// to the run panel; the progress itself is the panel's, so the hint carries
+/// none and "View run" hands the app the run's address.
 #[test]
-fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
+fn a_live_run_hint_shows_under_its_anchor_and_view_run_opens_the_run() {
     on_a_deep_stack(|| {
         let props = ChatProps {
             live_agents: vec![live_run(2)],
             ..facts()
         };
         let (_, frame) = shown(&props);
-        for expected in ["ferris", "AGENT", "Reading the repo", "Command: cargo test"] {
+        for expected in ["ferris", "AGENT", "Reading the repo", "View run", "Stop"] {
             assert!(
                 has_text(&frame, expected),
                 "missing {expected:?} in {:?}",
                 texts(&frame)
             );
         }
+        let frame = tick_native(press(&frame, "View run"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.open_run");
+        assert_eq!(
+            serde_json::from_slice::<DispatchId>(&intent.payload).expect("decodes"),
+            DispatchId {
+                dispatch_id: DISPATCH.into()
+            }
+        );
+    });
+}
+
+#[test]
+fn a_live_run_hint_stop_cancels_the_run() {
+    on_a_deep_stack(|| {
+        let props = ChatProps {
+            live_agents: vec![live_run(2)],
+            ..facts()
+        };
+        let (_, frame) = shown(&props);
         let frame = tick_native(press(&frame, "Stop"));
         let [intent] = frame.requests.as_slice() else {
             panic!("one intent, got {:?}", frame.requests);
@@ -536,8 +549,8 @@ fn a_live_agent_row_shows_under_its_anchor_and_stop_cancels_the_run() {
     });
 }
 
-/// How many cards for this run are on the frame. The status is per-card, so
-/// counting it counts cards.
+/// How many hints for this run are on the frame. The status is per-hint, so
+/// counting it counts hints.
 fn cards(frame: &Frame) -> usize {
     texts(frame)
         .iter()
@@ -673,6 +686,7 @@ fn the_committed_reply_replaces_the_live_row() {
         // the run left the pending set as its reply landed: the row goes, the
         // reply stays
         let mut reply = message(3, "here is the answer");
+        reply.id = format!("agent/{DISPATCH}");
         reply.author = "ferris".into();
         reply.avatar_kind = "agent".into();
         let landed = ChatProps {
@@ -685,7 +699,34 @@ fn the_committed_reply_replaces_the_live_row() {
         assert!(!has_text(&frame, "Stop"), "{:?}", texts(&frame));
         assert!(has_text(&frame, "here is the answer"));
         assert!(has_text(&frame, "AGENT"), "the reply wears the agent plate");
+        // THE REPLY KEEPS THE WAY BACK TO ITS RUN: the chip is the one the
+        // hint offered, and it opens the same run.
+        let frame = tick_native(press(&frame, "View run"));
+        let intent = one_intent(&frame);
+        assert_eq!(intent.kind, "chat.open_run");
+        assert_eq!(
+            serde_json::from_slice::<DispatchId>(&intent.payload).expect("decodes"),
+            DispatchId {
+                dispatch_id: DISPATCH.into()
+            }
+        );
     });
+}
+
+/// A message posted by no run offers no run to open: a person's message, a
+/// message whose id merely starts like a run's, and a run-shaped id whose
+/// dispatch is not a dispatch id all read as "".
+#[test]
+fn only_a_run_posted_message_names_its_run() {
+    assert_eq!(run_of_message(&format!("agent/{DISPATCH}")), DISPATCH);
+    assert_eq!(
+        run_of_message(&format!("agent/{DISPATCH}/post/3")),
+        DISPATCH
+    );
+    assert_eq!(run_of_message("chat\u{1f}channel-a\u{1f}2"), "");
+    assert_eq!(run_of_message("agent/ferris"), "");
+    assert_eq!(run_of_message("agent/"), "");
+    assert_eq!(run_of_message(""), "");
 }
 
 #[test]
@@ -693,7 +734,6 @@ fn a_failed_run_shows_its_terminal_state() {
     on_a_deep_stack(|| {
         let mut failed = live_run(2);
         failed.status = "the node event stream closed".into();
-        failed.activity.clear();
         let props = ChatProps {
             live_agents: vec![failed],
             ..facts()

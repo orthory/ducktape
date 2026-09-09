@@ -500,14 +500,13 @@ impl RunsModule {
                 "committed PR output names another repository or invalid number".into(),
             ));
         }
+        let pr = PrRef {
+            repo: opened.repo,
+            number: opened.number,
+        };
         self.pending_pr_links
-            .insert(request.view.run_id.clone(), opened.number);
-        self.record(
-            &request.view.run_id,
-            crate::RunFact::PrLinked {
-                number: opened.number,
-            },
-        );
+            .insert(request.view.run_id.clone(), pr.clone());
+        self.record(&request.view.run_id, crate::RunFact::PrLinked { pr });
         Ok(())
     }
 

@@ -38,7 +38,13 @@ use std::collections::BTreeMap;
 use index_guest::{Fail, MAX_SCAN_LIMIT, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
-use crate::{RunEvent, RunFact, RunOutcome, decode_assigned, dispatch_id_for};
+use crate::{
+    ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND,
+    ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT,
+    ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
+    OP_AGENT_CALL, OP_REPLY, PageSource, PrRef, RunEvent, RunFact, RunOutcome, decode_assigned,
+    delegated_run_id_for, dispatch_id_for, page_source,
+};
 use sdk::Origin as RunOrigin;
 
 /// [`Fail`] code: an applied op's assigned stamp did not decode — interface
@@ -96,8 +102,305 @@ pub struct RunView {
     pub state: RunState,
     /// actions the run staged, on either lane.
     pub actions: u64,
-    /// the forge PR the run opened or updated, once authenticated.
-    pub pr_number: Option<u64>,
+    /// where the run was called from; `None` for a delegated run, whose
+    /// caller is a run rather than a place.
+    pub origin: Option<RunPlace>,
+    /// every place the run's journal names, in the order it named them, each
+    /// once: what its receipts landed on and what it settled with.
+    pub places: Vec<RunPlace>,
+}
+
+/// one addressable resource a run's journal names — the origin it answers,
+/// a destination a receipt resolved, an id a receipt minted, an output it
+/// settled with. Every variant is one place the app can open.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunPlace {
+    /// a chat message: the anchor the run answers, or the thread root it
+    /// posted under.
+    ChatMessage {
+        channel_id: String,
+        seq: u64,
+    },
+    /// a channel the run posted into at top level.
+    Channel {
+        channel_id: String,
+    },
+    /// a page block: the block a run was called on, a comment's target, a
+    /// todo it ticked. A page's root block is the page itself.
+    PageBlock {
+        block_id: String,
+    },
+    /// a page comment thread the run was called in or commented into.
+    PageThread {
+        thread_id: String,
+    },
+    /// a page the run made.
+    Page {
+        page_id: String,
+        title: String,
+    },
+    Job {
+        job_id: String,
+    },
+    Task {
+        task_id: String,
+    },
+    /// a duckfs path the run wrote.
+    File {
+        path: String,
+    },
+    /// a module the run proposed an update of.
+    Module {
+        module_id: String,
+    },
+    /// a collaboration conversation the run messaged or acknowledged in.
+    Conversation {
+        conversation_id: String,
+    },
+    /// another run: the callee of an `agent.call`, by its dispatch id.
+    Run {
+        dispatch_id: String,
+    },
+    /// a forge tracker item: the issue or PR a run was called on, or the
+    /// PR its sink opened or updated.
+    ForgeItem {
+        repo: String,
+        number: u64,
+    },
+    /// what the run produced: forge `branch@commit` or a duckfs snapshot.
+    Output {
+        output_ref: String,
+    },
+}
+
+/// the place a run was called from, read off its dispatch fact. A delegated
+/// run has none: its caller is a run, and the journal keys that edge by its
+/// delegation id rather than a place.
+fn origin_place(channel_id: &str, anchor_seq: u64, job_id: &Option<String>) -> Option<RunPlace> {
+    if let Some(job_id) = job_id {
+        return Some(RunPlace::Job {
+            job_id: job_id.clone(),
+        });
+    }
+    match page_source(channel_id) {
+        Some(PageSource::Block(block_id)) => {
+            return Some(RunPlace::PageBlock {
+                block_id: block_id.into(),
+            });
+        }
+        Some(PageSource::CommentThread(thread_id)) => {
+            return Some(RunPlace::PageThread {
+                thread_id: thread_id.into(),
+            });
+        }
+        None => {}
+    }
+    if let Some(item) = crate::forge_source::parse_forge_channel(channel_id) {
+        return Some(RunPlace::ForgeItem {
+            repo: item.repo.into(),
+            number: item.number,
+        });
+    }
+    let has_anchor = !channel_id.is_empty() && anchor_seq != 0;
+    has_anchor.then(|| RunPlace::ChatMessage {
+        channel_id: channel_id.into(),
+        seq: anchor_seq,
+    })
+}
+
+/// a chat destination as its receipts name it: under a thread root, or at
+/// the channel's top level.
+fn chat_place(channel_id: String, thread: Option<u64>) -> RunPlace {
+    match thread {
+        Some(seq) => RunPlace::ChatMessage { channel_id, seq },
+        None => RunPlace::Channel { channel_id },
+    }
+}
+
+/// the receipt shapes the catalog's operations mint, decoded by operation
+/// name. `reply` nests the destination it resolved; every explicit operation
+/// reports its coordinates flat.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReplyDestinationReceipt {
+    Chat {
+        channel_id: String,
+        #[serde(default)]
+        thread: Option<u64>,
+    },
+    Page {
+        target: String,
+    },
+    PageThread {
+        thread_id: String,
+    },
+    Job {
+        job_id: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct ReplyReceipt {
+    destination: ReplyDestinationReceipt,
+}
+
+#[derive(Deserialize)]
+struct ChatPostReceipt {
+    channel_id: String,
+    #[serde(default)]
+    thread: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PageCommentReceipt {
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    thread_id: String,
+}
+
+#[derive(Deserialize)]
+struct BlockReceipt {
+    block_id: String,
+}
+
+#[derive(Deserialize)]
+struct PageReceipt {
+    page_id: String,
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct JobReceipt {
+    job_id: String,
+}
+
+#[derive(Deserialize)]
+struct TaskReceipt {
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+struct FileReceipt {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ModuleReceipt {
+    module_id: String,
+}
+
+#[derive(Deserialize)]
+struct ConversationReceipt {
+    conversation_id: String,
+}
+
+#[derive(Deserialize)]
+struct DelegationReceipt {
+    delegation_id: String,
+    callee_agent_id: String,
+}
+
+fn receipt<T: for<'de> Deserialize<'de>>(result: &serde_json::Value) -> Option<T> {
+    serde_json::from_value(result.clone()).ok()
+}
+
+/// the place one staged action landed on, from the receipt its preparer
+/// minted. A reaction names its anchor, which the origin already does; an
+/// effect with no receipt (the forge sink's label) names nothing here — its
+/// PR arrives as its own fact once authenticated.
+fn acted_place(operation: &str, result: &serde_json::Value) -> Option<RunPlace> {
+    match operation {
+        OP_REPLY => {
+            let ReplyReceipt { destination } = receipt(result)?;
+            Some(match destination {
+                ReplyDestinationReceipt::Chat { channel_id, thread } => {
+                    chat_place(channel_id, thread)
+                }
+                ReplyDestinationReceipt::Page { target } => {
+                    RunPlace::PageBlock { block_id: target }
+                }
+                ReplyDestinationReceipt::PageThread { thread_id } => {
+                    RunPlace::PageThread { thread_id }
+                }
+                ReplyDestinationReceipt::Job { job_id } => RunPlace::Job { job_id },
+            })
+        }
+        ACTION_CHAT_POST_MESSAGE => {
+            let ChatPostReceipt { channel_id, thread } = receipt(result)?;
+            Some(chat_place(channel_id, thread))
+        }
+        ACTION_PAGES_COMMENT => {
+            let PageCommentReceipt { target, thread_id } = receipt(result)?;
+            let has_block_target = !target.is_empty();
+            Some(match has_block_target {
+                true => RunPlace::PageBlock { block_id: target },
+                false => RunPlace::PageThread { thread_id },
+            })
+        }
+        ACTION_PAGES_SET_CHECKED => {
+            let BlockReceipt { block_id } = receipt(result)?;
+            Some(RunPlace::PageBlock { block_id })
+        }
+        ACTION_PAGES_POST => {
+            let PageReceipt { page_id, title } = receipt(result)?;
+            Some(RunPlace::Page { page_id, title })
+        }
+        ACTION_JOBS_COMMENT => {
+            let JobReceipt { job_id } = receipt(result)?;
+            Some(RunPlace::Job { job_id })
+        }
+        ACTION_TASKS_CREATE | ACTION_TASKS_UPDATE_STATUS => {
+            let TaskReceipt { task_id } = receipt(result)?;
+            Some(RunPlace::Task { task_id })
+        }
+        ACTION_DUCKFS_WRITE_TEXT => {
+            let FileReceipt { path } = receipt(result)?;
+            Some(RunPlace::File { path })
+        }
+        ACTION_MODULES_UPDATE => {
+            let ModuleReceipt { module_id } = receipt(result)?;
+            Some(RunPlace::Module { module_id })
+        }
+        ACTION_COLLABORATION_SEND | ACTION_COLLABORATION_ACKNOWLEDGE => {
+            let ConversationReceipt { conversation_id } = receipt(result)?;
+            Some(RunPlace::Conversation { conversation_id })
+        }
+        OP_AGENT_CALL => {
+            let DelegationReceipt {
+                delegation_id,
+                callee_agent_id,
+            } = receipt(result)?;
+            Some(RunPlace::Run {
+                dispatch_id: dispatch_id_for(&delegated_run_id_for(
+                    &delegation_id,
+                    &callee_agent_id,
+                )),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn pr_place(pr: &PrRef) -> RunPlace {
+    RunPlace::ForgeItem {
+        repo: pr.repo.clone(),
+        number: pr.number,
+    }
+}
+
+impl RunView {
+    /// name a place once: a second receipt on the same destination is the
+    /// same place, and a PR the settle found is the PR the link confirms.
+    fn touch(&mut self, place: RunPlace) {
+        let known = self.places.contains(&place);
+        if known {
+            return;
+        }
+        self.places.push(place);
+    }
 }
 
 /// one journal entry as the detail view returns it.
@@ -118,7 +421,7 @@ pub struct RunDetail {
 }
 
 /// runs' view requests, externally tagged:
-/// `{"recent": {"agent_id": "bot", "limit": 50}}`, `{"run": {"run_id": "…"}}`.
+/// `{"recent": {"agent_id": "bot", "limit": 50}}`, `{"run": {"dispatch_id": "…"}}`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunsViewQuery {
@@ -130,8 +433,9 @@ pub enum RunsViewQuery {
         #[serde(default)]
         limit: Option<usize>,
     },
-    /// one run and its journal.
-    Run { run_id: String },
+    /// one run and its journal, by the dispatch id that addresses a run
+    /// everywhere outside this module ([`dispatch_id_for`]).
+    Run { dispatch_id: String },
 }
 
 /// runs' view replies.
@@ -257,7 +561,8 @@ fn fold_fact(
                 dispatched: stamp(op),
                 state: RunState::Dispatched,
                 actions: 0,
-                pr_number: None,
+                origin: origin_place(channel_id, *anchor_seq, job_id),
+                places: Vec::new(),
             }
         }
         RunFact::SessionOpened { attempt, holder } => {
@@ -270,11 +575,16 @@ fn fold_fact(
             };
             run
         }
-        RunFact::Acted { .. } => {
+        RunFact::Acted {
+            operation, result, ..
+        } => {
             let Some(mut run) = load_run(read, touched, &dispatch_id)? else {
                 return Ok(());
             };
             run.actions += 1;
+            if let Some(place) = acted_place(operation, result) {
+                run.touch(place);
+            }
             run
         }
         RunFact::Settled {
@@ -283,7 +593,7 @@ fn fold_fact(
             degraded,
             executing_node,
             output_ref,
-            pr_number,
+            pr,
         } => {
             let Some(mut run) = load_run(read, touched, &dispatch_id)? else {
                 return Ok(());
@@ -296,7 +606,14 @@ fn fold_fact(
                 output_ref: output_ref.clone(),
                 at: stamp(op),
             };
-            run.pr_number = pr_number.or(run.pr_number);
+            if let Some(output_ref) = output_ref {
+                run.touch(RunPlace::Output {
+                    output_ref: output_ref.clone(),
+                });
+            }
+            if let Some(pr) = pr {
+                run.touch(pr_place(pr));
+            }
             run
         }
         RunFact::ResultActionRefused { .. } => {
@@ -314,11 +631,11 @@ fn fold_fact(
             }
             run
         }
-        RunFact::PrLinked { number } => {
+        RunFact::PrLinked { pr } => {
             let Some(mut run) = load_run(read, touched, &dispatch_id)? else {
                 return Ok(());
             };
-            run.pr_number = Some(*number);
+            run.touch(pr_place(pr));
             run
         }
     };
@@ -386,8 +703,7 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             };
             RunsViewReply::Runs(runs_under(read, &prefix, limit.unwrap_or(MAX_SCAN_LIMIT))?)
         }
-        RunsViewQuery::Run { run_id } => {
-            let dispatch_id = dispatch_id_for(&run_id);
+        RunsViewQuery::Run { dispatch_id } => {
             let detail = match load_run(read, &Touched::new(), &dispatch_id)? {
                 Some(run) => Some(Box::new(RunDetail {
                     journal: journal_of(read, &dispatch_id)?,
@@ -451,7 +767,16 @@ mod tests {
             degraded: false,
             executing_node: "ab".into(),
             output_ref: None,
-            pr_number: None,
+            pr: None,
+        }
+    }
+
+    fn acted(request: &str, operation: &str, result: serde_json::Value) -> RunFact {
+        RunFact::Acted {
+            request_id: request.into(),
+            lane: crate::LaneKind::Live,
+            operation: operation.into(),
+            result,
         }
     }
 
@@ -472,7 +797,7 @@ mod tests {
     }
 
     fn detail(map: &Map, run_id: &str) -> Option<RunDetail> {
-        let req = serde_json::json!({"run": {"run_id": run_id}});
+        let req = serde_json::json!({"run": {"dispatch_id": dispatch_id_for(run_id)}});
         let reply: RunsViewReply =
             serde_json::from_slice(&serve_view(map, &serde_json::to_vec(&req).unwrap()).unwrap())
                 .unwrap();
@@ -620,12 +945,16 @@ mod tests {
             &mut map,
             &op(2, 0, &[event(RUN, settled(RunOutcome::ResultAccepted))]),
         );
+        let pr = PrRef {
+            repo: "playground".into(),
+            number: 12,
+        };
         fold(
             &mut map,
-            &op(3, 0, &[event(RUN, RunFact::PrLinked { number: 12 })]),
+            &op(3, 0, &[event(RUN, RunFact::PrLinked { pr: pr.clone() })]),
         );
         let run = &recent(&map, None)[0];
-        assert_eq!(run.pr_number, Some(12));
+        assert_eq!(run.places, [pr_place(&pr)]);
         fold(
             &mut map,
             &op(
@@ -678,6 +1007,193 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// THE PLACES ARE THE JOURNAL'S RECEIPTS, each named once: the origin the
+    /// run answers, every destination a receipt resolved or id it minted, the
+    /// output and the PR it settled with — and a PR the settle found is the
+    /// same place the link later confirms.
+    #[test]
+    fn a_run_names_its_origin_and_every_place_its_receipts_touched_once() {
+        let mut map = Map::new();
+        fold(&mut map, &op(1, 0, &[event(RUN, dispatched("bot", 2))]));
+        let run = &recent(&map, None)[0];
+        assert_eq!(
+            run.origin,
+            Some(RunPlace::ChatMessage {
+                channel_id: "general".into(),
+                seq: 2
+            })
+        );
+        assert!(run.places.is_empty());
+
+        let callee = delegated_run_id_for("d1", "helper");
+        fold(
+            &mut map,
+            &op(
+                2,
+                0,
+                &[
+                    event(
+                        RUN,
+                        acted(
+                            "r0",
+                            OP_REPLY,
+                            serde_json::json!({
+                                "destination": {"kind": "chat", "channel_id": "general", "thread": 2},
+                                "id": "agent/x",
+                            }),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r1",
+                            ACTION_CHAT_POST_MESSAGE,
+                            serde_json::json!({"channel_id": "general", "thread": 2, "message_id": "agent/x/post/s1"}),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r2",
+                            ACTION_PAGES_POST,
+                            serde_json::json!({"page_id": "p9", "title": "Duck poem"}),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r3",
+                            ACTION_PAGES_COMMENT,
+                            serde_json::json!({"target": "b4", "thread_id": "t4", "comment_id": "c1"}),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r4",
+                            ACTION_TASKS_CREATE,
+                            serde_json::json!({"task_id": "t-1"}),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r5",
+                            ACTION_DUCKFS_WRITE_TEXT,
+                            serde_json::json!({"path": "/shared/poem.md", "base_snapshot": null}),
+                        ),
+                    ),
+                    event(
+                        RUN,
+                        acted(
+                            "r6",
+                            OP_AGENT_CALL,
+                            serde_json::json!({"delegation_id": "d1", "callee_agent_id": "helper"}),
+                        ),
+                    ),
+                    // a reaction names the anchor the origin already does
+                    event(
+                        RUN,
+                        acted("r7", crate::OP_REACT, serde_json::json!({"emoji": "👀"})),
+                    ),
+                    // the forge sink's label carries no receipt
+                    event(RUN, acted("r8", "forge", serde_json::Value::Null)),
+                ],
+            ),
+        );
+        let pr = PrRef {
+            repo: "playground".into(),
+            number: 7,
+        };
+        fold(
+            &mut map,
+            &op(
+                3,
+                0,
+                &[event(
+                    RUN,
+                    RunFact::Settled {
+                        outcome: RunOutcome::ResultAccepted,
+                        reason: None,
+                        degraded: false,
+                        executing_node: "ab".into(),
+                        output_ref: Some("agent/poem@abc123".into()),
+                        pr: Some(pr.clone()),
+                    },
+                )],
+            ),
+        );
+        fold(
+            &mut map,
+            &op(4, 0, &[event(RUN, RunFact::PrLinked { pr: pr.clone() })]),
+        );
+        let run = detail(&map, RUN).unwrap().run;
+        assert_eq!(run.actions, 9);
+        assert_eq!(
+            run.places,
+            [
+                RunPlace::ChatMessage {
+                    channel_id: "general".into(),
+                    seq: 2
+                },
+                RunPlace::Page {
+                    page_id: "p9".into(),
+                    title: "Duck poem".into()
+                },
+                RunPlace::PageBlock {
+                    block_id: "b4".into()
+                },
+                RunPlace::Task {
+                    task_id: "t-1".into()
+                },
+                RunPlace::File {
+                    path: "/shared/poem.md".into()
+                },
+                RunPlace::Run {
+                    dispatch_id: dispatch_id_for(&callee)
+                },
+                RunPlace::Output {
+                    output_ref: "agent/poem@abc123".into()
+                },
+                pr_place(&pr),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_called_from_a_page_a_job_or_a_forge_item_names_that_origin() {
+        let origin = |channel_id: &str, anchor_seq: u64, job_id: Option<&str>| {
+            origin_place(channel_id, anchor_seq, &job_id.map(str::to_string))
+        };
+        assert_eq!(
+            origin("", 0, Some("job-1")),
+            Some(RunPlace::Job {
+                job_id: "job-1".into()
+            })
+        );
+        assert_eq!(
+            origin(&crate::page_channel_id("t7"), 1, None),
+            Some(RunPlace::PageThread {
+                thread_id: "t7".into()
+            })
+        );
+        assert_eq!(
+            origin(&crate::page_block_channel_id("b3"), 1, None),
+            Some(RunPlace::PageBlock {
+                block_id: "b3".into()
+            })
+        );
+        assert_eq!(
+            origin("forge:playground:4", 1, None),
+            Some(RunPlace::ForgeItem {
+                repo: "playground".into(),
+                number: 4
+            })
+        );
+        // a delegated run answers a caller run, not a place
+        assert_eq!(origin("", 0, None), None);
     }
 
     #[test]
