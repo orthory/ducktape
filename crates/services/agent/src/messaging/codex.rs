@@ -151,7 +151,9 @@ pub enum Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadState {
     Idle,
-    Running { turn_id: String },
+    Running {
+        turn_id: String,
+    },
     /// the thread is not loaded, so there is nothing to start or steer.
     NotLoaded,
 }
@@ -238,10 +240,40 @@ impl CodexAppServer {
             }),
             Plan::Start => Attempt::Settled(self.rpc.turn_start(&self.thread_id, offer).await),
             Plan::Steer { expected_turn } => {
-                self.rpc.turn_steer(&self.thread_id, &expected_turn, offer).await
+                self.rpc
+                    .turn_steer(&self.thread_id, &expected_turn, offer)
+                    .await
             }
         }
     }
+}
+
+// ThreadResumeResponse carries status and turns inside `thread`, not a
+// top-level turn. Only a confirmed idle status permits a new turn.
+fn resumed_thread_state(resumed: &serde_json::Value) -> Result<ThreadState, String> {
+    let thread = &resumed["thread"];
+    match thread["status"]["type"].as_str() {
+        Some("idle") => Ok(ThreadState::Idle),
+        Some("notLoaded") => Ok(ThreadState::NotLoaded),
+        Some("active") => resumed_active_turn(thread),
+        _ => Err("thread_status_unavailable".to_string()),
+    }
+}
+
+fn resumed_active_turn(thread: &serde_json::Value) -> Result<ThreadState, String> {
+    let turns = thread["turns"]
+        .as_array()
+        .ok_or("active_turn_unavailable")?;
+    let mut active = turns.iter().filter(|turn| turn["status"] == "inProgress");
+    let turn = active.next().ok_or("active_turn_unavailable")?;
+    let turn_id = turn["id"].as_str().ok_or("active_turn_unavailable")?;
+    let ambiguous = active.next().is_some() || turn_id.is_empty();
+    if ambiguous {
+        return Err("active_turn_unavailable".to_string());
+    }
+    Ok(ThreadState::Running {
+        turn_id: turn_id.to_string(),
+    })
 }
 
 /// the result of one pass at offering.
@@ -318,13 +350,7 @@ impl Rpc {
             )
             .await
             .map_err(|_| "thread_resume_failed".to_string())?;
-        // a resumed thread with no turn running is idle; the notification lane
-        // corrects this the moment one starts.
-        let running = resumed["turn"]["id"].as_str().map(str::to_string);
-        Ok(match running {
-            Some(turn_id) => ThreadState::Running { turn_id },
-            None => ThreadState::Idle,
-        })
+        resumed_thread_state(&resumed)
     }
 
     async fn turn_start(&self, thread_id: &str, offer: &Offer<'_>) -> Outcome {
@@ -565,10 +591,7 @@ mod tests {
             classify_exit(true, b"Error: something scary on stderr"),
             Outcome::Accepted { .. }
         ));
-        assert!(matches!(
-            classify_exit(false, b""),
-            Outcome::Refused { .. }
-        ));
+        assert!(matches!(classify_exit(false, b""), Outcome::Refused { .. }));
     }
 
     #[test]
@@ -694,6 +717,53 @@ mod tests {
                 "model output is not a state transition: {noise}"
             );
         }
+    }
+
+    #[test]
+    fn a_resumed_active_thread_uses_the_nested_in_progress_turn() {
+        let response = serde_json::json!({"thread": {
+            "status": {"type": "active", "activeFlags": []},
+            "turns": [
+                {"id": "old", "status": "completed"},
+                {"id": "live", "status": "inProgress"}
+            ]
+        }});
+        let state = resumed_thread_state(&response).unwrap();
+        assert_eq!(
+            state,
+            ThreadState::Running {
+                turn_id: "live".into()
+            }
+        );
+        assert_eq!(
+            plan(&state, false),
+            Plan::Defer {
+                reason: "turn_busy"
+            }
+        );
+        assert_eq!(
+            plan(&state, true),
+            Plan::Steer {
+                expected_turn: "live".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_resumed_thread_needs_an_explicit_idle_status_to_start() {
+        for thread in [
+            serde_json::json!({"status": {"type": "active"}, "turns": []}),
+            serde_json::json!({"status": {"type": "systemError"}}),
+            serde_json::json!({}),
+        ] {
+            assert!(resumed_thread_state(&serde_json::json!({"thread": thread})).is_err());
+        }
+        assert_eq!(
+            resumed_thread_state(&serde_json::json!({"thread": {
+                "status": {"type": "idle"}, "turns": [{"id":"old", "status":"completed"}]
+            }})),
+            Ok(ThreadState::Idle)
+        );
     }
 
     /// A CLI that is not installed leaves the message queued rather than
