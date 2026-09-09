@@ -296,7 +296,7 @@ fn the_more_button_opens_the_menu_and_the_heart_opens_the_grid() {
             {
                 return *on_press;
             }
-            node.children().iter().find_map(|node| emoji_button(node))
+            node.children().iter().find_map(emoji_button)
         }
         let message = emoji_button(frame.root.as_ref().unwrap()).expect("duck reaction button");
         let frame = tick_native(vec![ui_lang_guest::wire::Event::Message(message)]);
@@ -333,7 +333,7 @@ fn a_copy_range_stays_above_the_scroller_and_clear_routes_to_the_host() {
             fn has_bar(node: &Node) -> bool {
                 node.key()
                     .is_some_and(|key| key.contains("/timeline-selection/"))
-                    || node.children().iter().any(|node| has_bar(node))
+                    || node.children().iter().any(has_bar)
             }
             if let Node::Scroll { content, .. } = node {
                 assert!(
