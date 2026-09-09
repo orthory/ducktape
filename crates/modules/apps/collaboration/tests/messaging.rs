@@ -4,9 +4,9 @@
 mod common;
 
 use collaboration::{
-    CollaborationMsg, CollaborationReply, DeliveryState, EventBody, EventPage, MessageKind,
-    ProtectedRead, Reference, Role, SendState, TaskRef, MAX_BODY_BYTES, MAX_REFERENCES,
-    MAX_SEQUENCE, MAX_UNDELIVERED_PER_SENDER, QUEUE_FULL, RECEIPT_PRUNED,
+    CollaborationMsg, CollaborationReply, DeliveryEligibility, DeliveryState, EventBody, EventPage,
+    MessageKind, ProtectedRead, Reference, Role, SendState, TaskRef, MAX_BODY_BYTES,
+    MAX_REFERENCES, MAX_SEQUENCE, MAX_UNDELIVERED_PER_SENDER, QUEUE_FULL, RECEIPT_PRUNED,
 };
 use common::*;
 use futures::executor::block_on;
@@ -39,6 +39,30 @@ async fn one_message() -> (collaboration::Collaboration, Vec<u8>, Vec<u8>, u64) 
         panic!("the send was admitted");
     };
     (module, scene.owner_a, scene.owner_b, seq)
+}
+
+/// the delivery-eligibility verdict `participant`'s bound service (key 20 on
+/// `c1`) gets at agreed time `now`. A free function, not a closure: a closure
+/// returning an async block that borrows its module argument needs an HRTB the
+/// call sites do not deserve.
+async fn eligibility(
+    module: &collaboration::Collaboration,
+    participant: &str,
+    now: u64,
+    seq: u64,
+) -> CollaborationReply {
+    let service = at(now, Origin::External(key(20)));
+    read(
+        module,
+        &service,
+        participant,
+        Some("c1"),
+        ProtectedRead::DeliveryEligibility {
+            conversation_id: "c1".into(),
+            seq,
+        },
+    )
+    .await
 }
 
 #[test]
@@ -1040,6 +1064,365 @@ fn a_cursor_below_the_retained_floor_gets_an_explicit_history_gap() {
                 floor_seq: seq + 1
             },
             "a consumer behind the floor resyncs, it does not advance blind"
+        );
+    });
+}
+
+/// `reply_to` names a MESSAGE. Every committed change takes an event sequence —
+/// a roster change, a delivery advance — so a range check would let a
+/// `SetRoster` event be the parent of a reply, and a reader threading by
+/// `reply_to` would find no message there at all.
+#[test]
+fn a_reply_answers_a_message_not_any_event_sequence() {
+    block_on(async {
+        let (mut module, alice_key, _bob_key, seq) = one_message().await;
+        let mut alice = at(6, Origin::External(alice_key));
+
+        // the sequence just below the first message is the roster event that
+        // seated bob — a real, retained, in-range event that is not a message.
+        let roster_event = seq - 1;
+        let refusal = apply(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(collaboration::SendRequest {
+                reply_to: Some(roster_event),
+                ..note("c1", "alice", "bob", 1, 2, 100)
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("not a retained message"),
+            "{refusal:?}"
+        );
+
+        // the message itself is a parent.
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(collaboration::SendRequest {
+                reply_to: Some(seq),
+                ..note("c1", "alice", "bob", 1, 2, 100)
+            }),
+        )
+        .await;
+    });
+}
+
+/// `ExpireMessage` is permissionless BECAUSE it checks the clock: every caller
+/// asking gets the same answer. Reaching the same terminal state through an
+/// acknowledgement would route around that check — a bound service, or the
+/// participant's own owner, could settle a still-live message and free its
+/// queue slot early.
+///
+/// A LATE report is a different thing and stays admissible (see
+/// [`a_late_authentic_acceptance_beats_the_sweeper_and_is_not_relabelled`]):
+/// the deadline bounds the resource, not the truth.
+#[test]
+fn expiry_is_never_reported_by_a_service() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner_b = at(2, Origin::External(scene.owner_b.clone()));
+        ok(&mut module, &mut owner_b, bind("c1", "bob", key(20), 0)).await;
+        let mut alice = at(5, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, 100)),
+        )
+        .await;
+        let seq = admitted_seq(&module, &alice, "alice", 1, 1).await;
+        let credential = credential_of(&module, &owner_b, "bob", "c1").await;
+        let claim_expired = |seq, credential| CollaborationMsg::Acknowledge {
+            conversation_id: "c1".into(),
+            seq,
+            binding_credential: credential,
+            state: DeliveryState::Expired,
+            reason: None,
+        };
+
+        // before, exactly at, and after the deadline: the reporter never owns
+        // this state, so the answer does not depend on the clock at all.
+        for (now, when) in [(6, "before"), (100, "at"), (150, "after")] {
+            let mut service = at(now, Origin::External(key(20)));
+            let refusal = apply(&mut module, &mut service, claim_expired(seq, credential))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{refusal:?}").contains("expiry is not reported"),
+                "a service {when} the deadline must not claim expiry: {refusal:?}"
+            );
+        }
+        // the owner is no shortcut either: it authorizes the report, it does
+        // not authorize skipping the clock.
+        let mut owner = at(6, Origin::External(scene.owner_b.clone()));
+        let refusal = apply(&mut module, &mut owner, claim_expired(seq, credential))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refusal:?}").contains("expiry is not reported"),
+            "{refusal:?}"
+        );
+
+        // a timely report still advances, and the record is still open.
+        let mut service = at(7, Origin::External(key(20)));
+        ok(
+            &mut module,
+            &mut service,
+            CollaborationMsg::Acknowledge {
+                conversation_id: "c1".into(),
+                seq,
+                binding_credential: credential,
+                state: DeliveryState::Queued,
+                reason: None,
+            },
+        )
+        .await;
+
+        // and the ONE lawful path to Expired opens at exactly the deadline.
+        let mut sweeper = at(100, Origin::External(key(77)));
+        ok(
+            &mut module,
+            &mut sweeper,
+            CollaborationMsg::ExpireMessage {
+                conversation_id: "c1".into(),
+                seq,
+            },
+        )
+        .await;
+        let bob = at(101, Origin::External(scene.owner_b));
+        let CollaborationReply::Receipt(Some(receipt)) = read(
+            &module,
+            &bob,
+            "bob",
+            None,
+            ProtectedRead::Receipt {
+                conversation_id: "c1".into(),
+                seq,
+            },
+        )
+        .await
+        else {
+            panic!("receipt")
+        };
+        assert_eq!(receipt.state, DeliveryState::Expired);
+    });
+}
+
+/// THE DELIVERY FENCE. A receipt is a LOG — a late but honest acceptance stays
+/// in it, unrelabelled. Eligibility is the forward-looking question a bound
+/// service must ask before handing a message to a provider, and the deadline
+/// decides that one alone: a historical acceptance is a fact, never an
+/// authorization to deliver again.
+///
+/// The time input is the block's agreed `consensus_time`, which the harness
+/// supplies per ctx exactly as a dispatch does — never a caller's clock.
+#[test]
+fn delivery_eligibility_ends_at_the_deadline_while_the_receipt_still_reads() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner_b = at(2, Origin::External(scene.owner_b.clone()));
+        ok(&mut module, &mut owner_b, bind("c1", "bob", key(20), 0)).await;
+        let mut alice = at(5, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, 100)),
+        )
+        .await;
+        let seq = admitted_seq(&module, &alice, "alice", 1, 1).await;
+        let credential = credential_of(&module, &owner_b, "bob", "c1").await;
+        // before the deadline: deliver it, and the answer carries the window.
+        assert_eq!(
+            eligibility(&module, "bob", 99, seq).await,
+            CollaborationReply::Eligibility(DeliveryEligibility::Eligible {
+                state: DeliveryState::Stored,
+                expires_at: 100,
+                asked_at: 99,
+            })
+        );
+
+        // AT the deadline — the exact moment `ExpireMessage` becomes
+        // admissible — eligibility is already false. The two agree about one
+        // moment, and neither needs the other to have run.
+        for now in [100, 101, 5_000] {
+            assert_eq!(
+                eligibility(&module, "bob", now, seq).await,
+                CollaborationReply::Eligibility(DeliveryEligibility::Expired {
+                    expires_at: 100,
+                    asked_at: now,
+                }),
+                "a new delivery must not be authorized at {now}"
+            );
+        }
+
+        // a LATE but authentic acceptance is still recorded — the log is
+        // truthful — and the record having been accepted does not make the
+        // message eligible again.
+        let mut service = at(150, Origin::External(key(20)));
+        for state in [DeliveryState::Queued, DeliveryState::AdapterAccepted] {
+            ok(
+                &mut module,
+                &mut service,
+                CollaborationMsg::Acknowledge {
+                    conversation_id: "c1".into(),
+                    seq,
+                    binding_credential: credential,
+                    state,
+                    reason: None,
+                },
+            )
+            .await;
+        }
+        let bob = at(151, Origin::External(scene.owner_b));
+        let CollaborationReply::Receipt(Some(receipt)) = read(
+            &module,
+            &bob,
+            "bob",
+            None,
+            ProtectedRead::Receipt {
+                conversation_id: "c1".into(),
+                seq,
+            },
+        )
+        .await
+        else {
+            panic!("receipt")
+        };
+        assert_eq!(
+            receipt.state,
+            DeliveryState::AdapterAccepted,
+            "the historical fact stays reportable and unrelabelled"
+        );
+        assert_eq!(
+            eligibility(&module, "bob", 151, seq).await,
+            CollaborationReply::Eligibility(DeliveryEligibility::Settled {
+                state: DeliveryState::AdapterAccepted
+            }),
+            "a settled record is not a new delivery job"
+        );
+    });
+}
+
+/// the verdicts that are NOT about time: a record the service could not
+/// resolve must not be replayed automatically, and an unknown sequence answers
+/// the same token as somebody else's message — probing tells them apart.
+#[test]
+fn eligibility_refuses_a_replay_and_tells_nothing_about_another_mailbox() {
+    block_on(async {
+        let scene = scene("c1").await;
+        let mut module = scene.module;
+        let mut owner_b = at(2, Origin::External(scene.owner_b.clone()));
+        ok(&mut module, &mut owner_b, bind("c1", "bob", key(20), 0)).await;
+        let mut alice = at(5, Origin::External(scene.owner_a.clone()));
+        ok(
+            &mut module,
+            &mut alice,
+            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, 100)),
+        )
+        .await;
+        let seq = admitted_seq(&module, &alice, "alice", 1, 1).await;
+        let credential = credential_of(&module, &owner_b, "bob", "c1").await;
+
+        let mut service = at(6, Origin::External(key(20)));
+        ok(
+            &mut module,
+            &mut service,
+            CollaborationMsg::Acknowledge {
+                conversation_id: "c1".into(),
+                seq,
+                binding_credential: credential,
+                state: DeliveryState::Queued,
+                reason: None,
+            },
+        )
+        .await;
+        ok(
+            &mut module,
+            &mut service,
+            CollaborationMsg::Acknowledge {
+                conversation_id: "c1".into(),
+                seq,
+                binding_credential: credential,
+                state: DeliveryState::DeliveryUnknown,
+                reason: Some("provider_timeout".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            eligibility(&module, "bob", 7, seq).await,
+            CollaborationReply::Eligibility(DeliveryEligibility::NotReplayable),
+            "an unresolved delivery is never retried on its own"
+        );
+        assert_eq!(
+            eligibility(&module, "bob", 7, seq + 99).await,
+            CollaborationReply::Eligibility(DeliveryEligibility::Unknown)
+        );
+        // alice SENT it and is authenticated on the conversation as its owner —
+        // and still learns nothing, because the mailbox is bob's. The same
+        // token an absent sequence gets, so probing cannot tell them apart.
+        let alice_owner = at(7, Origin::External(scene.owner_a));
+        assert_eq!(
+            read(
+                &module,
+                &alice_owner,
+                "alice",
+                None,
+                ProtectedRead::DeliveryEligibility {
+                    conversation_id: "c1".into(),
+                    seq,
+                },
+            )
+            .await,
+            CollaborationReply::Eligibility(DeliveryEligibility::Unknown)
+        );
+    });
+}
+
+#[test]
+fn a_revoked_owner_keeps_history_but_cannot_authorize_new_delivery() {
+    block_on(async {
+        let (mut module, _alice_key, bob_key, seq) = one_message().await;
+        let mut bob = at(6, Origin::External(bob_key));
+        ok(&mut module, &mut bob, bind("c1", "bob", key(20), 0)).await;
+        ok(
+            &mut module,
+            &mut bob,
+            CollaborationMsg::RevokeParticipant {
+                participant_id: "bob".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            read(
+                &module,
+                &bob,
+                "bob",
+                None,
+                ProtectedRead::Receipt {
+                    conversation_id: "c1".into(),
+                    seq
+                }
+            )
+            .await,
+            CollaborationReply::Receipt(Some(_))
+        ));
+        assert_eq!(
+            read(
+                &module,
+                &bob,
+                "bob",
+                None,
+                ProtectedRead::DeliveryEligibility {
+                    conversation_id: "c1".into(),
+                    seq
+                }
+            )
+            .await,
+            CollaborationReply::Denied(collaboration::DenyReason::NotPermitted)
         );
     });
 }

@@ -487,6 +487,11 @@ pub struct RunsModule {
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
     pages: Option<ModuleId>,
+    /// the collaboration module id — the target of the two `collaboration.*`
+    /// operations. genesis config, NOT committed state (never in `root()`).
+    /// `None` on nodes not wired for it, and then those operations refuse
+    /// rather than degrade: an unsent message must never look sent.
+    collaboration: Option<ModuleId>,
     /// this network's chain id, from the genesis `__config` record
     /// (`sdk::genesis_config::CHAIN_ID`) — the ONLY way a fixed component learns
     /// which network it is running on. Genesis config, NOT committed state
@@ -599,6 +604,7 @@ impl RunsModule {
             forge: None,
             files: None,
             pages: None,
+            collaboration: None,
             chain_id: String::new(),
             models: BTreeMap::new(),
             pending_models: BTreeMap::new(),
@@ -723,6 +729,20 @@ impl RunsModule {
             "pages module id must be distinct from the runs module id"
         );
         self.pages = Some(pages);
+        self
+    }
+
+    /// wire the collaboration module so the `collaboration.*` operations have a
+    /// target, after construction — mirrors the injected `Option<ModuleId>`
+    /// collaborators so `new` and every existing call site stay untouched.
+    /// unwired, those operations are refused by name.
+    pub fn with_collaboration_module(mut self, collaboration: impl Into<ModuleId>) -> Self {
+        let collaboration = collaboration.into();
+        assert!(
+            collaboration != self.id,
+            "collaboration module id must be distinct from the runs module id"
+        );
+        self.collaboration = Some(collaboration);
         self
     }
 

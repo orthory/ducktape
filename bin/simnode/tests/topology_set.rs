@@ -10,7 +10,7 @@ mod harness;
 
 use harness::Sim;
 
-/// The default 15-module sim genesis root-hash.
+/// The default 16-module sim genesis root-hash.
 ///
 /// This is the SIM's number and only the sim's: `sim_base` excludes all four of
 /// `acl`, `governance`, `modules` and `valset`, so it is NOT what a node runs
@@ -21,7 +21,7 @@ use harness::Sim;
 /// genesis is a pure function of deployment bytes and bindings, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "f863f808ddfa19f8dc5ef48303d55a49355536bec55f9c5160059ff87bddd9a8";
+    "9c3b5ea01658b32b78d436acd8eafdcfc9b6d7a2618c044da2248be01d73adc9";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -78,7 +78,7 @@ fn default_genesis_composes_topology_sim_base() {
          list is already pinned by the assertion above).\n\
          \n\
          EITHER WAY this is NOT the consensus pin, and updating it proves \
-         nothing about production: `sim_base` is 15 modules and excludes \
+         nothing about production: `sim_base` is 16 modules and excludes \
          acl/valset/governance/modules. The number a network forks on is \
          GENESIS_ROOT_HASH in bin/node/src/host_state.rs — if that moved too, go \
          read its message instead."

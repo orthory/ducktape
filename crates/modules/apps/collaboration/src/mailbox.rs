@@ -276,11 +276,17 @@ pub async fn send(
         )));
     }
 
+    // a reply answers a MESSAGE, not merely a sequence number. every committed
+    // change takes an event sequence — a roster change, a delivery advance, a
+    // prune — so a range check would let a `SetRoster` event be the parent of a
+    // reply, and a reader threading by `reply_to` would find no message there.
+    // the existence check subsumes the retention floor: a pruned message's
+    // record is gone, so its sequence stops being answerable with its body.
     if let Some(reply_to) = request.reply_to {
-        let retained_here = reply_to >= conversation.floor_seq && reply_to < conversation.next_seq;
-        if !retained_here {
+        let parent = store::message(staged, &conversation.id, reply_to).await?;
+        if parent.is_none() {
             return Err(Error::Module(format!(
-                "reply_to {reply_to} is not a retained event of conversation {}",
+                "reply_to {reply_to} is not a retained message of conversation {}",
                 conversation.id
             )));
         }
@@ -561,6 +567,25 @@ pub async fn acknowledge(
         return Err(Error::Module(
             "only the bound service key or the participant's owner may acknowledge".into(),
         ));
+    }
+    // EXPIRY IS THE DEADLINE'S, NOT A REPORTER'S. `expire` is permissionless
+    // precisely because it checks the clock — every caller asking gets the same
+    // answer. Reaching the same terminal state through an acknowledgement would
+    // route around that check: a bound service (or the participant's owner)
+    // could declare a still-live message expired, settle it, and free its queue
+    // slot before its deadline.
+    //
+    // A LATE report is a different thing and stays admissible: the receipt
+    // records what a bound service observed, and a provider that really did
+    // accept the input said so (see
+    // `a_late_authentic_acceptance_beats_the_sweeper_and_is_not_relabelled`).
+    // The deadline bounds the resource, not the truth — anyone may sweep an
+    // unsettled record once it passes.
+    if state == DeliveryState::Expired {
+        return Err(Error::Module(format!(
+            "expiry is not reported: {seq} on {conversation_id} expires at {} by the deadline alone",
+            message.expires_at
+        )));
     }
     if !receipt.state.may_advance_to(state) {
         return Err(Error::Module(format!(

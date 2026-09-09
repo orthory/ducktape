@@ -271,6 +271,15 @@ impl RunsModule {
                 self.conversational_msg(ctx, run_id, entry, &slot, &operation, &mut posts)
                     .await
             }
+            // live lane only, and this is why: the effect must reach
+            // collaboration as `Origin::Program(account)`, which is what the
+            // account's program mints when it claims this proposal. The settle
+            // lane would emit it as `Origin::Module("runs")`, and collaboration
+            // refuses that by design — no module speaks for a participant.
+            Operation::CollaborationSend { .. }
+            | Operation::CollaborationAcknowledge { .. } => {
+                self.collaboration_msg(&operation)
+            }
             Operation::ModulesUpdate(_) => Err(format!(
                 "{} is not available in the {} lane",
                 operation.name(),
