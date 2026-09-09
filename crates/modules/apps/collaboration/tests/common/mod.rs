@@ -25,13 +25,19 @@ pub const MAX_TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::Ti
 pub const NETWORK: &str = "test-net";
 
 pub fn module() -> Collaboration {
+    module_on(NETWORK, MAX_TTL)
+}
+
+/// a module composed for another network, or another delivery ceiling — the
+/// two genesis parameters a fixed component cannot compile in.
+pub fn module_on(network: &str, max_delivery_ttl: u64) -> Collaboration {
     Collaboration::new(
         MODULE,
         IDENTITY,
         TASKS,
         Box::new(MemStore::new()),
-        MAX_TTL,
-        NETWORK,
+        max_delivery_ttl,
+        network,
     )
 }
 
