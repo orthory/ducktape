@@ -5561,17 +5561,32 @@ pub(crate) mod tests {
         connection.rev += 1;
     }
 
-    pub(crate) async fn connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
-        let turn = connection_turn_lock().lock().await;
+    /// One test's turn over the seats: taken with them retired, and
+    /// retiring them again when it ends, so a test outside a turn never
+    /// inherits what a deployment left seated — a pages test reads the
+    /// `pages` seat through `current_page_document`, and a seat another
+    /// test left behind is a document it never staged.
+    pub(crate) struct ConnectionTurn {
+        _held: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ConnectionTurn {
+        fn drop(&mut self) {
+            reset_connection_turn();
+        }
+    }
+
+    pub(crate) async fn connection_turn() -> ConnectionTurn {
+        let held = connection_turn_lock().lock().await;
         reset_connection_turn();
-        turn
+        ConnectionTurn { _held: held }
     }
 
     /// Hold this outside allocation measurement until the render thread joins.
-    pub(crate) fn blocking_connection_turn() -> tokio::sync::MutexGuard<'static, ()> {
-        let turn = connection_turn_lock().blocking_lock();
+    pub(crate) fn blocking_connection_turn() -> ConnectionTurn {
+        let held = connection_turn_lock().blocking_lock();
         reset_connection_turn();
-        turn
+        ConnectionTurn { _held: held }
     }
 
     #[test]
