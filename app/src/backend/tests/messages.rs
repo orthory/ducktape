@@ -1082,7 +1082,10 @@ fn a_shift_press_starts_a_range_and_the_next_one_widens_it() {
     );
 
     let nowhere = copy_range_after_press(2, Timeline, 0, Timeline);
-    assert_eq!((nowhere.anchor, nowhere.head, nowhere.surface), (0, 0, Nowhere));
+    assert_eq!(
+        (nowhere.anchor, nowhere.head, nowhere.surface),
+        (0, 0, Nowhere)
+    );
 }
 
 /// A ROW LIGHTS UP ONLY FOR A RANGE DRAWN WHERE IT LIVES. A reply and a

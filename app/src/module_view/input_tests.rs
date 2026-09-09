@@ -277,7 +277,7 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
             {
                 return Some(*width);
             }
-            node.children().iter().find_map(|node| find(node))
+            node.children().iter().find_map(find)
         }
         let locked = mounted.lock().unwrap();
         let Slot::Ready(guest) = &locked.slot else {
