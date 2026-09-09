@@ -25,17 +25,24 @@ extern crate::host
   MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
   MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
-  RunRow(run_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
+  RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
   JournalEntry(height:str, kind:str, summary:str)
-  RunJournal(run_id:str, entries:[JournalEntry])
-  AgentsProps(rows:[AgentRow], runs:[RunRow], journal:RunJournal, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
+  RunLink(relation:str, kind:str, label:str, url:str)
+  RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
+  LiveActivity(label:str, done:bool)
+  LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
+  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, journal:RunJournal, live:LiveRun, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
   pure runs_summary(runs:&[RunRow]) -> str
   pure run_named(runs:&[RunRow], run_id:&str) -> RunRow
+  pure run_at(runs:&[RunRow], dispatch_id:&str) -> RunRow
   pure empty_journal() -> RunJournal
+  pure empty_live() -> LiveRun
   pure empty_run() -> RunRow
-  pure open_run(run_id:&str) -> bool
+  pure link_glyph(kind:&str) -> str
+  pure open_run(dispatch_id:&str) -> bool
+  pure open_link(url:&str) -> bool
   pure cap_count(caps:&AgentCaps) -> i64
   pure skill_count(skills:&[AgentSkill]) -> i64
   pure row_named(rows:&[AgentRow], id:&str) -> AgentRow
@@ -99,13 +106,16 @@ state
   rows:[AgentRow] = []
   runs:[RunRow] = []
   journal:RunJournal = empty_journal()
+  live:LiveRun = empty_live()
   // which panel the reader is on: the registry (who may act), the runs
   // tracker (what they did, and how it settled) or the messages pane (what was
   // said, and what was delivered). Mutually exclusive by construction — one
   // value, and every panel's content is gated on it.
   panel = "registry"
-  // the run open in the tracker, by run id; "" is none — and its row, as
-  // the register last listed it
+  // the run open in the tracker, by dispatch id; "" is none — and its row,
+  // as the register last listed it. The app owns which run is open (a chat
+  // hint, a bell or a duck://run link opens one from another tab), so the
+  // register's `open_run` is the truth and a press here is the request.
   open_run = ""
   open_row:RunRow = empty_run()
   capabilities:[str] = []
@@ -172,7 +182,9 @@ on props_changed(next)
   rows = next.rows
   runs = next.runs
   journal = next.journal
-  open_row = run_named(runs, open_run)
+  live = next.live
+  open_run = next.open_run
+  open_row = run_at(runs, open_run)
   capabilities = next.capabilities
   actions = next.actions
   account = next.account
@@ -261,16 +273,21 @@ on choose_panel(next)
   panel = next
 
 // Open a run: the app is asked for its journal, which arrives as the next
-// register under this run's id.
+// register under this run's dispatch id.
 on open_run_row(run_id)
-  open_run = run_id
   open_row = run_named(runs, run_id)
-  sent = open_run(run_id)
+  open_run = open_row.dispatch_id
+  sent = open_run(open_row.dispatch_id)
 
 on close_run
   open_run = ""
   open_row = empty_run()
+  live = empty_live()
   sent = open_run("")
+
+// A chip pressed: the app's open plane warps to the place it names.
+on open_place(url)
+  sent = open_link(url)
 
 on pick_capability_option(value)
   draft_capability = some(value)
@@ -751,6 +768,82 @@ view
                       size=10.0
                       @text-hint
                       @font-mono
+                  // THE RUN AS IT RUNS: its status, the steps it has taken
+                  // and the answer forming, off the node's live reading. The
+                  // chat stream only hints that a run is working under its
+                  // message; this is where the progress is drawn.
+                  if live.present
+                    box #live
+                      with
+                        w=fill
+                        px=12.0
+                        py=9.0
+                        bg=warning_bg
+                        border=warning_line
+                        border-w=1.0
+                        r=8.0
+                      col w=fill gap=4.0
+                        text live.status
+                          with
+                            w=fill
+                            size=12.0
+                            @text-fg
+                            @font-medium
+                        for act in live.activity
+                          row w=fill gap=5.0 align=center
+                            if act.done
+                              text "✓"
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            if !act.done
+                              text "…"
+                                with
+                                  size=11.0
+                                  @text-meta
+                                  @font-mono
+                            text act.label
+                              with
+                                w=fill
+                                size=11.0
+                                @text-meta
+                        if !empty(live.answer_preview)
+                          text live.answer_preview
+                            with
+                              w=fill
+                              size=12.0
+                              @text-meta
+                  // RELEVANT: where the run came from and every place it
+                  // touched, folded from its journal's receipts — the thread
+                  // that summoned it, the pages and blocks it wrote, the PR
+                  // it opened, the runs it delegated. Each chip is a duck://
+                  // address the app's open plane warps to; a place the
+                  // protocol cannot address yet draws as a label alone.
+                  if journal.dispatch_id == open_run && !empty(journal.links)
+                    text "Relevant"
+                      with
+                        size=12.5
+                        @text-fg
+                        @font-semibold
+                    flex
+                      with
+                        w=fill
+                        wrap=wrap
+                        gap-x=6.0
+                        gap-y=6.0
+                        items=start
+                      for link in journal.links
+                        if !empty(link.url)
+                          button -> open_place(link.url)
+                            with
+                              label=link.label
+                              h=26.0
+                              p=0.0
+                              @outline_action
+                            RunChip link=link
+                        if empty(link.url)
+                          RunChip link=link
                   if !empty(open_row.reason)
                     box
                       with
@@ -778,18 +871,18 @@ view
                       size=12.5
                       @text-fg
                       @font-semibold
-                  if journal.run_id != open_run
+                  if journal.dispatch_id != open_run
                     text "Reading the journal…"
                       with
                         size=12.0
                         @text-caption
-                  if journal.run_id == open_run && empty(journal.entries)
+                  if journal.dispatch_id == open_run && empty(journal.entries)
                     text "This run's journal has no entries yet — the fold may still be catching up to the chain."
                       with
                         w=fill
                         size=12.0
                         @text-caption
-                  if journal.run_id == open_run
+                  if journal.dispatch_id == open_run
                     for entry in journal.entries
                       row w=fill gap=8.0
                         text entry.height
@@ -2056,3 +2149,29 @@ view
                     p=10.0
                     @primary_action
                   text "Send" size=12.5
+
+// ONE PLACE A RUN TOUCHED, as a chip: the glyph of its kind, `from` when it
+// is where the run was called from, and the place's own label.
+component RunChip(link:RunLink)
+  box
+    with
+      px=9.0
+      py=4.0
+      r=13.0
+    row gap=6.0 align=center
+      text link_glyph(link.kind)
+        with
+          size=11.0
+          @text-meta
+          @font-mono
+      if link.relation == "from"
+        text "from"
+          with
+            size=10.5
+            @text-hint
+            @font-mono
+      text link.label
+        with
+          size=11.5
+          @text-fg
+          @font-medium

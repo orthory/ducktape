@@ -9,7 +9,7 @@
 //! of forge's wire types (`forge` stays a DEV-ONLY dependency; conformance
 //! tests pin every mirror against the real forge codec).
 
-use crate::{CapRequest, ReplyBlock};
+use crate::{CapRequest, PrRef, ReplyBlock};
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
@@ -189,7 +189,7 @@ impl RunsModule {
         message: &str,
         receipt: &WorkspaceReceipt,
         executing_node: &str,
-    ) -> Option<u64> {
+    ) -> Option<PrRef> {
         match sink {
             WireSink::Chain => None,
             WireSink::Pr {
@@ -353,7 +353,10 @@ impl RunsModule {
                 {
                     Ok(Some(number)) => {
                         self.note(ctx, format!("run {run_id} pr sink: updated PR #{number}"));
-                        return Some(number);
+                        return Some(PrRef {
+                            repo: repo.clone(),
+                            number,
+                        });
                     }
                     Ok(None) => {}
                     Err(why) => {

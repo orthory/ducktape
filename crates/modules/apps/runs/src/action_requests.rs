@@ -237,8 +237,7 @@ impl RunsModule {
         let Some(invocation) = &request.invocation else {
             return Ok(());
         };
-        let current = crate::operation_view(&request.view.operation)
-            .map(|view| view.schema_digest);
+        let current = crate::operation_view(&request.view.operation).map(|view| view.schema_digest);
         if current.as_deref() != Some(invocation.schema_digest.as_str()) {
             return Err(Error::Module(
                 "operation schema changed since this action was proposed".into(),
@@ -500,14 +499,13 @@ impl RunsModule {
                 "committed PR output names another repository or invalid number".into(),
             ));
         }
+        let pr = PrRef {
+            repo: opened.repo,
+            number: opened.number,
+        };
         self.pending_pr_links
-            .insert(request.view.run_id.clone(), opened.number);
-        self.record(
-            &request.view.run_id,
-            crate::RunFact::PrLinked {
-                number: opened.number,
-            },
-        );
+            .insert(request.view.run_id.clone(), pr.clone());
+        self.record(&request.view.run_id, crate::RunFact::PrLinked { pr });
         Ok(())
     }
 

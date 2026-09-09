@@ -58,10 +58,67 @@ pub struct LiveAgentRow {
     /// reply posts into that thread, so the rail draws the card there.
     pub thread_root: i64,
     pub run_id: String,
+    /// the run's address, and the key its output stream is watched under
+    pub dispatch_id: String,
     pub agent: String,
     pub status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
+}
+
+/// The chat stream's cut of a run in flight: enough to say a run is working
+/// under its anchor, whose it is, and which run to open for its progress —
+/// never the progress itself, which the run panel draws. What the row knows
+/// beyond this stays out of the timeline's frame budget.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct LiveRunHint {
+    pub channel_id: String,
+    pub anchor_seq: i64,
+    pub thread_root: i64,
+    pub run_id: String,
+    pub dispatch_id: String,
+    pub agent: String,
+    pub status: String,
+}
+
+impl From<&LiveAgentRow> for LiveRunHint {
+    fn from(row: &LiveAgentRow) -> Self {
+        Self {
+            channel_id: row.channel_id.clone(),
+            anchor_seq: row.anchor_seq,
+            thread_root: row.thread_root,
+            run_id: row.run_id.clone(),
+            dispatch_id: row.dispatch_id.clone(),
+            agent: row.agent.clone(),
+            status: row.status.clone(),
+        }
+    }
+}
+
+/// The progress of the run the reader has open in the run panel: the same
+/// reading the chat hint is cut from, drawn in full where there is room for
+/// it. `present` is false when that run is not in flight on this node —
+/// settled, or never dispatched here.
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
+pub struct LiveRun {
+    pub present: bool,
+    pub status: String,
+    pub activity: Vec<LiveActivity>,
+    pub answer_preview: String,
+}
+
+/// The open run's progress out of the node's live reading; an absent run
+/// reads as not present.
+pub fn live_run_for(rows: &[LiveAgentRow], dispatch_id: &str) -> LiveRun {
+    let Some(row) = rows.iter().find(|row| row.dispatch_id == dispatch_id) else {
+        return LiveRun::default();
+    };
+    LiveRun {
+        present: true,
+        status: row.status.clone(),
+        activity: row.activity.clone(),
+        answer_preview: row.answer_preview.clone(),
+    }
 }
 
 /// One reading of the node's pending runs, stamped with the connection it was
@@ -402,6 +459,7 @@ pub fn chat_live_agents(
                         anchor_seq: record["anchor_seq"].as_i64().unwrap_or(0),
                         thread_root: record["thread_root"].as_i64().unwrap_or(0),
                         run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
+                        dispatch_id: dispatch.clone(),
                         agent: labels
                             .get(agent_id)
                             .cloned()

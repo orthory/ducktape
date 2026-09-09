@@ -175,6 +175,7 @@ enum DuckKind
   forge_blob
   channel
   channel_message
+  run
 
 // The second step a forge deep link still owes once its repo is open.
 enum ForgeFocus
@@ -269,6 +270,7 @@ enum AgentsIntent
   save
   register
   open_run
+  open_link
   messaging_open
   messaging_page
   messaging_send
@@ -420,6 +422,7 @@ enum ChatIntent
   thread_delete
   load_thread
   cancel_run
+  open_run
   composer
 
 enum MutationPhase

@@ -325,6 +325,7 @@ component MessageContents(message:ChatMessage, surface:CopySurface)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_message_link(str)
+    open_run(str)
     press_message(i64, CopySurface)
   col w=fill
     row
@@ -410,6 +411,17 @@ component MessageContents(message:ChatMessage, surface:CopySurface)
               wrap=none
               font=code_medium
               @text-muted
+        // THE RUN THAT POSTED THIS. A run's reply and every post it staged
+        // carry its dispatch id in their message id, so the chip is the way
+        // back from the message to the run — its journal, its progress while
+        // it still runs, and every place it touched.
+        if !empty(run_of_message(message.id))
+          row w=fill pt=4.0
+            button "View run" -> emit(open_run, run_of_message(message.id))
+              with
+                h=20.0
+                p=3.0
+                @secondary_action
         // Reactions and the replies button STACK — the artifact gives each its
         // own line under the body, never one shared row.
         if !empty(message.reactions)
@@ -514,6 +526,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_ran
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
     open_message_link(str)
+    open_run(str)
     press_message(i64, CopySurface)
   col w=fill
     if message.show_author
@@ -573,6 +586,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_ran
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
           RowPlate.selected
             box
@@ -592,6 +606,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_ran
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
           RowPlate.ranged
             box
@@ -611,6 +626,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_ran
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
       col w=fill
         if !message.deleted && !message.pending
@@ -748,6 +764,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
     open_thread_message_reactions(i64, str, i64)
     press_message(i64, CopySurface)
     open_message_link(str)
+    open_run(str)
   col w=fill
     if message.show_author
       space w=1.0 h=14.0
@@ -781,6 +798,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
           RowPlate.selected
             box
@@ -800,6 +818,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
           RowPlate.ranged
             box
@@ -819,6 +838,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                   remove_reaction_at
                   open_thread_for
                   open_message_link
+                  open_run
                   press_message
       col w=fill
         if !message.deleted && !message.pending
@@ -982,6 +1002,7 @@ component ComposerGate(reason:str)
 component ThreadParentBlock(message:ChatMessage)
   emits
     open_message_link(str)
+    open_run(str)
   col #root w=fill
     row
       with
@@ -1030,6 +1051,12 @@ component ThreadParentBlock(message:ChatMessage)
                 wrap=none
                 font=code_medium
                 @text-muted
+          if !empty(run_of_message(message.id))
+            button "View run" -> emit(open_run, run_of_message(message.id))
+              with
+                h=20.0
+                p=3.0
+                @secondary_action
           space w=fill
         MessageBody message=message
           forward
@@ -1117,70 +1144,54 @@ component SkeletonRow()
           r=4.0
         space w=1.0 h=1.0
 
-// AN AGENT RUN IN FLIGHT under the message that summoned it: the plate, the
-// status, the steps it has taken and a Stop. It is drawn from the host's live
-// row, never from a chain message; the committed reply takes its place.
-component LiveAgentCard(live:LiveAgentRow)
+// AN AGENT RUN IN FLIGHT under the message that summoned it: whose it is,
+// where it stands, the way to its panel and a Stop. The progress itself is
+// the run panel's to draw — the stream only says that a run is working
+// here. It is drawn from the host's live row, never from a chain message;
+// the committed reply takes its place.
+component LiveRunCard(live:LiveRunHint)
   emits
     cancel_run(str)
-  col
+    open_run(str)
+  row
     with
       w=fill
-      gap=4.0
+      gap=6.0
+      align=center
       pl=37.0
       pr=7.0
       py=4.0
-    row
+    text live.agent
       with
-        w=fill
-        gap=6.0
-        align=center
-      text live.agent
+        size=12.0
+        wrap=none
+        font=code_medium
+        @text-fg
+    box
+      with
+        px=5.0
+        py=2.0
+        bg=primary
+        r=4.0
+      text "AGENT"
         with
-          size=12.0
+          size=9.0
           wrap=none
-          font=code_medium
-          @text-fg
-      box
-        with
-          px=5.0
-          py=2.0
-          bg=primary
-          r=4.0
-        text "AGENT"
-          with
-            size=9.0
-            wrap=none
-            font=code_semibold
-            @text-primary_fg
-      text live.status
-        with
-          size=11.0
-          wrap=none
-          @text-muted
-      button "Stop" -> emit(cancel_run, live.run_id)
-        with
-          h=22.0
-          p=4.0
-          @secondary_action
-    for act in live.activity
-      row gap=5.0 align=center
-        if act.done
-          text "✓"
-            with
-              size=11.0
-              wrap=none
-              @text-muted
-        if !act.done
-          text "…"
-            with
-              size=11.0
-              wrap=none
-              @text-muted
-        text act.label
-          with
-            size=11.0
-            wrap=none
-            @text-muted
-    if !empty(live.answer_preview)
-      text live.answer_preview size=12.5 @text-fg
+          font=code_semibold
+          @text-primary_fg
+    text live.status
+      with
+        size=11.0
+        wrap=none
+        @text-muted
+    space w=fill
+    button "View run" -> emit(open_run, live.dispatch_id)
+      with
+        h=22.0
+        p=4.0
+        @secondary_action
+    button "Stop" -> emit(cancel_run, live.run_id)
+      with
+        h=22.0
+        p=4.0
+        @secondary_action

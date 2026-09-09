@@ -59,13 +59,12 @@ extern crate::host
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmSidebarRow(peer:DmPeer, unread:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
-  LiveActivity(label:str, done:bool)
-  LiveAgentRow(anchor_seq:i64, thread_root:i64, run_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
+  LiveRunHint(anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str)
   // THE TWO LISTS THAT DRAW TOGETHER CROSS THE MEMO BOUNDARY TOGETHER — see
-  // `host::Timeline`. Folding a run's progress into `live_agents` alone leaves
-  // the timeline memo's key unmoved, and the card never repaints.
-  Timeline(messages:[ChatMessage], live_agents:[LiveAgentRow])
-  ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64, live_agents:[LiveAgentRow])
+  // `host::Timeline`. Folding a run's status into `live_agents` alone leaves
+  // the timeline memo's key unmoved, and the hint never repaints.
+  Timeline(messages:[ChatMessage], live_agents:[LiveRunHint])
+  ChatProps(dark:bool, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, search_phase:str, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:str, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:str, sent_serial:i64, live_agents:[LiveRunHint])
   PropsItem(next:ChatProps, error:str)
   subscription props() -> PropsItem
   pure search_phase_of(name:&str) -> SearchPhase
@@ -92,6 +91,8 @@ extern crate::host
   pure send_remove_reaction(seq:i64, emoji:&str) -> bool
   pure send_open_thread(seq:i64) -> bool
   pure send_cancel_run(run_id:&str) -> bool
+  pure send_open_run(dispatch_id:&str) -> bool
+  pure run_of_message(id:&str) -> str
   pure send_message_actions(seq:i64, body:&str, rev:i64) -> bool
   pure send_message_reactions(seq:i64, body:&str, rev:i64) -> bool
   pure send_begin_edit(seq:i64, body:&str, rev:i64) -> bool
@@ -122,9 +123,9 @@ extern crate::host
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
-  pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveAgentRow]) -> Timeline
-  pure run_in_thread(live:&LiveAgentRow, active_thread_seq:i64) -> bool
-  pure rail_owns_run(live:&LiveAgentRow, rail_shown:bool, active_thread_seq:i64) -> bool
+  pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveRunHint]) -> Timeline
+  pure run_in_thread(live:&LiveRunHint, active_thread_seq:i64) -> bool
+  pure rail_owns_run(live:&LiveRunHint, rail_shown:bool, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
   pure thread_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
@@ -187,7 +188,7 @@ state
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages:[ChatMessage] = []
-  live_agents:[LiveAgentRow] = []
+  live_agents:[LiveRunHint] = []
   timeline:Timeline = timeline_of([], [])
   thread_selected_seq = 0
   thread_selected_rev = 0
@@ -507,6 +508,9 @@ on load_more_thread
 on cancel_run(run_id)
   sent = send_cancel_run(run_id)
 
+on open_run(dispatch_id)
+  sent = send_open_run(dispatch_id)
+
 view
   sensor show=chat_viewport_changed resize=chat_viewport_changed
     ChatScreen search_draft<->search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
@@ -611,3 +615,4 @@ view
         delete_thread_message_submit -> delete_thread_message_submit
         load_more_thread -> load_more_thread
         cancel_run -> cancel_run _
+        open_run -> open_run _

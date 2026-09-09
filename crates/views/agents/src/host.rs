@@ -177,6 +177,8 @@ pub struct MessagingProps {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRow {
     pub run_id: String,
+    /// the run's address: what opens it, and what its journal is keyed by
+    pub dispatch_id: String,
     pub agent_id: String,
     pub agent_name: String,
     /// what the run answers: a channel message, a job, or a calling run
@@ -210,13 +212,46 @@ pub struct JournalEntry {
     pub summary: String,
 }
 
-/// The journal of one run, as the app last read it. `run_id` names the run
-/// it belongs to, so a journal that arrives after the reader moved on is
-/// told apart from the one they are looking at.
+/// One place a run touched, as a chip: where it was called from (`relation`
+/// "from") or what its receipts landed on ("touched"). `url` is the duck://
+/// address the chip opens; "" for a place the protocol has no address for
+/// yet, which draws as a label alone.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLink {
+    pub relation: String,
+    /// `chat`, `page`, `forge`, `file`, `task`, `job`, `module`,
+    /// `conversation`, `run` or `output` — the glyph the chip wears
+    pub kind: String,
+    pub label: String,
+    pub url: String,
+}
+
+/// The journal of one run, as the app last read it. `dispatch_id` names the
+/// run it belongs to, so a journal that arrives after the reader moved on
+/// is told apart from the one they are looking at.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunJournal {
-    pub run_id: String,
+    pub dispatch_id: String,
     pub entries: Vec<JournalEntry>,
+    /// the run's origin and every place it touched, as chips
+    pub links: Vec<RunLink>,
+}
+
+/// One step of a running agent: what it is doing, and whether it finished.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveActivity {
+    pub label: String,
+    pub done: bool,
+}
+
+/// The open run's progress off the node's live reading, while it runs:
+/// absent (`present` false) for a run that settled or never opened here.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub present: bool,
+    pub status: String,
+    pub activity: Vec<LiveActivity>,
+    pub answer_preview: String,
 }
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,8 +259,14 @@ pub struct AgentsProps {
     pub rows: Vec<AgentRow>,
     /// every agent's runs, newest dispatch first
     pub runs: Vec<RunRow>,
+    /// the run the app has open for the reader, by dispatch id; "" is none.
+    /// The app owns it because a run is opened from other tabs too — a chat
+    /// hint, a bell, a duck://run link — and the panel follows.
+    pub open_run: String,
     /// the journal of the run the app has open for the reader
     pub journal: RunJournal,
+    /// the open run's progress while it is still running
+    pub live: LiveRun,
     /// every capability tag a node on the network announces
     pub capabilities: Vec<String>,
     /// the action vocabulary a grant draws from
@@ -284,8 +325,38 @@ pub fn run_named(runs: &[RunRow], run_id: &str) -> RunRow {
         .unwrap_or_default()
 }
 
+/// The run listed under `dispatch_id`; an empty row when the list has none.
+pub fn run_at(runs: &[RunRow], dispatch_id: &str) -> RunRow {
+    runs.iter()
+        .find(|run| run.dispatch_id == dispatch_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub fn empty_journal() -> RunJournal {
     RunJournal::default()
+}
+
+pub fn empty_live() -> LiveRun {
+    LiveRun::default()
+}
+
+/// The glyph a chip wears for the kind of place it names.
+pub fn link_glyph(kind: &str) -> String {
+    match kind {
+        "chat" => "#",
+        "page" => "¶",
+        "forge" => "⎇",
+        "file" => "▤",
+        "task" => "☐",
+        "job" => "⚙",
+        "module" => "⬡",
+        "conversation" => "✉",
+        "run" => "▶",
+        "output" => "⇣",
+        _ => "·",
+    }
+    .to_owned()
 }
 
 pub fn empty_run() -> RunRow {
@@ -617,16 +688,26 @@ pub struct Draft {
 /// empty id closes it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRun {
-    pub run_id: String,
+    pub dispatch_id: String,
 }
 
-pub fn open_run(run_id: &str) -> bool {
+pub fn open_run(dispatch_id: &str) -> bool {
     notify(
         "agents.open_run",
         &OpenRun {
-            run_id: run_id.into(),
+            dispatch_id: dispatch_id.into(),
         },
     )
+}
+
+/// A chip pressed: the duck:// address the app's open plane warps to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenLink {
+    pub url: String,
+}
+
+pub fn open_link(url: &str) -> bool {
+    notify("agents.open_link", &OpenLink { url: url.into() })
 }
 
 pub fn status(agent_id: &str, paused: bool) -> bool {

@@ -86,7 +86,16 @@ pub struct RunRecord {
     /// landed, else the duckfs output snapshot, else `None`.
     pub output_ref: Option<String>,
     /// the forge PR this run opened or updated, when the PR sink applied.
-    pub pr_number: Option<u64>,
+    pub pr: Option<PrRef>,
+}
+
+/// one forge pull request: the repository it lives in and its number. A
+/// number alone addresses nothing — forge numbers items per repository.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrRef {
+    pub repo: String,
+    pub number: u64,
 }
 
 // ---- the run journal ----------------------------------------------------------
@@ -136,12 +145,13 @@ pub enum RunFact {
         degraded: bool,
         executing_node: String,
         output_ref: Option<String>,
-        pr_number: Option<u64>,
+        /// the PR the sink found already open on the pushed branch.
+        pr: Option<PrRef>,
     },
     /// a settled run's result action was refused by its program or target.
     ResultActionRefused { request_id: String },
-    /// the forge PR a settled run's sink opened or updated was authenticated.
-    PrLinked { number: u64 },
+    /// the forge PR a settled run's sink opened was authenticated.
+    PrLinked { pr: PrRef },
 }
 
 /// one journal entry: the run a fact is about.

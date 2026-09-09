@@ -113,7 +113,7 @@ fn result_action_rejection_is_committed_sticky_and_does_not_replace_worker_failu
         delivered_at: 2,
         executing_node: "node".into(),
         output_ref: None,
-        pr_number: None,
+        pr: None,
     });
     commit(&mut module);
     let rejection = dispatch::CallOutcomeSummary::Rejected {
@@ -172,7 +172,7 @@ fn a_verified_pr_link_is_staged_and_abort_discards_it() {
         delivered_at: 2,
         executing_node: "node".into(),
         output_ref: None,
-        pr_number: None,
+        pr: None,
     });
     commit(&mut module);
     let output = serde_json::json!({"number":7,"repo":"demo"});
@@ -188,14 +188,14 @@ fn a_verified_pr_link_is_staged_and_abort_discards_it() {
         .stage_completed_pr_link(&request, &outcome, result.clone())
         .unwrap();
     assert_eq!(
-        recent_runs(&module)[0].pr_number,
+        recent_runs(&module)[0].pr,
         None,
         "completion is still uncommitted"
     );
     abort(&mut module);
     commit(&mut module);
     assert_eq!(
-        recent_runs(&module)[0].pr_number,
+        recent_runs(&module)[0].pr,
         None,
         "abort left no link behind"
     );
@@ -206,12 +206,18 @@ fn a_verified_pr_link_is_staged_and_abort_discards_it() {
         .stage_completed_pr_link(&request, &outcome, result)
         .unwrap();
     assert_eq!(
-        recent_runs(&module)[0].pr_number,
+        recent_runs(&module)[0].pr,
         None,
         "an exact repeat still waits for commit"
     );
     commit(&mut module);
-    assert_eq!(recent_runs(&module)[0].pr_number, Some(7));
+    assert_eq!(
+        recent_runs(&module)[0].pr,
+        Some(PrRef {
+            repo: "demo".into(),
+            number: 7
+        })
+    );
     assert_eq!(
         recent_runs(&module).len(),
         1,

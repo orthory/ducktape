@@ -172,28 +172,42 @@ pub struct ChatProps {
     /// The agent runs anchored in THIS room, live while they run; the
     /// committed reply takes a row's place. The host filters by room before
     /// encoding, so a row here is always one of this room's.
-    pub live_agents: Vec<LiveAgentRow>,
+    pub live_agents: Vec<LiveRunHint>,
 }
 
-/// One step of a running agent: what it is doing, and whether it finished.
+/// An agent run in flight under its anchor message: whose it is, where it
+/// stands, and which run to open for its progress. The host's row also
+/// names the room; it is not mirrored, because this screen draws one room.
+/// The run's activity and answer preview are the run panel's to draw, so the
+/// stream never carries them.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
-pub struct LiveActivity {
-    pub label: String,
-    pub done: bool,
-}
-
-/// An agent run in flight under its anchor message. The host's row also names
-/// the room and the dispatch feeding it; neither is mirrored, because this
-/// screen draws one room and cannot act on a dispatch.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
-pub struct LiveAgentRow {
+pub struct LiveRunHint {
     pub anchor_seq: i64,
     pub thread_root: i64,
     pub run_id: String,
+    /// the run's address: what `open_run` hands the app
+    pub dispatch_id: String,
     pub agent: String,
     pub status: String,
-    pub activity: Vec<LiveActivity>,
-    pub answer_preview: String,
+}
+
+/// The run a committed message was posted by, off the message id the runs
+/// module mints for a run's replies: `agent/<dispatch_id>` for the run's one
+/// final reply, `agent/<dispatch_id>/post/<slot>` for a post it staged. ""
+/// for any other message.
+pub fn run_of_message(id: &str) -> String {
+    let Some(rest) = id.strip_prefix("agent/") else {
+        return String::new();
+    };
+    let dispatch = rest.split_once('/').map_or(rest, |(dispatch, _)| dispatch);
+    let is_dispatch_id = dispatch.len() == 64
+        && dispatch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    match is_dispatch_id {
+        true => dispatch.to_owned(),
+        false => String::new(),
+    }
 }
 
 /// One item of the facts subscription: the facts, or why not.
@@ -335,6 +349,12 @@ pub struct Seq {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunId {
     pub run_id: String,
+}
+
+/// The run a "View run" or a message's run chip opens.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DispatchId {
+    pub dispatch_id: String,
 }
 
 /// The message-menu openers: which message, its body and its revision.
@@ -491,6 +511,17 @@ pub fn send_cancel_run(run_id: &str) -> bool {
         "chat.cancel_run",
         &RunId {
             run_id: run_id.into(),
+        },
+    )
+}
+
+/// Take the reader to a run's panel: the live hint's "View run", or the run
+/// chip on a message a run posted.
+pub fn send_open_run(dispatch_id: &str) -> bool {
+    notify(
+        "chat.open_run",
+        &DispatchId {
+            dispatch_id: dispatch_id.into(),
         },
     )
 }
@@ -665,7 +696,7 @@ pub(crate) fn seq_in_copy_range(
 /// Only ask it with a thread actually open: at `active_thread_seq == 0` every
 /// top-level run answers it, since an unreplied run's `thread_root` is 0 too.
 /// Both callers are already inside the rail's visibility gate.
-pub fn run_in_thread(live: &LiveAgentRow, active_thread_seq: i64) -> bool {
+pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
 }
 
@@ -683,21 +714,21 @@ pub fn run_in_thread(live: &LiveAgentRow, active_thread_seq: i64) -> bool {
 /// is open". The channel-settings drawer replaces the rail while
 /// `active_thread_seq` still stands, so suppressing on the seq alone would have
 /// hidden BOTH cards for as long as the drawer was open.
-pub fn rail_owns_run(live: &LiveAgentRow, rail_shown: bool, active_thread_seq: i64) -> bool {
+pub fn rail_owns_run(live: &LiveRunHint, rail_shown: bool, active_thread_seq: i64) -> bool {
     rail_shown && run_in_thread(live, active_thread_seq)
 }
 
 /// The stream and the runs live in it, as one value: the timeline memo hashes
 /// its one dependency, so the two lists that draw together must cross the
-/// boundary together — a run's progress folded into `live_agents` alone would
-/// leave the memo's key unmoved and the card would never repaint.
+/// boundary together — a run's status folded into `live_agents` alone would
+/// leave the memo's key unmoved and the hint would never repaint.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct Timeline {
     pub messages: Vec<ChatMessage>,
-    pub live_agents: Vec<LiveAgentRow>,
+    pub live_agents: Vec<LiveRunHint>,
 }
 
-pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveAgentRow]) -> Timeline {
+pub fn timeline_of(messages: &[ChatMessage], live_agents: &[LiveRunHint]) -> Timeline {
     Timeline {
         messages: messages.to_vec(),
         live_agents: live_agents.to_vec(),

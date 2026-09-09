@@ -212,9 +212,9 @@ impl Module for RunsModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
-            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(
-                crate::catalog(filter.as_deref()),
-            ))),
+            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(crate::catalog(
+                filter.as_deref(),
+            )))),
             RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
                 self.next_module_update().await?,
             ))),
@@ -362,13 +362,13 @@ impl Module for RunsModule {
                 self.history.pop_front();
             }
         }
-        for (run_id, number) in std::mem::take(&mut self.pending_pr_links) {
+        for (run_id, pr) in std::mem::take(&mut self.pending_pr_links) {
             if let Some(record) = self
                 .history
                 .iter_mut()
                 .find(|record| record.run_id == run_id)
             {
-                record.pr_number = Some(number);
+                record.pr = Some(pr);
             }
         }
         for run_id in std::mem::take(&mut self.pending_action_rejections) {

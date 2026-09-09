@@ -589,7 +589,7 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     // The run settles before the program's PR receipt is committed. Wait for
     // that receipt, even when the forge PR itself is already visible.
     let record = cluster.await_committed(0, "run 1 has its PR receipt", FINALIZE, || {
-        run_record(&cluster, 0, &run_1).filter(|record| record.pr_number.is_some())
+        run_record(&cluster, 0, &run_1).filter(|record| record.pr.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 1 is clean: {record:?}");
@@ -597,7 +597,13 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         record.output_ref.as_deref(),
         Some(format!("{WORK_BRANCH}@{run1_oid}").as_str())
     );
-    assert_eq!(record.pr_number, Some(pr_number));
+    assert_eq!(
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: pr_number
+        })
+    );
 
     // ---- run 2: the PR item owns a separate work branch. It forks the PR's
     //      source tip and requests review INTO that branch instead of writing
@@ -645,7 +651,7 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     assert_eq!(child_pr.summary.title, ISSUE_TITLE);
     assert_eq!(child_pr.target_branch.as_deref(), Some(WORK_BRANCH));
     let record = cluster.await_committed(0, "run 2 has its PR receipt", FINALIZE, || {
-        run_record(&cluster, 0, &run_2).filter(|record| record.pr_number.is_some())
+        run_record(&cluster, 0, &run_2).filter(|record| record.pr.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 2 is clean: {record:?}");
@@ -653,7 +659,13 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         record.output_ref.as_deref(),
         Some(format!("{pr_work_branch}@{run2_oid}").as_str())
     );
-    assert_eq!(record.pr_number, Some(child_pr_number));
+    assert_eq!(
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: child_pr_number
+        })
+    );
 
     // ---- run 3: the SAME PR channel continues its own born work branch,
     //      preserving the first PR's source and reusing the child PR.
@@ -737,7 +749,7 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         "the duplicate guard reuses the child PR for the continued session"
     );
     let record = cluster.await_committed(0, "run 3 has its PR receipt", FINALIZE, || {
-        run_record(&cluster, 0, &run_3).filter(|record| record.pr_number.is_some())
+        run_record(&cluster, 0, &run_3).filter(|record| record.pr.is_some())
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 3 is clean: {record:?}");
@@ -746,8 +758,11 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         Some(format!("{pr_work_branch}@{run3_oid}").as_str())
     );
     assert_eq!(
-        record.pr_number,
-        Some(child_pr_number),
+        record.pr,
+        Some(runs::PrRef {
+            repo: REPO.into(),
+            number: child_pr_number
+        }),
         "the ring names the UPDATED PR"
     );
 }
