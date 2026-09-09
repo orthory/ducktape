@@ -64,6 +64,26 @@ use crate::wire::Capabilities;
 /// into an acceptance; it would only delay reporting the uncertainty.
 const VERDICT_WINDOW: Duration = Duration::from_millis(1_500);
 
+/// how long to keep listening after a message is HELD.
+///
+/// Long, because the thing being waited on is a human deciding — an approval
+/// barrier holds a message until somebody looks at it. Bounded all the same,
+/// because each held message costs a task and a map entry, and a session that
+/// went away never says anything again.
+///
+/// It is a local resource bound and NOT a deadline: the message's real deadline
+/// is `expires_at` on the agreed network clock. Nothing here converts one into
+/// the other.
+const HOLD_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// how many verdicts one message's lane holds. A message draws at most two —
+/// the hold, then its resolution — and a peer sending more than a small handful
+/// about one message has stopped making sense.
+const VERDICTS_PER_MESSAGE: usize = 4;
+
+/// one outstanding delivery's verdict lane, as [`Receipts`] holds it.
+type Verdicts = tokio::sync::mpsc::Sender<Status>;
+
 /// one resolved session: everything needed to reach it, and nothing else.
 ///
 /// `token` is a secret. It is never logged, never rendered into an error, and
@@ -209,15 +229,20 @@ impl ClaudeInbox {
     }
 
     /// offer one message to the session's inbox.
-    pub async fn offer(&self, offer: &Offer<'_>) -> Outcome {
-        let correlation = format!(
-            "{}.{}",
-            offer.message_id.generation, offer.message_id.sequence
-        );
+    ///
+    /// The second half of the answer is a [`Follow`]: this adapter's ONE
+    /// acceptance signal is a held message being released, which arrives after
+    /// the first verdict and after this returns. It is `Some` exactly when the
+    /// message is being held and there is still a lane to hear the release on —
+    /// every other path takes the waiter back out here, because a waiter
+    /// registered before the write and never consumed would sit in the map for
+    /// the life of the process.
+    pub async fn offer(&self, offer: &Offer<'_>) -> (Outcome, Option<Follow>) {
+        let correlation = correlation(&offer.message_id);
         // registered BEFORE the write: a verdict can come back the moment the
         // recipient reads the line, and a waiter installed afterwards would
         // race it and read silence.
-        let verdict = self
+        let verdicts = self
             .receipts
             .as_ref()
             .map(|receipts| receipts.expect(&correlation));
@@ -227,46 +252,66 @@ impl ClaudeInbox {
             .map(|receipts| format!("uds:{}", receipts.address().display()));
         let frames = self.frames(offer, &correlation, reply_to.as_deref());
 
-        let outcome = self.write_and_wait(&frames, verdict).await;
-        // the waiter went in before the write, so every path that did not
-        // consume it has to take it back out. A verdict that never arrives —
-        // the session refused the auth line, the socket was gone, the window
-        // passed — otherwise leaves its sender in the map for the life of the
-        // process, and that map only ever grows.
-        if let Some(receipts) = &self.receipts {
-            receipts.forget(&correlation);
-        }
-        outcome
+        let (outcome, verdicts) = self.write_and_wait(&frames, verdicts).await;
+        let holding = matches!(outcome, Outcome::Held { .. });
+        let follow = match (holding, verdicts, &self.receipts) {
+            (true, Some(verdicts), Some(receipts)) => Some(Follow {
+                verdicts,
+                receipts: receipts.clone(),
+                correlation,
+            }),
+            // not held, or nothing left to listen on. The registration goes now.
+            (_, _, receipts) => {
+                if let Some(receipts) = receipts {
+                    receipts.forget(&correlation);
+                }
+                None
+            }
+        };
+        (outcome, follow)
     }
 
     /// write the frames, then wait for whatever the recipient says about them.
+    ///
+    /// Hands the verdict lane back so a held message can keep listening on the
+    /// SAME registration — re-registering after the fact would lose a release
+    /// that landed in between.
     async fn write_and_wait(
         &self,
         frames: &[String],
-        verdict: Option<tokio::sync::oneshot::Receiver<Status>>,
-    ) -> Outcome {
-        match write_frames(&self.attached.socket, frames).await {
+        verdicts: Option<tokio::sync::mpsc::Receiver<Status>>,
+    ) -> (Outcome, Option<tokio::sync::mpsc::Receiver<Status>>) {
+        let written = write_frames(&self.attached.socket, frames).await;
+        let refusal = match written {
             // a socket that is not there is a session that is not running. The
             // item stays queued: a closed session is never silently recreated,
             // and a replacement would not be the session anyone attached.
-            Err(WriteFailed::Unreachable) => Outcome::Deferred {
+            Err(WriteFailed::Unreachable) => Some(Outcome::Deferred {
                 reason: "inbox_unreachable".to_string(),
-            },
+            }),
             // the recipient destroys the connection on a bad auth line, which
             // is the ONE negative signal the socket itself carries.
-            Err(WriteFailed::Rejected) => Outcome::Refused {
+            Err(WriteFailed::Rejected) => Some(Outcome::Refused {
                 reason: "auth_rejected".to_string(),
-            },
-            Err(WriteFailed::Io) => Outcome::Deferred {
+            }),
+            Err(WriteFailed::Io) => Some(Outcome::Deferred {
                 reason: "inbox_write_failed".to_string(),
-            },
-            Ok(()) => match verdict {
-                None => Outcome::Unknown {
+            }),
+            Ok(()) => None,
+        };
+        if let Some(refusal) = refusal {
+            return (refusal, verdicts);
+        }
+        let Some(mut verdicts) = verdicts else {
+            return (
+                Outcome::Unknown {
                     reason: "no_receipt_inbox".to_string(),
                 },
-                Some(verdict) => await_verdict(verdict).await,
-            },
-        }
+                None,
+            );
+        };
+        let outcome = await_verdict(&mut verdicts).await;
+        (outcome, Some(verdicts))
     }
 
     /// the two lines that go down the socket, in order.
@@ -298,8 +343,8 @@ impl ClaudeInbox {
 }
 
 /// map the recipient's verdict, or its silence, onto an outcome.
-async fn await_verdict(verdict: tokio::sync::oneshot::Receiver<Status>) -> Outcome {
-    let Ok(Ok(status)) = tokio::time::timeout(VERDICT_WINDOW, verdict).await else {
+async fn await_verdict(verdicts: &mut tokio::sync::mpsc::Receiver<Status>) -> Outcome {
+    let Ok(Some(status)) = tokio::time::timeout(VERDICT_WINDOW, verdicts.recv()).await else {
         // silence. The message may be sitting in the session's queue, and it
         // may have been dropped for a reason that carries no receipt. Nothing
         // here knows which, so nothing here may say.
@@ -307,6 +352,59 @@ async fn await_verdict(verdict: tokio::sync::oneshot::Receiver<Status>) -> Outco
             reason: "no_acceptance_signal".to_string(),
         };
     };
+    verdict_outcome(status)
+}
+
+/// A held message, still listening on the registration its offer made.
+///
+/// Held is not an ending: the recipient may release it, and that release is the
+/// ONLY acceptance signal a Claude inbox produces. Without this the release
+/// arrived for a waiter that had already been taken out, and a message a human
+/// approved stayed `held` on-chain forever.
+///
+/// It is the OWNER of the registration: dropping it — resolved, timed out, or
+/// the lane task going away — takes the waiter back out of the map.
+pub struct Follow {
+    verdicts: tokio::sync::mpsc::Receiver<Status>,
+    receipts: Arc<Receipts>,
+    correlation: String,
+}
+
+impl Follow {
+    /// Wait for the hold to resolve.
+    ///
+    /// `None` is "nothing more was said": the window passed, or the session
+    /// went away. The record stays `Held` — which is what was observed, is not
+    /// terminal, and is never replayed automatically. Reporting an acceptance
+    /// or a refusal on a timeout would be inventing the one fact this whole
+    /// channel exists to avoid inventing.
+    ///
+    /// [`HOLD_WINDOW`] is a LOCAL resource bound on how long this task lives,
+    /// never an authorization: the message's real deadline is `expires_at` on
+    /// the agreed clock, which the network enforces and this process cannot
+    /// convert into wall-clock seconds.
+    pub async fn resolve(mut self) -> Option<Outcome> {
+        let Ok(Some(status)) = tokio::time::timeout(HOLD_WINDOW, self.verdicts.recv()).await else {
+            return None;
+        };
+        Some(verdict_outcome(status))
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        self.receipts.forget(&self.correlation);
+    }
+}
+
+/// the sender-side identity of one message, as the back-channel spells it.
+fn correlation(message_id: &crate::wire::MessageId) -> String {
+    format!("{}.{}", message_id.generation, message_id.sequence)
+}
+
+/// one verdict as an outcome. Shared by the first wait and the hold follow-up,
+/// so a `delivered` means the same thing whenever it arrives.
+fn verdict_outcome(status: Status) -> Outcome {
     match status {
         // a barrier is holding it. Exposed, not overridden.
         Status::Held => Outcome::Held {
@@ -424,8 +522,13 @@ async fn write_frames(socket: &Path, frames: &[String]) -> Result<(), WriteFaile
 /// process is not a Claude session and does not present itself as one.
 pub struct Receipts {
     address: PathBuf,
-    waiting:
-        std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Status>>>,
+    /// one lane per outstanding delivery, NOT a one-shot: a hold is followed to
+    /// its resolution, so `held` and the `delivered` that releases it are two
+    /// verdicts about one message and both have to reach the same waiter. The
+    /// registration is made once, before the write, and taken out once, by the
+    /// [`Follow`] that owns it — there is no window in between for a release to
+    /// fall through.
+    waiting: std::sync::Mutex<std::collections::HashMap<String, Verdicts>>,
     /// the pids this daemon has bound a session to.
     ///
     /// A unix socket in a shared directory is reachable by anything running as
@@ -504,9 +607,9 @@ impl Receipts {
             .contains(&pid)
     }
 
-    /// register interest in one message's verdict, before it is sent.
-    pub fn expect(&self, correlation: &str) -> tokio::sync::oneshot::Receiver<Status> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    /// register interest in one message's verdicts, before it is sent.
+    pub fn expect(&self, correlation: &str) -> tokio::sync::mpsc::Receiver<Status> {
+        let (tx, rx) = tokio::sync::mpsc::channel(VERDICTS_PER_MESSAGE);
         self.waiting
             .lock()
             .expect("receipt waiters lock poisoned")
@@ -529,16 +632,21 @@ impl Receipts {
 
     /// hand a verdict to whoever is waiting for it.
     ///
+    /// The registration STAYS after a send: a `held` is followed by the
+    /// `delivered` that releases it, and removing the lane on the first would
+    /// drop the second — which is the acceptance signal this adapter has and no
+    /// other. [`Follow`] removes it when it stops listening.
+    ///
     /// A verdict nobody awaits is DROPPED with a debug line rather than
     /// queued: it is a late transition on a message whose delivery attempt has
-    /// already settled, and this daemon does not yet follow a hold to its
-    /// resolution. Buffering it would grow a map nothing drains.
+    /// already settled, and buffering it would grow a map nothing drains.
     fn deliver(&self, correlation: &str, status: Status) {
         let waiter = self
             .waiting
             .lock()
             .expect("receipt waiters lock poisoned")
-            .remove(correlation);
+            .get(correlation)
+            .cloned();
         let Some(waiter) = waiter else {
             tracing::debug!(
                 target: "ducktape::collab",
@@ -548,7 +656,17 @@ impl Receipts {
             );
             return;
         };
-        let _ = waiter.send(status);
+        // `try_send`, because this runs on the connection's read loop and a
+        // waiter that has stopped reading must not stall the peer's other
+        // verdicts. A full lane means this message already has more verdicts
+        // outstanding than a message can honestly have.
+        if waiter.try_send(status).is_err() {
+            tracing::debug!(
+                target: "ducktape::collab",
+                reason = "verdict_lane_full",
+                "dropped a provider verdict: its waiter is not reading"
+            );
+        }
     }
 
     /// read newline-delimited verdicts off one connection, from a peer this
@@ -712,9 +830,9 @@ mod tests {
             ),
         ];
         for (status, expected) in cases {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            tx.send(status.clone()).expect("the waiter is live");
-            let got = match await_verdict(rx).await {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(VERDICTS_PER_MESSAGE);
+            tx.send(status.clone()).await.expect("the waiter is live");
+            let got = match await_verdict(&mut rx).await {
                 Outcome::Accepted { .. } => "accepted",
                 Outcome::Held { .. } => "held",
                 Outcome::Refused { .. } => "refused",
@@ -731,8 +849,8 @@ mod tests {
     /// delivery and fabricating one.
     #[tokio::test(start_paused = true)]
     async fn silence_is_unknown_and_never_an_acceptance() {
-        let (_tx, rx) = tokio::sync::oneshot::channel();
-        let outcome = await_verdict(rx).await;
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(VERDICTS_PER_MESSAGE);
+        let outcome = await_verdict(&mut rx).await;
         let Outcome::Unknown { reason } = outcome else {
             panic!("silence must be unknown, got {outcome:?}");
         };
@@ -743,9 +861,12 @@ mod tests {
     /// we learned nothing, so we say nothing.
     #[tokio::test]
     async fn a_lost_receipt_channel_is_unknown_too() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Status>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Status>(VERDICTS_PER_MESSAGE);
         drop(tx);
-        assert!(matches!(await_verdict(rx).await, Outcome::Unknown { .. }));
+        assert!(matches!(
+            await_verdict(&mut rx).await,
+            Outcome::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -908,11 +1029,15 @@ mod tests {
             attached("sess-abc", Path::new("/tmp/ducktape-no-such-inbox.sock")),
             None,
         );
-        let outcome = inbox.offer(&an_offer("hello")).await;
+        let (outcome, follow) = inbox.offer(&an_offer("hello")).await;
         let Outcome::Deferred { reason } = outcome else {
             panic!("a closed session must not settle, got {outcome:?}");
         };
         assert_eq!(reason, "inbox_unreachable");
+        assert!(
+            follow.is_none(),
+            "nothing was written, so there is no hold to follow"
+        );
     }
 
     /// The back-channel, end to end over a real unix socket: a verdict written
@@ -926,7 +1051,7 @@ mod tests {
         // process a BINDING named. Without this the connection is dropped on
         // the credential check and the waiter below never resolves at all.
         receipts.trust(std::process::id());
-        let waiter = receipts.expect("2.1");
+        let mut waiter = receipts.expect("2.1");
 
         let mut peer = tokio::net::UnixStream::connect(receipts.address())
             .await
@@ -943,7 +1068,29 @@ mod tests {
         peer.flush().await.expect("flushes");
 
         // synchronized on the verdict arriving, not on a sleep.
-        assert_eq!(waiter.await.expect("a verdict arrives"), Status::Held);
+        assert_eq!(
+            waiter.recv().await.expect("a verdict arrives"),
+            Status::Held
+        );
+
+        // and the SECOND one, on the same registration: a held message is
+        // released later, and that release is this adapter's only acceptance
+        // signal. A registration consumed by the first verdict would drop it.
+        let released = serde_json::json!({
+            "type": "control",
+            "action": "peer_message_status",
+            "status": "delivered",
+            "orig_msg_id": "2.1",
+        });
+        peer.write_all(format!("{released}\n").as_bytes())
+            .await
+            .expect("writes");
+        peer.flush().await.expect("flushes");
+        assert_eq!(
+            waiter.recv().await.expect("the release arrives"),
+            Status::Delivered,
+            "the hold's resolution must reach the same waiter as the hold"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

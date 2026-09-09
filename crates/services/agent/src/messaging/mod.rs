@@ -208,11 +208,16 @@ impl Adapter {
         }
     }
 
-    async fn offer(&self, offer: &Offer<'_>) -> Outcome {
+    /// offer one message, and say whether the outcome can still change.
+    ///
+    /// The second half is `Some` only for a HELD message on an adapter that can
+    /// hear it released. The two Codex adapters answer `None` on every path:
+    /// neither surfaces a hold, so neither has a release to report.
+    async fn offer(&self, offer: &Offer<'_>) -> (Outcome, Option<claude::Follow>) {
         match self {
             Adapter::Claude(inbox) => inbox.offer(offer).await,
-            Adapter::CodexQueue(queue) => queue.offer(offer).await,
-            Adapter::CodexManaged(managed) => managed.offer(offer).await,
+            Adapter::CodexQueue(queue) => (queue.offer(offer).await, None),
+            Adapter::CodexManaged(managed) => (managed.offer(offer).await, None),
         }
     }
 }
@@ -824,7 +829,7 @@ impl Deliveries {
             );
             return;
         }
-        let outcome = adapter.offer(&offer).await;
+        let (outcome, follow) = adapter.offer(&offer).await;
         // `Deferred` is the adapter's own statement that it wrote NOTHING —
         // and it is the only thing entitled to make that statement, because
         // `attempting` is already on the disk. Recorded through its own seam
@@ -836,6 +841,59 @@ impl Deliveries {
         }
         let (state, reason) = outcome.record();
         self.settle(&key, deliver, generation, state, reason).await;
+        if let Some(follow) = follow {
+            self.watch_hold(follow, key, deliver.clone(), generation);
+        }
+    }
+
+    /// Follow a held message to its resolution, OFF this binding's lane.
+    ///
+    /// Off it deliberately: the lane is ordered and one delivery deep, and a
+    /// hold waits on a person. Blocking here would stop every message behind
+    /// this one until somebody clicked approve.
+    ///
+    /// The record is already `Held` and already reported. This adds the SECOND
+    /// observation the module's diagram admits (`Held -> AdapterAccepted |
+    /// Refused | Expired`) and nothing else: a window that passes says nothing
+    /// and settles nothing.
+    fn watch_hold(
+        &self,
+        follow: claude::Follow,
+        key: outbox::Key,
+        deliver: wire::Deliver,
+        generation: u64,
+    ) {
+        let plane = self.clone();
+        tokio::spawn(async move {
+            let Some(outcome) = follow.resolve().await else {
+                tracing::debug!(
+                    target: "ducktape::collab",
+                    conversation = %deliver.conversation,
+                    seq = deliver.seq,
+                    reason = "hold_unresolved",
+                    "a held delivery was never resolved; it stays held"
+                );
+                return;
+            };
+            // the generation is re-checked because a hold outlives a bind: the
+            // participant may have moved to another device while a human was
+            // deciding, and the module refuses a receipt from a replaced
+            // attachment anyway. Refusing here keeps the reason local.
+            if !plane.holds_generation(&deliver, generation) {
+                tracing::debug!(
+                    target: "ducktape::collab",
+                    conversation = %deliver.conversation,
+                    seq = deliver.seq,
+                    reason = "binding_replaced",
+                    "a hold resolved after its binding was replaced"
+                );
+                return;
+            }
+            let (state, reason) = outcome.record();
+            plane
+                .settle(&key, &deliver, generation, state, reason)
+                .await;
+        });
     }
 
     /// whether this device still holds the generation a queued delivery was
