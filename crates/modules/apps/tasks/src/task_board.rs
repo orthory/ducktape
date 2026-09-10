@@ -27,11 +27,9 @@
 use std::collections::BTreeSet;
 use std::ops::Bound;
 
-use sdk::{Error, Origin, StagedStore, require_non_empty};
+use sdk::{Error, StagedStore, require_non_empty};
 
-use crate::{
-    Party, Task, TaskMsg, TaskQuery, TaskReply, TaskStatus, check_record, controls, stage_record,
-};
+use crate::{Party, Task, TaskMsg, TaskQuery, TaskReply, TaskStatus, check_record, stage_record};
 
 /// max bytes of a `task_id`, matching the job board's [`crate::MAX_JOB_ID`].
 ///
@@ -129,18 +127,13 @@ async fn load_index(staged: &StagedStore) -> Result<BTreeSet<String>, Error> {
     sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("task index decode: {e}")))
 }
 
-/// Only trusted module code may assign another account's task.
+/// the task's owner: the named account when one is given, else the actor.
+/// ownership is attribution and the per-owner census key, never consent,
+/// so any actor may name any existing account.
 fn resolve_owner(actor: &Party, override_owner: Option<u64>) -> Result<Party, Error> {
     let Some(account) = override_owner else {
         return Ok(actor.clone());
     };
-    let owns_named_account = *actor == Party::Account(account);
-    let may_assign = matches!(actor, Party::Module(_)) || owns_named_account;
-    if !may_assign {
-        return Err(Error::Module(
-            "task owner override requires a module origin or the named account".into(),
-        ));
-    }
     if account == 0 {
         return Err(Error::Module("task owner account must be nonzero".into()));
     }
@@ -198,24 +191,18 @@ async fn create(
     Ok(())
 }
 
+/// move a task's status. any member's op lands: the owner is attribution,
+/// not a consent the update needs.
 async fn update_status(
     staged: &mut StagedStore,
     task_id: String,
     status: TaskStatus,
-    actor: &Party,
-    origin: &Origin,
     consensus_time: u64,
 ) -> Result<(), Error> {
     sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
     let mut task = load(staged, &task_id)
         .await?
         .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-    let is_owner = controls(&task.owner, actor, origin);
-    if !is_owner {
-        return Err(Error::Module(format!(
-            "only the owner may update status: {task_id}"
-        )));
-    }
     // an accepted no-op: it stages NOTHING, so the block's root holds.
     if task.status == status {
         return Ok(());
@@ -232,24 +219,13 @@ async fn update_status(
 }
 
 /// remove a task's record and free its board slot -- the only way the index
-/// (and [`MAX_TASKS`]) ever recedes. gated to the owner, the job board's
-/// `prune` shape.
-async fn delete(
-    staged: &mut StagedStore,
-    task_id: String,
-    actor: &Party,
-    origin: &Origin,
-) -> Result<(), Error> {
+/// (and [`MAX_TASKS`]) ever recedes. any member's op lands, the job board's
+/// `prune` shape; the slot freed is the record owner's, whoever deletes.
+async fn delete(staged: &mut StagedStore, task_id: String) -> Result<(), Error> {
     sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
     let task = load(staged, &task_id)
         .await?
         .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-    let is_owner = controls(&task.owner, actor, origin);
-    if !is_owner {
-        return Err(Error::Module(format!(
-            "only the owner may delete a task: {task_id}"
-        )));
-    }
 
     let owner_live = owner_count(staged, &task.owner).await?;
     let remaining = owner_live
@@ -273,7 +249,6 @@ async fn delete(
 pub(crate) async fn execute(
     staged: &mut StagedStore,
     actor: &Party,
-    origin: &Origin,
     msg: TaskMsg,
     consensus_time: u64,
 ) -> Result<(), Error> {
@@ -284,9 +259,9 @@ pub(crate) async fn execute(
             owner,
         } => create(staged, task_id, title, owner, actor, consensus_time).await,
         TaskMsg::UpdateStatus { task_id, status } => {
-            update_status(staged, task_id, status, actor, origin, consensus_time).await
+            update_status(staged, task_id, status, consensus_time).await
         }
-        TaskMsg::DeleteTask { task_id } => delete(staged, task_id, actor, origin).await,
+        TaskMsg::DeleteTask { task_id } => delete(staged, task_id).await,
     }
 }
 
@@ -430,74 +405,40 @@ mod tests {
         });
     }
 
-    /// a stranger's `UpdateStatus` is refused; the owner's is accepted.
+    /// any member's `UpdateStatus` lands on any task, and the owner stays
+    /// the creator: ownership is attribution, not a consent the update needs.
     #[test]
-    fn update_status_is_gated_to_the_owner() {
+    fn any_member_updates_any_tasks_status() {
         block_on(async {
             let mut staged = staged();
             create_as(&mut staged, &alice(), "t1", "ship it")
                 .await
                 .expect("create");
 
-            let refused = update_status(
-                &mut staged,
-                "t1".into(),
-                TaskStatus::Done,
-                &mallory(),
-                &Origin::Program(2),
-                2,
-            )
-            .await
-            .expect_err("a stranger cannot restatus another owner's task");
-            assert!(
-                refused.to_string().contains("only the owner"),
-                "unexpected error: {refused}"
-            );
-            assert_eq!(
-                load(&staged, "t1").await.unwrap().unwrap().status,
-                TaskStatus::Open,
-                "the refused update staged nothing"
-            );
-
-            update_status(
-                &mut staged,
-                "t1".into(),
-                TaskStatus::Done,
-                &alice(),
-                &Origin::Program(1),
-                2,
-            )
-            .await
-            .expect("the owner may update status");
-            assert_eq!(
-                load(&staged, "t1").await.unwrap().unwrap().status,
-                TaskStatus::Done
-            );
+            update_status(&mut staged, "t1".into(), TaskStatus::Done, 2)
+                .await
+                .expect("a stranger's update lands on another owner's task");
+            let task = load(&staged, "t1").await.unwrap().unwrap();
+            assert_eq!(task.status, TaskStatus::Done);
+            assert_eq!(task.owner, alice(), "the owner is attribution and stays");
+            assert_eq!(task.updated_at, 2);
         });
     }
 
-    /// delete frees the index slot AND decrements the owner's live count, so a
-    /// board at the per-owner cap admits a create right after a delete.
+    /// any member's delete frees the index slot AND decrements the RECORD
+    /// owner's live count, so a board at the per-owner cap admits the owner's
+    /// create right after a stranger's delete.
     #[test]
-    fn delete_is_gated_to_the_owner_and_frees_a_slot() {
+    fn any_member_deletes_any_task_and_frees_its_owners_slot() {
         block_on(async {
             let mut staged = staged();
             create_as(&mut staged, &alice(), "t1", "ship it")
                 .await
                 .expect("create");
 
-            let refused = delete(&mut staged, "t1".into(), &mallory(), &Origin::Program(2))
+            delete(&mut staged, "t1".into())
                 .await
-                .expect_err("a stranger cannot delete another owner's task");
-            assert!(
-                refused.to_string().contains("only the owner"),
-                "unexpected error: {refused}"
-            );
-            assert!(load(&staged, "t1").await.unwrap().is_some());
-
-            delete(&mut staged, "t1".into(), &alice(), &Origin::Program(1))
-                .await
-                .expect("the owner may delete");
+                .expect("a stranger's delete lands on another owner's task");
             assert!(load(&staged, "t1").await.unwrap().is_none());
             assert!(
                 load_index(&staged).await.unwrap().is_empty(),
@@ -562,11 +503,13 @@ mod tests {
         });
     }
 
+    /// any origin may name any account as the owner: the override is
+    /// attribution and the census key, not a consent the named account gives.
     #[test]
-    fn external_origin_cannot_name_a_different_owner() {
+    fn any_origin_may_name_another_account_as_owner() {
         block_on(async {
             let mut staged = staged();
-            let refused = create(
+            create(
                 &mut staged,
                 "t1".into(),
                 "ship it".into(),
@@ -575,12 +518,15 @@ mod tests {
                 1,
             )
             .await
-            .expect_err("mallory may not name alice as the owner");
-            assert!(
-                refused.to_string().contains("module origin"),
-                "unexpected error: {refused}"
+            .expect("mallory names alice as the owner");
+            let task = load(&staged, "t1").await.unwrap().expect("task exists");
+            assert_eq!(task.owner, alice(), "the named account owns the task");
+            assert_eq!(
+                owner_count(&staged, &alice()).await.unwrap(),
+                1,
+                "the census counts the named owner, not the actor"
             );
-            assert!(load(&staged, "t1").await.unwrap().is_none());
+            assert_eq!(owner_count(&staged, &mallory()).await.unwrap(), 0);
 
             // naming ITSELF is a no-op, accepted the same as `None`.
             create(
@@ -607,11 +553,7 @@ mod tests {
             staged.stage(owner_count_key(&alice()), vec![0]);
             staged.commit().await.unwrap();
             let before = staged.root();
-            assert!(
-                delete(&mut staged, "task".into(), &alice(), &Origin::Program(1))
-                    .await
-                    .is_err()
-            );
+            assert!(delete(&mut staged, "task".into()).await.is_err());
             assert!(staged.is_empty());
             staged.commit().await.unwrap();
             assert_eq!(staged.root(), before);

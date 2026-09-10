@@ -335,9 +335,9 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
 
 // ── C5 — jobs: the authorization matrix + attempt ceiling ─
 
-/// every guarded transition rejects the wrong actor with its own precise
-/// message: finalize/release are claimant-only, cancel is submitter-only, and
-/// prune only touches terminal jobs.
+/// every guarded transition rejects the wrong actor or state with its own
+/// precise message: finalize/release are claimant-only, cancel is any
+/// member's but pending-only, and prune only touches terminal jobs.
 #[test]
 fn the_jobs_authorization_matrix_gates_every_transition() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -377,24 +377,19 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
         "release gate: {error}"
     );
 
-    // release it back to pending so the CANCEL test hits the submitter gate, not
-    // the pending-only status guard.
-    sim.submit_ok(
-        "tasks",
-        job(serde_json::json!({ "release": { "job_id": "j1" } })),
-        Some("worker-a"),
-    );
+    // cancel is pending-only: while j1 is processing even its submitter is
+    // refused by the status guard, and nothing about who asks changes that.
     let error = sim.submit_rejected(
         "tasks",
         job(serde_json::json!({ "cancel": { "job_id": "j1" } })),
-        Some("worker-a"),
+        Some("poster"),
     );
     assert!(
-        error.contains("only the submitter may cancel"),
+        error.contains("cancel only applies to pending jobs"),
         "cancel gate: {error}"
     );
 
-    // prune only applies to terminal jobs: j1 is pending, so even its own
+    // prune only applies to terminal jobs: j1 is processing, so even its own
     // submitter is refused by the status guard.
     let error = sim.submit_rejected(
         "tasks",
@@ -404,6 +399,24 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
     assert!(
         error.contains("prune only applies to terminal jobs"),
         "prune gate: {error}"
+    );
+
+    // release it back to pending: any member cancels it, and any member
+    // prunes the cancelled record.
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "release": { "job_id": "j1" } })),
+        Some("worker-a"),
+    );
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "cancel": { "job_id": "j1" } })),
+        Some("worker-a"),
+    );
+    sim.submit_ok(
+        "tasks",
+        job(serde_json::json!({ "prune": { "job_id": "j1" } })),
+        Some("intruder"),
     );
 }
 

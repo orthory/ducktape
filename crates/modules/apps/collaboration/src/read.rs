@@ -36,8 +36,8 @@ use sdk::{Ctx, Error, Origin, StagedStore};
 
 use crate::interface::{
     BindingView, CollaborationReply, Conversation, ConversationAccess, ConversationEvent,
-    Credential, DeliveryEligibility, DeliveryState, DenyReason, EventBody, EventPage, Message,
-    Participant, ProtectedRead, Role, SendState, MAX_PAGE_LIMIT,
+    Credential, DeliveryEligibility, DeliveryState, DenyReason, EventBody, EventPage,
+    MAX_PAGE_LIMIT, Message, Participant, ProtectedRead, Role, SendState,
 };
 use crate::registry::{authenticates, live_binding, roster_role};
 use crate::store;
@@ -228,7 +228,10 @@ pub async fn serve(
             }))
         }
         ProtectedRead::Binding { conversation_id } => {
-            if reachable(staged, &reader, &conversation_id).await?.is_none() {
+            if reachable(staged, &reader, &conversation_id)
+                .await?
+                .is_none()
+            {
                 return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
             }
             let binding = store::binding(staged, &conversation_id, &reader.participant.id).await?;
@@ -252,7 +255,10 @@ pub async fn serve(
             conversation_id,
             seq,
         } => {
-            if reachable(staged, &reader, &conversation_id).await?.is_none() {
+            if reachable(staged, &reader, &conversation_id)
+                .await?
+                .is_none()
+            {
                 return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
             }
             Ok(CollaborationReply::Receipt(
@@ -263,7 +269,10 @@ pub async fn serve(
             conversation_id,
             seq,
         } => {
-            if reachable(staged, &reader, &conversation_id).await?.is_none() {
+            if reachable(staged, &reader, &conversation_id)
+                .await?
+                .is_none()
+            {
                 return Ok(CollaborationReply::Denied(DenyReason::NotPermitted));
             }
             // Revocation preserves owner history access, never authorization

@@ -35,8 +35,9 @@ pub const MAIN_BRANCH: &str = "main";
 /// the protected, explicit-release branch.
 pub const INTEGRATION_BRANCH: &str = "dev";
 
-/// `main` and the shared integration branch are the branches an owner gate
-/// covers — everything else is a feature branch anyone may force-push.
+/// `main` and the shared integration branch: undeletable, and installed on
+/// disk only by fast-forward — everything else is a feature branch anyone
+/// may force-push.
 pub(crate) fn is_protected_branch(branch: &str) -> bool {
     branch == MAIN_BRANCH || branch == INTEGRATION_BRANCH
 }

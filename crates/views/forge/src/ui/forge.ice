@@ -13,12 +13,10 @@
 // is the path only while the reader still stands where the file was
 // opened (same directory, same commit) — empty retires the preview.
 
-component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[ForgeBranch], branch_menu:bool, tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
+component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
-    forge_toggle_repo_menu()
-    forge_toggle_branch_menu()
     forge_pick_branch(str)
     select_forge_tab(str)
     forge_open_item(i64)
@@ -135,61 +133,53 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
             pr=16.0
             pt=8.0
             pb=8.0
-          stack w=fill
-            row
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            RepoCrumb org=org
+            // THE REPOSITORY SWITCHER is the host's own pick list: the host
+            // lays the menu out over everything below, hit-tests it and
+            // dismisses it, and neither this view nor the app holds an open
+            // flag for it. A pick leaves as the repo's name.
+            pick repo_names(repos) some(open_repo) #repo-pick -> emit(forge_open_repo, _)
               with
-                w=fill
-                gap=9.0
-                align=center
-              box w=fill clip=true
-                button -> emit(forge_toggle_repo_menu)
-                  with
-                    label="Switch repository"
-                    expanded=repo_menu
-                    w=fill
-                    p=0.0
-                    @ghost_action
-                  RepoCrumb
-                    with
-                      org
-                      repo=open_repo
-                      open=repo_menu
-                  active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
-                  hovered bg=row_hover text=fg
-                  pressed bg=elevated text=fg
-              // Detail navigation belongs in the persistent repo bar. Keeping
-              // it in the scrolling body spent a whole row on a control that
-              // should remain available while a long diff is being read.
-              if forge_item_number > 0 && item_phase == "ready"
-                BackToList kind=forge_item_kind
-                  forward
-                    forge_close_item
-              if forge_item_number > 0 && item_phase != "ready"
-                button "Back to tracker" -> emit(forge_close_item)
-                  with
-                    h=28.0
-                    p=6.0
-                    @secondary_action
-              // The repo's own address. Its NAME is typeable; the `?net=`
-              // digest that says which network's `ducktape` this is, is not.
-              button "Copy repo link" -> emit(copy_to_clipboard, duck_forge_repo_link(open_repo, network_chain_id), "Repo link copied")
+                p=4.0
+                text-size=14.0
+                font=display
+              active text=fg handle=muted bg=transparent border=transparent border-w=1.0 r=9.0
+              hovered text=fg handle=fg bg=row_hover border=transparent
+              opened text=brand handle=brand bg=row_hover border=transparent
+              opened-hovered text=brand handle=brand bg=row_hover border=transparent
+              menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+              handle arrow size=11.0
+            space w=fill
+            // Detail navigation belongs in the persistent repo bar. Keeping
+            // it in the scrolling body spent a whole row on a control that
+            // should remain available while a long diff is being read.
+            if forge_item_number > 0 && item_phase == "ready"
+              BackToList kind=forge_item_kind
+                forward
+                  forge_close_item
+            if forge_item_number > 0 && item_phase != "ready"
+              button "Back to tracker" -> emit(forge_close_item)
                 with
                   h=28.0
                   p=6.0
                   @secondary_action
-              button "All repos" -> emit(forge_close_repo)
-                with
-                  h=28.0
-                  p=6.0
-                  @secondary_action
-            if repo_menu
-              pin x=0.0 y=36.0
-                Popover width=290.0
-                  col w=fill gap=1.0
-                    for repo in repos
-                      RepoMenuRow repo=repo active=(repo.name == open_repo)
-                        forward
-                          forge_open_repo
+            // The repo's own address. Its NAME is typeable; the `?net=`
+            // digest that says which network's `ducktape` this is, is not.
+            button "Copy repo link" -> emit(copy_to_clipboard, duck_forge_repo_link(open_repo, network_chain_id), "Repo link copied")
+              with
+                h=28.0
+                p=6.0
+                @secondary_action
+            button "All repos" -> emit(forge_close_repo)
+              with
+                h=28.0
+                p=6.0
+                @secondary_action
         box
           with
             w=fill
@@ -258,11 +248,12 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                   pressed bg=transparent text=fg
                 // THE BRANCH SELECTOR. The commit the code browse is pinned
                 // to is context for every repo seat, so it sits in the tab
-                // row rather than charging the content a row of its own: the
-                // pill names the branch standing at that commit (or the
-                // commit itself once the branch has moved on) and opens the
-                // switcher; a pick leaves as an intent and the browse comes
-                // back re-rooted as props.
+                // row rather than charging the content a row of its own. The
+                // pick list names the branch standing at that commit, or
+                // reads the commit itself as its hint once every branch has
+                // moved on; the host draws and dismisses its menu, and a
+                // pick leaves as an intent naming the branch, after which the
+                // browse comes back re-rooted as props.
                 if !empty(branches)
                   box
                     with
@@ -270,28 +261,24 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                       h=18.0
                       bg=separator
                     space w=1.0 h=1.0
-                  stack
-                    button -> emit(forge_toggle_branch_menu)
+                  row gap=5.0 align=center
+                    Icon
                       with
-                        label="Switch branch"
-                        expanded=branch_menu
-                        p=0.0
-                        @ghost_action
-                      BranchPill
-                        with
-                          label=rev_label(tree_branch, tree_rev)
-                          open=branch_menu
-                      active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
-                      hovered bg=row_hover text=fg
-                      pressed bg=elevated text=fg
-                    if branch_menu
-                      pin x=0.0 y=26.0
-                        Popover width=240.0
-                          col w=fill gap=1.0
-                            for branch in branches
-                              BranchMenuRow branch=branch active=(branch.name == tree_branch)
-                                forward
-                                  forge_pick_branch
+                        name="branch"
+                        tone="ink"
+                        px=10.0
+                    pick branch_names(branches) pinned_branch(tree_branch) #branch-pick -> emit(forge_pick_branch, _)
+                      with
+                        hint=commit_label(tree_rev)
+                        p=3.0
+                        text-size=11.0
+                        font=code_medium
+                      active text=fg placeholder=fg handle=muted bg=surface border=border border-w=1.0 r=10.0
+                      hovered text=fg placeholder=fg handle=fg bg=row_hover border=border
+                      opened text=brand placeholder=brand handle=brand bg=surface border=brand_line
+                      opened-hovered text=brand placeholder=brand handle=brand bg=row_hover border=brand_line
+                      menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+                      handle arrow size=9.0
                 space w=fill
             box
               with

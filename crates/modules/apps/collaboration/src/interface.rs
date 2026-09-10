@@ -88,14 +88,15 @@ pub type Credential = u64;
 
 // ---- identity and addressing ----------------------------------------------
 
-/// An owner-authorized collaboration identity. Independent of any process: a
+/// A registered collaboration identity. Independent of any process: a
 /// participant outlives the run, session or device that speaks for it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Participant {
     pub id: String,
-    /// The authenticated party that registered it, and the only one that may
-    /// issue its credentials or revoke it.
+    /// The authenticated party that registered it. Attribution, and the key
+    /// [`Participant::owner_credential`] admits under; any authenticated
+    /// member issues its bindings or revokes it.
     pub owner: Party,
     /// Discovery label. NOT unique, never resolved for a mutation.
     pub display_name: String,
@@ -131,7 +132,8 @@ pub enum Role {
 pub struct Conversation {
     pub id: String,
     pub topic: String,
-    /// The authenticated party that created it: the roster's sole editor.
+    /// The authenticated party that created it. Attribution only: any
+    /// authenticated member edits the roster.
     pub owner: Party,
     /// participant id -> role, at most [`MAX_ROSTER`] entries.
     pub roster: BTreeMap<String, Role>,
@@ -158,15 +160,15 @@ pub struct Conversation {
 /// anything on the wire:
 ///
 /// * [`BoundPrincipal::ServiceKey`] ← `Origin::External(key)`. The
-///   owner-issued, conversation-scoped key a local adapter signs with. It is
-///   deliberately NOT the owner's account key, so the messaging agent never
-///   needs that key on the device.
+///   member-issued, conversation-scoped key a local adapter signs with. It is
+///   deliberately NOT the participant owner's account key, so the messaging
+///   agent never needs that key on the device.
 /// * [`BoundPrincipal::Program`] ← `Origin::Program(account)`. Only the
 ///   dispatch CALL lane mints that origin, and only after `identity` proves
 ///   the account is `Control::Program { executor }` executed by the requesting
 ///   module at an unmoved generation. So an agent reaching this module carries
-///   TWO independent authorizations — identity's, and the owner's binding —
-///   and neither of them is a module vouching for itself.
+///   TWO independent authorizations — identity's, and the binding a member
+///   issued — and neither of them is a module vouching for itself.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BoundPrincipal {
@@ -267,7 +269,7 @@ pub struct MessageId {
 /// It stops one short of `u64::MAX` on purpose: retention advances a
 /// credential's replay floor to `sequence + 1`, so admitting the last
 /// representable sequence would leave no floor above it. A credential that
-/// reaches this rotates — the owner issues a fresh binding, which draws a
+/// reaches this rotates — a member issues a fresh binding, which draws a
 /// fresh credential with its own empty sequence space.
 pub const MAX_SEQUENCE: u64 = u64::MAX - 1;
 
@@ -545,14 +547,14 @@ pub enum CollaborationMsg {
         agent_account: Option<AccountNumber>,
     },
     /// Retire every credential of a participant and stop it admitting or
-    /// receiving. Owner only. Its committed history survives.
+    /// receiving. Any authenticated member. Its committed history survives.
     RevokeParticipant { participant_id: String },
     CreateConversation {
         conversation_id: String,
         topic: String,
     },
-    /// Add, change or (with `role: None`) revoke one roster entry. The
-    /// conversation owner only.
+    /// Add, change or (with `role: None`) revoke one roster entry. Any
+    /// authenticated member.
     SetRoster {
         conversation_id: String,
         participant_id: String,
@@ -565,8 +567,9 @@ pub enum CollaborationMsg {
     /// claim it. Replacing a binding on one conversation leaves the same
     /// participant's bindings on other conversations untouched.
     ///
-    /// The participant's owner issues this; the attached principal then sends,
-    /// acknowledges and reads under its own origin alone — never the owner's.
+    /// Any authenticated member issues this, the principal itself included;
+    /// the attached principal then sends, acknowledges and reads under its
+    /// own origin alone — never the issuer's.
     Bind {
         conversation_id: String,
         participant_id: String,
@@ -574,8 +577,8 @@ pub enum CollaborationMsg {
         principal: BoundPrincipal,
         expected_credential: Credential,
     },
-    /// Release the binding. The owner or the bound principal; the credential
-    /// number is spent either way.
+    /// Release the binding. Any authenticated member; the credential number
+    /// is spent either way.
     Unbind {
         conversation_id: String,
         participant_id: String,
@@ -600,7 +603,7 @@ pub enum CollaborationMsg {
     /// does not undo work already accepted.
     ExpireMessage { conversation_id: String, seq: u64 },
     /// Advance the retention floor to `through_seq` (exclusive), dropping
-    /// those events and message bodies. Conversation owner only. The senders'
+    /// those events and message bodies. Any authenticated member. The senders'
     /// replay floors rise with it, so expired request bytes cannot be admitted
     /// as a new message after their body is pruned.
     Prune {

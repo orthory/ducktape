@@ -807,7 +807,6 @@ on select_shell_tab(next)
   thread_selected_rev = keep_i64(moved, 0, thread_selected_rev)
   thread_message_action = close_message_action(moved, thread_message_action)
   thread_edit_draft = keep_str(moved, "", thread_edit_draft)
-  forge_repo_menu = forge_repo_menu && !moved
   page_delete_armed = page_delete_armed && !moved
   fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
@@ -1038,7 +1037,7 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)) -> global_key_pressed _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target)) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows: a close just unregisters the slot (below).
   // The process leaves only when someone says so — the tray's Quit, or ⌘Q.

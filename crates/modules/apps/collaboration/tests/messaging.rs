@@ -610,29 +610,12 @@ fn delivery_advances_only_through_the_diagram_and_only_from_the_live_binding() {
         .unwrap_err();
         assert!(format!("{refusal:?}").contains("is stale"), "{refusal:?}");
 
-        // and a key that holds no binding cannot either.
+        // any member advances it under the live credential: the credential
+        // names the binding the receipt is for, not the caller.
         let mut stranger = at(7, Origin::External(key(99)));
-        let refusal = apply(
-            &mut module,
-            &mut stranger,
-            CollaborationMsg::Acknowledge {
-                conversation_id: "c1".into(),
-                seq,
-                binding_credential: credential,
-                state: DeliveryState::AdapterAccepted,
-                reason: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{refusal:?}").contains("only the bound service key"),
-            "{refusal:?}"
-        );
-
         ok(
             &mut module,
-            &mut service,
+            &mut stranger,
             CollaborationMsg::Acknowledge {
                 conversation_id: "c1".into(),
                 seq,

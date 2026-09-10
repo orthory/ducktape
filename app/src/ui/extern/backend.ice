@@ -245,8 +245,8 @@ extern crate::backend
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str, forge_repo_menu:bool) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str) -> str
+  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord
@@ -426,7 +426,7 @@ extern crate::backend
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str)
+  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
   AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])

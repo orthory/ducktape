@@ -417,7 +417,7 @@ fn happy_path_matrix_roots_identical_block_by_block() {
         "hosts disagree on the committed head"
     );
 
-    // pin [5] then unpin the head — owner-gated; same owner threads both.
+    // pin [5] then unpin the head; the same signer threads both.
     for (height, msg) in [
         (4, pin_op(&head_hex, "release")),
         (5, {

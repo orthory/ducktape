@@ -4,12 +4,44 @@
 
 use forge_view::host::{
     Body, ChatBlock, CommentStage, DiffLine, ForgeBranch, ForgeItem, ForgeProps, ForgeRepo, Name,
-    Number, Path, Tab, TreeEntry, drafts_cleared_by, duck_forge_item_link, duck_forge_repo_link,
-    filter_forge_items, forge_comment_target, forge_open_count, forge_push_command, rev_label,
+    Number, Path, Tab, TreeEntry, branch_names, commit_label, drafts_cleared_by,
+    duck_forge_item_link, duck_forge_repo_link, filter_forge_items, forge_comment_target,
+    forge_open_count, forge_push_command, pinned_branch, repo_names,
 };
 use forge_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
+use ui_lang_guest::testing::{has_text, item, pick, press, submit, texts, type_into};
 use ui_lang_guest::wire::Frame;
+
+#[test]
+fn display_limits_use_a_bounded_footer_only_when_content_is_clipped() {
+    use ui_lang_guest::wire::{Length, Node};
+    fn notice(node: &Node) -> Option<&Node> {
+        let is_notice = node
+            .key()
+            .is_some_and(|key| key.ends_with("/display-notice"));
+        if is_notice {
+            return Some(node);
+        }
+        node.children().iter().find_map(|node| notice(node))
+    }
+    let (_, frame) = shown(&overview());
+    assert!(notice(frame.root.as_ref().unwrap()).is_none());
+    assert!(!has_text(&frame, "rows are not shown."));
+    for (omitted, shortened) in [(100, false), (0, true), (100, true)] {
+        let (_, frame) = shown(&ForgeProps {
+            display_omitted: omitted,
+            display_shortened: shortened,
+            ..overview()
+        });
+        let Node::Container { height, .. } = notice(frame.root.as_ref().unwrap()).unwrap() else {
+            panic!("notice is a bounded footer");
+        };
+        assert_eq!(*height, Some(Length::Fixed(26.0)));
+        assert_eq!(has_text(&frame, "rows omitted"), omitted > 0);
+        assert_eq!(has_text(&frame, "Preview shortened"), shortened);
+        assert!(has_text(&frame, "core"));
+    }
+}
 
 fn overview() -> ForgeProps {
     ForgeProps {
@@ -201,34 +233,17 @@ fn the_repo_seats_pick_a_tab_and_the_code_browse_asks_the_host_for_a_file() {
     );
 }
 
-/// The branch selector names the branch the browse is pinned to, opens on
-/// the host's say-so, and a pick leaves as an intent naming the branch.
+/// The branch selector is the host's own pick list over the repo's born
+/// branches, selecting the branch the browse is pinned to; a pick leaves as
+/// an intent naming the branch. The host draws and dismisses the menu, so
+/// the view carries no open flag for it.
 #[test]
-fn the_branch_selector_opens_and_a_pick_names_the_branch_to_the_host() {
+fn the_branch_selector_lists_the_branches_and_a_pick_names_the_branch_to_the_host() {
     let (subscription, frame) = shown(&repo_open());
-    assert!(has_text(&frame, "main"), "{:?}", texts(&frame));
-    assert!(
-        !has_text(&frame, "2222"),
-        "the switcher is closed until the host opens it"
-    );
-    let frame = tick_native(press(&frame, "Switch branch"));
-    assert_eq!(one_intent(&frame).kind, "forge.toggle_branch_menu");
-    let open = ForgeProps {
-        branch_menu: true,
-        ..repo_open()
-    };
-    let frame = tick_native(vec![item(subscription, &encoded(&open))]);
-    assert!(has_text(&frame, "feature"), "{:?}", texts(&frame));
-    let rows: Vec<String> = texts(&frame)
-        .into_iter()
-        .filter(|text| text == "1111" || text == "2222")
-        .collect();
-    assert_eq!(
-        rows,
-        ["1111", "2222"],
-        "each row names the commit its head stands on"
-    );
-    let frame = tick_native(press(&frame, "Browse branch feature"));
+    assert_eq!(branch_names(&repo_open().branches), ["main", "feature"]);
+    assert_eq!(pinned_branch("main").as_deref(), Some("main"));
+    assert_eq!(pinned_branch(""), None);
+    let frame = tick_native(pick(&frame, "ForgeView/forge/branch-pick", "feature"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "forge.branch");
     assert_eq!(
@@ -237,10 +252,46 @@ fn the_branch_selector_opens_and_a_pick_names_the_branch_to_the_host() {
             name: "feature".into()
         }
     );
-    // pinned past every branch, the pill reads the commit itself
-    assert_eq!(rev_label("", "3333333333333333"), "333333333333");
-    assert_eq!(rev_label("dev", "3333"), "dev");
-    assert_eq!(rev_label("", ""), "…");
+    // pinned past every branch, the selector's hint reads the commit itself
+    assert_eq!(commit_label("3333333333333333"), "333333333333");
+    assert_eq!(commit_label(""), "…");
+    let past_every_branch = ForgeProps {
+        tree_branch: String::new(),
+        tree_rev: "3333333333333333".into(),
+        ..repo_open()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&past_every_branch))]);
+    assert!(has_text(&frame, "333333333333"), "{:?}", texts(&frame));
+}
+
+/// The repository switcher is the same shape over the forge's repositories:
+/// a pick leaves as an intent naming the repo to open.
+#[test]
+fn the_repository_switcher_lists_the_repos_and_a_pick_names_the_repo_to_the_host() {
+    let props = ForgeProps {
+        repos: vec![
+            ForgeRepo {
+                name: "core".into(),
+                head: "1111".into(),
+            },
+            ForgeRepo {
+                name: "playground".into(),
+                head: "2222".into(),
+            },
+        ],
+        ..repo_open()
+    };
+    assert_eq!(repo_names(&props.repos), ["core", "playground"]);
+    let (_, frame) = shown(&props);
+    let frame = tick_native(pick(&frame, "ForgeView/forge/repo-pick", "playground"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "forge.open_repo");
+    assert_eq!(
+        serde_json::from_slice::<Name>(&intent.payload).expect("decodes"),
+        Name {
+            name: "playground".into()
+        }
+    );
 }
 
 #[test]

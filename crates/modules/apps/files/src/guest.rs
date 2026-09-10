@@ -647,7 +647,7 @@ mod tests {
         let mut native = Fs::new(MemStore::new(), Refs::default());
         let mut guest = GuestLane::new();
         for (standing, path) in [
-            (identity::ProgramStanding::Active, "/home/acct:1/private"),
+            (identity::ProgramStanding::Active, "/outside/the/namespaces"),
             (identity::ProgramStanding::Suspended, "/home/acct:7/result"),
         ] {
             let payload = commit_inline(path, b"refused");
