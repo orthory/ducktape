@@ -1541,10 +1541,7 @@ mod tests {
             let end = rest.find("\n    }\n").expect("the builder ends");
             &rest[..end]
         }
-        let sources = [
-            ("composer_surface.rs", include_str!("composer_surface.rs")),
-            ("shell_composer.rs", include_str!("shell_composer.rs")),
-        ];
+        let sources = [("composer_surface.rs", include_str!("composer_surface.rs"))];
         for (file, source) in sources {
             let widget_impl = source
                 .split("\nimpl Widget<")

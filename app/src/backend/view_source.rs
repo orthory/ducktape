@@ -31,7 +31,7 @@ pub const MODULE_OWNED: [&str; 5] = ["governance", "files", "pages", "chat", "fo
 /// The desktop's own views, staged beside the binary and asked for at boot.
 /// With [`MODULE_OWNED`], every view the app draws: a tab's draw never
 /// starts a load, so a view named in neither would never be there.
-pub const DESKTOP_OWNED: [&str; 6] = ["members", "agents", "node", "explorer", "settings", "shell"];
+pub const DESKTOP_OWNED: [&str; 5] = ["members", "agents", "node", "explorer", "settings"];
 
 pub fn module_owned(module: &str) -> bool {
     MODULE_OWNED.contains(&module)

@@ -360,9 +360,15 @@ on copy_to_clipboard(text, label)
 
 view
   col w=fill h=fill
-    if display_unavailable
+    if !empty(host_error)
+      box w=fill h=fill p=22.0
+        EmptyState
+          with
+            title="Unable to read Forge view data"
+            description="The app and Forge view could not exchange display data. Check that both are up to date."
+    if empty(host_error) && display_unavailable
       text "Too much display data. Open a smaller directory or item." size=13.0
-    if !display_unavailable
+    if empty(host_error) && !display_unavailable
       col w=fill h=fill
         ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
           with

@@ -890,143 +890,6 @@ pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict
     }
 }
 
-// ---------- the shell seat ----------
-
-/// The Shell tab: the app's agent picks, the terminal it holds and the run
-/// it is watching, drawn by the `shell` view. The provider's wording — the
-/// header line, the grant note, the terminal note, the blurbs — is folded
-/// here, so the view names no provider; the terminal session is parked for
-/// the `agent_terminal_surface` slot. Intents come back as `surface`,
-/// `setup`, `identity`, `host_node`, `refresh`, `terminal_start`,
-/// `terminal_stop`, `reset`, `detach`, `reopen`, `discard`, `open_link`,
-/// and — from the host's own composer surface — `send` (`body`).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
-pub fn shell_view(
-    dark: bool,
-    connected: bool,
-    surface: crate::ShellSurface,
-    setup_open: bool,
-    identity_options: &[String],
-    identity: &str,
-    provider: &str,
-    credential: &str,
-    host_node_options: &[String],
-    host_node: &str,
-    credentials_loading: bool,
-    terminal: &crate::backend::AgentTerminalSession,
-    terminal_running: bool,
-    terminal_busy: bool,
-    terminal_title: &str,
-    terminal_error: &str,
-    entries: &[crate::backend::AgentChatEntry],
-    activity: &[crate::backend::AgentActivity],
-    chat_busy: bool,
-    chat_status: &str,
-    chat_detail: &str,
-    live: &str,
-    saga_id: &str,
-    detached_saga: &str,
-) -> Element<'static, ModuleViewEvent> {
-    use crate::backend as b;
-    *shell_terminal().lock().expect("shell terminal") = Some(terminal.clone());
-    let entries: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "id": entry.id,
-                "role": entry.role,
-                "body": entry.body,
-                "provider_label": b::agent_provider_label(&entry.provider),
-                "provider_initial": b::agent_provider_initial(&entry.provider),
-                "status": entry.status,
-                "run_label": b::agent_run_label(&entry.saga_id),
-                "steps": entry.steps,
-                "steps_label": entry.steps_label,
-            })
-        })
-        .collect();
-    let props = serde_json::json!({
-        "dark": dark,
-        "connected": connected,
-        "surface": match surface {
-            crate::ShellSurface::Tasks => "tasks",
-            crate::ShellSurface::Terminal => "terminal",
-        },
-        "setup_open": setup_open,
-        "identity_options": identity_options,
-        "identity": identity,
-        "provider_initial": b::agent_provider_initial(provider),
-        "credential": credential,
-        "host_node_options": host_node_options,
-        "host_node": host_node,
-        "credentials_loading": credentials_loading,
-        "terminal_running": terminal_running,
-        "terminal_busy": terminal_busy,
-        "terminal_title": terminal_title,
-        "terminal_error": terminal_error,
-        "entries": entries,
-        "activity": activity,
-        "chat_busy": chat_busy,
-        "chat_status": chat_status,
-        "chat_detail": chat_detail,
-        "live": live,
-        "saga_id": saga_id,
-        "detached_saga": detached_saga,
-        "run_line": b::agent_run_line(identity, host_node),
-        "grant_note": b::agent_host_grant_note(host_node, credential),
-        "terminal_note": b::agent_terminal_note(provider, credential),
-        "composer_hint": b::agent_composer_hint(provider),
-        "task_blurb": b::agent_task_blurb(host_node),
-        "register_hint": b::agent_register_hint(provider),
-    });
-    module_view("shell", serde_json::to_vec(&props).expect("props encode"))
-}
-
-pub fn shell_intent(event: &ModuleViewEvent) -> crate::ShellIntent {
-    use crate::ShellIntent as Intent;
-    match event.kind.as_str() {
-        "surface" => Intent::Surface,
-        "setup" => Intent::Setup,
-        "identity" => Intent::Identity,
-        "host_node" => Intent::HostNode,
-        "refresh" => Intent::Refresh,
-        "terminal_start" => Intent::TerminalStart,
-        "terminal_stop" => Intent::TerminalStop,
-        "send" => Intent::Send,
-        "reset" => Intent::Reset,
-        "detach" => Intent::Detach,
-        "reopen" => Intent::Reopen,
-        "discard" => Intent::Discard,
-        _ => Intent::OpenLink,
-    }
-}
-
-/// The surface a `surface` intent names; a word the screen has no surface
-/// for is the tasks.
-pub fn shell_event_surface(event: &ModuleViewEvent) -> crate::ShellSurface {
-    match event_text(event, "surface").as_str() {
-        "terminal" => crate::ShellSurface::Terminal,
-        _ => crate::ShellSurface::Tasks,
-    }
-}
-
-/// Empties the host-side shell composer.
-pub fn shell_composer_clear() -> bool {
-    crate::shell_composer::clear();
-    true
-}
-
-/// The terminal session behind the shell view's slot: the one the app
-/// last drew the tab with. One per process, like the view it belongs to.
-fn shell_terminal() -> &'static Mutex<Option<crate::backend::AgentTerminalSession>> {
-    static TERMINAL: OnceLock<Mutex<Option<crate::backend::AgentTerminalSession>>> =
-        OnceLock::new();
-    TERMINAL.get_or_init(Mutex::default)
-}
-
 // ---------- the pages seat ----------
 
 /// Pages supplies metadata and a stable source identity. Document bytes use
@@ -1719,29 +1582,6 @@ fn node_timeline() -> &'static Mutex<NodeTimeline> {
 /// activated link goes back to the guest's own handler as a string.
 fn surfaces_of(module: &str) -> Surfaces {
     let mut surfaces = Surfaces::default();
-    // the shell view's three: the terminal for the session the app parked,
-    // the answer Markdown (a link it opens goes back to the guest's
-    // handler), and the composer, whose submit is the app's `send` intent
-    if module == "shell" {
-        surfaces.insert(
-            "agent_terminal_surface".into(),
-            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
-                let session = shell_terminal().lock().expect("shell terminal").clone();
-                let Some(session) = session else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::agent_terminal_surface(&session).map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "agent_markdown".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
-                    .map(wire::SurfaceValue::Str)
-            }),
-        );
-        surfaces.insert("shell_composer".into(), crate::shell_composer::provider());
-    }
     if module == "chat" {
         surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
     }
@@ -1867,22 +1707,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         ],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
-        // `send` is deliberately NOT here: a send crosses only from the
-        // host's own composer surface (`deliver`), never as a guest request.
-        "shell" => &[
-            "surface",
-            "setup",
-            "identity",
-            "host_node",
-            "refresh",
-            "terminal_start",
-            "terminal_stop",
-            "reset",
-            "detach",
-            "reopen",
-            "discard",
-            "open_link",
-        ],
         "chat" => &[
             "search",
             "clear_search",
@@ -3491,11 +3315,9 @@ impl Guest {
             value,
         } = output
         {
-            // the shell composer's submit carries its body; the other
+            // the chat composer's submit carries its body; the other
             // unrouted surfaces only say that something happened
-            if self.module == "shell" {
-                self.intents.extend(crate::shell_composer::intent(&value));
-            } else if self.module == "chat" || self.module == "forge" {
+            if self.module == "chat" || self.module == "forge" {
                 self.intents.extend(crate::composer_surface::intent(&value));
             } else {
                 self.intents.push(ModuleViewEvent {
@@ -4304,7 +4126,7 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 11] = [
+        let other_route_only: [(&str, &str, &[&str]); 10] = [
             ("governance", "gov_intent", &[]),
             ("members", "roster_intent", &[]),
             ("agents", "agents_intent", &[]),
@@ -4312,7 +4134,6 @@ pub(crate) mod tests {
             ("explorer", "explorer_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
-            ("shell", "shell_intent", &["send"]),
             ("pages", "pages_intent", &["edited"]),
             ("chat", "chat_intent", &["composer"]),
             ("files", "files_intent", &[]),
@@ -5528,73 +5349,6 @@ pub(crate) mod tests {
             !guest.assets.contains_key("a.svg"),
             "A's late answer landed"
         );
-    }
-
-    /// The bundled Shell view through the host: the facts, the welcome
-    /// for a picked credential, the three host slots, a surface switch as
-    /// an intent — and a send, which only the host's composer can raise.
-    #[test]
-    fn the_staged_shell_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
-        let Some(staged) = staged("shell") else {
-            return;
-        };
-        let mut guest = Guest::load_from("shell", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "dark": false, "connected": true, "surface": "tasks", "setup_open": false,
-                "identity_options": ["team-codex · Codex"], "identity": "team-codex · Codex",
-                "provider_initial": "C", "credential": "team-codex",
-                "host_node_options": ["This node"], "host_node": "This node",
-                "credentials_loading": false, "terminal_running": false,
-                "terminal_busy": false, "terminal_title": "", "terminal_error": "",
-                "entries": [], "activity": [], "chat_busy": false, "chat_status": "",
-                "chat_detail": "", "live": "", "saga_id": "", "detached_saga": "",
-                "run_line": "team-codex · Codex · This node", "grant_note": "",
-                "terminal_note": "A sandboxed Codex session.", "composer_hint": "Message Codex…",
-                "task_blurb": "Each message runs an agent in a sandbox on this node.",
-                "register_hint": "Register one with `ducktape user cred add codex`"
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in [
-            "Shell",
-            "What should the agent do?",
-            "team-codex · Codex · This node",
-        ] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert_eq!(surface_names(&guest), ["shell_composer"]);
-        assert!(guest.surfaces.contains_key("shell_composer"));
-        assert!(guest.surfaces.contains_key("agent_terminal_surface"));
-        assert!(guest.surfaces.contains_key("agent_markdown"));
-        guest.deliver(Output::Activate(button_message(&guest, "Terminal")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "surface".into(),
-                detail: r#"{"surface":"terminal"}"#.into(),
-            }]
-        );
-        // the composer's submit is the host's intent, not a guest request
-        guest.deliver(Output::Surface {
-            handler: None,
-            value: wire::SurfaceValue::Str("ship it".into()),
-        });
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "send".into(),
-                detail: r#"{"body":"ship it"}"#.into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
     }
 
     /// The bundled Forge view through the host: the register, then a repo

@@ -80,7 +80,6 @@ pub fn open_proposals(rows: &[ProposalRow]) -> i64 {
 pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         (crate::ShellTab::Chat, "Chat", "nav-chat"),
-        (crate::ShellTab::Shell, "Shell", "code-slash"),
         (crate::ShellTab::Pages, "Pages", "nav-pages"),
         (crate::ShellTab::Forge, "Forge", "nav-forge"),
         (crate::ShellTab::Agents, "Agents", "nav-agents"),

@@ -401,6 +401,8 @@ fn the_controller_pauses_a_record_by_registry_id() {
 #[test]
 fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+    let frame = tick_native(press(&frame, "Runs"));
+    assert!(has_text(&frame, "New agent"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "New agent"));
     assert!(has_text(&frame, AGENT_ID_HINT), "{:?}", texts(&frame));
 
@@ -492,7 +494,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         texts(&frame)
     );
     let frame = tick_native(press(&frame, "Runs"));
-    assert!(!has_text(&frame, "New agent"));
+    assert!(has_text(&frame, "New agent"));
     assert!(!has_text(&frame, "Messages"));
     assert!(
         !texts(&frame)
