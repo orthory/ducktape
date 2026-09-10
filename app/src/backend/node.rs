@@ -1481,9 +1481,6 @@ async fn run_link(
         RunPlace::Module { module_id } => {
             link("module", format!("module {module_id}"), String::new())
         }
-        RunPlace::Conversation { .. } => {
-            link("conversation", "Agent conversation".into(), String::new())
-        }
         RunPlace::Run { dispatch_id } => link(
             "run",
             "Delegated run".into(),
@@ -1785,7 +1782,7 @@ fn action_description(operation: &str, result: &serde_json::Value) -> String {
         ACTION_DUCKFS_WRITE_TEXT => "Write file".into(),
         ACTION_MODULES_UPDATE => "Request module deployment".into(),
         ACTION_FORGE_OPEN_PR | "forge" => "Open pull request".into(),
-        ACTION_COLLABORATION_SEND => "Send agent message".into(),
+        ACTION_COLLABORATION_DELIVER => "Deliver agent message".into(),
         ACTION_COLLABORATION_ACKNOWLEDGE => "Acknowledge agent message".into(),
         "agent.call" => format!("Call {}", receipt_text(result, "callee_agent_id")),
         _ => "Module action".into(),
@@ -1979,8 +1976,10 @@ fn action_target(operation: &str, result: &serde_json::Value) -> Option<JournalT
         ACTION_DUCKFS_WRITE_TEXT => label("file", receipt_text(result, "path")),
         ACTION_MODULES_UPDATE => label("module", receipt_text(result, "module_id")),
         ACTION_FORGE_OPEN_PR => Some(JournalTarget::ForgeRepository(text("repo"))),
-        ACTION_COLLABORATION_SEND | ACTION_COLLABORATION_ACKNOWLEDGE => {
-            label("conversation", "Agent conversation")
+        ACTION_COLLABORATION_DELIVER | ACTION_COLLABORATION_ACKNOWLEDGE => {
+            Some(JournalTarget::Place(RunPlace::Channel {
+                channel_id: text("channel_id"),
+            }))
         }
         "agent.call" => Some(JournalTarget::Place(RunPlace::Run {
             dispatch_id: dispatch_id_for(&delegated_run_id_for(

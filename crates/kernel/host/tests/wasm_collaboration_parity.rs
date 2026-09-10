@@ -17,16 +17,17 @@
 //!   `WasmModule::query_with` threading the real env through the guest's query
 //!   export, which a `query`-only lane would not.
 //!
-//! identity and tasks stand as fixed-reply siblings on both hosts: the module
-//! reads them (actor resolution, task-attempt fencing) and they must answer
-//! identically on both sides or the comparison would be measuring them.
+//! identity, tasks and chat stand as fixed-reply siblings on both hosts: the
+//! module reads them (actor resolution, task-attempt fencing, channel access
+//! and the message a delivery names) and they must answer identically on both
+//! sides or the comparison would be measuring them.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use collaboration::{
-    BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery, DeliveryState, MessageId,
-    MessageKind, ProtectedRead, Role, SendRequest, encode_msg, encode_query,
+    BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery, DeliverRequest,
+    DeliveryState, MessageKind, Party, ProtectedRead, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, SubmitError};
@@ -41,19 +42,21 @@ const COLLABORATION_WASM: &[u8] = include_bytes!("fixtures/collaboration.compone
 const MODULE: &str = "collaboration";
 /// the height lane's ceiling — the unit this proof's blocks advance in.
 const TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
-/// the service key alice's binding authorizes. sends and reads below sign with
-/// THIS, never with the owner key.
+/// the service key alice's binding authorizes. It posts the messages below
+/// and asks for their delivery, never signing with the owner key.
 const SERVICE: u8 = 0x5e;
-/// bob's own bound service. A receipt is the RECIPIENT's record, so only bob's
-/// binding may advance it — alice's service key sends and cannot acknowledge.
+/// bob's own bound service. A delivery record is the RECIPIENT's, so only
+/// bob's binding may advance it — alice's service key asks and cannot
+/// acknowledge.
 const SERVICE_B: u8 = 0x5f;
 /// the network both runtimes are composed with — every op names it, and a
 /// wasm genesis gets it as the `chain_id` config parameter.
 const NETWORK: &str = "parity-net";
-/// the conversation's ONE event sequence covers roster edits and binding
-/// changes too, so the first message lands after them: seating alice took 1,
-/// seating bob 2, alice's binding 3, bob's 4, and the first send 5.
-const FIRST_MESSAGE_SEQ: u64 = 5;
+/// the chat sequences the stub assigns to `m1` and `m2`: the delivery record
+/// is keyed by the CHAT sequence of the message, not by the collaboration
+/// event that requested it.
+const M1_SEQ: u64 = 1;
+const M2_SEQ: u64 = 2;
 
 /// a fixed-reply sibling: enough of `identity` and `tasks` for the module's
 /// two cross-module reads to resolve, identically on both runtimes.
@@ -91,6 +94,70 @@ fn tasks_stub() -> Stub {
     Stub {
         id: "tasks".into(),
         reply: tasks::encode_job_reply(&tasks::JobsReply::Job(None)),
+    }
+}
+
+fn party(byte: u8) -> Party {
+    Party::Key(vec![byte; 32])
+}
+
+/// a chat sibling holding ONE open channel, `c1`, and two messages in it —
+/// `m1` at sequence 1 and `m2` at sequence 2, both posted by alice's service
+/// key. Every party may read `c1` and nothing else exists. Its writes (the
+/// seating follow-ups a bind emits) are accepted and discarded, identically
+/// on both runtimes.
+struct ChatStub;
+
+#[async_trait::async_trait(?Send)]
+impl Module for ChatStub {
+    fn id(&self) -> ModuleId {
+        "chat".into()
+    }
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let reply = match chat::decode_query(req).map_err(Error::Module)? {
+            chat::ChatQuery::Access { channel_id, .. } => {
+                let open = channel_id == "c1";
+                chat::ChatReply::Access(chat::ChannelAccess {
+                    may_read: open,
+                    may_post: open,
+                })
+            }
+            chat::ChatQuery::Message { message_id } => {
+                let seq = match message_id.as_str() {
+                    "m1" => Some(M1_SEQ),
+                    "m2" => Some(M2_SEQ),
+                    _ => None,
+                };
+                chat::ChatReply::Message(seq.map(|seq| chat::MessageView {
+                    channel_id: "c1".into(),
+                    seq,
+                    head: chat::MessageHead {
+                        message_id,
+                        author: party(SERVICE),
+                        origin: Origin::External(vec![SERVICE; 32]),
+                        content_origin: Origin::External(vec![SERVICE; 32]),
+                        blocks: vec![chat::Block::paragraph("please review")],
+                        created_at: seq,
+                        rev: 0,
+                        revision: 1,
+                        edited_at: None,
+                        base_rev: None,
+                        deleted: false,
+                        thread: None,
+                        reply_count: 0,
+                        last_reply_seq: None,
+                    },
+                }))
+            }
+            other => return Err(Error::Module(format!("unserved {other:?}"))),
+        };
+        Ok(chat::encode_reply(&reply))
     }
 }
 
@@ -169,6 +236,7 @@ impl Lane {
                 MODULE,
                 "identity",
                 "tasks",
+                "chat",
                 Box::new(store),
                 TTL,
                 NETWORK,
@@ -180,6 +248,7 @@ impl Lane {
             module,
             Box::new(identity_stub()),
             Box::new(tasks_stub()),
+            Box::new(ChatStub),
             Box::new(Prober {
                 request: request.clone(),
                 seen: seen.clone(),
@@ -237,76 +306,28 @@ fn msg(payload: CollaborationMsg) -> Msg {
     }
 }
 
-fn send(sequence: u64, body: &str, expires_at: u64) -> Msg {
-    msg(CollaborationMsg::Send(SendRequest {
-        conversation_id: "c1".into(),
-        sender_participant_id: "alice".into(),
-        // the credential alice's ONE binding drew — a participant's first is 2
-        // (1 is its owner credential), and a send must name the credential its
-        // origin actually authenticates with.
-        message_id: MessageId {
-            generation: 2,
-            sequence,
-        },
-        recipient_participant_id: "bob".into(),
-        kind: MessageKind::Notice,
-        reply_to: None,
+fn deliver(message_id: &str, kind: MessageKind, expires_at: u64) -> Msg {
+    msg(CollaborationMsg::Deliver(DeliverRequest {
+        channel_id: "c1".into(),
+        message_id: message_id.into(),
+        recipient: party(2),
+        kind,
         task: None,
-        body: body.into(),
-        expires_at,
         references: Vec::new(),
+        expires_at,
     }))
 }
 
-/// the accepted op matrix, each entry the signer and the op: registration,
-/// a conversation, a roster, a scoped binding, two sends under the binding's
-/// credential, and the delivery walk to a terminal state.
+/// the accepted op matrix, each entry the signer and the op: two scoped
+/// bindings, two delivery requests from alice's service key for messages it
+/// posted, and the delivery walk to a terminal state under bob's.
 fn accepted() -> Vec<(u8, Msg)> {
     vec![
         (
             1,
-            msg(CollaborationMsg::RegisterParticipant {
-                participant_id: "alice".into(),
-                display_name: "alice".into(),
-                agent_account: None,
-            }),
-        ),
-        (
-            2,
-            msg(CollaborationMsg::RegisterParticipant {
-                participant_id: "bob".into(),
-                display_name: "bob".into(),
-                agent_account: None,
-            }),
-        ),
-        (
-            1,
-            msg(CollaborationMsg::CreateConversation {
-                conversation_id: "c1".into(),
-                topic: "review".into(),
-            }),
-        ),
-        (
-            1,
-            msg(CollaborationMsg::SetRoster {
-                conversation_id: "c1".into(),
-                participant_id: "alice".into(),
-                role: Some(Role::Member),
-            }),
-        ),
-        (
-            1,
-            msg(CollaborationMsg::SetRoster {
-                conversation_id: "c1".into(),
-                participant_id: "bob".into(),
-                role: Some(Role::Member),
-            }),
-        ),
-        (
-            1,
             msg(CollaborationMsg::Bind {
-                conversation_id: "c1".into(),
-                participant_id: "alice".into(),
+                channel_id: "c1".into(),
+                participant: party(1),
                 device: "laptop".into(),
                 principal: BoundPrincipal::ServiceKey(vec![SERVICE; 32]),
                 expected_credential: 0,
@@ -315,21 +336,22 @@ fn accepted() -> Vec<(u8, Msg)> {
         (
             2,
             msg(CollaborationMsg::Bind {
-                conversation_id: "c1".into(),
-                participant_id: "bob".into(),
+                channel_id: "c1".into(),
+                participant: party(2),
                 device: "laptop".into(),
                 principal: BoundPrincipal::ServiceKey(vec![SERVICE_B; 32]),
                 expected_credential: 0,
             }),
         ),
-        (SERVICE, send(1, "please review", 400)),
-        (SERVICE, send(2, "and this one too", 400)),
+        (SERVICE, deliver("m1", MessageKind::Notice, 400)),
+        (SERVICE, deliver("m2", MessageKind::Notice, 400)),
         (
             SERVICE_B,
             msg(CollaborationMsg::Acknowledge {
-                conversation_id: "c1".into(),
-                seq: FIRST_MESSAGE_SEQ,
-                binding_credential: 2,
+                channel_id: "c1".into(),
+                seq: M1_SEQ,
+                recipient: party(2),
+                binding_credential: 1,
                 state: DeliveryState::Queued,
                 reason: None,
             }),
@@ -337,9 +359,10 @@ fn accepted() -> Vec<(u8, Msg)> {
         (
             SERVICE_B,
             msg(CollaborationMsg::Acknowledge {
-                conversation_id: "c1".into(),
-                seq: FIRST_MESSAGE_SEQ,
-                binding_credential: 2,
+                channel_id: "c1".into(),
+                seq: M1_SEQ,
+                recipient: party(2),
+                binding_credential: 1,
                 state: DeliveryState::AdapterAccepted,
                 reason: None,
             }),
@@ -347,15 +370,15 @@ fn accepted() -> Vec<(u8, Msg)> {
     ]
 }
 
-/// the refusal matrix: a replayed sequence with different bytes, a deadline
-/// past the ceiling, an over-cap body, a key that is not the sender's binding,
-/// and an op addressed to a DIFFERENT network. Each must be refused on both
-/// runtimes with the same reason and stage nothing.
+/// the refusal matrix: an op addressed to a DIFFERENT network, a repeated
+/// request with different metadata, a deadline past the ceiling, a message
+/// chat does not hold, and a key that did not post the message. Each must be
+/// refused on both runtimes with the same reason and stage nothing.
 ///
-/// the last two carry the whole weight of the guest's genesis config: the
-/// ceiling refusal proves it read `time_unit` as the height lane (a millisecond
-/// reading would admit that deadline), and the network refusal proves it read
-/// `chain_id` as THIS network rather than accepting anything.
+/// the first and third carry the whole weight of the guest's genesis config:
+/// the network refusal proves it read `chain_id` as THIS network rather than
+/// accepting anything, and the ceiling refusal proves it read `time_unit` as
+/// the height lane (a millisecond reading would admit that deadline).
 fn refused() -> Vec<(u8, Msg, &'static str)> {
     vec![
         (
@@ -364,20 +387,14 @@ fn refused() -> Vec<(u8, Msg, &'static str)> {
                 target: MODULE.into(),
                 payload: encode_msg(&collaboration::Request::new(
                     "another-net",
-                    CollaborationMsg::Send(SendRequest {
-                        conversation_id: "c1".into(),
-                        sender_participant_id: "alice".into(),
-                        message_id: MessageId {
-                            generation: 2,
-                            sequence: 3,
-                        },
-                        recipient_participant_id: "bob".into(),
+                    CollaborationMsg::Deliver(DeliverRequest {
+                        channel_id: "c1".into(),
+                        message_id: "m2".into(),
+                        recipient: party(2),
                         kind: MessageKind::Notice,
-                        reply_to: None,
                         task: None,
-                        body: "for somebody else's chain".into(),
-                        expires_at: 400,
                         references: Vec::new(),
+                        expires_at: 400,
                     }),
                 )),
             },
@@ -385,41 +402,41 @@ fn refused() -> Vec<(u8, Msg, &'static str)> {
         ),
         (
             SERVICE,
-            send(1, "different bytes, same id", 400),
-            "was admitted with different bytes",
+            deliver("m1", MessageKind::Question, 400),
+            "different metadata",
         ),
         (
             SERVICE,
-            send(3, "too far out", 400 + TTL),
-            "time units out",
+            deliver("m2", MessageKind::Notice, 400 + TTL),
+            "more than",
         ),
         (
             SERVICE,
-            send(3, &"x".repeat(collaboration::MAX_BODY_BYTES + 1), 400),
-            "over the",
+            deliver("m9", MessageKind::Notice, 400),
+            "no chat message",
         ),
         (
             9,
-            send(3, "not the bound key", 400),
-            "not authorized to send as",
+            deliver("m2", MessageKind::Notice, 400),
+            "not posted by this origin",
         ),
     ]
 }
 
-/// the reads compared across the runtimes, each as (signer, `via`, read).
-/// `via: Some("c1")` is how a conversation-scoped service key names the
-/// binding it acts under; the owner key uses `None`.
+/// the reads compared across the runtimes, each as (signer, read).
+/// `via: Some("c1")` is how a channel-scoped service key names the binding it
+/// acts under; the owner key uses `None`.
 fn reads() -> Vec<(u8, Vec<u8>)> {
-    let scoped = |read: ProtectedRead| {
+    let scoped = |participant: Party, read: ProtectedRead| {
         encode_query(&CollaborationQuery::Read {
-            participant_id: "alice".into(),
+            participant,
             via: Some("c1".into()),
             read,
         })
     };
-    let owned = |read: ProtectedRead| {
+    let owned = |participant: Party, read: ProtectedRead| {
         encode_query(&CollaborationQuery::Read {
-            participant_id: "alice".into(),
+            participant,
             via: None,
             read,
         })
@@ -427,50 +444,60 @@ fn reads() -> Vec<(u8, Vec<u8>)> {
     vec![
         (
             SERVICE,
-            scoped(ProtectedRead::Events {
-                conversation_id: "c1".into(),
-                from_seq: 1,
-                limit: 16,
-            }),
+            scoped(
+                party(1),
+                ProtectedRead::Events {
+                    channel_id: "c1".into(),
+                    from_seq: 1,
+                    limit: 16,
+                },
+            ),
+        ),
+        (
+            SERVICE_B,
+            scoped(
+                party(2),
+                ProtectedRead::Delivery {
+                    channel_id: "c1".into(),
+                    seq: M1_SEQ,
+                },
+            ),
+        ),
+        (
+            SERVICE_B,
+            scoped(
+                party(2),
+                ProtectedRead::DeliveryEligibility {
+                    channel_id: "c1".into(),
+                    seq: M2_SEQ,
+                },
+            ),
         ),
         (
             SERVICE,
-            scoped(ProtectedRead::Receipt {
-                conversation_id: "c1".into(),
-                seq: FIRST_MESSAGE_SEQ,
-            }),
+            scoped(
+                party(1),
+                ProtectedRead::Binding {
+                    channel_id: "c1".into(),
+                },
+            ),
         ),
-        (
-            SERVICE,
-            scoped(ProtectedRead::Access {
-                conversation_id: "c1".into(),
-            }),
-        ),
-        (
-            SERVICE,
-            scoped(ProtectedRead::Binding {
-                conversation_id: "c1".into(),
-            }),
-        ),
-        (
-            SERVICE,
-            scoped(ProtectedRead::SendState {
-                generation: 2,
-                sequence: 1,
-            }),
-        ),
-        // the participant-wide projections are the OWNER's: the same request
-        // must be answered for key 1 and denied for the service key, on both
+        // the participant-wide projection is the OWNER's: the same request
+        // must be answered for key 2 and denied for the service key, on both
         // runtimes.
-        (1, owned(ProtectedRead::Participant)),
-        (SERVICE, scoped(ProtectedRead::Participant)),
-        (1, owned(ProtectedRead::Mailbox)),
-        // and a conversation the caller is not on.
+        (2, owned(party(2), ProtectedRead::Mailbox)),
+        (SERVICE_B, scoped(party(2), ProtectedRead::Mailbox)),
+        // and a channel the caller may not read.
         (
             1,
-            owned(ProtectedRead::Conversation {
-                conversation_id: "absent".into(),
-            }),
+            owned(
+                party(1),
+                ProtectedRead::Events {
+                    channel_id: "absent".into(),
+                    from_seq: 1,
+                    limit: 16,
+                },
+            ),
         ),
     ]
 }
@@ -598,10 +625,10 @@ fn the_same_refusals_reject_identically_and_leave_no_trace() {
 }
 
 #[test]
-fn revoked_owner_history_is_readable_but_new_delivery_is_denied_on_both_runtimes() {
+fn a_detached_recipients_history_is_readable_but_new_delivery_is_unbound_on_both_runtimes() {
     deterministic::Runner::default().start(|context| async move {
-        let mut native = Lane::new(&context, "native_revoked", false).await;
-        let mut wasm = Lane::new(&context, "wasm_revoked", true).await;
+        let mut native = Lane::new(&context, "native_detached", false).await;
+        let mut wasm = Lane::new(&context, "wasm_detached", true).await;
         for (index, (signer, op)) in accepted().into_iter().enumerate() {
             let height = index as u64 + 1;
             native
@@ -614,8 +641,10 @@ fn revoked_owner_history_is_readable_but_new_delivery_is_denied_on_both_runtimes
                 .await
                 .unwrap();
         }
-        let op = msg(CollaborationMsg::RevokeParticipant {
-            participant_id: "bob".into(),
+        let op = msg(CollaborationMsg::Unbind {
+            channel_id: "c1".into(),
+            participant: party(2),
+            expected_credential: 1,
         });
         native
             .host
@@ -625,21 +654,21 @@ fn revoked_owner_history_is_readable_but_new_delivery_is_denied_on_both_runtimes
         wasm.host.submit_at(block(2, 20), op).await.unwrap();
         assert_eq!(native.root(), wasm.root());
         for (index, read) in [
-            ProtectedRead::Receipt {
-                conversation_id: "c1".into(),
-                seq: FIRST_MESSAGE_SEQ + 1,
+            ProtectedRead::Delivery {
+                channel_id: "c1".into(),
+                seq: M2_SEQ,
             },
             ProtectedRead::DeliveryEligibility {
-                conversation_id: "c1".into(),
-                seq: FIRST_MESSAGE_SEQ + 1,
+                channel_id: "c1".into(),
+                seq: M2_SEQ,
             },
         ]
         .into_iter()
         .enumerate()
         {
-            let history = matches!(read, ProtectedRead::Receipt { .. });
+            let history = matches!(read, ProtectedRead::Delivery { .. });
             let request = encode_query(&CollaborationQuery::Read {
-                participant_id: "bob".into(),
+                participant: party(2),
                 via: None,
                 read,
             });
@@ -652,13 +681,13 @@ fn revoked_owner_history_is_readable_but_new_delivery_is_denied_on_both_runtimes
             if history {
                 assert!(matches!(
                     reply,
-                    collaboration::CollaborationReply::Receipt(Some(_))
+                    collaboration::CollaborationReply::Delivery(Some(_))
                 ));
             } else {
                 assert_eq!(
                     reply,
-                    collaboration::CollaborationReply::Denied(
-                        collaboration::DenyReason::NotPermitted
+                    collaboration::CollaborationReply::Eligibility(
+                        collaboration::DeliveryEligibility::Unbound
                     )
                 );
             }
