@@ -1,6 +1,5 @@
 state
   pages:[PageItem] = []
-  doc_tabs:[str] = []
   blocks:[PageBlock] = []
   active_page = ""
   active_page_title = ""

@@ -18,7 +18,7 @@ use "kit.ice"
 extern crate::host
   HostError(message:str)
   AccountKeyRow(scheme:str, pubkey:str, label:str)
-  SettingsProps(dark:bool, connected:bool, loading:bool, status:str, busy:bool, recovering:bool, appearance:str, desktop_notifications:bool, unlocked:bool, account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, account_ticket:str, drafts_cleared:i64, drafts_scope:str)
+  SettingsProps(dark:bool, connected:bool, loading:bool, status:str, busy:bool, recovering:bool, appearance:str, desktop_notifications:bool, unlocked:bool, account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, account_ticket:str, drafts_cleared:i64, drafts_scope:str)
   stream props() -> SettingsProps ! HostError
   pure open_tab(tab:&str) -> bool
   pure reconnect_network() -> bool
@@ -36,7 +36,6 @@ extern crate::host
   pure link_wallet(label:&str) -> bool
   pure login() -> bool
   pure copy(text:&str, label:&str) -> bool
-  pure clear_tabs() -> bool
   pure set_light() -> bool
   pure set_dark() -> bool
   pure set_notifications(enabled:bool) -> bool
@@ -64,7 +63,6 @@ state
   account_ceremony_left = ""
   settings_key_state = ""
   settings_key_path = ""
-  settings_open_tabs:i64 = 0
   tier = ""
   admin = false
   members_line = ""
@@ -110,7 +108,6 @@ on props_changed(next)
   account_ceremony_left = next.account_ceremony_left
   settings_key_state = next.settings_key_state
   settings_key_path = next.settings_key_path
-  settings_open_tabs = next.settings_open_tabs
   tier = next.tier
   admin = next.admin
   members_line = next.members_line
@@ -192,9 +189,6 @@ on account_login_submit
 on copy_to_clipboard(text, label)
   sent = copy(text, label)
 
-on settings_clear_tabs
-  sent = clear_tabs()
-
 on set_appearance_light
   sent = set_light()
 
@@ -221,7 +215,6 @@ view
         account_ceremony_left
         settings_key_state
         settings_key_path
-        settings_open_tabs
         tier
         admin
         members_line
@@ -258,7 +251,6 @@ view
         account_wallet_submit -> account_wallet_submit
         account_login_submit -> account_login_submit
         copy_to_clipboard -> copy_to_clipboard _ _
-        settings_clear_tabs -> settings_clear_tabs
         set_appearance_light -> set_appearance_light
         set_appearance_dark -> set_appearance_dark
         set_desktop_notifications -> set_desktop_notifications _
