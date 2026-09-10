@@ -542,12 +542,24 @@ fn move_block(
         old.children.retain(|child| child != &block_id);
         put_row(out, &old)?;
     }
+    // A PAGE MOVED UNDER ANOTHER PARENT CHANGES WHICH PAGE CONTAINS IT, and
+    // the page list serves that from `page/<id>`, not from the block row:
+    // mirror the canonical `index_set_parent` — the CONTAINING page of the
+    // new parent (a page block names itself, a body block names its page),
+    // `None` at the root.
+    let mut containing_page = None;
     if let Some(parent_id) = &parent
         && let Some(mut new_parent) = read_row(read, parent_id)?
     {
         let at = insert_index(&new_parent.children, after.as_deref());
         new_parent.children.insert(at, block_id.clone());
+        containing_page = Some(new_parent.page_id.clone());
         put_row(out, &new_parent)?;
+    }
+    let moves_page = row.kind == BlockKind::Page;
+    if moves_page && let Some(mut page) = read_page(read, &block_id)? {
+        page.parent = containing_page;
+        put_page(out, &page)?;
     }
     row.parent = parent;
     put_row(out, &row)
@@ -1359,6 +1371,87 @@ mod tests {
             }],
         );
         assert_eq!(children(&map), ["b1", "b2"], "None anchors at the HEAD");
+    }
+
+    /// The page list reads `page/<id>.parent`, so a page moved under another
+    /// page — or under a BODY block of one, or back to the root — must land
+    /// there too, the way the canonical `index_set_parent` records the
+    /// containing page. A same-parent reorder leaves it alone.
+    #[test]
+    fn a_moved_page_changes_the_parent_the_page_list_reports() {
+        let mut map = Map::new();
+        let page = |id: &str| PageMsg::CreatePage {
+            page_id: id.into(),
+            title: id.to_uppercase(),
+            blocks: Vec::new(),
+        };
+        apply(
+            &mut map,
+            1,
+            &[page("a"), page("b"), page("c"), insert("a", "a1", "body")],
+        );
+        let parent_of = |map: &Map, id: &str| {
+            list(map)
+                .into_iter()
+                .find(|row| row.id == id)
+                .expect("the page is listed")
+                .parent
+        };
+        assert_eq!(parent_of(&map, "b"), None);
+
+        // top-level → nested under a page
+        apply(
+            &mut map,
+            2,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: Some("a".into()),
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), Some("a".into()));
+        assert_eq!(
+            read_row(&map, "b").unwrap().unwrap().parent,
+            Some("a".into()),
+            "the block row moves with it"
+        );
+
+        // nested under a BODY block: the containing page, not the block
+        apply(
+            &mut map,
+            3,
+            &[PageMsg::MoveBlock {
+                block_id: "c".into(),
+                parent: Some("a1".into()),
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "c"), Some("a".into()));
+
+        // a same-parent reorder is not a re-homing
+        apply(
+            &mut map,
+            4,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: Some("a".into()),
+                after: Some("a1".into()),
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), Some("a".into()));
+
+        // nested → top-level
+        apply(
+            &mut map,
+            5,
+            &[PageMsg::MoveBlock {
+                block_id: "b".into(),
+                parent: None,
+                after: None,
+            }],
+        );
+        assert_eq!(parent_of(&map, "b"), None);
+        assert_eq!(read_row(&map, "b").unwrap().unwrap().parent, None);
     }
 
     #[test]
