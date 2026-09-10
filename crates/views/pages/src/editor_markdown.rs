@@ -7,15 +7,11 @@
 //! is on their line, which is what makes the surface read as WYSIWYG instead of
 //! as a source view.
 //!
-//! TWO THINGS THE REFERENCE DOES THAT THIS DELIBERATELY DOES NOT:
-//!   * `pulldown-cmark` for the inline grammar. Pages must agree with the CHAT
-//!     renderer, not with CommonMark — a `_word_` that italicises in a message
-//!     has to italicise here. [`super::inline::inline_marks`] IS that grammar,
-//!     already tested against `chat::client::inline_spans`, so it is the parser
-//!     for both surfaces and no dependency is added.
-//!   * `iced_highlighter` language tokens inside fences. `PageBlock` carries no
-//!     language field, so there is nothing to colour BY; a fence body is one
-//!     mono plate.
+//! Inline emphasis uses the Chat grammar; Pages additionally conceals named
+//! link syntax outside the active editing line, without rewriting the source.
+//! Unlike the reference, there are no `iced_highlighter` language tokens inside
+//! fences. `PageBlock` carries no language field, so a fence body is one mono
+//! plate.
 //!
 //! The line metrics are the Pages design tokens from the pages view's `rows.ice`
 //! (H1 20/1.25, H2 16/1.3, H3 14/1.35, body 14/1.65, quote 14/1.6, code 12/1.6,
@@ -27,7 +23,7 @@ use iced::{Border, Color, Font, Padding, Pixels};
 use std::ops::Range;
 use ui_lang_runtime::editor_format::Format;
 
-use super::inline::{Inline, inline_marks};
+use super::inline::{Inline, document_marks};
 
 pub const BODY_SIZE: f32 = 14.0;
 pub const BODY_LINE_HEIGHT: f32 = 1.65;
@@ -69,6 +65,7 @@ const HEADING_PAD: [[f32; 2]; 3] = [[24.0, 8.0], [18.0, 6.0], [14.0, 4.0]];
 /// own line stays legible so it can be edited, everywhere else it disappears.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caret {
+    pub focused: bool,
     pub line: usize,
     pub column: usize,
     pub dark: bool,
@@ -259,7 +256,7 @@ impl Highlighter for DocumentHighlighter {
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
         let index = self.current_line;
         let inside_code = self.fences[index];
-        let on_caret_line = index == self.caret.line;
+        let on_caret_line = self.caret.focused && index == self.caret.line;
         let commented = self.caret.commented.contains(&(index as i64));
         let (marks, next_inside) = match index == 0 {
             true => (vec![(0..line.len(), Mark::Title)], false),
@@ -379,7 +376,7 @@ fn highlight(
         false => content,
     };
     marks.push((body_start..line.len(), Mark::Body(style)));
-    for (range, inline) in inline_marks(&line[content..]) {
+    for (range, inline) in document_marks(&line[content..]) {
         let shifted = content + range.start..content + range.end;
         let inline_style = match inline {
             Inline::Marker => {
@@ -844,6 +841,7 @@ mod tests {
     #[test]
     fn line_zero_is_the_title_and_nothing_in_it_is_markdown() {
         let mut highlighter = <DocumentHighlighter as Highlighter>::new(&Caret {
+            focused: true,
             line: 0,
             column: 0,
             dark: false,
@@ -854,6 +852,26 @@ mod tests {
         // ...and line 1 parses normally, so the title costs the body nothing.
         let body: Vec<_> = highlighter.highlight_line("# a real heading").collect();
         assert!(matches!(body[0].1, Mark::Marker { .. }));
+    }
+
+    #[test]
+    fn named_link_label_keeps_its_destination_when_syntax_is_hidden() {
+        let source = "[문서](duck://pages/alpha)";
+        let (marks, _) = highlight(source, false, false, false);
+        let (label, _) = marks
+            .iter()
+            .find(|(_, mark)| matches!(mark, Mark::Body(style) if style.link))
+            .unwrap();
+        assert_eq!(&source[label.clone()], "문서");
+        assert_eq!(
+            super::super::inline::document_link_at(source, label.start).as_deref(),
+            Some("duck://pages/alpha")
+        );
+        let hidden_markers = marks
+            .iter()
+            .filter(|(_, mark)| matches!(mark, Mark::Marker { hidden: true, .. }))
+            .count();
+        assert_eq!(hidden_markers, 2);
     }
 
     #[test]
@@ -970,6 +988,7 @@ mod plate_probe {
     #[test]
     fn the_code_body_line_keeps_full_size_ink() {
         let mut hl = <DocumentHighlighter as Highlighter>::new(&Caret {
+            focused: true,
             line: 0,
             column: 0,
             dark: false,

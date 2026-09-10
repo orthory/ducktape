@@ -159,3 +159,129 @@ fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
         }
     );
 }
+
+#[test]
+fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
+    use ui_lang_guest::{testing, wire};
+    use wire::editor_document::{EditorDocumentRef, EditorTransferId, EditorTransferSender};
+    let text = "Title\n[문서](https://example.com)";
+    let reference = EditorDocumentRef {
+        document: "page-alpha".into(),
+        reset: 1,
+        revision: 0,
+        text_revision: 0,
+        byte_len: text.len() as u32,
+        cursor: wire::EditorCursor {
+            position: wire::EditorPosition { line: 1, column: 1 },
+            selection: None,
+        },
+    };
+    let mut props = facts();
+    props.document_source = wire::encode(&pages_view::document_source::DocumentIdentity {
+        document: reference.document.clone(),
+        reset: reference.reset,
+    });
+    let (_, mut frame) = shown(&props);
+    let mut root = frame.root.clone().unwrap();
+    let source = frame
+        .requests
+        .iter()
+        .find(|request| request.kind == "pages.document")
+        .unwrap()
+        .id;
+    let mut sender = EditorTransferSender::new(
+        EditorTransferId {
+            instance: 1,
+            document: reference.document.clone(),
+            reset: 1,
+            serial: 1,
+            attempt: 0,
+        },
+        reference.clone(),
+    )
+    .unwrap();
+    while let Some(transfer) = sender.next_frame(&reference, text).unwrap() {
+        frame = tick_native(vec![item(source, &wire::encode(&transfer))]);
+        if let Some(next) = &frame.root {
+            root = next.clone();
+        } else {
+            wire::apply(&mut root, frame.patches.clone()).unwrap();
+        }
+    }
+    let focus_request = |frame: &Frame| {
+        let request = frame
+            .requests
+            .iter()
+            .find(|request| request.kind == "host.widget")
+            .unwrap();
+        assert_eq!(
+            wire::decode::<wire::WidgetCommand>(&request.payload).unwrap(),
+            wire::WidgetCommand::Focused {
+                target: "PagesView/root/pages/document".into()
+            }
+        );
+        request.id
+    };
+    let first = focus_request(&frame);
+    let mut reply = |id, focused| {
+        let frame = tick_native(vec![wire::Event::Response {
+            id,
+            result: Ok(wire::encode(&focused)),
+            done: true,
+        }]);
+        if let Some(next) = &frame.root {
+            root = next.clone();
+        } else {
+            wire::apply(&mut root, frame.patches.clone()).unwrap();
+        }
+        let shown = Frame {
+            root: Some(root.clone()),
+            ..Default::default()
+        };
+        let Some(wire::Node::Editor {
+            options, document, ..
+        }) = testing::find(&shown, "PagesView/root/pages/document")
+        else {
+            panic!("editor");
+        };
+        assert_eq!(document.byte_len, text.len() as u32);
+        assert_eq!(document.cursor, reference.cursor);
+        let paint = options.presentation.as_ref().unwrap();
+        paint
+            .spans
+            .iter()
+            .filter(|span| span.line == 1)
+            .filter(|span| paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0)
+            .map(|span| &text[6 + span.start as usize..6 + span.end as usize])
+            .collect::<String>()
+    };
+    assert_eq!(reply(first, true), "[문서](https://example.com)");
+    let release = || wire::Event::Mouse {
+        event: wire::mouse::Event::ButtonReleased(wire::mouse::Button::Left),
+        captured: true,
+    };
+    let old = focus_request(&tick_native(vec![release()]));
+    let latest = focus_request(&tick_native(vec![release()]));
+    assert_eq!(reply(latest, false), "문서");
+    assert_eq!(
+        reply(old, true),
+        "문서",
+        "late responses cannot reopen source syntax"
+    );
+    let next = focus_request(&tick_native(vec![release()]));
+    assert_eq!(reply(next, true), "[문서](https://example.com)");
+    // Tab is usually captured by the mounted widgets before this observation.
+    use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
+    let tab = wire::Event::Keyboard {
+        event: wire::keyboard::Event::Release(KeyState {
+            key: Key::Named(Named::Tab),
+            modified_key: Key::Named(Named::Tab),
+            physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+        }),
+        captured: true,
+    };
+    let tab_query = focus_request(&tick_native(vec![tab]));
+    assert_eq!(reply(tab_query, false), "문서");
+}
