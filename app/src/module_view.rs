@@ -1714,7 +1714,13 @@ fn intents_of(module: &str) -> &'static [&'static str] {
     match module {
         "governance" => &["vote", "execute"],
         "members" => &["copy", "agent_status", "propose"],
-        "agents" => &["status", "save", "register", "open_run", "open_link"],
+        "agents" => &[
+            "status",
+            "save",
+            "register",
+            "open_run",
+            "open_link",
+        ],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
         "chat" => &[
@@ -4098,10 +4104,18 @@ pub(crate) mod tests {
         assert_eq!(intents_of("members"), ["copy", "agent_status", "propose"]);
         assert_eq!(
             intents_of("agents"),
-            ["status", "save", "register", "open_run", "open_link",]
+            [
+                "status",
+                "save",
+                "register",
+                "open_run",
+                "open_link",
+            ]
         );
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 45);
+        assert_eq!(chat.len(), 43);
+        assert!(!chat.contains(&"edit"));
+        assert!(!chat.contains(&"thread_edit"));
         assert!(chat.contains(&"choose_channel"));
         assert!(
             chat.contains(&"cancel_run"),
@@ -4630,10 +4644,7 @@ pub(crate) mod tests {
         guest.redraw(&props);
         let intent = guest.intents.last().expect("target navigation");
         assert_eq!(intent.kind, "open_link");
-        assert!(matches!(
-            agents_intent(intent),
-            crate::AgentsIntent::OpenLink
-        ));
+        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
             target.url
@@ -7920,10 +7931,7 @@ pub(crate) mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
         guest.redraw(&chat_facts_in(
-            "channel-a",
-            &messages,
-            &[],
-            std::slice::from_ref(&starting),
+            "channel-a", &messages, &[], std::slice::from_ref(&starting),
         ));
         assert!(button_shown(&guest, "Chief Duck · View thread"));
         assert!(!button_shown(&guest, "Stop"));
@@ -7958,12 +7966,7 @@ pub(crate) mod tests {
             answer_preview: "the files crate builds clean".into(),
             ..starting
         };
-        guest.redraw(&chat_run_thread_facts(
-            "channel-a",
-            &messages,
-            &[],
-            &[working],
-        ));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &[working]));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -8096,12 +8099,7 @@ pub(crate) mod tests {
         };
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
-        guest.redraw(&chat_run_thread_facts(
-            "channel-a",
-            &messages,
-            &[],
-            &reading,
-        ));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -8113,12 +8111,7 @@ pub(crate) mod tests {
             "{shown:?}"
         );
         // the same reading, the other room on screen
-        guest.redraw(&chat_run_thread_facts(
-            "channel-b",
-            &messages,
-            &[],
-            &reading,
-        ));
+        guest.redraw(&chat_run_thread_facts("channel-b", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Draining the queue"),
