@@ -43,7 +43,6 @@ pub struct SettingsProps {
     pub account_ceremony_left: String,
     pub settings_key_state: String,
     pub settings_key_path: String,
-    pub settings_open_tabs: i64,
     pub tier: String,
     pub admin: bool,
     pub members_line: String,
@@ -230,10 +229,6 @@ pub fn copy(text: &str, label: &str) -> bool {
             label: label.into(),
         },
     )
-}
-
-pub fn clear_tabs() -> bool {
-    notify("settings.clear_tabs", &())
 }
 
 pub fn set_light() -> bool {

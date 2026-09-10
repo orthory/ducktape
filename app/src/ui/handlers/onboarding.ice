@@ -481,7 +481,6 @@ on network_entered
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
   pages = []
-  doc_tabs = []
   blocks = []
   active_page = ""
   active_page_title = ""

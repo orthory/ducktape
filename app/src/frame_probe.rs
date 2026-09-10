@@ -98,8 +98,8 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // one-change negative control measured with this deterministic fixture:
     // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
     // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
-    // externs borrowing their list and string arguments (`doc_tab_rows`,
-    // `subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
+    // externs borrowing their list and string arguments
+    // (`subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
     // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
     // externs cloning them per frame.
     ScreenProbe {
