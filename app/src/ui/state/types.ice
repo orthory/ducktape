@@ -325,7 +325,6 @@ enum SettingsIntent
   wallet
   login
   copy
-  clear_tabs
   light
   dark
   notifications
@@ -343,7 +342,6 @@ enum PagesIntent
   arm_delete
   disarm_delete
   delete
-  close_tab
   open_hit
   use_draft
   discard_draft

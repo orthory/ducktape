@@ -198,7 +198,7 @@ view
         // strip and the comments rail go in as props; the document is the
         // app's editor, painted into the view's slot by the host.
         pages:
-          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, doc_tabs, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
+          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW: the listing, the preview, the
         // history and the write refusal go in as props; every navigation
@@ -236,7 +236,7 @@ view
         // signing seat as a flag, never the password — and every act comes
         // back as an intent the handler signs. The drafts are the view's.
         settings:
-          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, settings_open_tabs, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
+          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
         // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
         // the last search go in as props; a refresh, a search, its clearing
         // and a copy come back as intents the handler acts on.

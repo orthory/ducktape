@@ -115,7 +115,6 @@ on settings_loaded(next)
   // chat load, so without this the composer stayed refused until the next
   // delta.
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
-  settings_open_tabs = next.open_tabs
 
 on settings_failed(cause)
   return if cause.generation != settings_generation
@@ -255,9 +254,6 @@ on settings_view_event(event)
       toast = event_text(event, "label")
       toast_age = 0
       task clipboard write event_text(event, "text")
-    SettingsIntent.clear_tabs
-      doc_tabs = []
-      run every clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
     SettingsIntent.light
       flow
         from done true

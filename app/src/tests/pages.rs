@@ -208,7 +208,7 @@ fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
         "run latest lane=page_autosave save_page_document(connected_rpc, password, active_page, text, page_saved_text) -> page_document_saved _ | page_document_save_failed _"
     ));
     assert!(!pages.contains("run replace lane=page_autosave"));
-    assert_eq!(pages.matches("invalidate lane=page_autosave").count(), 5);
+    assert_eq!(pages.matches("invalidate lane=page_autosave").count(), 4);
 
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
     assert_eq!(
@@ -464,19 +464,16 @@ fn a_page_click_repaints_before_the_load_lands() {
     assert!(app.page_saved_text.is_empty());
 }
 
-// `buffer_page`, not `active_page`, is what the install decision compares.
-// Closing the front tab moves the selection while the buffer is still the old
-// page's and still DIRTY — read against `active_page` the landing document is
-// a same-page refresh, the dirty buffer refuses it, and Beta opens showing
-// Alpha's text.
+// `buffer_page`, not `active_page`, is what the install decision compares. A
+// live resync moves `active_page` while a DIRTY buffer stays on the page it
+// came from — read against `active_page` the landing document is a same-page
+// refresh, the dirty buffer refuses it, and Beta opens showing Alpha's text.
 #[test]
 fn the_landing_document_installs_when_the_page_actually_moved() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
     let mut app = reading_alpha();
     app.page_text = ("Alpha\nalpha body, still typing").to_string();
-
-    let _ = app.__update(__DucktapeMessage::CloseDocTab("alpha".into()));
-    assert_eq!(app.active_page, "beta", "the tab close moved the selection");
+    app.active_page = "beta".into();
     assert_eq!(app.buffer_page, "alpha", "the buffer is still Alpha's");
 
     let _ = app.__update(__DucktapeMessage::PagesUpdated(page_load(
