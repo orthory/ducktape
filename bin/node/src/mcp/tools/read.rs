@@ -20,10 +20,9 @@
 //! hand-written json, so a wire change in `chat` or `forge` breaks this file at
 //! COMPILE time instead of at run time in front of a model.
 //!
-//! caps: `forge_read` and `duckfs_read` gate the two resource families the caps
-//! vocabulary actually names. chat / tasks / pages carry no read cap in
-//! `ResourceCaps`, so they are ungated here — inventing a gate the registry
-//! cannot express would be a permission nobody could grant.
+//! reads are not gated: a run reads what any member of the network reads. the
+//! `query` operation is the floor under the typed table — any module's own
+//! query, verbatim — so a read the table lacks a name for is still one call.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -31,10 +30,7 @@ use serde_json::{Value, json};
 
 use forge::ForgeQuery;
 use pages::PageQuery;
-// the ONE duckfs reply filter, shared with the sandboxed run's read lane.
-use provider_host::duckfs_cap;
-use runs::RunsQuery;
-use runs::{CapRequest, ModelQuery};
+use runs::{ModelQuery, RunsQuery};
 use tasks::{JobsQuery, TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
@@ -45,6 +41,8 @@ const TARGET_CHAT: &str = "chat";
 const TARGET_TASKS: &str = "tasks";
 const TARGET_PAGES: &str = "pages";
 const TARGET_FORGE: &str = "forge";
+/// the generic read: any module's own query, verbatim.
+pub const OP_QUERY: &str = "query";
 
 /// the read-list default: enough context to be useful, small enough that a
 /// careless call cannot blow the model's context.
@@ -55,32 +53,38 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "ducktape_whoami",
-            description: "Who you are in Ducktape: your run id, agent id, display name, owner, the \
-                          actions you are allowed to take, your resource caps, your workspace \
-                          directory, and where your skills are mounted. Call this first if you \
-                          are unsure what you are permitted to do — every write is gated on the \
-                          actions listed here.",
+            description: "Who you are in Ducktape: your run id, agent id, display name, owner, \
+                          program account, your workspace directory, and where your skills are \
+                          mounted. Call this first if you are unsure who you are acting as.",
             schema: || schema(&[]),
             handler: whoami,
         },
         Tool {
             name: "ducktape_actions",
             description: "The operation catalog. Each write operation comes from the runs module \
-                          with its target and input schemas, the receipt result it reports, the \
-                          grant it requires and the lanes it admits (live via ducktape_action, \
+                          with its target and input schemas, the receipt result it reports and \
+                          the lanes it admits (live via ducktape_action, \
                           final via your final response). Each read operation is one \
                           ducktape_query can run, with its target and input schemas. Pass filter \
                           to keep only names starting with it (e.g. \"pages.\").",
-            schema: || schema(&[("filter", "string", false, "A name prefix to narrow the catalog.")]),
+            schema: || {
+                schema(&[(
+                    "filter",
+                    "string",
+                    false,
+                    "A name prefix to narrow the catalog.",
+                )])
+            },
             handler: actions,
         },
         Tool {
             name: "ducktape_query",
             description: "Run one read operation from the catalog: operation names it, target \
                           selects the resource it reads (omit when the operation takes none), \
-                          input carries its options. Reads of forge repos require the repo in \
-                          your forge_read caps; reads of duckfs require the path under your \
-                          duckfs_read caps; everything else is ungated.",
+                          input carries its options. The query operation runs any module's own \
+                          query verbatim: target names the module, input is the query as that \
+                          module's wire spells it (an object with one key, or a bare string). \
+                          Reads are not gated.",
             schema: query_schema,
             handler: query,
         },
@@ -90,7 +94,14 @@ pub(super) fn tools() -> Vec<Tool> {
                           ducktape_action returned: its operation, result, target, payload and \
                           status (awaiting the program, claimed, completed with the target's \
                           outcome, or rejected with the reason).",
-            schema: || schema(&[("id", "string", true, "The receipt_id ducktape_action returned.")]),
+            schema: || {
+                schema(&[(
+                    "id",
+                    "string",
+                    true,
+                    "The receipt_id ducktape_action returned.",
+                )])
+            },
             handler: receipt,
         },
     ]
@@ -135,7 +146,7 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
     vec![
         ReadOperation {
             name: "agents.list",
-            description: "List registered agents with their status, owner, allowed actions, resource caps, and curated skills.",
+            description: "List registered agents with their status, owner, capability and curated skills.",
             target: None,
             input: bounded_list_schema(),
             handler: agents_list,
@@ -157,7 +168,10 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
         ReadOperation {
             name: "chat.messages",
             description: "Read the most recent top-level messages of a chat channel, oldest first. Each root carries its thread summary.",
-            target: Some(closed(json!({"channel_id": {"type": "string"}}), &["channel_id"])),
+            target: Some(closed(
+                json!({"channel_id": {"type": "string"}}),
+                &["channel_id"],
+            )),
             input: closed(
                 json!({"limit": {"type": "integer", "description": "How many of the newest roots to return (default 50, max 200)."}}),
                 &[],
@@ -201,14 +215,14 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
         },
         ReadOperation {
             name: "forge.items",
-            description: "List a forge repo's issues and pull requests. Requires the repo in your forge_read caps.",
+            description: "List a forge repo's issues and pull requests.",
             target: Some(closed(json!({"repo": {"type": "string"}}), &["repo"])),
             input: no_input(),
             handler: forge_items,
         },
         ReadOperation {
             name: "forge.item",
-            description: "Read one forge issue or pull request in full — body, branches, reviews, and the id of its discussion channel (readable with chat.messages). Requires the repo in your forge_read caps.",
+            description: "Read one forge issue or pull request in full — body, branches, reviews, and the id of its discussion channel (readable with chat.messages).",
             target: Some(closed(
                 json!({"repo": {"type": "string"}, "number": {"type": "integer"}}),
                 &["repo", "number"],
@@ -218,7 +232,7 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
         },
         ReadOperation {
             name: "forge.pr_diff",
-            description: "Read a pull request's exact committed source and target OIDs plus a bounded unified patch and full diff statistics. The patch is capped at 48 KiB and reports truncation; inputs beyond 256 changed files or 8 MiB of aggregate blobs fail instead of returning partial statistics. Fails if the item is not a PR or the pinned git objects are unavailable locally. Requires the repo in your forge_read caps.",
+            description: "Read a pull request's exact committed source and target OIDs plus a bounded unified patch and full diff statistics. The patch is capped at 48 KiB and reports truncation; inputs beyond 256 changed files or 8 MiB of aggregate blobs fail instead of returning partial statistics. Fails if the item is not a PR or the pinned git objects are unavailable locally.",
             target: Some(closed(
                 json!({"repo": {"type": "string"}, "number": {"type": "integer"}}),
                 &["repo", "number"],
@@ -228,21 +242,21 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
         },
         ReadOperation {
             name: "files.ls",
-            description: "List a directory in the Ducktape filesystem (duckfs). This is the shared, replicated filesystem — NOT your local workspace, which you read with ordinary file tools. Requires the path under your duckfs_read caps.",
+            description: "List a directory in the Ducktape filesystem (duckfs). This is the shared, replicated filesystem — NOT your local workspace, which you read with ordinary file tools.",
             target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
             input: no_input(),
             handler: files_ls,
         },
         ReadOperation {
             name: "files.read",
-            description: "Read a file from the Ducktape filesystem (duckfs) as text. Requires the path under your duckfs_read caps.",
+            description: "Read a file from the Ducktape filesystem (duckfs) as text.",
             target: Some(closed(json!({"path": {"type": "string"}}), &["path"])),
             input: no_input(),
             handler: files_read,
         },
         ReadOperation {
             name: "files.grep",
-            description: "Search the Ducktape filesystem (duckfs) for matching lines under a path prefix. Requires the prefix under your duckfs_read caps.",
+            description: "Search the Ducktape filesystem (duckfs) for matching lines under a path prefix.",
             target: Some(closed(json!({"prefix": {"type": "string"}}), &["prefix"])),
             input: closed(json!({"pattern": {"type": "string"}}), &["pattern"]),
             handler: files_grep,
@@ -253,6 +267,18 @@ pub(super) fn read_operations() -> Vec<ReadOperation> {
             target: None,
             input: no_input(),
             handler: agent_calls,
+        },
+        ReadOperation {
+            name: OP_QUERY,
+            description: "Run any module's own query verbatim — the floor under this table. target names the module; input is the query exactly as that module's wire spells it: an object with exactly one key (the query name) or a bare string. The module's reply comes back untouched, and an unknown query name is refused with the names the module does accept.",
+            target: Some(closed(json!({"module": {"type": "string"}}), &["module"])),
+            input: json!({
+                "oneOf": [
+                    {"type": "object", "minProperties": 1, "maxProperties": 1},
+                    {"type": "string"},
+                ],
+            }),
+            handler: module_query,
         },
     ]
 }
@@ -294,8 +320,6 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
         "owner": record.owner,
         "capability": record.capability,
         "status": record.status,
-        "allowed_actions": record.allowed_actions,
-        "caps": record.caps,
         "skills": record.skills,
         "run_id": run.run_id(),
         "workspace_dir": run.workspace,
@@ -329,7 +353,11 @@ fn actions(run: &Run, args: &Value) -> Result<Value> {
             view
         })
         .collect();
-    let keep = |name: &str| filter.as_deref().is_none_or(|prefix| name.starts_with(prefix));
+    let keep = |name: &str| {
+        filter
+            .as_deref()
+            .is_none_or(|prefix| name.starts_with(prefix))
+    };
     operations.extend(
         read_operations()
             .iter()
@@ -364,10 +392,18 @@ fn query(run: &Run, args: &Value) -> Result<Value> {
             )));
         }
     };
-    let input = match args.get("input") {
-        None | Some(Value::Null) => json!({}),
-        Some(input @ Value::Object(_)) => input.clone(),
-        Some(_) => {
+    let generic = operation.name == OP_QUERY;
+    let input = match (args.get("input"), generic) {
+        (None | Some(Value::Null), _) => json!({}),
+        (Some(input @ Value::Object(_)), _) => input.clone(),
+        (Some(input @ Value::String(_)), true) => input.clone(),
+        (Some(_), true) => {
+            return Err(NodeError::Rejected(format!(
+                "{name} needs an \"input\" argument that is the module's own query: an object \
+                 with one key, or a string"
+            )));
+        }
+        (Some(_), false) => {
             return Err(NodeError::Rejected(format!(
                 "{name} needs an object \"input\" argument"
             )));
@@ -487,7 +523,6 @@ fn forge_repos(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
 
 fn forge_items(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let repo = arg_str(target, "repo")?;
-    gate_forge_read(run, &repo)?;
     let query = ForgeQuery::ListItems { repo };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
@@ -495,7 +530,6 @@ fn forge_items(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
 fn forge_item(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let repo = arg_str(target, "repo")?;
     let number = item_number(target)?;
-    gate_forge_read(run, &repo)?;
     let query = ForgeQuery::GetItem { repo, number };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
@@ -503,7 +537,6 @@ fn forge_item(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
 fn forge_pr_diff(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let repo = arg_str(target, "repo")?;
     let number = item_number(target)?;
-    gate_forge_read(run, &repo)?;
     let query = ForgeQuery::PrDiff { repo, number };
     run.node.query(TARGET_FORGE, encode(&query)?)
 }
@@ -516,7 +549,6 @@ fn item_number(target: &Value) -> Result<u64> {
 
 fn files_ls(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let path = arg_str(target, "path")?;
-    gate_duckfs_read(run, &path)?;
     run.node.files("ls", &[("path", path)])
 }
 
@@ -525,7 +557,6 @@ fn files_ls(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
 /// handing a model a base64 blob to decode in its head.
 fn files_read(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     let path = arg_str(target, "path")?;
-    gate_duckfs_read(run, &path)?;
     let reply = run.node.files("read", &[("path", path.clone())])?;
     let Some(b64) = reply.get("b64").and_then(Value::as_str) else {
         return Ok(reply);
@@ -546,39 +577,11 @@ fn files_read(run: &Run, target: &Value, _input: &Value) -> Result<Value> {
     }
 }
 
-/// duckfs grep's own prefix rule is a raw string prefix (`/shared/team` also
-/// matches `/shared/team-secrets/...`), but the cap this operation gates on is
-/// segment-boundary (see `ModelRecord::permits`'s doc on `DuckfsRead`). Passing
-/// the gate on `prefix` does not make every hit `grep` returns covered by the
-/// cap, so each hit's own path is re-checked against the SAME predicate before
-/// it reaches the agent — closing the sibling-path leak without narrowing
-/// grep's textual-prefix search for callers that rely on it (the raw
-/// `/v1/files/grep` route has no cap at all). `prefix` itself is sent to
-/// duckfs UNCHANGED, deliberately: widening it to segment form
-/// (`/shared/team` -> `/shared/team/`) would close the sibling-scan at the
-/// source, but it would also silently empty a legitimate call whose `prefix`
-/// names one exact file rather than a directory (grep only matches a file
-/// candidate with `child == prefix || child.starts_with(prefix)`, and no
-/// file path ends in `/`). `duckfs_cap`'s two filters already re-check every
-/// hit and the resume cursor against the cap regardless of what duckfs scanned,
-/// so nothing outside the cap can reach the agent either way — a `next` cursor
-/// is a resume path, not a hit.
-///
-/// They live in `provider-host` rather than here because this is not the only
-/// gate in front of the raw route any more: a sandboxed run's node tunnel is a
-/// cap-checked read lane (`provider-host`'s `read_lane`) that filters the same
-/// replies, and the lane and this tool plane must decide identically.
 fn files_grep(run: &Run, target: &Value, input: &Value) -> Result<Value> {
     let prefix = arg_str(target, "prefix")?;
     let pattern = arg_str(input, "pattern")?;
-    let record = run.record()?;
-    run.permits(&record, &CapRequest::DuckfsRead(&prefix))?;
-    let mut reply = run
-        .node
-        .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
-    duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-    duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
-    Ok(reply)
+    run.node
+        .files("grep", &[("pattern", pattern), ("prefix", prefix)])
 }
 
 fn agent_calls(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
@@ -593,14 +596,29 @@ fn agent_calls(run: &Run, _target: &Value, _input: &Value) -> Result<Value> {
     )
 }
 
-fn gate_forge_read(run: &Run, repo: &str) -> Result<()> {
-    let record = run.record()?;
-    run.permits(&record, &CapRequest::ForgeRead(repo))
-}
-
-fn gate_duckfs_read(run: &Run, path: &str) -> Result<()> {
-    let record = run.record()?;
-    run.permits(&record, &CapRequest::DuckfsRead(path))
+/// the generic read: the module's own query, verbatim, and its reply the same
+/// way. the target module decides what the bytes mean; an unknown query name
+/// comes back as that module's own refusal, naming the queries it accepts.
+fn module_query(run: &Run, target: &Value, input: &Value) -> Result<Value> {
+    let module = arg_str(target, "module")?;
+    if module.is_empty() {
+        return Err(NodeError::Rejected(
+            "query needs a non-empty module in its target".into(),
+        ));
+    }
+    let names_one_query = match input {
+        Value::Object(fields) => fields.len() == 1,
+        Value::String(name) => !name.is_empty(),
+        _ => false,
+    };
+    if !names_one_query {
+        return Err(NodeError::Rejected(
+            "query needs the module's own query as input: an object with exactly one key, or a \
+             non-empty string"
+                .into(),
+        ));
+    }
+    run.node.query(&module, input.clone())
 }
 
 fn bounded_list_schema() -> Value {
@@ -807,12 +825,24 @@ mod tests {
         assert_eq!(names.len(), count, "read operation names must be unique");
         for op in &ops {
             assert!(!op.description.is_empty(), "{} has no description", op.name);
-            assert_eq!(op.input["type"], "object", "{} input is not an object", op.name);
+            let input_is_an_object = op.input["type"] == "object";
+            let input_is_the_modules_own_query = op.name == OP_QUERY;
+            assert!(
+                input_is_an_object || input_is_the_modules_own_query,
+                "{} input is not an object",
+                op.name
+            );
             if let Some(target) = &op.target {
-                assert_eq!(target["type"], "object", "{} target is not an object", op.name);
+                assert_eq!(
+                    target["type"], "object",
+                    "{} target is not an object",
+                    op.name
+                );
             }
             assert!(
-                runs::catalog(None).iter().all(|write| write.name != op.name),
+                runs::catalog(None)
+                    .iter()
+                    .all(|write| write.name != op.name),
                 "{} collides with a write operation",
                 op.name
             );
@@ -838,10 +868,7 @@ mod tests {
                 json!({"operation": "tasks.list", "input": []}),
                 "object \"input\"",
             ),
-            (
-                json!({"operation": "jobs.get", "target": {}}),
-                "job_id",
-            ),
+            (json!({"operation": "jobs.get", "target": {}}), "job_id"),
         ] {
             let error = query(&run, &args).unwrap_err();
             assert!(
@@ -973,132 +1000,50 @@ mod tests {
         );
     }
 
-    /// a record capped to `duckfs_read = ["/shared/team"]`, shared by the grep
-    /// cap tests below.
-    fn team_capped_record() -> runs::ModelRecord {
-        runs::ModelRecord {
-            account: 2,
-            agent_id: "bot".into(),
-            owner: runs::RunOrigin::External(vec![9; 32]),
-            display_name: "BOT".into(),
-            capability: "model-1".into(),
-            allowed_actions: vec![],
-            status: runs::ModelStatus::Active,
-            role: runs::ModelRole::General,
-            created_at: 0,
-            updated_at: 0,
-            recipe_hash: vec![],
-            caps: runs::ResourceCaps {
-                duckfs_read: vec!["/shared/team".into()],
-                ..Default::default()
-            },
-            skills: vec![],
+    #[test]
+    fn the_generic_query_takes_the_modules_own_query_and_nothing_else() {
+        let run = Run::from_env();
+        for (args, needle) in [
+            (
+                json!({"operation": OP_QUERY, "target": {"module": "forge"}}),
+                "module's own query",
+            ),
+            (
+                json!({"operation": OP_QUERY, "target": {"module": "forge"}, "input": {"a": 1, "b": 2}}),
+                "exactly one key",
+            ),
+            (
+                json!({"operation": OP_QUERY, "target": {"module": "forge"}, "input": ""}),
+                "non-empty string",
+            ),
+            (
+                json!({"operation": OP_QUERY, "target": {"module": "forge"}, "input": 7}),
+                "object with one key, or a string",
+            ),
+            (
+                json!({"operation": OP_QUERY, "target": {"module": ""}, "input": "list_repos"}),
+                "non-empty module",
+            ),
+            // a bare string is the generic operation's shape alone
+            (
+                json!({"operation": "tasks.list", "input": "list"}),
+                "object \"input\"",
+            ),
+        ] {
+            let error = query(&run, &args).unwrap_err();
+            assert!(
+                matches!(&error, NodeError::Rejected(m) if m.contains(needle)),
+                "{args} -> {error:?}"
+            );
         }
-    }
-
-    /// grep's own matcher is a raw string prefix (`/shared/team` also matches
-    /// `/shared/team-secrets/...`), but the cap it is gated on is
-    /// segment-boundary. A hit from a sibling path that only shares a textual
-    /// prefix with the capped one must be dropped before the reply reaches the
-    /// agent, while a hit truly under the cap must survive.
-    #[test]
-    fn grep_hits_outside_the_segment_boundary_cap_are_dropped() {
-        let record = team_capped_record();
-        let mut reply = json!({
-            "hits": [
-                {"path": "/shared/team/notes.txt", "line": 1, "text": "ok", "locator": "l1"},
-                {"path": "/shared/team-secrets/creds.txt", "line": 1, "text": "aws_secret=x", "locator": "l2"},
-            ],
-            "next": null,
-        });
-        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-        let paths: Vec<&str> = reply["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| h["path"].as_str().unwrap())
-            .collect();
-        assert_eq!(paths, vec!["/shared/team/notes.txt"]);
-    }
-
-    /// a `next` cursor naming a path outside the cap (the sibling tree
-    /// `/shared/team-secrets/...`, reached because duckfs' grep walk prefixes
-    /// on a raw string) must never reach the agent — it is replaced with the
-    /// last retained hit's own path so the agent can still resume inside its
-    /// cap.
-    #[test]
-    fn an_uncapped_resume_cursor_is_replaced_by_the_last_retained_hit() {
-        let record = team_capped_record();
-        let mut reply = json!({
-            "hits": [
-                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
-            ],
-            "next": "/shared/team-secrets/creds.txt",
-        });
-        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
-        assert_eq!(reply["next"], json!("/shared/team/a.txt"));
-    }
-
-    /// same as above but no hit survived the cap filter at all: `next` is
-    /// dropped (set to `null`) rather than handed back uncovered.
-    #[test]
-    fn an_uncapped_resume_cursor_with_no_retained_hits_is_dropped() {
-        let record = team_capped_record();
-        let mut reply = json!({
-            "hits": [
-                {"path": "/shared/team-secrets/creds.txt", "line": 1, "text": "aws_secret=x", "locator": "l2"},
-            ],
-            "next": "/shared/team-secrets/creds.txt",
-        });
-        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
-        assert_eq!(reply["hits"].as_array().unwrap().len(), 0);
-        assert_eq!(reply["next"], Value::Null);
-    }
-
-    /// a resume cursor genuinely inside the cap survives untouched.
-    #[test]
-    fn a_capped_resume_cursor_survives() {
-        let record = team_capped_record();
-        let mut reply = json!({
-            "hits": [
-                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
-            ],
-            "next": "/shared/team/b.txt",
-        });
-        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
-        assert_eq!(reply["next"], json!("/shared/team/b.txt"));
-    }
-
-    /// `prefix` is never widened before it reaches duckfs: a cap (and a call)
-    /// naming one exact FILE, not a directory, must still see its own hit and
-    /// keep a cursor that resumes at that same file — `retain_capped_rows`'s
-    /// `p == pre` exact-match arm (mirroring `ModelRecord::permits`) covers
-    /// this without any prefix rewriting.
-    #[test]
-    fn a_cap_naming_one_exact_file_still_sees_its_own_hit_and_cursor() {
-        let record = runs::ModelRecord {
-            caps: runs::ResourceCaps {
-                duckfs_read: vec!["/shared/team/a.txt".into()],
-                ..Default::default()
-            },
-            ..team_capped_record()
-        };
-        let mut reply = json!({
-            "hits": [
-                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
-            ],
-            "next": "/shared/team/a.txt",
-        });
-        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
-        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
-        assert_eq!(
-            reply["hits"].as_array().unwrap().len(),
-            1,
-            "the exact-file hit must survive"
-        );
-        assert_eq!(reply["next"], json!("/shared/team/a.txt"));
+        // a well-shaped query is the module's to judge, never this table's: it
+        // reaches the node (or fails to, unbound) without a shape complaint.
+        for input in [json!("list_repos"), json!({"list_items": {"repo": "app"}})] {
+            let args =
+                json!({"operation": OP_QUERY, "target": {"module": "forge"}, "input": input});
+            if let Err(NodeError::Rejected(message)) = query(&run, &args) {
+                panic!("{args} was refused for its shape: {message}");
+            }
+        }
     }
 }

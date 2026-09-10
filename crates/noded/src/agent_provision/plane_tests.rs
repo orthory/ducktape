@@ -277,7 +277,6 @@ fn duckfs_spec(agent: Option<&str>, mounts: Vec<RoMount>) -> WorkspaceSpec {
             source_snapshot: None,
         },
         ro_mounts: mounts,
-        library_readable: false,
     }
 }
 
@@ -343,15 +342,13 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
         env.get("DUCKTAPE_NODE").map(String::as_str),
         Some("http://127.0.0.1:8844")
     );
-    // … and WHO the run acts for. the grant (owner/allowed_actions/caps) is
-    // deliberately NOT here: it is read back from the committed registry by
-    // this id, so it can never drift from the record.
+    // … and WHO the run acts for. the model's record is deliberately NOT
+    // here: it is read back from the committed registry by this id, so it can
+    // never drift from the record.
     assert_eq!(
         env.get("DUCKTAPE_RUN_AGENT").map(String::as_str),
         Some("quackbot")
     );
-    assert!(!env.contains_key("DUCKTAPE_RUN_OWNER"));
-    assert!(!env.contains_key("DUCKTAPE_RUN_ALLOWED_ACTIONS"));
     // the workspace + skill roots (the skill tree is the -ro SIBLING).
     assert_eq!(
         env.get("DUCKTAPE_RUN_WORKSPACE").map(String::as_str),
@@ -501,7 +498,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     assert!(actions.lock().unwrap().is_empty());
 
     let action = runs::ActionEnvelope::new(
-        runs::ACTION_TASKS_CREATE,
+        runs::OP_TASKS_CREATE,
         None,
         serde_json::json!({"task_id": "task-1", "title": "scoped"}),
     );

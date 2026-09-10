@@ -329,7 +329,6 @@ pub(super) async fn provision(
         repo,
         commit,
         branch,
-        forge_push,
         ..
     } = &spec.source
     else {
@@ -356,12 +355,9 @@ pub(super) async fn provision(
     // git cannot see them at all.
     let (ro_dir, context_doc) = if spec.ro_mounts.is_empty() {
         // nothing to mount — but the document still ships (see the duckfs lane):
-        // the tool-plane instruction is ambient, and the library pointer rides
-        // the agent's own read cap. neither is curated.
-        (
-            None,
-            Some(assemble_context_doc(&[], spec.library_readable)?),
-        )
+        // the tool-plane instruction and the library pointer are ambient, not
+        // curated.
+        (None, Some(assemble_context_doc(&[])?))
     } else {
         let mounts = spec.ro_mounts.clone();
         let checkout_ro = ro_root.clone();
@@ -369,17 +365,14 @@ pub(super) async fn provision(
         // the link outlives the mounts: the session bind below rides the same
         // actor lane.
         let mount_node = node.clone();
-        // the committed library grant (consensus said it; the assembler obeys).
-        let library_readable = spec.library_readable;
         // the same step assembles the run's SOUL from the mounts it just
         // materialized — the only place holding both the curation and the bodies.
         let context_doc = tokio::task::spawn_blocking(move || {
-            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts, library_readable)
-                .inspect_err(|_| {
-                    // W5: a failed provision removes ALL its own debris. the mount
-                    // helper dropped its partial ro tree; the clone goes here.
-                    cleanup_blocking(&run_dir);
-                })
+            super::checkout_ro_mounts(&mount_node, &checkout_ro, &mounts).inspect_err(|_| {
+                // W5: a failed provision removes ALL its own debris. the mount
+                // helper dropped its partial ro tree; the clone goes here.
+                cleanup_blocking(&run_dir);
+            })
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
@@ -413,7 +406,6 @@ pub(super) async fn provision(
         ro_dir,
         push_url,
         node,
-        forge_push: *forge_push,
         source: spec.source.clone(),
         agent: spec.agent.clone(),
         _session: session,
@@ -508,8 +500,6 @@ struct ForgeWorkspace {
     /// has no SSH signing key to make a certificate with — the NODE is the
     /// pusher here, which is exactly what the credential says.
     node: NodeLink,
-    /// compose-height `forge_push` verdict; false for old envelopes.
-    forge_push: bool,
     source: WorkspaceSource,
     agent: Option<compute_service::AgentExecution>,
     committer_name: String,
@@ -530,8 +520,6 @@ impl ForgeWorkspace {
             agent: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
-            // receipts never assemble a document, so the grant is moot here.
-            library_readable: false,
         }
     }
 
@@ -841,7 +829,6 @@ fn commit_blocking(
     branch: &str,
     push_url: &str,
     node: &NodeLink,
-    forge_push: bool,
     response_proposal: Option<&str>,
     item_title: &str,
     identity: &CommitIdentity,
@@ -876,12 +863,7 @@ fn commit_blocking(
         return Ok(CommitOutcome::NoChanges);
     }
     // the run produced something to push — an agent-authored commit, a
-    // working-tree change, or both. the compose-height `forge_push` verdict is
-    // the last gate: a run without the grant may read and mutate its own clone
-    // but never move the shared branch. absent on old envelopes ⇒ false.
-    if !forge_push {
-        return Err("forge workspace changed, but this run has no forge_push grant".into());
-    }
+    // working-tree change, or both.
     if final_tree != head_tree {
         let message = select_commit_message(response_proposal, item_title)?;
         let oid = create_run_commit(
@@ -1011,7 +993,6 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
         let node = self.node.clone();
-        let forge_push = self.forge_push;
         let (agent_id, agent_display_name) = match &self.agent {
             Some(agent) => (agent.agent_id.clone(), agent.display_name.clone()),
             None => ("agent".into(), "agent".into()),
@@ -1030,7 +1011,6 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &branch,
                 &push_url,
                 &node,
-                forge_push,
                 proposal.as_deref(),
                 &item_title,
                 &identity,

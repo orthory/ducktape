@@ -436,7 +436,6 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
                 "agent_id": "quackbot",
                 "display_name": "Quackbot",
                 "capability": "echo",
-                "allowed_actions": ["chat.post"],
             }}}}),
             Some(origin.clone()),
         ),

@@ -25,7 +25,7 @@
 //! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
 //! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
 //! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
-//! and know who it acts for; the GRANT itself is never in the env (see
+//! and know who it acts for; the record itself is never in the env (see
 //! [`run_env`]).
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
@@ -255,11 +255,11 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// its read tunnel without a second convention. A node with
 /// no http surface has nothing to name, so the var is simply absent.
 ///
-/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the grant —
-/// owner, allowed_actions, ResourceCaps — is read back from the COMMITTED agent
-/// registry by whoever holds this id; copying it into the env would mint a
-/// second, unversioned copy that drifts from the record it came from the moment
-/// the registry moves. the committed record is the one truth.
+/// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the model's
+/// record is read back from the COMMITTED agent registry by whoever holds this
+/// id; copying it into the env would mint a second, unversioned copy that
+/// drifts from the record it came from the moment the registry moves. the
+/// committed record is the one truth.
 ///
 /// `DUCKTAPE_RUN_ACTION_URL` + `DUCKTAPE_RUN_ACTION_TOKEN` + `DUCKTAPE_RUN_ID`
 /// are the write half of the tool plane. The endpoint signs only the two Runs
@@ -354,7 +354,6 @@ fn checkout_ro_mounts(
     node: &NodeLink,
     ro_root: &Path,
     mounts: &[RoMount],
-    library_readable: bool,
 ) -> Result<String, String> {
     // built HERE, inside the caller's blocking context — see `NodeLink::files`.
     let api = node.files();
@@ -372,7 +371,7 @@ fn checkout_ro_mounts(
             read_skill_doc(ro_root, m)
         })
         .collect::<Result<Vec<_>, _>>()
-        .and_then(|docs| assemble_context_doc(&docs, library_readable))
+        .and_then(|docs| assemble_context_doc(&docs))
         .inspect_err(|_| {
             let _ = std::fs::remove_dir_all(ro_root);
         })
@@ -736,10 +735,10 @@ mod tests {
 
     #[test]
     fn the_consensus_run_id_rides_every_provisioned_run_session_or_not() {
-        // the read plane fetches a delegated run's admission ceiling BY THIS ID,
-        // and a run whose session was never opened must still be ceilinged — so
-        // the id is exported independently of the write half. it is identity,
-        // not a credential: no grant crosses in the env.
+        // the tool plane names the run to the model BY THIS ID, and a run whose
+        // session was never opened must still be named — so the id is exported
+        // independently of the write half. it is identity, not a credential:
+        // nothing but the id crosses in the env.
         let spec = WorkspaceSpec {
             run_id: "s1:0".into(),
             agent: Some(compute_service::AgentExecution {
@@ -753,14 +752,13 @@ mod tests {
                 source_snapshot: None,
             },
             ro_mounts: Vec::new(),
-            library_readable: false,
         };
         let env = run_env(Path::new("/tmp/ws"), None, None, &spec, None);
         assert_eq!(
             env.get("DUCKTAPE_RUN_ID").map(String::as_str),
             spec.agent.as_ref().map(|agent| agent.run_id.as_str())
         );
-        // the write half is absent without a session, and no grant rides along.
+        // the write half is absent without a session.
         assert!(!env.contains_key(session::ENV_ACTION_URL));
         assert!(!env.contains_key(session::ENV_ACTION_TOKEN));
 

@@ -1,5 +1,5 @@
 //! Interactive model work authenticates the host-owned ephemeral session
-//! signer against the committed execution lease and model grant. The signer
+//! signer against the committed execution lease. The signer
 //! never becomes a key of the program account, and the child receives only a
 //! narrow endpoint token.
 //!
@@ -24,9 +24,8 @@ use super::{
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_DELEGATIONS_PER_RUN, ModelStatus,
-    Origin, PendingState, RunAuthority, RunOrigin, RunsModule, SESSION_KEY_LEN, SiblingReadBudget,
-    delegated_run_id_for, delegation_id_for, dispatch_decode_reply, dispatch_encode_query,
-    dispatch_id_for, page_source,
+    Origin, PendingState, RunsModule, SESSION_KEY_LEN, SiblingReadBudget, delegated_run_id_for,
+    delegation_id_for, dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_source,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -202,9 +201,9 @@ impl RunsModule {
 
     /// ONE live operation as the exact message the account's program will
     /// execute. THE SAME VALIDATOR the settle path runs, on a one-action
-    /// response — grant, caps, lane admission and every probe that keeps an
-    /// emitted follow-up from being rejected by its target — followed by THE
-    /// SAME per-lane gate, except that every `Err` is returned to the
+    /// response — lane admission and every probe that keeps an emitted
+    /// follow-up from being rejected by its target — followed by THE SAME
+    /// per-lane preparer, except that every `Err` is returned to the
     /// submitter instead of degrading to a breadcrumb.
     async fn prepare_agent_action(
         &self,
@@ -241,14 +240,11 @@ impl RunsModule {
             Operation::PagesComment { .. }
             | Operation::PagesSetChecked { .. }
             | Operation::PagesPost { .. } => {
-                let agent = self.registered_agent(ctx, entry).await?;
-                self.pages_operation_msg(ctx, &agent, entry, run_id, &slot, &operation, &mut posts)
+                self.pages_operation_msg(ctx, entry, run_id, &slot, &operation, &mut posts)
                     .await
             }
-            Operation::DuckfsWriteText { .. } => {
-                let agent = self.registered_agent(ctx, entry).await?;
-                self.duckfs_write_msg(ctx, &agent, &operation).await
-            }
+            Operation::DuckfsWriteText { .. } => self.duckfs_write_msg(ctx, &operation).await,
+            Operation::Submit { .. } => Ok(self.submit_msg(&operation)),
             Operation::AgentCall {
                 agent_id,
                 instruction,
@@ -269,8 +265,7 @@ impl RunsModule {
             // account's program mints when it claims this proposal. The settle
             // lane would emit it as `Origin::Module("runs")`, and collaboration
             // refuses that by design — no module speaks for a participant.
-            Operation::CollaborationSend { .. }
-            | Operation::CollaborationAcknowledge { .. } => {
+            Operation::CollaborationSend { .. } | Operation::CollaborationAcknowledge { .. } => {
                 self.collaboration_msg(&operation)
             }
             Operation::ModulesUpdate(_) | Operation::ForgeOpenPr { .. } => Err(format!(
@@ -287,19 +282,6 @@ impl RunsModule {
             envelope_digest: envelope.digest(),
         });
         Ok(prepared)
-    }
-
-    /// the run's agent, which every per-lane gate reads its grant and caps
-    /// from.
-    async fn registered_agent(
-        &self,
-        ctx: &dyn Ctx,
-        entry: &PendingState,
-    ) -> Result<super::ModelRecord, Error> {
-        self.agent_for_run(ctx, entry)
-            .await
-            .map_err(Error::Module)?
-            .ok_or_else(|| Error::Module(format!("agent is not registered: {}", entry.agent_id)))
     }
 
     /// an `agent.call` as the program call that starts the caller/callee
@@ -405,7 +387,7 @@ impl RunsModule {
         }
 
         let caller = self
-            .agent_for_run(&*ctx, &entry)
+            .agent_record(&*ctx, &entry.agent_id)
             .await
             .map_err(Error::Module)?
             .ok_or_else(|| {
@@ -420,12 +402,6 @@ impl RunsModule {
                 caller.agent_id
             )));
         }
-        if caller.caps.subagent_budget == 0 {
-            return Err(Error::Module(format!(
-                "caller agent {} has no subagent budget",
-                caller.agent_id
-            )));
-        }
         let root_run_id = match entry.delegation_id.as_deref() {
             Some(id) => self
                 .delegation(id)
@@ -433,15 +409,8 @@ impl RunsModule {
                 .ok_or_else(|| Error::Module("caller run has no delegation edge".into()))?,
             None => run_id.clone(),
         };
-        let root_entry = self
-            .pending_entry(&dispatch_id_for(&root_run_id))
-            .cloned()
+        self.pending_entry(&dispatch_id_for(&root_run_id))
             .ok_or_else(|| Error::Module("delegation root is no longer in flight".into()))?;
-        let root = self
-            .agent_for_run(&*ctx, &root_entry)
-            .await
-            .map_err(Error::Module)?
-            .ok_or_else(|| Error::Module("delegation root agent is not registered".into()))?;
         let spent = self
             .delegation_ids()
             .into_iter()
@@ -451,12 +420,9 @@ impl RunsModule {
                     && state.view.status == DelegationStatus::Pending
             })
             .count();
-        let limit = usize::try_from(root.caps.subagent_budget)
-            .unwrap_or(usize::MAX)
-            .min(MAX_DELEGATIONS_PER_RUN);
-        if spent >= limit {
+        if spent >= MAX_DELEGATIONS_PER_RUN {
             return Err(Error::Module(format!(
-                "delegation tree has reached its concurrency limit of {limit} calls"
+                "delegation tree has reached its concurrency limit of {MAX_DELEGATIONS_PER_RUN} calls"
             )));
         }
 
@@ -467,39 +433,7 @@ impl RunsModule {
             .ok_or_else(|| {
                 Error::Module(format!("callee agent is unavailable: {}", request.agent_id))
             })?;
-        // the callee's dispatch payload EMBEDS the caller's channel transcript
-        // (`pin_context` pins up to CONTEXT_WINDOW messages of
-        // `entry.channel_id`) and is routed by the callee's capability tag to a
-        // provider the callee's OWNER runs. nothing else ties that owner to this
-        // channel, so without this a prompt-injected caller exfiltrates a
-        // private channel by delegating into a stranger's agent. the callee's
-        // owner is the account that will see the bytes, so its READ standing is
-        // the gate. a module/system owner is not narrowed — chat admits those
-        // origins everywhere already.
-        if let RunOrigin::External(owner) = &callee.owner {
-            let may_read = !owner.is_empty()
-                && self
-                    .may_read(&*ctx, owner, &entry.channel_id)
-                    .await
-                    .map_err(Error::Module)?;
-            if !may_read {
-                return Err(Error::Module(format!(
-                    "the owner of callee agent {} may not read the caller's channel: {}",
-                    callee.agent_id, entry.channel_id
-                )));
-            }
-        }
-        let scoped_callee = caller.scoped_for_call(&callee);
         let extra = crate::envelope::library_skills(&request.skills).map_err(Error::Module)?;
-        if let Some(skill) = extra
-            .iter()
-            .find(|skill| !caller.permits(&crate::CapRequest::DuckfsRead(&skill.source_prefix)))
-        {
-            return Err(Error::Module(format!(
-                "the call authority cannot read delegated skill {}",
-                skill.name
-            )));
-        }
         let workspace_agent = self
             .agent_record(&*ctx, &entry.workspace_agent_id)
             .await
@@ -522,7 +456,7 @@ impl RunsModule {
         let prepared = self
             .prepare_dispatch_with_context(
                 &*ctx,
-                &scoped_callee,
+                &callee,
                 &callee_run_id,
                 &entry.channel_id,
                 entry.anchor_seq,
@@ -564,7 +498,6 @@ impl RunsModule {
                 ("cores".into(), DELEGATED_CHILD_CORES),
                 ("mem_gb".into(), DELEGATED_CHILD_MEM_GB),
             ]),
-            Some(RunAuthority::from_record(&scoped_callee)),
             Some(delegation_id),
         );
         Ok(())
@@ -573,8 +506,8 @@ impl RunsModule {
     /// the lease the session was opened under must still BE the run's lease.
     /// `open_agent_session` reads it once, at bind time; a lease that moves —
     /// an explicit `ReassignRun`, or an expiry saga re-leasing on its own —
-    /// otherwise leaves the ex-holder's key bound, spending the agent's whole
-    /// grant for the rest of the run on a node that stopped executing it. the
+    /// otherwise leaves the ex-holder's key bound, acting as the agent for the
+    /// rest of the run on a node that stopped executing it. the
     /// session's authority IS the lease, so every acting op re-reads it.
     pub(super) async fn session_holds_lease(
         &self,

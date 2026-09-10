@@ -180,17 +180,8 @@ fn chat_commits_a_component_and_the_node_deploys_it_without_an_operator_update()
                 agent_id: MODEL.into(),
                 display_name: MODEL.into(),
                 capability: "wasm-test".into(),
-                allowed_actions: vec![
-                    runs::ACTION_CHAT_POST.into(),
-                    runs::ACTION_MODULES_UPDATE.into(),
-                ],
                 recipe_hash: None,
                 skills: None,
-                caps: Some(runs::ResourceCaps {
-                    forge_read: vec![REPO.into()],
-                    forge_push: vec![REPO.into()],
-                    ..Default::default()
-                }),
             },
         }),
     );

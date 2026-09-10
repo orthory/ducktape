@@ -17,7 +17,7 @@
 //! and dev-only conformance tests pin every mirror against the real forge
 //! codec so the wire cannot silently drift.
 
-use crate::{CapRequest, ModelRecord, SkillRef};
+use crate::{ModelRecord, SkillRef};
 use sdk::Ctx;
 use serde::{Deserialize, Serialize};
 
@@ -207,27 +207,20 @@ impl RunsModule {
         extra: &[SkillRef],
     ) -> Result<PortableInputs, String> {
         let repo = item_ref.repo;
-        // 1. the cap gate FIRST — before any tracker read.
-        if !agent.permits(&CapRequest::ForgeRead(repo)) {
-            return Err(format!(
-                "agent {} lacks forge_read for {repo}",
-                agent.agent_id
-            ));
-        }
         let Some(forge) = self.forge.clone() else {
             return Err("no forge module is wired for a forge-channel run".into());
         };
-        // 2. the committed tracker item.
+        // 1. the committed tracker item.
         let item = self
             .forge_item(ctx, &forge, repo, item_ref.number)
             .await?
             .ok_or_else(|| format!("no forge item {repo}#{}", item_ref.number))?;
-        // 3. the work branch — per ITEM, not per run (session identity), and
+        // 2. the work branch — per ITEM, not per run (session identity), and
         //    ALWAYS `agent/item-<n>` (#1836): a run only ever pushes a
         //    branch it owns, never a branch named by whoever opened the
         //    triggering item (a PR's `source_branch` is attacker-chosen).
         let branch = format!("agent/item-{}", item_ref.number);
-        // 4. the item's own base — what an unborn work branch forks from,
+        // 3. the item's own base — what an unborn work branch forks from,
         //    and what the requested sink's PR targets: dev for an issue, the
         //    PR's OWN source branch for a PR (so a human reviews the agent's
         //    change into their PR branch, never past it).
@@ -241,7 +234,7 @@ impl RunsModule {
                     format!("forge pr {repo}#{} has no source branch", item_ref.number)
                 })?,
         };
-        // 5. the pinned base commit + branch_born, from COMMITTED refs.
+        // 4. the pinned base commit + branch_born, from COMMITTED refs.
         let refs = self.forge_refs(ctx, &forge, repo).await?;
         let tip = |name: &str| refs.iter().find(|r| r.name == name).map(|r| r.head.clone());
         let (commit, branch_born) = match tip(&branch) {
@@ -258,7 +251,7 @@ impl RunsModule {
                 false,
             ),
         };
-        // 6. the requested sink: a PR of the work branch onto the item's
+        // 5. the requested sink: a PR of the work branch onto the item's
         //    base. title/body stay empty — delivery derives them from the
         //    message facet.
         let target_branch = item_base_branch;
@@ -269,7 +262,7 @@ impl RunsModule {
             title: String::new(),
             body: String::new(),
         };
-        // 7. the deterministic item-context section (byte-capped in inject).
+        // 6. the deterministic item-context section (byte-capped in inject).
         let context = inject::render_item_context(repo, &item, &branch);
         // skills are duckfs subtrees in every lane: resolve them against the
         // committed duckfs head exactly as the duckfs lane does (W2).
@@ -284,7 +277,6 @@ impl RunsModule {
                 commit,
                 branch,
                 branch_born,
-                forge_push: agent.permits(&CapRequest::ForgePush(repo)),
             },
             skills: envelope::resolve_skills(agent, extra, &head),
             sink,
