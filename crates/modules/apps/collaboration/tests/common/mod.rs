@@ -1,16 +1,23 @@
-//! the shared harness: a module over an in-memory store, plus the ctx
-//! constructors the behaviour tests drive it with.
+//! the shared harness: a module over an in-memory store, a FAKE chat sibling
+//! holding channels, rosters and messages, plus the ctx constructors the
+//! behaviour tests drive it with.
 //!
 //! `identity` answers "no account" by default, so an external key resolves to
-//! `Party::Key(key)` — the non-account principal every test signs as unless it
-//! deliberately registers an account. `tasks` answers with whatever job the
+//! `Party::Key(key)` — the non-account participant every test signs as unless
+//! it deliberately registers an account. `tasks` answers with whatever job the
 //! test installs, so attempt fencing is exercised against a real reply shape.
+//! `chat` answers `Access` from the fake roster and `Message` from the fake
+//! message table, so the module's two chat reads see real shapes too.
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+
 use collaboration::{
     BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery, CollaborationReply,
-    MessageId, MessageKind, ProtectedRead, Role, SendRequest, encode_msg, encode_query,
+    DeliverRequest, MessageKind, Party, ProtectedRead, encode_msg, encode_query,
 };
 use sdk::{Cause, Env, Error, Module, Msg, Origin};
 use sdk_testkit::{MemStore, TestCtx};
@@ -18,6 +25,7 @@ use sdk_testkit::{MemStore, TestCtx};
 pub const MODULE: &str = "collaboration";
 pub const IDENTITY: &str = "identity";
 pub const TASKS: &str = "tasks";
+pub const CHAT: &str = "chat";
 /// the height-lane ceiling every test composes with, so a deadline reads in
 /// the same units the assertions use.
 pub const MAX_TTL: u64 = collaboration::max_delivery_ttl(sdk::genesis_config::TimeUnit::Height);
@@ -35,6 +43,7 @@ pub fn module_on(network: &str, max_delivery_ttl: u64) -> Collaboration {
         MODULE,
         IDENTITY,
         TASKS,
+        CHAT,
         Box::new(MemStore::new()),
         max_delivery_ttl,
         network,
@@ -47,16 +56,121 @@ pub fn key(byte: u8) -> Vec<u8> {
     vec![byte; 32]
 }
 
-/// a ctx at `now`, dispatching as the external key `signer`.
-pub fn at(now: u64, origin: Origin) -> TestCtx {
-    with_job(now, origin, None)
+pub fn party(byte: u8) -> Party {
+    Party::Key(key(byte))
+}
+
+// ---- the fake chat --------------------------------------------------------
+
+/// one channel as the fake chat holds it: members-only, with a roster.
+#[derive(Default, Clone)]
+pub struct FakeChannel {
+    pub members: BTreeSet<Party>,
+}
+
+/// what the fake chat knows. shared by every ctx a test builds off one
+/// [`Scene`], so a message posted "in chat" is visible to every later op.
+#[derive(Default)]
+pub struct FakeChat {
+    pub channels: BTreeMap<String, FakeChannel>,
+    pub messages: BTreeMap<String, chat::MessageView>,
+    next_seq: BTreeMap<String, u64>,
+}
+
+impl FakeChat {
+    pub fn channel(&mut self, id: &str, members: &[Party]) {
+        self.channels.insert(
+            id.into(),
+            FakeChannel {
+                members: members.iter().cloned().collect(),
+            },
+        );
+    }
+
+    /// post one message as `origin`, the way chat records it: the author is
+    /// the party the origin resolves to (a bare key here) and `origin` is the
+    /// exact signer.
+    pub fn post(&mut self, channel_id: &str, message_id: &str, origin: Origin) -> u64 {
+        self.post_in_thread(channel_id, message_id, origin, None)
+    }
+
+    pub fn post_in_thread(
+        &mut self,
+        channel_id: &str,
+        message_id: &str,
+        origin: Origin,
+        thread: Option<u64>,
+    ) -> u64 {
+        let seq = self.next_seq.entry(channel_id.into()).or_insert(1);
+        let assigned = *seq;
+        *seq += 1;
+        let author = match &origin {
+            Origin::External(key) => Party::Key(key.clone()),
+            Origin::Program(account) => Party::Account(*account),
+            Origin::Module(id) => Party::Module(id.clone()),
+            Origin::System => Party::System,
+        };
+        self.messages.insert(
+            message_id.into(),
+            chat::MessageView {
+                channel_id: channel_id.into(),
+                seq: assigned,
+                head: chat::MessageHead {
+                    message_id: message_id.into(),
+                    author,
+                    origin: origin.clone(),
+                    content_origin: origin,
+                    blocks: vec![chat::Block::paragraph("ping")],
+                    created_at: 1,
+                    rev: 0,
+                    revision: 1,
+                    edited_at: None,
+                    base_rev: None,
+                    deleted: false,
+                    thread,
+                    reply_count: 0,
+                    last_reply_seq: None,
+                },
+            },
+        );
+        assigned
+    }
+
+    fn answer(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let reply = match chat::decode_query(req).map_err(Error::Module)? {
+            chat::ChatQuery::Access { channel_id, party } => {
+                let standing = self.channels.get(&channel_id).map_or(false, |channel| {
+                    channel.members.contains(&party) || !party.is_person()
+                });
+                chat::ChatReply::Access(chat::ChannelAccess {
+                    may_read: standing,
+                    may_post: standing,
+                })
+            }
+            chat::ChatQuery::Message { message_id } => {
+                chat::ChatReply::Message(self.messages.get(&message_id).cloned())
+            }
+            other => {
+                return Err(Error::Module(format!(
+                    "the fake chat does not serve {other:?}"
+                )));
+            }
+        };
+        Ok(chat::encode_reply(&reply))
+    }
+}
+
+pub type Chat = Rc<RefCell<FakeChat>>;
+
+/// a ctx at `now`, dispatching as `origin`, over `chat`.
+pub fn at(chat: &Chat, now: u64, origin: Origin) -> TestCtx {
+    with_job(chat, now, origin, None)
 }
 
 /// a ctx whose `identity` sibling knows ONE program account: the shape the
-/// dispatch call lane's `Origin::Program(account)` resolves against. Without
-/// it a program origin cannot resolve to an actor at all, which is a wiring
-/// error, not a refusal.
-pub fn as_program(now: u64, account: sdk::AccountNumber) -> TestCtx {
+/// dispatch call lane's `Origin::Program(account)` resolves against.
+pub fn as_program(chat: &Chat, now: u64, account: sdk::AccountNumber) -> TestCtx {
+    let chat = chat.clone();
     TestCtx::with_env(Env {
         height: now,
         consensus_time: now,
@@ -72,6 +186,7 @@ pub fn as_program(now: u64, account: sdk::AccountNumber) -> TestCtx {
     .on_query(TASKS, |_| {
         Ok(tasks::encode_job_reply(&tasks::JobsReply::Job(None)))
     })
+    .on_query(CHAT, move |req| chat.borrow().answer(req))
 }
 
 /// an ACTIVE program account executed by the `agent` module — what identity
@@ -95,7 +210,8 @@ pub fn program_account(number: sdk::AccountNumber) -> identity::AccountView {
 
 /// a ctx whose `tasks` sibling answers with `job` for every job query — the
 /// attempt fence's input.
-pub fn with_job(now: u64, origin: Origin, job: Option<tasks::Job>) -> TestCtx {
+pub fn with_job(chat: &Chat, now: u64, origin: Origin, job: Option<tasks::Job>) -> TestCtx {
+    let chat = chat.clone();
     TestCtx::with_env(Env {
         height: now,
         consensus_time: now,
@@ -111,6 +227,7 @@ pub fn with_job(now: u64, origin: Origin, job: Option<tasks::Job>) -> TestCtx {
     .on_query(TASKS, move |_| {
         Ok(tasks::encode_job_reply(&tasks::JobsReply::Job(job.clone())))
     })
+    .on_query(CHAT, move |req| chat.borrow().answer(req))
 }
 
 /// a job record with `attempt`, enough for the attempt fence to read.
@@ -168,12 +285,12 @@ pub async fn ok(module: &mut Collaboration, ctx: &mut TestCtx, payload: Collabor
 pub async fn read(
     module: &Collaboration,
     ctx: &TestCtx,
-    participant_id: &str,
+    participant: &Party,
     via: Option<&str>,
     read: ProtectedRead,
 ) -> CollaborationReply {
     let request = encode_query(&CollaborationQuery::Read {
-        participant_id: participant_id.into(),
+        participant: participant.clone(),
         via: via.map(str::to_string),
         read,
     });
@@ -184,92 +301,40 @@ pub async fn read(
     collaboration::decode_reply(&bytes).expect("a reply decodes")
 }
 
-/// the conversation event sequence an admission took. derived, never
-/// hardcoded: every committed change consumes a sequence, so a test that
-/// counts them by hand breaks the moment a setup step changes.
-pub async fn admitted_seq(
-    module: &Collaboration,
-    ctx: &TestCtx,
-    participant_id: &str,
-    generation: u64,
-    sequence: u64,
-) -> u64 {
-    let CollaborationReply::SendState(collaboration::SendState::Admitted { seq, .. }) = read(
-        module,
-        ctx,
-        participant_id,
-        None,
-        ProtectedRead::SendState {
-            generation,
-            sequence,
-        },
-    )
-    .await
-    else {
-        panic!("the send was admitted under {generation}/{sequence}");
-    };
-    seq
-}
-
-/// the credential a participant's current binding holds. Drawn from the
-/// participant's own allocator, so it depends on how many credentials that
-/// participant has been issued — derive it rather than guessing.
+/// the credential a participant's current binding holds.
 pub async fn credential_of(
     module: &Collaboration,
     ctx: &TestCtx,
-    participant_id: &str,
-    conversation_id: &str,
+    participant: &Party,
+    channel_id: &str,
 ) -> u64 {
     let CollaborationReply::Binding(Some(view)) = read(
         module,
         ctx,
-        participant_id,
+        participant,
         None,
         ProtectedRead::Binding {
-            conversation_id: conversation_id.into(),
+            channel_id: channel_id.into(),
         },
     )
     .await
     else {
-        panic!("{participant_id} holds a binding on {conversation_id}");
+        panic!("{participant:?} holds a binding on {channel_id}");
     };
     view.credential
 }
 
 // ---- op builders ----------------------------------------------------------
 
-pub fn register(participant_id: &str) -> CollaborationMsg {
-    CollaborationMsg::RegisterParticipant {
-        participant_id: participant_id.into(),
-        display_name: participant_id.into(),
-        agent_account: None,
-    }
-}
-
-pub fn conversation(conversation_id: &str) -> CollaborationMsg {
-    CollaborationMsg::CreateConversation {
-        conversation_id: conversation_id.into(),
-        topic: "review".into(),
-    }
-}
-
-pub fn seat(conversation_id: &str, participant_id: &str, role: Option<Role>) -> CollaborationMsg {
-    CollaborationMsg::SetRoster {
-        conversation_id: conversation_id.into(),
-        participant_id: participant_id.into(),
-        role,
-    }
-}
-
 pub fn bind(
-    conversation_id: &str,
-    participant_id: &str,
+    channel_id: &str,
+    participant: &Party,
     service_key: Vec<u8>,
     expected_credential: u64,
 ) -> CollaborationMsg {
     bind_to(
-        conversation_id,
-        participant_id,
+        channel_id,
+        participant,
         BoundPrincipal::ServiceKey(service_key),
         expected_credential,
     )
@@ -278,84 +343,79 @@ pub fn bind(
 /// bind an arbitrary principal — the program-account arm reaches this module
 /// over the dispatch call lane, not over a signature.
 pub fn bind_to(
-    conversation_id: &str,
-    participant_id: &str,
+    channel_id: &str,
+    participant: &Party,
     principal: BoundPrincipal,
     expected_credential: u64,
 ) -> CollaborationMsg {
     CollaborationMsg::Bind {
-        conversation_id: conversation_id.into(),
-        participant_id: participant_id.into(),
+        channel_id: channel_id.into(),
+        participant: participant.clone(),
         device: "laptop".into(),
         principal,
         expected_credential,
     }
 }
 
-/// a minimal notice from `sender` to `recipient` under credential `generation`
-/// at `sequence`, expiring at `expires_at`.
-pub fn note(
-    conversation_id: &str,
-    sender: &str,
-    recipient: &str,
-    generation: u64,
-    sequence: u64,
+/// a minimal notice delivery of chat message `message_id` to `recipient`,
+/// expiring at `expires_at`.
+pub fn deliver(
+    channel_id: &str,
+    message_id: &str,
+    recipient: &Party,
     expires_at: u64,
-) -> SendRequest {
-    SendRequest {
-        conversation_id: conversation_id.into(),
-        sender_participant_id: sender.into(),
-        message_id: MessageId {
-            generation,
-            sequence,
-        },
-        recipient_participant_id: recipient.into(),
+) -> DeliverRequest {
+    DeliverRequest {
+        channel_id: channel_id.into(),
+        message_id: message_id.into(),
+        recipient: recipient.clone(),
         kind: MessageKind::Notice,
-        reply_to: None,
         task: None,
-        body: "ping".into(),
         references: Vec::new(),
         expires_at,
     }
 }
 
-/// the whole setup every messaging test starts from: two participants owned by
-/// two different keys, both seated as members on one conversation owned by the
-/// first.
+/// the whole setup every delivery test starts from: two participants (the
+/// bare keys 1 and 2), both members of chat channel `c1`.
 pub struct Scene {
     pub module: Collaboration,
-    pub owner_a: Vec<u8>,
-    pub owner_b: Vec<u8>,
+    pub chat: Chat,
+    pub alice: Party,
+    pub bob: Party,
 }
 
-pub async fn scene(conversation_id: &str) -> Scene {
-    let mut module = module();
-    let owner_a = key(1);
-    let owner_b = key(2);
-
-    let mut ctx = at(1, Origin::External(owner_a.clone()));
-    ok(&mut module, &mut ctx, register("alice")).await;
-    ok(&mut module, &mut ctx, conversation(conversation_id)).await;
-
-    let mut ctx_b = at(1, Origin::External(owner_b.clone()));
-    ok(&mut module, &mut ctx_b, register("bob")).await;
-
-    ok(
-        &mut module,
-        &mut ctx,
-        seat(conversation_id, "alice", Some(Role::Member)),
-    )
-    .await;
-    ok(
-        &mut module,
-        &mut ctx,
-        seat(conversation_id, "bob", Some(Role::Member)),
-    )
-    .await;
-
+pub fn scene(channel_id: &str) -> Scene {
+    let chat: Chat = Rc::new(RefCell::new(FakeChat::default()));
+    let alice = party(1);
+    let bob = party(2);
+    chat.borrow_mut()
+        .channel(channel_id, &[alice.clone(), bob.clone()]);
     Scene {
-        module,
-        owner_a,
-        owner_b,
+        module: module(),
+        chat,
+        alice,
+        bob,
+    }
+}
+
+impl Scene {
+    /// alice posts `message_id` on `channel_id`; the chat sequence it took.
+    pub fn alice_posts(&self, channel_id: &str, message_id: &str) -> u64 {
+        self.chat
+            .borrow_mut()
+            .post(channel_id, message_id, Origin::External(key(1)))
+    }
+
+    pub fn as_alice(&self, now: u64) -> TestCtx {
+        at(&self.chat, now, Origin::External(key(1)))
+    }
+
+    pub fn as_bob(&self, now: u64) -> TestCtx {
+        at(&self.chat, now, Origin::External(key(2)))
+    }
+
+    pub fn as_key(&self, now: u64, byte: u8) -> TestCtx {
+        at(&self.chat, now, Origin::External(key(byte)))
     }
 }
