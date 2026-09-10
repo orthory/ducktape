@@ -428,9 +428,14 @@ pub struct ChatBlock {
 /// arm choice has to be data — the view emits every arm for every run and an
 /// empty span draws no glyphs. A run landing in two fields renders twice; a
 /// run landing in none vanishes ([`span_arm`] owns the decision).
+///
+/// `mention_link` rides `mention` the way `link` rides `link_text`: the
+/// `duck://account/<n>` the mention addresses, so the plate is a destination
+/// the reader can hover and open, or "" for a mention of a bare key.
 #[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
 pub struct ChatSpan {
     pub mention: String,
+    pub mention_link: String,
     pub link_text: String,
     pub link: String,
     pub bold_italic: String,
@@ -1451,7 +1456,9 @@ fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
 /// WHICH [`ChatSpan`] text field carries the run.
 enum SpanArm {
     Link(String),
-    Mention,
+    /// the `duck://account/<n>` the mention addresses, or "" for a mention
+    /// that names a bare key
+    Mention(String),
     BoldItalic,
     Bold,
     Italic,
@@ -1469,9 +1476,12 @@ fn span_arm(span: &Span) -> SpanArm {
     if let Some(url) = link {
         return SpanArm::Link(url);
     }
-    let mention = span.marks.iter().any(|m| matches!(m, Mark::Mention(_)));
-    if mention {
-        return SpanArm::Mention;
+    let mention = span.marks.iter().find_map(|mark| match mark {
+        Mark::Mention(party) => Some(party),
+        _ => None,
+    });
+    if let Some(party) = mention {
+        return SpanArm::Mention(mention_link(party));
     }
     let bold = span.marks.iter().any(|m| matches!(m, Mark::Bold));
     let italic = span.marks.iter().any(|m| matches!(m, Mark::Italic));
@@ -1480,6 +1490,20 @@ fn span_arm(span: &Span) -> SpanArm {
         (true, false) => SpanArm::Bold,
         (false, true) => SpanArm::Italic,
         (false, false) => SpanArm::Plain,
+    }
+}
+
+/// `duck://account/<n>` — the address a mention of an account opens (the DM
+/// with that account). A mention that names a bare key addresses no account
+/// the app can open, so it carries no link and draws as a plate alone.
+pub fn duck_account_link(account: u64) -> String {
+    format!("duck://account/{account}")
+}
+
+fn mention_link(party: &Party) -> String {
+    match party {
+        Party::Account(account) => duck_account_link(*account),
+        Party::Key(_) | Party::Module(_) | Party::System => String::new(),
     }
 }
 
@@ -1497,7 +1521,10 @@ fn run_spans(spans: &[Span]) -> Vec<ChatSpan> {
                 rendered.link_text = span.text.clone();
                 rendered.link = url;
             }
-            SpanArm::Mention => rendered.mention = span.text.clone(),
+            SpanArm::Mention(link) => {
+                rendered.mention = span.text.clone();
+                rendered.mention_link = link;
+            }
             SpanArm::BoldItalic => rendered.bold_italic = span.text.clone(),
             SpanArm::Bold => rendered.bold = span.text.clone(),
             SpanArm::Italic => rendered.italic = span.text.clone(),
@@ -2188,6 +2215,28 @@ pub fn is_derived_dm_channel(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mention of an account is a destination the reader can open — its
+    /// span carries `duck://account/<n>` beside the plate text; a mention of
+    /// a bare key names no account the app can open and carries no link.
+    #[test]
+    fn a_mention_of_an_account_carries_its_duck_link() {
+        let spans = vec![
+            Span {
+                text: "@zoe".into(),
+                marks: vec![Mark::Mention(Party::Account(7))],
+            },
+            Span {
+                text: "@a1b2".into(),
+                marks: vec![Mark::Mention(Party::Key(vec![0xa1, 0xb2]))],
+            },
+        ];
+        let rendered = run_spans(&spans);
+        assert_eq!(rendered[0].mention, "@zoe");
+        assert_eq!(rendered[0].mention_link, "duck://account/7");
+        assert_eq!(rendered[1].mention, "@a1b2");
+        assert_eq!(rendered[1].mention_link, "");
+    }
 
     fn committed(seq: i64, author: &str) -> ChatMessage {
         ChatMessage {

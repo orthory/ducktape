@@ -32,7 +32,7 @@ use ::chat::client::{chain_digest, duck_net_query as net_query, is_chain_digest}
 ///
 /// The module table: `page/<id>[#<block>]`, `files/<path>`, `forge/<repo>`,
 /// `forge/<repo>/<n>[#<seq>]`, `forge/<repo>/blob/<path>[@<oid>]`,
-/// `channel/<id>[#<seq>]`, `run/<dispatch_id>`.
+/// `channel/<id>[#<seq>]`, `run/<dispatch_id>`, `account/<n>`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuckLink {
     pub kind: DuckKind,
@@ -55,6 +55,8 @@ pub struct DuckLink {
     pub path: String,
     /// `forge_blob`: the `@rev`, or "" for the head.
     pub rev: String,
+    /// `account`: the account number, as the DM peer list keys it.
+    pub account: String,
     /// The `?net=` digest — the hex half of the chain id this link belongs
     /// to — or "" when the link names no network. `foreign_network` carries
     /// the digest that did NOT match.
@@ -74,6 +76,7 @@ impl DuckLink {
             channel: String::new(),
             path: String::new(),
             rev: String::new(),
+            account: String::new(),
             net: String::new(),
         }
     }
@@ -120,6 +123,7 @@ pub fn classify_duck_link(url: String) -> DuckLink {
         "forge" => classify_forge(&segments, rev, fragment),
         "channel" => classify_channel(&segments, rev, fragment),
         "run" => classify_run(&segments, rev, fragment),
+        "account" => classify_account(&segments, rev, fragment),
         _ => DuckLink::unknown(),
     };
     // An `Unknown` addresses nothing, so it belongs to no network either.
@@ -280,6 +284,25 @@ fn classify_run(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
     DuckLink {
         dispatch: (*dispatch).to_owned(),
         ..DuckLink::of(DuckKind::Run)
+    }
+}
+
+/// `/account/<n>`: an identity account by number — what a chat mention
+/// links to (`chat::client::duck_account_link`). Account numbers start at 1,
+/// and an account is neither versioned nor anchored.
+fn classify_account(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
+    let [account] = segments else {
+        return DuckLink::unknown();
+    };
+    let plain = rev.is_empty() && fragment.is_empty();
+    let numbered = positive(account).is_some();
+    let named = plain && numbered;
+    if !named {
+        return DuckLink::unknown();
+    }
+    DuckLink {
+        account: (*account).to_owned(),
+        ..DuckLink::of(DuckKind::Account)
     }
 }
 
@@ -509,6 +532,17 @@ mod tests {
         assert_eq!((message.kind, message.seq), (DuckKind::ChannelMessage, 42));
         assert_eq!(kind("duck://channel/general#0"), DuckKind::Unknown);
         assert_eq!(kind("duck://channel/"), DuckKind::Unknown);
+
+        let account = classify_duck_link(::chat::client::duck_account_link(7));
+        assert_eq!(
+            (account.kind, account.account.as_str()),
+            (DuckKind::Account, "7")
+        );
+        assert_eq!(kind("duck://account/0"), DuckKind::Unknown);
+        assert_eq!(kind("duck://account/abc"), DuckKind::Unknown);
+        assert_eq!(kind("duck://account/7/keys"), DuckKind::Unknown);
+        assert_eq!(kind("duck://account/7#1"), DuckKind::Unknown);
+        assert_eq!(kind("duck://account/7@v2"), DuckKind::Unknown);
 
         assert_eq!(
             kind("duck://memory/notes/a.md"),

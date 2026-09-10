@@ -575,6 +575,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "-> forge_open_repo _",
         "-> choose_channel _",
         "-> open_chat_search_hit(_, link.seq, link.seq)",
+        "-> choose_dm _",
     ] {
         assert!(
             open.contains(route),

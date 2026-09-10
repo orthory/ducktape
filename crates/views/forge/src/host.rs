@@ -37,6 +37,7 @@ pub struct ForgeItem {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChatSpan {
     pub mention: String,
+    pub mention_link: String,
     pub link_text: String,
     pub link: String,
     pub bold_italic: String,

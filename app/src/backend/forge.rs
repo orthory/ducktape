@@ -929,7 +929,8 @@ async fn inline_picture_bytes(
         | DuckKind::ForgeItem
         | DuckKind::Channel
         | DuckKind::ChannelMessage
-        | DuckKind::Run => None,
+        | DuckKind::Run
+        | DuckKind::Account => None,
     }
 }
 

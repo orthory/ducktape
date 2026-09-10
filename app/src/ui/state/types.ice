@@ -183,6 +183,7 @@ enum DuckKind
   channel
   channel_message
   run
+  account
 
 // The second step a forge deep link still owes once its repo is open.
 enum ForgeFocus

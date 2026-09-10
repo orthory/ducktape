@@ -534,7 +534,7 @@ component RichLine(block:ChatBlock, size:f64)
     for span in block.spans
       // Span padding expands only the paint, not the text layout. Keep it
       // below a prose space so ordinary surrounding spaces stay visible.
-      span span.mention bg=brand_bg px=1.0 r=4.0 font=medium color=brand
+      span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium color=brand
       span span.link_text link=span.link underline font=medium color=brand
       span span.bold_italic font=strongitalic
       span span.bold font=strong
