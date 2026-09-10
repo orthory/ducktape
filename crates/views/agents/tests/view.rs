@@ -213,7 +213,6 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
             0,
         ),
     )]);
-    let frame = tick_native(press(&frame, "Runs"));
     assert!(has_text(&frame, "→ Reaction requested"));
     assert!(!has_text(&frame, &receipt));
     assert!(!has_text(&frame, &running.dispatch_id));
