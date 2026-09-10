@@ -55,7 +55,7 @@ fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
 }
 
 #[test]
-fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_rail_draft() {
+fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_pick_carries_the_card_draft() {
     let (_, frame) = shown(&facts());
     for expected in [
         "Pages",

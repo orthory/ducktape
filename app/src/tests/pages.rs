@@ -521,27 +521,35 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     assert_eq!(app.buffer_page, "alpha");
 }
 
-/// The artifact hangs comments off the document as a docked 306px rail on
-/// the sidebar ladder, NOT as a floating card over it — a card would cover
-/// the block it is about the moment the block sits on the right half.
+/// Comments float over the document as a card on its right edge, NOT as a
+/// docked rail: a rail took its width off the document for as long as it
+/// stayed open, so pressing the count reflowed every line being read.
 #[test]
-fn block_comments_dock_a_rail_beside_the_document() {
+fn block_comments_float_a_card_over_the_document() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
     // the pages screen is the `pages` view's now (crates/views/pages).
     let pages = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
-    // the rail is a sibling of the document, separated by the same 1px rule
-    // every other docked column uses — never an overlay layer.
-    let rail = pages
+    // the card is a full-size positioning layer pinning a fixed-width card to
+    // the right edge — never a docked column, and never an overlay layer.
+    let card = pages
         .split_once("if connected && !empty(active_page) && block_comments_open\n")
         .unwrap()
         .1;
-    let mut opening = rail.lines().map(str::trim);
-    assert_eq!(opening.next(), Some("box w=1.0 h=fill bg=separator"));
-    assert_eq!(opening.next(), Some("space w=1.0 h=1.0"));
+    let mut opening = card.lines().map(str::trim);
+    assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0 align-x=end"));
     assert_eq!(
         opening.next(),
-        Some("box w=306.0 h=fill bg=sidebar clip=true")
+        Some(
+            "box w=340.0 h=fill bg=elevated r=12.0 shadow=shadow_popover shadow-y=8.0 shadow-blur=24.0 border=separator border-w=1.0 clip=true"
+        )
     );
+    assert!(!pages.contains("w=306.0"));
+    // A STACK LAYER DECLARED AFTER THE DOCUMENT ARM, or it would paint under
+    // the text it covers and the editor would own the pointer through it. The
+    // delete confirm still outranks it: that one IS an overlay with a scrim.
+    let layer = pages.find("if connected && !empty(active_page) && block_comments_open");
+    assert!(pages.find("slot document") < layer);
+    assert!(layer < pages.find("overlay when=page_delete_armed"));
     assert!(!pages.contains("close_block_comments backdrop=transparent"));
     assert!(pages.contains("-> emit(close_block_comments)"));
     assert!(pages.contains("#page-comment(active_page)"));
@@ -549,7 +557,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     assert!(!pages.contains("Saving"));
 
     // The control is a DOCUMENT ACTION in the header now, not a row buried in
-    // a per-block menu — the rail was always page-scoped.
+    // a per-block menu — the card was always page-scoped.
     assert!(pages.contains("button label=\"Comments\""));
     assert!(pages.contains("-> emit(toggle_block_comments)"));
     let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
@@ -570,7 +578,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     assert!(handlers.contains("on open_block_comment_thread(event)"));
     assert!(handlers.contains("let target = event_text(event, \"target\")"));
     // The guest editor shares the screen's document slot and keeps comment
-    // counts in its declarative presentation, beside the existing rail.
+    // counts in its declarative presentation, under the comments card.
     let guest_source = include_str!("../../../crates/views/pages/src/ui/app.ice");
     assert!(guest_source.contains("editor #document <-> document -> document_committed _"));
     let guest = inlined(guest_source);
