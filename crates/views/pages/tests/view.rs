@@ -353,3 +353,45 @@ fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
         "keep this draft"
     );
 }
+
+#[test]
+fn malformed_target_update_freezes_queued_actions_until_valid_facts_arrive() {
+    let (subscription, frame) = shown(&facts());
+    let frame = tick_native(type_into(&frame, "Add a comment…", "draft from Alpha"));
+    let post = press(&frame, "Post");
+    let delete = press(&frame, "Delete page");
+    let choose = press(&frame, "Beta");
+    // The host has moved to Beta, but an incomplete update cannot replace
+    // the Alpha facts that the reader still sees.
+    let malformed = br#"{"connected":true,"active_page":"beta"}"#;
+    let frame = tick_native(vec![item(subscription, malformed)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(has_text(&frame, "draft from Alpha"));
+    assert!(matches!(
+        ui_lang_guest::testing::find(&frame, "PagesView/root/pages/post"),
+        Some(ui_lang_guest::wire::Node::Button { on_press: None, .. })
+    ));
+    for queued in [post, delete, choose] {
+        let frame = tick_native(queued);
+        assert!(
+            frame.requests.is_empty(),
+            "stale actions must not reach the host"
+        );
+    }
+    let beta = PagesProps {
+        active_page: "beta".into(),
+        active_page_title: "Beta".into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&beta))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let frame = tick_native(press(&frame, "Post"));
+    let request = one_intent(&frame);
+    assert_eq!(request.kind, "pages.post");
+    assert_eq!(
+        serde_json::from_slice::<Post>(&request.payload)
+            .unwrap()
+            .text,
+        "draft from Alpha"
+    );
+}

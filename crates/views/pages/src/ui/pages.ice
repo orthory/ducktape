@@ -124,7 +124,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
             h=fill
           col w=fill gap=2.0
             for page in pages
-              PageButton page=page selected=(page.id == active_page)
+              PageButton page=page selected=(page.id == active_page) frozen=!empty(host_error)
                 forward
                   choose_page
     box
@@ -186,7 +186,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                   with
                     label="Search pages"
                     hint="Search pages…"
-                    disabled=(!connected || page_searching)
+                    disabled=(!empty(host_error) || !connected || page_searching)
                     submit=emit(search_pages_submit)
                     w=190.0
                     p=6.2
@@ -206,6 +206,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                 if !empty(trim(page_search_draft)) || !empty(page_search_hits)
                   button -> emit(clear_page_search)
                     with
+                      disabled=!empty(host_error)
                       label="Clear page search"
                       w=28.0
                       h=28.0
@@ -267,7 +268,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                 button -> emit(copy_to_clipboard, page_link, "Page link copied")
                   with
                     label="Copy page link"
-                    disabled=empty(active_page)
+                    disabled=(!empty(host_error) || empty(active_page))
                     w=28.0
                     h=28.0
                     p=0.0
@@ -498,6 +499,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                     for child in subpages
                       button -> emit(choose_page, child.id)
                         with
+                          disabled=!empty(host_error)
                           label="Open subpage"
                           description=child.title
                           w=fill
@@ -577,7 +579,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                     h=fill
                   col w=fill gap=1.0
                     for hit in page_search_hits
-                      PageSearchResult hit=hit
+                      PageSearchResult hit=hit frozen=!empty(host_error)
                         forward
                           open_page_search_hit
           // NOTHING MATCHED — A STACK LAYER, NOT A ROW IN THE DOCUMENT COLUMN,
@@ -737,7 +739,7 @@ component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_crea
                           align-x=center
                           @text-muted
                     for comment_row in comment_rows
-                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor
+                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
                         forward
                           open_block_comment_thread
                     if threads_has_more
