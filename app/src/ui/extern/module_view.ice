@@ -58,6 +58,7 @@ extern crate::module_view
   pure event_int(event:&ModuleViewEvent, field:&str) -> i64
   pure event_num(event:&ModuleViewEvent, field:&str) -> f64
   sync chat_composer_unsent(scope:&str, text:&str, committed:bool) -> bool
+  sync chat_composer_edit(scope:&str, messages:&[ChatMessage], seq:i64, rev:i64) -> bool
   // the room's roster for the composers over it: what `@` may complete to,
   // by the same rule the send resolves
   sync chat_composer_roster(scope:&str, members:&[ChatMember]) -> bool

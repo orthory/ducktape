@@ -472,7 +472,6 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                             with
                               label="Use as comment"
                               disabled=(loading || busy)
-                              h=26.0
                               p=5.0
                               @ghost_action
                             active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
@@ -481,7 +480,6 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                           button "Discard" -> emit(discard_orphaned_comment_draft, recovered_comment)
                             with
                               disabled=(loading || busy)
-                              h=26.0
                               p=5.0
                               @danger_action
                 // THE PAGE. One editor, the whole document — see the file
@@ -796,9 +794,8 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                       button "More" -> emit(load_more_block_threads)
                         with
                           disabled=(threads_loading || busy)
-                          h=24.0
                           p=4.0
-                          @secondary_action
+                          @secondary_action text-11px leading-snug font-medium
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
@@ -811,9 +808,8 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                   button "← Threads" -> emit(close_block_comment_thread)
                     with
                       disabled=(comments_loading || busy)
-                      h=24.0
                       p=4.0
-                      @secondary_action
+                      @secondary_action text-11px leading-snug font-medium
                     active bg=transparent text=muted r=6.0
                     hovered bg=fg/9 text=fg
                     pressed bg=fg/14
@@ -828,9 +824,8 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                     button "Resolve" -> emit(resolve_thread_submit, true)
                       with
                         disabled=(busy)
-                        h=24.0
                         p=4.0
-                        @secondary_action
+                        @secondary_action text-11px leading-snug font-medium
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
@@ -838,9 +833,8 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                     button "Reopen" -> emit(resolve_thread_submit, false)
                       with
                         disabled=(busy)
-                        h=24.0
                         p=4.0
-                        @secondary_action
+                        @secondary_action text-11px leading-snug font-medium
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
@@ -856,9 +850,8 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                       button "More" -> emit(load_more_block_comments)
                         with
                           disabled=(comments_loading || busy)
-                          h=24.0
                           p=4.0
-                          @secondary_action
+                          @secondary_action text-11px leading-snug font-medium
                         active bg=transparent text=muted r=6.0
                         hovered bg=fg/9 text=fg
                         pressed bg=fg/14
@@ -893,6 +886,5 @@ component PagesScreen(page_link:str, sidebar_width:f64, page_menu_open:bool, pag
                 button "Post" #post -> emit(post_block_comment_submit)
                   with
                     disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
-                    h=28.0
                     p=5.0
                     @primary_action

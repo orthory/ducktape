@@ -182,7 +182,6 @@ view
                         @text-fg
                     button "Dismiss" -> dismiss_error
                       with
-                        h=26.0
                         p=5.0
                         @ghost_action
                       active bg=transparent text=muted r=7.0
@@ -337,9 +336,8 @@ view
                         button "Mark all read" #mark-bell-read -> mark_bell_read_submit
                           with
                             disabled=(bell_unread <= 0 || bell_marking)
-                            h=22.0
                             p=4.0
-                            @ghost_action
+                            @ghost_action text-11px leading-snug font-medium
                           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                           hovered bg=elevated text=brand
                           pressed bg=subtle text=brand

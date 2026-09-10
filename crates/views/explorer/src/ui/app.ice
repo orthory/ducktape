@@ -230,7 +230,6 @@ view
               with
                 label="Refresh"
                 disabled=loading
-                h=30.0
                 p=7.0
                 @outline_action
         // A PARTIAL ANSWER SAYS SO. Each of the six sources behind a

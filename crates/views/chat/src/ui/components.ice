@@ -419,9 +419,8 @@ component MessageContents(message:ChatMessage, surface:CopySurface)
           row w=fill pt=4.0
             button "View run" -> emit(open_run, run_of_message(message.id))
               with
-                h=20.0
                 p=3.0
-                @secondary_action
+                @secondary_action text-11px leading-snug font-medium rounded-5px
         // Reactions and the replies button STACK — the artifact gives each its
         // own line under the body, never one shared row.
         if !empty(message.reactions)
@@ -1054,9 +1053,8 @@ component ThreadParentBlock(message:ChatMessage)
           if !empty(run_of_message(message.id))
             button "View run" -> emit(open_run, run_of_message(message.id))
               with
-                h=20.0
                 p=3.0
-                @secondary_action
+                @secondary_action text-11px leading-snug font-medium rounded-5px
           space w=fill
         MessageBody message=message
           forward
@@ -1144,54 +1142,49 @@ component SkeletonRow()
           r=4.0
         space w=1.0 h=1.0
 
-// AN AGENT RUN IN FLIGHT under the message that summoned it: whose it is,
-// where it stands, the way to its panel and a Stop. The progress itself is
-// the run panel's to draw — the stream only says that a run is working
-// here. It is drawn from the host's live row, never from a chain message;
-// the committed reply takes its place.
+// Live work stays under its thread. Name, progress, and actions get their own
+// rows so a long agent name or tool detail fits the narrow thread rail.
 component LiveRunCard(live:LiveRunHint)
   emits
     cancel_run(str)
     open_run(str)
-  row
+  col
     with
       w=fill
-      gap=6.0
-      align=center
-      pl=37.0
+      gap=5.0
+      pl=7.0
       pr=7.0
-      py=4.0
-    text live.agent
-      with
-        size=12.0
-        wrap=none
-        font=code_medium
-        @text-fg
-    box
-      with
-        px=5.0
-        py=2.0
-        bg=primary
-        r=4.0
-      text "AGENT"
+      py=6.0
+    row w=fill gap=6.0 align=center
+      text live.agent
         with
-          size=9.0
-          wrap=none
-          font=code_semibold
-          @text-primary_fg
+          w=fill
+          size=12.0
+          font=medium
+          @text-fg
+      box
+        with
+          px=5.0
+          py=2.0
+          bg=primary
+          r=4.0
+        text "AGENT"
+          with
+            size=9.0
+            wrap=none
+            font=code_semibold
+            @text-primary_fg
     text live.status
       with
+        w=fill
         size=11.0
-        wrap=none
         @text-muted
-    space w=fill
-    button "View run" -> emit(open_run, live.dispatch_id)
-      with
-        h=22.0
-        p=4.0
-        @secondary_action
-    button "Stop" -> emit(cancel_run, live.run_id)
-      with
-        h=22.0
-        p=4.0
-        @secondary_action
+    row gap=6.0 align=center
+      button "View run" -> emit(open_run, live.dispatch_id)
+        with
+          p=4.0
+          @secondary_action text-11px leading-snug font-medium rounded-5px
+      button "Stop" -> emit(cancel_run, live.run_id)
+        with
+          p=4.0
+          @secondary_action text-11px leading-snug font-medium rounded-5px

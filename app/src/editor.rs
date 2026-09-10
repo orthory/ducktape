@@ -4,14 +4,9 @@
 //! the IME hardening (preedit metrics, incremental relayout, grapheme deletes)
 //! that live only in the custom widget.
 //!
-//! The inline highlighter mirrors `chat::client::inline_spans` — the SAME
-//! marker grammar the message renderer parses, so what lights up while typing
-//! is exactly what the sent message will format. Marks do not nest; the first
-//! matching delimiter wins; there are no word-boundary rules. Mentions are the
-//! one renderer mark not previewed as ink: they need the member roster, which
-//! reaches the composer surface as its mention menu instead — the `@word`
-//! under the caret ([`mention_query`]) against the handles the send will
-//! resolve ([`mention_matches`]), completed in place ([`complete_mention`]).
+//! Selected mentions carry byte ranges and stable parties beside the editor
+//! text. Submission writes their ID tokens; names are only the visible label.
+//! Editing through a mention replaces the whole token.
 
 use crate::backend::handle_char;
 use iced::advanced::text::{self, Highlighter};
@@ -81,6 +76,8 @@ const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComposerEvent {
     Submit,
+    Copy,
+    Cut,
     Apply(RichAction),
     /// A formatting chord the widget claimed via its `on_chord` route —
     /// Cmd/Ctrl+B and friends land HERE, in the composer that has the
@@ -129,7 +126,9 @@ pub fn mention_query(document: &Content) -> Option<MentionQuery> {
     }
     let at = before.rfind('@')?;
     let partial = &before[at + 1..];
-    let partial_is_a_handle = partial.chars().all(handle_char);
+    let partial_is_a_handle = partial
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'));
     let at_opens_a_word = before[..at]
         .chars()
         .next_back()
@@ -143,21 +142,6 @@ pub fn mention_query(document: &Content) -> Option<MentionQuery> {
         end: column,
         partial: partial.to_owned(),
     })
-}
-
-/// The handles `partial` prefixes, case-insensitively, alphabetical: the
-/// menu's rows. `handles` is what the send parser resolves, so a row is
-/// always a mention that will land.
-pub fn mention_matches(handles: &[&str], partial: &str) -> Vec<String> {
-    let needle = partial.to_ascii_lowercase();
-    let mut matches: Vec<String> = handles
-        .iter()
-        .filter(|handle| handle.starts_with(&needle))
-        .map(|handle| (*handle).to_owned())
-        .collect();
-    matches.sort();
-    matches.dedup();
-    matches
 }
 
 /// Replace the typed `@partial` with `@handle ` and leave the caret after
@@ -177,6 +161,261 @@ pub fn complete_mention(mut document: Content, query: &MentionQuery, handle: &st
         std::sync::Arc::new(format!("@{handle} ")),
     )));
     document
+}
+
+/// Encode only selected mention ranges; ordinary @text stays ordinary text.
+pub fn mention_body(content: &Content, mentions: &[(Range<usize>, chat::Party)]) -> String {
+    let text = content.text();
+    let mut body = String::new();
+    let mut start = 0;
+    for (range, party) in mentions {
+        body.push_str(&text[start..range.start]);
+        body.push_str(&chat::client::mention_token(party));
+        start = range.end;
+    }
+    body.push_str(&text[start..]);
+    body
+}
+
+/// Copy whole identities even when the visible selection clips a name.
+pub fn copy_mention_selection(
+    content: &mut Content,
+    mentions: &[(Range<usize>, chat::Party)],
+) -> Option<String> {
+    content.selection().filter(|text| !text.is_empty())?;
+    let deletion = ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(Edit::Delete)));
+    select_mention_edit(content, mentions, &deletion);
+    let cursor = content.cursor();
+    let caret = text_offset(content, cursor.position);
+    let anchor = text_offset(content, cursor.selection?);
+    let selected = caret.min(anchor)..caret.max(anchor);
+    let selected_mentions: Vec<_> = mentions
+        .iter()
+        .filter(|(range, _)| range.start >= selected.start && range.end <= selected.end)
+        .map(|(range, party)| {
+            (
+                range.start - selected.start..range.end - selected.start,
+                party.clone(),
+            )
+        })
+        .collect();
+    let text = content.text();
+    Some(mention_body(
+        &Content::with_text(&text[selected]),
+        &selected_mentions,
+    ))
+}
+
+/// Plain clipboard text carries IDs; hydrate only canonical tokens, never names.
+pub fn paste_mentions(
+    mut content: Content,
+    mentions: &mut Vec<(Range<usize>, chat::Party)>,
+    body: &str,
+    names: &crate::backend::NameDirectory,
+) -> Content {
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let (text, pasted_mentions) = chat::client::draft_mentions(&body, names);
+    let event = ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(Edit::Paste(
+        std::sync::Arc::new(text.clone()),
+    ))));
+    select_mention_edit(&mut content, mentions, &event);
+    let cursor = content.cursor();
+    let caret = text_offset(&content, cursor.position);
+    let anchor = cursor
+        .selection
+        .map_or(caret, |at| text_offset(&content, at));
+    let selected = caret.min(anchor)..caret.max(anchor);
+    let start = selected.start;
+    replace_mention_ranges(mentions, selected, text.len());
+    mentions.extend(
+        pasted_mentions
+            .into_iter()
+            .map(|(range, party)| (start + range.start..start + range.end, party)),
+    );
+    mentions.sort_by_key(|(range, _)| range.start);
+    apply_composer_event(content, event)
+}
+
+/// Move ranges using the editor's actual replacement, including repeated labels.
+fn replace_mention_ranges(
+    mentions: &mut Vec<(Range<usize>, chat::Party)>,
+    replaced: Range<usize>,
+    inserted: usize,
+) {
+    mentions.retain_mut(|(range, _)| {
+        if range.end <= replaced.start {
+            return true;
+        }
+        if range.start >= replaced.end {
+            range.start = replaced.start + inserted + (range.start - replaced.end);
+            range.end = replaced.start + inserted + (range.end - replaced.end);
+            return true;
+        }
+        false
+    });
+}
+
+pub fn apply_mention_event(
+    mut content: Content,
+    mentions: &mut Vec<(Range<usize>, chat::Party)>,
+    event: ComposerEvent,
+) -> Content {
+    if let ComposerEvent::Mark(kind) = event {
+        return toggle_mention_mark(content, mentions, kind);
+    }
+    select_mention_edit(&mut content, mentions, &event);
+    let before = content.text();
+    let cursor = content.cursor();
+    let caret = text_offset(&content, cursor.position);
+    let anchor = cursor
+        .selection
+        .map_or(caret, |at| text_offset(&content, at));
+    let mut replaced = caret.min(anchor)..caret.max(anchor);
+    let next = apply_composer_event(content, event.clone());
+    let after = next.text();
+    if before == after {
+        return next;
+    }
+    match event {
+        ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(Edit::Backspace)))
+            if replaced.is_empty() =>
+        {
+            replaced.start = caret - (before.len() - after.len());
+        }
+        ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(Edit::Delete)))
+            if replaced.is_empty() =>
+        {
+            replaced.end = caret + (before.len() - after.len());
+        }
+        ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(
+            Edit::Indent | Edit::Unindent,
+        ))) => {
+            // Each selected line changes independently. A single bounding
+            // replacement would discard mentions between those indent edits.
+            let mut offset = 0;
+            for (old, new) in before
+                .split_inclusive('\n')
+                .zip(after.split_inclusive('\n'))
+            {
+                if old != new {
+                    let prefix: usize = old
+                        .chars()
+                        .zip(new.chars())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(c, _)| c.len_utf8())
+                        .sum();
+                    let suffix: usize = old[prefix..]
+                        .chars()
+                        .rev()
+                        .zip(new[prefix..].chars().rev())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(c, _)| c.len_utf8())
+                        .sum();
+                    replace_mention_ranges(
+                        mentions,
+                        offset + prefix..offset + old.len() - suffix,
+                        new.len() - prefix - suffix,
+                    );
+                }
+                offset += new.len();
+            }
+            return next;
+        }
+        _ => {}
+    }
+    let inserted = after.len() - (before.len() - replaced.len());
+    replace_mention_ranges(mentions, replaced, inserted);
+    next
+}
+
+pub fn toggle_mention_mark(
+    mut content: Content,
+    mentions: &mut Vec<(Range<usize>, chat::Party)>,
+    kind: String,
+) -> Content {
+    let (open, close) = match kind.as_str() {
+        "bold" => ("**", "**"),
+        "italic" => ("_", "_"),
+        "code" => ("```\n", "\n```"),
+        "quote" => ("> ", ""),
+        _ => return content,
+    };
+    let cursor = content.cursor();
+    let caret = text_offset(&content, cursor.position);
+    let anchor = cursor
+        .selection
+        .map_or(caret, |at| text_offset(&content, at));
+    let mut start = caret.min(anchor);
+    let mut end = caret.max(anchor);
+    for (range, _) in mentions.iter() {
+        let intersects = start < range.end && end > range.start;
+        let inside = start == end && start > range.start && start < range.end;
+        if intersects || inside {
+            start = start.min(range.start);
+            end = end.max(range.end);
+        }
+    }
+    let before = content.text();
+    content.move_to(Cursor {
+        position: text_position(&before, end),
+        selection: Some(text_position(&before, start)),
+    });
+    let next = composer_toggle_mark(content, kind);
+    replace_mention_ranges(mentions, end..end, close.len());
+    replace_mention_ranges(mentions, start..start, open.len());
+    next
+}
+
+fn text_offset(content: &Content, at: Position) -> usize {
+    (0..at.line)
+        .filter_map(|line| content.line(line))
+        .map(|line| line.text.len() + 1)
+        .sum::<usize>()
+        + at.column
+}
+
+fn text_position(text: &str, offset: usize) -> Position {
+    let before = &text[..offset];
+    Position {
+        line: before.bytes().filter(|b| *b == b'\n').count(),
+        column: before.rsplit('\n').next().unwrap_or_default().len(),
+    }
+}
+
+/// A deletion or replacement through a token selects its entire visible name.
+pub fn select_mention_edit(
+    content: &mut Content,
+    mentions: &[(Range<usize>, chat::Party)],
+    event: &ComposerEvent,
+) {
+    let ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(edit))) = event else {
+        return;
+    };
+    let cursor = content.cursor();
+    let caret = text_offset(content, cursor.position);
+    let anchor = cursor
+        .selection
+        .map_or(caret, |at| text_offset(content, at));
+    let mut start = caret.min(anchor);
+    let mut end = caret.max(anchor);
+    for (range, _) in mentions {
+        let overlaps = start < range.end && end > range.start;
+        let inside = start == end && start > range.start && start < range.end;
+        let backspace = start == end && start == range.end && matches!(edit, Edit::Backspace);
+        let delete = start == end && start == range.start && matches!(edit, Edit::Delete);
+        if overlaps || inside || backspace || delete {
+            start = start.min(range.start);
+            end = end.max(range.end);
+        }
+    }
+    if start == caret.min(anchor) && end == caret.max(anchor) {
+        return;
+    }
+    let text = content.text();
+    content.move_to(Cursor {
+        position: text_position(&text, end),
+        selection: Some(text_position(&text, start)),
+    });
 }
 
 /// The menu key a press is, while the menu is open: the arrows, Enter, Tab
@@ -215,7 +454,10 @@ pub fn apply_composer_event(document: Content, event: ComposerEvent) -> Content 
         ComposerEvent::Apply(RichAction::MoveTo(cursor)) => move_to(&mut document, cursor),
         ComposerEvent::Mark(kind) => return composer_toggle_mark(document, kind),
         // the menu's keys act on the surface's menu state, not the words
-        ComposerEvent::Submit | ComposerEvent::Menu(_) => {}
+        ComposerEvent::Submit
+        | ComposerEvent::Copy
+        | ComposerEvent::Cut
+        | ComposerEvent::Menu(_) => {}
     }
     document
 }
@@ -259,6 +501,8 @@ fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
     }
     let shifted = press.modifiers.shift();
     let mark = match press.physical_key {
+        Physical::Code(Code::KeyC) if !shifted => return Some(ComposerEvent::Copy),
+        Physical::Code(Code::KeyX) if !shifted => return Some(ComposerEvent::Cut),
         Physical::Code(Code::KeyB) if !shifted => "bold",
         Physical::Code(Code::KeyI) if !shifted => "italic",
         Physical::Code(Code::KeyC) if shifted => "code",
@@ -271,27 +515,42 @@ fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
 /// The composer editor. `menu_open` says a mention menu is showing over
 /// this composer, so the arrows, Enter, Tab and Escape are the menu's
 /// ([`ComposerEvent::Menu`]) instead of the editor's for as long as it is.
-pub fn rich_composer(
-    document: &Content,
+pub fn rich_composer<'a>(
+    id: iced::advanced::widget::Id,
+    document: &'a Content,
+    mentions: &[Range<usize>],
     hint: String,
     disabled: bool,
     menu_open: bool,
-    min_h: f64,
-    max_h: f64,
-    pad: f64,
-) -> Element<'_, ComposerEvent> {
+) -> Element<'a, ComposerEvent> {
+    let mut offset = 0;
+    let ranges: Vec<Vec<Range<usize>>> = document
+        .text()
+        .split('\n')
+        .map(|line| {
+            let end = offset + line.len();
+            let spans = mentions
+                .iter()
+                .filter(|range| range.start >= offset && range.end <= end)
+                .map(|range| range.start - offset..range.end - offset)
+                .collect();
+            offset = end + 1;
+            spans
+        })
+        .collect();
     let editor = RichTextEditor::new(document, content_version(document))
+        .id(id)
         .placeholder(hint)
         .width(iced::Length::Fill)
-        .min_height(min_h as f32)
-        .max_height(max_h as f32)
+        .min_height(44.0)
+        .max_height(150.0)
         .font(composer_font(Weight::Normal, FontStyle::Normal))
         .size(COMPOSER_SIZE)
         .line_height(COMPOSER_LINE_HEIGHT)
         .wrapping(text::Wrapping::Word)
-        .padding(pad as f32)
+        .padding(10.0)
         // format_key 0: the format table is static — no theme or mode inputs.
-        .highlight_with::<InlineMarkdownHighlighter>((), 0, inline_format)
+        .highlight_with::<InlineMarkdownHighlighter>(ranges, 0, composer_format)
         .style(composer_style)
         .key_binding(move |press| composer_key_binding(press, menu_open));
     if disabled {
@@ -326,7 +585,11 @@ fn content_version(document: &Content) -> ContentVersion {
 /// open mention menu claims resolves to NO binding, which is what routes it
 /// to the `on_chord` seam where [`menu_key`] reads it.
 fn composer_key_binding(press: &KeyPress, menu_open: bool) -> Option<Binding<Edit>> {
-    if menu_key(press, menu_open).is_some() {
+    let owned_chord = matches!(
+        composer_chord(press),
+        Some(ComposerEvent::Copy | ComposerEvent::Cut)
+    );
+    if menu_key(press, menu_open).is_some() || owned_chord {
         return None;
     }
     let enter = matches!(press.key, Key::Named(Named::Enter));
@@ -409,21 +672,43 @@ fn inline_format(kind: &Inline) -> Format {
     }
 }
 
+#[derive(Clone)]
+enum ComposerHighlight {
+    Markdown(Inline),
+    Mention,
+}
+
+fn composer_format(kind: &ComposerHighlight) -> Format {
+    match kind {
+        ComposerHighlight::Markdown(inline) => inline_format(inline),
+        ComposerHighlight::Mention => Format {
+            color: Some(rgb8(0xa0, 0x5a, 0x3c)),
+            font: Some(composer_font(Weight::Medium, FontStyle::Normal)),
+            ..Format::default()
+        },
+    }
+}
+
 struct InlineMarkdownHighlighter {
     current_line: usize,
+    mentions: Vec<Vec<Range<usize>>>,
 }
 
 impl Highlighter for InlineMarkdownHighlighter {
-    type Settings = ();
-    type Highlight = Inline;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Inline)>;
+    type Settings = Vec<Vec<Range<usize>>>;
+    type Highlight = ComposerHighlight;
+    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, ComposerHighlight)>;
 
-    fn new(_settings: &Self::Settings) -> Self {
-        Self { current_line: 0 }
+    fn new(settings: &Self::Settings) -> Self {
+        Self {
+            current_line: 0,
+            mentions: settings.clone(),
+        }
     }
 
-    fn update(&mut self, _settings: &Self::Settings) {
+    fn update(&mut self, settings: &Self::Settings) {
         self.current_line = 0;
+        self.mentions = settings.clone();
     }
 
     fn change_line(&mut self, line: usize) {
@@ -431,8 +716,36 @@ impl Highlighter for InlineMarkdownHighlighter {
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        let mentions = self
+            .mentions
+            .get(self.current_line)
+            .cloned()
+            .unwrap_or_default();
         self.current_line += 1;
-        inline_marks(line).into_iter()
+        let mut spans = Vec::new();
+        for (range, kind) in inline_marks(line) {
+            let mut start = range.start;
+            for mention in &mentions {
+                let overlaps = mention.start < range.end && mention.end > start;
+                if !overlaps {
+                    continue;
+                }
+                if start < mention.start {
+                    spans.push((start..mention.start, ComposerHighlight::Markdown(kind)));
+                }
+                start = mention.end.min(range.end);
+            }
+            if start < range.end {
+                spans.push((start..range.end, ComposerHighlight::Markdown(kind)));
+            }
+        }
+        spans.extend(
+            mentions
+                .into_iter()
+                .map(|range| (range, ComposerHighlight::Mention)),
+        );
+        spans.sort_by_key(|(range, _)| range.start);
+        spans.into_iter()
     }
 
     fn current_line(&self) -> usize {
@@ -659,7 +972,14 @@ mod tests {
         );
         // Plain Cmd+C is copy, not code; plain typing is an ordinary edit and
         // never reaches this route at all. An unclaimed chord bubbles on.
-        assert!(chord(Code::KeyC, Modifiers::COMMAND).is_none());
+        assert_eq!(
+            chord(Code::KeyC, Modifiers::COMMAND),
+            Some(ComposerEvent::Copy)
+        );
+        assert_eq!(
+            chord(Code::KeyX, Modifiers::COMMAND),
+            Some(ComposerEvent::Cut)
+        );
         assert!(chord(Code::KeyB, Modifiers::default()).is_none());
     }
 
@@ -735,5 +1055,106 @@ mod tests {
         )));
         let document = apply_composer_event(document, enter);
         assert_eq!(document.line_count(), 2);
+    }
+    #[test]
+    fn mention_ranges_follow_repeated_labels_and_formatting() {
+        let mut mentions = vec![
+            (0..5, chat::Party::Account(5)),
+            (6..11, chat::Party::Account(6)),
+        ];
+        let content = Content::with_text("@Same @Same");
+        let mut content = apply_mention_event(
+            content,
+            &mut mentions,
+            ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(Edit::Paste(
+                std::sync::Arc::new("@Same ".into()),
+            )))),
+        );
+        assert_eq!(mention_body(&content, &mentions), "@Same <@5> <@6>");
+        content.perform(text_editor::Action::SelectAll);
+        let content = toggle_mention_mark(content, &mut mentions, "bold".into());
+        assert_eq!(mention_body(&content, &mentions), "**@Same <@5> <@6>**");
+    }
+
+    #[test]
+    fn multiline_clipboard_paste_hydrates_ids_and_plain_replacement_removes_them() {
+        let names = crate::backend::NameDirectory::default();
+        let mut mentions = Vec::new();
+        let mut content =
+            paste_mentions(Content::new(), &mut mentions, "안녕\r\n<@5> <@6>", &names);
+        assert_eq!(content.text(), "안녕\n@account-5 @account-6");
+        assert_eq!(mention_body(&content, &mentions), "안녕\n<@5> <@6>");
+        content.move_to(Cursor {
+            position: Position {
+                line: 1,
+                column: 10,
+            },
+            selection: Some(Position { line: 1, column: 0 }),
+        });
+        assert_eq!(
+            copy_mention_selection(&mut content, &mentions).as_deref(),
+            Some("<@5>")
+        );
+        let content = paste_mentions(content, &mut mentions, "@account-5", &names);
+        assert_eq!(mention_body(&content, &mentions), "안녕\n@account-5 <@6>");
+    }
+
+    #[test]
+    fn multiline_tab_and_shift_tab_preserve_every_mention() {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::{Code, Physical};
+        let original = "<@5> first\n안녕 <@6> middle\n<@7> last";
+        let mut mentions = Vec::new();
+        let mut content = paste_mentions(
+            Content::new(),
+            &mut mentions,
+            original,
+            &crate::backend::NameDirectory::default(),
+        );
+        let display = content.text();
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            content.perform(text_editor::Action::SelectAll);
+            let press = KeyPress {
+                key: Key::Named(Named::Tab),
+                modified_key: Key::Named(Named::Tab),
+                physical_key: Physical::Code(Code::Tab),
+                modifiers,
+                text: None,
+                status: text_editor::Status::Focused { is_hovered: false },
+            };
+            let Some(Binding::Custom(edit)) = composer_key_binding(&press, false) else {
+                panic!("Tab must use the native indentation binding");
+            };
+            content = apply_mention_event(
+                content,
+                &mut mentions,
+                ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(edit))),
+            );
+            let canonical = mention_body(&content, &mentions);
+            assert_eq!(
+                canonical.lines().map(str::trim_start).collect::<Vec<_>>(),
+                original.lines().collect::<Vec<_>>()
+            );
+            assert_eq!(mentions.len(), 3);
+        }
+        assert_eq!(content.text(), display);
+        assert_eq!(mention_body(&content, &mentions), original);
+    }
+
+    #[test]
+    fn mention_highlighting_keeps_surrounding_markdown() {
+        let mut highlighter = InlineMarkdownHighlighter::new(&vec![vec![8..13]]);
+        let spans: Vec<_> = highlighter
+            .highlight_line("**hello @Same world**")
+            .collect();
+        assert!(spans.iter().any(|(range, kind)| *range == (2..8)
+            && matches!(kind, ComposerHighlight::Markdown(Inline::Bold))));
+        assert!(spans.iter().any(|(range, kind)| *range == (13..19)
+            && matches!(kind, ComposerHighlight::Markdown(Inline::Bold))));
+        assert!(
+            spans.iter().any(
+                |(range, kind)| *range == (8..13) && matches!(kind, ComposerHighlight::Mention)
+            )
+        );
     }
 }
