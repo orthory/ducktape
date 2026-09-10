@@ -1,6 +1,53 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// A node whose read page is not base64 answered garbage, not an empty file:
+/// the preview fails with a reason instead of showing "0 binary bytes".
+#[tokio::test]
+async fn a_malformed_read_page_fails_the_preview_instead_of_reading_as_empty() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = rpc_client(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                value = listener.accept() => value.unwrap(),
+                _ = &mut stopped => break,
+            };
+            let (mut socket, _) = accepted;
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body = if request.starts_with("GET /v1/files/refs") {
+                serde_json::json!({"head": "bb".repeat(32)})
+            } else {
+                assert!(request.starts_with("GET /v1/files/read"), "{request}");
+                serde_json::json!({"b64": "Zg==Zg==", "eof": true})
+            }
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let preview = files_text(&rpc, "/shared/note.txt".into(), 7).await;
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let error = preview.expect_err("garbage is not an empty file");
+    assert!(error.contains("not valid base64"), "{error}");
+}
+
 /// A stub node whose `ls` answers by page: the first request (no `after`)
 /// returns `a`, `b` and a cursor; the request echoing the cursor as `after`
 /// returns `c` and no cursor — or, when `fail_second` is set, a refusal.
