@@ -519,6 +519,31 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         !open.contains("run replace"),
         "the open plane owns no lane of its own"
     );
+    // A CHAT ADDRESS LANDS ON THE CHAT TAB. `choose_channel` is the sidebar's
+    // own click and moves no tab, so the channel arm moves it first; the
+    // message arm lands through the search hit's own tab move.
+    let channel_arm = open
+        .split_once("DuckKind.channel\n")
+        .expect("the channel arm")
+        .1
+        .split_once("DuckKind.channel_message\n")
+        .expect("the message arm follows")
+        .0;
+    assert!(
+        channel_arm.contains("shell_tab = ShellTab.chat"),
+        "a channel address moves to the chat tab before the room changes"
+    );
+    let search_hit = chat
+        .split_once("on open_chat_search_hit(channel_id, root_seq, target_seq)")
+        .expect("the search-hit handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        search_hit.contains("shell_tab = ShellTab.chat"),
+        "a message address lands on the chat tab through the search hit's own tab move"
+    );
 
     let forge = include_str!("../ui/handlers/forge.ice");
     let repo_loaded = forge
