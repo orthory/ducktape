@@ -1,6 +1,89 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// A stub node whose `ls` answers by page: the first request (no `after`)
+/// returns `a`, `b` and a cursor; the request echoing the cursor as `after`
+/// returns `c` and no cursor — or, when `fail_second` is set, a refusal.
+/// Returns the rpc url, the stop switch and the server task.
+async fn paged_ls_stub(
+    fail_second: bool,
+) -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                value = listener.accept() => value.unwrap(),
+                _ = &mut stopped => break,
+            };
+            let (mut socket, _) = accepted;
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 8192);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /v1/files/ls?"), "{request}");
+            let entry = |name: &str| serde_json::json!({"path": format!("/shared/{name}"), "kind": "file", "size": 1, "object": "o"});
+            let second_page = request.contains("after=b");
+            let (status, body) = match (second_page, fail_second) {
+                (false, _) => (
+                    "200 OK",
+                    serde_json::json!({"entries": [entry("a"), entry("b")], "next": "b"}),
+                ),
+                (true, false) => (
+                    "200 OK",
+                    serde_json::json!({"entries": [entry("c")], "next": null}),
+                ),
+                (true, true) => (
+                    "500 Internal Server Error",
+                    serde_json::json!({"error": "index closed"}),
+                ),
+            };
+            let body = body.to_string();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    (url, stop, server)
+}
+
+/// The browser lists the WHOLE directory: the node's page cursor is echoed as
+/// `after` until no cursor comes back, and a page that fails after the first
+/// is the listing failing, never a shorter directory presented as complete.
+#[tokio::test]
+async fn a_directory_listing_walks_every_page_and_a_failed_page_fails_the_listing() {
+    let (url, stop, server) = paged_ls_stub(false).await;
+    let listing = files_ls(url, "/shared".into(), 3).await.unwrap();
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+    assert_eq!(listing.generation, 3);
+
+    let (url, stop, server) = paged_ls_stub(true).await;
+    let failed = files_ls(url, "/shared".into(), 4).await;
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    let error = failed.expect_err("a failed second page is not a complete listing");
+    assert_eq!(error.generation, 4);
+}
+
 #[tokio::test]
 async fn a_file_preview_reads_the_snapshot_it_will_use_for_save() {
     const BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

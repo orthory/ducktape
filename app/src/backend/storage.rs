@@ -75,7 +75,12 @@ pub struct FsHistory {
     pub snapshots: Vec<FsSnapshot>,
 }
 
-/// List one duckfs directory (committed head), name order.
+/// List one duckfs directory (committed head), name order — EVERY page of
+/// it. The node answers `ls` a page at a time (256 entries, then a `next`
+/// cursor to echo as `after`); the browser shows the whole directory, so the
+/// pages are walked here and a directory of 300 children lists 300, not 256.
+/// A page that fails after the first is the listing failing: a partial
+/// directory presented as complete hides files.
 pub async fn files_ls(
     rpc: String,
     path: String,
@@ -84,7 +89,7 @@ pub async fn files_ls(
     async {
         let rpc = rpc_client(&rpc)?;
         let listed = rpc.files_get("ls", &[("path", path.as_str())]).await;
-        let reply = match listed {
+        let mut reply = match listed {
             Ok(reply) => reply,
             // A CLIENT reads an uncommitted path as an empty directory, not
             // an error: a fresh workspace has no `/shared` until something
@@ -104,9 +109,17 @@ pub async fn files_ls(
                 });
             }
         };
+        let mut entries = fs_entries(&reply);
+        while let Some(after) = reply["next"].as_str().map(str::to_owned) {
+            reply = rpc
+                .files_get("ls", &[("path", path.as_str()), ("after", after.as_str())])
+                .await
+                .map_err(|error| -> String { error.into() })?;
+            entries.extend(fs_entries(&reply));
+        }
         Ok(FsListing {
             generation,
-            entries: fs_entries(&reply),
+            entries,
             path,
         })
     }
