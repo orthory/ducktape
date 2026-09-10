@@ -908,6 +908,17 @@ pub fn forge_event_tab(event: &ModuleViewEvent) -> crate::ForgeTab {
     }
 }
 
+/// The seat an open item belongs to, by its kind: a pull request lights the
+/// Pull requests tab, an issue the Issues tab. A kind the tracker has no seat
+/// for leaves the code browse lit.
+pub fn forge_kind_tab(kind: &str) -> crate::ForgeTab {
+    match kind {
+        "pr" => crate::ForgeTab::Pulls,
+        "issue" => crate::ForgeTab::Issues,
+        _ => crate::ForgeTab::Code,
+    }
+}
+
 /// The verdict a `review_pick` intent names; an unknown word is a comment.
 pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict {
     match event_text(event, "verdict").as_str() {

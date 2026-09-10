@@ -67,7 +67,6 @@ extern crate::host
   pure branch_names(branches:&[ForgeBranch]) -> [str]
   pure pinned_branch(tree_branch:&str) -> str?
   pure duck_forge_item_link(repo:&str, number:i64, chain_id:&str) -> str
-  pure duck_forge_repo_link(repo:&str, chain_id:&str) -> str
   pure forge_push_command(rpc:&str) -> str
   pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure drafts_cleared_by(scope:&str, draft:&str) -> bool
