@@ -953,3 +953,38 @@ test locking_the_seat_takes_the_private_output_with_it
   expect empty(signer_key)
   expect empty(password)
   expect empty(live_agents)
+
+// A CHIP IS A LINK PRESSED ON ANOTHER TAB. The run panel's places carry
+// duck:// addresses and the open plane is where a link becomes navigation;
+// a chat address opened from the agents tab has to land on the chat tab
+// before it moves rooms, or the move happens under a tab the reader is not
+// looking at and the press appears to do nothing.
+test a_chat_address_opened_from_another_tab_lands_on_the_chat_tab
+  preset ui_live_run_seated
+  dispatch select_shell_tab(ShellTab.agents)
+  expect shell_tab == ShellTab.agents
+  dispatch open_message_link("duck://channel/general")
+  expect shell_tab == ShellTab.chat
+
+// EVERY DOOR ONTO A RUN IS A TAB MOVE, and a tab move retires the account
+// ceremony wherever it was pressed — the bell and a duck://run link reach the
+// run panel from any tab, the settings tab mid-ceremony included.
+preset ui_ceremony_on_settings
+  state
+    connected = true
+    connected_rpc = "http://127.0.0.1:8844"
+    network_chain_id = "testnet#abcd"
+    connect_generation = 7
+    signer_key = "aa11"
+    shell_tab = ShellTab.settings
+    account_ceremony_phase = "qr"
+    account_ceremony_qr = "otpauth://totp/demo"
+
+test a_run_opened_mid_ceremony_retires_the_ceremony_like_any_tab_move
+  preset ui_ceremony_on_settings
+  expect !empty(account_ceremony_phase)
+  dispatch open_run_panel("dispatch-1")
+  expect shell_tab == ShellTab.agents
+  expect agents_open_run == "dispatch-1"
+  expect empty(account_ceremony_phase)
+  expect empty(account_ceremony_qr)
