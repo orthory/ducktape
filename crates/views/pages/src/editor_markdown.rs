@@ -855,6 +855,26 @@ mod tests {
     }
 
     #[test]
+    fn named_link_label_keeps_its_destination_when_syntax_is_hidden() {
+        let source = "[문서](duck://pages/alpha)";
+        let (marks, _) = highlight(source, false, false, false);
+        let (label, _) = marks
+            .iter()
+            .find(|(_, mark)| matches!(mark, Mark::Body(style) if style.link))
+            .unwrap();
+        assert_eq!(&source[label.clone()], "문서");
+        assert_eq!(
+            super::super::inline::document_link_at(source, label.start).as_deref(),
+            Some("duck://pages/alpha")
+        );
+        let hidden_markers = marks
+            .iter()
+            .filter(|(_, mark)| matches!(mark, Mark::Marker { hidden: true, .. }))
+            .count();
+        assert_eq!(hidden_markers, 2);
+    }
+
+    #[test]
     fn a_divider_away_from_the_caret_is_a_rule_not_three_dashes() {
         let (away, _) = highlight("---", false, false, false);
         assert!(matches!(away[0].1, Mark::Marker { hidden: true, .. }));
