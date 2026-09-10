@@ -484,8 +484,8 @@ wasm-modules-check:
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
 ## under a `tests/` directory or named `tests.rs`, or below the file's first
-## `#[cfg(test)]`. Pure text, no toolchain: it runs in the dev gate beside
-## `wasm-modules-check`.
+## `#[cfg(test)]`. Pure text, no toolchain: it runs in the per-push CI lane
+## beside `wasm-modules-check`.
 wasm-embed-check:
 	@bad=0; \
 	for f in $$(git ls-files '*.rs' | grep -v -e '/tests/' -e '/tests\.rs$$'); do \
