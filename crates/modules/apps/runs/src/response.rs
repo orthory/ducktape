@@ -712,7 +712,7 @@ impl RunsModule {
                 WireSink::Chain
             }
         };
-        let pr = self
+        let sink_pr = self
             .emit_sink(
                 ctx,
                 run_id,
@@ -723,6 +723,20 @@ impl RunsModule {
                 &executing_node,
             )
             .await;
+        // the run's OWN proposals come after the committed sink, so a
+        // proposal of the sink's branch is the sink's PR, never a second one.
+        let proposed_pr = self
+            .emit_forge_proposals(
+                ctx,
+                run_id,
+                entry,
+                &sink_to_apply,
+                &operations,
+                &result.workspace_receipt,
+                &executing_node,
+            )
+            .await;
+        let pr = sink_pr.or(proposed_pr);
         // record the delivery into the ring AFTER the sink so the record can
         // carry the PR the sink found updated. observation only — every
         // emitted op above is byte-identical with or without it.
@@ -863,6 +877,10 @@ impl RunsModule {
         // the tasks arms probe BY ID (`task_exists`), so a response carrying no
         // task operation never touches the tasks module at all.
         let mut created: BTreeSet<String> = BTreeSet::new();
+        // the branches this response already proposes a PR from: a second
+        // proposal of the same branch would open a second PR, since every
+        // duplicate probe at delivery reads committed state only.
+        let mut proposed: BTreeSet<(String, String)> = BTreeSet::new();
         for (index, operation) in operations.iter().enumerate() {
             if operation.is_pages() || operation.is_duckfs() {
                 continue;
@@ -886,6 +904,36 @@ impl RunsModule {
                         );
                     }
                     update.validate()?
+                }
+                Operation::ForgeOpenPr {
+                    repo,
+                    source_branch,
+                    target_branch,
+                    title,
+                    body,
+                } => {
+                    // the same authority the push spent: the repo's forge_push
+                    // cap, on the run's OWN final response — a callee's result
+                    // returns to its caller and proposes nothing on the forge.
+                    if matches!(lane, Lane::DelegatedSettle) {
+                        return Err(
+                            "forge.open_pr requires the run's own final response".into(),
+                        );
+                    }
+                    if !agent.permits(&CapRequest::ForgePush(repo)) {
+                        return Err(format!(
+                            "agent {} lacks forge_push for {repo}",
+                            entry.agent_id
+                        ));
+                    }
+                    sink::validate_pr_proposal(source_branch, target_branch, title, body)?;
+                    let first_proposal_of_branch =
+                        proposed.insert((repo.clone(), source_branch.clone()));
+                    if !first_proposal_of_branch {
+                        return Err(format!(
+                            "forge.open_pr proposes {repo} branch {source_branch} twice"
+                        ));
+                    }
                 }
                 Operation::Reply { content } => {
                     self.reply_msg(
@@ -1957,6 +2005,7 @@ impl RunsModule {
             | Operation::PagesPost { .. }
             | Operation::DuckfsWriteText { .. }
             | Operation::ModulesUpdate(_)
+            | Operation::ForgeOpenPr { .. }
             | Operation::CollaborationSend { .. }
             | Operation::CollaborationAcknowledge { .. }
             | Operation::AgentCall { .. } => {
