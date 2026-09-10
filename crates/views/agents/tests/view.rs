@@ -207,6 +207,7 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
             vec![],
             vec![running.clone()],
             &running.dispatch_id,
+            1,
             journal,
             "7",
             0,
