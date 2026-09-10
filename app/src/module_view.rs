@@ -1898,6 +1898,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "save",
             "register",
             "open_run",
+            "open_link",
             "messaging_open",
             "messaging_page",
             "messaging_send",
