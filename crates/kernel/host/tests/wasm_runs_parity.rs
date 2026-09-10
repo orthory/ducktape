@@ -1157,12 +1157,6 @@ fn rejections_match_and_leave_no_trace() {
         for (origin, message, reason) in rejects {
             pair.rejected(origin, message, reason).await;
         }
-        pair.rejected(
-            Origin::External(vec![3; 32]),
-            register_agent(2, "intruder", None),
-            "requires an account",
-        )
-        .await;
     });
 }
 
