@@ -5091,8 +5091,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234ca1c2cec4155055f68fa5fad1b5242c496ac8238d80a259bca382fb44a102"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=00fccc604d5b2fb37a1d64eb47184419ba83de86#00fccc604d5b2fb37a1d64eb47184419ba83de86"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
