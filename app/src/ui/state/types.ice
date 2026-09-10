@@ -193,7 +193,6 @@ enum ForgeFocus
 
 enum ShellTab
   chat
-  shell
   pages
   forge
   agents
@@ -203,13 +202,6 @@ enum ShellTab
   members
   governance
   settings
-
-// The Shell tab's two SURFACES, not two modes: a durable task conversation and
-// an interactive terminal. Both can be live at once — the node holds a saga and
-// a pty session independently — so this only says which one is on screen.
-enum ShellSurface
-  tasks
-  terminal
 
 enum ForgeTab
   code
@@ -295,25 +287,6 @@ enum ExplorerIntent
   search
   clear
 
-// what the Settings view asks of the app: one variant per act the screen
-// offers, each carrying only what the reader typed (a name, a key, a ticket,
-// the key password) — the drafts themselves are the view's
-// what the shell view asks of the app — `crate::module_view::shell_intent`
-enum ShellIntent
-  surface
-  setup
-  identity
-  host_node
-  refresh
-  terminal_start
-  terminal_stop
-  send
-  reset
-  detach
-  reopen
-  discard
-  open_link
-
 // what the Files view asks of the app: one variant per act the browser
 // offers, from a navigation to a write
 enum FilesIntent
@@ -330,6 +303,9 @@ enum FilesIntent
   close_diff
   open_link
 
+// what the Settings view asks of the app: one variant per act the screen
+// offers, each carrying only what the reader typed (a name, a key, a ticket,
+// the key password) — the drafts themselves are the view's
 enum SettingsIntent
   tab
   reconnect

@@ -165,6 +165,35 @@ fn shown(props: &ForgeProps) -> (u64, Frame) {
     (subscription, frame)
 }
 
+#[test]
+fn unreadable_host_facts_are_not_a_disconnected_network_and_can_recover() {
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let subscription = frame.requests[0].id;
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(
+        has_text(&frame, "Unable to read Forge view data"),
+        "{:?}",
+        texts(&frame)
+    );
+    assert!(!has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+    let frame = tick_native(vec![item(subscription, &encoded(&overview()))]);
+    assert!(has_text(&frame, "core"), "{:?}", texts(&frame));
+    assert!(!has_text(&frame, "Unable to read Forge view data"));
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(has_text(&frame, "Unable to read Forge view data"));
+    assert!(!has_text(&frame, "core"));
+    let frame = tick_native(vec![item(
+        subscription,
+        &encoded(&ForgeProps {
+            connected: false,
+            ..overview()
+        }),
+    )]);
+    assert!(has_text(&frame, "Not connected"));
+    assert!(!has_text(&frame, "Unable to read Forge view data"));
+}
+
 fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);

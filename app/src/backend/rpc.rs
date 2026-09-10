@@ -584,19 +584,6 @@ pub(crate) fn env_user_key() -> Option<PathBuf> {
     keystore::wallet::env_user_key()
 }
 
-pub(crate) fn ducktape_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("DUCKTAPE_BIN") {
-        return path.into();
-    }
-    if let Ok(current) = std::env::current_exe()
-        && let Some(sibling) = current.parent().map(|parent| parent.join("ducktape"))
-        && sibling.is_file()
-    {
-        return sibling;
-    }
-    PathBuf::from("ducktape")
-}
-
 pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() || value.len() > limit || value.chars().any(|character| character == '\0') {
@@ -661,19 +648,6 @@ pub(crate) fn user_error(message: String) -> String {
     let key_unreadable = message.contains("local user key") || message.contains("wallet name");
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
-    }
-    // The only surviving subprocess is the agent pty — keys, signing, run
-    // scheduling, invite minting and joining a network all happen in this
-    // process now — so this branch matches the ONE sentence that path writes
-    // (`start_agent_terminal`), and names no tool it did not start. Matching
-    // `DUCKTAPE_BIN` instead, as this did, matched nothing at all: every
-    // message that used to carry the variable's name was deleted along with
-    // the subprocess that produced it.
-    let helper_cannot_start = message.contains("could not start the ducktape");
-    if helper_cannot_start {
-        return "Ducktape's helper program could not start. Check the ducktape install in \
-                Settings."
-            .into();
     }
     let node_slow = message.contains("timed out");
     if node_slow {
@@ -741,25 +715,8 @@ mod tests {
         );
     }
 
-    /// The install sentence must be REACHABLE, and it is the one thing this
-    /// function still says about a subprocess. The app has exactly one left —
-    /// the agent pty — and matching on the variable name `DUCKTAPE_BIN`, as
-    /// this branch did, matched nothing: every message carrying it was deleted
-    /// with the subprocess that wrote it.
-    #[test]
-    fn a_helper_that_cannot_start_names_no_particular_tool() {
-        assert_eq!(
-            user_error(
-                "could not start the ducktape agent terminal: Could not start Claude · raw \
-                 session: No such file or directory (os error 2)"
-                    .into()
-            ),
-            "Ducktape's helper program could not start. Check the ducktape install in Settings."
-        );
-    }
-
-    /// A node that went quiet is not the same event as a helper that would not
-    /// start, and both are reached only after the key causes above them.
+    /// A node that went quiet has its own sentence, reached only after the key
+    /// causes above it.
     #[test]
     fn a_slow_node_keeps_its_own_sentence() {
         assert_eq!(

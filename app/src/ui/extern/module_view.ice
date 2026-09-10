@@ -32,14 +32,6 @@ extern crate::module_view
   component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64, rpc:&str, chain:&str, connection:i64, preview_base:&str, save_reply:&FsSaveHistory) -> ModuleViewEvent
   pure files_intent(event:&ModuleViewEvent) -> FilesIntent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
-  // the Shell tab: the app's agent picks and the run it is watching, drawn
-  // by the `shell` view; the composer, the terminal and the answer Markdown
-  // are host surfaces, and a send arrives as the `send` intent
-  component shell_view(dark:bool, connected:bool, surface:ShellSurface, setup_open:bool, identity_options:&[str], identity:&str, provider:&str, credential:&str, host_node_options:&[str], host_node:&str, credentials_loading:bool, terminal:&AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:&str, terminal_error:&str, entries:&[AgentChatEntry], activity:&[AgentActivity], chat_busy:bool, chat_status:&str, chat_detail:&str, live:&str, saga_id:&str, detached_saga:&str) -> ModuleViewEvent
-  pure shell_intent(event:&ModuleViewEvent) -> ShellIntent
-  pure shell_event_surface(event:&ModuleViewEvent) -> ShellSurface
-  // empties the host-side composer (a new chat, a workspace reset)
-  sync shell_composer_clear() -> bool
   // The guest owns the document editor. The app supplies a bounded source
   // stream and reconciles accepted edits with persistence and navigation.
   component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_text:&str, buffer_page:&str, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent

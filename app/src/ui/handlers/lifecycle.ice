@@ -273,11 +273,6 @@ on workspace_connected(next)
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   dm_peers_generation = dm_peers_generation + 1
-  // Shell may have stayed selected while the endpoint reconnected. Refresh
-  // its device-local credential names here; tab selection alone will not fire
-  // again after the console comes back online.
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = shell_tab == ShellTab.shell
   parallel
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
@@ -294,10 +289,6 @@ on workspace_connected(next)
     run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
-    flow
-      from done load_request(shell_tab == ShellTab.shell, connected_rpc, "", shell_credentials_generation)
-      try request -> done request
-      done -> shell_credentials_load_selected _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -758,11 +749,6 @@ on select_shell_tab(next)
   // on the tab you are already looking at destroys an inline edit in progress.
   let moved = shell_tab != next
   shell_tab = next
-  // A credential read belongs to the Shell visit that issued it. Bump on
-  // EVERY move, including the chat/pages early return below, so a late reply
-  // cannot repaint a screen the reader already left.
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = connected && shell_tab == ShellTab.shell
   // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
   // `live_updated`'s tab gate: the cursor stood still while the pane was
   // unmounted, so this is where the room she is coming back to is caught up —
@@ -883,10 +869,6 @@ on select_shell_tab(next)
       from done load_request(shell_tab == ShellTab.forge, connected_rpc, "", forge_generation)
       try request -> done request
       done -> forge_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.shell, connected_rpc, "", shell_credentials_generation)
-      try request -> done request
-      done -> shell_credentials_load_selected _
 
 // Conditional effects are selected one update before launch. The selector's
 // optional `try` emits no message when false. A newer intent, tab, or network
@@ -960,14 +942,6 @@ on forge_load_selected(request)
   return if obsolete_request || unmounted
   run replace lane=forge_load load_forge(request.rpc, request.generation) -> forge_loaded _ | forge_list_failed _
 
-on shell_credentials_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != shell_credentials_generation
-  let unmounted = shell_tab != ShellTab.shell
-  return if obsolete_request || unmounted
-  parallel
-    run replace lane=shell_credentials load_agent_credentials(request.rpc, request.generation) -> shell_credentials_loaded _ | shell_credentials_failed _
-    run replace lane=shell_host_nodes load_agent_host_nodes(request.rpc, request.generation) -> shell_host_nodes_loaded _ | shell_host_nodes_failed _
-
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
 // stamped from `huddle_now` when she joins, so mm:ss is their difference.
@@ -983,13 +957,6 @@ on wall_tick
 // Node's expensive streams stay scoped to the operator pane that renders them.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
-  // A LIVE SESSION IS WATCHED WHEREVER THE OPERATOR IS. This used to be gated
-  // on the Shell tab being open AND its terminal surface being the one on
-  // screen, so a session that exited while the operator read the transcript
-  // kept its "running" dot lit until they navigated back. The session outlives
-  // the view — the pty is owned by `shell_terminal`, not by the widget — so the
-  // notice that says it ended has to as well.
-  agent_terminal_events(shell_terminal) when (connected && shell_terminal_running) -> shell_terminal_notice _
   // THE CALL SESSION IS THIS SUBSCRIPTION. Joining a huddle flips
   // `huddle_joined` and the media leg connects; leaving (or disconnecting)
   // stops the subscription, the stream drops, and the websocket + audio

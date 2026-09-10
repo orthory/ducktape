@@ -648,8 +648,8 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
     /// Settings (which owns connection repair and stays useful with the node
-    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages,
-    /// Forge and Shell are module-owned views now and not in this inventory;
+    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages
+    /// and Forge are module-owned views now and not in this inventory;
     /// every native data screen answers.
     const EXEMPT: [&str; 0] = [];
 
