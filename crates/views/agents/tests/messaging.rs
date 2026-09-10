@@ -92,6 +92,7 @@ fn register_with_runs(messaging: MessagingProps, runs: Vec<RunRow>) -> Vec<u8> {
         rows: Vec::new(),
         runs,
         open_run: String::new(),
+        opened: 0,
         journal: Default::default(),
         live: Default::default(),
         capabilities: Vec::new(),

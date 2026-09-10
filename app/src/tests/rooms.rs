@@ -42,8 +42,8 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             "chat_updated",
             "choose_channel",
             "choose_dm",
-            "console_opened",
             "live_resynced",
+            "network_entered",
             "open_chat_search_hit",
             "reconnect",
             "workspace_connected",
@@ -60,7 +60,7 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         "open_chat_search_hit",
         "create_channel_submit",
         "reconnect",
-        "console_opened",
+        "network_entered",
     ] {
         let body = HANDLERS
             .split(&format!("\non {launch}"))
@@ -338,7 +338,7 @@ fn the_dm_header_takes_the_slack_the_channel_title_would() {
     assert!(!screen.contains("if !empty(active_dm_peer)"));
 }
 
-// Opening a (possibly different) network through the console handoff clears
+// Entering a (possibly different) network through the doors' landing clears
 // every reading and draft of the previous one — and the in-flight huddle —
 // while the KEY password survives: it unlocks this device's user.key, not an
 // endpoint.
@@ -379,7 +379,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     type_into(&node_a_composer, "node a draft");
     assert_eq!(composer_text(&node_a_composer), "node a draft");
 
-    let _ = app.__update(__DucktapeMessage::ConsoleOpened(iced::window::Id::unique()));
+    let _ = app.__update(__DucktapeMessage::NetworkEntered);
 
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");

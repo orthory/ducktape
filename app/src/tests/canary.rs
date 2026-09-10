@@ -329,10 +329,8 @@ fn a_capture_draws_the_module_it_names() {
          "history": [{"height": 7, "code_hash": chat.hash()}]},
     ]}});
     let client = runtime.block_on(fake_node(node));
-    // the loads the connection starts, each joined: the seats are in
-    for load in crate::module_view::connected(&client) {
-        load.join().expect("a view load");
-    }
+    // the loads the connection starts, joined: the seats are in
+    crate::module_view::connected(&client).joined();
     for (module, artifact) in [("governance", &governance), ("chat", &chat)] {
         assert_eq!(
             seated_hash(module),

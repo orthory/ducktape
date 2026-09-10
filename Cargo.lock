@@ -1285,10 +1285,13 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2346,6 +2349,7 @@ version = "0.1.0"
 dependencies = [
  "commonware-codec",
  "commonware-cryptography",
+ "libc",
  "nat-traversal",
  "serde",
  "tempfile",
@@ -3504,7 +3508,6 @@ dependencies = [
  "node",
  "nokhwa",
  "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
  "objc2-user-notifications",
  "pages",
@@ -3533,6 +3536,7 @@ dependencies = [
  "wasmtime",
  "workspace-config",
  "x11rb",
+ "zbus",
  "zeroize",
  "zune-jpeg 0.4.21",
 ]

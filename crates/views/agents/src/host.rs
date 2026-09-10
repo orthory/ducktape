@@ -113,10 +113,8 @@ pub struct MessagingBinding {
     /// `service_key` (a local adapter's owner-issued scoped key, reported by
     /// SHAPE — the key itself is never read back) or `program` (an agent
     /// program reaching the module over the call lane). "" when unbound.
-    #[serde(default)]
     pub principal: String,
     /// the bound program's account number, decimal; "" for a service key
-    #[serde(default)]
     pub principal_account: String,
     pub detached: bool,
 }
@@ -299,6 +297,11 @@ pub struct AgentsProps {
     /// The app owns it because a run is opened from other tabs too — a chat
     /// hint, a bell, a duck://run link — and the panel follows.
     pub open_run: String,
+    /// the doors the app has opened a run through, counted — a chat hint's
+    /// "View run", a bell, a duck://run link, the runs list. The tracker is
+    /// landed on at every bump, so a door onto the run already open still
+    /// brings the reader to it from whichever panel they were on.
+    pub opened: i64,
     /// the journal of the run the app has open for the reader
     pub journal: RunJournal,
     /// the open run's progress while it is still running
@@ -315,7 +318,6 @@ pub struct AgentsProps {
     pub answered: bool,
     pub dark: bool,
     /// the messaging panel's whole reading
-    #[serde(default)]
     pub messaging: MessagingProps,
 }
 

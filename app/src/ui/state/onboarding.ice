@@ -14,6 +14,10 @@ state
   hub_wallet_selected = ""
   onboarding_name = ""
   onboarding_error = ""
+  // A door's connect on its way to a console that does not exist yet:
+  // `workspace_connected` opens the console for it, and the launch window's
+  // doors are held until then or until the connect is refused.
+  console_entry:ConsoleEntry = ConsoleEntry.idle
   invite_link = ""
   provision_steps:[ProvisionStep] = []
   provision_index:i64 = 0

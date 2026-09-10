@@ -133,6 +133,7 @@ on agents_loaded(next)
 on open_run_panel(dispatch_id)
   shell_tab = ShellTab.agents
   agents_open_run = dispatch_id
+  agents_opened = agents_opened + 1
   agents_journal = empty_run_journal()
   agents_journal_op = agents_journal_op + 1
   run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
