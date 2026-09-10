@@ -130,12 +130,13 @@ pub(crate) const SEP: char = sdk::KEY_SEP;
 /// registration.
 const RESERVED_AGENT_NS_PREFIX: &str = "agent/";
 
-/// the only module allowed to own a reserved `agent/` recipe id.
+/// the only module allowed to register a reserved `agent/` recipe id.
 const RESERVED_AGENT_NS_OWNER: &str = "runs";
 
-/// a recipe id in the reserved `agent/` namespace: registrable and
-/// removable only by [`RESERVED_AGENT_NS_OWNER`]'s module origin, never by
-/// an External account.
+/// a recipe id in the reserved `agent/` namespace: registrable only by
+/// [`RESERVED_AGENT_NS_OWNER`]'s module origin, never by an External
+/// account. the reservation is id namespacing at registration; once
+/// registered the recipe is updated and removed like any other.
 fn is_reserved_recipe_id(recipe_id: &str) -> bool {
     recipe_id.starts_with(RESERVED_AGENT_NS_PREFIX)
 }
@@ -301,9 +302,10 @@ impl DispatchModule {
         Ok(())
     }
 
-    /// the canonical state form of the acting origin — recipe ownership. a
-    /// program account has no `SagaOrigin` form: it acts only through calls
-    /// its executor queued, and owning a recipe is the executor's to do.
+    /// the canonical state form of the registering origin — the recipe's
+    /// recorded `owner`, attribution only. a program account has no
+    /// `SagaOrigin` form to record: it acts only through calls its executor
+    /// queued, and registering a recipe is the executor's to do.
     fn acting_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
         match origin {
             Origin::External(key) if key.is_empty() => {
@@ -311,32 +313,19 @@ impl DispatchModule {
             }
             Origin::External(key) => Ok(SagaOrigin::External(key.clone())),
             Origin::Module(module) => Ok(SagaOrigin::Module(module.clone())),
-            Origin::Program(_) => Err(Error::Module("a program account cannot own recipes".into())),
+            Origin::Program(_) => Err(Error::Module(
+                "a program account cannot register recipes".into(),
+            )),
             Origin::System => Ok(SagaOrigin::System),
         }
     }
 
-    async fn owned_recipe(&self, ctx: &dyn Ctx, recipe_id: &str) -> Result<Recipe, Error> {
-        let recipe = staged_recipe(&self.staged, recipe_id)
+    /// the recipe an update or removal acts on. any origin mutates any
+    /// recipe: `owner` is the registration's attribution, not a consent.
+    async fn existing_recipe(&self, recipe_id: &str) -> Result<Recipe, Error> {
+        staged_recipe(&self.staged, recipe_id)
             .await?
-            .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))?;
-        let origin = Self::acting_origin(&ctx.env().origin)?;
-        // a reserved id is owned by its RESERVED_AGENT_NS_OWNER module by
-        // construction (only that origin can ever register one) — match by
-        // module id rather than exact recipe.owner equality, so the check
-        // still holds if a future hook emits the removal from a different
-        // op than the one that registered it.
-        let is_owner = if is_reserved_recipe_id(recipe_id) {
-            matches!(&origin, SagaOrigin::Module(m) if m == RESERVED_AGENT_NS_OWNER)
-        } else {
-            recipe.owner == origin
-        };
-        if !is_owner {
-            return Err(Error::Module(format!(
-                "recipe {recipe_id:?} is not owned by this origin"
-            )));
-        }
-        Ok(recipe)
+            .ok_or_else(|| Error::Module(format!("unknown recipe {recipe_id:?}")))
     }
 
     // ---- contract validation ---------------------------------------------------------
@@ -1072,8 +1061,8 @@ impl DispatchModule {
         )
     }
 
-    async fn on_remove_recipe(&mut self, ctx: &dyn Ctx, recipe_id: String) -> Result<(), Error> {
-        self.owned_recipe(ctx, &recipe_id).await?;
+    async fn on_remove_recipe(&mut self, recipe_id: String) -> Result<(), Error> {
+        self.existing_recipe(&recipe_id).await?;
         // the record is the recipe's whole footprint, so removing every recipe
         // returns the plane to the root it had before any registration.
         self.staged.delete(recipe_key(&recipe_id));
@@ -1115,7 +1104,7 @@ impl DispatchModule {
                 output_contract,
                 max_attempts,
             } => {
-                let mut recipe = self.owned_recipe(ctx, &recipe_id).await?;
+                let mut recipe = self.existing_recipe(&recipe_id).await?;
                 if let Some(description) = description {
                     recipe.description = description;
                 }
@@ -1145,7 +1134,7 @@ impl DispatchModule {
                     "recipe record",
                 )
             }
-            DispatchMsg::RemoveRecipe { recipe_id } => self.on_remove_recipe(ctx, recipe_id).await,
+            DispatchMsg::RemoveRecipe { recipe_id } => self.on_remove_recipe(recipe_id).await,
             DispatchMsg::Dispatch {
                 dispatch_id,
                 recipe_id,

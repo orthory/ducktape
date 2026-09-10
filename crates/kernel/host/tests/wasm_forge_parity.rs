@@ -124,11 +124,11 @@ fn block(height: u64, origin: Origin) -> BlockContext {
     }
 }
 
-fn owner() -> Origin {
+fn founder() -> Origin {
     Origin::External(vec![0xA1; 32])
 }
 
-fn stranger() -> Origin {
+fn another_member() -> Origin {
     Origin::External(vec![0xB2; 32])
 }
 
@@ -257,209 +257,6 @@ fn submit_both(native: &mut Host, wasm: &mut Host, height: u64, origin: Origin, 
     }
 }
 
-/// Repository settlement uses real key consent and committed identity changes.
-/// Failed ref operations must roll back both ownership and its attribution.
-#[test]
-fn repository_owner_follows_identity_once_with_native_and_wasm_rollback() {
-    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-
-    fn identity_op(operation: identity::IdentityMsg) -> Msg {
-        Msg {
-            target: "identity".into(),
-            payload: identity::encode_msg(&operation),
-        }
-    }
-    fn drain(native: &mut Host, wasm: &mut Host, height: &mut u64) {
-        while block_on(native.has_pending_work()).unwrap() {
-            assert!(block_on(wasm.has_pending_work()).unwrap());
-            *height += 1;
-            let n = block_on(native.submit_block(block(*height, Origin::System), vec![])).unwrap();
-            let w = block_on(wasm.submit_block(block(*height, Origin::System), vec![])).unwrap();
-            assert_eq!(n.calls, w.calls);
-            assert_eq!(n.deliveries, w.deliveries);
-            assert_eq!(all_roots(native), all_roots(wasm));
-        }
-        assert!(!block_on(wasm.has_pending_work()).unwrap());
-    }
-    fn ownership(host: &Host) -> Vec<attribution::Relation> {
-        let query = attribution::AttributionQuery::Relations {
-            source: attribution::Source {
-                module: FORGE.into(),
-                kind: "repo".into(),
-                object: serde_json::to_string(REPO).unwrap(),
-            },
-        };
-        let bytes =
-            block_on(host.query("attribution", &attribution::encode_query(&query))).unwrap();
-        let attribution::AttributionReply::Relations(Some(view)) =
-            attribution::decode_reply(&bytes).unwrap()
-        else {
-            panic!("repository ownership source");
-        };
-        view.relations
-    }
-    let dir_n = tempfile::tempdir().unwrap();
-    let dir_w = tempfile::tempdir().unwrap();
-    let blobs_n = blobstore::BlobHandle::default();
-    let blobs_w = blobstore::BlobHandle::default();
-    let commits = history(
-        "owner-settlement",
-        &[
-            (1, "README.md", "one\n", "birth"),
-            (2, "README.md", "two\n", "advance"),
-            (3, "README.md", "three\n", "sibling"),
-        ],
-    );
-    let packs: Vec<_> = commits
-        .iter()
-        .map(|commit| {
-            let digest = blobs_n.put_chunk(commit.pack.clone());
-            assert_eq!(digest, blobs_w.put_chunk(commit.pack.clone()));
-            digest
-        })
-        .collect();
-    let mut native = native_host(&dir_n, blobs_n);
-    let mut wasm = wasm_host(&dir_w, blobs_w);
-    let founder = PrivateKey::from_seed(41);
-    let founder_key = founder.public_key().as_ref().to_vec();
-    let sibling_key = PrivateKey::from_seed(42).public_key().as_ref().to_vec();
-    let mut height = 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(founder_key.clone()),
-        push(vec![update("dev", None, Some(&commits[0]))], Some(packs[0]))
-    ));
-    drain(&mut native, &mut wasm, &mut height);
-    assert!(
-        ownership(&wasm).is_empty(),
-        "unregistered key has no account relation"
-    );
-    height += 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(founder_key.clone()),
-        identity_op(identity::IdentityMsg::Create {
-            name: "owner".into(),
-            scheme: identity::KeyScheme::Ed25519
-        })
-    ));
-    let expires_at = 1_000 + identity::MAX_CONSENT_TTL;
-    let preimage = identity::add_key_preimage(
-        CHAIN_ID,
-        identity::KeyScheme::Ed25519,
-        &sibling_key,
-        0,
-        1,
-        expires_at,
-    );
-    height += 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(sibling_key.clone()),
-        identity_op(identity::IdentityMsg::AddKey {
-            scheme: identity::KeyScheme::Ed25519,
-            label: None,
-            authorizer: identity::Authorizer {
-                key: founder_key.clone(),
-                account: 1,
-                expires_at,
-                proof: keyscheme::testkit::ed25519_proof(
-                    &founder,
-                    identity::IDENTITY_ADD_KEY_NS,
-                    &preimage
-                ),
-            },
-        })
-    ));
-    let unsettled = forge_root(&native);
-    for (actor, previous) in [
-        (stranger(), &commits[0]),
-        (Origin::External(sibling_key.clone()), &commits[2]),
-    ] {
-        height += 1;
-        assert!(!submit_both(
-            &mut native,
-            &mut wasm,
-            height,
-            actor,
-            push(
-                vec![update("dev", Some(previous), Some(&commits[1]))],
-                Some(packs[1])
-            )
-        ));
-        assert_eq!(forge_root(&native), unsettled);
-        assert_eq!(forge_root(&wasm), unsettled);
-    }
-    drain(&mut native, &mut wasm, &mut height);
-    assert!(
-        ownership(&wasm).is_empty(),
-        "refused operations publish no owner transition"
-    );
-    height += 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(sibling_key.clone()),
-        push(
-            vec![update("dev", Some(&commits[0]), Some(&commits[1]))],
-            Some(packs[1])
-        )
-    ));
-    drain(&mut native, &mut wasm, &mut height);
-    let expected = vec![attribution::Relation {
-        recipient: 1,
-        reason: attribution::Reason::Ownership,
-        detail: vec![],
-    }];
-    assert_eq!(ownership(&native), expected);
-    assert_eq!(ownership(&wasm), expected);
-    height += 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(founder_key.clone()),
-        identity_op(identity::IdentityMsg::RemoveKey {
-            key: founder_key.clone()
-        })
-    ));
-    let settled = forge_root(&native);
-    height += 1;
-    assert!(!submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(founder_key),
-        push(
-            vec![update("dev", Some(&commits[1]), Some(&commits[2]))],
-            Some(packs[2])
-        )
-    ));
-    assert_eq!(forge_root(&native), settled);
-    assert_eq!(forge_root(&wasm), settled);
-    height += 1;
-    assert!(submit_both(
-        &mut native,
-        &mut wasm,
-        height,
-        Origin::External(sibling_key),
-        push(
-            vec![update("dev", Some(&commits[1]), Some(&commits[2]))],
-            Some(packs[2])
-        )
-    ));
-    drain(&mut native, &mut wasm, &mut height);
-    assert_eq!(ownership(&wasm), expected);
-    assert_eq!(all_roots(&native), all_roots(&wasm));
-}
-
 /// Program calls persist the result bytes in dispatch receipts and agent
 /// bindings. Native serde_json/preserve_order must not change those bytes.
 #[test]
@@ -535,7 +332,7 @@ fn program_issue_and_pr_results_match_native_and_wasm() {
         &mut native,
         &mut wasm,
         2,
-        owner(),
+        founder(),
         push(
             vec![
                 update("dev", None, Some(commit)),
@@ -791,7 +588,7 @@ fn probe_op(q: &ForgeQuery) -> Msg {
 // ============================================================================
 
 /// pushes (birth, advance, multi-branch, delete), the tracker (issue, PR,
-/// review, merge, edit, close), owner-gated + CAS rejections, a multi-op block
+/// review, merge, edit, close), protected-branch + CAS rejections, a multi-op block
 /// with a same-branch conflict, and a mid-block sibling read — driven through
 /// BOTH runtimes, asserting the forge root is byte-identical after EVERY block
 /// from genesis and every query reply matches.
@@ -844,22 +641,22 @@ fn full_matrix_roots_identical_block_by_block() {
 
     // the accepted stream — every block here moves the forge root.
     let accepted: Vec<(u64, Origin, Msg)> = vec![
-        // birth: main at c1 (the owner pins).
+        // birth: main at c1.
         (
             1,
-            owner(),
+            founder(),
             push(vec![update("main", None, Some(c1))], Some(packs[0])),
         ),
         // advance main c1 → c2.
         (
             2,
-            owner(),
+            founder(),
             push(vec![update("main", Some(c1), Some(c2))], Some(packs[1])),
         ),
         // one atomic multi-branch push: dev born at c2, feature born at c3.
         (
             3,
-            owner(),
+            founder(),
             push(
                 vec![
                     update("dev", None, Some(c2)),
@@ -871,7 +668,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // the tracker: an issue (#1) — emits the discussion-channel follow-up.
         (
             4,
-            stranger(),
+            another_member(),
             op(&ForgeMsg::OpenIssue {
                 repo: REPO.into(),
                 title: "first issue".into(),
@@ -881,7 +678,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // a PR (#2) feature → dev.
         (
             5,
-            stranger(),
+            another_member(),
             op(&ForgeMsg::OpenPr {
                 repo: REPO.into(),
                 title: "review me".into(),
@@ -893,7 +690,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // a review on #2.
         (
             6,
-            owner(),
+            founder(),
             op(&ForgeMsg::SubmitReview {
                 repo: REPO.into(),
                 number: 2,
@@ -903,10 +700,10 @@ fn full_matrix_roots_identical_block_by_block() {
                 comments: Vec::new(),
             }),
         ),
-        // the owner merges #2: dev c2 → c4 (the client-computed merge).
+        // the founder merges #2: dev c2 → c4 (the client-computed merge).
         (
             7,
-            owner(),
+            founder(),
             op(&ForgeMsg::MergePr {
                 repo: REPO.into(),
                 number: 2,
@@ -919,7 +716,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // any member edits + closes the issue.
         (
             8,
-            stranger(),
+            another_member(),
             op(&ForgeMsg::EditItem {
                 repo: REPO.into(),
                 number: 1,
@@ -929,7 +726,7 @@ fn full_matrix_roots_identical_block_by_block() {
         ),
         (
             9,
-            stranger(),
+            another_member(),
             op(&ForgeMsg::SetItemState {
                 repo: REPO.into(),
                 number: 1,
@@ -939,7 +736,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // delete the merged feature branch (object-free: no pack).
         (
             10,
-            owner(),
+            founder(),
             push(vec![update("feature", Some(c3), None)], None),
         ),
     ];
@@ -955,22 +752,22 @@ fn full_matrix_roots_identical_block_by_block() {
 
     // the REJECTION matrix: every verdict identical, no root movement.
     let rejected: Vec<(u64, Origin, Msg)> = vec![
-        // a non-owner moving a protected branch.
+        // deleting a protected branch.
         (
             11,
-            stranger(),
-            push(vec![update("main", Some(c2), Some(c3))], Some(packs[2])),
+            another_member(),
+            push(vec![update("main", Some(c2), None)], None),
         ),
         // a stale CAS on main.
         (
             12,
-            owner(),
+            founder(),
             push(vec![update("main", Some(c1), Some(c3))], Some(packs[2])),
         ),
         // re-merging a merged PR.
         (
             13,
-            owner(),
+            founder(),
             op(&ForgeMsg::MergePr {
                 repo: REPO.into(),
                 number: 2,
@@ -983,7 +780,7 @@ fn full_matrix_roots_identical_block_by_block() {
         // a PR from a deleted (unborn) branch.
         (
             14,
-            owner(),
+            founder(),
             op(&ForgeMsg::OpenPr {
                 repo: REPO.into(),
                 title: "dangling".into(),
@@ -1014,21 +811,24 @@ fn full_matrix_roots_identical_block_by_block() {
     // (committed-only: c4 on both sides).
     let ops = vec![
         (
-            owner(),
+            founder(),
             push(vec![update("feature", None, Some(c3))], Some(packs[2])),
         ),
         (
-            owner(),
+            founder(),
             push(vec![update("main", Some(c2), Some(c3))], Some(packs[2])),
         ),
         (
-            owner(),
+            founder(),
             push(vec![update("feature", Some(c3), Some(c4))], Some(packs[3])),
         ),
-        (owner(), probe_op(&ForgeQuery::HeadOf { repo: REPO.into() })),
+        (
+            founder(),
+            probe_op(&ForgeQuery::HeadOf { repo: REPO.into() }),
+        ),
     ];
-    let n = block_on(native.submit_block(block(16, owner()), ops.clone())).expect("native block");
-    let w = block_on(wasm.submit_block(block(16, owner()), ops)).expect("wasm block");
+    let n = block_on(native.submit_block(block(16, founder()), ops.clone())).expect("native block");
+    let w = block_on(wasm.submit_block(block(16, founder()), ops)).expect("wasm block");
     for (i, (n, w)) in n.members.iter().zip(w.members.iter()).enumerate() {
         match (n, w) {
             (MemberOutcome::Applied { .. }, MemberOutcome::Applied { .. }) => {}
@@ -1139,8 +939,8 @@ fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
     let mut with_pack = wasm_host(&dir_full, full);
     let mut without = wasm_host(&dir_bare, bare.clone());
     let birth = push(vec![update("main", None, Some(c1))], Some(pack));
-    block_on(with_pack.submit_at(block(1, owner()), birth.clone())).expect("with pack");
-    block_on(without.submit_at(block(1, owner()), birth)).expect("without pack");
+    block_on(with_pack.submit_at(block(1, founder()), birth.clone())).expect("with pack");
+    block_on(without.submit_at(block(1, founder()), birth)).expect("without pack");
     assert_eq!(
         forge_root(&with_pack),
         forge_root(&without),
@@ -1183,7 +983,7 @@ fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
         title: "nudge".into(),
         body: String::new(),
     });
-    block_on(without.submit_at(block(2, owner()), touch)).expect("nudge");
+    block_on(without.submit_at(block(2, founder()), touch)).expect("nudge");
     assert!(
         forge::pending_branches(&dir_bare.path().join(FORGE))
             .unwrap()
@@ -1242,11 +1042,17 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
         &mut native,
         &mut wasm,
         1,
-        stranger(),
+        another_member(),
         rejected
     ));
 
     // this network's own chain id is accepted on both.
     let accepted = certified(CHAIN_ID);
-    assert!(submit_both(&mut native, &mut wasm, 2, stranger(), accepted));
+    assert!(submit_both(
+        &mut native,
+        &mut wasm,
+        2,
+        another_member(),
+        accepted
+    ));
 }

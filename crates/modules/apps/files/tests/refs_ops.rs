@@ -4,10 +4,9 @@
 //! decoding the snapshot image (`decode_refs(f.snapshot())`) — an honest codec
 //! round-trip, since the `Refs` query is not part of this task's read surface.
 //!
-//! covers the brief's list plus the two BINDING requirements from task 9's
-//! review: the origin/owner gates, the honest cap boundaries (1024 pins, 256
-//! watches), and — the controller ruling — segment-boundary watch matching at
-//! both ends (`/shared` fires for `/shared/x`, never for `/sharedsecret/x`).
+//! covers the origin rules, the honest cap boundaries (1024 pins, 256
+//! watches), and segment-boundary watch matching at both ends (`/shared`
+//! fires for `/shared/x`, never for `/sharedsecret/x`).
 //!
 //! each async call is `block_on`'d at the top level; `commit_block`/`abort_block`
 //! get their own `block_on` (nesting trips futures' LocalPool re-entry guard).
@@ -278,7 +277,7 @@ fn pin_per_owner_cap_is_independent_of_other_owners() {
 }
 
 #[test]
-fn pin_quota_follows_account_ownership_and_exact_key_admission() {
+fn pin_quota_follows_the_account_share_and_exact_key_admission() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
     let head = seed_head(&mut f, 1);
@@ -315,8 +314,9 @@ fn pin_quota_follows_account_ownership_and_exact_key_admission() {
     );
     assert_eq!(core.pending_refs(), &before);
 
-    // The other member controls only the account's pins, not the earlier key
-    // pin. Its one remaining account slot is shared by every account member.
+    // The other member draws on the account's share, not on the earlier key
+    // pin's. Its one remaining account slot is shared by every account member,
+    // and any member releases the earlier key pin.
     core.pin(&sibling, 2, head.clone(), "last-account-slot".into())
         .unwrap();
     let before = core.pending_refs().clone();
@@ -325,9 +325,7 @@ fn pin_quota_follows_account_ownership_and_exact_key_admission() {
         Err("files: pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
-    assert!(core.unpin(&sibling, 2, "before-admission".into()).is_err());
-    assert_eq!(core.pending_refs(), &before);
-    core.unpin(&admitted, 2, "before-admission".into()).unwrap();
+    core.unpin(&sibling, 2, "before-admission".into()).unwrap();
 
     // A keyless program has its own account share and can release its own pin
     // to regain capacity, with the same revision/rollback discipline.
@@ -350,34 +348,37 @@ fn pin_quota_follows_account_ownership_and_exact_key_admission() {
 // ---- unpin ------------------------------------------------------------------
 
 #[test]
-fn unpin_owner_gate_and_absent() {
+fn any_authority_unpins_and_an_absent_pin_is_refused() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
     let head = seed_head(&mut f, 1);
 
-    // alice (a module) creates the pin, so she is its owner.
+    // alice (a module) creates the pin: its owner for attribution and the
+    // per-owner pin share, not for removal.
     exec(&mut f, md("alice"), 2, pin_op(&head, "a")).expect("alice pins");
     commit_block(&mut f);
 
-    // bob cannot remove alice's pin.
-    let err = exec(&mut f, md("bob"), 3, unpin_op("a")).expect_err("bob is not the owner");
-    assert_module_err(&err, "only the pin owner may unpin");
-    abort_block(&mut f);
+    // bob, another module, removes alice's pin.
+    exec(&mut f, md("bob"), 3, unpin_op("a")).expect("bob unpins");
+    commit_block(&mut f);
+    assert!(decoded_refs(&f).pins.is_empty(), "bob removed alice's pin");
 
-    // alice, the owner, can.
-    exec(&mut f, md("alice"), 4, unpin_op("a")).expect("alice unpins");
+    // re-pin; alice removes her own.
+    exec(&mut f, md("alice"), 4, pin_op(&head, "a")).expect("re-pin");
+    commit_block(&mut f);
+    exec(&mut f, md("alice"), 5, unpin_op("a")).expect("alice unpins");
     commit_block(&mut f);
     assert!(decoded_refs(&f).pins.is_empty(), "alice's pin removed");
 
-    // re-pin, then system (the arbitrary-authority origin) removes anyone's pin.
-    exec(&mut f, md("alice"), 5, pin_op(&head, "a")).expect("re-pin");
+    // re-pin; system removes it too.
+    exec(&mut f, md("alice"), 6, pin_op(&head, "a")).expect("re-pin");
     commit_block(&mut f);
-    exec(&mut f, sdk::Origin::System, 6, unpin_op("a")).expect("system unpins");
+    exec(&mut f, sdk::Origin::System, 7, unpin_op("a")).expect("system unpins");
     commit_block(&mut f);
     assert!(decoded_refs(&f).pins.is_empty(), "system removed the pin");
 
-    // unpin of an absent name → not found.
-    let err = exec(&mut f, sdk::Origin::System, 7, unpin_op("ghost")).expect_err("absent");
+    // unpin of an absent name → not found, whoever asks.
+    let err = exec(&mut f, md("bob"), 8, unpin_op("ghost")).expect_err("absent");
     assert_module_err(&err, "pin not found");
     abort_block(&mut f);
 }

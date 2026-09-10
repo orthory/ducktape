@@ -22,13 +22,9 @@ impl Module for RelayChat {
         });
         Ok(())
     }
+    /// a reporting rule asks chat nothing before it fires.
     async fn query(&self, _: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(chat::encode_reply(&chat::ChatReply::Access(
-            chat::ChannelAccess {
-                may_read: true,
-                may_post: true,
-            },
-        )))
+        Err(Error::QueryUnsupported)
     }
 }
 struct Executor;
@@ -181,8 +177,11 @@ async fn changes(host: &Host) -> Vec<attribution::ChangeEntry> {
     changes
 }
 
+/// a rule is a standing capability of the network, not of the account that
+/// registered it: the creator's program being revoked, handed to another
+/// controller or suspended changes nothing about whether the rule fires.
 #[test]
-fn current_identity_authority_controls_existing_standing_rules() {
+fn a_rule_keeps_firing_whatever_becomes_of_its_creator_account() {
     block_on(async {
         for (origin, change) in [
             (
@@ -207,9 +206,9 @@ fn current_identity_authority_controls_existing_standing_rules() {
             identity_op(&mut host, origin, change).await;
             let before = host.root_hash();
             fire(&mut host, chat::Party::Module("worker".into())).await;
-            assert_eq!(host.root_hash(), before);
-            assert_eq!(rule(&host).await.fire_count, 1);
-            assert_eq!(changes(&host).await.len(), 1);
+            assert_ne!(host.root_hash(), before, "the fire landed");
+            assert_eq!(rule(&host).await.fire_count, 2);
+            assert_eq!(changes(&host).await.len(), 2);
         }
     });
 }

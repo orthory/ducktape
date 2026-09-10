@@ -200,20 +200,6 @@ fn program_is_the_real_author_and_pin_owner_and_recreation_survives_disk_reopen(
         assert_eq!(source.revision, 2);
         assert_eq!(source.relations[0].recipient, 2);
         assert_eq!(source.relations[0].reason, Reason::Ownership);
-        let before = host.root_hash();
-        assert!(
-            host.submit_at(
-                context(alice()),
-                file_msg(FilesMsg::Unpin { name: name.clone() })
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            host.root_hash(),
-            before,
-            "controller does not own the program's pin"
-        );
         host.submit_at(
             context(Origin::Program(2)),
             file_msg(FilesMsg::Unpin { name: name.clone() }),
@@ -296,12 +282,9 @@ fn unauthorized_or_suspended_program_writes_and_failed_publications_leave_no_sou
         provision(&mut host).await;
         let before = host.root_hash();
         assert!(
-            host.submit_at(
-                context(Origin::Program(2)),
-                file_msg(write("/home/acct:1/private"))
-            )
-            .await
-            .is_err()
+            host.submit_at(context(Origin::Program(2)), file_msg(write("/etc/private")))
+                .await
+                .is_err()
         );
         assert_eq!(host.root_hash(), before);
         let result = host
@@ -383,7 +366,7 @@ fn unauthorized_or_suspended_program_writes_and_failed_publications_leave_no_sou
 }
 
 #[test]
-fn actual_signer_retains_its_old_key_home_and_pin_after_admission_and_reassignment() {
+fn a_keys_writes_are_attributed_to_the_account_it_holds_at_the_time() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let mut host = arena(&dir, &Stores::default());
@@ -447,16 +430,6 @@ fn actual_signer_retains_its_old_key_home_and_pin_after_admission_and_reassignme
             },
         )
         .await;
-        let before = host.root_hash();
-        assert!(
-            host.submit_at(
-                context(Origin::External(sibling_bytes)),
-                file_msg(FilesMsg::Unpin { name: "old".into() })
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(host.root_hash(), before);
         // Alice can remove herself while the admitted sibling keeps account 1.
         identity(
             &mut host,

@@ -40,7 +40,7 @@ fn flush(fs: &mut Fs<MemStore>) {
 }
 
 #[test]
-fn account_homes_and_old_key_rights_follow_actual_authority() {
+fn every_home_is_every_authoritys_to_write_and_a_pin_records_its_pinner() {
     let mut fs = Fs::new(MemStore::new(), Refs::default());
     write(&mut fs, &signed(0xaa, None), 1, "/home/ext:aa/old").unwrap();
     let snapshot = duckfs_core::to_hex(&fs.pending_refs().head.unwrap());
@@ -52,29 +52,21 @@ fn account_homes_and_old_key_rights_follow_actual_authority() {
     );
     flush(&mut fs);
 
+    // the key's own home, its account's home, a sibling key's write into the
+    // key's home, a program's write into it: all land.
     write(&mut fs, &signed(0xaa, Some(7)), 2, "/home/ext:aa/new").unwrap();
     write(&mut fs, &signed(0xaa, Some(7)), 2, "/home/acct:7/new").unwrap();
-    let before = fs.pending_refs().clone();
-    assert!(write(&mut fs, &signed(0xbb, Some(7)), 2, "/home/ext:aa/sibling").is_err());
-    assert!(
-        fs.unpin(&signed(0xbb, Some(7)), 2, "key pin".into())
-            .is_err()
-    );
-    assert!(write(&mut fs, &Authority::Program(7), 2, "/home/ext:aa/program").is_err());
-    assert_eq!(*fs.pending_refs(), before);
+    write(&mut fs, &signed(0xbb, Some(7)), 2, "/home/ext:aa/sibling").unwrap();
+    write(&mut fs, &Authority::Program(7), 2, "/home/ext:aa/program").unwrap();
     write(&mut fs, &Authority::Program(7), 2, "/home/acct:7/program").unwrap();
-    // Removing/reassigning the key preserves only its historical key rights.
-    assert!(
-        write(
-            &mut fs,
-            &signed(0xaa, Some(8)),
-            2,
-            "/home/acct:7/reassigned"
-        )
-        .is_err()
-    );
-    fs.unpin(&signed(0xaa, Some(8)), 2, "key pin".into())
-        .unwrap();
+    // a key reassigned to another account still writes both homes …
+    write(
+        &mut fs,
+        &signed(0xaa, Some(8)),
+        2,
+        "/home/acct:7/reassigned",
+    )
+    .unwrap();
     write(
         &mut fs,
         &signed(0xaa, Some(8)),
@@ -82,16 +74,20 @@ fn account_homes_and_old_key_rights_follow_actual_authority() {
         "/home/ext:aa/reassigned",
     )
     .unwrap();
+    // … and any authority releases the key's pin.
+    fs.unpin(&signed(0xbb, Some(7)), 2, "key pin".into())
+        .unwrap();
+    assert!(fs.pending_refs().pins.is_empty());
 }
 
 #[test]
-fn module_names_cannot_impersonate_system_accounts_or_keys() {
+fn a_module_writes_every_home_and_watches_only_under_its_own_name() {
     for module in ["system", "acct:7", "ext:aa"] {
         let authority = Authority::Module(module.into());
         let mut fs = Fs::new(MemStore::new(), Refs::default());
         assert!(write(&mut fs, &authority, 1, "/anywhere").is_err());
-        assert!(write(&mut fs, &authority, 1, "/home/acct:7/private").is_err());
-        assert!(write(&mut fs, &authority, 1, "/home/ext:aa/private").is_err());
+        write(&mut fs, &authority, 1, "/home/acct:7/private").unwrap();
+        write(&mut fs, &authority, 1, "/home/ext:aa/private").unwrap();
         write(
             &mut fs,
             &authority,

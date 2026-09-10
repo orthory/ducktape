@@ -520,10 +520,7 @@ impl RunsModule {
             title,
             body,
         } = proposal;
-        match self
-            .forge_pr_probe(&*ctx, forge, repo, source_branch)
-            .await
-        {
+        match self.forge_pr_probe(&*ctx, forge, repo, source_branch).await {
             Ok(Some(number)) => {
                 self.note(ctx, format!("run {run_id} {label}: updated PR #{number}"));
                 return Some(PrRef {
@@ -546,9 +543,7 @@ impl RunsModule {
             Ok(false) => {
                 self.note(
                     ctx,
-                    format!(
-                        "run {run_id} {label} skipped: target branch {target_branch} not born"
-                    ),
+                    format!("run {run_id} {label} skipped: target branch {target_branch} not born"),
                 );
                 return None;
             }
@@ -856,7 +851,7 @@ mod tests {
         };
 
         // birth the repo and both branches: a member pushes (a ref-moving op
-        // still requires an external principal — #860's owner gate, untouched).
+        // requires an external principal).
         let member = sdk::Origin::External(vec![1u8; 32]);
         for (t, branch) in [(1u64, "main"), (2, "agent/run-1")] {
             let push = forge::encode_msg(&forge::ForgeMsg::PushRefs {

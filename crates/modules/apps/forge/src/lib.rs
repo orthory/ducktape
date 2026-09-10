@@ -74,21 +74,18 @@
 //! branch are protected (never deleted, fast-forward-guarded at materialize);
 //! feature branches may force-push and be deleted — the GitHub flow.
 //!
-//! ## repo ownership — the ONLY protected-branch lever there is
+//! ## protected branches — every member's to move
 //!
 //! consensus CANNOT check ref descendancy: a validator may not hold the
-//! objects, and reading them would break the determinism invariant above. so
-//! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
-//! a repo pins its owner — the Identity ACCOUNT principal the origin resolves
-//! to (every bound key resolves to its canonical account; an unbound key
-//! retains exact signer ownership) — and only that
-//! owner may move `main`/`dev` afterwards, whether by
-//! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
-//! FEATURE branches stay open to every member.
-//!
-//! without the gate one signed op from any member CAS-moves `main` to bytes no
-//! pack closes: `materialize` then refuses forever and `snapshot()` errors on
-//! every node, so the network stops checkpointing and cannot admit joiners.
+//! objects, and reading them would break the determinism invariant above. no
+//! member owns a repo: any member births one with a push, moves `main`/`dev`
+//! by [`ForgeMsg::PushRefs`] or [`ForgeMsg::MergePr`], and force-pushes or
+//! deletes a feature branch. what a protected branch keeps is the CAS on its
+//! previous head, its refusal to be deleted, and materialize's fast-forward
+//! rule on disk: a head that is not a descendant of the installed one is
+//! never installed. a push is attributed to the ACCOUNT principal its origin
+//! resolves to (every bound key resolves to its canonical account; an unbound
+//! key stays the exact signer) — attribution is who did it, never who may.
 //!
 //! ## the default repo
 //!
@@ -106,7 +103,7 @@
 //!
 //! ## the two runtimes over one core
 //!
-//! the consensus half — the CAS gate, ownership, the tracker — is the pure
+//! the consensus half — the CAS gate, attribution, the tracker — is the pure
 //! [`state::ForgeState`], and it is the ONLY implementation of forge's
 //! accept/reject logic. two runtimes drive it:
 //!
