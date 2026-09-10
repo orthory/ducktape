@@ -2,10 +2,12 @@
 //! an intent carrying what the reader typed, and a draft the app hands back
 //! lands in the field only when the seed moved.
 
-use pages_view::host::{Choose, Create, PageItem, PagesProps, Post, Search};
+use pages_view::host::{
+    Choose, Create, PageItem, PagesProps, Post, Search, sidebar_width_after_delta,
+};
 use pages_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{find, has_text, item, press, submit, texts, type_into};
+use ui_lang_guest::wire::{Event, Frame, Length, Node};
 
 fn facts() -> PagesProps {
     PagesProps {
@@ -158,6 +160,71 @@ fn a_draft_the_app_hands_back_lands_only_when_the_seed_moved() {
             text: "the refused one".into()
         }
     );
+}
+
+/// The events the host sends when the reader drags a resize handle sideways.
+fn drag(frame: &Frame, key: &str, dx: f64) -> Vec<Event> {
+    let Some(Node::ResizeHandle {
+        on_drag: Some(handler),
+        ..
+    }) = find(frame, key)
+    else {
+        panic!("no resize handle {key:?}");
+    };
+    vec![Event::Drag {
+        handler: *handler,
+        dx,
+        dy: 0.0,
+    }]
+}
+
+fn list_width(frame: &Frame) -> f32 {
+    let Some(Node::Container {
+        width: Some(Length::Fixed(width)),
+        ..
+    }) = find(frame, "PagesView/root/pages/page-list")
+    else {
+        panic!("no page list in {:?}", texts(frame));
+    };
+    *width
+}
+
+#[test]
+fn the_page_list_is_the_readers_to_size_and_never_crowds_the_document() {
+    assert_eq!(sidebar_width_after_delta(230.0, 60.0, 1280.0), 290.0);
+    assert_eq!(sidebar_width_after_delta(230.0, -400.0, 1280.0), 180.0);
+    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 1280.0), 420.0);
+    // A narrow console keeps half its width for the document …
+    assert_eq!(sidebar_width_after_delta(230.0, 400.0, 600.0), 300.0);
+    // … and a window narrower than two list minimums still gets a list.
+    assert_eq!(sidebar_width_after_delta(230.0, 0.0, 200.0), 180.0);
+
+    let (_, frame) = shown(&facts());
+    assert_eq!(list_width(&frame), 230.0);
+    let handle = "PagesView/root/pages/sidebar-resize";
+    let frame = tick_native(drag(&frame, handle, 60.0));
+    assert!(frame.requests.is_empty(), "sizing the list is view-local");
+    assert_eq!(list_width(&frame), 290.0);
+    let frame = tick_native(drag(&frame, handle, 500.0));
+    assert_eq!(list_width(&frame), 420.0);
+    let frame = tick_native(drag(&frame, handle, -500.0));
+    assert_eq!(list_width(&frame), 180.0);
+}
+
+#[test]
+fn the_header_menu_names_the_delete_before_it_arms_it() {
+    let menu = "PagesView/root/pages/page-menu";
+    let (_, frame) = shown(&facts());
+    // The `⋯` arms nothing on its own: it opens a menu, view-locally …
+    assert!(find(&frame, menu).is_none());
+    let frame = tick_native(press(&frame, "Page actions"));
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+    assert!(find(&frame, menu).is_some(), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "Delete page…"), "{:?}", texts(&frame));
+    // … and the named item is what arms the confirm dialog, closing behind it.
+    let frame = tick_native(press(&frame, "Delete page…"));
+    assert_eq!(one_intent(&frame).kind, "pages.arm_delete");
+    assert!(find(&frame, menu).is_none(), "the menu left with the act");
 }
 
 #[test]
