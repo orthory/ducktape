@@ -721,6 +721,15 @@ fn files_base64_round_trips() {
     }
     assert_eq!(base64_encode(b"abc"), "YWJj");
     assert_eq!(base64_encode(b"ab"), "YWI=");
+    // MALFORMED IS A REFUSAL, NOT EMPTY BYTES. The handwritten decoder this
+    // replaced stopped at padding per quartet (`Zg==Zg==` read as `ff`) and
+    // read a lone `Z` as nothing; a read page that decodes to `None` fails
+    // the read upstream instead of showing an empty file.
+    for malformed in [
+        "Zg==Zg==", "Z", "Zg", "Zg=", "Zg===", "Zh==", "Y*Jj", "YWJj\n",
+    ] {
+        assert_eq!(base64_decode(malformed), None, "{malformed}");
+    }
 }
 
 #[test]
