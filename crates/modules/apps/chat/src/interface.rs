@@ -107,7 +107,7 @@ impl Party {
     }
 
     /// a person's party — an account or a key — as opposed to trusted code.
-    /// post policy, channel administration, creation caps and huddles all
+    /// post policy, the `:` channel namespace, creation caps and huddles all
     /// distinguish people from modules and the system on exactly this line.
     pub fn is_person(&self) -> bool {
         match self {
@@ -292,10 +292,10 @@ pub enum ChatMsg {
     /// `Chat::stage_channel`).
     CreateDmChannel { counterpart: u64, name: String },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
-    /// the reserved `:` namespace gate + the record byte cap). channel-admin
-    /// authority: only the channel's `owner` may rename it among people, and
-    /// no person at all may rename a module- or system-owned one. module
-    /// and system origins pass as elsewhere.
+    /// the reserved `:` namespace gate + the record byte cap). any
+    /// authenticated party renames any channel: `owner` is attribution, not
+    /// a gate; the `:` namespace gate is what keeps a person off a
+    /// module-namespaced channel.
     RenameChannel { channel_id: String, name: String },
     /// archive or unarchive a channel. an archived channel rejects posts,
     /// reactions, and huddle joins; membership, rename, and unarchive stay
@@ -312,16 +312,16 @@ pub enum ChatMsg {
         thread: Option<u64>,
     },
     /// replace the head blocks; the prior head is appended to the immutable
-    /// revision history. only the stored author may edit; the mentions of the
-    /// new blocks are validated like a post's.
+    /// revision history. any authenticated party may edit any message; the
+    /// mentions of the new blocks are validated like a post's.
     EditMessage {
         channel_id: String,
         seq: u64,
         blocks: Vec<Block>,
         base_rev: Option<u32>,
     },
-    /// tombstone: content and reactions cleared, skeleton kept. only the
-    /// stored author may delete.
+    /// tombstone: content and reactions cleared, skeleton kept. any
+    /// authenticated party may delete any message.
     DeleteMessage { channel_id: String, seq: u64 },
     /// idempotent per (emoji, party).
     AddReaction {
@@ -335,23 +335,23 @@ pub enum ChatMsg {
         seq: u64,
         emoji: String,
     },
-    /// subscribe a module to this channel's post notifications. channel-admin
-    /// authority (same rule as `RenameChannel`): a hook sees everything posted
-    /// to the channel, so attaching one is the owner's call.
+    /// subscribe a module to this channel's post notifications: a hook sees
+    /// everything posted to the channel. any authenticated party attaches
+    /// one, as with `RenameChannel`; the module must be registered.
     RegisterHook {
         channel_id: String,
         module_id: String,
     },
-    /// detach a hook module. channel-admin authority, and the sharper half of
-    /// the pair — an ungated unregister silently disables every automation
-    /// registered on the channel.
+    /// detach a hook module, which disables that automation on the channel.
+    /// any authenticated party detaches one; an absent hook is a no-op.
     UnregisterHook {
         channel_id: String,
         module_id: String,
     },
-    /// add/remove a person from the channel member set. channel-admin
-    /// authority: this roster IS `PostPolicy::MembersOnly`'s admission list, so
-    /// only the owner writes it — a self-service roster is no admission rule.
+    /// add/remove a person from the channel member set. this roster is
+    /// `PostPolicy::MembersOnly`'s admission list, and any authenticated
+    /// party writes it, themself included: the roster records who posts, it
+    /// is not a gate a channel's owner holds.
     /// `party` names a person in the resolved vocabulary: an account that
     /// exists, or a key that holds no account (a key that does hold one is
     /// refused — name the account). modules and the system are never members;
@@ -378,12 +378,10 @@ pub enum ChatMsg {
     /// deterministic no-op; an empty roster means no huddle.
     LeaveHuddle { channel_id: String },
     /// evict a huddle member — call liveness is not consensus-observable (a
-    /// crashed client cannot leave), so cleanup needs two paths: a person
-    /// naming themself is a leave in disguise and always allowed; naming
-    /// anyone else is channel-admin authority (`SetMembership`'s rule),
-    /// because post policy alone lets any poster on an open channel name and
-    /// evict an unrelated, still-live participant. sweeping an absent party
-    /// is a deterministic no-op.
+    /// crashed client cannot leave), so cleanup has two paths: a person
+    /// naming themself is a leave in disguise; a person naming anyone else
+    /// evicts them, since the room's people are its only cleanup. sweeping an
+    /// absent party is a deterministic no-op.
     SweepHuddle { channel_id: String, party: Party },
 }
 

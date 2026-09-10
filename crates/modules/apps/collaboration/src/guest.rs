@@ -36,13 +36,13 @@
 //! this is where the network's value reaches a component whose bytes are the
 //! same everywhere.
 
-use crate::{max_delivery_ttl, Collaboration};
+use crate::{Collaboration, max_delivery_ttl};
 
 /// the id this module registers under (the native twin's id: `Env::me` and
 /// follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "collaboration";
 
-use ducktape_module_sdk::{store_genesis_chain_id, store_genesis_time_unit, WitStore};
+use ducktape_module_sdk::{WitStore, store_genesis_chain_id, store_genesis_time_unit};
 
 ducktape_module_sdk::store_guest! {
     id: MODULE_ID,

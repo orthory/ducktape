@@ -7,10 +7,7 @@ use automations::{
     Action, AutomationsMsg, AutomationsQuery, AutomationsReply, RunRecord, Trigger, decode_reply,
     encode_msg, encode_query,
 };
-use chat::{
-    ChannelAccess, ChatEvent, ChatQuery, ChatReply, Party, decode_query as chat_decode_query,
-    encode_event, encode_reply as chat_encode_reply,
-};
+use chat::{ChatEvent, Party, encode_event};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -46,17 +43,10 @@ impl Module for RelayChat {
         });
         Ok(())
     }
-    /// the one read the relay serves: a rule owner's standing in a channel,
-    /// which the fire path consults before a rule may observe an event. this
-    /// stand-in has no channels, so it answers as an open one does — admitted.
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let ChatQuery::Access { .. } = chat_decode_query(req).map_err(Error::Module)? else {
-            return Err(Error::QueryUnsupported);
-        };
-        Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
-            may_read: true,
-            may_post: true,
-        })))
+    /// the relay serves no read: a task-creating rule asks chat nothing
+    /// before it fires.
+    async fn query(&self, _: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::QueryUnsupported)
     }
 }
 

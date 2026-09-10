@@ -153,7 +153,7 @@ pub enum FilesMsg {
         snapshot: DigestHex,
         name: String,
     },
-    /// owner-gated: only the pin's creator (or system) may unpin.
+    /// any authority removes any pin by name; the pin's owner is attribution.
     Unpin {
         name: String,
     },

@@ -35,8 +35,8 @@ use crate::wire::{
     HISTORY_WINDOW, MAX_PINS, MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_WATCHES,
 };
 
-/// a named pin: the snapshot it protects from gc and the owner allowed to remove
-/// it (owner-gated unpin).
+/// a named pin: the snapshot it protects from gc and the actor that created it,
+/// kept for attribution and the per-owner pin share; any authority may remove it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinEntry {
     pub snapshot: ObjectId,

@@ -43,8 +43,8 @@ pub enum Action {
         task_id_prefix: String,
         title_template: String,
     },
-    /// Publish a source-owned report to this rule owner. Body substitutions
-    /// share the existing action-template budget.
+    /// Publish a source-owned report to `recipient`, attributed to the rule's
+    /// creator. Body substitutions share the existing action-template budget.
     Report {
         recipient: sdk::AccountNumber,
         kind: String,
@@ -57,9 +57,9 @@ pub enum Action {
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub rule_id: String,
-    /// The account whose current authority authorizes every fire.
+    /// The account that registered the rule: the tasks it creates and the
+    /// reports it publishes are attributed to this account.
     pub owner: sdk::AccountNumber,
-    pub authority: RuleAuthority,
     pub enabled: bool,
     pub trigger: Trigger,
     pub action: Action,
@@ -86,16 +86,16 @@ pub struct RunRecord {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationsMsg {
-    /// register a rule owned by the submitter.
+    /// register a rule; the submitter is recorded as its creator.
     CreateRule {
         rule_id: String,
         trigger: Trigger,
         action: Action,
     },
-    /// enable or disable an OWN rule — a disabled rule stays registered and
-    /// stops firing. An explicit enable captures the current identity generation.
+    /// enable or disable a rule — a disabled rule stays registered and stops
+    /// firing. Any account may administer any rule.
     SetEnabled { rule_id: String, enabled: bool },
-    /// delete an OWN rule.
+    /// delete a rule. Any account may.
     DeleteRule { rule_id: String },
     /// the chat hook payload: the `chat::ChatEvent` bytes chat delivers
     /// as a follow-up. HONORED ONLY when the dispatch origin is the chat module;
@@ -147,12 +147,4 @@ pub fn encode_reply(r: &AutomationsReply) -> Vec<u8> {
 
 pub fn decode_reply(b: &[u8]) -> Result<AutomationsReply, String> {
     sdk::wire::decode(b)
-}
-
-/// A standing grant is tied to the authority under which it was enabled.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuleAuthority {
-    Keys,
-    Program { generation: u64 },
 }

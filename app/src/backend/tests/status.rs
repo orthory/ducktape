@@ -464,9 +464,9 @@ fn the_files_root_is_a_slash() {
 }
 
 /// THE WRITE GATE IS THE FILES MODULE'S OWN RULE, asked before the round
-/// trip: the roots refuse, another member's home refuses by name, and the
-/// viewer's home and `/shared` answer with nothing. A device without a key
-/// has no owner to check for; its refusal comes from the signer.
+/// trip: the roots refuse, and every home and `/shared` answer with nothing.
+/// A device without a key has nothing to check; its refusal comes from the
+/// signer.
 #[test]
 fn the_files_write_gate_answers_in_the_modules_words() {
     let me = "ab".repeat(32);
@@ -478,9 +478,6 @@ fn the_files_write_gate_answers_in_the_modules_words() {
     assert_eq!(gate("/shared/reports"), "");
     assert_eq!(gate(&format!("/home/ext:{me}")), "");
     assert_eq!(gate(&format!("/home/ext:{me}/notes")), "");
-    assert_eq!(
-        gate(&format!("/home/ext:{other}")),
-        format!("actor 'ext:{me}' is not the home owner 'ext:{other}'")
-    );
+    assert_eq!(gate(&format!("/home/ext:{other}")), "");
     assert_eq!(files_write_gate("/".into(), String::new()), "");
 }
