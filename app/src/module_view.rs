@@ -2047,11 +2047,12 @@ fn intents_of(module: &str) -> &'static [&'static str] {
 // ---------- mounting ----------
 
 /// The widget for one module's view, with `props` as the app has them now.
-/// Drawing never starts a load: the view was asked for when its source was
-/// — the staged file at boot ([`booted`]), the node's deployment at connect
-/// ([`connected`]) and at every block that moves it
-/// ([`deployments_checked`]) — on its own thread, and the tab shows what
-/// stage it is at until it is there.
+/// Drawing never starts a load, and never finds one on its way: the view
+/// was asked for when its source was — the staged file at boot
+/// ([`booted`]), the node's deployment at connect ([`connected`]) — and
+/// both hand every view over before anything draws. A block that moves the
+/// deployment ([`deployments_checked`]) reloads the view in place: the tab
+/// keeps the one it has until the replacement is ready.
 fn module_view(module: &'static str, props: Vec<u8>) -> Element<'static, ModuleViewEvent> {
     mounted(module).lock().expect("module view lock").props = Some(props);
     drawn(module)
@@ -2065,6 +2066,9 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
         let mut locked = mounted.lock().expect("module view lock");
         let generation = locked.generation;
         match &mut locked.slot {
+            // a seat before its source event has answered: the boot and the
+            // connect hand every view over before a tab can draw, so this
+            // is a module's tab drawn before any node was ever asked
             Slot::Loading => return notice("Loading the view…"),
             Slot::Empty => {
                 return notice(&format!(
@@ -2091,13 +2095,14 @@ pub(crate) fn drawn(module: &'static str) -> Element<'static, ModuleViewEvent> {
 
 /// The node the app is connected to, for the views that come from its
 /// deployments. Told by `backend::connect`; every module-owned view is
-/// asked of this node, drawn or not: one still loading or failed off the
-/// previous node starts over, under a new generation, so an answer the
-/// previous node is still composing lands nowhere; one seated is reloaded
-/// and swapped in place; one no tab has drawn yet is seated here, so the
-/// tab finds it there or on its way. Returns the loads it started, for a
-/// test to wait on.
-pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<()>> {
+/// asked of this node, drawn or not, under a new generation, so an answer
+/// the previous node is still composing lands nowhere. Every seat keeps
+/// what it shows until this node's answer lands: one seated is swapped in
+/// place, one failed or empty off the previous node shows that until then,
+/// and one no tab has drawn yet is seated here. The connect answers only
+/// once the loads returned here have [settled](Loads::settled), so the
+/// tabs it opens onto find their views there.
+pub fn connected(client: &ducktape_rpc::Client) -> Loads {
     // THE REGISTRY LOCK FIRST: a connection change and the restart of the
     // views under it are one step. Two callers — `backend::connect` runs on
     // the executor's threads, and two connects can overlap — otherwise
@@ -2118,7 +2123,7 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
     for module in crate::backend::view_source::MODULE_OWNED {
         registry.entry(module).or_insert_with(Mounted::seat);
     }
-    registry
+    let loads = registry
         .iter()
         .filter_map(|(module, mounted)| {
             let mut locked = mounted.lock().expect("module view lock");
@@ -2130,55 +2135,85 @@ pub fn connected(client: &ducktape_rpc::Client) -> Vec<std::thread::JoinHandle<(
             if left_alone {
                 return None;
             }
-            // a module-owned view is reloaded from this node's deployment
-            // and swapped in place; the tab keeps showing the one it has
-            // until then
-            if !seated {
-                locked.slot = Slot::Loading;
-            }
+            // a module-owned view is reloaded from this node's deployment;
+            // the seat keeps what it shows until that lands
             let generation = locked.start(None);
             Some(spawn_load(module, mounted, generation, snapshot.clone()))
         })
-        .collect()
+        .collect();
+    Loads(loads)
 }
 
 /// The desktop's own views, staged beside the binary: every one is asked
-/// for at boot, on its own thread, so the first draw of any of their tabs
-/// finds the view there or on its way. Told by `main`, before the window.
-/// Returns the loads it started, for a test to wait on.
-pub fn booted() -> Vec<std::thread::JoinHandle<()>> {
+/// for at boot, on its own thread, and `main` [joins](Loads::joined) them
+/// before the window, so the first draw of any of their tabs finds the
+/// view there.
+pub fn booted() -> Loads {
     let mut registry = registry().lock().expect("module views");
     let snapshot = connection().lock().expect("views rpc").clone();
-    crate::backend::view_source::DESKTOP_OWNED
+    let loads = crate::backend::view_source::DESKTOP_OWNED
         .into_iter()
         .map(|module| {
             let mounted = registry.entry(module).or_insert_with(Mounted::seat);
             let generation = mounted.lock().expect("module view lock").start(None);
             spawn_load(module, mounted, generation, snapshot.clone())
         })
-        .collect()
+        .collect();
+    Loads(loads)
+}
+
+/// The loads one source event started, each on its own thread. The boot
+/// and the connect hand their views over — the boot joins them before the
+/// window, the connect settles them before it answers — so a tab never
+/// draws a seat with its answer still on the way. A block's loads swap in
+/// place and are waited on by nobody but a test.
+pub struct Loads(Vec<std::thread::JoinHandle<()>>);
+
+impl Loads {
+    /// Every load in: the seats hold what their source answered.
+    pub fn joined(self) {
+        for load in self.0 {
+            load.join().expect("a view load");
+        }
+    }
+
+    /// [`joined`](Self::joined), off the executor's threads: a cranelift
+    /// compile is a second or more cold, which no async worker sits
+    /// through.
+    pub async fn settled(self) {
+        tokio::task::spawn_blocking(move || self.joined())
+            .await
+            .expect("the view loads");
+    }
+
+    /// How many loads the event started.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// The node's deployments moved (a new block): every module-owned view
 /// whose module's active code is not the one it was drawn from is loaded
 /// again, under a new generation, and swapped in place when it is ready.
 /// One check in flight at a time; a block that lands during one is
-/// covered by the next. Returns the loads it started, for a test to wait on.
-pub async fn deployments_checked() -> Vec<std::thread::JoinHandle<()>> {
+/// covered by the next. The loads it starts swap in place, so nobody waits
+/// on them but a test; the block stream drops them.
+pub async fn deployments_checked() -> Loads {
     static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     use std::sync::atomic::Ordering;
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return Vec::new();
+        return Loads(Vec::new());
     }
     let started = deployments_check().await;
     IN_FLIGHT.store(false, Ordering::SeqCst);
     started
 }
 
-async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
+async fn deployments_check() -> Loads {
     let asked_of = connection().lock().expect("views rpc").clone();
     let Some(client) = &asked_of.client else {
-        return Vec::new();
+        return Loads(Vec::new());
     };
     let hashes = match crate::backend::view_source::active_hashes(client).await {
         Ok(hashes) => hashes,
@@ -2189,7 +2224,7 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
                 error = %error,
                 "module deployments not checked"
             );
-            return Vec::new();
+            return Loads(Vec::new());
         }
     };
     let registry = registry().lock().expect("module views");
@@ -2197,9 +2232,9 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
     // asked of the old one dies at install, and `connected` restarted
     // everything under the new one
     if connection().lock().expect("views rpc").rev != asked_of.rev {
-        return Vec::new();
+        return Loads(Vec::new());
     }
-    registry
+    let loads = registry
         .iter()
         .filter(|(module, _)| crate::backend::view_source::module_owned(module))
         .filter_map(|(module, mounted)| {
@@ -2232,7 +2267,8 @@ async fn deployments_check() -> Vec<std::thread::JoinHandle<()>> {
             locked.replacement = replacement;
             Some(spawn_load(module, mounted, generation, asked_of.clone()))
         })
-        .collect()
+        .collect();
+    Loads(loads)
 }
 
 /// The node the module-owned views load from, and how many times the app
@@ -2429,14 +2465,12 @@ fn spawn_load(
             slot,
             hash,
             replacement,
-            wanted,
             retry,
             ..
         } = &mut *locked;
         let replacement = *replacement;
         // a load that came back at all clears the hold-off; only the error
         // arm below puts one back, widened against the one taken here
-        let wanted = *wanted;
         let held_off = retry.take();
         match loaded {
             Ok(Loaded::Fresh(mut guest)) => {
@@ -2512,7 +2546,10 @@ fn spawn_load(
                 *hash = fresh.hash;
                 *slot = Slot::Ready(fresh);
             }
-            Err(reason) => {
+            Err(Unloaded {
+                hash: failed_on,
+                reason,
+            }) => {
                 tracing::warn!(
                     target: "ducktape::app",
                     module,
@@ -2520,10 +2557,11 @@ fn spawn_load(
                     error = %reason,
                     "module view not loaded"
                 );
-                // the next block leaves this candidate alone until the gap
-                // is up; a transport error is only spaced out, never
-                // suppressed, and any other deployment is unaffected
-                *retry = Some(Retry::after(held_off.as_ref(), wanted));
+                // the next block leaves the candidate this failed on alone
+                // until the gap is up; a failure before any candidate (a
+                // status or transport error) holds nothing off, and any
+                // other deployment is unaffected
+                *retry = Some(Retry::after(held_off.as_ref(), failed_on));
                 // a view that is there stays, with its hash: the failure is
                 // the replacement's, not its own
                 if !matches!(slot, Slot::Ready(_)) {
@@ -2550,6 +2588,14 @@ enum Loaded {
     },
     /// The deployment (this hash) ships no view.
     Empty([u8; 32]),
+}
+
+/// A load that came back with no view, and the candidate it failed on —
+/// none when it never got as far as one — so the block check's hold-off
+/// keys on the bytes that failed, never on what the load was asked after.
+struct Unloaded {
+    hash: Option<[u8; 32]>,
+    reason: String,
 }
 
 /// Whether `hash` is still the module's active code, asked of the node
@@ -2938,11 +2984,16 @@ impl Guest {
         client: Option<&ducktape_rpc::Client>,
         generation: u64,
         mounted: &Arc<Mutex<Mounted>>,
-    ) -> Result<Loaded, String> {
+    ) -> Result<Loaded, Unloaded> {
         use crate::backend::view_source::{self, ViewSource};
+        let before_any_candidate = |reason: String| Unloaded { hash: None, reason };
         if !view_source::module_owned(module) {
-            let path = views_dir()?.join(format!("{module}_view.wasm"));
-            return Self::load_from(module, &path).map(|guest| Loaded::Fresh(Box::new(guest)));
+            let path = views_dir()
+                .map_err(before_any_candidate)?
+                .join(format!("{module}_view.wasm"));
+            return Self::load_from(module, &path)
+                .map(|guest| Loaded::Fresh(Box::new(guest)))
+                .map_err(before_any_candidate);
         }
         let logged = |hash: Option<&[u8; 32]>, state: &str, reason: &str| {
             log_source(module, hash, state, generation, reason);
@@ -2952,13 +3003,13 @@ impl Guest {
             None => {
                 let reason = "not connected to a node yet";
                 logged(None, "Failed", reason);
-                return Err(reason.to_owned());
+                return Err(before_any_candidate(reason.to_owned()));
             }
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| before_any_candidate(error.to_string()))?;
         let started = Instant::now();
         let mut timing = LoadTiming {
             path: "first",
@@ -2974,14 +3025,16 @@ impl Guest {
                 let reason = error.to_string();
                 logged(None, "Failed", &reason);
                 timing.log(module, None, started, "Failed");
-                return Err(reason);
+                return Err(before_any_candidate(reason));
             }
         };
         let (hash, component, assets) = match source {
             ViewSource::NotActivated => {
                 logged(None, "NotActivated", "");
                 timing.log(module, None, started, "NotActivated");
-                return Err(format!("the {module} module is not activated yet"));
+                return Err(before_any_candidate(format!(
+                    "the {module} module is not activated yet"
+                )));
             }
             ViewSource::Missing { hash } => {
                 // a removal answered late, after the code moved on, is not
@@ -2994,14 +3047,20 @@ impl Guest {
                     Err(reason) => {
                         logged(Some(&hash), "Failed", &reason);
                         timing.log(module, Some(&hash), started, "Failed");
-                        return Err(reason);
+                        return Err(Unloaded {
+                            hash: Some(hash),
+                            reason,
+                        });
                     }
                 };
                 if !active {
                     let reason = "the active code moved while the view was prepared";
                     logged(Some(&hash), "Failed", reason);
                     timing.log(module, Some(&hash), started, "Failed");
-                    return Err(reason.to_owned());
+                    return Err(Unloaded {
+                        hash: Some(hash),
+                        reason: reason.to_owned(),
+                    });
                 }
                 logged(Some(&hash), "Missing", "");
                 timing.log(module, Some(&hash), started, "Missing");
@@ -3117,7 +3176,10 @@ impl Guest {
             }
         };
         timing.log(module, Some(&hash), started, state);
-        outcome
+        outcome.map_err(|reason| Unloaded {
+            hash: Some(hash),
+            reason,
+        })
     }
 
     /// The deployment's own: its assets and the surfaces that paint them
@@ -5365,7 +5427,10 @@ pub(crate) mod tests {
         for module in crate::backend::view_source::MODULE_OWNED {
             let mounted = Mounted::seat();
             assert_eq!(
-                Guest::load(module, None, 0, &mounted).err().as_deref(),
+                Guest::load(module, None, 0, &mounted)
+                    .err()
+                    .map(|unloaded| unloaded.reason)
+                    .as_deref(),
                 Some("not connected to a node yet"),
                 "{module}"
             );
@@ -5409,13 +5474,9 @@ pub(crate) mod tests {
         let asked_of_a = connected(&node_a);
         // the app moves to B while A is still composing its answer
         let asked_of_b = connected(&node_b);
-        for load in asked_of_b {
-            load.join().expect("the load on B");
-        }
+        asked_of_b.joined();
         hold.notify_one();
-        for load in asked_of_a {
-            load.join().expect("the load on A");
-        }
+        asked_of_a.joined();
         let locked = mounted.lock().expect("module view lock");
         let Slot::Ready(guest) = &locked.slot else {
             panic!("the view of B is not there");
@@ -5706,15 +5767,8 @@ pub(crate) mod tests {
         hold
     }
 
-    fn join_all(loads: Vec<std::thread::JoinHandle<()>>) {
-        for load in loads {
-            load.join().expect("the load");
-        }
-    }
-
-    /// A tab's first draw finds its view there or on its way: the connect
-    /// seats and loads every module-owned view, drawn or not, and a draw
-    /// before any node asks for nothing.
+    /// The connect seats and loads every module-owned view, drawn or not,
+    /// and a draw before any node asks for nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_module_owned_view_is_asked_at_connect_not_at_its_tabs_first_draw() {
         let _turn = connection_turn().await;
@@ -5737,7 +5791,7 @@ pub(crate) mod tests {
         }
         let loads = connected(&client);
         assert_eq!(
-            loads.len(),
+            loads.started(),
             MODULE_OWNED.len(),
             "one load per module-owned view, drawn or not"
         );
@@ -5749,16 +5803,16 @@ pub(crate) mod tests {
                 "{module} was not asked of the node at connect"
             );
         }
-        join_all(loads);
+        loads.joined();
         assert_eq!(slot_assets(&mounted("governance")), ["a.svg"]);
         for module in MODULE_OWNED {
             registry().lock().expect("module views").remove(module);
         }
     }
 
-    /// The desktop's own views are all asked for at boot, so the first draw
-    /// of any of their tabs finds the view there or on its way — and there,
-    /// once every load is in, for every one of them.
+    /// The desktop's own views are all asked for at boot and joined before
+    /// the window, so the first draw of any of their tabs finds the view
+    /// there: every one of them, once the boot's loads are in.
     #[test]
     fn every_desktop_view_is_asked_at_boot() {
         let _turn = blocking_connection_turn();
@@ -5772,7 +5826,7 @@ pub(crate) mod tests {
         unsafe { std::env::set_var("DUCKTAPE_VIEWS_DIR", staged.parent().expect("staging dir")) };
         let loads = booted();
         assert_eq!(
-            loads.len(),
+            loads.started(),
             DESKTOP_OWNED.len(),
             "one load per desktop view"
         );
@@ -5781,7 +5835,7 @@ pub(crate) mod tests {
             let locked = seat.lock().expect("module view lock");
             assert_eq!(locked.generation, 1, "{module} was not asked for at boot");
         }
-        join_all(loads);
+        loads.joined();
         for module in DESKTOP_OWNED {
             let seat = mounted(module);
             let locked = seat.lock().expect("module view lock");
@@ -5817,6 +5871,94 @@ pub(crate) mod tests {
             assert!(!locked.in_flight, "{module}");
             let landed = !matches!(locked.slot, Slot::Loading);
             assert_eq!(landed, lands, "{module}");
+        }
+    }
+
+    /// The connect answers only once every module-owned view has settled:
+    /// while one node answer is still held, the loads are not settled; the
+    /// moment it is released they are, and no seat is on its way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_settles_only_once_every_module_view_answered() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::MODULE_OWNED;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        let node = FakeDeployment::serving("governance", &a);
+        let hold = hold_status(&node);
+        let client = fake_node(node.clone()).await;
+        let settled = tokio::spawn(connected(&client).settled());
+        // one status answer is waiting on the hold: that load cannot be
+        // in, so neither can the loads
+        node.held.notified().await;
+        assert!(
+            !settled.is_finished(),
+            "the connect settled with a node answer still held"
+        );
+        hold.notify_one();
+        settled.await.expect("the loads settle");
+        for module in MODULE_OWNED {
+            let seat = mounted(module);
+            let locked = seat.lock().expect("module view lock");
+            assert!(!locked.in_flight, "{module} is still on its way");
+            assert!(
+                !matches!(locked.slot, Slot::Loading),
+                "{module} settled without an answer"
+            );
+        }
+        assert_eq!(slot_assets(&mounted("governance")), ["a.svg"]);
+        for module in MODULE_OWNED {
+            registry().lock().expect("module views").remove(module);
+        }
+    }
+
+    /// A seat keeps what it shows through a reconnect: one failed off the
+    /// previous node shows that failure, never "Loading", until the new
+    /// node's answer lands — and then that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_keeps_what_a_seat_shows_until_the_new_node_answers() {
+        let _turn = connection_turn().await;
+        use crate::backend::view_source::tests::{FakeDeployment, fake_node, node};
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let component = std::fs::read(staged).expect("the staged view");
+        let a = deployment(&component, "a.svg");
+        // a node that runs none of the modules: every seat fails
+        let runs_nothing = node(
+            serde_json::json!({"module_status": {"modules": []}}),
+            None,
+            None,
+        )
+        .await;
+        connected(&runs_nothing).joined();
+        let seat = mounted("governance");
+        assert!(
+            matches!(seat.lock().expect("module view lock").slot, Slot::Failed(_)),
+            "the seat did not fail off the node that runs nothing"
+        );
+        // the app moves to a node that runs governance, whose answer waits
+        let node_b = FakeDeployment::serving("governance", &a);
+        let hold = hold_status(&node_b);
+        let client = fake_node(node_b.clone()).await;
+        let loads = connected(&client);
+        node_b.held.notified().await;
+        {
+            let locked = seat.lock().expect("module view lock");
+            assert!(locked.in_flight, "governance was not asked of the new node");
+            assert!(
+                matches!(locked.slot, Slot::Failed(_)),
+                "the seat went back to loading while the new node composed its answer"
+            );
+        }
+        hold.notify_one();
+        loads.joined();
+        assert_eq!(slot_assets(&seat), ["a.svg"]);
+        for module in crate::backend::view_source::MODULE_OWNED {
+            registry().lock().expect("module views").remove(module);
         }
     }
 
@@ -7247,7 +7389,7 @@ pub(crate) mod tests {
             let client = fake_node(node.clone()).await;
 
             let mounted = fresh(module);
-            join_all(connected(&client));
+            connected(&client).joined();
             assert_eq!(slot_assets(&mounted), ["a.svg"], "{module}");
             let (generation, frame_rev) = {
                 let mut locked = mounted.lock().expect("module view lock");
@@ -7270,7 +7412,7 @@ pub(crate) mod tests {
 
             // a block activates B: the check finds the hash moved
             node.deploy(module, &b);
-            join_all(deployments_checked().await);
+            deployments_checked().await.joined();
             assert_eq!(slot_assets(&mounted), ["b.svg"], "{module}: B installed");
             let generation = {
                 let mut locked = mounted.lock().expect("module view lock");
@@ -7309,7 +7451,7 @@ pub(crate) mod tests {
                 locked.generation
             };
             // and the same deployment again is nothing to do
-            join_all(deployments_checked().await);
+            deployments_checked().await.joined();
             {
                 let locked = mounted.lock().expect("module view lock");
                 assert_eq!(
@@ -7371,11 +7513,11 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         let generation = drawn_then_stuck(&mounted);
         node.deploy("governance", &b);
         for _ in 0..3 {
-            join_all(deployments_checked().await);
+            deployments_checked().await.joined();
             let locked = mounted.lock().expect("module view lock");
             assert_eq!(locked.generation, generation, "no load opened");
             assert_eq!(locked.hash, Some(a.hash()));
@@ -7405,16 +7547,16 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         let generation = never_valid_pending(&mounted);
         node.deploy("governance", &b);
         // inside the wait: nothing moves
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         // the wait is over
         mounted.lock().expect("module view lock").waiting_since =
             Some(Instant::now() - REPLACEMENT_WAIT);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(
             slot_assets(&mounted),
             ["b.svg"],
@@ -7456,13 +7598,13 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         let generation = drawn_then_stuck(&mounted);
         node.deploy("governance", &b);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         mounted.lock().expect("module view lock").waiting_since =
             Some(Instant::now() - REPLACEMENT_WAIT * 4);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"], "the drawn view stays");
         let locked = mounted.lock().expect("module view lock");
         assert_eq!(
@@ -7490,7 +7632,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         let generation = drawn_then_stuck(&mounted);
         node.deploy("governance", &b);
         {
@@ -7501,7 +7643,7 @@ pub(crate) mod tests {
             guest.frame.root = None;
             locked.waiting_since = Some(Instant::now() - REPLACEMENT_WAIT * 4);
         }
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(
             slot_assets(&mounted),
             ["a.svg"],
@@ -7514,7 +7656,7 @@ pub(crate) mod tests {
             };
             guest.fault = Some("terminal trap after unsaved edits (test)".into());
         }
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(
             slot_assets(&mounted),
             ["a.svg"],
@@ -7538,7 +7680,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         let generation = never_valid_pending(&mounted);
         mounted.lock().unwrap().waiting_since = Some(Instant::now() - REPLACEMENT_WAIT);
         node.deploy("governance", &b);
@@ -7547,7 +7689,7 @@ pub(crate) mod tests {
         node.held.notified().await;
         drawn_then_stuck(&mounted);
         hold.notify_one();
-        join_all(loads);
+        loads.joined();
         assert_eq!(
             slot_assets(&mounted),
             ["a.svg"],
@@ -7587,7 +7729,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
         // B activates, but its bytes are slow — and C activates meanwhile
@@ -7597,11 +7739,11 @@ pub(crate) mod tests {
         node.held.notified().await;
         node.deploy("forge", &c);
         hold.notify_one();
-        join_all(loads);
+        loads.joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"], "B is not installed");
         assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
         // the next block's check brings C
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(slot_assets(&mounted), ["c.svg"]);
     }
 
@@ -7620,10 +7762,10 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         node.deploy("forge", &removed);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         let locked = mounted.lock().unwrap();
         assert!(
             matches!(locked.slot, Slot::Empty),
@@ -7650,26 +7792,30 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
         let before = mounted.lock().unwrap().generation;
         node.deploy("forge", &b);
         let hold = hold_blob(&node);
-        let mut loads = deployments_checked().await;
+        let loads = deployments_checked().await;
         node.held.notified().await;
         let generation = mounted.lock().unwrap().generation;
         assert_eq!(generation, before + 1);
         // three more blocks while B's bytes are held: the status still
         // answers, and none of them starts this view over (the views of
         // earlier tests, unknown to this node, get their own loads)
+        let mut later_blocks = Vec::new();
         for _ in 0..3 {
-            loads.extend(deployments_checked().await);
+            later_blocks.push(deployments_checked().await);
             let locked = mounted.lock().unwrap();
             assert_eq!((locked.generation, locked.in_flight), (generation, true));
         }
         hold.notify_one();
-        join_all(loads);
+        loads.joined();
+        for loads in later_blocks {
+            loads.joined();
+        }
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
         let locked = mounted.lock().unwrap();
         assert_eq!((locked.generation, locked.in_flight), (generation, false));
@@ -7687,7 +7833,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("forge", &bad);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
-        join_all(connected(&client));
+        connected(&client).joined();
         {
             let locked = mounted.lock().unwrap();
             assert!(
@@ -7699,10 +7845,10 @@ pub(crate) mod tests {
 
         // the first block names the candidate the reconnect did not: it is
         // tried once under its own hash, and every block after it is held
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         let generation = mounted.lock().unwrap().generation;
         for _ in 0..5 {
-            join_all(deployments_checked().await);
+            deployments_checked().await.joined();
         }
         {
             let locked = mounted.lock().unwrap();
@@ -7721,7 +7867,7 @@ pub(crate) mod tests {
         // candidate is tried again, so a load that failed on the transport
         // still recovers on its own
         tokio::time::sleep(RETRY_FIRST + Duration::from_millis(100)).await;
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(
             mounted.lock().unwrap().generation,
             generation + 1,
@@ -7748,7 +7894,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
         node.deploy("governance", &removed);
@@ -7757,10 +7903,10 @@ pub(crate) mod tests {
         node.held.notified().await;
         node.deploy("governance", &c);
         hold.notify_one();
-        join_all(loads);
+        loads.joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"], "A is still drawn");
         assert_eq!(mounted.lock().unwrap().hash, Some(a.hash()));
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(slot_assets(&mounted), ["c.svg"]);
     }
 
@@ -7783,9 +7929,9 @@ pub(crate) mod tests {
         let client = fake_node(node.clone()).await;
         let lines = super::canary::tap();
         let _mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         node.deploy("governance", &b);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
 
         let loads: Vec<String> = lines
             .try_iter()
@@ -7853,7 +7999,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("governance", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("governance");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
 
         node.deploy("governance", &b);
@@ -7875,7 +8021,7 @@ pub(crate) mod tests {
             assert!((0..4).any(|_| !guest.redraw(&None)));
         }
         status.notify_one();
-        join_all(loads);
+        loads.joined();
         let ticks = {
             let locked = mounted.lock().unwrap();
             assert_eq!(locked.hash, Some(a.hash()), "the candidate was refused");
@@ -7885,7 +8031,7 @@ pub(crate) mod tests {
             guest.ticks
         };
         assert!(ticks > 0);
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         let locked = mounted.lock().unwrap();
         assert_eq!(locked.hash, Some(b.hash()));
         let Slot::Ready(guest) = &locked.slot else {
@@ -7911,7 +8057,7 @@ pub(crate) mod tests {
         let node = FakeDeployment::serving("forge", &a);
         let client = fake_node(node.clone()).await;
         let mounted = fresh("forge");
-        join_all(connected(&client));
+        connected(&client).joined();
         assert_eq!(slot_assets(&mounted), ["a.svg"]);
         {
             let locked = mounted.lock().unwrap();
@@ -7927,7 +8073,7 @@ pub(crate) mod tests {
         node.held.notified().await;
         FIRST_FRAME_TRAPS.store(true, std::sync::atomic::Ordering::SeqCst);
         hold.notify_one();
-        join_all(loads);
+        loads.joined();
         assert!(!FIRST_FRAME_TRAPS.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(slot_assets(&mounted), ["a.svg"], "A stays");
         {
@@ -7936,7 +8082,7 @@ pub(crate) mod tests {
         }
         // a first frame that trapped is a property of those bytes, so the
         // very next block does not pay for the same candidate again
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(
             slot_assets(&mounted),
             ["a.svg"],
@@ -7949,7 +8095,7 @@ pub(crate) mod tests {
             let retry = locked.retry.as_mut().expect("B left a hold-off");
             retry.next = Instant::now();
         }
-        join_all(deployments_checked().await);
+        deployments_checked().await.joined();
         assert_eq!(slot_assets(&mounted), ["b.svg"]);
     }
 
