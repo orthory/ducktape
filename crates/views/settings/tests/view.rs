@@ -27,7 +27,6 @@ fn facts() -> SettingsProps {
         account_ceremony_left: String::new(),
         settings_key_state: "sealed".into(),
         settings_key_path: "/keys/user.key".into(),
-        settings_open_tabs: 2,
         tier: "validator".into(),
         admin: true,
         members_line: "3 humans · 1 agent".into(),
@@ -72,7 +71,7 @@ fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
 #[test]
 fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_link_leaves_as_a_tab() {
     let (_, frame) = shown(&facts());
-    for expected in ["Settings", "Theme", "Open page tabs"] {
+    for expected in ["Settings", "Theme"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",

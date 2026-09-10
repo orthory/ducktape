@@ -472,95 +472,14 @@ pub async fn save_appearance(mode: crate::Appearance) -> bool {
 }
 
 /// The prefs key a network's per-network readings (`networks[<key>]`: its
-/// doc tabs, its last-used stamp) sit under: the chain id when the endpoint
-/// is served by a workspace on this device — the one name that survives a
-/// port change — else the canonical endpoint of a remote.
+/// last-used stamp) sit under: the chain id when the endpoint is served by a
+/// workspace on this device — the one name that survives a port change —
+/// else the canonical endpoint of a remote.
 pub(crate) fn network_key(rpc: &str) -> String {
     match workspace_at(rpc) {
         Some((chain_id, _)) => chain_id,
         None => canonical_endpoint(rpc.to_string()),
     }
-}
-
-/// This network's persisted doc tabs (open page ids, in open order).
-pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
-    let prefs = read_prefs();
-    prefs["networks"][network_key(&rpc)]["doc_tabs"]
-        .as_array()
-        .map(|tabs| {
-            tabs.iter()
-                .filter_map(|tab| tab.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Persist this network's doc tabs. Best-effort: a failed write only costs
-/// tab restoration on the next boot.
-pub async fn save_doc_tabs(rpc: String, tabs: Vec<String>) -> bool {
-    let mut prefs = read_prefs();
-    prefs["networks"][network_key(&rpc)]["doc_tabs"] = serde_json::json!(tabs);
-    write_prefs(&prefs)
-}
-
-/// Add a page to the doc-tab strip (idempotent, keeps open order).
-pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    if page_id.is_empty() || tabs.contains(&page_id) {
-        return tabs;
-    }
-    tabs.push(page_id);
-    tabs
-}
-
-/// Close one tab.
-pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    tabs.retain(|tab| *tab != page_id);
-    tabs
-}
-
-/// One rendered doc tab.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct DocTab {
-    pub id: String,
-    pub title: String,
-    pub active: bool,
-}
-
-/// The rendered tab strip: open tabs that still exist, titled from the page
-/// list, the active one flagged.
-pub fn doc_tab_rows(tabs: &[String], pages: &[PageItem], active: &str) -> Vec<DocTab> {
-    tabs.iter()
-        .filter_map(|tab| {
-            let page = pages.iter().find(|page| page.id == *tab)?;
-            Some(DocTab {
-                title: page.title.clone(),
-                active: tab == active,
-                id: tab.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Drop tabs whose page is gone. `doc_tab_rows` already resolves every tab
-/// against the live page list when it draws, so a dead id is invisible in the
-/// bar — but the PERSISTED list kept them forever, and Settings counts that
-/// list: `Open page tabs 11` beside a bar showing two. Pruning where the pages
-/// land keeps the stored list and its count honest.
-pub fn doc_tabs_pruned(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
-}
-
-/// The tab to activate after closing one: the last remaining tab, or empty.
-pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
-    if closed != active {
-        return active;
-    }
-    tabs.into_iter()
-        .rev()
-        .find(|tab| *tab != closed)
-        .unwrap_or_default()
 }
 
 /// WHERE A NETWORK'S WALLETS LIVE ON THIS DEVICE. A wallet is an identity ON

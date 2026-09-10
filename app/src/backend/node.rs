@@ -9,7 +9,6 @@ pub struct SettingsFacts {
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
-    pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
     /// `ChatMember.key` is `member_id(..)` at full width, and the account card
     /// carries an account NUMBER, not a key, so neither the account card nor
@@ -20,8 +19,8 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-/// Load the settings facts: the local user key's location and state, the
-/// workspace directory, and the persisted tab count.
+/// Load the settings facts: the local user key's location and state, and the
+/// workspace directory.
 pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
@@ -33,7 +32,6 @@ pub async fn load_settings_facts(
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
             Ok(path) => (path.display().to_string(), key_state_of(&path)),
         };
-        let tabs = load_doc_tabs(rpc.clone()).await;
         let data_dir = workspace_at(&rpc)
             .map(|(_, dir)| dir.display().to_string())
             .or_else(|| ducktape_home().map(|home| home.display().to_string()))
@@ -43,7 +41,6 @@ pub async fn load_settings_facts(
             key_path,
             key_state,
             data_dir,
-            open_tabs: count_i64(tabs.len()),
             user_key: local_user_key()
                 .await
                 .map(|key| hex_encode(&key))
@@ -55,11 +52,6 @@ pub async fn load_settings_facts(
         generation,
         message: user_error(message),
     })
-}
-
-/// Forget this endpoint's persisted doc tabs.
-pub async fn clear_doc_tabs(rpc: String) -> bool {
-    save_doc_tabs(rpc, Vec::new()).await
 }
 
 /// One log line for the operator pane.

@@ -42,10 +42,6 @@ on pages_view_event(event)
       flow
         from done true
         done -> delete_page_submit()
-    PagesIntent.close_tab
-      flow
-        from done event_text(event, "id")
-        done -> close_doc_tab _
     // The same echo the chat plane uses to reach this two-arg handler: a
     // flow route takes one `_`, a run route takes the literal.
     PagesIntent.open_hit
@@ -117,12 +113,10 @@ on search_pages_submit
   run replace lane=page_search search_pages(connected_rpc, "", page_search_query) -> page_search_loaded _ | page_search_failed _
 
 // AN EMPTY QUERY MEANS NO SEARCH IS STANDING — every dismissal path clears
-// `page_search_query`, so this guard is the install decision for a reply the
-// dismissal could not invalidate: `close_doc_tab` rides an active/background
-// decision a lane invalidate cannot ride, and without the guard its late
-// reply restored the hits float over the tab just landed on and clobbered
-// `error` (or, on the failure route, raised a banner for a search nobody is
-// waiting on).
+// `page_search_query`, so this guard drops a late reply the dismissal could
+// not invalidate instead of restoring the hits float over the page just
+// landed on and clobbering `error` (or, on the failure route, raising a
+// banner for a search nobody is waiting on).
 on page_search_loaded(next)
   return if empty(page_search_query)
   page_search_hits = next.hits
@@ -568,8 +562,6 @@ on pages_updated(next)
   invalidate lane=page_autosave
   loading = false
   error = ""
-  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   // A create/delete moves the selection to another page — a navigation, so the
@@ -633,52 +625,6 @@ on pages_mutated(next)
   page_delete_armed = false
   mutation_phase = MutationPhase.idle
   error = ""
-  // THE SAME TWO LINES `pages_updated` ENDS ON. A mutation moves the selection
-  // exactly as a pick does — a create lands on the page it just made — so the
-  // page it lands on belongs in the tab bar. Without them a created page was
-  // selected in the sidebar and titled in the header while the tab bar still
-  // showed only the documents opened before it. A tab whose page is gone needs
-  // no removal here: `doc_tab_rows` resolves every tab against the live page
-  // list and drops the ones it cannot find.
-  doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
-  run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-
-on doc_tabs_saved(_result)
-
-on doc_tabs_loaded(tabs)
-  doc_tabs = tabs
-
-on close_doc_tab(id)
-  return if loading || mutation_phase != MutationPhase.idle
-  // THE SAME DECISION `next_doc_tab` MAKES, read here before `active_page`
-  // moves under it: that function returns `active` UNCHANGED when the closed
-  // tab is not the active one, so closing a BACKGROUND tab navigates nowhere
-  // and an unconditional dismissal would take down a search answer the user is
-  // still reading. Only the closure that actually moves the selection is a
-  // navigation, and only it dismisses. A lane invalidate cannot ride a
-  // decision, so a reply already in flight is dropped on ARRIVAL instead: both
-  // reply handlers return early on an empty `page_search_query`, and the
-  // active-close empties it below.
-  let closing_active = id == active_page
-  page_searching = keep_bool(closing_active, false, page_searching)
-  page_search_hits = keep_page_hits(closing_active, [], page_search_hits)
-  page_search_query = keep_str(closing_active, "", page_search_query)
-  active_page = next_doc_tab(doc_tabs, id, active_page)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  doc_tabs = doc_tabs_without(doc_tabs, id)
-  // The same prologue as `choose_page`: `active_page` just moved under the
-  // buffer, and without `loading` the next 900ms tick would write the OLD
-  // page's text into the NEW page. `pages_updated` clears it and decides the
-  // install; closing a background tab reloads the same page, which the
-  // install decision keeps harmless for a dirty buffer.
-  invalidate lane=page_autosave
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  loading = true
-  parallel
-    run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
-    run replace lane=page_load load_page(connected_rpc, active_page) -> pages_updated _ | failed _
 
 // Accepted guest edits update the save buffer only after the host resolves
 // their exact canonical reference in the current page and connection.

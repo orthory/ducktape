@@ -13,7 +13,7 @@ enum SettingsPane
   account
   security
 
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, tier:str, admin:bool, members_line:str, members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:str, desktop_notifications:bool, unlocked:bool, status:str, loading:bool, connected:bool, busy:bool, recovering:bool)
   emits
     show_tab(str)
     reconnect()
@@ -31,7 +31,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     account_wallet_submit()
     account_login_submit()
     copy_to_clipboard(str, str)
-    settings_clear_tabs()
     set_appearance_light()
     set_appearance_dark()
     set_desktop_notifications(bool)
@@ -261,44 +260,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
             // and flipped itself OFF a beat later, because the loader
             // answers `false` for an absent key. The group comes back the
             // day the marks are actually gated on it.
-            col w=fill gap=9.0
-              GroupLabel label="THIS DEVICE"
-              box
-                with
-                  w=fill
-                  bg=surface
-                  border=card_line
-                  border-w=1.0
-                  r=11.0
-                  clip=true
-                col w=fill
-                  box
-                    with
-                      w=fill
-                      px=15.0
-                      py=13.0
-                    row
-                      with
-                        w=fill
-                        gap=10.0
-                        align=center
-                      col w=fill gap=1.0
-                        text "Open page tabs" size=12.5 @text-accent_fg
-                        text "Preferences persist per endpoint in app-prefs.json beside the user key."
-                          with
-                            size=12.5
-                            @text-meta
-                      text settings_open_tabs
-                        with
-                          size=12.0
-                          wrap=none
-                          font=code_medium
-                          @text-secondary_fg
-                      button "Forget tabs" -> emit(settings_clear_tabs)
-                        with
-                          h=28.0
-                          p=5.0
-                          @secondary_action
         SettingsPane.network
           col w=fill gap=18.0
             col w=fill gap=9.0
