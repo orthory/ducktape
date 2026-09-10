@@ -380,12 +380,6 @@ pub struct Emoji {
     pub emoji: String,
 }
 
-/// `chat.edit`, `chat.thread_edit` — the edited body.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Text {
-    pub text: String,
-}
-
 /// `chat.rename` — the channel's new name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Name {
@@ -586,10 +580,6 @@ pub fn send_reaction_submit(emoji: &str) -> bool {
     )
 }
 
-pub fn send_edit(text: &str) -> bool {
-    notify("chat.edit", &Text { text: text.into() })
-}
-
 pub fn send_delete() -> bool {
     notify("chat.delete", &())
 }
@@ -636,10 +626,6 @@ pub fn send_thread_arm_delete(seq: i64, body: &str, rev: i64) -> bool {
 
 pub fn send_thread_clear_selection() -> bool {
     notify("chat.thread_clear_selection", &())
-}
-
-pub fn send_thread_edit(text: &str) -> bool {
-    notify("chat.thread_edit", &Text { text: text.into() })
 }
 
 pub fn send_thread_delete() -> bool {

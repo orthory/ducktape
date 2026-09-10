@@ -116,10 +116,22 @@ fn pick_mention(
 /// Open an existing message as an ID-preserving draft in its own composer.
 pub fn seed(scope: &str, body: &str) {
     let shared = slot(scope);
-    let mut slot = lock(&shared);
-    restore_document(&mut slot.document, body);
-    slot.document.failed.clear();
-    slot.rev += 1;
+    {
+        let mut slot = lock(&shared);
+        restore_document(&mut slot.document, body);
+        slot.document.failed.clear();
+        slot.rev += 1;
+    }
+    let room = room_scope(scope);
+    let target = iced::advanced::widget::Id::from(scope.to_owned());
+    SLOTS.with_borrow(|slots| {
+        for (scope, shared) in slots {
+            let same_room = room_scope(scope) == room;
+            if same_room {
+                lock(shared).focus_pending = Some(target.clone());
+            }
+        }
+    });
 }
 
 /// The shape of the tree the composer was last laid out with: whether the
@@ -152,6 +164,7 @@ struct Slot {
     painted: Shape,
     painted_rev: u64,
     facts: Option<Facts>,
+    focus_pending: Option<iced::advanced::widget::Id>,
 }
 
 /// The reader's position in the mention menu for ONE typed word: which row
@@ -200,6 +213,7 @@ fn slot(scope: &str) -> Shared {
                     painted: Shape::default(),
                     painted_rev: 0,
                     facts: None,
+                    focus_pending: None,
                 }))
             })
             .clone()
@@ -398,6 +412,24 @@ impl Composer {
     /// state.
     fn diff_shape(&self, tree: &mut Tree, content: &Content, shape: &Shape) {
         tree.diff_children(&[self.build(content, shape).as_widget()]);
+    }
+
+    /// Apply a seed's focus request before this editor can receive a key.
+    /// Every composer in the room sees the same target; only the edit matches.
+    fn apply_focus(
+        &self,
+        slot: &mut Slot,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+    ) {
+        let Some(target) = slot.focus_pending.take() else {
+            return;
+        };
+        let mut focus = iced::advanced::widget::operation::focusable::focus(target);
+        self.build(&slot.document.content, &slot.painted)
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, &mut focus);
     }
 
     /// The shape the document calls for right now: the banner over a stash,
@@ -694,14 +726,12 @@ impl Composer {
         };
         let menu = shape.menu.as_ref();
         let editor = rich_composer(
+            iced::advanced::widget::Id::from(self.scope.clone()),
             content,
             &shape.mentions,
             self.hint.clone(),
             self.blocked,
             menu.is_some(),
-            44.0,
-            150.0,
-            10.0,
         )
         .map(Interaction::Editor);
         let suggestions: Element<'a, Interaction> = match menu {
@@ -1015,9 +1045,12 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         if shape_changed {
             self.diff_shape(tree, &slot.document.content, &slot.painted);
         }
-        self.build(&slot.document.content, &slot.painted)
+        let node = self
+            .build(&slot.document.content, &slot.painted)
             .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
+            .layout(&mut tree.children[0], renderer, limits);
+        self.apply_focus(&mut slot, tree, Layout::new(&node), renderer);
+        node
     }
 
     fn draw(
@@ -1069,6 +1102,7 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
         viewport: &Rectangle,
     ) {
         let mut slot = lock(&self.slot);
+        self.apply_focus(&mut slot, tree, layout, renderer);
         let mut interactions = Vec::new();
         let mut local = Shell::new(&mut interactions);
         self.build(&slot.document.content, &slot.painted)
@@ -1335,6 +1369,122 @@ mod tests {
         assert_eq!(detail["body"], "hi");
         assert_eq!(detail["id"], "reply-1");
         assert!(intent(&Value::Unit).is_none());
+    }
+
+    #[test]
+    fn a_seeded_edit_focuses_after_mount_without_stealing_focus_on_relayout() {
+        use iced::advanced::clipboard;
+        use iced::keyboard;
+        use iced_test::runtime::user_interface::{self, UserInterface};
+
+        let room = "net\u{1f}edit-focus";
+        let edit = "net\u{1f}edit-focus#2/edit";
+        let reply = "net\u{1f}edit-focus#2";
+        seed(edit, "draft");
+        let composer = |scope: &str, kind: &str| {
+            Element::<Value>::new(Composer {
+                slot: slot(scope),
+                scope: scope.into(),
+                kind: kind.into(),
+                compact: true,
+                hint: String::new(),
+                blocked: false,
+                restore_blocked: false,
+                failed_note: String::new(),
+            })
+        };
+        let content: Element<'_, Value> = widget::column![
+            composer(room, "message"),
+            composer(reply, "reply"),
+            composer(edit, "edit")
+        ]
+        .into();
+        let mut renderer = crate::frame_probe::headless_renderer();
+        let size = Size::new(600.0, 400.0);
+        let mut ui =
+            UserInterface::build(content, size, user_interface::Cache::new(), &mut renderer);
+        let mut clipboard = clipboard::Null;
+        let mut published = Vec::new();
+        let key = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("x".into()),
+            modified_key: keyboard::Key::Character("x".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: Some("x".into()),
+            repeat: false,
+        });
+        ui.update(
+            &[key.clone()],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        let edited = testing::text(edit);
+        assert_eq!(
+            edited.len(),
+            "draft".len() + 1,
+            "typing needs no mouse click"
+        );
+        assert!(edited.contains('x'));
+        assert_eq!(
+            testing::text(room),
+            "",
+            "the other scope never receives the key"
+        );
+
+        for previous in [room, reply] {
+            let target = iced::advanced::widget::Id::from(previous.to_owned());
+            ui.operate(
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus(target),
+            );
+            ui.update(
+                &[key.clone()],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard,
+                &mut published,
+            );
+            let before = testing::text(previous);
+            assert!(!before.is_empty(), "the previous composer really had focus");
+            seed(edit, "draft");
+            ui.update(
+                &[key.clone()],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard,
+                &mut published,
+            );
+            assert_eq!(
+                testing::text(previous),
+                before,
+                "the old focus cannot consume the edit key"
+            );
+            assert_eq!(testing::text(edit).len(), "draft".len() + 1);
+            assert!(testing::text(edit).contains('x'));
+        }
+
+        let edited = testing::text(edit);
+        ui.operate(
+            &renderer,
+            &mut iced::advanced::widget::operation::focusable::unfocus(),
+        );
+        let mut ui = ui.relayout(size, &mut renderer);
+        ui.update(
+            &[key],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut published,
+        );
+        assert_eq!(
+            testing::text(edit),
+            edited,
+            "ordinary relayout must not refocus"
+        );
+        assert!(published.is_empty());
     }
 
     /// THE MENU IS A WIDGET THAT APPEARS UNDER A TREE DIFFED FOR ITS ABSENCE.

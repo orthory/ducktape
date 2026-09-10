@@ -51,10 +51,10 @@ pub(crate) fn provider_output_event(provider: &str, line: &str, id: i64) -> Opti
         let name = clip_text(tool["name"].as_str()?, 80);
         return Some(AgentChatEvent {
             id,
-            kind: "activity".into(),
+            kind: "status".into(),
             title: format!("Using {name}"),
             detail: String::new(),
-            status: "running".into(),
+            status: String::new(),
             answer: String::new(),
             saga_id: String::new(),
         });
@@ -542,7 +542,7 @@ mod tests {
         })
         .to_string();
         let event = provider_output_event("claude", &line, 8).unwrap();
-        assert_eq!(event.kind, "activity");
+        assert_eq!(event.kind, "status");
         assert_eq!(event.title, "Using Read");
         assert!(event.detail.is_empty());
         assert!(event.answer.is_empty());

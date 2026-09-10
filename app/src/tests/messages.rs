@@ -574,10 +574,27 @@ fn the_edited_marker_reaches_every_row_it_annotates() {
 fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = MutationPhase::Idle;
-
+    app.connected_rpc = "http://message-actions".into();
+    app.active_channel = "general".into();
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
     assert_eq!(app.selected_message_seq, 7);
     assert_eq!(app.message_action, MessageAction::More);
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
+    assert_eq!(
+        app.message_action,
+        MessageAction::More,
+        "a missing row cannot be edited"
+    );
+    app.messages = vec![backend::ChatMessage {
+        rev: 2,
+        ..message(7, "hello", false)
+    }];
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "stale".into(), 1));
+    assert_eq!(
+        app.message_action,
+        MessageAction::More,
+        "a stale menu cannot seed an edit"
+    );
     let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
     assert_eq!(app.message_action, MessageAction::Editing);
     // Every cancel affordance in the view routes `clear_message_selection`

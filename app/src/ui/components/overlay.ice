@@ -79,7 +79,6 @@ component ConfirmDelete(title:str, subject:str, note:str, action:str, busy:bool)
             with
               label=action
               disabled=busy
-              h=30.0
               p=7.0
               @danger_action
             text action size=13.0 wrap=none

@@ -1572,11 +1572,6 @@ on chat_view_event(event)
       flow
         from done event_text(event, "emoji")
         done -> add_reaction_submit _
-    ChatIntent.edit
-      let scope = edit_scope(connected_rpc, active_channel, selected_message_seq)
-      let seq = selected_message_seq
-      let rev = selected_message_rev
-      run every duck_echo_str(event_text(event, "text")) -> edit_message_submit(_, scope, seq, rev) | external_url_failed _
     ChatIntent.delete
       flow
         from done true
@@ -1625,11 +1620,6 @@ on chat_view_event(event)
       flow
         from done true
         done -> clear_thread_message_selection()
-    ChatIntent.thread_edit
-      let scope = edit_scope(connected_rpc, active_channel, thread_selected_seq)
-      let seq = thread_selected_seq
-      let rev = thread_selected_rev
-      run every duck_echo_str(event_text(event, "text")) -> edit_thread_message_submit(_, scope, seq, rev) | external_url_failed _
     ChatIntent.thread_delete
       flow
         from done true

@@ -531,7 +531,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                       with
                         label="Pick comment verdict"
                         checked=(review_verdict == "comment")
-                        h=24.0
                         p=5.0
                         @ghost_action
                       text verdict_pick_label(review_verdict, "comment", "Comment") size=13.0
@@ -542,7 +541,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                       with
                         label="Pick approve verdict"
                         checked=(review_verdict == "approve")
-                        h=24.0
                         p=5.0
                         @ghost_action
                       text verdict_pick_label(review_verdict, "approve", "Approve") size=13.0
@@ -553,7 +551,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                       with
                         label="Pick request-changes verdict"
                         checked=(review_verdict == "request_changes")
-                        h=24.0
                         p=5.0
                         @ghost_action
                       text verdict_pick_label(review_verdict, "request_changes", "Request changes")

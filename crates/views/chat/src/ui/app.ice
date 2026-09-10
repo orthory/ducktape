@@ -102,7 +102,6 @@ extern crate::host
   pure send_clear_range() -> bool
   pure send_copy_range() -> bool
   pure send_reaction_submit(emoji:&str) -> bool
-  pure send_edit(text:&str) -> bool
   pure send_delete() -> bool
   pure send_rename(name:&str) -> bool
   pure send_archive() -> bool
@@ -115,7 +114,6 @@ extern crate::host
   pure send_thread_begin_edit(seq:i64, body:&str, rev:i64) -> bool
   pure send_thread_arm_delete(seq:i64, body:&str, rev:i64) -> bool
   pure send_thread_clear_selection() -> bool
-  pure send_thread_edit(text:&str) -> bool
   pure send_thread_delete() -> bool
   pure send_load_thread() -> bool
   pure icon(name:&str) -> bytes
@@ -414,10 +412,6 @@ on clear_message_selection
 on add_reaction_submit(emoji)
   sent = send_reaction_submit(emoji)
 
-on edit_message_submit
-  return if busy || empty(trim(message_edit_draft))
-  sent = send_edit(trim(message_edit_draft))
-
 on delete_message_submit
   sent = send_delete()
 
@@ -474,10 +468,6 @@ on arm_thread_message_delete(seq, body, rev)
 on clear_thread_message_selection
   thread_edit_draft = ""
   sent = send_thread_clear_selection()
-
-on edit_thread_message_submit
-  return if busy || empty(trim(thread_edit_draft))
-  sent = send_thread_edit(trim(thread_edit_draft))
 
 on delete_thread_message_submit
   sent = send_thread_delete()
@@ -577,7 +567,6 @@ view
         arm_message_delete -> arm_message_delete _ _ _
         clear_message_selection -> clear_message_selection
         add_reaction_submit -> add_reaction_submit _
-        edit_message_submit -> edit_message_submit
         delete_message_submit -> delete_message_submit
         rename_channel_submit -> rename_channel_submit
         archive_channel_submit -> archive_channel_submit
@@ -591,7 +580,6 @@ view
         begin_thread_message_edit -> begin_thread_message_edit _ _ _
         arm_thread_message_delete -> arm_thread_message_delete _ _ _
         clear_thread_message_selection -> clear_thread_message_selection
-        edit_thread_message_submit -> edit_thread_message_submit
         delete_thread_message_submit -> delete_thread_message_submit
         load_more_thread -> load_more_thread
         cancel_run -> cancel_run _

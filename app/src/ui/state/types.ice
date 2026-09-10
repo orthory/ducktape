@@ -385,7 +385,6 @@ enum ChatIntent
   clear_range
   copy_range
   reaction_submit
-  edit
   delete
   rename
   archive
@@ -398,7 +397,6 @@ enum ChatIntent
   thread_begin_edit
   thread_arm_delete
   thread_clear_selection
-  thread_edit
   thread_delete
   load_thread
   cancel_run

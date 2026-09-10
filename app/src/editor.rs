@@ -501,14 +501,12 @@ fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
 /// this composer, so the arrows, Enter, Tab and Escape are the menu's
 /// ([`ComposerEvent::Menu`]) instead of the editor's for as long as it is.
 pub fn rich_composer<'a>(
+    id: iced::advanced::widget::Id,
     document: &'a Content,
     mentions: &[Range<usize>],
     hint: String,
     disabled: bool,
     menu_open: bool,
-    min_h: f64,
-    max_h: f64,
-    pad: f64,
 ) -> Element<'a, ComposerEvent> {
     let mut offset = 0;
     let ranges: Vec<Vec<Range<usize>>> = document
@@ -526,15 +524,16 @@ pub fn rich_composer<'a>(
         })
         .collect();
     let editor = RichTextEditor::new(document, content_version(document))
+        .id(id)
         .placeholder(hint)
         .width(iced::Length::Fill)
-        .min_height(min_h as f32)
-        .max_height(max_h as f32)
+        .min_height(44.0)
+        .max_height(150.0)
         .font(composer_font(Weight::Normal, FontStyle::Normal))
         .size(COMPOSER_SIZE)
         .line_height(COMPOSER_LINE_HEIGHT)
         .wrapping(text::Wrapping::Word)
-        .padding(pad as f32)
+        .padding(10.0)
         // format_key 0: the format table is static — no theme or mode inputs.
         .highlight_with::<InlineMarkdownHighlighter>(ranges, 0, composer_format)
         .style(composer_style)

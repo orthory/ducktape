@@ -245,7 +245,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     arm_message_delete(i64, str, i64)
     clear_message_selection()
     add_reaction_submit(str)
-    edit_message_submit()
     delete_message_submit()
     rename_channel_submit()
     archive_channel_submit()
@@ -259,7 +258,6 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     begin_thread_message_edit(i64, str, i64)
     arm_thread_message_delete(i64, str, i64)
     clear_thread_message_selection()
-    edit_thread_message_submit()
     delete_thread_message_submit()
     load_more_thread()
   state
