@@ -2048,18 +2048,18 @@ impl MentionCandidates {
             .collect()
     }
 
-    /// The target a typed word names: a WHOLE account name, else a key the
-    /// word prefixes. Both case-insensitive.
-    fn resolve(&self, word: &str) -> Option<&MentionTarget> {
+    /// A bare key the typed word prefixes, case-insensitively.
+    fn resolve_key_prefix(&self, word: &str) -> Option<&MentionTarget> {
         let needle = word.to_ascii_lowercase();
-        let names_an_account = |target: &&MentionTarget| target.handle == needle;
         let prefixes_a_key = |target: &&MentionTarget| {
-            needle.len() >= MIN_KEY_PREFIX && target.handle.starts_with(&needle)
+            needle.len() >= MIN_KEY_PREFIX
+                && target
+                    .parties
+                    .iter()
+                    .all(|party| matches!(party, Party::Key(_)))
+                && target.handle.starts_with(&needle)
         };
-        self.targets
-            .iter()
-            .find(names_an_account)
-            .or_else(|| self.targets.iter().find(prefixes_a_key))
+        self.targets.iter().find(prefixes_a_key)
     }
 }
 
@@ -2090,6 +2090,26 @@ fn mention_at<'a>(
     if !opens || mentions.is_empty() {
         return None;
     }
+    // Match directory names before scanning a key token: a name can contain
+    // spaces or Unicode, and the longest complete name owns the whole span.
+    let tail = &chars[at + 1..];
+    for target in &mentions.targets {
+        let len = target.handle.chars().count();
+        let Some(candidate) = tail.get(..len) else {
+            continue;
+        };
+        let matches = candidate
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .eq(target.handle.chars());
+        let ends = tail[len..]
+            .iter()
+            .take_while(|c| handle_char(**c) || c.is_alphanumeric())
+            .all(|c| !c.is_alphanumeric());
+        if matches && ends {
+            return Some((target, 1 + len));
+        }
+    }
     let mut word: Vec<char> = chars[at + 1..]
         .iter()
         .copied()
@@ -2097,7 +2117,7 @@ fn mention_at<'a>(
         .collect();
     loop {
         let candidate: String = word.iter().collect();
-        if let Some(target) = mentions.resolve(&candidate) {
+        if let Some(target) = mentions.resolve_key_prefix(&candidate) {
             return Some((target, 1 + word.len()));
         }
         let sheds = word
@@ -2893,6 +2913,64 @@ mod tests {
             panic!("paragraph expected");
         };
         assert!(spans.iter().any(|span| span.text == "@orthory-ops"));
+    }
+
+    #[test]
+    fn mentions_highlight_whole_names_including_spaces() {
+        let names = NameDirectory::new(BTreeMap::from([
+            (
+                "aa11".into(),
+                BoundAccount {
+                    number: 1,
+                    name: "Selfhost".into(),
+                },
+            ),
+            (
+                "bb22".into(),
+                BoundAccount {
+                    number: 2,
+                    name: "Selfhost Duck".into(),
+                },
+            ),
+            (
+                "cc33".into(),
+                BoundAccount {
+                    number: 3,
+                    name: "셀프호스트 덕".into(),
+                },
+            ),
+        ]));
+        let mentions = MentionCandidates::new(&names, &[]);
+        for (body, highlighted, parties) in [
+            (
+                "ping @Selfhost Duck. thanks",
+                "@Selfhost Duck",
+                vec![Party::Account(2)],
+            ),
+            ("@SELFHOST DUCK", "@SELFHOST DUCK", vec![Party::Account(2)]),
+            (
+                "@셀프호스트 덕 hello",
+                "@셀프호스트 덕",
+                vec![Party::Account(3)],
+            ),
+            ("@Selfhost hello", "@Selfhost", vec![Party::Account(1)]),
+            ("@SelfhostDuck", "", vec![]),
+            ("@Selfhosté", "", vec![]),
+            ("@Selfhost-ops", "", vec![]),
+            ("@Selfhost_2", "", vec![]),
+            ("@Selfh", "", vec![]),
+        ] {
+            let blocks = parse_message_with_mentions(body, &mentions);
+            assert_eq!(mention_parties(&blocks), parties, "{body}");
+            let rendered = blocks_view(&blocks);
+            let ink: String = rendered[0]
+                .spans
+                .iter()
+                .map(|span| span.mention.as_str())
+                .collect();
+            assert_eq!(ink, highlighted, "{body}");
+            assert_eq!(message_body(&blocks), body);
+        }
     }
 
     /// Trailing punctuation is sentence, not handle.
