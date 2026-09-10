@@ -392,21 +392,6 @@ component TabLabel(label:str, count:i64, active:bool)
           bg=transparent
         space w=1.0 h=1.0
 
-component Popover(width:f64)
-  box #root
-    with
-      w=width
-      p=5.0
-      bg=surface
-      border=border
-      border-w=1.0
-      r=11.0
-      shadow=shadow_popover
-      shadow-y=3.0
-      shadow-blur=12.0
-    col w=fill
-      slot
-
 // Shapes lifted from components/chat.ice for the non-chat probes (the
 // composer there refuses to compile unmounted).
 component RichBody(blocks:[ChatBlock], size:f64)

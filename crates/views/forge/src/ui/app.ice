@@ -34,13 +34,11 @@ extern crate::host
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   TreeEntry(name:str, path:str, kind:str)
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  ForgeProps(display_omitted:i64, display_shortened:bool, display_unavailable:bool, dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[ForgeBranch], branch_menu:bool, tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
+  ForgeProps(display_omitted:i64, display_shortened:bool, display_unavailable:bool, dark:bool, connected:bool, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, review_busy:bool, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, landed_seq:i64, landed_tick:i64, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, drafts_cleared:i64, drafts_scope:str, note_scope:str, note_blocked:bool)
   PropsItem(next:ForgeProps, error:str)
   subscription props() -> PropsItem
   pure open_repo(name:&str) -> bool
   pure close_repo() -> bool
-  pure toggle_repo_menu() -> bool
-  pure toggle_branch_menu() -> bool
   pure pick_branch(name:&str) -> bool
   pure pick_tab(tab:&str) -> bool
   pure open_item(number:i64) -> bool
@@ -64,8 +62,10 @@ extern crate::host
   pure markdown_path(path:&str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
   pure binary_note(text:&str) -> str
-  pure rev_label(branch:&str, rev:&str) -> str
-  pure browse_branch_label(name:&str) -> str
+  pure commit_label(rev:&str) -> str
+  pure repo_names(repos:&[ForgeRepo]) -> [str]
+  pure branch_names(branches:&[ForgeBranch]) -> [str]
+  pure pinned_branch(tree_branch:&str) -> str?
   pure duck_forge_item_link(repo:&str, number:i64, chain_id:&str) -> str
   pure duck_forge_repo_link(repo:&str, chain_id:&str) -> str
   pure forge_push_command(rpc:&str) -> str
@@ -105,10 +105,8 @@ state
   repos:[ForgeRepo] = []
   list_phase = "idle"
   open_repo = ""
-  repo_menu = false
   repo_phase = "idle"
   branches:[ForgeBranch] = []
-  branch_menu = false
   tree_branch = ""
   tab = "code"
   items:[ForgeItem] = []
@@ -200,10 +198,8 @@ on props_arrived(item)
   repos = next.repos
   list_phase = next.list_phase
   open_repo = next.open_repo
-  repo_menu = next.repo_menu
   repo_phase = next.repo_phase
   branches = next.branches
-  branch_menu = next.branch_menu
   tree_branch = next.tree_branch
   tab = next.tab
   items = next.items
@@ -297,12 +293,6 @@ on forge_open_repo(name)
 on forge_close_repo
   sent = close_repo()
 
-on forge_toggle_repo_menu
-  sent = toggle_repo_menu()
-
-on forge_toggle_branch_menu
-  sent = toggle_branch_menu()
-
 on forge_pick_branch(name)
   sent = pick_branch(name)
 
@@ -392,10 +382,8 @@ view
             repos
             list_phase
             open_repo
-            repo_menu
             repo_phase
             branches
-            branch_menu
             tree_branch
             tab
             items
@@ -453,8 +441,6 @@ view
           events
             forge_open_repo -> forge_open_repo _
             forge_close_repo -> forge_close_repo
-            forge_toggle_repo_menu -> forge_toggle_repo_menu
-            forge_toggle_branch_menu -> forge_toggle_branch_menu
             forge_pick_branch -> forge_pick_branch _
             select_forge_tab -> select_forge_tab _
             forge_open_item -> forge_open_item _

@@ -143,12 +143,10 @@ pub struct ForgeProps {
     pub repos: Vec<ForgeRepo>,
     pub list_phase: String,
     pub open_repo: String,
-    pub repo_menu: bool,
     pub repo_phase: String,
     pub branches: Vec<ForgeBranch>,
-    /// the branch switcher's open state, and the branch the code browse's
-    /// pinned commit is the head of ("" when no branch stands there)
-    pub branch_menu: bool,
+    /// the branch the code browse's pinned commit is the head of ("" when
+    /// no branch stands there)
     pub tree_branch: String,
     pub tab: String,
     pub items: Vec<ForgeItem>,
@@ -309,14 +307,6 @@ pub fn open_repo(name: &str) -> bool {
 
 pub fn close_repo() -> bool {
     notify("forge.close_repo", &())
-}
-
-pub fn toggle_repo_menu() -> bool {
-    notify("forge.toggle_repo_menu", &())
-}
-
-pub fn toggle_branch_menu() -> bool {
-    notify("forge.toggle_branch_menu", &())
 }
 
 /// `forge.branch` — re-root the code browse at one branch's head.
@@ -546,22 +536,30 @@ pub fn keep_draft(consumed: bool, draft: &str) -> String {
     }
 }
 
-/// What the branch selector reads: the branch standing at the browse's
-/// commit, else the commit itself abbreviated, else the root read is still
-/// in flight.
-pub fn rev_label(branch: &str, rev: &str) -> String {
-    if !branch.is_empty() {
-        return branch.to_owned();
-    }
+/// What the branch selector reads while no branch stands at the browse's
+/// commit: the commit itself abbreviated, or the root read still in flight.
+pub fn commit_label(rev: &str) -> String {
     if rev.is_empty() {
         return "…".to_owned();
     }
     rev.chars().take(12).collect()
 }
 
-/// The switcher row's accessible name: which branch this row browses.
-pub fn browse_branch_label(name: &str) -> String {
-    format!("Browse branch {name}")
+/// The repository switcher's options: the forge's repositories by name.
+pub fn repo_names(repos: &[ForgeRepo]) -> Vec<String> {
+    repos.iter().map(|repo| repo.name.clone()).collect()
+}
+
+/// The branch selector's options: the open repo's born branches by name.
+pub fn branch_names(branches: &[ForgeBranch]) -> Vec<String> {
+    branches.iter().map(|branch| branch.name.clone()).collect()
+}
+
+/// The branch selector's selection: the branch standing at the browse's
+/// commit, or none once every branch has moved past it.
+pub fn pinned_branch(tree_branch: &str) -> Option<String> {
+    let a_branch_stands_at_the_commit = !tree_branch.is_empty();
+    a_branch_stands_at_the_commit.then(|| tree_branch.to_owned())
 }
 
 /// The seq a fresh landing names, or 0 when the props carried no new one.
