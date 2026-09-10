@@ -162,14 +162,9 @@ impl BindingState {
             }
             wire::editor_presentation::EditorInteraction::LinePress { tag: 2, position } => {
                 if let Some(line) = wire::editor_lines(state.text).nth(position.line as usize) {
-                    navigation.link = crate::inline::inline_marks(line)
-                        .into_iter()
-                        .find(|(range, kind)| {
-                            *kind == crate::inline::Inline::Link
-                                && range.contains(&(position.column as usize))
-                        })
-                        .map(|(range, _)| line[range].to_owned())
-                        .unwrap_or_default();
+                    navigation.link =
+                        crate::inline::document_link_at(line, position.column as usize)
+                            .unwrap_or_default();
                 }
             }
             _ => {}

@@ -47,7 +47,13 @@ one JSON item per change) and speaks back only in intents (`governance.vote`,
 `members.propose`, …) that the tab's handler signs and submits exactly as the
 native screen did; a view with nothing to write, like Agents, declares none. The guest sees no key, no endpoint and no clock, and a view
 that traps shows why in its place instead of taking the window with it. A
-view may leave a slot for something only the host can draw: the Node view's
+view can also request `host.widget` operations on its own mounted tree and nested overlays:
+focus traversal, targeted focus and focus queries; native text-input cursor
+and selection operations; and scroll offsets, relative movement, end snapping
+and keyed-row reveals. Requests are validated and bounded, run only after the
+matching native frame is laid out and editor work has drained, and are refused
+if their frame was replaced. They cannot address another view's widgets.
+A view may leave a slot for something only the host can draw: the Node view's
 Activity tab declares `node_log_timeline` as a host surface, and the app
 paints its own retained log ring there (`surfaces_of` in `module_view.rs`),
 queuing what the reader does in it for the handler to drain. A view that

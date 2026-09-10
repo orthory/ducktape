@@ -25,6 +25,7 @@ microphone = "Ducktape uses the microphone for voice in huddles."
 ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1533d98e9db3ccb3c265c74612271f7ace59067e", version = "=0.1.0" }
 
 [dependencies]
+pulldown-cmark = "0.12.2"
 # the program-account module: the Agents editor provisions a new agent's
 # keyless account through it before the runs module registers the record.
 agent.workspace = true

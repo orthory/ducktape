@@ -3510,6 +3510,7 @@ dependencies = [
  "objc2-foundation 0.2.2",
  "objc2-user-notifications",
  "pages",
+ "pulldown-cmark",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "run-envelope",

@@ -4,6 +4,8 @@ pub mod guest_document;
 #[path = "../../../crates/views/pages/src/editor_indent.rs"]
 mod indent;
 #[path = "../../../crates/views/pages/src/editor_inline.rs"]
+// Pages guest consumes document links; native Chat consumes inline emphasis.
+#[allow(dead_code)]
 pub mod inline;
 #[cfg(test)]
 #[path = "../../../crates/views/pages/src/editor_markdown.rs"]
