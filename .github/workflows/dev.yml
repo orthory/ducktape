@@ -1,21 +1,29 @@
-# The PR gate. Everything in .github/workflows/ before this was push-triggered
-# and path-filtered, so a pull request against `dev` carried no checks at all
-# (#1392). This workflow runs on every PR targeting `dev` and gates on the
-# things the dev loop already treats as load-bearing: the committed wasm
-# component bytes (`make wasm-modules-check`) and that no binary embeds any
-# of them (`make wasm-embed-check`), the genesis root-hash pin
-# (`host_state`), the simnode suites (`cargo test -p simnode` — the sim's own
-# genesis pin in `topology_set.rs` lives here, alongside every other simnode
-# scenario; #1433), and clippy across the workspace.
-name: pr
+# The dev gate. The whole suite runs once per push to `dev` — every merge —
+# and on demand for a branch someone wants checked before it lands
+# (`gh workflow run dev.yml --ref <branch>`). Nothing runs on a pull request:
+# a cold run is ~35 min wall-clock and ~2.5 h of runner time, and the GitHub
+# cache is branch-scoped, so a suite that only ran on PRs never left a warm
+# `target/` on `dev` for the next PR to restore — every PR compiled the
+# workspace from scratch. Running here saves the cache on `dev`, where every
+# later run (a dev push or a dispatched branch) restores it.
+#
+# What it gates: the committed wasm component bytes (`make wasm-modules-check`)
+# and that no binary embeds any of them (`make wasm-embed-check`), the
+# genesis root-hash pin (`host_state`), the simnode suites (`cargo test -p
+# simnode` — the sim's own genesis pin in `topology_set.rs` lives here,
+# alongside every other simnode scenario), and clippy across the workspace.
+name: dev
 
 on:
-  pull_request:
+  push:
     branches: [dev]
+  workflow_dispatch:
 
+# Runs queue per ref rather than cancel: a cancelled job saves no cache, and
+# nothing waits on this lane.
 concurrency:
-  group: pr-${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,8 +42,16 @@ jobs:
       - run: python3 .github/ci-scope.py --self-test
       - id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # the ref's tip before this push; a dispatch carries none
+          BASE_SHA: ${{ github.event.before }}
         run: |
+          # No base to diff against — a dispatch, or a branch's first push
+          # (the null sha) — runs the whole suite.
+          case "$BASE_SHA" in
+            ''|0000000000000000000000000000000000000000)
+              echo "full=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 .github/ci-scope.py "$BASE_SHA" >> "$GITHUB_OUTPUT"
 
@@ -55,15 +71,10 @@ jobs:
       - run: make wasm-modules-check
       - run: make wasm-embed-check
 
-  # Rebuild every component and index guest from the requested source
-  # revision. Comparing committed copies alone cannot detect stale bytes.
-  #
-  # On the PR's own HEAD, not the merge commit actions/checkout builds by
-  # default: guest-builder compiles the module out of the repository at the
-  # checkout's HEAD, and a merge commit is a revision no committed artifact
-  # was ever built at — every PR whose base moved a compiled line would fail
-  # here on bytes that are correct. `refs/pull/N/head` is on this repository,
-  # a fork PR included, so the fetch resolves either way.
+  # Rebuild every component and index guest from the source at HEAD and
+  # compare against the committed bytes. Comparing committed copies alone
+  # cannot detect stale bytes; a mismatch here means the guest source moved
+  # and its `component.wasm` was not rebuilt with it.
   wasm-rebuild-check:
     needs: scope
     if: needs.scope.outputs.full == 'true'
@@ -71,8 +82,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
@@ -97,11 +106,10 @@ jobs:
 
   # the wasm/native cutover-continuity proofs (crates/kernel/host/tests/wasm_*_parity.rs):
   # each op sequence must commit the identical root, replies and rejection
-  # reasons on both a native module and its wasm guest, block by block. Had
-  # no PR gate (#1695) — a fixture written before a module's own admission
-  # rule shifted (#1650, #1046) slipped a stale-fixture failure onto dev
-  # unnoticed. Measured ~1 min for `--tests` warm-cache locally, plus the
-  # ~2-3 min host-crate compile; 30 min matches the other host-crate jobs.
+  # reasons on both a native module and its wasm guest, block by block. A
+  # fixture written before a module's admission rule shifted fails here.
+  # Measured ~1 min for `--tests` warm-cache locally, plus the ~2-3 min
+  # host-crate compile; 30 min matches the other host-crate jobs.
   host-parity:
     needs: scope
     if: needs.scope.outputs.full == 'true'
@@ -120,10 +128,9 @@ jobs:
   # cranelift-compiles the sim's module set per boot (25–29 min on the
   # 2-core runner, so the timeout sits well above that) with no sandbox,
   # microVM, or outbound network — every simnode test binds loopback only —
-  # so the whole crate runs here, not a scoped subset. This is the job that
-  # was missing (#1433): `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH`
-  # pins the sim's own genesis composition and drifted unnoticed with no PR
-  # gate exercising it.
+  # so the whole crate runs here, not a scoped subset. `topology_set.rs`'s
+  # `DEFAULT_GENESIS_ROOT_HASH` pins the sim's own genesis composition, and
+  # this is the only job that exercises it.
   #
   # DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's own compilation cache
   # (`simnode::boot` calls `wasm_host::enable_compilation_cache`) for this job
@@ -151,14 +158,12 @@ jobs:
       - run: make views
       - run: cargo test --locked -p simnode
 
-  # The rendezvous/coordinator unit lane had no PR gate at all: three
-  # `reachability::rendezvous::tests` and coordinator-bin's
-  # `probe_floods_invalid_signatures_then_recovers` went red on dev when the
-  # advert book's readvertise-nonce and Lookup-source-binding guards
-  # landed, and nothing ran them to notice. `--lib` only —
-  # `coordinator-bin`'s integration suites (deploy_smoke, policy_args, smoke)
-  # bind real sockets and belong with the other integration jobs above, not
-  # this fast unit lane.
+  # The rendezvous/coordinator unit lane: `reachability::rendezvous::tests`
+  # and coordinator-bin's `probe_floods_invalid_signatures_then_recovers`
+  # guard the advert book's readvertise-nonce and Lookup-source-binding
+  # rules. `--lib` only — `coordinator-bin`'s integration suites
+  # (deploy_smoke, policy_args, smoke) bind real sockets and belong with the
+  # other integration jobs above, not this fast unit lane.
   net-unit:
     needs: scope
     if: needs.scope.outputs.full == 'true'
