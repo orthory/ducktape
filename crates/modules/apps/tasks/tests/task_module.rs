@@ -446,10 +446,10 @@ fn oversized_task_id_cannot_brick_the_board() {
 }
 
 // wired end-to-end through `Tasks::execute` (not the board's own unit tests):
-// a stranger's restatus is refused, the owner's is accepted, and a delete
-// frees the task's slot.
+// a stranger's restatus lands like the owner's, and the owner stays the
+// creator.
 #[test]
-fn a_strangers_update_is_refused_the_owners_is_accepted() {
+fn a_strangers_update_lands_like_the_owners() {
     block_on(async {
         let mut tasks = tasks_on_mem();
         tasks
@@ -458,22 +458,29 @@ fn a_strangers_update_is_refused_the_owners_is_accepted() {
             .expect("alice creates");
         tasks.commit_block().await.expect("commit create");
 
-        let refused = tasks
+        tasks
             .execute(
                 &mut at_as(2, ext("mallory")),
-                &update("t1", TaskStatus::Done),
+                &update("t1", TaskStatus::InProgress),
             )
             .await
-            .expect_err("mallory cannot restatus alice's task");
-        assert!(
-            matches!(refused, Error::Module(ref m) if m.contains("only the owner")),
-            "unexpected error: {refused:?}"
+            .expect("mallory restatuses alice's task");
+        tasks
+            .commit_block()
+            .await
+            .expect("commit the stranger's update");
+        let task = module_tasks(&tasks).await.remove(0);
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(
+            task.owner,
+            tasks::Party::Key(b"alice".to_vec()),
+            "the owner stays"
         );
 
         tasks
             .execute(&mut at_as(3, ext("alice")), &update("t1", TaskStatus::Done))
             .await
-            .expect("alice may update her own task");
+            .expect("alice updates her own task");
         tasks.commit_block().await.expect("commit update");
         assert_eq!(module_tasks(&tasks).await[0].status, TaskStatus::Done);
     });
@@ -516,25 +523,16 @@ fn delete_frees_a_slot_at_the_cap_and_a_per_owner_cap_admits_another_owner() {
             .expect("another owner is still admitted");
         tasks.commit_block().await.expect("commit mallory's task");
 
-        // a stranger cannot free alice's slot.
-        let refused = tasks
+        // a stranger's delete frees alice's slot: the census recedes for the
+        // record's owner, whoever deletes.
+        tasks
             .execute(&mut at_as(4, ext("mallory")), &delete("a0"))
             .await
-            .expect_err("mallory cannot delete alice's task");
-        assert!(
-            matches!(refused, Error::Module(ref m) if m.contains("only the owner")),
-            "unexpected error: {refused:?}"
-        );
-
-        // alice deletes her own task, freeing the slot she was at the cap on.
-        tasks
-            .execute(&mut at_as(5, ext("alice")), &delete("a0"))
-            .await
-            .expect("alice may delete her own task");
+            .expect("mallory deletes alice's task");
         tasks.commit_block().await.expect("commit delete");
         tasks
             .execute(
-                &mut at_as(6, ext("alice")),
+                &mut at_as(5, ext("alice")),
                 &create("a-again", "the freed slot is usable"),
             )
             .await

@@ -1,15 +1,16 @@
-//! Owner-scoped standing rules over authenticated chat events. Identity
-//! accounts own rules; live authority and channel permissions gate every fire.
-//! Actions publish source-owned attribution, posts or tasks in the originating
-//! atomic unit. Structurally refused actions remain visible in run history.
+//! Standing rules over authenticated chat events. Any identity account
+//! registers a rule and any account administers one; a rule observes every
+//! channel chat hooks this module into and posts wherever it names. Actions
+//! publish source-owned attribution, posts or tasks in the originating atomic
+//! unit. Structurally refused actions remain visible in run history.
 mod interface;
 pub use interface::*;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use chat::{
-    Block, ChannelAccess, ChatEvent, ChatMsg, ChatQuery, ChatReply, Party,
-    decode_event as chat_decode_event, decode_reply as chat_decode_reply,
-    encode_msg as chat_encode_msg, encode_query as chat_encode_query,
+    Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, Party, decode_event as chat_decode_event,
+    decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
+    encode_query as chat_encode_query,
 };
 use sdk::{
     AccountNumber, Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget,
@@ -24,11 +25,11 @@ use tasks::{
 /// execute. [`MAX_RULES_PER_OWNER`] is the per-account bound that keeps any
 /// ONE account from being the reason this global roster ever fills.
 pub const MAX_RULES: usize = 1024;
-/// max rules one owner may hold at once, the tasks board's
+/// max rules one creator may hold at once, the tasks board's
 /// [`tasks::MAX_OPEN_TASKS_PER_OWNER`] shape applied to the rule roster: no
 /// single account can fill [`MAX_RULES`] and permanently deny the feature to
-/// everyone else. [`AutomationsMsg::DeleteRule`] is how an owner recedes from
-/// it.
+/// everyone else. an [`AutomationsMsg::DeleteRule`], from any account, frees
+/// a slot.
 pub const MAX_RULES_PER_OWNER: usize = 32;
 /// `rule_id` byte bound (also the `channel_id`/`task_id_prefix` bound).
 pub const MAX_ID_BYTES: usize = 256;
@@ -60,33 +61,6 @@ pub const MAX_ACTIONS_PER_EVENT: usize = 8;
 /// wedge every syncing peer (the poison-value lesson), so the create op
 /// refuses loudly instead.
 pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
-/// distinct `(rule owner, channel)` standing lookups ONE event may spend at
-/// chat. every lookup is a sibling read, and the wasm host bounds a dispatch at
-/// `MAX_SIBLING_READS` = 64 distinct sibling reads TOTAL — a
-/// budget this event's text fetch and per-action probes also draw on. a roster
-/// of rules with distinct owners would otherwise trap the dispatch and abort
-/// the posting user's block, so the lookups are capped here and a rule past the
-/// cap does not fire (fail closed, deterministically on every validator).
-pub const MAX_ACCESS_PROBES_PER_EVENT: usize = 32;
-
-fn authority(control: &identity::Control) -> Option<RuleAuthority> {
-    match control {
-        identity::Control::Keys => Some(RuleAuthority::Keys),
-        identity::Control::Program {
-            generation,
-            standing: identity::ProgramStanding::Active,
-            ..
-        } => Some(RuleAuthority::Program {
-            generation: *generation,
-        }),
-        identity::Control::Program {
-            standing: identity::ProgramStanding::Suspended,
-            ..
-        }
-        | identity::Control::Revoked { .. } => None,
-    }
-}
-
 async fn identity_account(
     ctx: &dyn Ctx,
     identity: &str,
@@ -96,16 +70,16 @@ async fn identity_account(
     let reply = identity::decode_reply(&bytes).map_err(Error::Module)?;
     let identity::IdentityReply::Account(Some(account)) = reply else {
         return Err(Error::Module(
-            "automation owner requires an identity account".into(),
+            "automation rules require an identity account".into(),
         ));
     };
     Ok(account)
 }
 
-async fn rule_owner(
-    ctx: &dyn Ctx,
-    identity: &str,
-) -> Result<(AccountNumber, RuleAuthority), Error> {
+/// the account an admin op is submitted under: the creator a new rule
+/// records and the key of the per-account rule quota. any account
+/// administers any rule.
+async fn submitting_account(ctx: &dyn Ctx, identity: &str) -> Result<AccountNumber, Error> {
     let query = match &ctx.env().origin {
         Origin::External(key) => {
             if key.is_empty() {
@@ -130,10 +104,7 @@ async fn rule_owner(
             "program origin requires a program account".into(),
         ));
     }
-    let Some(authority) = authority(&account.control) else {
-        return Err(Error::Module("automation owner is not active".into()));
-    };
-    Ok((account.number, authority))
+    Ok(account.number)
 }
 
 /// per-rule record key: prefix + 0 + id (the single-component shape chat
@@ -181,23 +152,6 @@ struct RunCursor {
     head: u64,
     next: u64,
 }
-
-/// this event's answers to "what may THIS rule owner do in THIS channel",
-/// asked of chat once per distinct pair and spent against
-/// [`MAX_ACCESS_PROBES_PER_EVENT`]. a rule's owner is fixed and the event
-/// channel is one, so a roster of rules by the same owner costs one lookup.
-#[derive(Default)]
-struct AccessMemo {
-    seen: Vec<((AccountNumber, String), ChannelAccess)>,
-    authorities: Vec<(AccountNumber, Option<RuleAuthority>)>,
-    probes: usize,
-}
-
-/// the standing a caller gets when it may not ask: fail closed.
-const NO_ACCESS: ChannelAccess = ChannelAccess {
-    may_read: false,
-    may_post: false,
-};
 
 pub struct Automations {
     id: ModuleId,
@@ -393,41 +347,11 @@ impl Automations {
         Ok(())
     }
 
-    /// The rule grants reporting to its owner's account only.
-    fn validate_report_owner(owner: &AccountNumber, action: &Action) -> Result<(), Error> {
-        let Action::Report { recipient, .. } = action else {
-            return Ok(());
-        };
-        if recipient != owner {
-            return Err(Error::Module(
-                "report recipient must be the rule owner".into(),
-            ));
-        }
-        Ok(())
-    }
-
     // ---- admin ops ----------------------------------------------------------
-
-    /// authorize an op on an EXISTING rule. owner-only, and that is the whole
-    /// rule: a rule fires under this module's authority, so admitting anyone
-    /// but the principal who took responsibility for it hands a stranger
-    /// either a kill switch (`SetEnabled`/`DeleteRule` on someone else's
-    /// automation) or, worse, a way to swap the standing grant for their own.
-    fn check_rule_owner(rule: &Rule, submitter: &AccountNumber) -> Result<(), Error> {
-        let is_owner = rule.owner == *submitter;
-        if !is_owner {
-            return Err(Error::Module(format!(
-                "only the owner may administer rule {}",
-                rule.rule_id
-            )));
-        }
-        Ok(())
-    }
 
     async fn stage_create_rule(
         &mut self,
         owner: AccountNumber,
-        authority: RuleAuthority,
         rule_id: String,
         trigger: Trigger,
         action: Action,
@@ -437,7 +361,6 @@ impl Automations {
         Self::validate_len("rule_id", &rule_id, MAX_ID_BYTES)?;
         Self::validate_trigger(&trigger)?;
         Self::validate_action(&action)?;
-        Self::validate_report_owner(&owner, &action)?;
         let mut roster = self.roster().await?;
         let position = match roster.binary_search(&rule_id) {
             Ok(_) => {
@@ -467,7 +390,6 @@ impl Automations {
             &Rule {
                 rule_id: rule_id.clone(),
                 owner,
-                authority,
                 enabled: true,
                 trigger,
                 action,
@@ -479,49 +401,34 @@ impl Automations {
         Ok(())
     }
 
-    async fn stage_set_enabled(
-        &mut self,
-        submitter: &AccountNumber,
-        authority: RuleAuthority,
-        rule_id: String,
-        enabled: bool,
-    ) -> Result<(), Error> {
+    async fn stage_set_enabled(&mut self, rule_id: String, enabled: bool) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
         let Some(mut rule) = self.rule(&rule_id).await? else {
             return Err(Error::Module(format!("unknown rule: {rule_id}")));
         };
-        // BEFORE the idempotency short-circuit: a gate a no-op walks past is
-        // not a gate, and a stranger must not learn a rule's enabled state
-        // from which of the two refusals comes back.
-        Self::check_rule_owner(&rule, submitter)?;
-        let unchanged = rule.enabled == enabled && rule.authority == authority;
+        let unchanged = rule.enabled == enabled;
         if unchanged {
             // idempotent: staging nothing keeps the op log — and the root —
             // byte-identical to no write at all.
             return Ok(());
         }
         rule.enabled = enabled;
-        rule.authority = authority;
         self.store(rule_key(&rule_id), &rule);
         Ok(())
     }
 
-    async fn stage_delete_rule(
-        &mut self,
-        submitter: &AccountNumber,
-        rule_id: String,
-    ) -> Result<(), Error> {
+    async fn stage_delete_rule(&mut self, rule_id: String) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
         let mut roster = self.roster().await?;
         let Ok(position) = roster.binary_search(&rule_id) else {
             return Err(Error::Module(format!("unknown rule: {rule_id}")));
         };
-        // the roster is the existence authority; the RECORD carries the owner.
-        // a rostered id without a record is a store bug — loud, as everywhere.
+        // the roster is the existence authority; the RECORD carries the
+        // creator whose quota the delete frees. a rostered id without a record
+        // is a store bug — loud, as everywhere.
         let Some(rule) = self.rule(&rule_id).await? else {
             return Err(Error::Module(format!("missing rule record: {rule_id}")));
         };
-        Self::check_rule_owner(&rule, submitter)?;
         let owner_rules = self.owner_rule_count(&rule.owner).await?;
         roster.remove(position);
         self.staged.delete(rule_key(&rule_id));
@@ -554,30 +461,15 @@ impl Automations {
         let height = ctx.env().height;
         let rules = self.all_rules().await?;
 
-        // the OWNER's standing decides what a rule OBSERVES: a rule matches
-        // this event only if its owner may read the event's channel, so a
-        // wildcard trigger means "every channel the owner can read" and never
-        // "every channel this module is hooked into". a rule whose owner is not
-        // admitted is simply NOT A MATCH — no record, because recording every
-        // channel a rule cannot see is both a history bomb and the very
-        // disclosure the gate exists to prevent.
-        let mut access = AccessMemo::default();
-        let mut candidates: Vec<&Rule> = Vec::new();
-        for rule in &rules {
-            let is_candidate =
-                rule.enabled && Self::matches_channel_and_mention(rule, &channel_id, &mentions);
-            if !is_candidate {
-                continue;
-            }
-            let owner_may_read = self
-                .owner_access(&*ctx, &mut access, rule, &channel_id)
-                .await
-                .may_read;
-            if !owner_may_read {
-                continue;
-            }
-            candidates.push(rule);
-        }
+        // a rule observes every channel chat hooks this module into: a
+        // wildcard trigger is "every hooked channel", and only the trigger's
+        // own filters decide a match.
+        let candidates: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| {
+                rule.enabled && Self::matches_channel_and_mention(rule, &channel_id, &mentions)
+            })
+            .collect();
 
         // fetch the post's text ONCE, and only if some matching rule needs it
         // (a `text_contains` filter, or a `{text}` placeholder). `None` = the
@@ -641,13 +533,7 @@ impl Automations {
                 mention: &mention_actor,
             };
             match self
-                .build_and_emit(
-                    ctx,
-                    &mut access,
-                    rule,
-                    cursor.next + records.len() as u64,
-                    &vars,
-                )
+                .build_and_emit(ctx, rule, cursor.next + records.len() as u64, &vars)
                 .await
             {
                 Ok(detail) => {
@@ -707,7 +593,6 @@ impl Automations {
     async fn build_and_emit(
         &self,
         ctx: &mut dyn Ctx,
-        access: &mut AccessMemo,
         rule: &Rule,
         run_seq: u64,
         vars: &TemplateVars<'_>,
@@ -747,22 +632,7 @@ impl Automations {
                         _ => return Err("chat probe returned an unexpected reply".into()),
                     },
                 }
-                // probe 2, the AUTHORIZATION one, and the only probe that is
-                // not about whether chat would ACCEPT the post: it rides out
-                // under `Origin::Module("automations")`, which chat's post
-                // policy admits unconditionally, so nothing downstream can
-                // tell this text is a user's. the rule OWNER's own standing is
-                // the gate — a rule may write only where its owner could have
-                // written by hand. AFTER the existence probe, so a channel
-                // that simply does not exist is named as that.
-                let owner_may_post = self
-                    .owner_access(&*ctx, access, rule, channel_id)
-                    .await
-                    .may_post;
-                if !owner_may_post {
-                    return Err(format!("rule owner may not post to {channel_id}"));
-                }
-                // probe 3: the deterministic message id must be unused — ids
+                // probe 2: the deterministic message id must be unused — ids
                 // are caller-supplied at chat, so a user could pre-post the
                 // composed id to wedge this rule's next fire (id squatting).
                 let req = chat_encode_query(&ChatQuery::Message {
@@ -869,9 +739,6 @@ impl Automations {
                 kind,
                 body_template,
             } => {
-                if *recipient != rule.owner {
-                    return Err("report recipient must be the rule owner".into());
-                }
                 let body = substitute_bounded(body_template, vars);
                 let detail = sdk::wire::encode(
                     &serde_json::json!({ "rule_id": rule.rule_id, "channel_id": event_channel, "seq": seq, "kind": kind, "body": body }),
@@ -916,84 +783,6 @@ impl Automations {
             .into_iter()
             .find(|view| view.seq == seq)
             .map(|view| blocks_text(&view.head.blocks))
-    }
-
-    /// what the RULE OWNER may do in `channel_id`, per chat's own membership
-    /// and post policy — the decider for BOTH what a rule may observe and
-    /// where it may write. the owner is asked about, never this module: a rule
-    /// fires under `Origin::Module("automations")`, which chat admits
-    /// unconditionally, so the owner's standing is the only thing that can
-    /// keep a rule from reaching past its author.
-    ///
-    /// one lookup per distinct `(owner, channel)` in an event fan-out. past
-    /// [`MAX_ACCESS_PROBES_PER_EVENT`], and on a failed or unexpected reply,
-    /// the answer is [`NO_ACCESS`] — deterministic on every validator, and
-    /// closed.
-    async fn owner_access(
-        &self,
-        ctx: &dyn Ctx,
-        memo: &mut AccessMemo,
-        rule: &Rule,
-        channel_id: &str,
-    ) -> ChannelAccess {
-        let owner = &rule.owner;
-        // Key-held control is immutable and retains at least one key.
-        // Program grants additionally need a live standing/generation read.
-        let current = match &rule.authority {
-            RuleAuthority::Keys => Some(RuleAuthority::Keys),
-            RuleAuthority::Program { .. } => {
-                match memo
-                    .authorities
-                    .iter()
-                    .find(|(account, _)| account == owner)
-                {
-                    Some((_, current)) => current.clone(),
-                    None => {
-                        if memo.probes >= MAX_ACCESS_PROBES_PER_EVENT {
-                            return NO_ACCESS;
-                        }
-                        memo.probes += 1;
-                        let current = identity_account(
-                            ctx,
-                            &self.identity,
-                            identity::IdentityQuery::Get { number: *owner },
-                        )
-                        .await
-                        .ok()
-                        .and_then(|account| authority(&account.control));
-                        memo.authorities.push((*owner, current.clone()));
-                        current
-                    }
-                }
-            }
-        };
-        if current.as_ref() != Some(&rule.authority) {
-            return NO_ACCESS;
-        }
-        let memoized = memo
-            .seen
-            .iter()
-            .find(|((key_owner, key_channel), _)| key_owner == owner && key_channel == channel_id);
-        if let Some((_, access)) = memoized {
-            return *access;
-        }
-        if memo.probes >= MAX_ACCESS_PROBES_PER_EVENT {
-            return NO_ACCESS;
-        }
-        memo.probes += 1;
-        let req = chat_encode_query(&ChatQuery::Access {
-            channel_id: channel_id.to_string(),
-            party: Party::Account(*owner),
-        });
-        let access = match ctx.query(&self.chat, &req).await {
-            Ok(bytes) => match chat_decode_reply(&bytes) {
-                Ok(ChatReply::Access(access)) => access,
-                _ => NO_ACCESS,
-            },
-            Err(_) => NO_ACCESS,
-        };
-        memo.seen.push(((*owner, channel_id.to_string()), access));
-        access
     }
 
     fn matches_channel_and_mention(
@@ -1161,19 +950,17 @@ impl Module for Automations {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // route by the HOST-ASSIGNED origin (spoof-proof): only chat's own
         // follow-ups reach the hook arm; everything else is an admin op. the
-        // hook lane returns HERE, before the owner gate — a rule RUNS under a
-        // module origin and is CREATED under a submitter's, and conflating the
-        // two would either break every fire or leave creation ungated.
+        // hook lane returns HERE, before the submitter is resolved — a rule
+        // RUNS under a module origin and is CREATED under a submitter's.
         let origin = ctx.env().origin.clone();
         let is_chat_hook = origin == Origin::Module(self.chat.clone());
         if is_chat_hook {
             return self.on_chat_event(ctx, &msg.payload).await;
         }
-        // every admin op below is owner-bound, so the submitter is derived
-        // ONCE — before the payload is even decoded — and every arm receives
-        // it. an arm that took no submitter would be the whole class of bug
-        // this gate exists to close.
-        let (submitter, authority) = rule_owner(ctx, &self.identity).await?;
+        // every admin op is submitted under an identity account, resolved ONCE
+        // before the payload is decoded: a create records it as the rule's
+        // creator and keys the per-account quota on it.
+        let submitter = submitting_account(ctx, &self.identity).await?;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             AutomationsMsg::CreateRule {
                 rule_id,
@@ -1181,23 +968,13 @@ impl Module for Automations {
                 action,
             } => {
                 let consensus_time = ctx.env().consensus_time;
-                self.stage_create_rule(
-                    submitter,
-                    authority,
-                    rule_id,
-                    trigger,
-                    action,
-                    consensus_time,
-                )
-                .await
-            }
-            AutomationsMsg::SetEnabled { rule_id, enabled } => {
-                self.stage_set_enabled(&submitter, authority, rule_id, enabled)
+                self.stage_create_rule(submitter, rule_id, trigger, action, consensus_time)
                     .await
             }
-            AutomationsMsg::DeleteRule { rule_id } => {
-                self.stage_delete_rule(&submitter, rule_id).await
+            AutomationsMsg::SetEnabled { rule_id, enabled } => {
+                self.stage_set_enabled(rule_id, enabled).await
             }
+            AutomationsMsg::DeleteRule { rule_id } => self.stage_delete_rule(rule_id).await,
             AutomationsMsg::HookEvent(_) => Err(Error::Module(
                 "hook events must originate from the chat module".into(),
             )),

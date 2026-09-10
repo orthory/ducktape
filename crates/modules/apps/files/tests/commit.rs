@@ -429,24 +429,35 @@ fn case6_rm_mv_mkdir_symlink() {
 fn case7_authority() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
-    // ext:bob writing under alice's home → reject (home is owner-gated).
-    let alice_owner = format!("ext:{}", to_hex(b"alice"));
-    let alice_home = format!("/home/{alice_owner}/secret");
-    let err = commit(
+    // ext:bob writing under alice's home lands: a home's label is attribution.
+    let alice_label = format!("ext:{}", to_hex(b"alice"));
+    let alice_home = format!("/home/{alice_label}/note");
+    commit(
         &mut f,
         ext(b"bob"),
         1,
         None,
         vec![put_inline(&alice_home, b"x")],
     )
-    .expect_err("bob cannot write alice's home");
+    .expect("bob writes under alice's home");
+    commit_block(&mut f);
+    assert!(stat(&f, &alice_home, None).is_some());
+    // ext:bob writing outside /home and /shared → reject.
+    let err = commit(
+        &mut f,
+        ext(b"bob"),
+        2,
+        None,
+        vec![put_inline("/etc/passwd", b"x")],
+    )
+    .expect_err("bob cannot write outside the namespaces");
     assert!(matches!(err, sdk::Error::Module(_)));
     abort_block(&mut f);
     // system writes anywhere (bypasses /home + /shared authority).
     commit(
         &mut f,
         sdk::Origin::System,
-        2,
+        3,
         None,
         vec![put_inline("/genesis/seed", b"s")],
     )

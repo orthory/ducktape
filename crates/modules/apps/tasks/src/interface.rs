@@ -3,10 +3,10 @@
 //! this module hosts TWO boards behind one consensus module id:
 //!
 //! * the **task board** (assigned-list kind): ordered human task lists. writes
-//!   go via [`TaskMsg`]; reads via [`TaskQuery`] -> [`TaskReply`]. no claims,
-//!   but [`Task::owner`] IS origin-derived identity, the same convention the
-//!   job board uses for `submitter`/`worker`: `UpdateStatus` and `DeleteTask`
-//!   are gated to the task's owner.
+//!   go via [`TaskMsg`]; reads via [`TaskQuery`] -> [`TaskReply`]. no claims;
+//!   [`Task::owner`] is origin-derived attribution and the per-owner census
+//!   key, the same convention the job board uses for `submitter`/`worker`.
+//!   any member's `UpdateStatus` and `DeleteTask` land on any task.
 //! * the **job board** (first-claim kind): a consensus-native work board. a
 //!   submitter posts a job, any worker claims it, exactly one claim wins by
 //!   consensus order, the claimant processes off-platform and reports a result.
@@ -40,6 +40,7 @@ pub struct Task {
     pub title: String,
     pub status: TaskStatus,
     /// Stable owning account, or the authenticated non-account creator.
+    /// attribution and the per-owner census key; no op needs its consent.
     pub owner: Party,
     pub created_at: u64,
     pub updated_at: u64,
@@ -57,16 +58,16 @@ pub enum TaskMsg {
     CreateTask {
         task_id: String,
         title: String,
-        /// A module may assign another existing account; other origins may
-        /// name only their own account. None derives ownership from origin.
+        /// Any origin may name any existing account as the owner. None
+        /// derives ownership from origin.
         #[serde(default)]
         owner: Option<AccountNumber>,
     },
-    /// move a task's status. gated to [`Task::owner`] -- anyone else's op
-    /// fails the block.
+    /// move a task's status. any member's op lands on any task.
     UpdateStatus { task_id: String, status: TaskStatus },
-    /// remove a task's record entirely and free its board slot. gated to
-    /// [`Task::owner`], the board's only way to recede from [`crate::MAX_TASKS`].
+    /// remove a task's record entirely and free its board slot, the board's
+    /// only way to recede from [`crate::MAX_TASKS`]. any member's op lands on
+    /// any task; the slot freed is [`Task::owner`]'s.
     DeleteTask { task_id: String },
 }
 
@@ -210,9 +211,10 @@ pub enum JobsMsg {
     Release { job_id: String },
     /// permissionless requeue of a `Processing` job whose lease has expired.
     Reclaim { job_id: String },
-    /// the submitter cancels a still-`Pending` job.
+    /// any member cancels a still-`Pending` job.
     Cancel { job_id: String },
-    /// the submitter removes a terminal job's record entirely.
+    /// any member removes a terminal job's record entirely; the slot freed
+    /// is the submitter's.
     Prune { job_id: String },
     /// register the caller module as a worker notified on every successful submit.
     RegisterWorker {},

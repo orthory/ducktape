@@ -1894,7 +1894,6 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     app.thread_selected_rev = 1;
     app.thread_message_action = MessageAction::Editing;
     app.thread_edit_draft = "half typed too".into();
-    app.forge_repo_menu = true;
     app.page_delete_armed = true;
     app.fs_delete_target = "/shared/report.md".into();
 
@@ -1908,7 +1907,6 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.thread_edit_draft, "");
     assert_eq!(app.thread_selected_seq, 0);
     assert_eq!(app.thread_selected_rev, 0);
-    assert!(!app.forge_repo_menu);
     assert!(
         !app.page_delete_armed,
         "an armed delete never rides a tab move"

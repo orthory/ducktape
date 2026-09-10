@@ -690,7 +690,6 @@ fn push_refused(repo: &str, reason: &'static str, detail: &str) {
 fn push_refusal_reason(message: &str) -> &'static str {
     const KNOWN: &[(&str, &str)] = &[
         ("non-fast-forward", "non_fast_forward"),
-        ("only the owner", "owner_mismatch"),
         ("requires an authenticated external origin", "unsigned"),
         ("offered no push-cert", "push_cert_unoffered"),
         ("signature does not verify", "bad_cert_signature"),
@@ -785,11 +784,11 @@ pub(crate) async fn git_receive_pack(
     //   principal — right for a node seeding or republishing its own repo,
     //   and what the agent-run lane pushing back into this node presents.
     //
-    // A push with neither used to be accepted and RE-SIGNED WITH THE NODE'S
-    // KEY, so the first unsigned push to a new repo made this node's raw
-    // pubkey the permanent owner and every later signed push was refused as
-    // "only the owner" (#1292). The data-plane signature is NOT a third way:
-    // it covers a body digest, and `git push` computes the packfile itself.
+    // A push with neither is refused rather than re-signed with the node's
+    // key: the signer is who the push is attributed to, and the node speaks
+    // for itself only when its operator says so. The data-plane signature is
+    // NOT a third way: it covers a body digest, and `git push` computes the
+    // packfile itself.
     //
     // checked here, BEFORE `parse_push_commands` (a signed push's certificate
     // parse: base64 dearmor + certificate text parse), rather than after: a

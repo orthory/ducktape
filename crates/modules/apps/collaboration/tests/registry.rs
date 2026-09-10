@@ -58,27 +58,31 @@ fn a_second_registration_of_one_id_is_refused() {
         let refusal = apply(&mut module, &mut other, register("alice"))
             .await
             .unwrap_err();
-        assert!(format!("{refusal:?}").contains("already exists"), "{refusal:?}");
+        assert!(
+            format!("{refusal:?}").contains("already exists"),
+            "{refusal:?}"
+        );
     });
 }
 
 #[test]
-fn only_the_conversation_owner_edits_its_roster() {
+fn any_member_edits_a_conversations_roster() {
     block_on(async {
         let mut module = module();
         let mut owner = at(1, Origin::External(key(1)));
         ok(&mut module, &mut owner, register("alice")).await;
         ok(&mut module, &mut owner, conversation("c1")).await;
 
+        // a member who neither created the conversation nor registered the
+        // participant seats it, and unseats it again.
         let mut stranger = at(2, Origin::External(key(7)));
-        let refusal = apply(
+        ok(
             &mut module,
             &mut stranger,
             seat("c1", "alice", Some(Role::Member)),
         )
-        .await
-        .unwrap_err();
-        assert!(format!("{refusal:?}").contains("only the owner"), "{refusal:?}");
+        .await;
+        ok(&mut module, &mut stranger, seat("c1", "alice", None)).await;
     });
 }
 
@@ -95,7 +99,10 @@ fn an_unregistered_participant_cannot_be_seated() {
         )
         .await
         .unwrap_err();
-        assert!(format!("{refusal:?}").contains("no participant"), "{refusal:?}");
+        assert!(
+            format!("{refusal:?}").contains("no participant"),
+            "{refusal:?}"
+        );
     });
 }
 
@@ -138,19 +145,35 @@ fn binding_replacement_requires_the_expected_credential() {
 }
 
 #[test]
-fn a_service_key_cannot_issue_its_own_binding() {
+fn a_service_key_issues_its_own_binding() {
     block_on(async {
         let scene = scene("c1").await;
         let mut module = scene.module;
 
+        // the service key binds itself, then sends under the credential the
+        // binding drew: what the binding authorizes is the principal it names.
         let mut service = at(2, Origin::External(key(10)));
-        let refusal = apply(&mut module, &mut service, bind("c1", "alice", key(10), 0))
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{refusal:?}").contains("only the owner may bind"),
-            "a service cannot promote itself: {refusal:?}"
-        );
+        ok(&mut module, &mut service, bind("c1", "alice", key(10), 0)).await;
+        let CollaborationReply::Binding(Some(view)) = read(
+            &module,
+            &service,
+            "alice",
+            Some("c1"),
+            ProtectedRead::Binding {
+                conversation_id: "c1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("the service reads its own binding");
+        };
+        assert_eq!(view.credential, 2);
+        ok(
+            &mut module,
+            &mut service,
+            CollaborationMsg::Send(note("c1", "alice", "bob", 2, 1, 100)),
+        )
+        .await;
     });
 }
 
@@ -179,8 +202,18 @@ fn two_devices_of_one_participant_hold_disjoint_sequence_spaces() {
             ok(&mut module, &mut a, seat(room, "alice", Some(Role::Member))).await;
             ok(&mut module, &mut a, seat(room, "bob", Some(Role::Member))).await;
         }
-        ok(&mut module, &mut a, bind("c1", "alice", device_1.clone(), 0)).await;
-        ok(&mut module, &mut a, bind("c2", "alice", device_2.clone(), 0)).await;
+        ok(
+            &mut module,
+            &mut a,
+            bind("c1", "alice", device_1.clone(), 0),
+        )
+        .await;
+        ok(
+            &mut module,
+            &mut a,
+            bind("c2", "alice", device_2.clone(), 0),
+        )
+        .await;
 
         let CollaborationReply::Binding(Some(one)) = read(
             &module,
@@ -297,7 +330,12 @@ fn replacing_one_binding_leaves_a_sibling_conversation_attached() {
         };
 
         // replace the c1 attachment only.
-        ok(&mut module, &mut a, bind("c1", "alice", key(12), before.credential - 1)).await;
+        ok(
+            &mut module,
+            &mut a,
+            bind("c1", "alice", key(12), before.credential - 1),
+        )
+        .await;
 
         let CollaborationReply::Binding(Some(after)) = read(
             &module,
@@ -332,7 +370,14 @@ fn revoking_a_roster_seat_detaches_that_binding() {
         // the service key can no longer read as the participant: its binding
         // is spent, so `via` no longer authenticates it.
         let service = at(3, Origin::External(key(10)));
-        let reply = read(&module, &service, "alice", Some("c1"), ProtectedRead::Participant).await;
+        let reply = read(
+            &module,
+            &service,
+            "alice",
+            Some("c1"),
+            ProtectedRead::Participant,
+        )
+        .await;
         assert_eq!(
             reply,
             CollaborationReply::Denied(DenyReason::NotReader),
@@ -383,7 +428,7 @@ fn a_revoked_participant_stops_admitting_on_every_credential() {
 }
 
 #[test]
-fn a_detached_service_key_cannot_send_or_unbind() {
+fn a_detached_service_key_cannot_send_and_any_member_unbinds() {
     block_on(async {
         let scene = scene("c1").await;
         let mut module = scene.module;
@@ -404,6 +449,8 @@ fn a_detached_service_key_cannot_send_or_unbind() {
             "a replaced device is fenced: {refusal:?}"
         );
 
+        // the replaced credential no longer names the binding, so an unbind
+        // naming it is refused whoever sends it.
         let refusal = apply(
             &mut module,
             &mut stale,
@@ -415,7 +462,37 @@ fn a_detached_service_key_cannot_send_or_unbind() {
         )
         .await
         .unwrap_err();
-        assert!(format!("{refusal:?}").contains("only the owner"), "{refusal:?}");
+        assert!(
+            format!("{refusal:?}").contains("not the expected"),
+            "{refusal:?}"
+        );
+
+        // any member releases the live binding by naming its credential.
+        let mut stranger = at(4, Origin::External(key(99)));
+        ok(
+            &mut module,
+            &mut stranger,
+            CollaborationMsg::Unbind {
+                conversation_id: "c1".into(),
+                participant_id: "alice".into(),
+                expected_credential: 3,
+            },
+        )
+        .await;
+        let CollaborationReply::Binding(Some(view)) = read(
+            &module,
+            &owner,
+            "alice",
+            None,
+            ProtectedRead::Binding {
+                conversation_id: "c1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("the owner reads the released binding");
+        };
+        assert!(view.detached, "the stranger's unbind landed");
     });
 }
 
@@ -441,12 +518,7 @@ fn a_bound_program_account_sends_under_its_credential() {
         ok(
             &mut module,
             &mut owner,
-            bind_to(
-                "c1",
-                "alice",
-                BoundPrincipal::Program(AGENT_ACCOUNT),
-                0,
-            ),
+            bind_to("c1", "alice", BoundPrincipal::Program(AGENT_ACCOUNT), 0),
         )
         .await;
         let credential = credential_of(&module, &owner, "alice", "c1").await;
@@ -490,12 +562,7 @@ fn a_module_origin_never_authenticates_as_a_bound_principal() {
         ok(
             &mut module,
             &mut owner,
-            bind_to(
-                "c1",
-                "alice",
-                BoundPrincipal::Program(AGENT_ACCOUNT),
-                0,
-            ),
+            bind_to("c1", "alice", BoundPrincipal::Program(AGENT_ACCOUNT), 0),
         )
         .await;
         let credential = credential_of(&module, &owner, "alice", "c1").await;
@@ -545,12 +612,7 @@ fn a_different_program_account_is_not_the_bound_one() {
         ok(
             &mut module,
             &mut owner,
-            bind_to(
-                "c1",
-                "alice",
-                BoundPrincipal::Program(AGENT_ACCOUNT),
-                0,
-            ),
+            bind_to("c1", "alice", BoundPrincipal::Program(AGENT_ACCOUNT), 0),
         )
         .await;
         let credential = credential_of(&module, &owner, "alice", "c1").await;

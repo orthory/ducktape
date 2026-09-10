@@ -641,10 +641,8 @@ struct ForgeProps<'a> {
     repos: &'a [crate::backend::ForgeRepo],
     list_phase: &'static str,
     open_repo: &'a str,
-    repo_menu: bool,
     repo_phase: &'static str,
     branches: &'a [crate::backend::ForgeBranch],
-    branch_menu: bool,
     tree_branch: &'a str,
     tab: &'static str,
     items: &'a [crate::backend::ForgeItem],
@@ -721,10 +719,8 @@ pub fn forge_view(
     repos: &[crate::backend::ForgeRepo],
     list_phase: crate::ForgePhase,
     open_repo: &str,
-    repo_menu: bool,
     repo_phase: crate::ForgePhase,
     branches: &[crate::backend::ForgeBranch],
-    branch_menu: bool,
     tree_branch: &str,
     tab: crate::ForgeTab,
     items: &[crate::backend::ForgeItem],
@@ -788,10 +784,8 @@ pub fn forge_view(
         repos,
         list_phase: forge_phase_word(list_phase),
         open_repo,
-        repo_menu,
         repo_phase: forge_phase_word(repo_phase),
         branches,
-        branch_menu,
         tree_branch,
         tab: match tab {
             crate::ForgeTab::Code => "code",
@@ -887,8 +881,6 @@ pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
     match event.kind.as_str() {
         "open_repo" => Intent::OpenRepo,
         "close_repo" => Intent::CloseRepo,
-        "toggle_repo_menu" => Intent::ToggleRepoMenu,
-        "toggle_branch_menu" => Intent::ToggleBranchMenu,
         "branch" => Intent::Branch,
         "tab" => Intent::Tab,
         "open_item" => Intent::OpenItem,
@@ -1898,6 +1890,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "save",
             "register",
             "open_run",
+            "open_link",
             "messaging_open",
             "messaging_page",
             "messaging_send",
@@ -1970,7 +1963,7 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "forge" => &[
             "open_repo",
             "close_repo",
-            "toggle_repo_menu",
+            "branch",
             "tab",
             "open_item",
             "close_item",
@@ -4214,6 +4207,7 @@ pub(crate) mod tests {
                 "save",
                 "register",
                 "open_run",
+                "open_link",
                 "messaging_open",
                 "messaging_page",
                 "messaging_send",
@@ -4230,6 +4224,79 @@ pub(crate) mod tests {
             !chat.contains(&"composer"),
             "a submit reaches the app only through the composer surface it was typed in"
         );
+    }
+
+    /// Every kind a module's decoder names is admitted at that module's
+    /// door, so a view never emits an intent the app knows how to decode
+    /// but refuses to hear. The kinds a decoder names off its door are
+    /// exactly the ones that cross by another route: a host surface's own
+    /// event, or the composer's submit. In the other direction the door
+    /// admits nothing the decoder leaves to its wildcard, except the kind
+    /// the wildcard's verdict itself names.
+    #[test]
+    fn every_kind_a_decoder_names_is_admitted_at_its_door() {
+        use std::collections::BTreeSet;
+        let (source, _tests) = include_str!("module_view.rs")
+            .split_once("\npub(crate) mod tests {")
+            .expect("the tests module");
+        let other_route_only: [(&str, &str, &[&str]); 11] = [
+            ("governance", "gov_intent", &[]),
+            ("members", "roster_intent", &[]),
+            ("agents", "agents_intent", &[]),
+            ("node", "node_intent", &["log_timeline"]),
+            ("explorer", "explorer_intent", &[]),
+            ("settings", "settings_intent", &[]),
+            ("forge", "forge_intent", &[]),
+            ("shell", "shell_intent", &["send"]),
+            ("pages", "pages_intent", &["edited"]),
+            ("chat", "chat_intent", &["composer"]),
+            ("files", "files_intent", &[]),
+        ];
+        let snake = |variant: &str| -> String {
+            let mut word = String::new();
+            for (index, letter) in variant.chars().enumerate() {
+                let starts_a_word = letter.is_ascii_uppercase() && index > 0;
+                if starts_a_word {
+                    word.push('_');
+                }
+                word.push(letter.to_ascii_lowercase());
+            }
+            word
+        };
+        for (module, decoder, other_routes) in other_route_only {
+            let header = format!("pub fn {decoder}(event: &ModuleViewEvent)");
+            let body = &source[source.find(&header).expect(decoder)..];
+            let body = &body[..body.find("\n}\n").expect("the decoder's end")];
+            let mut arms = BTreeSet::new();
+            let mut wildcard_verdict = None;
+            for line in body.lines().map(str::trim) {
+                let named_arm = line
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split_once("\" =>"))
+                    .map(|(kind, _)| kind);
+                if let Some(kind) = named_arm {
+                    arms.insert(kind);
+                }
+                if let Some(verdict) = line.strip_prefix("_ => ") {
+                    let variant = verdict.trim_end_matches(',').rsplit("::").next();
+                    wildcard_verdict = variant.map(snake);
+                }
+            }
+            let door: BTreeSet<&str> = intents_of(module).iter().copied().collect();
+            let off_door: Vec<&str> = arms.difference(&door).copied().collect();
+            assert_eq!(
+                off_door, other_routes,
+                "{module}: {decoder} names a kind the door refuses"
+            );
+            let left_to_the_wildcard: Vec<&str> = door.difference(&arms).copied().collect();
+            let wildcard_verdict = wildcard_verdict.expect("a total decoder ends in a wildcard");
+            assert!(
+                left_to_the_wildcard
+                    .iter()
+                    .all(|kind| *kind == wildcard_verdict),
+                "{module}: the door admits {left_to_the_wildcard:?}, which {decoder} decodes only by its wildcard ({wildcard_verdict})"
+            );
+        }
     }
 
     /// A roster intent is read field by field off its JSON; a missing or
@@ -4630,6 +4697,92 @@ pub(crate) mod tests {
         }
         assert!(guest.intents.is_empty());
         assert!(guest.fault.is_none());
+    }
+
+    #[test]
+    fn the_staged_agents_view_renders_semantic_actions_and_opens_the_exact_target() {
+        let Some(staged) = staged("agents") else {
+            return;
+        };
+        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
+        let run = crate::backend::RunRow {
+            run_id: "machine-run-hash".into(),
+            dispatch_id: "machine-dispatch-hash".into(),
+            agent_id: "reviewer".into(),
+            agent_name: "Reviewer".into(),
+            origin: "#Engineering · Message 42".into(),
+            state: "running".into(),
+            dispatched: "h 1".into(),
+            settled: String::new(),
+            attempt: 1,
+            holder: String::new(),
+            actions: 1,
+            degraded: false,
+            reason: String::new(),
+            output_ref: String::new(),
+            pr_number: 0,
+        };
+        let target = crate::backend::RunLink {
+            relation: "target".into(),
+            kind: "chat".into(),
+            label: "#Engineering · Eddy: Bound and scroll".into(),
+            url: "duck://channel/room?net=a1b2c3d4#42".into(),
+        };
+        let journal = crate::backend::RunJournal {
+            dispatch_id: run.dispatch_id.clone(),
+            entries: vec![crate::backend::JournalEntry {
+                height: "h 2".into(),
+                kind: "action".into(),
+                summary: "React 👀".into(),
+                status: "Completed".into(),
+                targets: vec![target.clone()],
+            }],
+            ..Default::default()
+        };
+        let props = Some(agents_props(
+            false,
+            true,
+            true,
+            "7",
+            0,
+            &[],
+            std::slice::from_ref(&run),
+            &run.dispatch_id,
+            1,
+            &journal,
+            &crate::backend::LiveRun::default(),
+            &[],
+            &[],
+            &crate::backend::MessagingView::default(),
+            false,
+            false,
+            "",
+            0,
+        ));
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["React 👀", "Completed", &target.label] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(
+            !shown
+                .iter()
+                .any(|text| text.contains("machine-dispatch-hash"))
+        );
+        assert!(guest.fault.is_none());
+        guest.deliver(Output::Activate(button_message(&guest, &target.label)));
+        guest.redraw(&props);
+        let intent = guest.intents.last().expect("target navigation");
+        assert_eq!(intent.kind, "open_link");
+        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
+            target.url
+        );
     }
 
     /// The BUNDLED Agents view's messages pane, end to end through the host:
@@ -6243,6 +6396,141 @@ pub(crate) mod tests {
         );
         assert!(original.is_char_boundary(insertion));
         assert!(cursor.selection.is_none());
+        // A second press must replace the first selection anchor before any
+        // subsequent drag or edit. Drive the native queue and actual Pages guest.
+        macro_rules! pointer_step {
+            ($event:expr, $point:expr) => {{
+                let point = $point;
+                let mut outputs = Vec::new();
+                ui.update(
+                    &[$event],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+                loop {
+                    for output in outputs.drain(..) {
+                        guest.deliver(output);
+                    }
+                    settle(&mut guest, &props);
+                    ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                    if !guest.inputs.editor_transactions_pending() {
+                        break;
+                    }
+                    ui.update(
+                        &[Event::Window(
+                            window::Event::RedrawRequested(Instant::now()),
+                        )],
+                        mouse::Cursor::Available(point),
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut outputs,
+                    );
+                }
+                guest
+                    .inputs
+                    .editor_document(&editor_key)
+                    .unwrap()
+                    .reference()
+                    .cursor
+            }};
+        }
+        let a = iced::Point::new(bounds.x + 66.0, bounds.y + 10.0);
+        let a_end = iced::Point::new(bounds.x + 100.0, bounds.y + 10.0);
+        let b = iced::Point::new(bounds.x + 140.0, bounds.y + 10.0);
+        let b_end = iced::Point::new(bounds.x + 80.0, bounds.y + 10.0);
+        let first = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            a
+        );
+        let first_drag = pointer_step!(
+            Event::Mouse(mouse::Event::CursorMoved { position: a_end }),
+            a_end
+        );
+        assert_eq!(
+            first_drag.selection,
+            Some(first.position),
+            "first drag must establish A"
+        );
+        let first_released = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            a_end
+        );
+        let first_moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: b }), b);
+        assert_eq!(
+            first_moved, first_released,
+            "first selection followed the pointer after release"
+        );
+        let second = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            b
+        );
+        assert_ne!(
+            second.position, first.position,
+            "second press must land away from A"
+        );
+        assert_eq!(
+            second.selection, None,
+            "new Pages press B retained first drag anchor A"
+        );
+        let second_drag = pointer_step!(
+            Event::Mouse(mouse::Event::CursorMoved { position: b_end }),
+            b_end
+        );
+        assert_eq!(
+            second_drag.selection,
+            Some(second.position),
+            "second drag must anchor at B, not A"
+        );
+        let released = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            b_end
+        );
+        let moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
+        assert_eq!(
+            moved, released,
+            "movement after release must not change selection"
+        );
+        // Repeat without guest redraws between inputs: the next drag arrives
+        // while the previous press/selection/release still await acknowledgment.
+        for (event, point) in [
+            (mouse::Event::ButtonPressed(mouse::Button::Left), a),
+            (mouse::Event::CursorMoved { position: a_end }, a_end),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), a_end),
+            (mouse::Event::ButtonPressed(mouse::Button::Left), b),
+            (mouse::Event::CursorMoved { position: b_end }, b_end),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), b_end),
+        ] {
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+        }
+        let burst = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
+        assert_eq!(
+            burst, released,
+            "queued second drag must use B and stop on release"
+        );
+        let restored = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            pointer.position().unwrap()
+        );
+        assert_eq!(
+            restored, cursor,
+            "restore the original caret for the edit below"
+        );
+        pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            pointer.position().unwrap()
+        );
         let mut expected = original.clone();
         expected.insert(insertion, 'X');
         guest.intents.clear();
@@ -6571,8 +6859,8 @@ pub(crate) mod tests {
           "tier": "validator", "network_chain_id": "mynet#d0cdf950",
           "connected_rpc": "http://127.0.0.1:1",
           "repos": [{"name": "core", "head": "main"}],
-          "list_phase": "ready", "open_repo": "", "repo_menu": false,
-          "repo_phase": "idle", "branches": [], "branch_menu": false, "tree_branch": "", "tab": "code", "items": [],
+          "list_phase": "ready", "open_repo": "",
+          "repo_phase": "idle", "branches": [], "tree_branch": "", "tab": "code", "items": [],
           "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
           "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
           "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
@@ -8181,8 +8469,8 @@ pub(crate) mod tests {
               "tier": "validator", "network_chain_id": "mynet#d0cdf950",
               "connected_rpc": "http://127.0.0.1:1",
               "repos": [{"name": "core", "head": "main"}],
-              "list_phase": "ready", "open_repo": "core", "repo_menu": false,
-              "repo_phase": "ready", "branches": [{"name": "main", "head": "1111"}], "branch_menu": false, "tree_branch": "main", "tab": "issues", "items": [],
+              "list_phase": "ready", "open_repo": "core",
+              "repo_phase": "ready", "branches": [{"name": "main", "head": "1111"}], "tree_branch": "main", "tab": "issues", "items": [],
               "forge_item_number": 7, "item_phase": "ready", "forge_item_kind": "issue",
               "forge_item_title": "Bound every list", "forge_item_state": "open",
               "forge_item_author": "duck", "forge_item_branches": "", "forge_item_body": "",
