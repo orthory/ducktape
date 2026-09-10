@@ -167,8 +167,8 @@ async fn collab_plane(
     // delivery settles `DeliveryUnknown` — degraded, and honest, which is the
     // right trade against reclaiming an address that may belong to a live
     // session.
-    let receipts = match claude_sockets_dir() {
-        Some(dir) => match agent_service::messaging::claude::Receipts::bind(&dir).await {
+    let receipts =
+        match agent_service::messaging::claude::Receipts::bind(&claude_sockets_dir()).await {
             Ok(receipts) => Some(receipts),
             Err(error) => {
                 tracing::warn!(
@@ -179,9 +179,7 @@ async fn collab_plane(
                 );
                 None
             }
-        },
-        None => None,
-    };
+        };
     let plane = agent_service::messaging::Deliveries::open(
         &service.storage_dir.join("collab"),
         // the chain id, which is what this network IS. A directory that has
@@ -221,11 +219,43 @@ fn claude_registry() -> Option<std::path::PathBuf> {
     Some(home.join("sessions"))
 }
 
-/// where the per-session inboxes live, and where this daemon binds the address
-/// a recipient answers verdicts to.
-fn claude_sockets_dir() -> Option<std::path::PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    Some(std::path::PathBuf::from(runtime).join("cc-socks"))
+/// where Claude Code binds a session's inbox on this host, by its own rule —
+/// and so where this daemon binds the address a recipient answers verdicts
+/// to: a reply address beside the session's own socket is one a session
+/// answers without further checks. The rule: `$XDG_RUNTIME_DIR`, else the
+/// temp dir (`$TMPDIR`, `$TMP`, `$TEMP`, else `/tmp`), plus `cc-socks`; and
+/// when a socket path there would not fit a socket address,
+/// `/tmp/cc-socks-<uid>` instead. Every input is an environment fact, so the
+/// answer is the same rule on every host rather than a host's own case.
+fn claude_sockets_dir() -> std::path::PathBuf {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let temp_dir = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .find_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    // SAFETY: `getuid` reads the calling process's real uid and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    claude_sockets_dir_from(runtime_dir.as_deref(), &temp_dir, std::process::id(), uid)
+}
+
+/// The longest socket path Claude Code binds under the default directory;
+/// past it the per-user directory under `/tmp` is used. A unix socket
+/// address holds 104 bytes on macOS, NUL included.
+const SOCKET_PATH_BYTES: usize = 103;
+
+fn claude_sockets_dir_from(
+    runtime_dir: Option<&std::path::Path>,
+    temp_dir: &std::path::Path,
+    pid: u32,
+    uid: u32,
+) -> std::path::PathBuf {
+    let default = runtime_dir.unwrap_or(temp_dir).join("cc-socks");
+    let socket_fits = default.join(format!("{pid}.sock")).as_os_str().len() <= SOCKET_PATH_BYTES;
+    if socket_fits {
+        return default;
+    }
+    std::path::PathBuf::from(format!("/tmp/cc-socks-{uid}"))
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.
@@ -251,6 +281,33 @@ mod tests {
         assert_eq!(
             ws_url("http://127.0.0.1:8844/"),
             "ws://127.0.0.1:8844/v1/ws"
+        );
+    }
+
+    /// The receipt address goes where Claude Code puts a session's own
+    /// socket on this host: the runtime dir where there is one, the temp
+    /// dir where there is not, and the per-user `/tmp` directory when a
+    /// socket path under the temp dir would not fit a socket address.
+    #[test]
+    fn the_receipt_address_sits_where_claude_code_binds_its_own() {
+        use std::path::Path;
+        assert_eq!(
+            claude_sockets_dir_from(Some(Path::new("/run/user/1000")), Path::new("/tmp"), 4242, 1000),
+            Path::new("/run/user/1000/cc-socks")
+        );
+        assert_eq!(
+            claude_sockets_dir_from(
+                None,
+                Path::new("/var/folders/9k/1kcv0c8s6xz2c9b1f4s7x0y40000gn/T/"),
+                4242,
+                501
+            ),
+            Path::new("/var/folders/9k/1kcv0c8s6xz2c9b1f4s7x0y40000gn/T/cc-socks")
+        );
+        let deep = format!("/{}", "d".repeat(SOCKET_PATH_BYTES));
+        assert_eq!(
+            claude_sockets_dir_from(None, Path::new(&deep), 4242, 501),
+            Path::new("/tmp/cc-socks-501")
         );
     }
 
