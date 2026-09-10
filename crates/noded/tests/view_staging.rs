@@ -89,7 +89,7 @@ fn declared_views_become_pending_restore_and_remove_only_with_ownership() {
 #[test]
 fn desktop_globals_are_never_module_views() {
     let scratch = tempfile::tempdir().unwrap();
-    for id in ["members", "agents", "shell", "node", "explorer", "settings"] {
+    for id in ["members", "agents", "node", "explorer", "settings"] {
         let package = scratch.path().join("crates/views").join(id);
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();

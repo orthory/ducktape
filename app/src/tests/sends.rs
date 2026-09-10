@@ -645,7 +645,7 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
 /// in `rooms.rs` pins that no handler can reach a composer to mark it.
 #[test]
 fn the_keyboard_subscription_no_longer_marks_a_composer() {
-    const HANDLERS: [(&str, &str); 11] = [
+    const HANDLERS: [(&str, &str); 10] = [
         ("chat", include_str!("../ui/handlers/chat.ice")),
         ("files", include_str!("../ui/handlers/files.ice")),
         ("forge", include_str!("../ui/handlers/forge.ice")),
@@ -656,11 +656,10 @@ fn the_keyboard_subscription_no_longer_marks_a_composer() {
         ("overlays", include_str!("../ui/handlers/overlays.ice")),
         ("pages", include_str!("../ui/handlers/pages.ice")),
         ("roster", include_str!("../ui/handlers/roster.ice")),
-        ("shell", include_str!("../ui/handlers/shell.ice")),
     ];
 
     // `app.ice` is the real registry; the list above is a hand copy of it, and
-    // a twelfth handler file would otherwise ship unscanned.
+    // an eleventh handler file would otherwise ship unscanned.
     for line in include_str!("../ui/app.ice").lines() {
         let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
             continue;

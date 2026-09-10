@@ -908,8 +908,6 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
               match tab
                 ShellTab.chat
                   slot chat
-                ShellTab.shell
-                  slot shell
                 ShellTab.pages
                   slot pages
                 ShellTab.forge

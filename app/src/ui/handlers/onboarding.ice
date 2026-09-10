@@ -416,9 +416,6 @@ on network_entered
   invalidate lane=forge_item
   invalidate lane=forge_discussion
   invalidate lane=files_preview
-  invalidate lane=shell_credentials
-  invalidate lane=shell_terminal
-  invalidate lane=shell_chat
   invalidate lane=page_autosave
   wall_now = current_wall_seconds()
   connected = false
@@ -443,33 +440,6 @@ on network_entered
   chat_at_tail = true
   node_log_filter = ""
   node_log_timeline = node_log_timeline_reset()
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials = []
-  shell_identities = []
-  shell_identity_options = []
-  shell_identity = ""
-  shell_provider = "codex"
-  shell_credential = ""
-  shell_credentials_loading = false
-  shell_setup_open = false
-  shell_host_nodes = []
-  shell_host_node_options = ["This node"]
-  shell_host_node = "This node"
-  shell_host_node_key = ""
-  shell_terminal = idle_agent_terminal()
-  shell_terminal_running = false
-  shell_terminal_busy = false
-  shell_terminal_title = ""
-  shell_terminal_error = ""
-  shell_chat_entries = []
-  shell_chat_activity = []
-  shell_draft_cleared = shell_composer_clear()
-  shell_chat_busy = false
-  shell_chat_status = ""
-  shell_chat_detail = ""
-  shell_chat_live = ""
-  shell_chat_saga = ""
-  shell_detached_saga = ""
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
@@ -764,19 +734,6 @@ on switch_network
   account_ceremony_detail = ""
   account_ceremony_left = ""
   invalidate lane=page_autosave
-  invalidate lane=shell_credentials
-  invalidate lane=shell_terminal
-  invalidate lane=shell_chat
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = false
-  shell_terminal = idle_agent_terminal()
-  shell_terminal_running = false
-  shell_terminal_busy = false
-  shell_terminal_title = ""
-  shell_chat_busy = false
-  shell_chat_status = ""
-  shell_chat_detail = ""
-  shell_chat_live = ""
   task window open onboarding -> onboarding_reopened _
 
 on onboarding_reopened(id)
@@ -812,19 +769,6 @@ on open_account_welcome
   account_ceremony_detail = ""
   account_ceremony_left = ""
   invalidate lane=page_autosave
-  invalidate lane=shell_credentials
-  invalidate lane=shell_terminal
-  invalidate lane=shell_chat
-  shell_credentials_generation = shell_credentials_generation + 1
-  shell_credentials_loading = false
-  shell_terminal = idle_agent_terminal()
-  shell_terminal_running = false
-  shell_terminal_busy = false
-  shell_terminal_title = ""
-  shell_chat_busy = false
-  shell_chat_status = ""
-  shell_chat_detail = ""
-  shell_chat_live = ""
   rpc = connected_rpc
   hub_chain_id = network_chain_id
   task window open onboarding -> welcome_reopened _
