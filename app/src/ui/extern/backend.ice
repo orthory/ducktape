@@ -266,7 +266,6 @@ extern crate::backend
   pure height_label(height:i64) -> str
   pure height_label_short(height:i64) -> str
   pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str
-  pure doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
   pure initial_of(name:&str) -> str
   pure initials_of(name:&str) -> str
   NodeLogLine(cursor:str, line:str)
@@ -323,9 +322,8 @@ extern crate::backend
   pure ceremony_step(phase:str, qr:str, detail:str) -> CeremonyStep
   pure ceremony_phase(step:&CeremonyStep) -> CeremonyPhase
   pure welcome_door(name_draft:&str) -> WelcomeDoor
-  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
-  clear_doc_tabs(rpc:str) -> bool
   ForgeRepo(name:str, head:str)
   ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
@@ -408,17 +406,10 @@ extern crate::backend
   KindCount(kind:str, label:str, count:i64)
   ExplorerResults(hits:[ExplorerHit], kinds:[KindCount], partial:str)
   search_workspace(rpc:str, text:str) -> ExplorerResults
-  pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
-  pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
-  DocTab(id:str, title:str, active:bool)
-  pure doc_tab_rows(tabs:&[str], pages:&[PageItem], active:&str) -> [DocTab]
-  pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
-  load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
   load_desktop_notifications() -> bool
   save_desktop_notifications(enabled:bool) -> bool
-  save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase
   pure mutation_phase_after_recovery(current:MutationPhase) -> MutationPhase
@@ -458,7 +449,6 @@ extern crate::backend
   pure chain_moved(held:str, live:str) -> bool
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
-  pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]

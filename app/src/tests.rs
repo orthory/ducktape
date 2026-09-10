@@ -552,7 +552,6 @@ fn reading_alpha() -> Ducktape {
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.pages = vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")];
-    app.doc_tabs = vec!["alpha".into(), "beta".into()];
     app.active_page = "alpha".into();
     app.active_page_title = "Alpha".into();
     app.active_page_parent = "Root".into();

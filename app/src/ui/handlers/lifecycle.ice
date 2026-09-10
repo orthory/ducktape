@@ -124,7 +124,6 @@ on reconnect
   chat_search_phase = SearchPhase.idle
   chat_search_query = ""
   pages = []
-  doc_tabs = []
   blocks = []
   active_page = ""
   active_page_title = ""
@@ -275,7 +274,6 @@ on workspace_connected(next)
   node_peers_generation = node_peers_generation + 1
   dm_peers_generation = dm_peers_generation + 1
   parallel
-    run replace lane=doc_tabs_load load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
     run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _

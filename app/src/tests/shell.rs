@@ -516,7 +516,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
-            open_tabs: 0,
             user_key: "abcd".into(),
         },
     ));
@@ -1153,9 +1152,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "root state reclaimed `reply_draft`"
     );
     let page_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
-    assert!(!root_state.contains("closing_doc_tab"));
-    assert!(page_handlers.contains("on close_doc_tab(id)"));
-    assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
     assert!(!root_state.contains("page_link"));
     assert!(page_handlers.contains("let page_link = document.link"));
 
