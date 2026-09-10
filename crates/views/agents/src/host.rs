@@ -3,6 +3,7 @@
 
 use iced::futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use ui_lang_guest::host;
 
 /// Presentation only: routing and the expandable receipt retain the full value.
 pub fn compact_run_text(value: &str) -> String {
@@ -23,14 +24,15 @@ pub fn compact_run_text(value: &str) -> String {
 pub fn journal_summary(kind: &str, summary: &str) -> String {
     if kind == "acted" {
         let operation = summary.split(" · ").next().unwrap_or(summary);
+        // Acted records admission to the action queue, not the target's completion.
         let action = match operation {
-            "react" => "Reacted",
-            "unreact" => "Removed reaction",
-            "reply" => "Replied",
-            "agent.call" => "Called an agent",
-            other => other,
+            "react" => "Reaction requested".to_owned(),
+            "unreact" => "Reaction removal requested".to_owned(),
+            "reply" => "Reply requested".to_owned(),
+            "agent.call" => "Agent call requested".to_owned(),
+            other => format!("Requested: {other}"),
         };
-        return format!("✓ {action}");
+        return format!("→ {action}");
     }
     compact_run_text(summary)
 }
@@ -39,7 +41,6 @@ pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
     (width + delta).clamp(280.0, maximum)
 }
-use ui_lang_guest::host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostError {
