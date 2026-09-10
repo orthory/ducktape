@@ -1085,52 +1085,6 @@ impl From<AgentSkill> for runs::SkillRef {
     }
 }
 
-/// The resource grant, list by list: the record's caps as the register shows
-/// them and the editor hands them back.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AgentCaps {
-    pub forge_read: Vec<String>,
-    pub forge_push: Vec<String>,
-    pub duckfs_read: Vec<String>,
-    pub duckfs_write: Vec<String>,
-    pub tools: Vec<String>,
-    pub secrets: Vec<String>,
-    pub pages_write: Vec<String>,
-    pub subagent_budget: i64,
-}
-
-impl From<runs::ResourceCaps> for AgentCaps {
-    fn from(caps: runs::ResourceCaps) -> Self {
-        Self {
-            forge_read: caps.forge_read,
-            forge_push: caps.forge_push,
-            duckfs_read: caps.duckfs_read,
-            duckfs_write: caps.duckfs_write,
-            tools: caps.tools,
-            secrets: caps.secrets,
-            pages_write: caps.pages_write,
-            subagent_budget: i64::from(caps.subagent_budget),
-        }
-    }
-}
-
-impl AgentCaps {
-    fn into_resource_caps(self) -> Result<runs::ResourceCaps, String> {
-        let subagent_budget = u32::try_from(self.subagent_budget)
-            .map_err(|_| "the subagent budget must be a whole number of calls".to_string())?;
-        Ok(runs::ResourceCaps {
-            forge_read: self.forge_read,
-            forge_push: self.forge_push,
-            duckfs_read: self.duckfs_read,
-            duckfs_write: self.duckfs_write,
-            tools: self.tools,
-            secrets: self.secrets,
-            pages_write: self.pages_write,
-            subagent_budget,
-        })
-    }
-}
-
 /// One configured model: its record, whole, with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct AgentRow {
@@ -1148,8 +1102,6 @@ pub struct AgentRow {
     /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -1162,8 +1114,6 @@ pub struct AgentsData {
     /// Every capability tag a node on this network announces — what a
     /// record's `capability` can be dispatched on today.
     pub capabilities: Vec<String>,
-    /// The action vocabulary a grant draws from.
-    pub actions: Vec<String>,
 }
 
 /// Load model configurations with current account controllers and run activity.
@@ -1218,8 +1168,6 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                     status,
                     owner_handle,
                     controller: controller.to_string(),
-                    allowed_actions: record.allowed_actions,
-                    caps: record.caps.into(),
                     skills: record.skills.into_iter().map(AgentSkill::from).collect(),
                 })
             })
@@ -1241,10 +1189,6 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
             agents,
             runs,
             capabilities,
-            actions: runs::KNOWN_ACTIONS
-                .iter()
-                .map(|action| (*action).to_string())
-                .collect(),
         })
     }
     .await
@@ -1878,8 +1822,6 @@ pub struct AgentDraft {
     pub agent_id: String,
     pub display_name: String,
     pub capability: String,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -1902,9 +1844,7 @@ pub async fn save_agent(rpc: String, password: String, draft: String) -> Result<
             agent_id,
             display_name: Some(draft.display_name),
             capability: Some(draft.capability),
-            allowed_actions: Some(draft.allowed_actions),
             recipe_hash: None,
-            caps: Some(draft.caps.into_resource_caps()?),
             skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
         };
         let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
@@ -1954,9 +1894,7 @@ pub async fn register_agent(
             agent_id: draft.agent_id,
             display_name,
             capability: draft.capability,
-            allowed_actions: draft.allowed_actions,
             recipe_hash: None,
-            caps: Some(draft.caps.into_resource_caps()?),
             skills: Some(draft.skills.into_iter().map(runs::SkillRef::from).collect()),
         };
         let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });

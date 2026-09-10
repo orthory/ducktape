@@ -7,28 +7,22 @@ use super::{
 impl RunsModule {
     // ---- admin ops + explicit runs (any other origin) --------------------------------
 
-    async fn controlled_dispatch_id(
+    /// the dispatch id of a run still in flight; `None` for a run that already
+    /// settled (its control op is a no-op), an error for a run never staged.
+    async fn pending_dispatch_id(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
-        action: &str,
     ) -> Result<Option<String>, Error> {
-        let submitter = canonical_origin(&ctx.env().origin)?;
         let dispatch_id = dispatch_id_for(run_id);
-        let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
-            return match self.turn_taken(ctx, &dispatch_id).await {
-                Ok(true) => Ok(None),
-                Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
-                Err(reason) => Err(Error::Module(reason)),
-            };
-        };
-        let controls_program = self.control_model(ctx, entry.account).await.is_ok();
-        if submitter != entry.requester && !controls_program {
-            return Err(Error::Module(format!(
-                "only the run creator or the program controller may {action} a run"
-            )));
+        if self.pending_entry(&dispatch_id).is_some() {
+            return Ok(Some(dispatch_id));
         }
-        Ok(Some(dispatch_id))
+        match self.turn_taken(ctx, &dispatch_id).await {
+            Ok(true) => Ok(None),
+            Ok(false) => Err(Error::Module(format!("unknown run: {run_id}"))),
+            Err(reason) => Err(Error::Module(reason)),
+        }
     }
 
     pub(super) async fn on_admin(
@@ -124,20 +118,6 @@ impl RunsModule {
                     other => canonical_origin(other)?,
                 };
                 reject_run_separator("channel_id", &channel_id)?;
-                // The external requester must be able to post in the channel
-                // whose transcript it asks the model to read. The eventual
-                // program call also passes chat's own account authority gate.
-                if let Origin::External(key) = &ctx.env().origin {
-                    let may_post = self
-                        .may_post(&*ctx, key, &channel_id)
-                        .await
-                        .map_err(Error::Module)?;
-                    if !may_post {
-                        return Err(Error::Module(format!(
-                            "requester may not post to channel: {channel_id}"
-                        )));
-                    }
-                }
                 // the requester's per-run skills, confined to the library by
                 // construction (names, not paths) — see `library_skills`.
                 let extra = envelope::library_skills(&skills).map_err(Error::Module)?;
@@ -244,10 +224,7 @@ impl RunsModule {
                 Ok(())
             }
             RunsMsg::CancelRun { run_id } => {
-                let Some(dispatch_id) = self
-                    .controlled_dispatch_id(&*ctx, &run_id, "cancel")
-                    .await?
-                else {
+                let Some(dispatch_id) = self.pending_dispatch_id(&*ctx, &run_id).await? else {
                     return Ok(());
                 };
                 // cancel through the dispatch plane; the entry stays pending
@@ -261,10 +238,7 @@ impl RunsModule {
                 Ok(())
             }
             RunsMsg::ReassignRun { run_id, attempt } => {
-                let Some(dispatch_id) = self
-                    .controlled_dispatch_id(&*ctx, &run_id, "reassign")
-                    .await?
-                else {
+                let Some(dispatch_id) = self.pending_dispatch_id(&*ctx, &run_id).await? else {
                     return Ok(());
                 };
                 ctx.emit_msg(Msg {

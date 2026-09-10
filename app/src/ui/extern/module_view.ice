@@ -14,7 +14,7 @@ extern crate::module_view
   pure gov_event_proposal(event:&ModuleViewEvent) -> str
   pure gov_event_approves(event:&ModuleViewEvent) -> bool
   component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str], actions:&[str], messaging:&MessagingView, messaging_loading:bool, messaging_sending:bool, messaging_send_error:&str, messaging_sent:i64) -> ModuleViewEvent
+  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str], messaging:&MessagingView, messaging_loading:bool, messaging_sending:bool, messaging_send_error:&str, messaging_sent:i64) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure roster_intent(event:&ModuleViewEvent) -> RosterIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str

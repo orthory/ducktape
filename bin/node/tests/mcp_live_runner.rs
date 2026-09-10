@@ -6,8 +6,8 @@
 //! capability spec's own argv, the model calls its tools, the server signs a
 //! `RunsMsg::AgentAction` frame with the run's session key, the frame crosses the
 //! real router into the real `runs` module — which says NO, because the key is
-//! bound to no live run. the agent HOLDS `tasks.create`; the grant is not what
-//! stops it. the session gate is. a task appearing on the chain here would mean
+//! bound to no live run. nothing about the agent's record stops it; the
+//! session gate is what does. a task appearing on the chain here would mean
 //! that gate can be walked straight past.
 //!
 //! (the positive case — a bound session's write landing as `Party::Account` —
@@ -45,7 +45,7 @@ const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape","arg
 #[test]
 #[ignore = "drives the real `claude` CLI: needs auth, network, and budget"]
 fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
-    let h = Harness::start(&["tasks.create"]);
+    let h = Harness::start();
 
     // the binary under test must be resolvable by BARE NAME, exactly as the
     // provisioner arranges it (path_entries() puts its dir on the run's PATH).
@@ -116,9 +116,9 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     // the model's prose is not evidence — a model will happily claim it called a
     // tool it never reached (it did, repeatedly, while this was built). the node
     // is the oracle, and it must hold NOTHING: the agent's session key is bound
-    // to no live run, so consensus refused the write even though the agent holds
-    // the tasks.create grant. a task appearing here would mean the write bypassed
-    // the session gate entirely — the exact defect this design closes.
+    // to no live run, so consensus refused the write however plainly the agent
+    // asked for it. a task appearing here would mean the write bypassed the
+    // session gate entirely — the exact defect this design closes.
     let reply = h.query("tasks", json!("list"));
     assert!(
         reply["tasks"].as_array().is_none_or(|t| t.is_empty()),

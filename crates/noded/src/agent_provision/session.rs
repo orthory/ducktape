@@ -14,14 +14,14 @@
 //! and that node is the run's committed lease-holder, because it is the node
 //! executing the run. `runs` checks the holder and attempt against the live
 //! saga; retries fence old keys and retain the run's action counter. The
-//! model's grant is already committed as `ModelRecord { owner, allowed_actions,
-//! caps }`; opening the session requires no additional controller signature.
+//! model's record is already committed; opening the session requires no
+//! additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
 //! accepts `RunsMsg::AgentAction` for exactly this run, signs it, waits for the
 //! committed receipt, and dies with the provisioned workspace. A shell can
-//! therefore exercise the committed agent grant but can never recover a
-//! general-purpose frame signer.
+//! therefore act as the run but can never recover a general-purpose frame
+//! signer.
 //!
 //! A refused bind fails provisioning. An agent run never starts with a
 //! silently disabled write plane.

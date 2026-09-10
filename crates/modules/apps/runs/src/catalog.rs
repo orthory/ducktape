@@ -1,21 +1,23 @@
 //! The module-owned action catalog: every operation an agent may invoke, with
-//! its target/input/result schemas, the authority it needs and the lanes that
-//! admit it. The host carries an [`ActionEnvelope`] and a receipt; this module
-//! decodes the envelope into a typed [`Operation`], validates and prepares it.
-//! Adding an operation is a change here and nowhere in the host binary.
+//! its target/input/result schemas and the lanes that admit it. The host
+//! carries an [`ActionEnvelope`] and a receipt; this module decodes the
+//! envelope into a typed [`Operation`], validates and prepares it. Adding an
+//! operation is a change here and nowhere in the host binary.
+//!
+//! The typed entries are conveniences: each decodes a shape this module knows,
+//! probes the target's committed state so the prepared message cannot be
+//! rejected at apply, and mints deterministic ids. [`OP_SUBMIT`] is the floor
+//! under all of them — any message a member may submit to any module, carried
+//! verbatim to that module as the run's program account. Nothing here refuses
+//! an operation on the strength of the agent's record: only the target
+//! module's own rules do.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND,
-    ACTION_DUCKFS_WRITE_TEXT, ACTION_FORGE_OPEN_PR, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE,
-    ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
-    ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES,
-    ModuleUpdateSpec, ReplyBlock,
-};
 use crate::sink::{FORGE_BODY_BYTE_CAP, FORGE_TITLE_BYTE_CAP};
+use crate::{MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES, ModuleUpdateSpec, ReplyBlock};
 
 // ---- the envelope ----------------------------------------------------------------
 
@@ -141,19 +143,6 @@ fn content_schema() -> Value {
 
 // ---- the catalog view --------------------------------------------------------------
 
-/// The authority an operation needs, in the grant vocabulary an owner writes.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum Grant {
-    /// A fixed action name from [`crate::KNOWN_ACTIONS`].
-    Action(String),
-    /// Resolved from the run's committed source: chat.post for a chat source,
-    /// pages.comment for a Pages source, jobs.comment for a job source.
-    Source,
-    /// A resource cap on the model record rather than an action name.
-    Cap(String),
-}
-
 /// Which lanes admit an operation.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -170,7 +159,6 @@ pub enum LaneKind {
 pub struct OperationView {
     pub name: String,
     pub description: String,
-    pub grant: Grant,
     /// JSON Schema of the target object; `None` when the operation takes none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<Value>,
@@ -187,7 +175,6 @@ pub struct OperationView {
 struct Spec {
     name: &'static str,
     description: &'static str,
-    grant: Grant,
     target: Option<Value>,
     input: Value,
     result: Value,
@@ -199,7 +186,6 @@ impl Spec {
         let mut view = OperationView {
             name: self.name.into(),
             description: self.description.into(),
-            grant: self.grant,
             target: self.target,
             input: self.input,
             result: self.result,
@@ -226,19 +212,50 @@ const LIVE_AND_FINAL: &[LaneKind] = &[LaneKind::Live, LaneKind::Final];
 const LIVE_ONLY: &[LaneKind] = &[LaneKind::Live];
 const FINAL_ONLY: &[LaneKind] = &[LaneKind::Final];
 
+/// Reply where this run was called; the destination resolves from the source.
 pub const OP_REPLY: &str = "reply";
-/// React to the message this run was called on; source-granted like `reply`.
+/// React to the message this run was called on; source-resolved like `reply`.
 pub const OP_REACT: &str = "react";
 /// Take this agent's own reaction off that message again.
 pub const OP_UNREACT: &str = "unreact";
+/// Post a message to any chat channel.
+pub const OP_CHAT_POST_MESSAGE: &str = "chat.post_message";
+/// Create a task.
+pub const OP_TASKS_CREATE: &str = "tasks.create";
+/// Move a task.
+pub const OP_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// Anchor a comment to a page or block.
+pub const OP_PAGES_COMMENT: &str = "pages.comment";
+/// Comment on a job.
+pub const OP_JOBS_COMMENT: &str = "jobs.comment";
+/// Flip a todo block's checked state.
+pub const OP_PAGES_SET_CHECKED: &str = "pages.set_checked";
+/// Publish a new top-level page with its body.
+pub const OP_PAGES_POST: &str = "pages.post";
+/// Write a small UTF-8 text file under duckfs.
+pub const OP_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
+/// Deploy the component committed by this run after its program accepts the
+/// request.
+pub const OP_MODULES_UPDATE: &str = "modules.update";
+/// Open a pull request on a forge repository from a branch the run pushed.
+pub const OP_FORGE_OPEN_PR: &str = "forge.open_pr";
+/// Send one collaboration message as a bound participant. The action reaches
+/// `collaboration` as `Origin::Program(account)`, and that module admits it
+/// only if the participant's owner bound that account to that conversation
+/// under a live credential.
+pub const OP_COLLABORATION_SEND: &str = "collaboration.send";
+/// Record a delivery state for a message the bound participant received.
+pub const OP_COLLABORATION_ACKNOWLEDGE: &str = "collaboration.acknowledge";
+/// Call another registered agent while this run is live.
 pub const OP_AGENT_CALL: &str = "agent.call";
+/// Submit any message to any module, verbatim, as the run's program account.
+pub const OP_SUBMIT: &str = "submit";
 
 fn specs() -> Vec<Spec> {
     vec![
         Spec {
             name: OP_REPLY,
-            description: "Reply mid-run where this run was called: its chat thread, Pages block or comment thread, or job discussion. Runs resolves the destination from the committed source; a source-less run cannot reply. Chat sources need chat.post, Pages sources pages.comment plus the page in pages_write, job sources jobs.comment. Live only: the final response's reply_blocks are the run's final reply, posted by runs itself.",
-            grant: Grant::Source,
+            description: "Reply mid-run where this run was called: its chat thread, Pages block or comment thread, or job discussion. Runs resolves the destination from the committed source; a source-less run cannot reply. Live only: the final response's reply_blocks are the run's final reply, posted by runs itself.",
             target: None,
             input: object(json!({"content": content_schema()}), &["content"]),
             result: object(
@@ -249,8 +266,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: OP_REACT,
-            description: "React with one emoji to the chat message this run was called on — the acknowledgement a room sees before any reply. Idempotent per emoji. Needs the same chat.post grant as reply; a run called from a page or a job has no message to react to.",
-            grant: Grant::Source,
+            description: "React with one emoji to the chat message this run was called on — the acknowledgement a room sees before any reply. Idempotent per emoji. A run called from a page or a job has no message to react to.",
             target: None,
             input: object(json!({"emoji": emoji_schema()}), &["emoji"]),
             result: reaction_result(),
@@ -258,17 +274,15 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: OP_UNREACT,
-            description: "Remove this agent's own emoji reaction from the chat message this run was called on; a reaction that is not there is a no-op. Needs chat.post, like react.",
-            grant: Grant::Source,
+            description: "Remove this agent's own emoji reaction from the chat message this run was called on; a reaction that is not there is a no-op.",
             target: None,
             input: object(json!({"emoji": emoji_schema()}), &["emoji"]),
             result: reaction_result(),
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_CHAT_POST_MESSAGE,
-            description: "Post to a chat channel. Omit thread to start a new post; name a root message seq to reply in its thread. Requires chat.post_message.",
-            grant: Grant::Action(ACTION_CHAT_POST_MESSAGE.into()),
+            name: OP_CHAT_POST_MESSAGE,
+            description: "Post to a chat channel. Omit thread to start a new post; name a root message seq to reply in its thread.",
             target: Some(object(
                 json!({"channel_id": {"type": "string"}, "thread": {"type": "integer", "description": "Seq of the root message to reply under."}}),
                 &["channel_id"],
@@ -281,9 +295,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_PAGES_COMMENT,
-            description: "Comment on a page or block (target opens a new thread) or continue an existing comment thread (thread_id). Requires pages.comment and the owning page in pages_write.",
-            grant: Grant::Action(ACTION_PAGES_COMMENT.into()),
+            name: OP_PAGES_COMMENT,
+            description: "Comment on a page or block (target opens a new thread) or continue an existing comment thread (thread_id).",
             target: Some(json!({
                 "type": "object",
                 "oneOf": [
@@ -299,10 +312,12 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_PAGES_SET_CHECKED,
-            description: "Tick or untick a todo block. Requires pages.set_checked and the owning page in pages_write.",
-            grant: Grant::Action(ACTION_PAGES_SET_CHECKED.into()),
-            target: Some(object(json!({"block_id": {"type": "string"}}), &["block_id"])),
+            name: OP_PAGES_SET_CHECKED,
+            description: "Tick or untick a todo block.",
+            target: Some(object(
+                json!({"block_id": {"type": "string"}}),
+                &["block_id"],
+            )),
             input: object(json!({"checked": {"type": "boolean"}}), &["checked"]),
             result: object(
                 json!({"block_id": {"type": "string"}, "checked": {"type": "boolean"}}),
@@ -311,9 +326,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_PAGES_POST,
-            description: "Publish a new top-level page: a title and its body, whole in one write. Requires pages.post and the every-page entry (*) in pages_write; the page id is minted by runs and returned in the result.",
-            grant: Grant::Action(ACTION_PAGES_POST.into()),
+            name: OP_PAGES_POST,
+            description: "Publish a new top-level page: a title and its body, whole in one write. The page id is minted by runs and returned in the result.",
             target: None,
             input: object(
                 json!({"title": {"type": "string", "minLength": 1, "maxLength": pages::MAX_PAGE_TITLE_LEN}, "content": content_schema()}),
@@ -326,9 +340,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_JOBS_COMMENT,
-            description: "Comment on a job's discussion. Requires jobs.comment.",
-            grant: Grant::Action(ACTION_JOBS_COMMENT.into()),
+            name: OP_JOBS_COMMENT,
+            description: "Comment on a job's discussion.",
             target: Some(object(json!({"job_id": {"type": "string"}}), &["job_id"])),
             input: object(json!({"content": content_schema()}), &["content"]),
             result: object(
@@ -338,9 +351,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_TASKS_CREATE,
-            description: "Create a task. Omit task_id and Runs derives one from the run. Requires tasks.create.",
-            grant: Grant::Action(ACTION_TASKS_CREATE.into()),
+            name: OP_TASKS_CREATE,
+            description: "Create a task. Omit task_id and Runs derives one from the run.",
             target: None,
             input: object(
                 json!({"title": {"type": "string"}, "task_id": {"type": "string", "description": "Optional caller-chosen id; must be free."}}),
@@ -350,9 +362,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_TASKS_UPDATE_STATUS,
-            description: "Move a task to open, in_progress or done. Requires tasks.update_status.",
-            grant: Grant::Action(ACTION_TASKS_UPDATE_STATUS.into()),
+            name: OP_TASKS_UPDATE_STATUS,
+            description: "Move a task to open, in_progress or done.",
             target: Some(object(json!({"task_id": {"type": "string"}}), &["task_id"])),
             input: object(
                 json!({"status": {"type": "string", "enum": ["open", "in_progress", "done"]}}),
@@ -365,10 +376,12 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_DUCKFS_WRITE_TEXT,
-            description: "Write one small UTF-8 text file in the shared filesystem (duckfs). base_snapshot is the snapshot the write was read against (files' own per-path compare-and-set); omit it to require that the path is new. Requires duckfs.write_text and a duckfs_write prefix containing the path.",
-            grant: Grant::Action(ACTION_DUCKFS_WRITE_TEXT.into()),
-            target: Some(object(json!({"path": {"type": "string", "description": "Absolute duckfs path."}}), &["path"])),
+            name: OP_DUCKFS_WRITE_TEXT,
+            description: "Write one small UTF-8 text file in the shared filesystem (duckfs). base_snapshot is the snapshot the write was read against (files' own per-path compare-and-set); omit it to require that the path is new.",
+            target: Some(object(
+                json!({"path": {"type": "string", "description": "Absolute duckfs path."}}),
+                &["path"],
+            )),
             input: object(
                 json!({"text": {"type": "string", "maxLength": MAX_DUCKFS_WRITE_TEXT_BYTES}, "base_snapshot": {"type": "string"}}),
                 &["text"],
@@ -380,9 +393,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_AND_FINAL,
         },
         Spec {
-            name: ACTION_MODULES_UPDATE,
-            description: "Request deployment of a module artifact committed in this run's forge output. Final response only: Runs binds the artifact to the host-pushed commit. Requires modules.update.",
-            grant: Grant::Action(ACTION_MODULES_UPDATE.into()),
+            name: OP_MODULES_UPDATE,
+            description: "Request deployment of a module artifact committed in this run's forge output. Final response only: Runs binds the artifact to the host-pushed commit.",
             target: None,
             input: object(
                 json!({
@@ -400,10 +412,12 @@ fn specs() -> Vec<Spec> {
             lanes: FINAL_ONLY,
         },
         Spec {
-            name: ACTION_FORGE_OPEN_PR,
-            description: "Open a pull request on a forge repository from a branch you pushed there (git push through this run's forge transport), onto a born target branch such as dev. Final response only: Runs opens it after your output commits, appends the run's breadcrumb to the body, and reports an open PR that already sources the branch instead of opening a second one. Requires the forge_push cap on the repository; the same cap that admitted the push.",
-            grant: Grant::Cap("forge_push".into()),
-            target: Some(object(json!({"repo": {"type": "string", "description": "The forge repository name."}}), &["repo"])),
+            name: OP_FORGE_OPEN_PR,
+            description: "Open a pull request on a forge repository from a branch you pushed there (git push through this run's forge transport), onto a born target branch such as dev. Final response only: Runs opens it after your output commits, appends the run's breadcrumb to the body, and reports an open PR that already sources the branch instead of opening a second one.",
+            target: Some(object(
+                json!({"repo": {"type": "string", "description": "The forge repository name."}}),
+                &["repo"],
+            )),
             input: object(
                 json!({
                     "source_branch": {"type": "string", "description": "The branch to merge, already pushed."},
@@ -420,9 +434,8 @@ fn specs() -> Vec<Spec> {
             lanes: FINAL_ONLY,
         },
         Spec {
-            name: ACTION_COLLABORATION_SEND,
-            description: "Send one message in a collaboration conversation, as a participant this run's account is BOUND to. Live lane only: the message reaches collaboration as this account's program origin, and that module refuses it unless the participant's owner bound this account to the conversation under `credential`. Sequence is yours to choose and must be monotonic per credential; resending identical bytes under the same sequence is the same message, not a second one. Requires collaboration.send.",
-            grant: Grant::Action(ACTION_COLLABORATION_SEND.into()),
+            name: OP_COLLABORATION_SEND,
+            description: "Send one message in a collaboration conversation, as a participant this run's account is BOUND to. Live lane only: the message reaches collaboration as this account's program origin, and that module refuses it unless the participant's owner bound this account to the conversation under `credential`. Sequence is yours to choose and must be monotonic per credential; resending identical bytes under the same sequence is the same message, not a second one.",
             target: Some(object(
                 json!({
                     "conversation_id": {"type": "string"},
@@ -441,7 +454,14 @@ fn specs() -> Vec<Spec> {
                     "reply_to": {"type": ["integer", "null"], "description": "Conversation sequence this answers."},
                     "task": {"type": ["object", "null"], "properties": {"id": {"type": "string"}, "expected_attempt": {"type": "integer", "minimum": 0}}, "required": ["id", "expected_attempt"], "additionalProperties": false, "description": "Current task attempt; required for task_update."}
                 }),
-                &["credential", "sequence", "recipient_participant_id", "kind", "body", "expires_at"],
+                &[
+                    "credential",
+                    "sequence",
+                    "recipient_participant_id",
+                    "kind",
+                    "body",
+                    "expires_at",
+                ],
             ),
             result: object(
                 json!({
@@ -454,9 +474,8 @@ fn specs() -> Vec<Spec> {
             lanes: LIVE_ONLY,
         },
         Spec {
-            name: ACTION_COLLABORATION_ACKNOWLEDGE,
-            description: "Record what happened to a message this bound participant received: queued, adapter_accepted, held, refused, delivery_unknown. Live lane only, same binding rule as collaboration.send. Which participant is reporting is NOT stated here — collaboration reads it off the binding this account holds. `reason` is a stable snake_case token, never prose. Requires collaboration.acknowledge.",
-            grant: Grant::Action(ACTION_COLLABORATION_ACKNOWLEDGE.into()),
+            name: OP_COLLABORATION_ACKNOWLEDGE,
+            description: "Record what happened to a message this bound participant received: queued, adapter_accepted, held, refused, delivery_unknown. Live lane only, same binding rule as collaboration.send. Which participant is reporting is NOT stated here — collaboration reads it off the binding this account holds. `reason` is a stable snake_case token, never prose.",
             target: Some(object(
                 json!({"conversation_id": {"type": "string"}}),
                 &["conversation_id"],
@@ -482,9 +501,11 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: OP_AGENT_CALL,
-            description: "Call another registered agent while this run is live. The callee runs with caller ∩ callee authority; the root run's subagent_budget bounds concurrent calls. Collect results with the agent.calls query.",
-            grant: Grant::Cap("subagent_budget".into()),
-            target: Some(object(json!({"agent_id": {"type": "string"}}), &["agent_id"])),
+            description: "Call another registered agent while this run is live. The callee runs as itself; the root run's whole call tree holds a bounded number of live calls at once, and completed calls release their slot. Collect results with the agent.calls query.",
+            target: Some(object(
+                json!({"agent_id": {"type": "string"}}),
+                &["agent_id"],
+            )),
             input: object(
                 json!({
                     "instruction": {"type": "string"},
@@ -497,6 +518,26 @@ fn specs() -> Vec<Spec> {
                 &["delegation_id", "callee_agent_id"],
             ),
             lanes: LIVE_ONLY,
+        },
+        Spec {
+            name: OP_SUBMIT,
+            description: "Submit any message to any module of this network as this run's program account, exactly as a member would submit it. target names the module (chat, tasks, pages, forge, files, agent, runs, …); input is the module's own message: an object with one key, the snake_case message name, whose value carries the message's fields — {\"open_issue\":{\"repo\":\"playground\",\"title\":\"Flaky gate\",\"body\":\"…\"}} to forge opens an issue, and forge's merge_pr, chat's post_message, every message a module decodes is reachable the same way — or a non-empty string naming a message that has no fields. The other catalog operations are conveniences over this one: they probe committed state and mint ids for you, this one carries your bytes verbatim. Nothing in runs refuses a submit; the module decides on its own rules, and its refusal names an unknown message's alternatives or a missing field. Read the receipt for the module's outcome.",
+            target: Some(object(
+                json!({"module": {"type": "string", "description": "The module id the message is for."}}),
+                &["module"],
+            )),
+            input: json!({
+                "description": "The module's message, verbatim: {\"<message>\": {…fields…}} or \"<message>\" for a field-less one.",
+                "oneOf": [
+                    {"type": "object", "minProperties": 1, "maxProperties": 1},
+                    {"type": "string"}
+                ]
+            }),
+            result: object(
+                json!({"module": {"type": "string"}, "message": {"type": "string", "description": "The message name the input carried."}}),
+                &["module", "message"],
+            ),
+            lanes: LIVE_AND_FINAL,
         },
     ]
 }
@@ -531,8 +572,8 @@ pub(crate) enum PageAnchor {
 }
 
 /// A catalog operation with its target and input decoded against the schema
-/// this module owns. Everything downstream (grants, probes, the prepared
-/// target message) works on this, never on the envelope.
+/// this module owns. Everything downstream (probes, the prepared target
+/// message) works on this, never on the envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Operation {
     Reply {
@@ -612,6 +653,28 @@ pub(crate) enum Operation {
         instruction: String,
         skills: Vec<String>,
     },
+    /// Any module message, carried verbatim: `message` is the module's own
+    /// externally tagged JSON, and the prepared payload is exactly its bytes.
+    Submit {
+        module: String,
+        message: Value,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitTarget {
+    module: String,
+}
+
+/// The name a module message carries: the one key of its object form, or the
+/// string itself for a field-less message. An empty string names nothing.
+pub(crate) fn message_name(message: &Value) -> Option<&str> {
+    match message {
+        Value::Object(fields) if fields.len() == 1 => fields.keys().next().map(String::as_str),
+        Value::String(name) if !name.is_empty() => Some(name),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -776,9 +839,7 @@ struct CallInput {
     skills: Vec<String>,
 }
 
-fn decode_target<T: serde::de::DeserializeOwned>(
-    envelope: &ActionEnvelope,
-) -> Result<T, String> {
+fn decode_target<T: serde::de::DeserializeOwned>(envelope: &ActionEnvelope) -> Result<T, String> {
     let Some(target) = &envelope.target else {
         return Err(format!("{} requires a target", envelope.operation));
     };
@@ -821,7 +882,7 @@ impl Operation {
                 let input: EmojiInput = decode_input(envelope)?;
                 Ok(Self::Unreact { emoji: input.emoji })
             }
-            ACTION_CHAT_POST_MESSAGE => {
+            OP_CHAT_POST_MESSAGE => {
                 let target: ChatTarget = decode_target(envelope)?;
                 let input: ContentInput = decode_input(envelope)?;
                 Ok(Self::ChatPost {
@@ -830,7 +891,7 @@ impl Operation {
                     content: input.content,
                 })
             }
-            ACTION_PAGES_COMMENT => {
+            OP_PAGES_COMMENT => {
                 let target: PagesCommentTarget = decode_target(envelope)?;
                 let input: ContentInput = decode_input(envelope)?;
                 Ok(Self::PagesComment {
@@ -841,7 +902,7 @@ impl Operation {
                     content: input.content,
                 })
             }
-            ACTION_PAGES_SET_CHECKED => {
+            OP_PAGES_SET_CHECKED => {
                 let target: BlockTarget = decode_target(envelope)?;
                 let input: CheckedInput = decode_input(envelope)?;
                 Ok(Self::PagesSetChecked {
@@ -849,7 +910,7 @@ impl Operation {
                     checked: input.checked,
                 })
             }
-            ACTION_PAGES_POST => {
+            OP_PAGES_POST => {
                 no_target(envelope)?;
                 let input: PagePostInput = decode_input(envelope)?;
                 Ok(Self::PagesPost {
@@ -857,7 +918,7 @@ impl Operation {
                     content: input.content,
                 })
             }
-            ACTION_JOBS_COMMENT => {
+            OP_JOBS_COMMENT => {
                 let target: JobTarget = decode_target(envelope)?;
                 let input: ContentInput = decode_input(envelope)?;
                 Ok(Self::JobsComment {
@@ -865,7 +926,7 @@ impl Operation {
                     content: input.content,
                 })
             }
-            ACTION_TASKS_CREATE => {
+            OP_TASKS_CREATE => {
                 no_target(envelope)?;
                 let input: TaskCreateInput = decode_input(envelope)?;
                 Ok(Self::TasksCreate {
@@ -873,7 +934,7 @@ impl Operation {
                     title: input.title,
                 })
             }
-            ACTION_TASKS_UPDATE_STATUS => {
+            OP_TASKS_UPDATE_STATUS => {
                 let target: TaskTarget = decode_target(envelope)?;
                 let input: StatusInput = decode_input(envelope)?;
                 Ok(Self::TasksUpdateStatus {
@@ -881,7 +942,7 @@ impl Operation {
                     status: input.status,
                 })
             }
-            ACTION_DUCKFS_WRITE_TEXT => {
+            OP_DUCKFS_WRITE_TEXT => {
                 let target: PathTarget = decode_target(envelope)?;
                 let input: TextInput = decode_input(envelope)?;
                 Ok(Self::DuckfsWriteText {
@@ -890,7 +951,7 @@ impl Operation {
                     base_snapshot: input.base_snapshot,
                 })
             }
-            ACTION_COLLABORATION_SEND => {
+            OP_COLLABORATION_SEND => {
                 let target: CollaborationTarget = decode_target(envelope)?;
                 let input: CollaborationSendInput = decode_input(envelope)?;
                 Ok(Self::CollaborationSend {
@@ -906,7 +967,7 @@ impl Operation {
                     task: input.task,
                 })
             }
-            ACTION_COLLABORATION_ACKNOWLEDGE => {
+            OP_COLLABORATION_ACKNOWLEDGE => {
                 let target: CollaborationAckTarget = decode_target(envelope)?;
                 let input: CollaborationAckInput = decode_input(envelope)?;
                 Ok(Self::CollaborationAcknowledge {
@@ -917,12 +978,12 @@ impl Operation {
                     reason: input.reason,
                 })
             }
-            ACTION_MODULES_UPDATE => {
+            OP_MODULES_UPDATE => {
                 no_target(envelope)?;
                 let spec: ModuleUpdateSpec = decode_input(envelope)?;
                 Ok(Self::ModulesUpdate(spec))
             }
-            ACTION_FORGE_OPEN_PR => {
+            OP_FORGE_OPEN_PR => {
                 let target: ForgeRepoTarget = decode_target(envelope)?;
                 let input: ForgeOpenPrInput = decode_input(envelope)?;
                 Ok(Self::ForgeOpenPr {
@@ -942,6 +1003,21 @@ impl Operation {
                     skills: input.skills,
                 })
             }
+            OP_SUBMIT => {
+                let target: SubmitTarget = decode_target(envelope)?;
+                if target.module.is_empty() {
+                    return Err(format!("{OP_SUBMIT} target: module must not be empty"));
+                }
+                if message_name(&envelope.input).is_none() {
+                    return Err(format!(
+                        "{OP_SUBMIT} input: a module message is an object with exactly one key naming the message, or a non-empty string naming a message with no fields"
+                    ));
+                }
+                Ok(Self::Submit {
+                    module: target.module,
+                    message: envelope.input.clone(),
+                })
+            }
             other => Err(format!(
                 "{other:?} is not a catalog operation; discover the catalog to see the names"
             )),
@@ -954,33 +1030,20 @@ impl Operation {
             Self::Reply { .. } => OP_REPLY,
             Self::React { .. } => OP_REACT,
             Self::Unreact { .. } => OP_UNREACT,
-            Self::ChatPost { .. } => ACTION_CHAT_POST_MESSAGE,
-            Self::PagesComment { .. } => ACTION_PAGES_COMMENT,
-            Self::PagesSetChecked { .. } => ACTION_PAGES_SET_CHECKED,
-            Self::PagesPost { .. } => ACTION_PAGES_POST,
-            Self::JobsComment { .. } => ACTION_JOBS_COMMENT,
-            Self::TasksCreate { .. } => ACTION_TASKS_CREATE,
-            Self::TasksUpdateStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
-            Self::DuckfsWriteText { .. } => ACTION_DUCKFS_WRITE_TEXT,
-            Self::CollaborationSend { .. } => ACTION_COLLABORATION_SEND,
-            Self::CollaborationAcknowledge { .. } => ACTION_COLLABORATION_ACKNOWLEDGE,
-            Self::ModulesUpdate(_) => ACTION_MODULES_UPDATE,
-            Self::ForgeOpenPr { .. } => ACTION_FORGE_OPEN_PR,
+            Self::ChatPost { .. } => OP_CHAT_POST_MESSAGE,
+            Self::PagesComment { .. } => OP_PAGES_COMMENT,
+            Self::PagesSetChecked { .. } => OP_PAGES_SET_CHECKED,
+            Self::PagesPost { .. } => OP_PAGES_POST,
+            Self::JobsComment { .. } => OP_JOBS_COMMENT,
+            Self::TasksCreate { .. } => OP_TASKS_CREATE,
+            Self::TasksUpdateStatus { .. } => OP_TASKS_UPDATE_STATUS,
+            Self::DuckfsWriteText { .. } => OP_DUCKFS_WRITE_TEXT,
+            Self::CollaborationSend { .. } => OP_COLLABORATION_SEND,
+            Self::CollaborationAcknowledge { .. } => OP_COLLABORATION_ACKNOWLEDGE,
+            Self::ModulesUpdate(_) => OP_MODULES_UPDATE,
+            Self::ForgeOpenPr { .. } => OP_FORGE_OPEN_PR,
             Self::AgentCall { .. } => OP_AGENT_CALL,
-        }
-    }
-
-    /// The fixed grant this operation needs, or `None` when it is resolved
-    /// from the source (`reply`, `react`, `unreact`) or gated by a cap
-    /// (`agent.call`, `forge.open_pr`).
-    pub(crate) fn fixed_grant(&self) -> Option<&'static str> {
-        match self {
-            Self::Reply { .. }
-            | Self::React { .. }
-            | Self::Unreact { .. }
-            | Self::ForgeOpenPr { .. }
-            | Self::AgentCall { .. } => None,
-            other => Some(other.name()),
+            Self::Submit { .. } => OP_SUBMIT,
         }
     }
 
@@ -1049,53 +1112,53 @@ mod tests {
             envelope(OP_REACT, None, json!({"emoji": "👀"})),
             envelope(OP_UNREACT, None, json!({"emoji": "👀"})),
             envelope(
-                ACTION_CHAT_POST_MESSAGE,
+                OP_CHAT_POST_MESSAGE,
                 Some(json!({"channel_id": "general", "thread": 3})),
                 json!({"content": [{"type": "code", "text": "x", "lang": "rs"}]}),
             ),
             envelope(
-                ACTION_PAGES_COMMENT,
+                OP_PAGES_COMMENT,
                 Some(json!({"target": "b1"})),
                 json!({"content": [{"type": "text", "text": "hi"}]}),
             ),
             envelope(
-                ACTION_PAGES_COMMENT,
+                OP_PAGES_COMMENT,
                 Some(json!({"thread_id": "t1"})),
                 json!({"content": [{"type": "text", "text": "hi"}]}),
             ),
             envelope(
-                ACTION_PAGES_SET_CHECKED,
+                OP_PAGES_SET_CHECKED,
                 Some(json!({"block_id": "b1"})),
                 json!({"checked": true}),
             ),
             envelope(
-                ACTION_PAGES_POST,
+                OP_PAGES_POST,
                 None,
                 json!({"title": "Report", "content": [{"type": "text", "text": "hi"}]}),
             ),
             envelope(
-                ACTION_JOBS_COMMENT,
+                OP_JOBS_COMMENT,
                 Some(json!({"job_id": "j1"})),
                 json!({"content": [{"type": "text", "text": "hi"}]}),
             ),
-            envelope(ACTION_TASKS_CREATE, None, json!({"title": "t"})),
+            envelope(OP_TASKS_CREATE, None, json!({"title": "t"})),
             envelope(
-                ACTION_TASKS_UPDATE_STATUS,
+                OP_TASKS_UPDATE_STATUS,
                 Some(json!({"task_id": "t1"})),
                 json!({"status": "done"}),
             ),
             envelope(
-                ACTION_DUCKFS_WRITE_TEXT,
+                OP_DUCKFS_WRITE_TEXT,
                 Some(json!({"path": "/shared/x"})),
                 json!({"text": "hello", "base_snapshot": "s1"}),
             ),
             envelope(
-                ACTION_MODULES_UPDATE,
+                OP_MODULES_UPDATE,
                 None,
                 json!({"module_id": "hello", "artifact": "hello.module", "code_hash": "ab".repeat(32), "after": 50}),
             ),
             envelope(
-                ACTION_FORGE_OPEN_PR,
+                OP_FORGE_OPEN_PR,
                 Some(json!({"repo": "app"})),
                 json!({"source_branch": "agent/x", "target_branch": "dev", "title": "Add the poem"}),
             ),
@@ -1105,7 +1168,7 @@ mod tests {
                 json!({"instruction": "review", "skills": ["review"]}),
             ),
             envelope(
-                ACTION_COLLABORATION_SEND,
+                OP_COLLABORATION_SEND,
                 Some(json!({"conversation_id": "c1", "participant_id": "alice"})),
                 json!({
                     "credential": 2,
@@ -1119,9 +1182,14 @@ mod tests {
             // the acknowledgement names no participant: collaboration reads the
             // reporter off the binding the origin holds.
             envelope(
-                ACTION_COLLABORATION_ACKNOWLEDGE,
+                OP_COLLABORATION_ACKNOWLEDGE,
                 Some(json!({"conversation_id": "c1"})),
                 json!({"credential": 2, "seq": 4, "state": "queued"}),
+            ),
+            envelope(
+                OP_SUBMIT,
+                Some(json!({"module": "forge"})),
+                json!({"merge_pr": {"repo": "playground", "number": 3}}),
             ),
         ];
         let names: Vec<&str> = cases
@@ -1143,8 +1211,11 @@ mod tests {
         let unknown = Operation::decode(&envelope("chat.shout", None, json!({}))).unwrap_err();
         assert!(unknown.contains("chat.shout"), "{unknown}");
         let missing_target =
-            Operation::decode(&envelope(ACTION_CHAT_POST_MESSAGE, None, json!({}))).unwrap_err();
-        assert!(missing_target.contains("requires a target"), "{missing_target}");
+            Operation::decode(&envelope(OP_CHAT_POST_MESSAGE, None, json!({}))).unwrap_err();
+        assert!(
+            missing_target.contains("requires a target"),
+            "{missing_target}"
+        );
         let extra_target = Operation::decode(&envelope(
             OP_REPLY,
             Some(json!({"channel_id": "x"})),
@@ -1160,7 +1231,7 @@ mod tests {
         .unwrap_err();
         assert!(bad_part.contains("reply input"), "{bad_part}");
         let stray = Operation::decode(&envelope(
-            ACTION_TASKS_CREATE,
+            OP_TASKS_CREATE,
             None,
             json!({"title": "t", "owner": "me"}),
         ))
@@ -1192,52 +1263,102 @@ mod tests {
             .collect();
         assert_eq!(
             pages,
-            [
-                ACTION_PAGES_COMMENT,
-                ACTION_PAGES_SET_CHECKED,
-                ACTION_PAGES_POST
-            ]
+            [OP_PAGES_COMMENT, OP_PAGES_SET_CHECKED, OP_PAGES_POST]
         );
         assert!(catalog(Some("nothing.")).is_empty());
     }
 
+    /// the floor under the catalog: a submit carries the module's own message
+    /// shape and nothing else. the object form names exactly one message, the
+    /// string form names a field-less one, and the module id is never empty.
     #[test]
-    fn every_fixed_grant_is_a_known_action_and_every_known_action_has_an_operation() {
-        for view in catalog(None) {
-            if let Grant::Action(name) = &view.grant {
-                assert!(
-                    crate::KNOWN_ACTIONS.contains(&name.as_str()),
-                    "{} is gated on an unknown grant {name}",
-                    view.name
-                );
+    fn a_submit_carries_one_module_message_verbatim() {
+        let object = Operation::decode(&envelope(
+            OP_SUBMIT,
+            Some(json!({"module": "tasks"})),
+            json!({"task": {"create": {"task_id": "t1", "title": "x"}}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            object,
+            Operation::Submit {
+                module: "tasks".into(),
+                message: json!({"task": {"create": {"task_id": "t1", "title": "x"}}}),
             }
+        );
+        let bare = Operation::decode(&envelope(
+            OP_SUBMIT,
+            Some(json!({"module": "runs"})),
+            json!("pending_runs"),
+        ))
+        .unwrap();
+        assert_eq!(message_name(&json!("pending_runs")), Some("pending_runs"));
+        assert!(
+            matches!(bare, Operation::Submit { message, .. } if message == json!("pending_runs"))
+        );
+
+        for (target, input, needle) in [
+            (json!({"module": ""}), json!({"x": {}}), "must not be empty"),
+            (json!({"module": "forge"}), json!({}), "exactly one key"),
+            (
+                json!({"module": "forge"}),
+                json!({"a": {}, "b": {}}),
+                "exactly one key",
+            ),
+            (json!({"module": "forge"}), json!([1]), "exactly one key"),
+            (json!({"module": "forge"}), json!(""), "non-empty string"),
+            (
+                json!({"module": "forge", "extra": 1}),
+                json!({"a": {}}),
+                "extra",
+            ),
+        ] {
+            let error = Operation::decode(&envelope(OP_SUBMIT, Some(target), input)).unwrap_err();
+            assert!(error.contains(needle), "{error}");
         }
-        // chat.post is the source grant `reply` resolves to; every other
-        // known action is a catalog operation of its own name.
-        for action in crate::KNOWN_ACTIONS {
-            let source_only = action == crate::ACTION_CHAT_POST;
-            assert!(
-                source_only || operation_view(action).is_some(),
-                "no catalog operation for the {action} grant"
-            );
-        }
+        let missing = Operation::decode(&envelope(OP_SUBMIT, None, json!({"a": {}}))).unwrap_err();
+        assert!(missing.contains("requires a target"), "{missing}");
+    }
+
+    /// the invariant the generic operation exists for: the bytes runs prepares
+    /// for a submit ARE the bytes a member would submit, so the target module
+    /// decodes them with its own codec and reaches its own verdict.
+    #[test]
+    fn a_submit_payload_is_the_target_modules_own_wire() {
+        let message = json!({"post_message": {
+            "channel_id": "general",
+            "message_id": "m1",
+            "blocks": [{"paragraph": [{"text": "hi", "marks": []}]}],
+            "thread": null,
+        }});
+        let payload = sdk::wire::encode(&message);
+        let decoded = chat::decode_msg(&payload).expect("chat decodes a member-shaped submit");
+        assert!(
+            matches!(decoded, chat::ChatMsg::PostMessage { channel_id, .. } if channel_id == "general")
+        );
+        // an unknown message name is refused by the MODULE, naming what it knows.
+        let unknown = chat::decode_msg(&sdk::wire::encode(&json!({"shout": {}}))).unwrap_err();
+        assert!(
+            unknown.contains("shout") && unknown.contains("post_message"),
+            "{unknown}"
+        );
     }
 
     #[test]
     fn envelope_digests_ignore_key_order_and_track_every_field() {
         let a = envelope(
-            ACTION_CHAT_POST_MESSAGE,
+            OP_CHAT_POST_MESSAGE,
             Some(json!({"channel_id": "c", "thread": 1})),
             json!({"content": [{"type": "text", "text": "x"}]}),
         );
         let b = envelope(
-            ACTION_CHAT_POST_MESSAGE,
+            OP_CHAT_POST_MESSAGE,
             Some(json!({"thread": 1, "channel_id": "c"})),
             json!({"content": [{"text": "x", "type": "text"}]}),
         );
         assert_eq!(a.digest(), b.digest());
         let c = envelope(
-            ACTION_CHAT_POST_MESSAGE,
+            OP_CHAT_POST_MESSAGE,
             Some(json!({"channel_id": "c", "thread": 2})),
             json!({"content": [{"type": "text", "text": "x"}]}),
         );

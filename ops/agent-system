@@ -233,7 +233,7 @@ switch (command) {
     } else {
       for (const agent of value)
         console.log(
-          `${agent.agent_id} ${agent.status} ${agent.capability} actions=${agent.allowed_actions.join(",")}`,
+          `${agent.agent_id} ${agent.status} ${agent.capability}`,
         );
     }
     break;

@@ -578,13 +578,10 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
             owner_handle: String::new(),
             controller: String::new(),
             live: true,
-            allowed_actions: Vec::new(),
-            caps: backend::AgentCaps::default(),
             skills: Vec::new(),
         }],
         runs: Vec::new(),
         capabilities: Vec::new(),
-        actions: Vec::new(),
     }));
     assert!(
         backend::any_agent_active(&app.agents_rows),

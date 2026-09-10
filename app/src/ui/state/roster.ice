@@ -21,10 +21,8 @@ state
   // two networks can carry the same run id, so an answer about A would match
   // on the way back into A after a switch to B and back. Counts dispatches.
   agents_journal_op:i64 = 0
-  // what the network announces and what a grant may name — the editor's
-  // pick lists
+  // what the network announces — the editor's executor pick list
   agents_capabilities:[str] = []
-  agents_actions:[str] = []
   // one per committed agent write: the view re-seeds its drafts on the bump
   agents_committed:i64 = 0
   // THE MESSAGING PANEL. `messaging` is one authenticated reading of ONE

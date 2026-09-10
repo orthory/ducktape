@@ -54,18 +54,17 @@ Forge output and runs verifies it against dispatch's committed output digest.
 The allocated repository and number determine the link; queued or rejected
 actions cannot predict one. Existing PR links come from committed Forge state.
 
-ConfigureModel records an existing program account's capability tag, allowed
-actions, caps and skills, atomically with its dispatch recipe. Its current
-identity controller governs later changes. ModelRecord.owner records the
-registering origin; it does not track controller transfers. Manual RequestRun
-publications retain their authenticated requester's cancellation/reassignment
-authority in runs-owned detail. Other content reactions remain program-created
-work. Duplicate manual model/channel/anchor requests claim one run.
+ConfigureModel records an existing program account's capability tag and
+skills, atomically with its dispatch recipe. Any member may change the record
+later. ModelRecord.owner records the registering origin; it does not track
+controller transfers. Any member may cancel or reassign a manual RequestRun.
+Other content reactions remain program-created work. Duplicate manual
+model/channel/anchor requests claim one run.
 
 The compute service receives a committed work payload and returns an oracle
 result. A host-owned ephemeral signer authenticates that run's interactive
-`RunsMsg::AgentAction` requests against its session, lease and grant. It is
-never an identity key of the program account. The scoped HTTP endpoint
+`RunsMsg::AgentAction` requests against its session and lease. It is never an
+identity key of the program account. The scoped HTTP endpoint
 subscribes before admission and waits for the actual target receipt, which it
 returns to the caller. Each execution attempt binds a fresh public key under
 its lease holder's node key. The private key stays on that host; the guest
@@ -80,11 +79,13 @@ Every agent write is one envelope: `operation`, an optional `target`, an
 `ducktape_action` and forwards it opaque; `ducktape_actions` lists the catalog
 and `ducktape_receipt` reads a receipt back. Runs owns the catalog
 (`RunsQuery::Catalog`): each operation's name, target and input schemas, result
-schema, required grant (a fixed action, the source-resolved reply grant, or a
-resource cap) and the lanes it admits (live through the session signer, final
-through the response's `actions`, or both). The same envelopes ride the final
-response, so adding an operation to the module needs no change to the executor
-or the tool binary. `request_id` is idempotent per run: the same bytes under
+schema and the lanes it admits (live through the session signer, final through
+the response's `actions`, or both). The `submit` operation is the catalog's
+floor: its target names a module and its input is that module's own message,
+verbatim, prepared for the run's program account, so whatever a member may
+submit to a module a run may. The same envelopes ride the final response, so
+adding an operation to the module needs no change to the executor or the tool
+binary. `request_id` is idempotent per run: the same bytes under
 the same id answer with the existing receipt, different bytes are refused, and
 the receipt id is `runs::action_request_id(run_id, request_id)`. Every
 proposal is pinned to its operation's `schema_digest`; the program's claim
@@ -98,15 +99,12 @@ program account. Pages reply validation reads thread metadata without loading
 the discussion bodies. An action-only final response keeps its actions without
 inventing another source reply. Explicit destinations are their own
 operations: `chat.post_message` (channel_id, optional thread), `pages.comment`
-(target or thread_id) and `jobs.comment` (job_id). Source chat replies require
-`chat.post`; `chat.post_message` requires its own grant. Pages comments require
-`pages.comment` and the owning page in `pages_write`. Job comments require
-`jobs.comment`. `tasks.create`, `tasks.update_status`, `pages.set_checked`,
-`pages.post` (a new page under the run's `agent/` prefix, which `pages_write`
-must cover), `duckfs.write_text`, `modules.update` (final only) and
-`agent.call` (live only) complete the catalog; `react` and `unreact` mark the
-source message under `chat.post`. A grant of `*` is every action the catalog
-knows now or later. A destination never supplies the author.
+(target or thread_id) and `jobs.comment` (job_id). `tasks.create`,
+`tasks.update_status`, `pages.set_checked`, `pages.post` (a new page under the
+run's `agent/` prefix), `duckfs.write_text`, `modules.update` (final only),
+`agent.call` (live only) and `submit` (any module's own message, verbatim,
+under the run's program account) complete the catalog; `react` and `unreact`
+mark the source message. A destination never supplies the author.
 
 The job board stores bounded, immutable comments with their authenticated actor
 and commit height, and exposes them through its point read and index. Comments

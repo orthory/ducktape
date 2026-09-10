@@ -1,7 +1,7 @@
 // AGENTS, as a module-owned view: the register the host pushes, listed, with
 // the one record the reader opened beside it as an editor. The record is the
-// row: name, executor, the action grant, the resource caps, the curated
-// skills and the standing, every one editable by the account that controls
+// row: name, executor, the curated skills and the standing, every one
+// editable by the account that controls
 // it and read-only for everyone else. Drafts are the view's; a save hands the
 // app the whole record and the app signs it. The plates are the kit's shapes
 // spelled flat in the wire's vocabulary (no named fonts, `wrap=none`, line
@@ -19,8 +19,7 @@ use "../../../../../app/src/ui/ducktape-ui/recipes.ice"
 extern crate::host
   HostError(message:str)
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
-  AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
   MessagingSeat(participant:str, role:str, you:bool)
   MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
@@ -31,7 +30,7 @@ extern crate::host
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
   LiveActivity(label:str, done:bool)
   LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
-  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, opened:i64, journal:RunJournal, live:LiveRun, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
+  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, opened:i64, journal:RunJournal, live:LiveRun, capabilities:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
   pure runs_summary(runs:&[RunRow]) -> str
@@ -46,17 +45,10 @@ extern crate::host
   pure journal_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure open_run(dispatch_id:&str) -> bool
   pure open_link(url:&str) -> bool
-  pure cap_count(caps:&AgentCaps) -> i64
   pure skill_count(skills:&[AgentSkill]) -> i64
   pure row_named(rows:&[AgentRow], id:&str) -> AgentRow
   pure editable(connected:bool, account:&str, controller:&str) -> bool
   pure has(list:&[str], item:&str) -> bool
-  pure with_flag(list:&[str], item:&str, on:bool) -> [str]
-  pure cap_kinds() -> [str]
-  pure caps_with(caps:&AgentCaps, kind:&str, entry:&str) -> AgentCaps
-  pure caps_without(caps:&AgentCaps, kind:&str, entry:&str) -> AgentCaps
-  pure caps_with_budget(caps:&AgentCaps, text:&str) -> AgentCaps
-  pure budget_text(budget:i64) -> str
   pure with_skill(skills:&[AgentSkill], name:&str, source_prefix:&str, source_snapshot:&str, always:bool) -> [AgentSkill]
   pure without_skill(skills:&[AgentSkill], name:&str) -> [AgentSkill]
   pure skill_loaded(skills:&[AgentSkill], name:&str, always:bool) -> [AgentSkill]
@@ -68,9 +60,7 @@ extern crate::host
   pure pick_str(condition:bool, then:&str, or:&str) -> str
   pure pick_capability(condition:bool, then:&str, or:&str?) -> str?
   pure pick_option(condition:bool, then:&str, or:&str?) -> str?
-  pure empty_caps() -> AgentCaps
   pure pick_list(condition:bool, then:&[str], or:&[str]) -> [str]
-  pure pick_caps(condition:bool, then:&AgentCaps, or:&AgentCaps) -> AgentCaps
   pure pick_skills(condition:bool, then:&[AgentSkill], or:&[AgentSkill]) -> [AgentSkill]
   pure valid_agent_id(id:&str) -> bool
   pure empty_messaging() -> MessagingProps
@@ -101,8 +91,8 @@ extern crate::host
   pure page_messages(from_seq:i64, newest:bool) -> bool
   pure send_message(kind:&str, recipient:&str, body:&str, reply_to:i64) -> bool
   pure status(agent_id:&str, paused:bool) -> bool
-  pure save(agent_id:&str, display_name:&str, capability:&str, allowed_actions:&[str], caps:&AgentCaps, skills:&[AgentSkill]) -> bool
-  pure register(agent_id:&str, display_name:&str, capability:&str, allowed_actions:&[str], caps:&AgentCaps, skills:&[AgentSkill]) -> bool
+  pure save(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
+  pure register(agent_id:&str, display_name:&str, capability:&str, skills:&[AgentSkill]) -> bool
 
 state
   active_palette:palette[AppTheme] = AppTheme.app
@@ -130,7 +120,6 @@ state
   // last carried it; a bump is a door pressed since
   opened:i64 = 0
   capabilities:[str] = []
-  actions:[str] = []
   account = ""
   committed:i64 = 0
   connected = false
@@ -148,13 +137,7 @@ state
   draft_id = ""
   draft_name = ""
   draft_capability:str? = none
-  draft_actions:[str] = []
-  draft_caps:AgentCaps = empty_caps()
-  draft_budget = ""
   draft_skills:[AgentSkill] = []
-  // the "add a grant" row
-  cap_kind:str? = some("forge_read")
-  cap_entry = ""
   // the "add a skill" row
   skill_name = ""
   skill_prefix = ""
@@ -232,7 +215,6 @@ on props_changed(next)
   opened = next.opened
   panel = pick_str(door_pressed, "runs", panel)
   capabilities = next.capabilities
-  actions = next.actions
   account = next.account
   connected = next.connected
   answered = next.answered
@@ -245,9 +227,6 @@ on props_changed(next)
   selected_status = row.status
   draft_name = pick_str(consumed, row.name, draft_name)
   draft_capability = pick_capability(consumed, row.capability, draft_capability)
-  draft_actions = pick_list(consumed, row.allowed_actions, draft_actions)
-  draft_caps = pick_caps(consumed, row.caps, draft_caps)
-  draft_budget = pick_str(consumed, budget_text(row.caps.subagent_budget), draft_budget)
   draft_skills = pick_skills(consumed, row.skills, draft_skills)
   // A LANDED SEND CLEARS ONLY ITS OWN DRAFT. `sent_seq` moves when the network
   // admitted this panel's send; the scope check is what stops an answer about
@@ -280,11 +259,7 @@ on open_agent(id)
   draft_id = row.id
   draft_name = row.name
   draft_capability = some_str(row.capability)
-  draft_actions = row.allowed_actions
-  draft_caps = row.caps
-  draft_budget = budget_text(row.caps.subagent_budget)
   draft_skills = row.skills
-  cap_entry = ""
   skill_name = ""
   skill_prefix = ""
   skill_snapshot = ""
@@ -298,11 +273,7 @@ on open_new
   draft_id = ""
   draft_name = ""
   draft_capability = none
-  draft_actions = []
-  draft_caps = empty_caps()
-  draft_budget = ""
   draft_skills = []
-  cap_entry = ""
   skill_name = ""
   skill_prefix = ""
   skill_snapshot = ""
@@ -341,19 +312,6 @@ on open_place(url)
 on pick_capability_option(value)
   draft_capability = some(value)
 
-on toggle_action(action, on)
-  draft_actions = with_flag(draft_actions, action, on)
-
-on pick_cap_kind(kind)
-  cap_kind = some(kind)
-
-on add_cap
-  draft_caps = caps_with(draft_caps, or_empty(cap_kind), cap_entry)
-  cap_entry = ""
-
-on remove_cap(kind, entry)
-  draft_caps = caps_without(draft_caps, kind, entry)
-
 on set_skill_always(on)
   skill_always = on
 
@@ -374,10 +332,10 @@ on set_status(agent_id, paused)
   sent = status(agent_id, paused)
 
 on submit_save
-  sent = save(selected, draft_name, or_empty(draft_capability), draft_actions, caps_with_budget(draft_caps, draft_budget), draft_skills)
+  sent = save(selected, draft_name, or_empty(draft_capability), draft_skills)
 
 on submit_register
-  sent = register(draft_id, draft_name, or_empty(draft_capability), draft_actions, caps_with_budget(draft_caps, draft_budget), draft_skills)
+  sent = register(draft_id, draft_name, or_empty(draft_capability), draft_skills)
 
 // ---- the messaging panel ----------------------------------------------------
 
@@ -1014,7 +972,7 @@ view
               border=border
               border-w=1.0
               r=12.0
-            text "No model agents configured — models appear here with their capability and grants."
+            text "No model agents configured — models appear here with their capability and skills."
               with
                 size=13.0
                 @text-meta
@@ -1090,8 +1048,8 @@ view
                                     @text-secondary_fg
                                     @font-mono
                                     @font-semibold
-                            // what it may do, counted — never a comma-joined dump
-                            // of grant names
+                            // what it carries, counted — never a comma-joined
+                            // dump of skill names
                             row
                               with
                                 w=fill
@@ -1103,19 +1061,7 @@ view
                                   @text-meta
                                   @font-mono
                                   @font-medium
-                              text "skills ·"
-                                with
-                                  size=10.5
-                                  @text-meta
-                                  @font-mono
-                                  @font-medium
-                              text cap_count(agent.caps)
-                                with
-                                  size=10.5
-                                  @text-meta
-                                  @font-mono
-                                  @font-medium
-                              text "grants · owner"
+                              text "skills · owner"
                                 with
                                   size=10.5
                                   @text-meta
@@ -1388,227 +1334,6 @@ view
                           size=12.0
                           @text-fg
                           @font-mono
-                  // The action grant: the whole vocabulary, ticked.
-                  col w=fill gap=6.0
-                    text "Actions"
-                      with
-                        size=12.5
-                        @text-fg
-                        @font-semibold
-                    text "Every write this agent may propose. An unticked action is refused at the registry."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
-                    // "*" is every action the catalog knows today and every
-                    // one added later; the registry keeps it as the whole
-                    // grant, so the individual ticks read as implied.
-                    checkbox "every action (*)" #action-every checked=has(draft_actions, "*") disabled=!can_edit -> toggle_action("*", _)
-                    for action in actions
-                      checkbox action #action(action) checked=(has(draft_actions, action) || has(draft_actions, "*")) disabled=(!can_edit || has(draft_actions, "*")) -> toggle_action(action, _)
-                  // Resource caps: exact repos, duckfs prefixes, page ids ("*"
-                  // is every page), tool ids, vault refs, and the peer-call
-                  // budget.
-                  col w=fill gap=6.0
-                    text "Grants"
-                      with
-                        size=12.5
-                        @text-fg
-                        @font-semibold
-                    text "Forge repos by name, duckfs prefixes, page ids (\"*\" for every page), tool ids and vault refs. Empty denies everything."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
-                    for entry in draft_caps.forge_read
-                      row w=fill gap=6.0 align=center
-                        text "forge read"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("forge_read", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.forge_push
-                      row w=fill gap=6.0 align=center
-                        text "forge push"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("forge_push", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.duckfs_read
-                      row w=fill gap=6.0 align=center
-                        text "duckfs read"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("duckfs_read", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.duckfs_write
-                      row w=fill gap=6.0 align=center
-                        text "duckfs write"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("duckfs_write", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.tools
-                      row w=fill gap=6.0 align=center
-                        text "tool"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("tools", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.secrets
-                      row w=fill gap=6.0 align=center
-                        text "secret"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("secrets", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    for entry in draft_caps.pages_write
-                      row w=fill gap=6.0 align=center
-                        text "pages write"
-                          with
-                            size=10.5
-                            @text-hint
-                            @font-mono
-                        text entry
-                          with
-                            size=12.0
-                            @text-fg
-                            @font-mono
-                        space w=fill
-                        if can_edit
-                          button -> remove_cap("pages_write", entry)
-                            with
-                              label="Remove grant"
-                              w=22.0
-                              h=22.0
-                              p=0.0
-                            text "×" size=14.0 @text-meta
-                    if can_edit
-                      row w=fill gap=6.0 align=center
-                        pick cap_kinds() cap_kind #cap-kind -> pick_cap_kind _
-                          with
-                            hint="kind"
-                            w=130.0
-                        input "" #cap-entry <-> cap_entry
-                          with
-                            label="Grant entry"
-                            hint="repo, prefix, page id…"
-                            w=fill
-                            p=7.0
-                            text-size=12.5
-                            line-h=1.2
-                            @control
-                          active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                          hovered bg=elevated border=fg/21
-                          disabled bg=muted_bg/54 value=muted
-                        button -> add_cap
-                          with
-                            label="Add grant"
-                            disabled=empty(trim(cap_entry))
-                            h=28.0
-                            p=5.0
-                            @secondary_action
-                          text "Add" size=12.0
-                    row w=fill gap=6.0 align=center
-                      text "Peer-call budget" size=12.0 @text-fg
-                      space w=fill
-                      input "" #agent-budget <-> draft_budget
-                        with
-                          label="Subagent budget"
-                          hint="0"
-                          disabled=!can_edit
-                          w=70.0
-                          p=7.0
-                          text-size=12.5
-                          line-h=1.2
-                          @control
-                        active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                        hovered bg=elevated border=fg/21
-                        disabled bg=muted_bg/54 value=muted
                   // Curated skills: an always-loaded skill is the persona,
                   // assembled into every run's context; an on-demand one is
                   // indexed and read when the task calls for it.
