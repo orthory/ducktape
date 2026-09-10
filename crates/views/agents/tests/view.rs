@@ -78,6 +78,7 @@ fn register(rows: Vec<AgentRow>, account: &str, committed: i64) -> Vec<u8> {
         rows,
         Vec::new(),
         "",
+        0,
         RunJournal::default(),
         account,
         committed,
@@ -88,6 +89,7 @@ fn register_with_runs(
     rows: Vec<AgentRow>,
     runs: Vec<RunRow>,
     open_run: &str,
+    opened: i64,
     journal: RunJournal,
     account: &str,
     committed: i64,
@@ -96,6 +98,7 @@ fn register_with_runs(
         rows,
         runs,
         open_run,
+        opened,
         journal,
         LiveRun::default(),
         account,
@@ -103,10 +106,12 @@ fn register_with_runs(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_with_live(
     rows: Vec<AgentRow>,
     runs: Vec<RunRow>,
     open_run: &str,
+    opened: i64,
     journal: RunJournal,
     live: LiveRun,
     account: &str,
@@ -116,6 +121,7 @@ fn register_with_live(
         rows,
         runs,
         open_run: open_run.into(),
+        opened,
         journal,
         live,
         capabilities: vec!["claude".into(), "codex".into()],
@@ -159,6 +165,121 @@ fn frame_has_button(frame: &Frame, name: &str) -> bool {
         named || node.children().iter().any(|child| walk(child, name))
     }
     frame.root.as_ref().is_some_and(|root| walk(root, name))
+}
+
+fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
+    fn find<'a>(node: &'a Node, suffix: &str) -> Option<&'a Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node);
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
+
+#[test]
+fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
+    use ui_lang_guest::wire::{Event, Length, mouse};
+    let (subscription, _) = booted(vec![], "7");
+    let mut running = run("peer", "Claude", "running");
+    running.dispatch_id = "32a29e72a8fc5b673f196f93ab63a18b8cef8f47f94ceac9c1bb7c1".into();
+    let receipt = format!(
+        "react · live · message {} · request-id",
+        running.dispatch_id
+    );
+    let journal = RunJournal {
+        dispatch_id: running.dispatch_id.clone(),
+        entries: vec![JournalEntry {
+            height: "h 123".into(),
+            kind: "acted".into(),
+            summary: receipt.clone(),
+        }],
+        links: vec![RunLink {
+            relation: "from".into(),
+            kind: "chat".into(),
+            label: "Bound and scroll the branch selector without overflowing the button".into(),
+            url: "duck://channel/general/12".into(),
+        }],
+    };
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_runs(
+            vec![],
+            vec![running.clone()],
+            &running.dispatch_id,
+            1,
+            journal,
+            "7",
+            0,
+        ),
+    )]);
+    assert!(has_text(&frame, "→ Reaction requested"));
+    assert!(!has_text(&frame, &receipt));
+    assert!(!has_text(&frame, &running.dispatch_id));
+    fn check_place(node: &Node) -> bool {
+        if let Node::Button {
+            label: Some(label),
+            width,
+            height,
+            ..
+        } = node
+            && label.starts_with("Bound and scroll")
+        {
+            assert_eq!(*width, Some(Length::Fill));
+            assert_eq!(*height, None, "a wrapped title grows its button");
+            return true;
+        }
+        node.children().iter().any(check_place)
+    }
+    assert!(check_place(frame.root.as_ref().unwrap()));
+    let frame = tick_native(press(&frame, &receipt));
+    assert!(has_text(&frame, &receipt));
+    let frame = tick_native(press(&frame, "Run identifier"));
+    assert!(has_text(&frame, &running.dispatch_id));
+    assert!(!has_text(&frame, &receipt));
+    let width = |frame: &Frame| match node_ending(frame, "/journal") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => *width,
+        node => panic!("fixed journal width: {node:?}"),
+    };
+    assert_eq!(width(&frame), 400.0);
+    assert!(frame.mouse_interest);
+    let movement = |x| Event::Mouse {
+        event: mouse::Event::CursorMoved { x, y: 30.0 },
+        captured: true,
+    };
+    let frame = tick_native(vec![movement(700.0)]);
+    let Node::MouseArea {
+        on_press: Some(handler),
+        ..
+    } = node_ending(&frame, "/journal-resize")
+    else {
+        panic!("resize handle")
+    };
+    let frame = tick_native(vec![Event::Message(*handler), movement(620.0)]);
+    assert_eq!(width(&frame), 480.0);
+    let frame = tick_native(vec![
+        Event::Mouse {
+            event: mouse::Event::ButtonReleased(mouse::Button::Left),
+            captured: true,
+        },
+        movement(500.0),
+    ]);
+    assert_eq!(width(&frame), 480.0);
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, 900.0, 900.0),
+        570.0
+    );
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, -900.0, 900.0),
+        280.0
+    );
+    assert_eq!(
+        agents_view::host::compact_run_text(&"한".repeat(40)),
+        format!("{}…", "한".repeat(16))
+    );
 }
 
 #[test]
@@ -367,6 +488,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             vec![agent("Reviewer", "active", true)],
             vec![running.clone(), failed.clone()],
             "",
+            0,
             RunJournal::default(),
             "7",
             0,
@@ -434,6 +556,7 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             vec![agent("Reviewer", "active", true)],
             vec![running, failed.clone()],
             &failed.dispatch_id,
+            1,
             journal,
             "7",
             0,
@@ -474,34 +597,66 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
 
 /// THE APP OWNS WHICH RUN IS OPEN. A chat hint, a bell or a duck://run link
 /// opens a run from another tab, so the register's `open_run` opens the
-/// panel here without a press — and the panel it opens is keyed by the
-/// run's address, which is also the key its journal and live reading carry.
+/// tracker here without a press, whichever panel the reader was on — and the
+/// panel it opens is keyed by the run's address, which is also the key its
+/// journal and live reading carry. The run stays open while the reader looks
+/// at another panel, and a second door onto that same run lands them on the
+/// tracker again: the landing follows the door count, not the run's name.
 #[test]
 fn the_register_opens_the_run_the_app_names() {
     boot_native();
     let frame = tick_native(Vec::new());
     let subscription = frame.requests[0].id;
     let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
-    let frame = tick_native(vec![item(
-        subscription,
-        &register_with_runs(
-            vec![agent("Reviewer", "active", true)],
-            vec![running.clone()],
-            &running.dispatch_id,
-            RunJournal::default(),
-            "7",
-            0,
-        ),
-    )]);
-    let frame = tick_native(press(&frame, "Runs"));
+    let opened_by_the_app = |opened: i64| {
+        item(
+            subscription,
+            &register_with_runs(
+                vec![agent("Reviewer", "active", true)],
+                vec![running.clone()],
+                &running.dispatch_id,
+                opened,
+                RunJournal::default(),
+                "7",
+                0,
+            ),
+        )
+    };
+    let frame = tick_native(vec![opened_by_the_app(1)]);
     assert!(
         has_text(&frame, "Reading the journal…"),
-        "{:?}",
+        "the tracker is landed on without a press: {:?}",
         texts(&frame)
     );
     assert!(
-        has_text(&frame, &running.dispatch_id),
-        "the open panel names the run's address: {:?}",
+        has_text(
+            &frame,
+            &agents_view::host::compact_run_text(&running.dispatch_id)
+        ),
+        "the open panel abbreviates the run's address: {:?}",
+        texts(&frame)
+    );
+    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+
+    // the reader looks at the registry; the run stays open behind it
+    let frame = tick_native(press(&frame, "Registry"));
+    assert!(
+        !has_text(&frame, "Reading the journal…"),
+        "{:?}",
+        texts(&frame)
+    );
+    let frame = tick_native(vec![opened_by_the_app(1)]);
+    assert!(
+        !has_text(&frame, "Reading the journal…"),
+        "the register alone moves no panel: {:?}",
+        texts(&frame)
+    );
+
+    // the same run, through another door: the tracker again
+    let frame = tick_native(vec![opened_by_the_app(2)]);
+    assert!(
+        has_text(&frame, "Reading the journal…"),
+        "a door onto the open run lands on the tracker: {:?}",
         texts(&frame)
     );
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
@@ -566,13 +721,13 @@ fn the_open_run_draws_its_progress_and_its_places_as_chips() {
             vec![agent("Reviewer", "active", true)],
             vec![running.clone()],
             &running.dispatch_id,
+            1,
             journal,
             live,
             "7",
             0,
         ),
     )]);
-    let frame = tick_native(press(&frame, "Runs"));
     for expected in [
         "Reading the repo",
         "Command: cargo test",

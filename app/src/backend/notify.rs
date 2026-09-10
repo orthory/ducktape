@@ -4,17 +4,25 @@
 //! Everything a mention produced before this landed inside the app — an inbox
 //! row and the bell's unread count — which is worth nothing to a reader whose
 //! window is behind an editor. The decision of WHETHER to notify is pure and
-//! lives in [`desktop_notice`]; posting is one platform call behind it, and
-//! only that call is untestable.
+//! lives in [`desktop_notice`]; posting is one call on whichever notifier the
+//! host offers, and only that call is untestable.
 //!
-//! THE POSTING SIDE REFUSES OUTSIDE A BUNDLE. `UNUserNotificationCenter`
-//! terminates a process that has no bundle identifier, and `cargo test` is
-//! exactly such a process — so the bundle is checked before the framework is
-//! touched, and a bare binary degrades to a `debug!` line.
+//! "Behind an editor" is the app's own fact on every host: the window focus
+//! events say whether any window of this app has focus, and the reducer
+//! records their answer here ([`note_window_focus`]) for the live fold, which
+//! runs beside the reducer and cannot read its state.
+//!
+//! THE NOTIFIER IS WHAT THE HOST OFFERS. On macOS it is the notification
+//! center, which terminates a process that has no bundle identifier — and
+//! `cargo test` is exactly such a process — so the bundle is checked before
+//! the framework is touched, and a bare binary degrades to a `debug!` line.
+//! Everywhere else it is the freedesktop notifications service on the session
+//! bus; a host with no session bus degrades the same way.
 
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 /// How much of a message body a notification carries. A banner shows two or
@@ -219,6 +227,23 @@ fn active_channel() -> String {
         .unwrap_or_default()
 }
 
+/// WHETHER ANY WINDOW OF THIS APP HAS FOCUS, as the OS last reported it. A
+/// banner is for a reader who is elsewhere; a mention landing in the window
+/// they are looking at is already on screen.
+static APP_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// Record the focus the window events reported: `true` when a window of this
+/// app took focus, `false` when the last focused one lost it. A task so the
+/// reducer can call it where it learns the fact; it has nothing to deliver.
+pub fn note_window_focus(focused: bool) -> iced::Task<()> {
+    APP_FOCUSED.store(focused, Ordering::Relaxed);
+    iced::Task::none()
+}
+
+fn app_focused() -> bool {
+    APP_FOCUSED.load(Ordering::Relaxed)
+}
+
 // ============================================================================
 // the live trigger
 // ============================================================================
@@ -240,7 +265,7 @@ pub(crate) fn notify_chat_op(
         return;
     };
     let screen = OnScreen {
-        app_focused: platform::app_is_frontmost(),
+        app_focused: app_focused(),
         active_channel: active_channel(),
     };
     let Some(notice) = desktop_notice(&arrival, notifications_enabled(), &screen) else {
@@ -296,7 +321,6 @@ mod platform {
 
     use objc2::rc::Retained;
     use objc2::runtime::Bool;
-    use objc2_app_kit::NSRunningApplication;
     use objc2_foundation::{NSBundle, NSError, NSString};
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
@@ -329,13 +353,6 @@ mod platform {
             // SAFETY: the center is a live object and the block outlives the call.
             unsafe { center.requestAuthorizationWithOptions_completionHandler(options, &handler) };
         });
-    }
-
-    /// True when this app is the one the person is looking at.
-    pub(super) fn app_is_frontmost() -> bool {
-        // SAFETY: `currentApplication` and `isActive` are documented as
-        // callable from any thread.
-        unsafe { NSRunningApplication::currentApplication().isActive() }
     }
 
     pub(super) fn post(notice: &DesktopNotice) {
@@ -374,31 +391,151 @@ mod platform {
     }
 }
 
+/// The freedesktop notifications service: one `Notify` call on the session
+/// bus, which every desktop off macOS answers through its own notification
+/// daemon. Pure Rust, and no new dependency — zbus is already in this binary
+/// under the accessibility stack.
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use super::DesktopNotice;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
 
-    /// No native notifier is wired outside macOS yet; the in-app bell is still
-    /// the whole story there.
-    pub(super) fn post(notice: &DesktopNotice) {
-        tracing::debug!(
-            target: "ducktape::app",
-            reason = "unsupported_platform",
-            room = %notice.thread,
-            "skipped a desktop notification"
-        );
+    /// The desktop entry the banner is filed under (`app/packaging`), which
+    /// is what gives it this app's icon and lets the desktop group it.
+    const DESKTOP_ENTRY: &str = "dev.ducktape.app";
+
+    /// One session-bus connection per process, opened on the first banner. A
+    /// host with no session bus answers every banner with the same skip, and
+    /// says so once.
+    fn session_bus() -> Option<&'static zbus::blocking::Connection> {
+        static BUS: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
+        BUS.get_or_init(|| match zbus::blocking::Connection::session() {
+            Ok(connection) => Some(connection),
+            Err(error) => {
+                tracing::debug!(
+                    target: "ducktape::app",
+                    reason = "no_session_bus",
+                    %error,
+                    "desktop notifications are off on this host"
+                );
+                None
+            }
+        })
+        .as_ref()
     }
 
-    /// With no way to ask, assume the reader is elsewhere: a banner they did
-    /// not need costs less than the mention they never saw.
-    pub(super) fn app_is_frontmost() -> bool {
-        false
+    /// The freedesktop body is markup for the servers that render it, so the
+    /// message's own angle brackets and ampersands are escaped rather than
+    /// swallowed as tags.
+    pub(super) fn markup_escaped(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    pub(super) fn post(notice: &DesktopNotice) {
+        let Some(bus) = session_bus() else {
+            tracing::debug!(
+                target: "ducktape::app",
+                reason = "no_session_bus",
+                room = %notice.thread,
+                "skipped a desktop notification"
+            );
+            return;
+        };
+        let bus = bus.clone();
+        let notice = notice.clone();
+        // The live fold must not wait on the bus: the call runs on its own
+        // thread and reports there.
+        std::thread::spawn(move || {
+            if let Err(error) = notify(&bus, &notice) {
+                tracing::debug!(
+                    target: "ducktape::app",
+                    reason = "notify_refused",
+                    room = %notice.thread,
+                    %error,
+                    "skipped a desktop notification"
+                );
+            }
+        });
+    }
+
+    /// One `Notify` call: `(app_name, replaces_id, app_icon, summary, body,
+    /// actions, hints, expire_timeout)` → the banner's id. A fresh id per
+    /// banner, the desktop's own timeout, and no actions — the bell is where
+    /// a reader acts.
+    pub(super) fn notify(
+        bus: &zbus::blocking::Connection,
+        notice: &DesktopNotice,
+    ) -> zbus::Result<u32> {
+        let body = markup_escaped(&format!("{}: {}", notice.subtitle, notice.body));
+        let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::from([
+            ("desktop-entry", zbus::zvariant::Value::from(DESKTOP_ENTRY)),
+            ("category", zbus::zvariant::Value::from("im.received")),
+        ]);
+        let reply = bus.call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &(
+                "Ducktape",
+                0u32,
+                "",
+                notice.title.as_str(),
+                body.as_str(),
+                Vec::<&str>::new(),
+                hints,
+                -1i32,
+            ),
+        )?;
+        reply.body().deserialize::<u32>()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fold's "is anyone looking" is what the windows last reported, on
+    /// every host: focus taken is looking, focus lost is elsewhere.
+    #[test]
+    fn the_focus_fact_is_what_the_windows_last_reported() {
+        let _ = note_window_focus(true);
+        assert!(app_focused());
+        let _ = note_window_focus(false);
+        assert!(!app_focused());
+    }
+
+    /// A message's own markup characters reach the freedesktop body escaped,
+    /// so a notification server that renders markup shows them as typed.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_freedesktop_body_escapes_the_message_markup() {
+        assert_eq!(platform::markup_escaped("a <b> & c"), "a &lt;b&gt; &amp; c");
+    }
+
+    /// THE DRIVE: a banner through this session's own notification daemon.
+    /// Ignored because it needs a session bus with a daemon on it and shows a
+    /// real banner; run it by name on a desktop to see the arm work.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[ignore = "needs a session bus with a notification daemon; shows a banner"]
+    fn the_freedesktop_arm_posts_a_banner_the_daemon_accepts() {
+        let bus = zbus::blocking::Connection::session().expect("a session bus");
+        let id = platform::notify(
+            &bus,
+            &DesktopNotice {
+                title: "#general".into(),
+                subtitle: "Reader".into(),
+                body: "a <drive> banner & nothing more".into(),
+                thread: "drive".into(),
+            },
+        )
+        .expect("the daemon takes the banner");
+        assert!(id > 0, "a banner has a nonzero id, got {id}");
+    }
 
     #[test]
     fn notification_uses_canonical_program_author_and_account_mentions() {

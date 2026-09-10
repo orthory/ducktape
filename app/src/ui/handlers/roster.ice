@@ -131,8 +131,18 @@ on agents_loaded(next)
 // its journal read under a fresh op so a slower earlier read cannot land over
 // it. An empty id closes the panel.
 on open_run_panel(dispatch_id)
+  invalidate lane=account_ceremony
+  invalidate lane=account_desktop_ceremony
+  account_busy = account_busy && empty(account_ceremony_phase)
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
+  account_ceremony_left = ""
+  // Same tab-move rule as `select_shell_tab`; uniform on purpose, so no door
+  // has to prove which tab it was pressed on before trusting the retire.
   shell_tab = ShellTab.agents
   agents_open_run = dispatch_id
+  agents_opened = agents_opened + 1
   agents_journal = empty_run_journal()
   agents_journal_op = agents_journal_op + 1
   run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _

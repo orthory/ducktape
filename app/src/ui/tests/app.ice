@@ -875,12 +875,14 @@ test the_status_item_opens_a_window_when_none_is_tracked
   expect onboarding_win != none
 
 // A CONNECTED NETWORK WITH NOTHING TRACKED IS ORDINARY (#1782): merely closing
-// the console must reopen the CONSOLE, not send its owner back through the
-// launch window to the network picker — `onboarding_opened` always re-runs
-// `hub_state()`, which resets `hub_step`. `rpc` stays empty on purpose: the
-// reconnect task the console's own open would otherwise start needs a live
-// socket this scenario has none of, and the only claim under test is which
-// window comes back and whether `hub_step` moved.
+// the console must re-enter the network through the doors' landing
+// (`network_entered`, whose connect opens the CONSOLE on its answer), not send
+// its owner back through the launch window to the network picker —
+// `onboarding_opened` always re-runs `hub_state()`, which resets `hub_step`.
+// `rpc` stays empty on purpose: the connect the landing would otherwise run
+// needs a live socket this scenario has none of, so the landing stops at its
+// reset, and the claims under test are which way it went (the console's
+// connect begun, no launch window) and whether `hub_step` moved.
 preset ui_tray_reconnect
   state
     connected = true
@@ -891,7 +893,11 @@ test the_status_item_reopens_the_console_without_resetting_hub_step
   expect console_win == none
   expect onboarding_win == none
   tray choose "Open Ducktape"
-  expect console_win != none
+  // The door's own writes, not the status row: the preset's `connected`
+  // arms the live stream, whose publications write `status` whenever they
+  // land (see `ui_tray_live`), so the row is nobody's to expect here.
+  expect !connected
+  expect loading
   expect onboarding_win == none
   expect hub_step == HubStep.live
 
@@ -947,3 +953,38 @@ test locking_the_seat_takes_the_private_output_with_it
   expect empty(signer_key)
   expect empty(password)
   expect empty(live_agents)
+
+// A CHIP IS A LINK PRESSED ON ANOTHER TAB. The run panel's places carry
+// duck:// addresses and the open plane is where a link becomes navigation;
+// a chat address opened from the agents tab has to land on the chat tab
+// before it moves rooms, or the move happens under a tab the reader is not
+// looking at and the press appears to do nothing.
+test a_chat_address_opened_from_another_tab_lands_on_the_chat_tab
+  preset ui_live_run_seated
+  dispatch select_shell_tab(ShellTab.agents)
+  expect shell_tab == ShellTab.agents
+  dispatch open_message_link("duck://channel/general")
+  expect shell_tab == ShellTab.chat
+
+// EVERY DOOR ONTO A RUN IS A TAB MOVE, and a tab move retires the account
+// ceremony wherever it was pressed — the bell and a duck://run link reach the
+// run panel from any tab, the settings tab mid-ceremony included.
+preset ui_ceremony_on_settings
+  state
+    connected = true
+    connected_rpc = "http://127.0.0.1:8844"
+    network_chain_id = "testnet#abcd"
+    connect_generation = 7
+    signer_key = "aa11"
+    shell_tab = ShellTab.settings
+    account_ceremony_phase = "qr"
+    account_ceremony_qr = "otpauth://totp/demo"
+
+test a_run_opened_mid_ceremony_retires_the_ceremony_like_any_tab_move
+  preset ui_ceremony_on_settings
+  expect !empty(account_ceremony_phase)
+  dispatch open_run_panel("dispatch-1")
+  expect shell_tab == ShellTab.agents
+  expect agents_open_run == "dispatch-1"
+  expect empty(account_ceremony_phase)
+  expect empty(account_ceremony_qr)

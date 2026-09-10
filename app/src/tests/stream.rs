@@ -214,15 +214,15 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     // — forever if it hangs — "Load older" is dead in the room she lands in.
     // Every LAUNCH that starts a room transition is here, not just the two
     // channel pickers: the search hit and the create both land in a different
-    // room, and the reconnect and the console open drop the socket the page was
-    // requested on, so those two may never answer at all.
+    // room, and the reconnect and a door's network entry drop the socket the
+    // page was requested on, so those two may never answer at all.
     for abandoning in [
         __DucktapeMessage::ChooseChannel("b".into()),
         __DucktapeMessage::ChooseDm("peer".into()),
         __DucktapeMessage::OpenChatSearchHit("b".into(), 7, 7),
         __DucktapeMessage::CreateChannelSubmit,
         __DucktapeMessage::Reconnect,
-        __DucktapeMessage::ConsoleOpened(iced::window::Id::unique()),
+        __DucktapeMessage::NetworkEntered,
     ] {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;

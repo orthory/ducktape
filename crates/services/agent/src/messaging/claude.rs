@@ -5,7 +5,10 @@
 //! An interactive session binds a unix socket and publishes a registry entry
 //! naming it. Both are per-session and per-user:
 //!
-//! - `$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, mode 0600 in a 0700 directory;
+//! - `<sockets dir>/<pid>.sock`, mode 0600 in a 0700 directory, the sockets
+//!   dir being `$XDG_RUNTIME_DIR/cc-socks` where a runtime dir is set and
+//!   `<temp dir>/cc-socks` where not (`/tmp/cc-socks-<uid>` when a socket
+//!   path there would not fit a socket address);
 //! - `<claude home>/sessions/<pid>.json` — `{pid, sessionId, messagingSocketPath, …}`;
 //! - `<claude home>/sessions/<pid>.<sha256(socket path)>.key`, mode 0600 —
 //!   `{peerToken, …}`.
@@ -560,12 +563,20 @@ impl Receipts {
     /// session, and reclaiming another process's address to gain a receipt
     /// channel is not a trade this daemon makes.
     pub async fn bind(sockets_dir: &Path) -> Result<Arc<Self>, String> {
-        tokio::fs::create_dir_all(sockets_dir)
-            .await
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        // the directory and the socket are the user's own, as the interface
+        // above states: 0700 around 0600. A directory already there keeps its
+        // mode — Claude Code made it, to the same rule.
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true).mode(0o700);
+        directory
+            .create(sockets_dir)
             .map_err(|error| format!("create sockets dir: {error}"))?;
         let address = sockets_dir.join(format!("{}.sock", std::process::id()));
         let listener = tokio::net::UnixListener::bind(&address)
             .map_err(|error| format!("bind receipt address: {error}"))?;
+        std::fs::set_permissions(&address, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("guard receipt address: {error}"))?;
         let receipts = Arc::new(Self {
             address,
             waiting: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1047,6 +1058,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ducktape-receipts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let receipts = Receipts::bind(&dir).await.expect("binds");
+        // the user's own, as the interface states: 0700 around 0600
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &Path| std::fs::metadata(path).expect("exists").permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700, "the sockets dir is the user's own");
+            assert_eq!(mode(receipts.address()), 0o600, "the receipt address is the user's own");
+        }
         // the peer below is this process, and a verdict is only read from a
         // process a BINDING named. Without this the connection is dropped on
         // the credential check and the waiter below never resolves at all.

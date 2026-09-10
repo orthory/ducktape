@@ -149,6 +149,11 @@ pub const ACTION_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
 
 /// Deploy the component committed by this run after its program accepts the request.
 pub const ACTION_MODULES_UPDATE: &str = "modules.update";
+/// Open a pull request on a forge repository from a branch the run pushed
+/// (the `forge.open_pr` operation). Not a grant name: the operation is gated
+/// by the model's `forge_push` cap on the repository, the same authority the
+/// push itself spent.
+pub const ACTION_FORGE_OPEN_PR: &str = "forge.open_pr";
 /// permission to send one collaboration message as a bound participant (the
 /// `collaboration.send` operation).
 ///

@@ -79,9 +79,13 @@ pub async fn connect(
     }
     let result = async {
         let rpc = rpc_client(&rpc)?;
-        // the node the module-owned views load their deployments from
-        crate::module_view::connected(&rpc);
-        load_workspace(&rpc, None, None, generation).await
+        // the node the module-owned views load their deployments from: the
+        // views load while the workspace does, and this answers with both
+        // in hand, so the tabs it opens onto never draw a view on its way
+        let views = crate::module_view::connected(&rpc);
+        let workspace = load_workspace(&rpc, None, None, generation).await?;
+        views.settled().await;
+        Ok::<_, String>(workspace)
     }
     .await;
     // SAY WHAT ACTUALLY FAILED. This threw the cause away with `|_|` and

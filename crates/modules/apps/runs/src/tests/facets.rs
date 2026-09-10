@@ -1290,3 +1290,319 @@ fn workspace_receipt_mirror_decodes_the_forge_fields() {
     assert_eq!(receipt.branch, None);
     assert_eq!(receipt.output_commit, None);
 }
+
+// ---- forge.open_pr: the run's own proposal ------------------------------------
+
+/// a module wired with the forge sink and one CHAT-origin run for "bot"
+/// (a Chain sink, a duckfs workspace) whose agent holds forge_push on "app":
+/// the run that pushed a branch through the transport and proposes it.
+fn chat_run_with_forge_push() -> (RunsModule, Registry, String) {
+    let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
+    let mut m = module().with_sink_forge("forge");
+    m.models = granted.clone();
+    commit(&mut m);
+    request_post(&mut m, &granted, 2, &[]);
+    commit(&mut m);
+    (m, granted, run_id_for("general", 2, "bot"))
+}
+
+#[test]
+fn a_forge_open_pr_from_a_chat_run_opens_the_pr_with_the_runs_breadcrumb() {
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["pushed the poem"],
+                vec![forge_open_pr(
+                    "app",
+                    "chiefduck/poem",
+                    "dev",
+                    "Add the poem",
+                    "A poem, as asked.",
+                )],
+            )),
+        ),
+    )
+    .unwrap();
+    let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+    assert_eq!(forge_ops.len(), 1, "one OpenPr proposed");
+    // the model's title and prose, then the run's breadcrumb: a duckfs
+    // receipt has no forge output line, and no saga is seeded.
+    assert_eq!(
+        forge::decode_msg(&forge_ops[0].payload).unwrap(),
+        forge::ForgeMsg::OpenPr {
+            repo: "app".into(),
+            title: "Add the poem".into(),
+            body: format!(
+                "A poem, as asked.\n\n---\nrun: {run_id}\noutput: none (no changes this run)\nnode: unknown"
+            ),
+            source_branch: "chiefduck/poem".into(),
+            target_branch: "dev".into(),
+        }
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run's reply still posts");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
+}
+
+#[test]
+fn a_forge_open_pr_without_the_cap_fails_the_run_by_name() {
+    // the strict lane: the cap that admits the push is the one the proposal
+    // needs, and its absence fails the RUN — never the block, never silently.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![forge_open_pr("app", "chiefduck/poem", "dev", "Add the poem", "")],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("lacks forge_push for app")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "no cap → no forge op"
+    );
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+}
+
+#[test]
+fn a_forge_open_pr_with_fields_forge_would_reject_fails_the_response_not_the_block() {
+    // forge rejects identical branches, an empty title and an over-cap
+    // title; each would abort the delivery block at apply, so each fails the
+    // response by name here.
+    for (source, target, title, reason) in [
+        ("dev", "dev", "Same branch", "same branch"),
+        ("chiefduck/poem", "dev", "   ", "non-empty title"),
+        ("chiefduck/poem", "dev", &"t".repeat(257), "the cap is 256"),
+    ] {
+        let (mut m, registry, run_id) = chat_run_with_forge_push();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "chiefduck/poem")
+            .with_forge_ref("app", "dev");
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(response(
+                    &["done"],
+                    vec![forge_open_pr("app", source, target, title, "")],
+                )),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.notes().iter().any(|n| n.contains(reason)),
+            "{reason}: {:?}",
+            ctx.notes()
+        );
+        assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+        commit(&mut m);
+        assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+    }
+}
+
+#[test]
+fn two_forge_open_pr_of_one_branch_fail_the_response() {
+    // every duplicate probe at delivery reads committed state, so the second
+    // proposal of a branch is refused where the response is validated.
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![
+                    forge_open_pr("app", "chiefduck/poem", "dev", "Add the poem", ""),
+                    forge_open_pr("app", "chiefduck/poem", "main", "Add it again", ""),
+                ],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("proposes app branch chiefduck/poem twice")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+}
+
+#[test]
+fn a_forge_open_pr_of_a_branch_already_under_an_open_pr_links_that_pr() {
+    // the duplicate-PR guard: the push updated the open PR, which becomes the
+    // run's link; no second OpenPr.
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem")
+        .with_forge_ref("app", "dev")
+        .with_forge_item(
+            "app",
+            forge_pr(7, "Add the poem", "", "chiefduck/poem", "dev"),
+        );
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![forge_open_pr("app", "chiefduck/poem", "dev", "Add the poem", "")],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"), "no second PR");
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("forge.open_pr: updated PR #7")),
+        "{:?}",
+        ctx.notes()
+    );
+    commit(&mut m);
+    assert_eq!(
+        recent_runs(&m)[0].pr,
+        Some(PrRef {
+            repo: "app".into(),
+            number: 7
+        })
+    );
+}
+
+#[test]
+fn a_forge_open_pr_of_an_unborn_target_degrades_without_aborting() {
+    let (mut m, registry, run_id) = chat_run_with_forge_push();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "chiefduck/poem");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["done"],
+                vec![forge_open_pr("app", "chiefduck/poem", "dev", "Add the poem", "")],
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("forge.open_pr skipped: target branch dev not born")),
+        "{:?}",
+        ctx.notes()
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its reply");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
+}
+
+#[test]
+fn a_forge_open_pr_of_the_sinks_own_branch_is_the_sinks_pr() {
+    // a forge-item run whose committed sink already proposes agent/x: the
+    // model's own proposal of that branch is the sink's PR, so exactly one
+    // OpenPr leaves, with the sink's derived title.
+    let (mut m, registry, run_id) = forge_push_run();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
+    let oid = "1a".repeat(20);
+    let facets = serde_json::json!({
+        "workspace_receipt": {
+            "source_prefix": "forge:app",
+            "source_snapshot": "2b".repeat(20),
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": false,
+            "branch": "agent/x",
+            "output_commit": oid,
+        },
+        "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main"},
+    });
+    let prose = String::from_utf8(response_json(
+        &["done"],
+        vec![forge_open_pr("app", "agent/x", "main", "My own title", "")],
+    ))
+    .unwrap();
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(runner_wrapper(&prose, facets))),
+    )
+    .unwrap();
+    let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+    assert_eq!(forge_ops.len(), 1, "the sink's OpenPr, and no second one");
+    let forge::ForgeMsg::OpenPr { title, .. } = forge::decode_msg(&forge_ops[0].payload).unwrap()
+    else {
+        panic!("an OpenPr")
+    };
+    assert_eq!(title, "done", "the sink derives the title; the proposal is skipped");
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("the run's committed sink already proposes agent/x")),
+        "{:?}",
+        ctx.notes()
+    );
+}

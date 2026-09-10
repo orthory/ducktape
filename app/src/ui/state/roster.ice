@@ -13,6 +13,9 @@ state
   // open, and that run's journal as last read
   agents_runs:[RunRow] = []
   agents_open_run = ""
+  // one per door a run was opened through: the view lands on its tracker at
+  // every bump, onto the run already open as much as onto a new one
+  agents_opened:i64 = 0
   agents_journal:RunJournal = empty_run_journal()
   // the journal read's own name. The run id is its SUBJECT, not its identity:
   // two networks can carry the same run id, so an answer about A would match

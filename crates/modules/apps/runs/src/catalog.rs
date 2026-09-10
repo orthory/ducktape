@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND,
-    ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT,
-    ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_DUCKFS_WRITE_TEXT, ACTION_FORGE_OPEN_PR, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE,
+    ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS, MAX_DUCKFS_WRITE_TEXT_BYTES, MAX_REQUEST_ID_BYTES,
     ModuleUpdateSpec, ReplyBlock,
 };
+use crate::sink::{FORGE_BODY_BYTE_CAP, FORGE_TITLE_BYTE_CAP};
 
 // ---- the envelope ----------------------------------------------------------------
 
@@ -399,6 +400,26 @@ fn specs() -> Vec<Spec> {
             lanes: FINAL_ONLY,
         },
         Spec {
+            name: ACTION_FORGE_OPEN_PR,
+            description: "Open a pull request on a forge repository from a branch you pushed there (git push through this run's forge transport), onto a born target branch such as dev. Final response only: Runs opens it after your output commits, appends the run's breadcrumb to the body, and reports an open PR that already sources the branch instead of opening a second one. Requires the forge_push cap on the repository; the same cap that admitted the push.",
+            grant: Grant::Cap("forge_push".into()),
+            target: Some(object(json!({"repo": {"type": "string", "description": "The forge repository name."}}), &["repo"])),
+            input: object(
+                json!({
+                    "source_branch": {"type": "string", "description": "The branch to merge, already pushed."},
+                    "target_branch": {"type": "string", "description": "The branch to merge into, e.g. dev."},
+                    "title": {"type": "string", "maxLength": FORGE_TITLE_BYTE_CAP},
+                    "body": {"type": "string", "maxLength": FORGE_BODY_BYTE_CAP}
+                }),
+                &["source_branch", "target_branch", "title"],
+            ),
+            result: object(
+                json!({"repo": {"type": "string"}, "source_branch": {"type": "string"}, "target_branch": {"type": "string"}}),
+                &["repo", "source_branch", "target_branch"],
+            ),
+            lanes: FINAL_ONLY,
+        },
+        Spec {
             name: ACTION_COLLABORATION_SEND,
             description: "Send one message in a collaboration conversation, as a participant this run's account is BOUND to. Live lane only: the message reaches collaboration as this account's program origin, and that module refuses it unless the participant's owner bound this account to the conversation under `credential`. Sequence is yours to choose and must be monotonic per credential; resending identical bytes under the same sequence is the same message, not a second one. Requires collaboration.send.",
             grant: Grant::Action(ACTION_COLLABORATION_SEND.into()),
@@ -577,6 +598,15 @@ pub(crate) enum Operation {
         reason: Option<String>,
     },
     ModulesUpdate(ModuleUpdateSpec),
+    /// A pull request the run proposes from a branch it pushed; `body` is
+    /// the model's prose, before the run's breadcrumb.
+    ForgeOpenPr {
+        repo: String,
+        source_branch: String,
+        target_branch: String,
+        title: String,
+        body: String,
+    },
     AgentCall {
         agent_id: String,
         instruction: String,
@@ -588,6 +618,22 @@ pub(crate) enum Operation {
 #[serde(deny_unknown_fields)]
 struct ContentInput {
     content: Vec<ContentPart>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgeRepoTarget {
+    repo: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgeOpenPrInput {
+    source_branch: String,
+    target_branch: String,
+    title: String,
+    #[serde(default)]
+    body: String,
 }
 
 /// Which conversation, and which of the caller's participants it acts as.
@@ -876,6 +922,17 @@ impl Operation {
                 let spec: ModuleUpdateSpec = decode_input(envelope)?;
                 Ok(Self::ModulesUpdate(spec))
             }
+            ACTION_FORGE_OPEN_PR => {
+                let target: ForgeRepoTarget = decode_target(envelope)?;
+                let input: ForgeOpenPrInput = decode_input(envelope)?;
+                Ok(Self::ForgeOpenPr {
+                    repo: target.repo,
+                    source_branch: input.source_branch,
+                    target_branch: input.target_branch,
+                    title: input.title,
+                    body: input.body,
+                })
+            }
             OP_AGENT_CALL => {
                 let target: AgentTarget = decode_target(envelope)?;
                 let input: CallInput = decode_input(envelope)?;
@@ -908,18 +965,20 @@ impl Operation {
             Self::CollaborationSend { .. } => ACTION_COLLABORATION_SEND,
             Self::CollaborationAcknowledge { .. } => ACTION_COLLABORATION_ACKNOWLEDGE,
             Self::ModulesUpdate(_) => ACTION_MODULES_UPDATE,
+            Self::ForgeOpenPr { .. } => ACTION_FORGE_OPEN_PR,
             Self::AgentCall { .. } => OP_AGENT_CALL,
         }
     }
 
     /// The fixed grant this operation needs, or `None` when it is resolved
     /// from the source (`reply`, `react`, `unreact`) or gated by a cap
-    /// (`agent.call`).
+    /// (`agent.call`, `forge.open_pr`).
     pub(crate) fn fixed_grant(&self) -> Option<&'static str> {
         match self {
             Self::Reply { .. }
             | Self::React { .. }
             | Self::Unreact { .. }
+            | Self::ForgeOpenPr { .. }
             | Self::AgentCall { .. } => None,
             other => Some(other.name()),
         }
@@ -1034,6 +1093,11 @@ mod tests {
                 ACTION_MODULES_UPDATE,
                 None,
                 json!({"module_id": "hello", "artifact": "hello.module", "code_hash": "ab".repeat(32), "after": 50}),
+            ),
+            envelope(
+                ACTION_FORGE_OPEN_PR,
+                Some(json!({"repo": "app"})),
+                json!({"source_branch": "agent/x", "target_branch": "dev", "title": "Add the poem"}),
             ),
             envelope(
                 OP_AGENT_CALL,

@@ -191,15 +191,18 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
             let receipt = network
                 .action(&runs::action_request_id(&run.run_id, "tick"))
                 .await;
+            // a page grant ticks the todo under the program's authority; the
+            // block keeps its author — pages records who wrote a block, and a
+            // tick is not a rewrite.
             assert!(
                 matches!(
                     receipt.status,
                     runs::ActionStatus::Completed {
-                        outcome: dispatch::CallOutcomeSummary::Rejected { .. },
+                        outcome: dispatch::CallOutcomeSummary::Applied { .. },
                         ..
                     }
                 ),
-                "page grants cannot impersonate the author: {receipt:?}"
+                "the granted page write applies under program authority: {receipt:?}"
             );
             let pages::PageReply::Block(Some(todo)) = page(
                 &network,
@@ -212,7 +215,7 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                 panic!("todo");
             };
             assert_eq!(todo.author, pages::Party::Account(1));
-            assert!(!todo.checked);
+            assert!(todo.checked);
             for text in ["Review started.", "Review still in progress."] {
                 network
                     .submit(
