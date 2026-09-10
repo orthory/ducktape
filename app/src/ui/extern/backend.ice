@@ -8,7 +8,7 @@ extern crate::backend
   ChannelSwitchFacts(unread_boundary:i64, name:str, archived:bool, members_only:bool)
   ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, edit_body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
   CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
@@ -441,6 +441,7 @@ extern crate::backend
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
+  pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -514,12 +515,12 @@ extern crate::backend
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   pure reaction_refusal(archived:bool, banner:str) -> str
-  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
+  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, after_reply_seq:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64) -> LiveThreadData ! AppError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
-  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str, members:[ChatMember]) -> bool ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError

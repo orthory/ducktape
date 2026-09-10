@@ -504,7 +504,7 @@ on composer_submitted(kind, pending_body, pending_id, scope)
           // fold — an optimistic insert she cannot see is no confirmation at all.
           // The stream is `anchor-y=end`, where relative 0.0 is the tail.
           chat_sent_serial = chat_sent_serial + 1
-          run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
+          run every send_message(connected_rpc, password, active_channel, pending_id, pending_body) -> message_sent _ | message_send_failed _
     ComposerKind.reply
       // The rail twin, with the rail's own two terms: its readiness is
       // `thread_loading`, and an open rail is what `seated` says.
@@ -522,7 +522,17 @@ on composer_submitted(kind, pending_body, pending_id, scope)
           thread_message_action = selection.action
           thread_edit_draft = selection.draft
           error = ""
-          run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_id, pending_body, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
+          run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_id, pending_body) -> thread_reply_sent _ | thread_reply_send_failed _
+    ComposerKind.edit
+      return if scope != edit_scope(connected_rpc, active_channel, selected_message_seq) || message_action != MessageAction.editing
+      let seq = selected_message_seq
+      let rev = selected_message_rev
+      run every duck_echo_str(pending_body) -> edit_message_submit(_, scope, seq, rev) | external_url_failed _
+    ComposerKind.thread_edit
+      return if scope != edit_scope(connected_rpc, active_channel, thread_selected_seq) || thread_message_action != MessageAction.editing
+      let seq = thread_selected_seq
+      let rev = thread_selected_rev
+      run every duck_echo_str(pending_body) -> edit_thread_message_submit(_, scope, seq, rev) | external_url_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -858,6 +868,8 @@ on arm_thread_message_delete(seq, body, rev)
 
 on begin_thread_message_edit(seq, body, rev)
   return if seq <= 0
+  composer_stashed = chat_composer_edit(edit_scope(connected_rpc, active_channel, seq), thread_messages, seq, rev)
+  return if !composer_stashed
   thread_selected_seq = seq
   thread_selected_rev = rev
   thread_message_action = MessageAction.editing
@@ -869,7 +881,8 @@ on clear_thread_message_selection
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
 
-on edit_thread_message_submit(text)
+on edit_thread_message_submit(text, scope, seq, rev)
+  return if scope != edit_scope(connected_rpc, active_channel, thread_selected_seq) || seq != thread_selected_seq || rev != thread_selected_rev || thread_message_action != MessageAction.editing
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(text))
   thread_edit_draft = trim(text)
   invalidate lane=live_thread
@@ -877,7 +890,7 @@ on edit_thread_message_submit(text)
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.message_edit
   error = ""
-  run every edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
+  run every edit_message(connected_rpc, password, active_channel, seq, rev, trim(thread_edit_draft)) -> chat_acked _ | mutation_failed _
 
 on delete_thread_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != MessageAction.delete
@@ -917,6 +930,8 @@ on arm_message_delete(seq, body, rev)
 
 on begin_message_edit(seq, body, rev)
   return if seq <= 0
+  composer_stashed = chat_composer_edit(edit_scope(connected_rpc, active_channel, seq), messages, seq, rev)
+  return if !composer_stashed
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = MessageAction.editing
@@ -1233,7 +1248,8 @@ on close_thread
   copy_head_seq = 0
   copy_surface = CopySurface.nowhere
 
-on edit_message_submit(text)
+on edit_message_submit(text, scope, seq, rev)
+  return if scope != edit_scope(connected_rpc, active_channel, selected_message_seq) || seq != selected_message_seq || rev != selected_message_rev || message_action != MessageAction.editing
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(text))
   // The view owns the keystrokes; the body it submits is the draft from here on.
   message_edit_draft = trim(text)
@@ -1242,7 +1258,7 @@ on edit_message_submit(text)
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.message_edit
   error = ""
-  run every edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
+  run every edit_message(connected_rpc, password, active_channel, seq, rev, trim(message_edit_draft)) -> chat_acked _ | mutation_failed _
 
 on delete_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || message_action != MessageAction.delete
@@ -1556,10 +1572,6 @@ on chat_view_event(event)
       flow
         from done event_text(event, "emoji")
         done -> add_reaction_submit _
-    ChatIntent.edit
-      flow
-        from done event_text(event, "text")
-        done -> edit_message_submit _
     ChatIntent.delete
       flow
         from done true
@@ -1608,10 +1620,6 @@ on chat_view_event(event)
       flow
         from done true
         done -> clear_thread_message_selection()
-    ChatIntent.thread_edit
-      flow
-        from done event_text(event, "text")
-        done -> edit_thread_message_submit _
     ChatIntent.thread_delete
       flow
         from done true

@@ -298,7 +298,6 @@ component NodeScreen(node_key:str, node_data_dir:str, tier:str, admin:bool, stat
               button "Copy node key" -> emit(copy_to_clipboard, node_key, "Node key copied")
                 with
                   disabled=empty(node_key)
-                  h=28.0
                   p=7.0
                   @secondary_action
               GroupLabel label="NETWORK"

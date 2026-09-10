@@ -404,7 +404,7 @@ on forge_composer_event(scope, body)
     SubmitVerdict.admitted
       let op = fresh_operation_id("forge-note")
       forge_discussion_pending = op
-      run every send_message(connected_rpc, password, forge_item_channel, op, trim(body), forge_discussion_members) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)
+      run every send_message(connected_rpc, password, forge_item_channel, op, trim(body)) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)
 
 on forge_note_sent(op, next)
   return if op != forge_discussion_pending

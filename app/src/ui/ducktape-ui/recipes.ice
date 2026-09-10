@@ -33,6 +33,8 @@ recipe control for input
 // text ink (a primary button's light `primary_fg` would vanish on a light
 // page). The styled ring also takes each button's rounded-* radius in place
 // of the default 3px.
+// Text actions size from their label line box plus padding. A fixed height
+// smaller than that sum squeezes or clips glyphs, especially on compact actions.
 recipe primary_action for button
   @text-12.5px font-semibold px-16px py-11px bg-primary text-primary_fg rounded-9px hover:bg-primary_hover pressed:bg-primary/80 disabled:bg-disabled disabled:text-disabled_fg focus-visible:border-ring
 
