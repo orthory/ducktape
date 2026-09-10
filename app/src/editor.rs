@@ -290,21 +290,36 @@ pub fn apply_mention_event(
         ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(
             Edit::Indent | Edit::Unindent,
         ))) => {
-            // Indentation changes a whole line; preserve untouched suffix tokens.
-            replaced.start = before
-                .chars()
-                .zip(after.chars())
-                .take_while(|(a, b)| a == b)
-                .map(|(c, _)| c.len_utf8())
-                .sum();
-            let suffix: usize = before[replaced.start..]
-                .chars()
-                .rev()
-                .zip(after[replaced.start..].chars().rev())
-                .take_while(|(a, b)| a == b)
-                .map(|(c, _)| c.len_utf8())
-                .sum();
-            replaced.end = before.len() - suffix;
+            // Each selected line changes independently. A single bounding
+            // replacement would discard mentions between those indent edits.
+            let mut offset = 0;
+            for (old, new) in before
+                .split_inclusive('\n')
+                .zip(after.split_inclusive('\n'))
+            {
+                if old != new {
+                    let prefix: usize = old
+                        .chars()
+                        .zip(new.chars())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(c, _)| c.len_utf8())
+                        .sum();
+                    let suffix: usize = old[prefix..]
+                        .chars()
+                        .rev()
+                        .zip(new[prefix..].chars().rev())
+                        .take_while(|(a, b)| a == b)
+                        .map(|(c, _)| c.len_utf8())
+                        .sum();
+                    replace_mention_ranges(
+                        mentions,
+                        offset + prefix..offset + old.len() - suffix,
+                        new.len() - prefix - suffix,
+                    );
+                }
+                offset += new.len();
+            }
+            return next;
         }
         _ => {}
     }
@@ -1082,6 +1097,48 @@ mod tests {
         );
         let content = paste_mentions(content, &mut mentions, "@account-5", &names);
         assert_eq!(mention_body(&content, &mentions), "안녕\n@account-5 <@6>");
+    }
+
+    #[test]
+    fn multiline_tab_and_shift_tab_preserve_every_mention() {
+        use iced::keyboard::Modifiers;
+        use iced::keyboard::key::{Code, Physical};
+        let original = "<@5> first\n안녕 <@6> middle\n<@7> last";
+        let mut mentions = Vec::new();
+        let mut content = paste_mentions(
+            Content::new(),
+            &mut mentions,
+            original,
+            &crate::backend::NameDirectory::default(),
+        );
+        let display = content.text();
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            content.perform(text_editor::Action::SelectAll);
+            let press = KeyPress {
+                key: Key::Named(Named::Tab),
+                modified_key: Key::Named(Named::Tab),
+                physical_key: Physical::Code(Code::Tab),
+                modifiers,
+                text: None,
+                status: text_editor::Status::Focused { is_hovered: false },
+            };
+            let Some(Binding::Custom(edit)) = composer_key_binding(&press, false) else {
+                panic!("Tab must use the native indentation binding");
+            };
+            content = apply_mention_event(
+                content,
+                &mut mentions,
+                ComposerEvent::Apply(RichAction::Edit(text_editor::Action::Edit(edit))),
+            );
+            let canonical = mention_body(&content, &mentions);
+            assert_eq!(
+                canonical.lines().map(str::trim_start).collect::<Vec<_>>(),
+                original.lines().collect::<Vec<_>>()
+            );
+            assert_eq!(mentions.len(), 3);
+        }
+        assert_eq!(content.text(), display);
+        assert_eq!(mention_body(&content, &mentions), original);
     }
 
     #[test]
