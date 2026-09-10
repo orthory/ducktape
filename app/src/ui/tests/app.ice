@@ -882,7 +882,7 @@ test the_status_item_opens_a_window_when_none_is_tracked
 // `rpc` stays empty on purpose: the connect the landing would otherwise run
 // needs a live socket this scenario has none of, so the landing stops at its
 // reset, and the claims under test are which way it went (the console's
-// "Connecting…", no launch window) and whether `hub_step` moved.
+// connect begun, no launch window) and whether `hub_step` moved.
 preset ui_tray_reconnect
   state
     connected = true
@@ -893,7 +893,11 @@ test the_status_item_reopens_the_console_without_resetting_hub_step
   expect console_win == none
   expect onboarding_win == none
   tray choose "Open Ducktape"
-  expect status == "Connecting…"
+  // The door's own writes, not the status row: the preset's `connected`
+  // arms the live stream, whose publications write `status` whenever they
+  // land (see `ui_tray_live`), so the row is nobody's to expect here.
+  expect !connected
+  expect loading
   expect onboarding_win == none
   expect hub_step == HubStep.live
 

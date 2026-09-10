@@ -31,7 +31,7 @@ extern crate::host
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
   LiveActivity(label:str, done:bool)
   LiveRun(present:bool, status:str, activity:[LiveActivity], answer_preview:str)
-  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, journal:RunJournal, live:LiveRun, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
+  AgentsProps(rows:[AgentRow], runs:[RunRow], open_run:str, opened:i64, journal:RunJournal, live:LiveRun, capabilities:[str], actions:[str], account:str, committed:i64, connected:bool, answered:bool, dark:bool, messaging:MessagingProps)
   stream props() -> AgentsProps ! HostError
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
   pure runs_summary(runs:&[RunRow]) -> str
@@ -118,6 +118,9 @@ state
   // register's `open_run` is the truth and a press here is the request.
   open_run = ""
   open_row:RunRow = empty_run()
+  // the doors the app has opened a run through, counted, as the register
+  // last carried it; a bump is a door pressed since
+  opened:i64 = 0
   capabilities:[str] = []
   actions:[str] = []
   account = ""
@@ -185,6 +188,14 @@ on props_changed(next)
   live = next.live
   open_run = next.open_run
   open_row = run_at(runs, open_run)
+  // A DOOR LANDS THE READER ON THE TRACKER. A run opened from another tab —
+  // a chat hint, a bell, a link — is shown, whichever panel the reader was
+  // on; afterwards the run stays open while they look elsewhere. So the panel
+  // moves on the door, never on the run's name, and a door onto the run
+  // already open lands here again.
+  let door_pressed = next.opened != opened && !empty(next.open_run)
+  opened = next.opened
+  panel = pick_str(door_pressed, "runs", panel)
   capabilities = next.capabilities
   actions = next.actions
   account = next.account
