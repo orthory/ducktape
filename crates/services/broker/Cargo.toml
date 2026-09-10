@@ -27,6 +27,10 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# the macOS Keychain service Claude Code files a login under is keyed on the
+# SHA-256 of an NFC-normalized `CLAUDE_CONFIG_DIR` (`HostLoginStore`)
+sha2 = { workspace = true }
+unicode-normalization = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-stream = "0.1"
 tracing = { workspace = true }
@@ -51,3 +55,5 @@ airlock = { path = "../../airlock", features = ["client", "server", "verify", "t
 # wedged provider child asked for), so a test reads it back off a real
 # subscriber rather than trusting the macro is still there.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# a login file that is absent, then present, in a directory of the test's own
+tempfile = { workspace = true }

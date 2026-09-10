@@ -34,8 +34,10 @@ commentary in the app, with run outcomes available through the query API.
   installs the claude CLI into the workspace so its runs execute.
 - **Provider authentication on the executing service.** Codex uses
   `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
-  `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.claude/.credentials.json`. Installing an
-  executable does not configure its credentials.
+  `CLAUDE_CODE_OAUTH_TOKEN`, or Claude Code's own login on that host — the
+  macOS Keychain item `Claude Code-credentials` where Claude Code uses the
+  Keychain, else `$CLAUDE_CONFIG_DIR/.credentials.json` (`~/.claude` by
+  default). Installing an executable does not configure its credentials.
 - **Raise the provider timeout for cold Rust builds.**
   `DUCKTAPE_PROVIDER_TIMEOUT_SECS=<secs>` on the executing compute service
   overrides the spec's *idle* timeout. The hard wall-clock cap is

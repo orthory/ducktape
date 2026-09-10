@@ -1178,10 +1178,194 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Claude Code's config dir on this host: `$CLAUDE_CONFIG_DIR`, else
+/// `~/.claude`. The login it writes is keyed on this directory in both stores.
+fn claude_config_dir() -> Option<ClaudeConfigDir> {
+    if let Some(dir) = env_nonempty("CLAUDE_CONFIG_DIR") {
+        return Some(ClaudeConfigDir::Named(dir));
+    }
+    std::env::var_os("HOME")
+        .map(|home| ClaudeConfigDir::Default(std::path::PathBuf::from(home).join(".claude")))
+}
+
+/// Claude Code's config dir: the one `CLAUDE_CONFIG_DIR` names, which keys a
+/// Keychain login of its own, or the default under the home directory.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeConfigDir {
+    Named(String),
+    Default(std::path::PathBuf),
+}
+
+impl ClaudeConfigDir {
+    fn path(&self) -> std::path::PathBuf {
+        match self {
+            Self::Named(dir) => std::path::PathBuf::from(dir),
+            Self::Default(path) => path.clone(),
+        }
+    }
+
+    /// The Keychain service Claude Code files this dir's login under:
+    /// `Claude Code-credentials`, suffixed with the first eight hex digits of
+    /// the SHA-256 of a named dir (NFC-normalized), so two config dirs on one
+    /// account keep two logins.
+    fn keychain_service(&self) -> String {
+        use sha2::Digest as _;
+        use unicode_normalization::UnicodeNormalization as _;
+        let Self::Named(dir) = self else {
+            return "Claude Code-credentials".to_string();
+        };
+        let normalized: String = dir.nfc().collect();
+        let digest = sha2::Sha256::digest(normalized.as_bytes());
+        let suffix: String = digest
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("Claude Code-credentials-{suffix}")
+    }
+}
+
+/// The account Claude Code files its Keychain item under: `$USER` when it is
+/// a plain identifier, else Claude Code's fixed fallback.
+fn keychain_account() -> String {
+    let plain = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    };
+    match env_nonempty("USER") {
+        Some(user) if plain(&user) => user,
+        _ => "claude-code-user".to_string(),
+    }
+}
+
+/// Where Claude Code keeps its login on a host. Both stores hold the same
+/// JSON, `{ "claudeAiOauth": { accessToken, refreshToken, expiresAt } }`:
+/// the file under the config dir where Claude Code writes a file, and a
+/// generic password in the macOS Keychain where it uses that. Which one a host
+/// has is a runtime fact — the Keychain is read through the `security` tool,
+/// and a host without that tool has no Keychain — never a compile-time one.
+#[derive(Debug, PartialEq, Eq)]
+enum HostLoginStore {
+    File(std::path::PathBuf),
+    Keychain { service: String, account: String },
+}
+
+impl HostLoginStore {
+    /// The stores this host may hold a login in, in the order they are
+    /// asked: the Keychain first, since where it exists it is the store
+    /// Claude Code writes, then the file.
+    fn on_this_host(config_dir: &ClaudeConfigDir, account: &str) -> Vec<Self> {
+        vec![
+            Self::Keychain {
+                service: config_dir.keychain_service(),
+                account: account.to_string(),
+            },
+            Self::File(config_dir.path().join(".credentials.json")),
+        ]
+    }
+
+    /// The login JSON this store holds; `None` when the store holds no login
+    /// or does not exist on this host at all.
+    fn read(&self) -> Result<Option<String>, String> {
+        match self {
+            Self::File(path) => read_login_file(path),
+            Self::Keychain { service, account } => read_keychain_login(service, account),
+        }
+    }
+}
+
+impl std::fmt::Display for HostLoginStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(formatter, "{}", path.display()),
+            Self::Keychain { service, account } => {
+                write!(formatter, "Keychain item {service:?} for {account:?}")
+            }
+        }
+    }
+}
+
+fn read_login_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(login) => Ok(Some(login)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "read Claude Code login {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// `security find-generic-password -a <account> -s <service> -w`: the item's
+/// password, which is the login JSON. No `security` tool means no Keychain on
+/// this host; the tool answering that the item is absent means no login.
+fn read_keychain_login(service: &str, account: &str) -> Result<Option<String>, String> {
+    // errSecItemNotFound, the one refusal that means "no login" rather than
+    // "cannot read": a locked keychain or a denied access is the operator's
+    let item_not_found = Some(44);
+    let output = match std::process::Command::new("security")
+        .args(["find-generic-password", "-a", account, "-s", service, "-w"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("run security(1) for {service:?}: {error}")),
+    };
+    let code = output.status.code();
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string(),
+        ));
+    }
+    if code == item_not_found {
+        return Ok(None);
+    }
+    Err(format!(
+        "security(1) refused {service:?} for {account:?} (exit {code:?}): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// The OAuth tokens in a login as Claude Code writes it; `source` names the
+/// store for the message when the login is not one.
+fn oauth_from_login(login: &str, source: &str) -> Result<OauthTokens, String> {
+    let creds: serde_json::Value = serde_json::from_str(login)
+        .map_err(|e| format!("parse Claude Code login in {source}: {e}"))?;
+    let oauth = creds.get("claudeAiOauth").unwrap_or(&creds);
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Claude Code login in {source} has no claudeAiOauth.accessToken; run `claude` \
+                 to log in or set ANTHROPIC_API_KEY"
+            )
+        })?
+        .to_string();
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    // expiresAt is unix-ms in the login
+    let expires_at = oauth.get("expiresAt").and_then(serde_json::Value::as_u64);
+    Ok(OauthTokens {
+        access_token,
+        refresh_token,
+        expires_at,
+    })
+}
+
 impl AnthropicAuth {
     /// THE knob. Precedence: `ANTHROPIC_API_KEY` (API-key path), else
-    /// `CLAUDE_CODE_OAUTH_TOKEN` (OAuth, no refresh material), else the Linux
-    /// credentials file `~/.claude/.credentials.json` (OAuth with refresh).
+    /// `CLAUDE_CODE_OAUTH_TOKEN` (OAuth, no refresh material), else Claude
+    /// Code's own login on this host (OAuth with refresh), read from the store
+    /// Claude Code writes here — see [`HostLoginStore`].
     fn from_host() -> Result<Self, String> {
         if let Some(auth) = Self::from_host_from(
             env_nonempty("ANTHROPIC_API_KEY"),
@@ -1189,43 +1373,27 @@ impl AnthropicAuth {
         ) {
             return Ok(auth);
         }
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or_else(|| {
-            "Anthropic broker has no ANTHROPIC_API_KEY, no CLAUDE_CODE_OAUTH_TOKEN, and no HOME \
-             to read ~/.claude/.credentials.json"
+        let config_dir = claude_config_dir().ok_or_else(|| {
+            "Anthropic broker has no ANTHROPIC_API_KEY, no CLAUDE_CODE_OAUTH_TOKEN, and no \
+             CLAUDE_CONFIG_DIR or HOME to find Claude Code's login under"
                 .to_string()
         })?;
-        let path = home.join(".claude").join(".credentials.json");
-        let creds: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path)
-                .map_err(|e| format!("read host Claude credentials {}: {e}", path.display()))?,
-        )
-        .map_err(|e| format!("parse host Claude credentials {}: {e}", path.display()))?;
-        // Claude Code (Linux) stores { "claudeAiOauth": { accessToken, refreshToken, expiresAt } }.
-        let oauth = creds.get("claudeAiOauth").unwrap_or(&creds);
-        let access_token = oauth
-            .get("accessToken")
-            .and_then(serde_json::Value::as_str)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "host Claude credentials {} have no claudeAiOauth.accessToken; run `claude` \
-                     to log in or set ANTHROPIC_API_KEY",
-                    path.display()
-                )
-            })?
-            .to_string();
-        let refresh_token = oauth
-            .get("refreshToken")
-            .and_then(serde_json::Value::as_str)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string);
-        // expiresAt is unix-MS in the credentials file.
-        let expires_at = oauth.get("expiresAt").and_then(serde_json::Value::as_u64);
-        Ok(Self::Oauth(OauthTokens {
-            access_token,
-            refresh_token,
-            expires_at,
-        }))
+        let stores = HostLoginStore::on_this_host(&config_dir, &keychain_account());
+        for store in &stores {
+            let Some(login) = store.read()? else {
+                continue;
+            };
+            return oauth_from_login(&login, &store.to_string()).map(Self::Oauth);
+        }
+        let looked_in = stores
+            .iter()
+            .map(HostLoginStore::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "no Claude Code login on this host (looked in {looked_in}); run `claude` to log in \
+             or set ANTHROPIC_API_KEY"
+        ))
     }
 
     /// the env-arm precedence, factored out so the knob's contract is testable
@@ -2951,6 +3119,76 @@ mod tests {
             Some(AnthropicAuth::Oauth(t)) if t.access_token == "oauth-tok"
         ));
         assert!(AnthropicAuth::from_host_from(None, None).is_none());
+    }
+
+    /// The login is looked for where Claude Code writes it on this host:
+    /// the Keychain item first, then the file, both keyed on the config dir.
+    #[test]
+    fn a_host_login_is_looked_for_in_the_keychain_then_the_file() {
+        let default_dir = ClaudeConfigDir::Default("/home/op/.claude".into());
+        assert_eq!(
+            HostLoginStore::on_this_host(&default_dir, "op"),
+            [
+                HostLoginStore::Keychain {
+                    service: "Claude Code-credentials".into(),
+                    account: "op".into(),
+                },
+                HostLoginStore::File("/home/op/.claude/.credentials.json".into()),
+            ]
+        );
+        // a named config dir keys its own Keychain item: the first eight hex
+        // digits of the SHA-256 of the dir, as Claude Code files it
+        let named = ClaudeConfigDir::Named("/srv/creds/chief".into());
+        assert_eq!(
+            named.keychain_service(),
+            format!(
+                "Claude Code-credentials-{}",
+                &sha256_hex("/srv/creds/chief")[..8]
+            )
+        );
+        assert_eq!(
+            HostLoginStore::on_this_host(&named, "op")[1],
+            HostLoginStore::File("/srv/creds/chief/.credentials.json".into())
+        );
+    }
+
+    fn sha256_hex(text: &str) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Both stores hold the same login JSON; the tokens come out of it the
+    /// same way, and a login without an access token names its store.
+    #[test]
+    fn a_login_from_either_store_yields_its_oauth_tokens() {
+        let login = r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":1700000000000}}"#;
+        let tokens = oauth_from_login(login, "the file").unwrap();
+        assert_eq!(tokens.access_token, "at");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(tokens.expires_at, Some(1_700_000_000_000));
+        // no `Debug` on the tokens (they are secrets), so no `unwrap_err`
+        let Err(refused) = oauth_from_login(r#"{"claudeAiOauth":{}}"#, "Keychain item") else {
+            panic!("a login without an access token was taken");
+        };
+        assert!(refused.contains("Keychain item"), "{refused}");
+        assert!(
+            refused.contains("no claudeAiOauth.accessToken"),
+            "{refused}"
+        );
+    }
+
+    /// A login file that is not there is no login, not a failure: the next
+    /// store is asked, and only a file that is there is read.
+    #[test]
+    fn a_missing_login_file_is_no_login_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        assert_eq!(read_login_file(&path).unwrap(), None);
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(read_login_file(&path).unwrap().as_deref(), Some("{}"));
     }
 
     #[tokio::test]
