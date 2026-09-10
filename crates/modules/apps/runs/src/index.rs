@@ -39,7 +39,7 @@ use index_guest::{Fail, MAX_SCAN_LIMIT, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND,
+    ACTION_CHAT_POST_MESSAGE, ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_DELIVER,
     ACTION_DUCKFS_WRITE_TEXT, ACTION_JOBS_COMMENT, ACTION_MODULES_UPDATE, ACTION_PAGES_COMMENT,
     ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
     OP_AGENT_CALL, OP_REPLY, PageSource, PrRef, RunEvent, RunFact, RunOutcome, decode_assigned,
@@ -122,7 +122,8 @@ pub enum RunPlace {
         channel_id: String,
         seq: u64,
     },
-    /// a channel the run posted into at top level.
+    /// a channel the run posted into at top level, asked a delivery in, or
+    /// acknowledged one in.
     Channel {
         channel_id: String,
     },
@@ -153,10 +154,6 @@ pub enum RunPlace {
     /// a module the run proposed an update of.
     Module {
         module_id: String,
-    },
-    /// a collaboration conversation the run messaged or acknowledged in.
-    Conversation {
-        conversation_id: String,
     },
     /// another run: the callee of an `agent.call`, by its dispatch id.
     Run {
@@ -293,8 +290,8 @@ struct ModuleReceipt {
 }
 
 #[derive(Deserialize)]
-struct ConversationReceipt {
-    conversation_id: String,
+struct ChannelReceipt {
+    channel_id: String,
 }
 
 #[derive(Deserialize)]
@@ -364,9 +361,9 @@ fn acted_place(operation: &str, result: &serde_json::Value) -> Option<RunPlace> 
             let ModuleReceipt { module_id } = receipt(result)?;
             Some(RunPlace::Module { module_id })
         }
-        ACTION_COLLABORATION_SEND | ACTION_COLLABORATION_ACKNOWLEDGE => {
-            let ConversationReceipt { conversation_id } = receipt(result)?;
-            Some(RunPlace::Conversation { conversation_id })
+        ACTION_COLLABORATION_DELIVER | ACTION_COLLABORATION_ACKNOWLEDGE => {
+            let ChannelReceipt { channel_id } = receipt(result)?;
+            Some(RunPlace::Channel { channel_id })
         }
         OP_AGENT_CALL => {
             let DelegationReceipt {

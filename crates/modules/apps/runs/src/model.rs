@@ -154,20 +154,22 @@ pub const ACTION_MODULES_UPDATE: &str = "modules.update";
 /// by the model's `forge_push` cap on the repository, the same authority the
 /// push itself spent.
 pub const ACTION_FORGE_OPEN_PR: &str = "forge.open_pr";
-/// permission to send one collaboration message as a bound participant (the
-/// `collaboration.send` operation).
+/// permission to ask that a chat message this run's account posted be
+/// delivered to one recipient's bound device (the `collaboration.deliver`
+/// operation).
 ///
 /// NECESSARY, NOT SUFFICIENT. This grant is one half of an intersection: the
 /// action reaches `collaboration` on the live lane as
-/// `Origin::Program(account)`, and that module then applies its OWN check —
-/// the participant's owner must have bound that account to that conversation
-/// under a live credential. A model granted this still sends nothing until a
-/// human has bound it, and a bound account still sends nothing without this
-/// grant.
-pub const ACTION_COLLABORATION_SEND: &str = "collaboration.send";
-/// permission to record a delivery state for a message the bound participant
-/// received (the `collaboration.acknowledge` operation). Same intersection as
-/// [`ACTION_COLLABORATION_SEND`].
+/// `Origin::Program(account)`, and that module then applies its OWN checks —
+/// the named chat message must have been posted by that origin, and the
+/// recipient must be able to read the channel. A model granted this still
+/// delivers nothing it did not post.
+pub const ACTION_COLLABORATION_DELIVER: &str = "collaboration.deliver";
+/// permission to record a delivery state for a message delivered to the
+/// participant this account is bound as (the `collaboration.acknowledge`
+/// operation). The same intersection: the participant's owner must have
+/// bound this account to that channel under a live credential, and a bound
+/// account still reports nothing without this grant.
 pub const ACTION_COLLABORATION_ACKNOWLEDGE: &str = "collaboration.acknowledge";
 /// maximum UTF-8 text payload accepted by the `duckfs.write_text` operation.
 pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
@@ -188,7 +190,7 @@ pub const KNOWN_ACTIONS: [&str; 12] = [
     ACTION_PAGES_POST,
     ACTION_DUCKFS_WRITE_TEXT,
     ACTION_MODULES_UPDATE,
-    ACTION_COLLABORATION_SEND,
+    ACTION_COLLABORATION_DELIVER,
     ACTION_COLLABORATION_ACKNOWLEDGE,
 ];
 
