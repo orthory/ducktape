@@ -397,8 +397,6 @@ mod forge;
 mod hub;
 mod live;
 mod load;
-// the agent-messaging panel's authenticated reads, its send, and its outbox.
-mod messaging;
 mod model;
 mod node;
 mod notify;
@@ -425,7 +423,6 @@ pub use forge::*;
 pub use hub::*;
 pub use live::*;
 pub use load::*;
-pub use messaging::*;
 pub use model::*;
 pub use node::*;
 pub use notify::*;

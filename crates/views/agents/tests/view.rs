@@ -131,9 +131,6 @@ fn register_with_live(
         connected: true,
         answered: true,
         dark: false,
-        // the messages pane's own tests are `tests/messaging.rs`; the register
-        // draws with nothing open beside it
-        messaging: agents_view::host::MessagingProps::default(),
     })
     .expect("props encode")
 }
