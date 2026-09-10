@@ -180,6 +180,7 @@ pub fn agents_view(
     rows: &[crate::backend::AgentRow],
     runs: &[crate::backend::RunRow],
     open_run: &str,
+    opened: i64,
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
@@ -201,6 +202,7 @@ pub fn agents_view(
             rows,
             runs,
             open_run,
+            opened,
             journal,
             live,
             capabilities,
@@ -226,6 +228,7 @@ pub(crate) fn agents_props(
     rows: &[crate::backend::AgentRow],
     runs: &[crate::backend::RunRow],
     open_run: &str,
+    opened: i64,
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
@@ -262,6 +265,7 @@ pub(crate) fn agents_props(
         "rows": rows,
         "runs": runs,
         "open_run": open_run,
+        "opened": opened,
         "journal": book,
         "live": live,
         "capabilities": capabilities,
@@ -4566,33 +4570,56 @@ pub(crate) mod tests {
             "{:?}",
             texts(&guest)
         );
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "rows": [{
-                    "id": "reviewer-bot", "name": "Reviewer Bot", "initials": "RB",
-                    "capability": "review", "status": "paused", "owner_handle": "eddy",
-                    "controller": "7", "live": false,
-                    "allowed_actions": ["chat.post"],
-                    "caps": {
-                        "forge_read": ["ducktape"], "forge_push": [], "duckfs_read": [],
-                        "duckfs_write": [], "tools": [], "secrets": [], "pages_write": ["*"],
-                        "subagent_budget": 0
-                    },
-                    "skills": [
-                        {"name": "review", "source_prefix": "/shared/skills/review", "source_snapshot": "", "always": true},
-                        {"name": "style", "source_prefix": "/shared/skills/style", "source_snapshot": "", "always": false},
-                        {"name": "tests", "source_prefix": "/shared/skills/tests", "source_snapshot": "", "always": false}
-                    ]
-                }],
-                "runs": [], "open_run": "",
-                "journal": {"dispatch_id": "", "entries": [], "links": []},
-                "live": {"present": false, "status": "", "activity": [], "answer_preview": ""},
-                "capabilities": ["claude", "review"], "actions": ["chat.post", "tasks.create"],
-                "account": "", "committed": 0,
-                "connected": true, "answered": true, "dark": false
-            }))
-            .expect("props encode"),
-        );
+        // the props the app ENCODES, not a hand-written shape beside the
+        // encoder: a field the encoder dropped, or the guest stopped taking,
+        // fails here
+        let skill = |name: &str, always: bool| crate::backend::AgentSkill {
+            name: name.into(),
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: String::new(),
+            always,
+        };
+        let reviewer = crate::backend::AgentRow {
+            id: "reviewer-bot".into(),
+            name: "Reviewer Bot".into(),
+            initials: "RB".into(),
+            capability: "review".into(),
+            status: "paused".into(),
+            owner_handle: "eddy".into(),
+            controller: "7".into(),
+            live: false,
+            allowed_actions: vec!["chat.post".into()],
+            caps: crate::backend::AgentCaps {
+                forge_read: vec!["ducktape".into()],
+                pages_write: vec!["*".into()],
+                ..Default::default()
+            },
+            skills: vec![
+                skill("review", true),
+                skill("style", false),
+                skill("tests", false),
+            ],
+        };
+        let props = Some(agents_props(
+            false,
+            true,
+            true,
+            "",
+            0,
+            &[reviewer],
+            &[],
+            "",
+            0,
+            &crate::backend::RunJournal::default(),
+            &crate::backend::LiveRun::default(),
+            &["claude".into(), "review".into()],
+            &["chat.post".into(), "tasks.create".into()],
+            &crate::backend::MessagingView::default(),
+            false,
+            false,
+            "",
+            0,
+        ));
         guest.redraw(&props);
         let shown = texts(&guest);
         for expected in ["1 agent · 0 working", "Reviewer Bot", "PAUSED", "eddy"] {
@@ -4684,6 +4711,7 @@ pub(crate) mod tests {
             &[],
             &[],
             "",
+            0,
             &crate::backend::RunJournal::default(),
             &crate::backend::LiveRun::default(),
             &[],

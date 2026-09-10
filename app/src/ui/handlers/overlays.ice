@@ -120,11 +120,9 @@ on bell_open_item(generation, account, context)
   bell_open = false
   match context.target
     BellTarget.run
-      shell_tab = ShellTab.agents
-      agents_open_run = context.object
-      agents_journal = empty_run_journal()
-      agents_journal_op = agents_journal_op + 1
-      run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
+      flow
+        from done context.object
+        done -> open_run_panel _
     BellTarget.page
       run replace lane=bell_navigation duck_echo_str(context.object) -> open_page_search_hit(_, context.anchor) | external_url_failed _
     BellTarget.message
