@@ -1064,7 +1064,10 @@ subscribe
   keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
   // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
   // console, the last opened) would close a window nobody was looking at.
+  // The pair is also "is anyone looking at this app": the desktop notifier
+  // banners a mention only for a reader who is elsewhere.
   window focused with-id -> window_focused _
+  window unfocused with-id -> window_unfocused _
   run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
@@ -1206,9 +1209,18 @@ on drag_launch_window
 on close_launch_window
   task window close target=window_target(onboarding_win)
 
-// WHICH WINDOW HAS FOCUS. Read by ⌘W and nothing else.
+// WHICH WINDOW HAS FOCUS. Read by ⌘W, and told to the desktop notifier as
+// "a window of this app has focus" — the fact that decides whether a
+// mention is already on screen or worth a banner, on every host alike.
 on window_focused(id)
   focused_win = some(id)
+  task note_window_focus(true) -> window_focus_noted
+
+on window_unfocused(id)
+  focused_win = without_window(focused_win, id)
+  task note_window_focus(focused_win != none) -> window_focus_noted
+
+on window_focus_noted
 
 // THE COMMAND CHORDS, ON ONE DISPATCH. The classification is one pure extern
 // so ⌘Q and ⌘W are answered in a single place, and this branches once on what
