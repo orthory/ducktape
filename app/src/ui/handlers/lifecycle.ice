@@ -323,6 +323,8 @@ on console_entry_answered
 on live_updated(next)
   status = next.status
   block_height = keep_i64(next.height >= 0, next.height, block_height)
+  // a height that moved is a block: every view reading the feed is told
+  views_live_serial = view_block_hit(block_height, views_live_serial)
   // A publication has one closed kind and runs one arm. In particular, only
   // the chat arm even evaluates the wide, by-value chat fold arguments.
   match next.kind

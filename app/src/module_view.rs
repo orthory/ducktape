@@ -21,7 +21,7 @@ mod kernel;
 
 pub(crate) mod pages_document;
 
-pub use kernel::live_hit as view_live_hit;
+pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -2360,15 +2360,6 @@ enum Slot {
 
 type Registry = Mutex<HashMap<&'static str, Arc<Mutex<Mounted>>>>;
 
-/// The module's name as the registry keys it, for a name that arrived as a
-/// string: only a module with a seat has one.
-fn static_module(name: &str) -> Option<&'static str> {
-    crate::backend::view_source::MODULE_OWNED
-        .into_iter()
-        .chain(crate::backend::view_source::DESKTOP_OWNED)
-        .find(|module| *module == name)
-}
-
 fn registry() -> &'static Registry {
     static MOUNTED: OnceLock<Registry> = OnceLock::new();
     MOUNTED.get_or_init(Mutex::default)
@@ -2769,9 +2760,9 @@ struct Guest {
     intents: Vec<ModuleViewEvent>,
     /// The kernel's answers to this guest's node calls, on their way in.
     replies: Arc<kernel::Replies>,
-    /// The guest's `rpc.live` subscriptions: told on every block that
-    /// moves its module's plane.
-    live_subscriptions: Vec<u64>,
+    /// The guest's `rpc.live` subscriptions, each with the plane it named:
+    /// told on every block that moves that plane.
+    live_subscriptions: Vec<(u64, String)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3573,7 +3564,7 @@ impl Guest {
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
-            self.live_subscriptions.retain(|live| *live != id);
+            self.live_subscriptions.retain(|(live, _)| *live != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -4541,7 +4532,7 @@ pub(crate) mod tests {
 
         // a block on the governance plane: the live item lands and the
         // view reads again
-        let live_id = guest.live_subscriptions[0];
+        let live_id = guest.live_subscriptions[0].0;
         guest.pending.push(wire::Event::Response {
             id: live_id,
             result: Ok(b"{}".to_vec()),

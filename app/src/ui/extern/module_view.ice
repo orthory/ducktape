@@ -16,6 +16,9 @@ extern crate::module_view
   // a block moved a module's plane: every `rpc.live` subscription its view
   // holds is told; the serial moves when one was, so the redraw follows
   sync view_live_hit(module:&str, serial:i64) -> i64
+  // the node's height as the app last heard it: a height that moved is a
+  // hit on the `block` plane every view reading the feed subscribes to
+  sync view_block_hit(height:i64, serial:i64) -> i64
   component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
   component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str], actions:&[str]) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent

@@ -8,9 +8,11 @@
 //!   the module's index-tier view.
 //! - `rpc.blocks` `{limit}` — the recent block feed; `rpc.status` and
 //!   `rpc.peers` the node's own status and peers JSON.
-//! - `rpc.live` `<module>` — a subscription that gets one item per block
-//!   the app's live stream reports for that module's plane
-//!   ([`live_hit`]), so the view re-reads what moved.
+//! - `rpc.live` `<plane>` — a subscription that gets one item per block
+//!   the app's live stream reports for that plane: a module's name
+//!   ([`live_hit`], any module — an audited view is trusted to read what
+//!   it names), or `block` for every block ([`block_hit`]), so the view
+//!   re-reads what moved.
 //! - `op.submit` `{target, payload}` — one module op, signed with the
 //!   SEATED key and submitted; answered with the block height. The view
 //!   never carries a password, an endpoint or a key.
@@ -24,7 +26,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use super::{Guest, ModuleViewEvent, Slot, mounted, wire};
+use super::{Guest, ModuleViewEvent, Slot, wire};
 
 /// The most blocks one `rpc.blocks` may ask for.
 const MAX_BLOCKS: usize = 1_000;
@@ -112,10 +114,11 @@ pub(super) fn answer(
         ("rpc", "status") => spawn(guest, id, b"{}", status),
         ("rpc", "peers") => spawn(guest, id, b"{}", peers),
         ("rpc", "live") => {
-            let own_plane = payload == guest.module.as_bytes();
-            match own_plane {
-                true => guest.live_subscriptions.push(id),
-                false => guest.refuse(id, "`rpc.live` names another module's plane".into()),
+            let plane = std::str::from_utf8(payload).unwrap_or_default().trim();
+            let named = plane == BLOCK_PLANE || workspace_config::validate_module_id(plane).is_ok();
+            match named {
+                true => guest.live_subscriptions.push((id, plane.to_owned())),
+                false => guest.refuse(id, "`rpc.live` names no plane".into()),
             }
         }
         ("op", "submit") => spawn(guest, id, payload, submit),
@@ -255,28 +258,55 @@ fn submit(
     })
 }
 
-/// A block moved `module`'s plane: every `rpc.live` subscription the
-/// module's view holds gets one item. Answers `serial + 1` when a view was
-/// told — the app keeps that number in its state, so the redraw that
-/// delivers the item follows — and `serial` when none was.
-pub fn live_hit(module: &str, serial: i64) -> i64 {
-    let Some(module) = super::static_module(module) else {
-        return serial;
-    };
-    let mounted = mounted(module);
-    let mut locked = mounted.lock().expect("module view lock");
-    let Slot::Ready(guest) = &mut locked.slot else {
-        return serial;
-    };
-    if guest.live_subscriptions.is_empty() {
+/// The plane every block moves: a view that reads the feed itself
+/// subscribes to it.
+const BLOCK_PLANE: &str = "block";
+
+/// A block moved `plane` (a module's, or [`BLOCK_PLANE`]): every `rpc.live`
+/// subscription on it, in whichever view holds it, gets one item. Answers
+/// `serial + 1` when a view was told — the app keeps that number in its
+/// state, so the redraw that delivers the item follows — and `serial` when
+/// none was.
+pub fn live_hit(plane: &str, serial: i64) -> i64 {
+    // lock order, everywhere: registry, then a view
+    let registry = super::registry().lock().expect("module views");
+    let mut told = false;
+    for mounted in registry.values() {
+        let mut locked = mounted.lock().expect("module view lock");
+        let Slot::Ready(guest) = &mut locked.slot else {
+            continue;
+        };
+        let ids: Vec<u64> = guest
+            .live_subscriptions
+            .iter()
+            .filter(|(_, subscribed)| subscribed == plane)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            guest.pending.push(wire::Event::Response {
+                id,
+                result: Ok(b"{}".to_vec()),
+                done: false,
+            });
+            told = true;
+        }
+    }
+    match told {
+        true => serial + 1,
+        false => serial,
+    }
+}
+
+/// The node's height as the app last heard it: a height that moved is a
+/// hit on [`BLOCK_PLANE`]; the same height again, or none, is not.
+pub fn block_hit(height: i64, serial: i64) -> i64 {
+    static LAST: Mutex<i64> = Mutex::new(-1);
+    let mut last = LAST.lock().expect("last height");
+    let moved = height >= 0 && height != *last;
+    if !moved {
         return serial;
     }
-    for id in &guest.live_subscriptions {
-        guest.pending.push(wire::Event::Response {
-            id: *id,
-            result: Ok(b"{}".to_vec()),
-            done: false,
-        });
-    }
-    serial + 1
+    *last = height;
+    drop(last);
+    live_hit(BLOCK_PLANE, serial)
 }
