@@ -62,6 +62,10 @@ pub struct LiveAgentRow {
     pub dispatch_id: String,
     pub agent: String,
     pub status: String,
+    /// Public committed progress used when this device cannot read stdout.
+    /// Kept off the view wire; `snapshot` selects one display status.
+    #[serde(skip)]
+    pub public_status: String,
     pub activity: Vec<LiveActivity>,
     pub answer_preview: String,
 }
@@ -254,10 +258,39 @@ struct Taken {
 /// watcher for the same run.
 const MAX_OUTPUT_DIALS: u32 = 5;
 
-/// What the screen says about a run whose progress this device is not entitled
-/// to read. The run IS working — `runs` says so — and the card still carries the
-/// agent, the anchor and a Stop; it is the stdout that is out of reach.
+/// Internal refusal marker. The snapshot replaces it with public committed
+/// progress; keeping it internally prevents retries of an unauthorized read.
 const OUTPUT_UNAVAILABLE: &str = "Working · progress unavailable from this device";
+
+/// Only committed public facts, never provider text, prompts or tool arguments.
+fn public_run_status(
+    run_id: &str,
+    sessions: Option<&serde_json::Value>,
+    delegations: Option<&serde_json::Value>,
+) -> String {
+    let calls = delegations.and_then(|reply| reply["delegations"].as_array());
+    let peer_pending =
+        calls.is_some_and(|calls| calls.iter().any(|call| call["status"] == "pending"));
+    if peer_pending {
+        return "Working · peer call pending".into();
+    }
+    let peer_delivered =
+        calls.is_some_and(|calls| calls.iter().any(|call| call["status"] == "delivered"));
+    if peer_delivered {
+        return "Working · peer reply received".into();
+    }
+    let Some(sessions) = sessions.and_then(|reply| reply["agent_sessions"].as_array()) else {
+        return "Working".into();
+    };
+    let Some(session) = sessions.iter().find(|session| session["run_id"] == run_id) else {
+        return "Starting".into();
+    };
+    match session["actions"].as_u64().unwrap_or_default() {
+        0 => "Working".into(),
+        1 => "Working · 1 action recorded".into(),
+        count => format!("Working · {count} actions recorded"),
+    }
+}
 
 /// One run's output watcher and how many times it has been dialed.
 struct Watcher {
@@ -279,8 +312,7 @@ enum Reach {
     /// (`noded::stream::admit_run_reader`), so a run someone else asked for is
     /// refused here the same as a stranger's would be.
     Signed,
-    /// neither. The card still carries the agent, the anchor and a Stop; the
-    /// stdout is out of reach and says so.
+    /// Neither. The card uses public committed progress, not private stdout.
     Nothing,
 }
 
@@ -338,7 +370,23 @@ fn snapshot(taken: &Taken, rows: &Rows) -> LiveAgentNotice {
         chain_id: taken.chain_id.clone(),
         generation: taken.generation,
         signer_key: taken.signer_key.clone(),
-        rows: rows.values().cloned().collect(),
+        rows: rows
+            .values()
+            .cloned()
+            .map(|mut row| {
+                let private_output = row.status == OUTPUT_UNAVAILABLE;
+                if private_output {
+                    row.status = if row.public_status.is_empty() {
+                        "Working".into()
+                    } else {
+                        row.public_status.clone()
+                    };
+                    row.activity.clear();
+                    row.answer_preview.clear();
+                }
+                row
+            })
+            .collect(),
     }
 }
 
@@ -364,7 +412,7 @@ pub fn chat_live_agents(
         // admits only for the key that created it. With the user key locked
         // there is no proof to make at all, and that is not a transient failure:
         // the card still carries the agent, the room, the anchor and a Stop, and
-        // says plainly that the progress is out of reach.
+        // shows the public committed progress instead of private stdout.
         //
         // READ OFF THE SUBSCRIPTION'S OWN ARGUMENT, never from the process's
         // signer: `signer_key` is what this lane is KEYED on, so deciding the
@@ -422,6 +470,21 @@ pub fn chat_live_agents(
                         .or_insert_with(|| id.to_string());
                 }
             }
+            let output_unreadable = reach == Reach::Nothing
+                || rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|row| row.status == OUTPUT_UNAVAILABLE);
+            let needs_public_progress = !anchored.is_empty() && output_unreadable;
+            let sessions = if needs_public_progress {
+                client
+                    .query::<_, serde_json::Value>("runs", &"agent_sessions")
+                    .await
+                    .ok()
+            } else {
+                None
+            };
             let mut seen = Vec::new();
             for record in anchored {
                 let dispatch = record["dispatch_id"]
@@ -473,6 +536,23 @@ pub fn chat_live_agents(
                     rows.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(dispatch.clone(), row);
+                }
+                if dial == Dial::Unreadable {
+                    let run_id = record["run_id"].as_str().unwrap_or_default();
+                    let ask = serde_json::json!({"delegations": {"caller_run_id": run_id}});
+                    let delegations = client
+                        .query::<_, serde_json::Value>("runs", &ask)
+                        .await
+                        .ok();
+                    let public_status =
+                        public_run_status(run_id, sessions.as_ref(), delegations.as_ref());
+                    if let Some(row) = rows
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&dispatch)
+                    {
+                        row.public_status = public_status;
+                    }
                 }
                 let dials = match dial {
                     Dial::Unreadable | Dial::Watching | Dial::GaveUp => continue,
@@ -712,10 +792,10 @@ async fn watch_live_output(
     };
     if let Err(message) = watch.await {
         // AN ENTITLEMENT IS NOT A FAILURE. A node that would not admit this
-        // device as the run's reader leaves the card saying so, in the same
-        // words a device with no proof at all uses — and `dial_for` reads that
-        // status back as settled, so it is asked once and never re-dialed. Every
-        // other failure is an error the reader can act on.
+        // device as the run's reader leaves an internal refusal sentinel.
+        // `dial_for` reads it as settled, so it is asked once and never
+        // re-dialed; `snapshot` shows public progress instead. Every other
+        // failure is an error the reader can act on.
         let refused = message == OUTPUT_UNAVAILABLE;
         fold(&AgentChatEvent {
             id: 0,
@@ -884,7 +964,7 @@ mod tests {
         }
         assert_eq!(
             OUTPUT_UNAVAILABLE, "Working · progress unavailable from this device",
-            "and the row says so, rather than showing a run that looks stalled"
+            "the internal refusal marker remains distinct from public progress"
         );
         // THE REFUSAL IS A STATUS, NOT AN ERROR — that is the byte the poll
         // reads back to decide it has already asked.
@@ -897,6 +977,80 @@ mod tests {
             },
         );
         assert_eq!(row.status, OUTPUT_UNAVAILABLE);
+    }
+
+    #[test]
+    fn public_progress_uses_committed_counts_not_private_content() {
+        use serde_json::json;
+        let sessions = json!({"agent_sessions": [
+            {"run_id": "mine", "actions": 3, "session_key": "private-looking-key"},
+            {"run_id": "other", "actions": 99}
+        ]});
+        assert_eq!(public_run_status("mine", None, None), "Working");
+        assert_eq!(
+            public_run_status("missing", Some(&sessions), None),
+            "Starting"
+        );
+        assert_eq!(
+            public_run_status("mine", Some(&sessions), None),
+            "Working · 3 actions recorded"
+        );
+        let calls = json!({"delegations": [{
+            "status": "pending", "delegation_id": "long-private-looking-id",
+            "result": {"text": "SECRET provider result"}
+        }]});
+        assert_eq!(
+            public_run_status("mine", Some(&sessions), Some(&calls)),
+            "Working · peer call pending"
+        );
+        let delivered =
+            json!({"delegations": [{"status": "delivered", "result": {"text": "SECRET"}}]});
+        assert_eq!(
+            public_run_status("mine", Some(&sessions), Some(&delivered)),
+            "Working · peer reply received"
+        );
+        let failed = json!({"delegations": [{"status": "failed", "result": {"text": "SECRET"}}]});
+        assert_eq!(
+            public_run_status("mine", Some(&sessions), Some(&failed)),
+            "Working · 3 actions recorded"
+        );
+    }
+
+    #[test]
+    fn refused_output_publishes_only_public_progress_without_redialing() {
+        let taken = Taken {
+            rpc: "http://node".into(),
+            chain_id: "chain".into(),
+            generation: 1,
+            signer_key: "key".into(),
+        };
+        let rows: Rows = Arc::default();
+        rows.lock().unwrap().insert(
+            "dispatch".into(),
+            LiveAgentRow {
+                status: OUTPUT_UNAVAILABLE.into(),
+                public_status: "Working · peer call pending".into(),
+                activity: vec![LiveActivity {
+                    label: "SECRET tool argument".into(),
+                    done: false,
+                }],
+                answer_preview: "SECRET provider answer".into(),
+                ..LiveAgentRow::default()
+            },
+        );
+        let notice = snapshot(&taken, &rows);
+        let row = &notice.rows[0];
+        assert_eq!(row.status, "Working · peer call pending");
+        assert!(row.activity.is_empty());
+        assert!(row.answer_preview.is_empty());
+        let encoded = serde_json::to_value(row).unwrap();
+        assert!(encoded.get("public_status").is_none());
+        assert!(!encoded.to_string().contains("SECRET"));
+        let status = &rows.lock().unwrap()["dispatch"].status;
+        assert_eq!(
+            dial_for(Reach::Signed, status == OUTPUT_UNAVAILABLE, None),
+            Dial::Unreadable
+        );
     }
 
     /// THE SIGNATURE COVERS THE PATH THE REQUEST CARRIES. A proof over
