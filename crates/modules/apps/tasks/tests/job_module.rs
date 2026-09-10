@@ -529,24 +529,20 @@ fn attempts_exhausted_reclaim_fails_the_job() {
 }
 
 // ============================================================================
-// cancel / prune (submitter authority)
+// cancel / prune (any member; the submitter is attribution, not consent)
 // ============================================================================
 
 #[test]
-fn cancel_only_from_pending_and_only_by_submitter() {
+fn cancel_only_from_pending_by_any_member() {
     block_on(async {
         let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
 
-        // a non-submitter cannot cancel.
-        let err = stage(&mut jobs, 2, ext("intruder"), cancel("j1"))
-            .await
-            .expect_err("non-submitter cannot cancel");
-        assert!(matches!(err, Error::Module(m) if m.contains("only the submitter may cancel")));
-
-        // the submitter can, while pending.
-        apply(&mut jobs, 3, ext("submitter"), cancel("j1")).await;
-        assert_eq!(get(&jobs, "j1").await.unwrap().status, JobStatus::Cancelled);
+        // any member cancels a pending job, the submitter's attribution kept.
+        apply(&mut jobs, 2, ext("intruder"), cancel("j1")).await;
+        let cancelled = get(&jobs, "j1").await.unwrap();
+        assert_eq!(cancelled.status, JobStatus::Cancelled);
+        assert_eq!(cancelled.submitter, actor("submitter"));
 
         // once claimed, even the submitter cannot cancel.
         apply(&mut jobs, 4, ext("submitter"), submit("j2", "k", "")).await;
@@ -559,7 +555,7 @@ fn cancel_only_from_pending_and_only_by_submitter() {
 }
 
 #[test]
-fn prune_only_terminal_and_by_submitter_removes_record() {
+fn prune_only_terminal_by_any_member_removes_record() {
     block_on(async {
         let mut jobs = jobs_on_mem();
         apply(&mut jobs, 1, ext("submitter"), submit("j1", "k", "")).await;
@@ -572,15 +568,9 @@ fn prune_only_terminal_and_by_submitter_removes_record() {
 
         apply(&mut jobs, 3, ext("submitter"), cancel("j1")).await; // now terminal
 
-        // a non-submitter cannot prune.
-        let err = stage(&mut jobs, 4, ext("intruder"), prune("j1"))
-            .await
-            .expect_err("non-submitter cannot prune");
-        assert!(matches!(err, Error::Module(m) if m.contains("only the submitter may prune")));
-
-        // the submitter prunes the record out of existence.
+        // any member prunes the record out of existence.
         let before = jobs.root();
-        apply(&mut jobs, 5, ext("submitter"), prune("j1")).await;
+        apply(&mut jobs, 4, ext("intruder"), prune("j1")).await;
         assert!(get(&jobs, "j1").await.is_none(), "record removed");
         assert_ne!(jobs.root(), before, "prune moves the committed root");
     });
@@ -835,14 +825,10 @@ fn submitter_cap_is_shared_by_account_keys_and_isolated_per_program() {
         )
         .await
         .unwrap();
+        // any member prunes: the controller account releases the program's
+        // slot, and the census debits the PROGRAM, not the pruner.
         jobs.execute(
             &mut account_ctx(4, ext("founder"), &account),
-            &prune("program-0"),
-        )
-        .await
-        .expect_err("the controller account does not own the program's jobs");
-        jobs.execute(
-            &mut account_ctx(4, Origin::Program(2), &program),
             &prune("program-0"),
         )
         .await
@@ -890,14 +876,10 @@ fn pruning_after_key_admission_debits_the_stored_key_quota() {
             .unwrap();
         }
         jobs.commit_block().await.unwrap();
+        // an account sibling cancels and prunes the historical key's job; the
+        // census still debits the exact original signer, never the sibling.
         jobs.execute(
             &mut account_ctx(3, ext("sibling"), &account),
-            &cancel("key-0"),
-        )
-        .await
-        .expect_err("an account sibling cannot control the historical key's job");
-        jobs.execute(
-            &mut account_ctx(3, ext("founder"), &account),
             &cancel("key-0"),
         )
         .await
@@ -905,12 +887,6 @@ fn pruning_after_key_admission_debits_the_stored_key_quota() {
         jobs.commit_block().await.unwrap();
         jobs.execute(
             &mut account_ctx(4, ext("sibling"), &account),
-            &prune("key-0"),
-        )
-        .await
-        .expect_err("pruning also requires the actual historical signer");
-        jobs.execute(
-            &mut account_ctx(4, ext("founder"), &account),
             &prune("key-0"),
         )
         .await
@@ -925,7 +901,7 @@ fn pruning_after_key_admission_debits_the_stored_key_quota() {
         .await
         .expect_err("aborting the prune restores the key census");
         jobs.execute(
-            &mut account_ctx(5, ext("founder"), &account),
+            &mut account_ctx(5, ext("sibling"), &account),
             &prune("key-0"),
         )
         .await

@@ -392,21 +392,6 @@ component TabLabel(label:str, count:i64, active:bool)
           bg=transparent
         space w=1.0 h=1.0
 
-component Popover(width:f64)
-  box #root
-    with
-      w=width
-      p=5.0
-      bg=surface
-      border=border
-      border-w=1.0
-      r=11.0
-      shadow=shadow_popover
-      shadow-y=3.0
-      shadow-blur=12.0
-    col w=fill
-      slot
-
 // Shapes lifted from components/chat.ice for the non-chat probes (the
 // composer there refuses to compile unmounted).
 component RichBody(blocks:[ChatBlock], size:f64)
@@ -543,7 +528,9 @@ component RichLine(block:ChatBlock, size:f64)
       wrap=word-or-glyph
       color=accent_fg
     for span in block.spans
-      span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand
+      // Span padding expands only the paint, not the text layout. Keep it
+      // below a prose space so ordinary surrounding spaces stay visible.
+      span span.mention bg=brand_bg px=1.0 r=4.0 font=medium color=brand
       span span.link_text link=span.link underline font=medium color=brand
       span span.bold_italic font=strongitalic
       span span.bold font=strong

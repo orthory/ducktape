@@ -167,6 +167,126 @@ fn frame_has_button(frame: &Frame, name: &str) -> bool {
     frame.root.as_ref().is_some_and(|root| walk(root, name))
 }
 
+fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
+    fn find<'a>(node: &'a Node, suffix: &str) -> Option<&'a Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node);
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
+
+#[test]
+fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
+    use ui_lang_guest::wire::{Event, Length, mouse};
+    let (subscription, _) = booted(vec![], "7");
+    let mut running = run("peer", "Claude", "running");
+    running.dispatch_id = "32a29e72a8fc5b673f196f93ab63a18b8cef8f47f94ceac9c1bb7c1".into();
+    let target = RunLink {
+        relation: "target".into(),
+        kind: "chat".into(),
+        label: "#Engineering · Eddy: Bound and scroll the branch selector".into(),
+        url: "duck://channel/engineering?net=a1b2c3d4#12".into(),
+    };
+    let journal = RunJournal {
+        dispatch_id: running.dispatch_id.clone(),
+        entries: vec![JournalEntry {
+            height: "h 123".into(),
+            kind: "action".into(),
+            summary: "React 👀".into(),
+            status: "Completed".into(),
+            targets: vec![target.clone()],
+        }],
+        links: vec![RunLink {
+            relation: "from".into(),
+            kind: "chat".into(),
+            label: "Bound and scroll the branch selector without overflowing the button".into(),
+            url: "duck://channel/general/12".into(),
+        }],
+    };
+    let frame = tick_native(vec![item(
+        subscription,
+        &register_with_runs(
+            vec![],
+            vec![running.clone()],
+            &running.dispatch_id,
+            1,
+            journal,
+            "7",
+            0,
+        ),
+    )]);
+    assert!(has_text(&frame, "React 👀"));
+    assert!(has_text(&frame, "Completed"));
+    assert!(has_text(&frame, &target.label));
+    assert!(!has_text(&frame, &running.dispatch_id));
+    fn check_place(node: &Node) -> bool {
+        if let Node::Button {
+            label: Some(label),
+            width,
+            height,
+            ..
+        } = node
+            && label.starts_with("Bound and scroll")
+        {
+            assert_eq!(*width, Some(Length::Fill));
+            assert_eq!(*height, None, "a wrapped title grows its button");
+            return true;
+        }
+        node.children().iter().any(check_place)
+    }
+    assert!(check_place(frame.root.as_ref().unwrap()));
+    let frame = tick_native(press(&frame, &target.label));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "agents.open_link");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent.payload).unwrap()["url"],
+        target.url
+    );
+    let frame = tick_native(press(&frame, "Run diagnostics"));
+    assert!(has_text(&frame, &running.dispatch_id));
+    let width = |frame: &Frame| match node_ending(frame, "/journal") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => *width,
+        node => panic!("fixed journal width: {node:?}"),
+    };
+    assert_eq!(width(&frame), 400.0);
+    assert!(frame.mouse_interest);
+    let movement = |x| Event::Mouse {
+        event: mouse::Event::CursorMoved { x, y: 30.0 },
+        captured: true,
+    };
+    let frame = tick_native(vec![movement(700.0)]);
+    let Node::MouseArea {
+        on_press: Some(handler),
+        ..
+    } = node_ending(&frame, "/journal-resize")
+    else {
+        panic!("resize handle")
+    };
+    let frame = tick_native(vec![Event::Message(*handler), movement(620.0)]);
+    assert_eq!(width(&frame), 480.0);
+    let frame = tick_native(vec![
+        Event::Mouse {
+            event: mouse::Event::ButtonReleased(mouse::Button::Left),
+            captured: true,
+        },
+        movement(500.0),
+    ]);
+    assert_eq!(width(&frame), 480.0);
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, 900.0, 900.0),
+        570.0
+    );
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, -900.0, 900.0),
+        280.0
+    );
+}
+
 #[test]
 fn the_register_the_host_pushes_is_what_the_screen_shows() {
     boot_native();
@@ -427,11 +547,13 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
                 height: "h 84,912".into(),
                 kind: "dispatched".into(),
                 summary: "for reviewer from #general · msg 9".into(),
+                ..JournalEntry::default()
             },
             JournalEntry {
                 height: "h 84,920".into(),
                 kind: "settled".into(),
                 summary: "failed: worker exploded".into(),
+                ..JournalEntry::default()
             },
         ],
     };
@@ -513,11 +635,8 @@ fn the_register_opens_the_run_the_app_names() {
         "the tracker is landed on without a press: {:?}",
         texts(&frame)
     );
-    assert!(
-        has_text(&frame, &running.dispatch_id),
-        "the open panel names the run's address: {:?}",
-        texts(&frame)
-    );
+    assert!(has_text(&frame, "Run diagnostics"));
+    assert!(!has_text(&frame, &running.dispatch_id));
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
     // the reader looks at the registry; the run stays open behind it
@@ -560,6 +679,7 @@ fn the_open_run_draws_its_progress_and_its_places_as_chips() {
             height: "h 84,912".into(),
             kind: "dispatched".into(),
             summary: "for reviewer from #general · msg 12".into(),
+            ..JournalEntry::default()
         }],
         links: vec![
             RunLink {

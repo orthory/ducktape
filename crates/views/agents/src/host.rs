@@ -5,6 +5,11 @@ use iced::futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use ui_lang_guest::host;
 
+pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
+    (width + delta).clamp(280.0, maximum)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostError {
     pub message: String,
@@ -208,6 +213,8 @@ pub struct JournalEntry {
     /// `result action refused`, `pr linked`
     pub kind: String,
     pub summary: String,
+    pub status: String,
+    pub targets: Vec<RunLink>,
 }
 
 /// One place a run touched, as a chip: where it was called from (`relation`

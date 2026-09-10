@@ -454,8 +454,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
                   create: bool,
                   thread_action: MessageAction,
                   action: MessageAction,
-                  drawer: bool,
-                  repo_menu: bool| {
+                  drawer: bool| {
         escape_target(
             escape.clone(),
             tab,
@@ -467,7 +466,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             drawer,
             false,
             String::new(),
-            repo_menu,
         )
     };
 
@@ -484,7 +482,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             true,
             "/shared/q3.md".into(),
-            true,
         ),
         ""
     );
@@ -497,7 +494,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
-            true,
             true,
         ),
         ""
@@ -513,7 +509,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             true,
-            true,
         ),
         "bell"
     );
@@ -525,7 +520,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
-            true,
             true,
         ),
         "channel_create"
@@ -539,7 +533,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             false,
-            true,
         ),
         "thread_menu"
     );
@@ -558,7 +551,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::Toolbar,
             true,
-            true,
         ),
         "channel_settings"
     );
@@ -571,12 +563,11 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Editing,
             true,
-            true,
         ),
         "message_menu"
     );
-    // THE DRAWER SITS BETWEEN THEM. The stream's menu floats over Channel
-    // details, so it wins; the repo menu lives on another tab, so it loses.
+    // THE DRAWER SITS UNDER THE STREAM'S MENU, which floats over Channel
+    // details, so it wins.
     // It had no rung at all — an `×` and no keyboard exit, while every other
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.
@@ -589,22 +580,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             true,
-            true,
         ),
         "channel_settings"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Forge,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            true,
-        ),
-        "repo_menu"
     );
     // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
     // the Pages screen — so it is a rung, and it answers only from Pages.
@@ -620,7 +597,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             page_delete,
             fs_delete.into(),
-            false,
         )
     };
     assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
@@ -638,7 +614,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             MessageAction::Toolbar,
             MessageAction::Toolbar,
-            false,
             false,
         ),
         ""
@@ -660,51 +635,38 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
 
     // One closure per reader, the sibling test's `target` shape: tab first,
     // then one argument per layer.
-    let overlay = |tab: ShellTab,
-                   thread_action: MessageAction,
-                   action: MessageAction,
-                   drawer: bool,
-                   repo_menu: bool| {
-        topmost_overlay(
-            tab,
-            false,
-            false,
-            false,
-            thread_action,
-            action,
-            drawer,
-            false,
-            "",
-            repo_menu,
-        )
-    };
-    let target =
-        |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction, repo_menu: bool| {
-            escape_target(
-                escape.clone(),
+    let overlay =
+        |tab: ShellTab, thread_action: MessageAction, action: MessageAction, drawer: bool| {
+            topmost_overlay(
                 tab,
                 false,
-                bell,
-                create,
+                false,
+                false,
                 thread_action,
-                MessageAction::Toolbar,
+                action,
+                drawer,
                 false,
-                false,
-                String::new(),
-                repo_menu,
+                "",
             )
         };
-
-    // A stale chat menu names no layer from another tab — for BOTH readers.
-    let stale_thread_menu = |tab: ShellTab| {
-        overlay(
+    let target = |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction| {
+        escape_target(
+            escape.clone(),
             tab,
-            MessageAction::More,
+            false,
+            bell,
+            create,
+            thread_action,
             MessageAction::Toolbar,
             false,
             false,
+            String::new(),
         )
     };
+
+    // A stale chat menu names no layer from another tab — for BOTH readers.
+    let stale_thread_menu =
+        |tab: ShellTab| overlay(tab, MessageAction::More, MessageAction::Toolbar, false);
     assert_eq!(stale_thread_menu(ShellTab::Chat), "thread_menu");
     assert_eq!(stale_thread_menu(ShellTab::Pages), none);
     assert_eq!(stale_thread_menu(ShellTab::Explorer), none);
@@ -716,7 +678,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             MessageAction::Editing,
             false,
-            false,
         ),
         none
     );
@@ -726,46 +687,18 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             true,
-            false,
         ),
         none
-    );
-
-    // And the forge menu answers only from Forge.
-    let repo_menu = |tab: ShellTab| {
-        overlay(
-            tab,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            true,
-        )
-    };
-    assert_eq!(repo_menu(ShellTab::Forge), "repo_menu");
-    assert_eq!(repo_menu(ShellTab::Chat), none);
-
-    // THE LOAD-BEARING STACK: a stale chat flag must not SHADOW the menu that
-    // is actually on screen. Before scoping, this named "thread_menu" and the
-    // visible forge menu survived the press.
-    assert_eq!(
-        target(ShellTab::Forge, false, false, MessageAction::More, true),
-        "repo_menu"
     );
 
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
     assert_eq!(
-        target(
-            ShellTab::Governance,
-            true,
-            false,
-            MessageAction::Toolbar,
-            false
-        ),
+        target(ShellTab::Governance, true, false, MessageAction::Toolbar),
         "bell"
     );
     assert_eq!(
-        target(ShellTab::Node, false, true, MessageAction::Toolbar, false),
+        target(ShellTab::Node, false, true, MessageAction::Toolbar),
         "channel_create"
     );
 }

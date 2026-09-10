@@ -136,7 +136,8 @@ fn capture(src: &Forge) -> Captured {
 }
 
 /// Build Git history off-chain, then drive every resulting head through the
-/// real PushRefs path. This is the production ownership split in miniature.
+/// real PushRefs path. This is the production consensus/data-plane split in
+/// miniature.
 fn source_history(
     tag: &str,
     changes: &[(u64, &str, &str, &str)],

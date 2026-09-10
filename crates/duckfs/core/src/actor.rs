@@ -17,7 +17,7 @@ pub enum Actor {
 }
 
 impl Actor {
-    /// The owner segment below `/home`, also the canonical display label.
+    /// The label segment below `/home`, also the canonical display label.
     pub fn home_label(&self) -> String {
         self.to_string()
     }
@@ -91,8 +91,8 @@ impl fmt::Display for Actor {
 }
 
 /// Evidence supplied by the authenticated adapter, never by a file message.
-/// Account admission preserves a key's own earlier home and pin authority;
-/// another key on that account receives only the account's shared authority.
+/// Account admission keeps a key's own earlier staging and pin shares under
+/// the exact key; another key on that account draws on the account's shares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authority {
     External { key: Vec<u8>, account: Option<u64> },
@@ -140,17 +140,6 @@ impl Authority {
             (Actor::Key(owner_key), Self::External { key, .. }) => owner_key == key,
             (Actor::Key(_), Self::Program(_) | Self::Module(_) | Self::System) => false,
             (Actor::Account(_) | Actor::Module(_) | Actor::System, _) => *owner == self.actor(),
-        }
-    }
-
-    pub fn owns_home(&self, label: &str) -> bool {
-        let canonical_home = self.actor().home_label() == label;
-        if canonical_home {
-            return true;
-        }
-        match self {
-            Self::External { key, .. } => Actor::Key(key.clone()).home_label() == label,
-            Self::Program(_) | Self::Module(_) | Self::System => false,
         }
     }
 }

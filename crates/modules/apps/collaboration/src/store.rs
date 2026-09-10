@@ -23,8 +23,8 @@ use sdk::{Error, StagedStore};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::interface::{
-    Binding, Conversation, ConversationEvent, Credential, MailboxUsage, Message, Participant,
-    Receipt, MAX_ENCODED_MESSAGE_BYTES,
+    Binding, Conversation, ConversationEvent, Credential, MAX_ENCODED_MESSAGE_BYTES, MailboxUsage,
+    Message, Participant, Receipt,
 };
 
 /// write-time cap on ONE stored record, mirroring `tasks::MAX_RECORD_BYTES`:
@@ -121,11 +121,7 @@ pub async fn conversation(staged: &StagedStore, cid: &str) -> Result<Option<Conv
     load(staged, &conversation_key(cid), "conversation").await
 }
 
-pub async fn binding(
-    staged: &StagedStore,
-    cid: &str,
-    pid: &str,
-) -> Result<Option<Binding>, Error> {
+pub async fn binding(staged: &StagedStore, cid: &str, pid: &str) -> Result<Option<Binding>, Error> {
     load(staged, &binding_key(cid, pid), "binding").await
 }
 

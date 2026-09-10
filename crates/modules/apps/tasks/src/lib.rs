@@ -184,13 +184,15 @@ async fn actor_from_origin(ctx: &dyn Ctx, identity: &str) -> Result<Party, Error
     }
 }
 
-/// Key-owned records remain controlled by that signer after account admission.
-/// Account-owned records are controlled by the resolved account, including
-/// its other keys. Admission never silently transfers a key-owned record.
-pub(crate) fn controls(owner: &Party, actor: &Party, origin: &Origin) -> bool {
-    match owner {
+/// whether the actor holds a work lease (a job claim's worker): the one
+/// consent the boards keep, since a claimant's in-flight work is theirs to
+/// finalize or release. a key-held lease stays with that signer after
+/// account admission; an account-held lease is the resolved account's,
+/// including its other keys. admission never silently transfers a lease.
+pub(crate) fn controls(holder: &Party, actor: &Party, origin: &Origin) -> bool {
+    match holder {
         Party::Key(key) => matches!(origin, Origin::External(signer) if signer == key),
-        Party::Account(_) | Party::Module(_) | Party::System => owner == actor,
+        Party::Account(_) | Party::Module(_) | Party::System => holder == actor,
     }
 }
 
@@ -335,14 +337,7 @@ impl Tasks {
         };
         let revision = next_revision(&self.staged, "task", &task_id).await?;
         let before = task_board::load(&self.staged, &task_id).await?;
-        task_board::execute(
-            &mut self.staged,
-            &actor,
-            &ctx.env().origin,
-            msg,
-            ctx.env().consensus_time,
-        )
-        .await?;
+        task_board::execute(&mut self.staged, &actor, msg, ctx.env().consensus_time).await?;
         let after = task_board::load(&self.staged, &task_id).await?;
         let owner = after
             .as_ref()

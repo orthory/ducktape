@@ -314,13 +314,6 @@ impl Authority {
         }
         self.party.clone()
     }
-
-    fn owns(&self, owner: &Party) -> bool {
-        match owner {
-            Party::Key(key) => matches!(&self.origin, Origin::External(signer) if signer == key),
-            Party::Account(_) | Party::Module(_) | Party::System => owner == &self.party,
-        }
-    }
 }
 
 struct MessageContent {
@@ -798,36 +791,6 @@ impl Chat {
         }
     }
 
-    /// authorize a channel-admin op — rename, archive, membership, and hook
-    /// (un)registration, i.e. every write that changes who may write. among
-    /// people, only the owner administers a channel; a channel owned by a
-    /// module or the system admits NO person, because the principal that
-    /// minted it is trusted code and a person is not it — `forge:<repo>:<n>`
-    /// is the live case, and admitting any person there would hand a
-    /// stranger the roster and the hook list of another module's channel.
-    /// module and system parties are genesis-fixed trusted code and always
-    /// pass.
-    fn check_channel_admin(channel: &Channel, authority: &Authority) -> Result<(), Error> {
-        let party = &authority.party;
-        if !party.is_person() {
-            return Ok(());
-        }
-        let is_owner = authority.owns(&channel.owner);
-        if is_owner {
-            return Ok(());
-        }
-        match channel.owner.is_person() {
-            true => Err(Error::Module(format!(
-                "only the owner may administer channel {}",
-                channel.id
-            ))),
-            false => Err(Error::Module(format!(
-                "channel {} is unowned by any person; only trusted code administers it",
-                channel.id
-            ))),
-        }
-    }
-
     /// refuse channel creation once a person is at [`MAX_CHANNELS_PER_CREATOR`]
     /// — there is no `DeleteChannel` op, so this is the only thing bounding
     /// one party's share of the (permanent) channel set. trusted code is not
@@ -992,10 +955,12 @@ impl Chat {
         })
     }
 
-    /// rename a channel. reuses `CreateChannel`'s name validation (non-empty +
-    /// the `:` namespace gate — the id is unchanged, but the gate still keeps a
-    /// person off a module-namespaced channel) and the record byte cap. a
-    /// same-name rename stages nothing and reports nothing.
+    /// rename a channel. any authenticated party renames any channel: a
+    /// channel's owner is attribution, not a gate. reuses `CreateChannel`'s
+    /// name validation (non-empty + the `:` namespace gate — the id is
+    /// unchanged, but the gate still keeps a person off a module-namespaced
+    /// channel) and the record byte cap. a same-name rename stages nothing
+    /// and reports nothing.
     async fn stage_rename(
         &mut self,
         authority: &Authority,
@@ -1007,7 +972,6 @@ impl Chat {
         require_non_empty("name", &name)?;
         Self::validate_channel_namespace(party, channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
-        Self::check_channel_admin(&channel, authority)?;
         if channel.name == name {
             // idempotent: a same-name rename stages nothing, so the op log —
             // and the root — is byte-identical to no write at all.
@@ -1032,7 +996,6 @@ impl Chat {
         require_non_empty("channel_id", channel_id)?;
         Self::validate_channel_namespace(party, channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
-        Self::check_channel_admin(&channel, authority)?;
         if channel.archived == archived {
             return Ok(None);
         }
@@ -1332,19 +1295,17 @@ impl Chat {
 
     // ---- roster writes ----------------------------------------------------
 
-    /// register a hook module on a channel. channel-admin authority: a hook is
-    /// a standing subscription to everything posted there, so attaching one is
-    /// the owner's call, not any member's.
+    /// register a hook module on a channel: a standing subscription to
+    /// everything posted there. any authenticated party attaches one to any
+    /// channel; the caller has already checked the module is registered.
     async fn stage_register_hook(
         &mut self,
-        authority: &Authority,
         channel_id: &str,
         module_id: String,
     ) -> Result<(), Error> {
         require_non_empty("channel_id", channel_id)?;
         require_non_empty("module_id", &module_id)?;
         let mut channel = self.require_channel(channel_id).await?;
-        Self::check_channel_admin(&channel, authority)?;
         if channel.hooks.contains(&module_id) {
             // idempotent: registering twice stages nothing.
             return Ok(());
@@ -1356,18 +1317,16 @@ impl Chat {
         self.store_channel(&channel)
     }
 
-    /// unregister a hook module. same authority as registration — an ungated
-    /// unregister is a one-message off switch for every automation on the
-    /// channel, which is the sharper half of the pair.
+    /// unregister a hook module: the one-message off switch for that
+    /// automation on the channel, open to any authenticated party like
+    /// registration. an absent hook stages nothing.
     async fn stage_unregister_hook(
         &mut self,
-        authority: &Authority,
         channel_id: &str,
         module_id: &str,
     ) -> Result<(), Error> {
         require_non_empty("channel_id", channel_id)?;
         let mut channel = self.require_channel(channel_id).await?;
-        Self::check_channel_admin(&channel, authority)?;
         let before = channel.hooks.len();
         channel.hooks.retain(|hook| hook != module_id);
         if channel.hooks.len() == before {
@@ -1376,22 +1335,20 @@ impl Chat {
         self.store_channel(&channel)
     }
 
-    /// add/remove a person from the channel roster. channel-admin authority:
-    /// the roster IS `PostPolicy::MembersOnly`'s admission list, so a
-    /// self-service roster is no admission rule at all — anyone could add
-    /// themselves and post right through the policy. WHO first, then WHAT:
-    /// the admin gate runs before the named party is even resolved.
+    /// add/remove a person from the channel roster. the roster is
+    /// `PostPolicy::MembersOnly`'s admission list, and any authenticated
+    /// party writes it: membership is a fact about who posts, not a gate a
+    /// channel's owner holds. the channel must exist; the named party is
+    /// resolved after that.
     async fn stage_membership(
         &mut self,
         ctx: &dyn Ctx,
-        authority: &Authority,
         channel_id: &str,
         member_party: Party,
         member: bool,
     ) -> Result<(), Error> {
         require_non_empty("channel_id", channel_id)?;
-        let channel = self.require_channel(channel_id).await?;
-        Self::check_channel_admin(&channel, authority)?;
+        self.require_channel(channel_id).await?;
         // idempotent: an unchanged membership stages nothing, so the qmdb op
         // log — and the root — is byte-identical to no write at all. the point
         // record is the policy read; the roster VIEW lives on the index tier.
@@ -1492,22 +1449,13 @@ impl Chat {
         Ok(party)
     }
 
-    /// whether `actor` may evict `target` from `channel`'s huddle: the
-    /// channel's admin always may (`check_channel_admin` — the owner, or any
-    /// module/system party). a self-sweep is legitimate too, but it is
-    /// routed to `stage_leave_huddle` before this predicate ever runs, not
-    /// decided here. there is no third arm: `HuddleMember` carries only
-    /// `joined_at`, set once at join and never refreshed on liveness, so the
-    /// module holds no call-presence signal a staleness rule could read —
-    /// only the admin authority remains.
-    fn may_sweep(channel: &Channel, actor: &Authority) -> bool {
-        Self::check_channel_admin(channel, actor).is_ok()
-    }
-
     /// evict `target` from the channel's huddle (staleness cleanup — see
-    /// `ChatMsg::SweepHuddle`). a poster naming themself is a leave in
-    /// disguise; naming anyone else is an admin-only eviction (`may_sweep`).
-    /// absent target = no-op either way.
+    /// `ChatMsg::SweepHuddle`). a person naming themself is a leave in
+    /// disguise; naming anyone else evicts them, by any person: `HuddleMember`
+    /// carries only `joined_at`, set once at join and never refreshed on
+    /// liveness, so the module holds no call-presence signal a staleness
+    /// rule could read, and the room's people are its only cleanup. absent
+    /// target = no-op either way.
     async fn stage_sweep_huddle(
         &mut self,
         authority: &Authority,
@@ -1523,12 +1471,6 @@ impl Chat {
             return self.stage_leave_huddle(authority, channel_id).await;
         }
         let mut channel = self.require_channel(channel_id).await?;
-        let owns_entry = authority.owns(target);
-        if !owns_entry && !Self::may_sweep(&channel, authority) {
-            return Err(Error::Module(format!(
-                "only the channel admin may sweep another party's huddle entry in {channel_id}"
-            )));
-        }
         let before = channel.huddle.len();
         channel.huddle.retain(|m| m.party != *target);
         if channel.huddle.len() == before {
@@ -1779,30 +1721,26 @@ impl Chat {
                 module_id,
             } => {
                 // the target must be a registered module other than chat
-                // itself, or every later post would poison the block. WHO may
-                // attach it is `check_channel_admin`, inside the stage fn.
+                // itself, or every later post would poison the block; any
+                // authenticated party may attach it.
                 if module_id == self.id {
                     return Err(Error::Module("chat cannot hook itself".into()));
                 }
                 if ctx.module_root(&module_id).is_none() {
                     return Err(Error::Module(format!("unknown hook module: {module_id}")));
                 }
-                self.stage_register_hook(&authority, &channel_id, module_id)
-                    .await
+                self.stage_register_hook(&channel_id, module_id).await
             }
             ChatMsg::UnregisterHook {
                 channel_id,
                 module_id,
-            } => {
-                self.stage_unregister_hook(&authority, &channel_id, &module_id)
-                    .await
-            }
+            } => self.stage_unregister_hook(&channel_id, &module_id).await,
             ChatMsg::SetMembership {
                 channel_id,
                 party: member_party,
                 member,
             } => {
-                self.stage_membership(&*ctx, &authority, &channel_id, member_party, member)
+                self.stage_membership(&*ctx, &channel_id, member_party, member)
                     .await
             }
             ChatMsg::JoinHuddle {

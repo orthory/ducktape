@@ -273,7 +273,7 @@ impl RunsModule {
             | Operation::CollaborationAcknowledge { .. } => {
                 self.collaboration_msg(&operation)
             }
-            Operation::ModulesUpdate(_) => Err(format!(
+            Operation::ModulesUpdate(_) | Operation::ForgeOpenPr { .. } => Err(format!(
                 "{} is not available in the {} lane",
                 operation.name(),
                 lane.kind_name()

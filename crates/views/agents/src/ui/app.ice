@@ -26,7 +26,7 @@ extern crate::host
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
   MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str)
+  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
   LiveActivity(label:str, done:bool)
@@ -41,6 +41,7 @@ extern crate::host
   pure empty_live() -> LiveRun
   pure empty_run() -> RunRow
   pure link_glyph(kind:&str) -> str
+  pure journal_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure open_run(dispatch_id:&str) -> bool
   pure open_link(url:&str) -> bool
   pure cap_count(caps:&AgentCaps) -> i64
@@ -117,6 +118,11 @@ state
   // hint, a bell or a duck://run link opens one from another tab), so the
   // register's `open_run` is the truth and a press here is the request.
   open_run = ""
+  journal_width = 400.0
+  viewport_width = 1280.0
+  journal_dragging = false
+  pointer_x = 0.0
+  expanded_receipt = ""
   open_row:RunRow = empty_run()
   // the doors the app has opened a run through, counted, as the register
   // last carried it; a bump is a door pressed since
@@ -176,6 +182,33 @@ state
 
 on mount
   stream every props() -> props_changed _ | props_failed _
+
+subscribe
+  mouse moved status=any when panel == "runs" && !empty(open_run) -> journal_pointer_moved _ _
+  mouse released status=any when journal_dragging -> journal_pointer_released _
+  mouse left status=any when journal_dragging -> cancel_journal_resize
+
+on journal_pointer_moved(x, _y)
+  let delta = pointer_x - x
+  pointer_x = x
+  return if !journal_dragging
+  journal_width = journal_width_after_delta(journal_width, delta, viewport_width)
+
+on viewport_changed(width, _height)
+  viewport_width = width
+  journal_width = journal_width_after_delta(journal_width, 0.0, width)
+
+on start_journal_resize
+  journal_dragging = true
+
+on journal_pointer_released(_button)
+  journal_dragging = false
+
+on cancel_journal_resize
+  journal_dragging = false
+
+on toggle_receipt(value)
+  expanded_receipt = pick_str(expanded_receipt != value, value, "")
 
 // The register moved. A bumped `committed` means the app signed a write off
 // these drafts: the New form closes onto the agent it registered, and an
@@ -286,11 +319,14 @@ on choose_panel(next)
 // Open a run: the app is asked for its journal, which arrives as the next
 // register under this run's dispatch id.
 on open_run_row(run_id)
+  expanded_receipt = ""
   open_row = run_named(runs, run_id)
   open_run = open_row.dispatch_id
   sent = open_run(open_row.dispatch_id)
 
 on close_run
+  expanded_receipt = ""
+  journal_dragging = false
   open_run = ""
   open_row = empty_run()
   live = empty_live()
@@ -395,6 +431,8 @@ view
       h=fill
       bg=bg
     col w=fill h=fill
+      sensor show=viewport_changed resize=viewport_changed
+        space w=fill h=0.0
       box
         with
           w=fill
@@ -598,6 +636,7 @@ view
                                   @font-semibold
                               text run.origin
                                 with
+                                  w=fill
                                   size=11.0
                                   @text-meta
                                   @font-mono
@@ -628,18 +667,6 @@ view
                                   @text-meta
                                   @font-mono
                                   @font-medium
-                              if !empty(run.holder)
-                                text "· on"
-                                  with
-                                    size=10.5
-                                    @text-hint
-                                    @font-mono
-                              if !empty(run.holder)
-                                text run.holder
-                                  with
-                                    size=10.5
-                                    @text-hint
-                                    @font-mono
                               if run.pr_number > 0
                                 text "· PR #"
                                   with
@@ -727,9 +754,18 @@ view
           // THE JOURNAL: the open run's lifecycle, fact by fact, beside the
           // list. Read-only — a run is history the moment it is written.
           if !empty(open_run)
+            mouse #journal-resize press=start_journal_resize
+              box #journal-divider
+                with
+                  w=10.0
+                  h=fill
+                  bg=sidebar
+                  align-x=center
+                box w=2.0 h=fill bg=separator
+                  space w=2.0 h=1.0
             box #journal
               with
-                w=400.0
+                w=journal_width
                 h=fill
                 bg=surface
                 border=border
@@ -773,12 +809,31 @@ view
                       size=11.0
                       @text-meta
                       @font-mono
-                  text open_run
+                  button -> toggle_receipt(open_run)
                     with
+                      label="Run diagnostics"
+                      expanded=(expanded_receipt == open_run)
                       w=fill
-                      size=10.0
-                      @text-hint
-                      @font-mono
+                      p=0.0
+                    text "Run diagnostics"
+                      with
+                        w=fill
+                        size=10.0
+                        @text-hint
+                        @font-mono
+                  if expanded_receipt == open_run
+                    text open_run
+                      with
+                        w=fill
+                        size=10.0
+                        @text-meta
+                        @font-mono
+                    text open_row.output_ref
+                      with
+                        w=fill
+                        size=10.0
+                        @text-meta
+                        @font-mono
                   // THE RUN AS IT RUNS: its status, the steps it has taken
                   // and the answer forming, off the node's live reading. The
                   // chat stream only hints that a run is working under its
@@ -837,19 +892,16 @@ view
                         size=12.5
                         @text-fg
                         @font-semibold
-                    flex
+                    col
                       with
                         w=fill
-                        wrap=wrap
-                        gap-x=6.0
-                        gap-y=6.0
-                        items=start
+                        gap=6.0
                       for link in journal.links
                         if !empty(link.url)
                           button -> open_place(link.url)
                             with
                               label=link.label
-                              h=26.0
+                              w=fill
                               p=0.0
                               @outline_action
                             RunChip link=link
@@ -870,13 +922,6 @@ view
                           w=fill
                           size=12.0
                           @text-danger
-                  if !empty(open_row.output_ref)
-                    text open_row.output_ref
-                      with
-                        w=fill
-                        size=11.0
-                        @text-meta
-                        @font-mono
                   text "Journal"
                     with
                       size=12.5
@@ -913,6 +958,19 @@ view
                               w=fill
                               size=12.0
                               @text-meta
+                          if !empty(entry.status)
+                            text entry.status size=11.0 @text-meta
+                          for target in entry.targets
+                            if !empty(target.url)
+                              button -> open_place(target.url)
+                                with
+                                  label=target.label
+                                  w=fill
+                                  p=0.0
+                                  @outline_action
+                                RunChip link=target
+                            if empty(target.url)
+                              RunChip link=target
       if connected && panel == "registry" && empty(rows) && answered && !creating
         box
           with
@@ -2166,23 +2224,26 @@ view
 component RunChip(link:RunLink)
   box
     with
+      w=fill
+      clip=true
       px=9.0
       py=4.0
       r=13.0
-    row gap=6.0 align=center
+    row w=fill gap=6.0 align=center
       text link_glyph(link.kind)
         with
-          size=11.0
+          size=11.5
           @text-meta
-          @font-mono
+          @font-medium
       if link.relation == "from"
         text "from"
           with
-            size=10.5
+            size=11.5
             @text-hint
-            @font-mono
+            @font-medium
       text link.label
         with
+          w=fill
           size=11.5
           @text-fg
           @font-medium

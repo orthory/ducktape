@@ -488,7 +488,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     );
 
     // the admin surface: register (all fields), a duplicate rejection, an
-    // owner-gated update, a foreign update rejection.
+    // update by the registrant, an update by anyone else.
     accept(
         &mut native,
         &mut wasm,
@@ -516,15 +516,15 @@ async fn same_ops_inner(context: &deterministic::Context) {
         max_attempts: Some(5),
     };
     accept(&mut native, &mut wasm, 3, alice.clone(), op(&update), true).await;
-    reject(
-        &mut native,
-        &mut wasm,
-        4,
-        bob.clone(),
-        op(&update),
-        "not owned",
-    )
-    .await;
+    let by_anyone = DispatchMsg::UpdateRecipe {
+        recipe_id: "summarize".into(),
+        description: Some("summarize, terser still".into()),
+        capability: None,
+        routing: None,
+        output_contract: None,
+        max_attempts: None,
+    };
+    accept(&mut native, &mut wasm, 4, bob.clone(), op(&by_anyone), true).await;
 
     // the run surface, under a MODULE origin (the receiver of the result):
     // two dispatches, a duplicate that is a deterministic NO-OP (roots hold on

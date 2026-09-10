@@ -1356,6 +1356,19 @@ fn agent_call(agent_id: impl Into<String>, instruction: impl Into<String>) -> Ac
     )
 }
 
+fn forge_open_pr(repo: &str, source: &str, target: &str, title: &str, body: &str) -> ActionEnvelope {
+    envelope(
+        crate::ACTION_FORGE_OPEN_PR,
+        Some(serde_json::json!({"repo": repo})),
+        serde_json::json!({
+            "source_branch": source,
+            "target_branch": target,
+            "title": title,
+            "body": body,
+        }),
+    )
+}
+
 mod collaboration_actions;
 mod composition;
 mod delivery;

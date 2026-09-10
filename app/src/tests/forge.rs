@@ -458,23 +458,34 @@ fn forge_layout_keeps_repo_navigation_compact() {
         .find("emit(select_forge_tab, \"issues\")")
         .expect("issues tab");
     let selector = repo_body
-        .find("emit(forge_toggle_branch_menu)")
+        .find("pick branch_names(branches) pinned_branch(tree_branch) #branch-pick ")
         .expect("branch selector");
+    assert!(
+        repo_body[selector..]
+            .lines()
+            .next()
+            .is_some_and(|line| line.ends_with(" -> emit(forge_pick_branch, _)")),
+        "a pick leaves as the intent naming the branch"
+    );
     assert!(
         tabs_end < selector,
         "branch context follows the tabs in their shared navigation row"
     );
-    assert_eq!(repo_body.matches("for branch in branches").count(), 1);
+    assert_eq!(repo_body.matches("#branch-pick").count(), 1);
+    // A switcher's menu is the host's own pick list, laid out over whatever
+    // follows it. A `pin` is a positioned child of its parent, painted at the
+    // parent's z-order, so the content after the row paints over it.
     assert!(
-        repo_body.contains("BranchMenuRow branch=branch active=(branch.name == tree_branch)"),
-        "the switcher's rows mark the branch the browse is pinned to"
+        !screen.contains("pin x="),
+        "a menu is a pick list, never a pinned child"
     );
+    assert_eq!(screen.matches("#repo-pick").count(), 1);
 
     let item_body = screen
         .split_once("if forge_item_number > 0 && item_phase == \"ready\"")
         .expect("detail back control")
         .1;
-    assert!(item_body.starts_with("\n                BackToList"));
+    assert!(item_body.starts_with("\n              BackToList"));
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
 }
 
@@ -518,6 +529,31 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         !open.contains("run replace"),
         "the open plane owns no lane of its own"
+    );
+    // A CHAT ADDRESS LANDS ON THE CHAT TAB. `choose_channel` is the sidebar's
+    // own click and moves no tab, so the channel arm moves it first; the
+    // message arm lands through the search hit's own tab move.
+    let channel_arm = open
+        .split_once("DuckKind.channel\n")
+        .expect("the channel arm")
+        .1
+        .split_once("DuckKind.channel_message\n")
+        .expect("the message arm follows")
+        .0;
+    assert!(
+        channel_arm.contains("shell_tab = ShellTab.chat"),
+        "a channel address moves to the chat tab before the room changes"
+    );
+    let search_hit = chat
+        .split_once("on open_chat_search_hit(channel_id, root_seq, target_seq)")
+        .expect("the search-hit handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        search_hit.contains("shell_tab = ShellTab.chat"),
+        "a message address lands on the chat tab through the search hit's own tab move"
     );
 
     let forge = include_str!("../ui/handlers/forge.ice");
@@ -1023,7 +1059,10 @@ fn a_branch_pick_re_roots_the_browse_at_that_branches_head() {
     assert_eq!(backend::forge_tree_branch(&branches, "", dev), "dev");
     assert_eq!(backend::forge_tree_branch(&branches, "main", dev), "main");
     assert_eq!(backend::forge_tree_branch(&branches, "feature", dev), "dev");
-    assert_eq!(backend::forge_tree_branch(&branches, "", feature), "feature");
+    assert_eq!(
+        backend::forge_tree_branch(&branches, "", feature),
+        "feature"
+    );
     assert_eq!(backend::forge_tree_branch(&branches, "feature", "3333"), "");
     assert_eq!(backend::forge_tree_branch(&branches, "", ""), "");
     assert_eq!(backend::forge_branch_head(&branches, "feature"), feature);
@@ -1060,30 +1099,23 @@ fn a_branch_pick_re_roots_the_browse_at_that_branches_head() {
     let _ = app.__update(tree(dev, "src"));
     assert_eq!(app.forge_tree_path, "src");
 
-    // the switchers are exclusive: one opening closes the other
-    let toggle = |kind: &str| {
-        __DucktapeMessage::ForgeViewEvent(crate::module_view::ModuleViewEvent {
-            kind: kind.into(),
-            detail: "{}".into(),
-        })
-    };
-    let _ = app.__update(toggle("toggle_repo_menu"));
-    assert!(app.forge_repo_menu);
-    let _ = app.__update(toggle("toggle_branch_menu"));
-    assert!(app.forge_branch_menu && !app.forge_repo_menu);
-
     let pick = |name: &str| __DucktapeMessage::ForgePickBranch(name.into());
-    // a name the slice no longer holds picks nothing, but still closes the menu
+    // a name the slice no longer holds picks nothing
     let _ = app.__update(pick("gone"));
-    assert!(!app.forge_branch_menu);
     assert_eq!(app.forge_tree_rev, dev);
     assert_eq!(app.forge_tree_path, "src");
     assert_eq!(app.forge_tree_phase, ForgeTreePhase::Ready);
 
     let _ = app.__update(pick("feature"));
     assert_eq!(app.forge_tree_branch, "feature");
-    assert_eq!(app.forge_tree_rev, feature, "the browse is pinned at the branch's head");
-    assert_eq!(app.forge_tree_path, "", "and starts over at that branch's root");
+    assert_eq!(
+        app.forge_tree_rev, feature,
+        "the browse is pinned at the branch's head"
+    );
+    assert_eq!(
+        app.forge_tree_path, "",
+        "and starts over at that branch's root"
+    );
     assert_eq!(app.forge_tree_phase, ForgeTreePhase::Loading);
     assert!(app.forge_tree_entries.is_empty());
     let _ = app.__update(tree(dev, ""));
@@ -1097,7 +1129,7 @@ fn a_branch_pick_re_roots_the_browse_at_that_branches_head() {
 
     // leaving the repo forgets the pick along with the browse
     let _ = app.__update(__DucktapeMessage::ForgeCloseRepo);
-    assert!(app.forge_tree_branch.is_empty() && !app.forge_branch_menu);
+    assert!(app.forge_tree_branch.is_empty());
 }
 
 #[test]

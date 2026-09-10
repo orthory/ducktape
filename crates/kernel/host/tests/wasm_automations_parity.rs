@@ -817,16 +817,17 @@ fn rejections_match_and_leave_no_trace() {
             reject_roundtrip(&mut native, &mut wasm, height, ops.clone(), m, needle).await;
         }
 
-        // the OWNER gate, proven in the compiled component and not just
-        // natively: `ops` owns `r-post`, and neither a stranger nor a
-        // module/system origin may touch it or mint a rule of their own.
-        // `env().origin` is the one authorization input that crosses the WIT
-        // boundary, so a gate keyed on it has to be checked on both sides.
+        // the submitter resolution, proven in the compiled component and not
+        // just natively: `ops` registered `r-post`, and any other account
+        // administers it, while a module/system origin has no account to
+        // record and mints no rule. `env().origin` is the one such input
+        // that crosses the WIT boundary, so it is checked on both sides.
         let stranger = Origin::External(key(0xC3));
         let unownable = [
             (Origin::External(Vec::new()), "non-empty submitter id"),
             // a NON-chat module id: the chat origin is the hook lane, which is
-            // routed before the owner gate and never rejects by design.
+            // routed before the submitter is resolved and never rejects by
+            // design.
             (
                 Origin::Module("governance".into()),
                 "automation rules require an account origin",
@@ -843,15 +844,7 @@ fn rejections_match_and_leave_no_trace() {
                 rule_id: "r-post".into(),
             }),
         ] {
-            reject_roundtrip(
-                &mut native,
-                &mut wasm,
-                height,
-                stranger.clone(),
-                op,
-                "only the owner",
-            )
-            .await;
+            roundtrip(&mut native, &mut wasm, height, stranger.clone(), op, true).await;
             height += 1;
         }
         for (origin, needle) in unownable {

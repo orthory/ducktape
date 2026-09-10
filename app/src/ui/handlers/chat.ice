@@ -1019,6 +1019,14 @@ on open_message_link(url)
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.channel
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
+      shell_tab = ShellTab.chat
       run every duck_echo_str(link.channel) -> choose_channel _ | external_url_failed _
     DuckKind.channel_message
       run every duck_echo_str(link.channel) -> open_chat_search_hit(_, link.seq, link.seq) | external_url_failed _

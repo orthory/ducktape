@@ -229,14 +229,7 @@ impl Collaboration {
                 Ok(())
             }
             CollaborationMsg::RevokeParticipant { participant_id } => {
-                registry::revoke_participant(
-                    &mut self.staged,
-                    &actor,
-                    &origin,
-                    now,
-                    participant_id,
-                )
-                .await?;
+                registry::revoke_participant(&mut self.staged, now, participant_id).await?;
                 self.stamp_registry(ctx, actor);
                 Ok(())
             }
@@ -263,8 +256,6 @@ impl Collaboration {
             } => {
                 let advanced = registry::set_roster(
                     &mut self.staged,
-                    &actor,
-                    &origin,
                     now,
                     conversation_id.clone(),
                     participant_id,
@@ -283,8 +274,6 @@ impl Collaboration {
             } => {
                 let advanced = registry::bind(
                     &mut self.staged,
-                    &actor,
-                    &origin,
                     now,
                     conversation_id.clone(),
                     participant_id,
@@ -303,8 +292,6 @@ impl Collaboration {
             } => {
                 let advanced = registry::unbind(
                     &mut self.staged,
-                    &actor,
-                    &origin,
                     now,
                     conversation_id.clone(),
                     participant_id,
@@ -352,8 +339,6 @@ impl Collaboration {
                 let advanced = mailbox::acknowledge(
                     &mut self.staged,
                     ctx,
-                    &actor,
-                    &origin,
                     now,
                     &self.tasks,
                     conversation_id.clone(),
@@ -379,15 +364,7 @@ impl Collaboration {
                 conversation_id,
                 through_seq,
             } => {
-                mailbox::prune(
-                    &mut self.staged,
-                    &actor,
-                    &origin,
-                    now,
-                    conversation_id,
-                    through_seq,
-                )
-                .await?;
+                mailbox::prune(&mut self.staged, now, conversation_id, through_seq).await?;
                 self.stamp_registry(ctx, actor);
                 Ok(())
             }

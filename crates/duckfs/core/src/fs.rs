@@ -403,9 +403,7 @@ impl<S: ObjectStore> Fs<S> {
         height: u64,
         name: String,
     ) -> Result<(), String> {
-        self.transact(authority, height, |fs| {
-            fs.unpin_apply(authority, height, name)
-        })
+        self.transact(authority, height, |fs| fs.unpin_apply(height, name))
     }
 
     pub fn watch(
@@ -672,29 +670,19 @@ impl<S: ObjectStore> Fs<S> {
         Ok(())
     }
 
-    /// remove a pin by name — owner-gated: only the pin's creator or system.
+    /// remove a pin by name. any authority removes any pin: the entry's owner
+    /// is attribution and the per-owner pin share, never a gate on removal.
     /// mutates the PENDING view only (see [`Fs::pin`] for the height/sweep rules).
-    fn unpin_apply(
-        &mut self,
-        authority: &Authority,
-        height: u64,
-        name: String,
-    ) -> Result<(), String> {
+    fn unpin_apply(&mut self, height: u64, name: String) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
         // `transact` restores the sweep if this verb is refused.
         sweep_expired(&mut pending.refs, height);
 
-        let owner = match pending.refs.pins.get(&name) {
-            Some(entry) => entry.owner.clone(),
-            None => return Err("files: pin not found".into()),
-        };
-        // owner-gated: the creator or system may remove it; nobody else.
-        let can_unpin = authority.controls(&owner) || matches!(authority, Authority::System);
-        if !can_unpin {
-            return Err("files: only the pin owner may unpin".into());
+        let removed = pending.refs.pins.remove(&name);
+        if removed.is_none() {
+            return Err("files: pin not found".into());
         }
-        pending.refs.pins.remove(&name);
         Ok(())
     }
 

@@ -77,9 +77,8 @@ state
   forge_file_phase:ForgeFilePhase = ForgeFilePhase.idle
 
   forge_tab:ForgeTab = ForgeTab.code
-  forge_repo_menu = false
-  // THE BRANCH SELECTOR: the switcher's open state, and the branch the reader
-  // picked ("" until a pick) — the browse itself stays pinned to a commit
-  // (`forge_tree_rev`); the pick re-roots it at that branch's head.
-  forge_branch_menu = false
+  // THE BRANCH SELECTOR: the branch the reader picked ("" until a pick) —
+  // the browse itself stays pinned to a commit (`forge_tree_rev`); the pick
+  // re-roots it at that branch's head. The selector's menu is the host's
+  // own pick list, so no open flag lives here.
   forge_tree_branch = ""
