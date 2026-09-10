@@ -26,7 +26,7 @@ extern crate::host
   MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
   MessagingProps(participant:str, conversation:str, network:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, loading:bool, answered:bool, sending:bool, send_error:str, sent_seq:i64, visibility:str)
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str)
+  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink])
   LiveActivity(label:str, done:bool)
@@ -41,8 +41,6 @@ extern crate::host
   pure empty_live() -> LiveRun
   pure empty_run() -> RunRow
   pure link_glyph(kind:&str) -> str
-  pure compact_run_text(value:&str) -> str
-  pure journal_summary(kind:&str, summary:&str) -> str
   pure journal_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure open_run(dispatch_id:&str) -> bool
   pure open_link(url:&str) -> bool
@@ -636,7 +634,7 @@ view
                                   size=13.5
                                   @text-fg
                                   @font-semibold
-                              text compact_run_text(run.origin)
+                              text run.origin
                                 with
                                   w=fill
                                   size=11.0
@@ -669,18 +667,6 @@ view
                                   @text-meta
                                   @font-mono
                                   @font-medium
-                              if !empty(run.holder)
-                                text "· on"
-                                  with
-                                    size=10.5
-                                    @text-hint
-                                    @font-mono
-                              if !empty(run.holder)
-                                text run.holder
-                                  with
-                                    size=10.5
-                                    @text-hint
-                                    @font-mono
                               if run.pr_number > 0
                                 text "· PR #"
                                   with
@@ -817,7 +803,7 @@ view
                         h=24.0
                         p=0.0
                       text "×" size=16.0 @text-meta
-                  text compact_run_text(open_row.origin)
+                  text open_row.origin
                     with
                       w=fill
                       size=11.0
@@ -825,11 +811,11 @@ view
                       @font-mono
                   button -> toggle_receipt(open_run)
                     with
-                      label="Run identifier"
+                      label="Run diagnostics"
                       expanded=(expanded_receipt == open_run)
                       w=fill
                       p=0.0
-                    text compact_run_text(open_run)
+                    text "Run diagnostics"
                       with
                         w=fill
                         size=10.0
@@ -837,6 +823,12 @@ view
                         @font-mono
                   if expanded_receipt == open_run
                     text open_run
+                      with
+                        w=fill
+                        size=10.0
+                        @text-meta
+                        @font-mono
+                    text open_row.output_ref
                       with
                         w=fill
                         size=10.0
@@ -930,26 +922,6 @@ view
                           w=fill
                           size=12.0
                           @text-danger
-                  if !empty(open_row.output_ref)
-                    button -> toggle_receipt(open_row.output_ref)
-                      with
-                        label="Output reference"
-                        expanded=(expanded_receipt == open_row.output_ref)
-                        w=fill
-                        p=0.0
-                      text compact_run_text(open_row.output_ref)
-                        with
-                          w=fill
-                          size=11.0
-                          @text-meta
-                          @font-mono
-                    if expanded_receipt == open_row.output_ref
-                      text open_row.output_ref
-                        with
-                          w=fill
-                          size=11.0
-                          @text-meta
-                          @font-mono
                   text "Journal"
                     with
                       size=12.5
@@ -981,25 +953,24 @@ view
                               @text-fg
                               @font-mono
                               @font-semibold
-                          text journal_summary(entry.kind, entry.summary)
+                          text entry.summary
                             with
                               w=fill
                               size=12.0
                               @text-meta
-                          if journal_summary(entry.kind, entry.summary) != entry.summary
-                            button -> toggle_receipt(entry.summary)
-                              with
-                                label=entry.summary
-                                expanded=(expanded_receipt == entry.summary)
-                                p=0.0
-                              text "Details" size=10.5 @text-hint
-                            if expanded_receipt == entry.summary
-                              text entry.summary
+                          if !empty(entry.status)
+                            text entry.status size=11.0 @text-meta
+                          for target in entry.targets
+                            if !empty(target.url)
+                              button -> open_place(target.url)
                                 with
+                                  label=target.label
                                   w=fill
-                                  size=11.0
-                                  @text-meta
-                                  @font-mono
+                                  p=0.0
+                                  @outline_action
+                                RunChip link=target
+                            if empty(target.url)
+                              RunChip link=target
       if connected && panel == "registry" && empty(rows) && answered && !creating
         box
           with
@@ -2270,7 +2241,7 @@ component RunChip(link:RunLink)
             size=11.5
             @text-hint
             @font-medium
-      text compact_run_text(link.label)
+      text link.label
         with
           w=fill
           size=11.5
