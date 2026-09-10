@@ -1526,9 +1526,9 @@ async fn run_links(
 /// and a reconnect to the same endpoint is a different session — so a read
 /// started on network A, answering after the app moved to B with that same run
 /// open, would install A's journal under B. The fields below are what make the
-/// comparison identify the OPERATION rather than its subject, exactly as the
-/// messaging panel's do: `link` is the app's `connect_generation`, `account`
-/// the seated account, and `op` a fresh per-dispatch nonce.
+/// comparison identify the OPERATION rather than its subject: `link` is the
+/// app's `connect_generation`, `account` the seated account, and `op` a fresh
+/// per-dispatch nonce.
 #[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct RunJournal {
     pub dispatch_id: String,
@@ -2315,8 +2315,8 @@ pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
 /// id is the reader closing the journal: nothing is read and the empty journal
 /// comes back at once.
 ///
-/// Infallible on purpose, like the messaging panel's reads: the answer carries
-/// its own scope, and a `Result`'s error arm cannot. A refusal that arrives
+/// Infallible on purpose: the answer carries its own scope, and a `Result`'s
+/// error arm cannot. A refusal that arrives
 /// without its scope has nowhere safe to be shown once the reader has moved to
 /// another network with the same run open.
 #[allow(clippy::too_many_arguments)]
