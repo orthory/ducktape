@@ -15,7 +15,9 @@ use ui_lang_guest::wire::Frame;
 fn display_limits_use_a_bounded_footer_only_when_content_is_clipped() {
     use ui_lang_guest::wire::{Length, Node};
     fn notice(node: &Node) -> Option<&Node> {
-        let is_notice = node.key().is_some_and(|key| key.ends_with("/display-notice"));
+        let is_notice = node
+            .key()
+            .is_some_and(|key| key.ends_with("/display-notice"));
         if is_notice {
             return Some(node);
         }
