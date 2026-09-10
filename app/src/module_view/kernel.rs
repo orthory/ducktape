@@ -4,8 +4,10 @@
 //! never changes for it.
 //!
 //! - `rpc.query` `{target, query}` — one module query on the connected
-//!   node, answered with the reply's JSON.
-//! - `rpc.blocks` `{limit}` — the recent block feed.
+//!   node, answered with the reply's JSON; `rpc.view` the same against
+//!   the module's index-tier view.
+//! - `rpc.blocks` `{limit}` — the recent block feed; `rpc.status` and
+//!   `rpc.peers` the node's own status and peers JSON.
 //! - `rpc.live` `<module>` — a subscription that gets one item per block
 //!   the app's live stream reports for that module's plane
 //!   ([`live_hit`]), so the view re-reads what moved.
@@ -105,7 +107,10 @@ pub(super) fn answer(
 ) -> bool {
     match (capability, operation) {
         ("rpc", "query") => spawn(guest, id, payload, query),
+        ("rpc", "view") => spawn(guest, id, payload, view),
         ("rpc", "blocks") => spawn(guest, id, payload, blocks),
+        ("rpc", "status") => spawn(guest, id, b"{}", status),
+        ("rpc", "peers") => spawn(guest, id, b"{}", peers),
         ("rpc", "live") => {
             let own_plane = payload == guest.module.as_bytes();
             match own_plane {
@@ -183,6 +188,43 @@ fn query(
             .query(&target, &ask["query"])
             .await
             .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn view(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let target = target_of(&ask)?;
+        let reply: serde_json::Value = client
+            .view(&target, &ask["query"])
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn status(
+    client: ducktape_rpc::Client,
+    _ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let reply = client
+            .status_json()
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn peers(
+    client: ducktape_rpc::Client,
+    _ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let reply = client.peers().await.map_err(|error| error.to_string())?;
         serde_json::to_vec(&reply).map_err(|error| error.to_string())
     })
 }
