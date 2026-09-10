@@ -12,6 +12,37 @@ use forge_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, submit, texts, type_into};
 use ui_lang_guest::wire::Frame;
 
+#[test]
+fn display_limits_use_a_bounded_footer_only_when_content_is_clipped() {
+    use ui_lang_guest::wire::{Length, Node};
+    fn notice(node: &Node) -> Option<&Node> {
+        let is_notice = node
+            .key()
+            .is_some_and(|key| key.ends_with("/display-notice"));
+        if is_notice {
+            return Some(node);
+        }
+        node.children().iter().find_map(|node| notice(node))
+    }
+    let (_, frame) = shown(&overview());
+    assert!(notice(frame.root.as_ref().unwrap()).is_none());
+    assert!(!has_text(&frame, "rows are not shown."));
+    for (omitted, shortened) in [(100, false), (0, true), (100, true)] {
+        let (_, frame) = shown(&ForgeProps {
+            display_omitted: omitted,
+            display_shortened: shortened,
+            ..overview()
+        });
+        let Node::Container { height, .. } = notice(frame.root.as_ref().unwrap()).unwrap() else {
+            panic!("notice is a bounded footer");
+        };
+        assert_eq!(*height, Some(Length::Fixed(26.0)));
+        assert_eq!(has_text(&frame, "rows omitted"), omitted > 0);
+        assert_eq!(has_text(&frame, "Preview shortened"), shortened);
+        assert!(has_text(&frame, "core"));
+    }
+}
+
 fn overview() -> ForgeProps {
     ForgeProps {
         dark: false,
