@@ -668,31 +668,53 @@ view
                       size=11.0
                       @text-meta
                       @font-mono
+                  // THE RUN'S IDENTIFIERS, folded behind a disclosure: the
+                  // dispatch id the run is addressed by (`duck://run/<id>`)
+                  // and the blob its output landed in. Each is LABELED — a
+                  // bare hash under a button called "Run diagnostics" read as
+                  // a command that answered with a digest. A disclosure wears
+                  // the ghost face, never the default button face.
                   button -> toggle_receipt(open_run)
                     with
-                      label="Run diagnostics"
+                      label="Run details"
                       expanded=(expanded_receipt == open_run)
-                      w=fill
-                      p=0.0
-                    text "Run diagnostics"
-                      with
-                        w=fill
-                        size=10.0
-                        @text-hint
-                        @font-mono
+                      p=4.0
+                      @ghost_action
+                    row gap=6.0 align=center
+                      if expanded_receipt == open_run
+                        text "▾" size=10.0 @text-meta
+                      if expanded_receipt != open_run
+                        text "▸" size=10.0 @text-meta
+                      text "Details" size=11.0 @text-meta
                   if expanded_receipt == open_run
-                    text open_run
-                      with
-                        w=fill
-                        size=10.0
-                        @text-meta
-                        @font-mono
-                    text open_row.output_ref
-                      with
-                        w=fill
-                        size=10.0
-                        @text-meta
-                        @font-mono
+                    col w=fill gap=4.0
+                      row w=fill gap=8.0 align=center
+                        text "dispatch"
+                          with
+                            w=64.0
+                            size=10.0
+                            @text-label
+                            @font-mono
+                        text open_run
+                          with
+                            w=fill
+                            size=10.0
+                            @text-meta
+                            @font-mono
+                      if !empty(open_row.output_ref)
+                        row w=fill gap=8.0 align=center
+                          text "output"
+                            with
+                              w=64.0
+                              size=10.0
+                              @text-label
+                              @font-mono
+                          text open_row.output_ref
+                            with
+                              w=fill
+                              size=10.0
+                              @text-meta
+                              @font-mono
                   // THE RUN AS IT RUNS: its status, the steps it has taken
                   // and the answer forming, off the node's live reading. The
                   // chat stream only hints that a run is working under its

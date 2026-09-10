@@ -241,7 +241,7 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
         serde_json::from_slice::<serde_json::Value>(&intent.payload).unwrap()["url"],
         target.url
     );
-    let frame = tick_native(press(&frame, "Run diagnostics"));
+    let frame = tick_native(press(&frame, "Run details"));
     assert!(has_text(&frame, &running.dispatch_id));
     let width = |frame: &Frame| match node_ending(frame, "/journal") {
         Node::Container {
@@ -635,7 +635,7 @@ fn the_register_opens_the_run_the_app_names() {
         "the tracker is landed on without a press: {:?}",
         texts(&frame)
     );
-    assert!(has_text(&frame, "Run diagnostics"));
+    assert!(has_text(&frame, "Details"));
     assert!(!has_text(&frame, &running.dispatch_id));
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
