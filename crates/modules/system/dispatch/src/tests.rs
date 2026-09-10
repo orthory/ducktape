@@ -293,7 +293,7 @@ fn delivered(payload: &[u8]) -> Delivery {
 }
 
 #[test]
-fn recipe_registration_validates_and_gates_mutation_by_owner() {
+fn recipe_registration_validates_and_any_origin_mutates() {
     let mut m = module();
     let mut ctx = mk_ctx(0, owner());
     exec(
@@ -357,19 +357,28 @@ fn recipe_registration_validates_and_gates_mutation_by_owner() {
         assert!(err.to_string().contains(needle), "wanted {needle} in {err}");
     }
 
-    // a foreign origin cannot update or remove.
+    // a foreign origin's update lands: the owner is attribution, not consent,
+    // and stays the registering origin.
     let mut foreign = mk_ctx(0, Origin::External(b"other".to_vec()));
-    let err = exec(
+    exec(
         &mut m,
         &mut foreign,
-        &DispatchMsg::RemoveRecipe {
+        &DispatchMsg::UpdateRecipe {
             recipe_id: "summarize".into(),
+            description: Some("edited by a stranger".into()),
+            capability: None,
+            routing: None,
+            output_contract: None,
+            max_attempts: None,
         },
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("not owned"), "got {err}");
+    .unwrap();
+    commit(&mut m);
+    let edited = recipe(&m, "summarize").expect("recipe committed");
+    assert_eq!(edited.description, "edited by a stranger");
+    assert_eq!(edited.owner, SagaOrigin::External(b"owner".to_vec()));
 
-    // the owner can update; the update is validated too.
+    // an update is validated the same as a registration.
     let err = exec(
         &mut m,
         &mut ctx,
@@ -448,22 +457,12 @@ fn agent_namespace_is_reserved_for_the_runs_module_origin() {
     commit(&mut m);
     assert!(recipe(&m, "agent/bot").is_some());
 
-    // a foreign module (never runs) still cannot remove it.
+    // the reservation is id namespacing at registration only: once
+    // registered, a foreign module removes the recipe like any other.
     let mut other = mk_ctx(0, Origin::Module("other".into()));
-    let err = exec(
-        &mut m,
-        &mut other,
-        &DispatchMsg::RemoveRecipe {
-            recipe_id: "agent/bot".into(),
-        },
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("not owned"), "got {err}");
-
-    // runs (the reserved owner) can remove its own reserved recipe.
     exec(
         &mut m,
-        &mut runs,
+        &mut other,
         &DispatchMsg::RemoveRecipe {
             recipe_id: "agent/bot".into(),
         },
@@ -476,8 +475,8 @@ fn agent_namespace_is_reserved_for_the_runs_module_origin() {
 #[test]
 fn a_program_origin_reaches_the_admin_surface_and_is_refused_where_it_must_be() {
     // a program account acts only through calls its executor queued: it can
-    // own no recipe, dispatch nothing, queue nothing — and a Nudge from it is
-    // the same no-op it is from anyone.
+    // register no recipe, dispatch nothing, queue nothing — and a Nudge from
+    // it is the same no-op it is from anyone.
     let mut m = module();
     let mut ctx = mk_ctx(0, Origin::Program(PROGRAM));
     let err = exec(
@@ -486,7 +485,10 @@ fn a_program_origin_reaches_the_admin_surface_and_is_refused_where_it_must_be() 
         &register(OutputContract::Text, Routing::Rendezvous),
     )
     .unwrap_err();
-    assert!(err.to_string().contains("cannot own recipes"), "got {err}");
+    assert!(
+        err.to_string().contains("cannot register recipes"),
+        "got {err}"
+    );
     let err = exec(&mut m, &mut ctx, &dispatch_op("d1", b"x")).unwrap_err();
     assert!(err.to_string().contains("module-origin only"), "got {err}");
     let err = exec(&mut m, &mut ctx, &call_op("run-1", 0, "chat", b"x")).unwrap_err();

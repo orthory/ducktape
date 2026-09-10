@@ -518,24 +518,16 @@ async fn reclaim(staged: &mut StagedStore, job_id: String, height: u64) -> Resul
     stage_job(staged, &job)
 }
 
-async fn cancel(
-    staged: &mut StagedStore,
-    job_id: String,
-    actor: &Party,
-    origin: &Origin,
-    height: u64,
-) -> Result<(), Error> {
+/// any member cancels a still-pending job: the submitter is attribution and
+/// the census key, not a consent the cancel needs. a claim is a work lease,
+/// and the lease does gate.
+async fn cancel(staged: &mut StagedStore, job_id: String, height: u64) -> Result<(), Error> {
     let mut job = require(staged, &job_id).await?;
-    // once claimed, the worker owns it until finalize/release/lease expiry.
+    // once claimed, the worker holds it until finalize/release/lease expiry.
     if job.status != JobStatus::Pending {
         return Err(Error::Module(format!(
             "cancel only applies to pending jobs (status {:?}): {job_id}",
             job.status
-        )));
-    }
-    if !controls(&job.submitter, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the submitter may cancel: {job_id}"
         )));
     }
     job.status = JobStatus::Cancelled;
@@ -543,22 +535,14 @@ async fn cancel(
     stage_job(staged, &job)
 }
 
-async fn prune(
-    staged: &mut StagedStore,
-    job_id: String,
-    actor: &Party,
-    origin: &Origin,
-) -> Result<(), Error> {
+/// any member prunes a terminal job's record; the slot freed is the
+/// submitter's, whoever prunes.
+async fn prune(staged: &mut StagedStore, job_id: String) -> Result<(), Error> {
     let job = require(staged, &job_id).await?;
     if !job.status.is_terminal() {
         return Err(Error::Module(format!(
             "prune only applies to terminal jobs (status {:?}): {job_id}",
             job.status
-        )));
-    }
-    if !controls(&job.submitter, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the submitter may prune: {job_id}"
         )));
     }
     let count = live_count(staged).await?;
@@ -622,8 +606,8 @@ pub(crate) async fn execute(
         } => finalize(staged, job_id, ok, payload, actor, &origin, height).await,
         JobsMsg::Release { job_id } => release(staged, job_id, actor, &origin, height).await,
         JobsMsg::Reclaim { job_id } => reclaim(staged, job_id, height).await,
-        JobsMsg::Cancel { job_id } => cancel(staged, job_id, actor, &origin, height).await,
-        JobsMsg::Prune { job_id } => prune(staged, job_id, actor, &origin).await,
+        JobsMsg::Cancel { job_id } => cancel(staged, job_id, height).await,
+        JobsMsg::Prune { job_id } => prune(staged, job_id).await,
         JobsMsg::RegisterWorker {} => register_worker(staged, &origin, module_id).await,
         JobsMsg::UnregisterWorker {} => unregister_worker(staged, &origin, module_id).await,
     }

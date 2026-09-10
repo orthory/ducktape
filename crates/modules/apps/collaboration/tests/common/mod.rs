@@ -9,8 +9,8 @@
 #![allow(dead_code)]
 
 use collaboration::{
-    encode_msg, encode_query, BoundPrincipal, CollaborationMsg, CollaborationQuery,
-    CollaborationReply, Collaboration, MessageId, MessageKind, ProtectedRead, Role, SendRequest,
+    BoundPrincipal, Collaboration, CollaborationMsg, CollaborationQuery, CollaborationReply,
+    MessageId, MessageKind, ProtectedRead, Role, SendRequest, encode_msg, encode_query,
 };
 use sdk::{Cause, Env, Error, Module, Msg, Origin};
 use sdk_testkit::{MemStore, TestCtx};

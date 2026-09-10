@@ -172,20 +172,10 @@ fn program_repo_pr_review_and_ref_lifecycle_publish_full_sets() {
             push("main", None, Some(1)),
         )
         .await;
-        let owner = relations(&host, "repo", serde_json::json!("demo")).await;
-        assert_eq!(owner.relations[0].recipient, 3);
-        assert_eq!(owner.relations[0].reason, Reason::Ownership);
         let main = relations(&host, "ref", serde_json::json!(["demo", "main"])).await;
         assert_eq!(main.relations[0].recipient, 3);
         assert_eq!(main.relations[0].detail, vec![1; 20]);
 
-        let denied = host
-            .submit_at(
-                context(key(1)),
-                message("forge", &push("main", Some(1), Some(2))),
-            )
-            .await;
-        assert!(denied.is_err(), "controller is not the program repo owner");
         apply(&mut host, key(1), "forge", push("feature", None, Some(2))).await;
         apply(
             &mut host,
@@ -244,13 +234,8 @@ fn program_repo_pr_review_and_ref_lifecycle_publish_full_sets() {
             merge_oid: "03".repeat(20),
             pack_digest: "09".repeat(32),
         };
-        assert!(
-            host.submit_at(context(key(2)), message("forge", &merge))
-                .await
-                .is_err(),
-            "review credit grants no merge authority"
-        );
-        apply(&mut host, Origin::Program(3), "forge", merge).await;
+        // the reviewer merges: a merge onto a protected branch is any member's.
+        apply(&mut host, key(2), "forge", merge).await;
         assert_eq!(item(&host, 1).await.summary.state, forge::ItemState::Merged);
         let merged = relations(&host, "item", serde_json::json!(["demo", 1])).await;
         assert_eq!(merged.relations, credited.relations);
@@ -582,7 +567,7 @@ fn item_authorship_records_the_signers_canonical_actor() {
 }
 
 #[test]
-fn repository_owner_settlement_is_atomic_and_publishes_account_ownership() {
+fn ref_attribution_settles_with_the_push_and_a_refused_push_publishes_nothing() {
     block_on(async {
         let context = |byte, accounts: Vec<(u8, u64)>| {
             test_ctx(key(byte)).on_query("identity", move |req| {
@@ -623,26 +608,26 @@ fn repository_owner_settlement_is_atomic_and_publishes_account_ownership() {
         );
         let before = state.published_image();
         let accounts = vec![(9, 1), (10, 1), (11, 2)];
-        // Both authorization and CAS can fail after the owner lookup. Neither
-        // may persist an account transition or publish its ownership report.
-        for (actor, previous) in [(11, 1), (10, 8)] {
-            let mut ctx = context(actor, accounts.clone());
-            assert!(
-                state
-                    .apply(
-                        &mut ctx,
-                        &forge::encode_msg(&push("main", Some(previous), Some(2))),
-                        None,
-                        Some("attribution"),
-                        "sources"
-                    )
-                    .await
-                    .is_err()
-            );
-            assert_eq!(state.published_image(), before);
-            assert!(ctx.msgs().is_empty());
-        }
+        // the CAS fails after the party lookup: nothing is published and no
+        // report leaves the module.
         let mut ctx = context(10, accounts.clone());
+        assert!(
+            state
+                .apply(
+                    &mut ctx,
+                    &forge::encode_msg(&push("main", Some(8), Some(2))),
+                    None,
+                    Some("attribution"),
+                    "sources"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(state.published_image(), before);
+        assert!(ctx.msgs().is_empty());
+        // a member other than the one who birthed the repo moves main, and
+        // the report names the ACCOUNT its key resolves to.
+        let mut ctx = context(11, accounts.clone());
         state
             .apply(
                 &mut ctx,
@@ -653,74 +638,30 @@ fn repository_owner_settlement_is_atomic_and_publishes_account_ownership() {
             )
             .await
             .unwrap();
-        assert_eq!(state.tracker_view().owner("demo"), Some(&Party::Account(1)));
         let attribution::AttributionMsg::AttributeBatch { updates } =
             attribution::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("source report");
         };
-        let owner = updates
+        let main = updates
             .iter()
-            .find(|update| update.object.kind == "repo")
+            .find(|update| update.object.kind == "ref")
             .unwrap();
-        assert_eq!(owner.actor, Actor::Account(1));
+        assert_eq!(main.actor, Actor::Account(2));
         assert_eq!(
-            owner.relations,
+            main.relations,
             vec![attribution::Relation {
-                recipient: 1,
-                reason: Reason::Ownership,
-                detail: Vec::new(),
+                recipient: 2,
+                reason: Reason::Defined("ref_writer".into()),
+                detail: vec![2; 20],
             }]
         );
         state.abort();
         assert_eq!(
             state.published_image(),
             before,
-            "aborted settlement is invisible"
+            "an aborted push is invisible"
         );
-        state
-            .apply(
-                &mut context(10, accounts),
-                &forge::encode_msg(&push("main", Some(1), Some(2))),
-                None,
-                Some("attribution"),
-                "sources",
-            )
-            .await
-            .unwrap();
-        state = forge::state::ForgeState::from_lane(
-            forge::state::decode_image(&state.published_image()).unwrap(),
-            Default::default(),
-        );
-        let settled = state.published_image();
-        assert!(
-            state
-                .apply(
-                    &mut context(9, vec![(10, 1)]),
-                    &forge::encode_msg(&push("main", Some(2), Some(3))),
-                    None,
-                    Some("attribution"),
-                    "sources"
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            state.published_image(),
-            settled,
-            "removed key cannot regain ownership"
-        );
-        state
-            .apply(
-                &mut context(10, vec![(10, 1)]),
-                &forge::encode_msg(&push("main", Some(2), Some(3))),
-                None,
-                Some("attribution"),
-                "sources",
-            )
-            .await
-            .unwrap();
-        assert_eq!(state.tracker_view().owner("demo"), Some(&Party::Account(1)));
     });
 }
 
@@ -753,13 +694,6 @@ fn signed_push_attributes_the_real_account_signer_instead_of_its_relay() {
         });
         apply(&mut host, key(1), "forge", signed).await;
         assert_eq!(
-            relations(&host, "repo", serde_json::json!("demo"))
-                .await
-                .relations[0]
-                .recipient,
-            4
-        );
-        assert_eq!(
             relations(&host, "ref", serde_json::json!(["demo", "main"]))
                 .await
                 .relations[0]
@@ -785,13 +719,5 @@ fn signed_push_attributes_the_real_account_signer_instead_of_its_relay() {
             panic!("changes")
         };
         assert_eq!(changes[0].change.actor, Actor::Account(4));
-        assert!(
-            host.submit_at(
-                context(key(1)),
-                message("forge", &push("main", Some(1), Some(2)))
-            )
-            .await
-            .is_err()
-        );
     });
 }

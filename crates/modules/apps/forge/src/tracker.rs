@@ -96,15 +96,9 @@ impl Item {
     }
 }
 
-/// one repo's tracker: its owner, the shared number space, and its items.
+/// one repo's tracker: the shared number space and its items.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct RepoTracker {
-    /// the principal that owns this repo — `None` until a push births it.
-    /// pinned by the BIRTHING push and never reassigned; only this principal
-    /// may move a protected branch (`main`/`dev`) afterwards. see
-    /// [`crate::state::ForgeState::stage_push_refs`] for why authorization is
-    /// the whole of protected-branch safety.
-    pub owner: Option<Party>,
     /// the LAST assigned number; 0 = none yet. the next item gets `+1`.
     pub last_number: u64,
     /// how many items in [`Self::items`] are currently `Open` — what
@@ -197,36 +191,14 @@ fn note_author_closed(rt: &mut RepoTracker, author: &Party) {
 }
 
 impl Tracker {
-    /// LOAD-BEARING: a repo owner is consensus state, so an owner alone must
-    /// make the tracker non-empty. otherwise `compose_state_root` skips the
-    /// tracker fold and the owner becomes UNAUTHENTICATED state — a joiner
-    /// could install a snapshot naming any owner it liked.
+    /// empty is what `compose_state_root` skips: no item was ever numbered
+    /// and no source revision published.
     pub fn is_empty(&self) -> bool {
         self.source_revision == 0
             && self
                 .repos
                 .values()
-                .all(|r| r.owner.is_none() && r.items.is_empty() && r.last_number == 0)
-    }
-
-    /// the principal that owns `repo`, if a push has birthed it.
-    pub fn owner(&self, repo: &str) -> Option<&Party> {
-        self.repos.get(repo).and_then(|r| r.owner.as_ref())
-    }
-
-    /// how many repos `principal` already owns — derived from the tracker the
-    /// owner entries already live in, so the cap needs no counter of its own.
-    pub fn repos_owned_by(&self, principal: &Party) -> usize {
-        self.repos
-            .values()
-            .filter(|r| r.owner.as_ref() == Some(principal))
-            .count()
-    }
-
-    /// pin the owner of the repo this block's push is BIRTHING. the caller has
-    /// already established that the repo has none.
-    pub fn claim_owner(&mut self, repo: &str, principal: Party) {
-        self.repos.entry(repo.to_string()).or_default().owner = Some(principal);
+                .all(|r| r.items.is_empty() && r.last_number == 0)
     }
 
     fn item(&self, repo: &str, number: u64) -> Result<&Item, Error> {
@@ -511,13 +483,6 @@ impl Tracker {
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
-            match &rt.owner {
-                None => codec::put_u8(&mut out, 0),
-                Some(owner) => {
-                    codec::put_u8(&mut out, 1);
-                    encode_author(&mut out, owner);
-                }
-            }
             codec::put_u64(&mut out, rt.last_number);
             codec::put_u32(&mut out, rt.items.len() as u32);
             for item in rt.items.values() {
@@ -539,11 +504,6 @@ impl Tracker {
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
             let name = r.str_()?;
-            let owner = match r.u8()? {
-                0 => None,
-                1 => Some(decode_author(&mut r)?),
-                _ => return Err(Error::Module("forge tracker: invalid owner tag".into())),
-            };
             let last_number = r.u64()?;
             let item_count = r.u32()?;
             let mut items = BTreeMap::new();
@@ -573,7 +533,6 @@ impl Tracker {
                 .insert(
                     name,
                     RepoTracker {
-                        owner,
                         last_number,
                         open_count,
                         open_by_author,

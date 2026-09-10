@@ -608,14 +608,12 @@ fn rejects_never_move_root_hash() {
         "oversized putblob",
     );
 
-    // 2) bad-authority commit — ext:bob writing under ext:alice's home tree.
-    let alice = format!("ext:{}", to_hex(b"alice"));
-    let alice_home = format!("/home/{alice}/secret");
+    // 2) bad-authority commit — ext:bob writing outside /home and /shared.
     assert_rejected(
         &mut host,
         5,
         Origin::External(b"bob".to_vec()),
-        commit_op(None, "x", vec![put_inline(&alice_home, b"x")]),
+        commit_op(None, "x", vec![put_inline("/etc/passwd", b"x")]),
         "bad-authority commit",
     );
 

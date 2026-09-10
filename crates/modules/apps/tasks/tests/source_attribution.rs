@@ -147,23 +147,6 @@ fn program_owns_ordinary_tasks_and_recreation_retains_revision_history() {
             panic!("task");
         };
         assert_eq!(record.owner, Party::Account(3));
-        let root = host.root_hash();
-        let stranger = TaskMsg::UpdateStatus {
-            task_id: "task".into(),
-            status: TaskStatus::Done,
-        };
-        assert!(
-            host.submit_at(
-                context(alice()),
-                Msg {
-                    target: "tasks".into(),
-                    payload: tasks::encode_task_msg(&stranger)
-                }
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(host.root_hash(), root);
         task(
             &mut host,
             Origin::Program(3),
@@ -445,21 +428,6 @@ fn an_authenticated_key_keeps_its_records_after_joining_identity() {
             "admission never transfers ownership"
         );
         assert_eq!(record.status, TaskStatus::Done);
-        let root = host.root_hash();
-        assert!(
-            host.submit_at(
-                context(alice()),
-                Msg {
-                    target: "tasks".into(),
-                    payload: tasks::encode_task_msg(&TaskMsg::DeleteTask {
-                        task_id: "task".into()
-                    })
-                }
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(host.root_hash(), root);
         task(
             &mut host,
             signer,
