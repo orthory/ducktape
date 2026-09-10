@@ -568,8 +568,6 @@ on network_entered
   forge_repos = []
   forge_repo = ""
   forge_repo_phase = ForgePhase.idle
-  forge_repo_menu = false
-  forge_branch_menu = false
   forge_tree_branch = ""
   forge_branches = []
   forge_items = []

@@ -21,13 +21,6 @@ on forge_view_event(event)
       flow
         from done true
         done -> forge_close_repo()
-    // The two switchers share the repo bar; opening one closes the other.
-    ForgeIntent.toggle_repo_menu
-      forge_repo_menu = !forge_repo_menu
-      forge_branch_menu = false
-    ForgeIntent.toggle_branch_menu
-      forge_branch_menu = !forge_branch_menu
-      forge_repo_menu = false
     ForgeIntent.branch
       flow
         from done event_text(event, "name")
@@ -106,8 +99,6 @@ on forge_open_repo(name)
   return if !connected
   invalidate lane=forge_item
   invalidate lane=forge_discussion
-  forge_repo_menu = false
-  forge_branch_menu = false
   forge_tree_branch = ""
   forge_repo = name
   error = ""
@@ -185,7 +176,6 @@ on forge_repo_failed(cause)
 // the open menu) picks nothing; the open file retires through
 // `forge_file_header` as it does on any tree move.
 on forge_pick_branch(name)
-  forge_branch_menu = false
   return if !connected || empty(forge_repo)
   let head = forge_branch_head(forge_branches, name)
   return if empty(head)
@@ -490,8 +480,6 @@ on forge_close_repo
   forge_repo_phase = ForgePhase.idle
   forge_branches = []
   forge_items = []
-  forge_repo_menu = false
-  forge_branch_menu = false
   forge_tree_branch = ""
   forge_item_number = 0
   forge_item_phase = ForgePhase.idle
