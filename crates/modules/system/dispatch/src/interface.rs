@@ -108,7 +108,8 @@ pub enum OutputContract {
 
 /// one registered what-to-run manifest — an ordered-op registration, so which
 /// capability and contract a recipe binds is part of the root-hash. `owner` is
-/// the registration origin and gates every mutation.
+/// the registration origin, attribution only: any origin may update or
+/// remove any recipe.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
@@ -414,7 +415,7 @@ pub enum DispatchMsg {
         deadline_views: Option<u64>,
         lease_views: Option<u64>,
     },
-    /// owner-gated partial update; `None` fields keep their current value.
+    /// partial update by any origin; `None` fields keep their current value.
     /// (clearing an optional field means re-registering.)
     UpdateRecipe {
         recipe_id: String,
@@ -424,7 +425,7 @@ pub enum DispatchMsg {
         output_contract: Option<OutputContract>,
         max_attempts: Option<u32>,
     },
-    /// owner-gated removal. in-flight dispatches under the recipe finish
+    /// removal by any origin. in-flight dispatches under the recipe finish
     /// against the manifest values captured at dispatch time.
     RemoveRecipe { recipe_id: String },
     /// run `recipe_id` once over `payload`. MODULE-ORIGIN ONLY — the

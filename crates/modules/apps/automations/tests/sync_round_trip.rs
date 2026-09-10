@@ -21,18 +21,15 @@ use automations::{
     Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, MAX_ID_BYTES, Trigger,
     decode_reply, encode_msg, encode_query,
 };
-use chat::{
-    ChannelAccess, ChatEvent, ChatReply, Party, encode_event as chat_encode_event,
-    encode_reply as chat_encode_reply,
-};
+use chat::{ChatEvent, Party, encode_event as chat_encode_event};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
 /// Drives `execute` with a controllable env. Identity resolves the operator
-/// account and chat admits the fire path's owner-standing probe. The fired
-/// report uses static templates and is published through attribution.
+/// account; the fired report uses static templates, asks chat nothing, and
+/// is published through attribution.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
         height,
@@ -53,12 +50,6 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
                 updated_at: 0,
             }),
         )))
-    })
-    .on_query("chat", |_req| {
-        Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
-            may_read: true,
-            may_post: true,
-        })))
     })
 }
 
@@ -155,8 +146,7 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
                 "alpha",
                 None,
                 Action::Report {
-                    // Reports may attribute only the rule owner's account,
-                    // which the identity fixture resolves to account 1.
+                    // the identity fixture resolves the operator to account 1.
                     recipient: 1,
                     kind: "note".into(),
                     body_template: "a post landed".into(),

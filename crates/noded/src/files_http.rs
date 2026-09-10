@@ -130,9 +130,7 @@ fn refusal_reason(message: &str) -> &'static str {
         ("quota exceeded", "quota_exceeded"),
         ("exceeds the change cap", "too_many_changes"),
         ("chunk exceeds", "chunk_over_size"),
-        ("is not the home owner", "bad_owner"),
         ("root is not writable", "bad_owner"),
-        ("only the pin owner", "bad_owner"),
         ("module-origin only", "bad_owner"),
         ("outside /home and /shared", "path_outside_roots"),
         ("changed since base", "cas_conflict"),
@@ -317,9 +315,9 @@ pub struct UnpinBody {
 }
 
 /// POST /v1/files/unpin — release a pin so gc can reclaim it once nothing
-/// else roots it. owner-gated at the module (`Fs::unpin`): the pin's creator
-/// or `system` may release it; anyone else's attempt is the module's verbatim
-/// 400. the name travels in the signed JSON body, never a path segment: a
+/// else roots it. any signer releases any pin; an unknown name is the
+/// module's verbatim 400. the name travels in the signed JSON body, never a
+/// path segment: a
 /// pin name has no charset restriction (`.` and `..` are legal, see
 /// `pin_apply`), and a path segment is normalized by the `url` crate before
 /// it reaches the wire — `%2E%2E` collapses to a different route. a body is

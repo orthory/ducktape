@@ -1019,8 +1019,7 @@ fn same_ops_identical_roots_block_by_block() {
                 },
                 true,
             ),
-            // alice, not bob: hook (un)registration is channel-admin authority
-            // and alice owns "general".
+            // any member unregisters a hook; alice does here.
             (
                 alice.clone(),
                 ChatMsg::UnregisterHook {
@@ -1226,57 +1225,6 @@ fn rejections_match_and_leave_no_trace() {
                     module_id: "ghost-module".into(),
                 },
                 "unknown hook module",
-            ),
-            // CHANNEL-ADMIN AUTHORITY, proven in the compiled component and
-            // not just natively: the gate reads `env().origin`, the one
-            // authorization input that crosses the WIT boundary, so a gate
-            // keyed on it is exactly the kind that can compile, review as
-            // correct, and be inert inside the guest.
-            //
-            // alice owns "general"; carol writes neither its roster nor its
-            // hook list. the roster IS `PostPolicy::MembersOnly`'s admission
-            // list, so an ungated `SetMembership` let carol admit HERSELF and
-            // post straight through the only admission rule chat has.
-            (
-                carol.clone(),
-                ChatMsg::SetMembership {
-                    channel_id: "general".into(),
-                    party: chat::Party::Key(carol.clone()),
-                    member: true,
-                },
-                "only the owner",
-            ),
-            // a hook is a standing subscription to everything posted there.
-            (
-                carol.clone(),
-                ChatMsg::RegisterHook {
-                    channel_id: "general".into(),
-                    module_id: "sink".into(),
-                },
-                "only the owner",
-            ),
-            // and the sharper half: an ungated unregister is a one-message off
-            // switch for every automation on the channel.
-            (
-                carol.clone(),
-                ChatMsg::UnregisterHook {
-                    channel_id: "general".into(),
-                    module_id: "sink".into(),
-                },
-                "only the owner",
-            ),
-            // an UNOWNED channel admits NO user — not even alice, who
-            // administers channels of her own. the module that minted it is
-            // its principal, and `check_channel_admin` fails closed rather
-            // than letting the `None` owner fall through.
-            (
-                alice.clone(),
-                ChatMsg::SetMembership {
-                    channel_id: "sink:room".into(),
-                    party: chat::Party::Key(alice.clone()),
-                    member: true,
-                },
-                "is unowned",
             ),
         ];
 

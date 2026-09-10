@@ -4710,6 +4710,92 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
+    #[test]
+    fn the_staged_agents_view_renders_semantic_actions_and_opens_the_exact_target() {
+        let Some(staged) = staged("agents") else {
+            return;
+        };
+        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
+        let run = crate::backend::RunRow {
+            run_id: "machine-run-hash".into(),
+            dispatch_id: "machine-dispatch-hash".into(),
+            agent_id: "reviewer".into(),
+            agent_name: "Reviewer".into(),
+            origin: "#Engineering · Message 42".into(),
+            state: "running".into(),
+            dispatched: "h 1".into(),
+            settled: String::new(),
+            attempt: 1,
+            holder: String::new(),
+            actions: 1,
+            degraded: false,
+            reason: String::new(),
+            output_ref: String::new(),
+            pr_number: 0,
+        };
+        let target = crate::backend::RunLink {
+            relation: "target".into(),
+            kind: "chat".into(),
+            label: "#Engineering · Eddy: Bound and scroll".into(),
+            url: "duck://channel/room?net=a1b2c3d4#42".into(),
+        };
+        let journal = crate::backend::RunJournal {
+            dispatch_id: run.dispatch_id.clone(),
+            entries: vec![crate::backend::JournalEntry {
+                height: "h 2".into(),
+                kind: "action".into(),
+                summary: "React 👀".into(),
+                status: "Completed".into(),
+                targets: vec![target.clone()],
+            }],
+            ..Default::default()
+        };
+        let props = Some(agents_props(
+            false,
+            true,
+            true,
+            "7",
+            0,
+            &[],
+            std::slice::from_ref(&run),
+            &run.dispatch_id,
+            1,
+            &journal,
+            &crate::backend::LiveRun::default(),
+            &[],
+            &[],
+            &crate::backend::MessagingView::default(),
+            false,
+            false,
+            "",
+            0,
+        ));
+        guest.redraw(&None);
+        guest.redraw(&props);
+        let shown = texts(&guest);
+        for expected in ["React 👀", "Completed", &target.label] {
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(
+            !shown
+                .iter()
+                .any(|text| text.contains("machine-dispatch-hash"))
+        );
+        assert!(guest.fault.is_none());
+        guest.deliver(Output::Activate(button_message(&guest, &target.label)));
+        guest.redraw(&props);
+        let intent = guest.intents.last().expect("target navigation");
+        assert_eq!(intent.kind, "open_link");
+        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
+            target.url
+        );
+    }
+
     /// The BUNDLED Agents view's messages pane, end to end through the host:
     /// the real `agents_view.wasm`, the real props encoder, the real intent
     /// decoder. The guest tests assert the pane's own arithmetic; this asserts
@@ -6321,6 +6407,141 @@ pub(crate) mod tests {
         );
         assert!(original.is_char_boundary(insertion));
         assert!(cursor.selection.is_none());
+        // A second press must replace the first selection anchor before any
+        // subsequent drag or edit. Drive the native queue and actual Pages guest.
+        macro_rules! pointer_step {
+            ($event:expr, $point:expr) => {{
+                let point = $point;
+                let mut outputs = Vec::new();
+                ui.update(
+                    &[$event],
+                    mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
+                loop {
+                    for output in outputs.drain(..) {
+                        guest.deliver(output);
+                    }
+                    settle(&mut guest, &props);
+                    ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                    if !guest.inputs.editor_transactions_pending() {
+                        break;
+                    }
+                    ui.update(
+                        &[Event::Window(
+                            window::Event::RedrawRequested(Instant::now()),
+                        )],
+                        mouse::Cursor::Available(point),
+                        &mut renderer,
+                        &mut iced::advanced::clipboard::Null,
+                        &mut outputs,
+                    );
+                }
+                guest
+                    .inputs
+                    .editor_document(&editor_key)
+                    .unwrap()
+                    .reference()
+                    .cursor
+            }};
+        }
+        let a = iced::Point::new(bounds.x + 66.0, bounds.y + 10.0);
+        let a_end = iced::Point::new(bounds.x + 100.0, bounds.y + 10.0);
+        let b = iced::Point::new(bounds.x + 140.0, bounds.y + 10.0);
+        let b_end = iced::Point::new(bounds.x + 80.0, bounds.y + 10.0);
+        let first = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            a
+        );
+        let first_drag = pointer_step!(
+            Event::Mouse(mouse::Event::CursorMoved { position: a_end }),
+            a_end
+        );
+        assert_eq!(
+            first_drag.selection,
+            Some(first.position),
+            "first drag must establish A"
+        );
+        let first_released = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            a_end
+        );
+        let first_moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: b }), b);
+        assert_eq!(
+            first_moved, first_released,
+            "first selection followed the pointer after release"
+        );
+        let second = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            b
+        );
+        assert_ne!(
+            second.position, first.position,
+            "second press must land away from A"
+        );
+        assert_eq!(
+            second.selection, None,
+            "new Pages press B retained first drag anchor A"
+        );
+        let second_drag = pointer_step!(
+            Event::Mouse(mouse::Event::CursorMoved { position: b_end }),
+            b_end
+        );
+        assert_eq!(
+            second_drag.selection,
+            Some(second.position),
+            "second drag must anchor at B, not A"
+        );
+        let released = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            b_end
+        );
+        let moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
+        assert_eq!(
+            moved, released,
+            "movement after release must not change selection"
+        );
+        // Repeat without guest redraws between inputs: the next drag arrives
+        // while the previous press/selection/release still await acknowledgment.
+        for (event, point) in [
+            (mouse::Event::ButtonPressed(mouse::Button::Left), a),
+            (mouse::Event::CursorMoved { position: a_end }, a_end),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), a_end),
+            (mouse::Event::ButtonPressed(mouse::Button::Left), b),
+            (mouse::Event::CursorMoved { position: b_end }, b_end),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), b_end),
+        ] {
+            let mut outputs = Vec::new();
+            ui.update(
+                &[Event::Mouse(event)],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+        }
+        let burst = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
+        assert_eq!(
+            burst, released,
+            "queued second drag must use B and stop on release"
+        );
+        let restored = pointer_step!(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            pointer.position().unwrap()
+        );
+        assert_eq!(
+            restored, cursor,
+            "restore the original caret for the edit below"
+        );
+        pointer_step!(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            pointer.position().unwrap()
+        );
         let mut expected = original.clone();
         expected.insert(insertion, 'X');
         guest.intents.clear();

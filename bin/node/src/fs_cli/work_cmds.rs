@@ -179,8 +179,7 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 }
 
 /// `unpin <name>` — release a pin so gc can reclaim it once nothing else roots
-/// it. owner-gated at the module: only the pin's creator or `system` may
-/// release it.
+/// it. any signer releases any pin.
 pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
     use duckfs_client::api::{ApiError, NodeApi};
 
