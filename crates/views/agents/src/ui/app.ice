@@ -122,8 +122,6 @@ state
   open_run = ""
   journal_width = 400.0
   viewport_width = 1280.0
-  journal_dragging = false
-  pointer_x = 0.0
   expanded_receipt = ""
   open_row:RunRow = empty_run()
   // the doors the app has opened a run through, counted, as the register
@@ -185,29 +183,12 @@ state
 on mount
   stream every props() -> props_changed _ | props_failed _
 
-subscribe
-  mouse moved status=any when panel == "runs" && !empty(open_run) -> journal_pointer_moved _ _
-  mouse released status=any when journal_dragging -> journal_pointer_released _
-  mouse left status=any when journal_dragging -> cancel_journal_resize
-
-on journal_pointer_moved(x, _y)
-  let delta = pointer_x - x
-  pointer_x = x
-  return if !journal_dragging
-  journal_width = journal_width_after_delta(journal_width, delta, viewport_width)
+on journal_resized(dx, _dy)
+  journal_width = journal_width_after_delta(journal_width, -dx, viewport_width)
 
 on viewport_changed(width, _height)
   viewport_width = width
   journal_width = journal_width_after_delta(journal_width, 0.0, width)
-
-on start_journal_resize
-  journal_dragging = true
-
-on journal_pointer_released(_button)
-  journal_dragging = false
-
-on cancel_journal_resize
-  journal_dragging = false
 
 on toggle_receipt(value)
   expanded_receipt = pick_str(expanded_receipt != value, value, "")
@@ -328,7 +309,6 @@ on open_run_row(run_id)
 
 on close_run
   expanded_receipt = ""
-  journal_dragging = false
   open_run = ""
   open_row = empty_run()
   live = empty_live()
@@ -768,7 +748,7 @@ view
           // THE JOURNAL: the open run's lifecycle, fact by fact, beside the
           // list. Read-only — a run is history the moment it is written.
           if !empty(open_run)
-            mouse #journal-resize press=start_journal_resize
+            resize-handle #journal-resize drag=journal_resized cursor=resize-horizontal
               box #journal-divider
                 with
                   w=10.0
