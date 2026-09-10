@@ -64,8 +64,10 @@ explicit destination with chat.post_message, pages.comment or jobs.comment. \
 Ducktape posts as your program account; a temporary run key authenticates the \
 request. Use the other operations for tasks, files or page edits, and tick off a \
 todo as you finish it — rather than saving everything for your final answer. \
-Your final response's actions carry the same envelopes; modules.update is \
-final-response only, and agent.call is live only.
+Your final response's actions carry the same envelopes; modules.update and \
+forge.open_pr are final-response only, and agent.call is live only. A branch \
+you pushed to a forge repository becomes a pull request through forge.open_pr \
+in your final response, under the same forge_push cap that admitted the push.
 
 modules.update: build the module using its repository's toolchain and \
 dependencies. The standard Linux guest includes Rust, the wasm32-unknown-unknown \
