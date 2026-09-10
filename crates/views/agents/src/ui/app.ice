@@ -373,25 +373,24 @@ view
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-      // The explainer for the pane on screen: the model, not a reading, so it
-      // stays with the node down.
-      box
-        with
-          w=fill
-          px=22.0
-          pt=12.0
-          pb=10.0
-        text pane_note(panel)
+      if panel == "registry"
+        box
           with
             w=fill
-            size=12.0
-            @text-caption
-      box
-        with
-          w=fill
-          h=1.0
-          bg=separator
-        space w=1.0 h=1.0
+            px=22.0
+            pt=12.0
+            pb=10.0
+          text pane_note(panel)
+            with
+              w=fill
+              size=12.0
+              @text-caption
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
+          space w=1.0 h=1.0
       if !empty(host_error)
         text host_error #host-error size=12.0 @text-danger
       // NOT CONNECTED IS NOT EMPTY — the registry lives on chain and nothing

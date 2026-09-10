@@ -500,12 +500,21 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
         ),
     )]);
     // the registry is the first panel; the tracker is one press away
+    assert!(has_text(&frame, "New agent"));
+    assert!(!has_text(&frame, "Messages"));
     assert!(
         !has_text(&frame, "#general · msg 12"),
         "{:?}",
         texts(&frame)
     );
     let frame = tick_native(press(&frame, "Runs"));
+    assert!(!has_text(&frame, "New agent"));
+    assert!(!has_text(&frame, "Messages"));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.starts_with("A run is a dispatch"))
+    );
     for expected in [
         "2 runs · 1 in flight",
         "#general · msg 12",
