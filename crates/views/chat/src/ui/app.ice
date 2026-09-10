@@ -52,7 +52,7 @@ extern crate::host
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
-  ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
+  ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   ChatSidebarRow(channel:ChatChannel, unread:bool)

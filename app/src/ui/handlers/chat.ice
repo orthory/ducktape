@@ -1030,6 +1030,20 @@ on open_message_link(url)
       run every duck_echo_str(link.channel) -> choose_channel _ | external_url_failed _
     DuckKind.channel_message
       run every duck_echo_str(link.channel) -> open_chat_search_hit(_, link.seq, link.seq) | external_url_failed _
+    // A MENTION OPENS THE DM. `duck://account/<n>` is what a mention plate
+    // links to; the DM peer list is keyed by account number, so the address
+    // is the peer key `choose_dm` takes. An account with no peer row — the
+    // reader's own — lands on nothing, exactly as a click on it did before.
+    DuckKind.account
+      invalidate lane=account_ceremony
+      invalidate lane=account_desktop_ceremony
+      account_busy = account_busy && empty(account_ceremony_phase)
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_ceremony_detail = ""
+      account_ceremony_left = ""
+      shell_tab = ShellTab.chat
+      run every duck_echo_str(link.account) -> choose_dm _ | external_url_failed _
 
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
 // the settled chip on my own bubble both land here, and both name the same

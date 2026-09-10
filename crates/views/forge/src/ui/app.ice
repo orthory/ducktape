@@ -26,7 +26,7 @@ extern crate::host
   ForgeRepo(name:str, head:str)
   ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
-  ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
+  ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(seq:i64, author:str, meta:str, blocks:[ChatBlock], initial:str, avatar_kind:str, render_rev:i64)
   ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])

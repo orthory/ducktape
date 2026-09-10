@@ -456,9 +456,15 @@ fn the_message_line_is_one_rich_text_paragraph() {
         .map(str::trim)
         .filter(|line| line.starts_with("span ") && line.contains("bg="))
         .collect();
+    // The plate is ALSO a destination: `link=` carries the account the
+    // mention names, so the widget's own link route opens it on a click and
+    // shows the pointer on hover.
     assert_eq!(
         plated,
-        ["span span.mention bg=brand_bg px=1.0 r=4.0 font=medium color=brand"],
+        [
+            "span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium \
+             color=brand"
+        ],
         "the mention arm alone wears a plate that leaves prose whitespace visible"
     );
     let forge = inlined(include_str!("../../../crates/views/forge/src/ui/kit.ice"));

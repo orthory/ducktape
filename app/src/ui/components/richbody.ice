@@ -21,7 +21,11 @@
 // person. A LINK wears the underline instead, the one convention every reader
 // already knows, and ONLY the link arm draws that rule: it marks a
 // destination, not an emphasis. Both keep brand ink; the plate versus the
-// rule is what tells a human from a destination.
+// rule is what tells a human from a destination. A MENTION IS ALSO A
+// DESTINATION: its `link=` is the `duck://account/<n>` it names, so the
+// plate takes the pointer on hover and a click opens that account's DM
+// through the same open plane every other link lands on; a mention of a
+// bare key carries no link and is a plate alone.
 component RichLine(block:ChatBlock, size:f64)
   emits
     open_message_link(str)
@@ -35,7 +39,7 @@ component RichLine(block:ChatBlock, size:f64)
     for span in block.spans
       // Span padding expands only the paint, not the text layout. Keep it
       // below a prose space so ordinary surrounding spaces stay visible.
-      span span.mention bg=brand_bg px=1.0 r=4.0 font=medium color=brand
+      span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium color=brand
       span span.link_text link=span.link underline font=medium color=brand
       span span.bold_italic font=strongitalic
       span span.bold font=strong
