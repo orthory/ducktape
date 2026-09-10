@@ -475,10 +475,7 @@ pub fn empty_caps() -> AgentCaps {
 /// discovered by using it.
 pub fn pane_note(pane: &str) -> String {
     match pane {
-        "runs" => {
-            "A run is a dispatch and what the network settled about it: who held it, what it \
-             acted on, and how it ended. This is the only execution status on this screen."
-        }
+        "runs" => "",
         _ => {
             "The registry records who may act, what they may do, and under whose grant — every \
              entry here is on chain. The acting itself is recorded separately, as each agent's \
