@@ -308,13 +308,9 @@ fn composer_text(scope: &str) -> String {
     composer::text(scope).trim().to_owned()
 }
 
-/// THE WORDS ONE COMPOSER'S PLATE IS HOLDING, as the reader sees them at the
-/// next frame. The stash is the scope's document's own, which is why reading
-/// it takes a scope; a body the app handed back waits in the composer's inbox
-/// until the widget's own build point takes it in, so the read settles the
-/// scope first.
+/// THE WORDS ONE COMPOSER'S PLATE IS HOLDING. The stash is the scope's
+/// document's own, which is why reading it takes a scope.
 fn composer_stash(scope: &str) -> String {
-    composer::settle(scope);
     composer::failed(scope)
 }
 
