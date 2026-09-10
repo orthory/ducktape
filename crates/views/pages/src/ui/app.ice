@@ -328,6 +328,7 @@ view
       bg=bg
     PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft block_comment_draft<->block_comment_draft #pages
       with
+        host_error
         page_link
         pages
         page_create_open

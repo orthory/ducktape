@@ -285,3 +285,71 @@ fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
     let tab_query = focus_request(&tick_native(vec![tab]));
     assert_eq!(reply(tab_query, false), "문서");
 }
+
+#[test]
+fn initial_loading_empty_and_recovered_pages_have_visible_states() {
+    let loading = PagesProps {
+        connected: true,
+        loading: true,
+        ..PagesProps::default()
+    };
+    let (subscription, frame) = shown(&loading);
+    assert!(has_text(&frame, "Loading pages…"));
+    assert!(!has_text(&frame, "No page selected"));
+    let empty = PagesProps {
+        loading: false,
+        ..loading
+    };
+    let frame = tick_native(vec![item(subscription, &encoded(&empty))]);
+    assert!(has_text(&frame, "No page selected"));
+    assert!(!has_text(&frame, "Loading pages…"));
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(has_text(&frame, "Alpha"));
+    assert!(!has_text(&frame, "Loading pages…"));
+    assert!(!has_text(&frame, "No page selected"));
+    let disconnected = PagesProps::default();
+    let frame = tick_native(vec![item(subscription, &encoded(&disconnected))]);
+    assert!(has_text(&frame, "Not connected"));
+    assert!(!has_text(&frame, "Loading pages…"));
+}
+
+#[test]
+fn invalid_props_are_visible_and_a_valid_update_recovers_the_same_draft() {
+    boot_native();
+    let boot = tick_native(Vec::new());
+    let subscription = boot
+        .requests
+        .iter()
+        .find(|request| request.kind == "pages.props")
+        .unwrap()
+        .id;
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(
+        !has_text(&frame, "Not connected"),
+        "a props error is not a network status"
+    );
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let _ = tick_native(type_into(&frame, "Add a comment…", "keep this draft"));
+    let frame = tick_native(vec![item(subscription, br#"{"connected":true}"#)]);
+    assert!(has_text(&frame, "Pages could not load"));
+    assert!(
+        texts(&frame)
+            .iter()
+            .any(|text| text.contains("missing field"))
+    );
+    assert!(
+        has_text(&frame, "Alpha"),
+        "keep the last readable page visible"
+    );
+    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    assert!(!has_text(&frame, "Pages could not load"));
+    let frame = tick_native(press(&frame, "Post"));
+    assert_eq!(
+        serde_json::from_slice::<Post>(&one_intent(&frame).payload)
+            .unwrap()
+            .text,
+        "keep this draft"
+    );
+}
