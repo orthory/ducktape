@@ -245,8 +245,8 @@ extern crate::backend
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str, forge_repo_menu:bool) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str) -> str
+  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord

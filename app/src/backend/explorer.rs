@@ -338,12 +338,10 @@ pub fn topmost_overlay(
     channel_settings_open: bool,
     page_delete_armed: bool,
     fs_delete_target: &str,
-    forge_repo_menu: bool,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
     let on_pages = shell_tab == crate::ShellTab::Pages;
     let on_files = shell_tab == crate::ShellTab::Files;
-    let on_forge = shell_tab == crate::ShellTab::Forge;
     if palette_open {
         return "palette".into();
     }
@@ -368,11 +366,10 @@ pub fn topmost_overlay(
     if on_chat && message_action != crate::MessageAction::Toolbar {
         return "message_menu".into();
     }
-    // BELOW the stream's message menu, which floats over the drawer, and above
-    // the repo menu, which lives on another tab. The drawer had no rung at all: it
-    // shipped with an `×` and no keyboard exit while every other overlay in the
-    // app answered Escape. Measured on the running app — Escape over an open
-    // Channel details changed exactly zero pixels.
+    // BELOW the stream's message menu, which floats over the drawer. The drawer
+    // had no rung at all: it shipped with an `×` and no keyboard exit while
+    // every other overlay in the app answered Escape. Measured on the running
+    // app — Escape over an open Channel details changed exactly zero pixels.
     if on_chat && channel_settings_open {
         return "channel_settings".into();
     }
@@ -394,9 +391,8 @@ pub fn topmost_overlay(
     if on_files && !fs_delete_target.is_empty() {
         return "fs_delete".into();
     }
-    if on_forge && forge_repo_menu {
-        return "repo_menu".into();
-    }
+    // The forge's repository and branch switchers are the host's own pick
+    // lists: the host dismisses their menus itself, so they hold no rung.
     String::new()
 }
 
@@ -419,7 +415,6 @@ pub fn escape_target(
     channel_settings_open: bool,
     page_delete_armed: bool,
     fs_delete_target: String,
-    forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
     let not_escape = logical != Key::Named(Named::Escape);
@@ -436,7 +431,6 @@ pub fn escape_target(
         channel_settings_open,
         page_delete_armed,
         &fs_delete_target,
-        forge_repo_menu,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows
     // Escape, so the ladder yields rather than naming a rung.

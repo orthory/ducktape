@@ -240,8 +240,6 @@ enum ForgeFilePhase
 enum ForgeIntent
   open_repo
   close_repo
-  toggle_repo_menu
-  toggle_branch_menu
   branch
   tab
   open_item
