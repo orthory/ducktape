@@ -10,8 +10,9 @@ fn prepare(
     dark: bool,
     commented: Vec<i64>,
     marks: Vec<CommentMark>,
+    focused: bool,
 ) -> Result<EditorPresentation, PresentationError> {
-    let mut paint = crate::presentation::build(state, menu, dark, commented)?;
+    let mut paint = crate::presentation::build(state, menu, dark, commented, focused)?;
     let lines = wire::editor_lines(state.text).count();
     paint.affordances.margin_label = "Open comments".into();
     // Saved anchors can lag unsaved line deletion. The native document also
@@ -47,9 +48,10 @@ pub fn document_presentation(
     dark: bool,
     commented: Vec<i64>,
     marks: Vec<CommentMark>,
+    focused: bool,
 ) -> PreparedPresentation {
     let state = document.state_view();
-    let (paint, notice) = match prepare(state, menu, dark, commented, marks) {
+    let (paint, notice) = match prepare(state, menu, dark, commented, marks, focused) {
         Ok(paint) => (paint, String::new()),
         Err(_) => (EditorPresentation::default(), FORMAT_NOTICE.into()),
     };

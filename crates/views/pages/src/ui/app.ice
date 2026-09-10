@@ -68,7 +68,7 @@ extern crate::editor_view
   pure presentation_notice(document:&editor, prepared:&PreparedPresentation) -> str
   pure empty_presentation() -> PreparedPresentation
   editor-highlighter paint(prepared:PreparedPresentation)
-  pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark]) -> PreparedPresentation
+  pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark], focused:bool) -> PreparedPresentation
 
 extern crate::document_ingress
   DocumentSource(reference:bytes)
@@ -79,6 +79,8 @@ extern crate::document_ingress
   subscription document_source(source:DocumentSource) -> DocumentItem
 
 state
+  document_focused = false
+  focus_query:i64 = 0
   document_paint:PreparedPresentation = empty_presentation()
   document:editor = ""
   document_history:HistoryState = initial_history()
@@ -135,8 +137,40 @@ state
 // subscription, not a mount task, so a replacement restored from this
 // view's state asks for the facts again on its own.
 subscribe
+  mouse released status=any -> document_pointer_released _
+  keyboard release status=any -> document_key_released _
+  window focused -> document_window_focused
+  window unfocused -> document_window_unfocused
   document_source(document_source_ref) when !empty(document_source_ref.reference) && document_source_ref.reference != document_installed -> document_arrived _
   props() -> props_arrived _
+
+on document_pointer_released(_button)
+  focus_query = focus_query + 1
+  let query = focus_query
+  let source = document_installed
+  task widget focused #root/pages/document -> document_focus_checked query source _
+
+on document_key_released(_key)
+  focus_query = focus_query + 1
+  let query = focus_query
+  let source = document_installed
+  task widget focused #root/pages/document -> document_focus_checked query source _
+
+on document_window_focused
+  focus_query = focus_query + 1
+  let query = focus_query
+  let source = document_installed
+  task widget focused #root/pages/document -> document_focus_checked query source _
+
+on document_window_unfocused
+  focus_query = focus_query + 1
+  document_focused = false
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+
+on document_focus_checked(query, source, focused)
+  return if query != focus_query || source != document_installed || focused == document_focused
+  document_focused = focused
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
 
 on props_arrived(item)
   host_error = item.error
@@ -184,7 +218,7 @@ on props_arrived(item)
   document_dark = next.dark
   document_commented = next.commented_lines
   document_marks = next.comment_marks
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
@@ -280,12 +314,17 @@ on document_arrived(item)
   document_installed = item.source
   sent = installed(document, document_installed)
   document_menu = initial_menu()
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
+  document_focused = false
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  focus_query = focus_query + 1
+  let query = focus_query
+  let source = document_installed
+  task widget focused #root/pages/document -> document_focus_checked query source _
 
 on document_committed(next)
   document_history = next.history
   document_menu = next.menu
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
   sent = edited(document_installed, next.reference, next.interaction)
 
 view

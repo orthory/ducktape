@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 test = false
 
 [dependencies]
+pulldown-cmark = "0.12.2"
 ui-lang-wire.workspace = true
 # the product icon set, as bytes the wire carries
 design = { path = "../support/design" }

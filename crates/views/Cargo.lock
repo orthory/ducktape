@@ -3140,6 +3140,7 @@ version = "0.1.0"
 dependencies = [
  "design",
  "iced",
+ "pulldown-cmark",
  "serde",
  "ui-lang",
  "ui-lang-build",
@@ -3155,6 +3156,7 @@ version = "0.1.0"
 dependencies = [
  "design",
  "iced",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "ui-lang",
