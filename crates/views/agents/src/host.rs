@@ -3,6 +3,42 @@
 
 use iced::futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+
+/// Presentation only: routing and the expandable receipt retain the full value.
+pub fn compact_run_text(value: &str) -> String {
+    value
+        .split(' ')
+        .map(|word| {
+            let is_long = word.chars().count() > 32;
+            if is_long {
+                format!("{}…", word.chars().take(16).collect::<String>())
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn journal_summary(kind: &str, summary: &str) -> String {
+    if kind == "acted" {
+        let operation = summary.split(" · ").next().unwrap_or(summary);
+        let action = match operation {
+            "react" => "Reacted",
+            "unreact" => "Removed reaction",
+            "reply" => "Replied",
+            "agent.call" => "Called an agent",
+            other => other,
+        };
+        return format!("✓ {action}");
+    }
+    compact_run_text(summary)
+}
+
+pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport - 10.0 - 320.0).clamp(280.0, 800.0);
+    (width + delta).clamp(280.0, maximum)
+}
 use ui_lang_guest::host;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
