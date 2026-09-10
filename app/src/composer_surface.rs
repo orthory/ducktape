@@ -1415,7 +1415,7 @@ mod tests {
             repeat: false,
         });
         ui.update(
-            &[key.clone()],
+            std::slice::from_ref(&key),
             mouse::Cursor::Unavailable,
             &mut renderer,
             &mut clipboard,
@@ -1441,7 +1441,7 @@ mod tests {
                 &mut iced::advanced::widget::operation::focusable::focus(target),
             );
             ui.update(
-                &[key.clone()],
+                std::slice::from_ref(&key),
                 mouse::Cursor::Unavailable,
                 &mut renderer,
                 &mut clipboard,
@@ -1451,7 +1451,7 @@ mod tests {
             assert!(!before.is_empty(), "the previous composer really had focus");
             seed(edit, "draft");
             ui.update(
-                &[key.clone()],
+                std::slice::from_ref(&key),
                 mouse::Cursor::Unavailable,
                 &mut renderer,
                 &mut clipboard,
