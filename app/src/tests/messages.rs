@@ -725,3 +725,68 @@ fn a_range_starts_with_shift_and_a_plain_press_leaves_it_alone() {
     let _ = app.__update(__DucktapeMessage::ClearCopyRange);
     assert_eq!((app.copy_anchor_seq, app.copy_head_seq), (0, 0));
 }
+
+/// Editing starts from the row's IDs even when the menu passed stale copy text.
+#[test]
+fn editing_a_named_mention_keeps_its_id_when_the_account_is_renamed() {
+    let scope_rpc = "http://mention-edit-identity";
+    let account_id = 900_002;
+    let names = |name: &str| {
+        chat::client::NameDirectory::new(std::collections::BTreeMap::from([(
+            "aa11".into(),
+            chat::client::BoundAccount {
+                number: account_id,
+                name: name.into(),
+            },
+        )]))
+    };
+    let original_names = names("Selfhost Duck");
+    let body = format!("Ask <@{account_id}> **again**");
+    let mut row = chat::client::optimistic_message(
+        Vec::new(),
+        body.clone(),
+        "mention-edit".into(),
+        chat::client::ChatReader::new(None, &original_names),
+    )
+    .remove(0);
+    row.seq = 7;
+    row.pending = false;
+    assert_eq!(row.body, "Ask @Selfhost Duck again");
+    assert_eq!(row.edit_body, body);
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected_rpc = scope_rpc.into();
+    app.active_channel = "general".into();
+    app.messages = vec![row];
+    let _ = app.__update(__DucktapeMessage::BeginMessageEdit(
+        7,
+        "stale menu text".into(),
+        0,
+    ));
+    let scope = format!("{}/edit", backend::thread_scope(scope_rpc, "general", 7));
+    let submitted = composer::interact(
+        &scope,
+        "edit",
+        false,
+        false,
+        Interaction::Editor(editor::ComposerEvent::Submit),
+    )
+    .expect("the seeded edit can be submitted");
+    let event = composer_surface::intent(&submitted).expect("a composer intent");
+    let detail: serde_json::Value = serde_json::from_str(&event.detail).expect("intent fields");
+    assert_eq!(detail["body"], body);
+    assert_eq!(detail["scope"], scope);
+    assert_eq!(detail["kind"], "edit");
+
+    let blocks = chat::client::parse_message(detail["body"].as_str().expect("draft body"));
+    assert!(chat::client::mentions_reach(
+        &blocks,
+        &[chat::Party::Account(account_id)]
+    ));
+    let renamed = names("Claude Peer");
+    assert_eq!(
+        chat::client::message_body_with_names(&blocks, &renamed),
+        "Ask @Claude Peer again"
+    );
+    assert_eq!(chat::client::draft_body(&blocks), body);
+}

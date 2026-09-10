@@ -54,7 +54,6 @@ component ConfirmDelete(title:str, subject:str, note:str, action:str, busy:bool)
           button "Cancel" -> emit(cancel)
             with
               disabled=busy
-              h=30.0
               p=7.0
               @secondary_action
           button -> emit(confirm)

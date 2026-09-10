@@ -39,6 +39,49 @@ pub(crate) fn provider_output_event(provider: &str, line: &str, id: i64) -> Opti
         let answer = value["result"].as_str()?.to_string();
         return Some(chat_preview(id, answer));
     }
+    let claude_assistant = provider == "claude" && value["type"] == "assistant";
+    if claude_assistant {
+        // Tool names describe observed activity without copying arguments,
+        // tool output, or thinking blocks into the chat status.
+        let blocks = value["message"]["content"].as_array()?;
+        let tool = blocks
+            .iter()
+            .rev()
+            .find(|block| block["type"] == "tool_use")?;
+        let name = clip_text(tool["name"].as_str()?, 80);
+        return Some(AgentChatEvent {
+            id,
+            kind: "activity".into(),
+            title: format!("Using {name}"),
+            detail: String::new(),
+            status: "running".into(),
+            answer: String::new(),
+            saga_id: String::new(),
+        });
+    }
+    let claude_tool_reply = provider == "claude" && value["type"] == "user";
+    if claude_tool_reply {
+        let blocks = value["message"]["content"].as_array()?;
+        let result = blocks
+            .iter()
+            .rev()
+            .find(|block| block["type"] == "tool_result")?;
+        let failed = result["is_error"] == true;
+        let title = if failed {
+            "Tool failed · waiting for agent"
+        } else {
+            "Tool finished · waiting for agent"
+        };
+        return Some(AgentChatEvent {
+            id,
+            kind: "status".into(),
+            title: title.into(),
+            detail: String::new(),
+            status: String::new(),
+            answer: String::new(),
+            saga_id: String::new(),
+        });
+    }
     let event_type = value["type"].as_str().unwrap_or_default();
     let item = &value["item"];
     let item_type = item["type"]
@@ -487,6 +530,30 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_tool_progress_names_the_observed_tool_without_private_content() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "thinking", "thinking": "SECRET reasoning" },
+                { "type": "tool_use", "name": "Read", "input": { "file_path": "SECRET path" } }
+            ] }
+        })
+        .to_string();
+        let event = provider_output_event("claude", &line, 8).unwrap();
+        assert_eq!(event.kind, "activity");
+        assert_eq!(event.title, "Using Read");
+        assert!(event.detail.is_empty());
+        assert!(event.answer.is_empty());
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"SECRET output"}]}}"#;
+        let event = provider_output_event("claude", result, 9).unwrap();
+        assert_eq!(event.title, "Tool finished · waiting for agent");
+        assert!(event.detail.is_empty());
+        assert!(event.answer.is_empty());
+        let thought = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"SECRET"}]}}"#;
+        assert!(provider_output_event("claude", thought, 9).is_none());
+    }
 
     #[test]
     fn provider_output_projects_known_events_not_raw_json() {

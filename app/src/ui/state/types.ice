@@ -33,6 +33,8 @@ enum SubmitVerdict
 enum ComposerKind
   message
   reply
+  edit
+  thread_edit
 
 enum MessageAction
   toolbar

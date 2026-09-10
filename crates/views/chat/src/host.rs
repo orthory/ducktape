@@ -63,6 +63,7 @@ pub struct ChatMessage {
     pub author: String,
     pub meta: String,
     pub body: String,
+    pub edit_body: String,
     pub blocks: Vec<ChatBlock>,
     pub pending: bool,
     pub rev: i64,
@@ -690,33 +691,19 @@ pub(crate) fn seq_in_copy_range(
     range_seqs(anchor, head).is_some_and(|(low, high)| seq >= low && seq <= high)
 }
 
+pub fn live_thread_label(agent: &str) -> String {
+    format!("{agent} · View thread")
+}
+
 /// The run whose answer posts into the thread rooted at `active_thread_seq` —
 /// either because that root IS its anchor, or because its anchor is a reply
 /// inside that thread.
 ///
 /// Only ask it with a thread actually open: at `active_thread_seq == 0` every
 /// top-level run answers it, since an unreplied run's `thread_root` is 0 too.
-/// Both callers are already inside the rail's visibility gate.
+/// Callers use the open thread or a concrete message sequence.
 pub fn run_in_thread(live: &LiveRunHint, active_thread_seq: i64) -> bool {
     live.anchor_seq == active_thread_seq || live.thread_root == active_thread_seq
-}
-
-/// Whether the thread RAIL owns this run's card, and so the stream must not draw
-/// one for it.
-///
-/// ONE RUN, ONE CARD. The stream draws a card under the anchor and the rail draws
-/// one at its foot — and when the open thread IS the run's thread, both
-/// conditions held: two cards and two Stops for a single run. The rail wins
-/// while it is on screen, because that is the surface the reader is working in,
-/// and the stream takes the card back the moment the rail closes.
-///
-/// `rail_shown` is the rail's OWN visibility — `active_thread_seq > 0 &&
-/// !channel_settings_open`, the gate it is drawn under — and not merely "a thread
-/// is open". The channel-settings drawer replaces the rail while
-/// `active_thread_seq` still stands, so suppressing on the seq alone would have
-/// hidden BOTH cards for as long as the drawer was open.
-pub fn rail_owns_run(live: &LiveRunHint, rail_shown: bool, active_thread_seq: i64) -> bool {
-    rail_shown && run_in_thread(live, active_thread_seq)
 }
 
 /// The stream and the runs live in it, as one value: the timeline memo hashes
@@ -851,6 +838,10 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
 
 pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
     format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
+}
+
+pub fn edit_scope(endpoint: &str, channel_id: &str, seq: i64) -> String {
+    format!("{endpoint}\u{1f}{channel_id}#{seq}/edit")
 }
 
 pub(crate) fn tone_of(dark: bool) -> crate::Tone {

@@ -156,10 +156,10 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
             // flag for it. A pick leaves as the repo's name.
             pick repo_names(repos) some(open_repo) #repo-pick -> emit(forge_open_repo, _)
               with
-                p=4.0
-                text-size=14.0
-                font=display
-              active text=fg handle=muted bg=transparent border=transparent border-w=1.0 r=9.0
+                p=6.0
+                text-size=13.0
+                font=medium
+              active text=fg handle=muted bg=transparent border=transparent border-w=1.0 r=5.0
               hovered text=fg handle=fg bg=row_hover border=transparent
               opened text=brand handle=brand bg=row_hover border=transparent
               opened-hovered text=brand handle=brand bg=row_hover border=transparent
@@ -183,13 +183,13 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                 pick branch_names(branches) pinned_branch(tree_branch) #branch-pick -> emit(forge_pick_branch, _)
                   with
                     hint=commit_label(tree_rev)
-                    p=3.0
-                    text-size=11.0
-                    font=code_medium
-                  active text=fg placeholder=fg handle=muted bg=surface border=border border-w=1.0 r=10.0
-                  hovered text=fg placeholder=fg handle=fg bg=row_hover border=border
-                  opened text=brand placeholder=brand handle=brand bg=surface border=brand_line
-                  opened-hovered text=brand placeholder=brand handle=brand bg=row_hover border=brand_line
+                    p=6.0
+                    text-size=12.0
+                    font=code
+                  active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=1.0 r=5.0
+                  hovered text=fg placeholder=fg handle=fg bg=row_hover border=transparent
+                  opened text=brand placeholder=brand handle=brand bg=row_hover border=transparent
+                  opened-hovered text=brand placeholder=brand handle=brand bg=row_hover border=transparent
                   menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
                   handle arrow size=9.0
             space w=fill
@@ -203,7 +203,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
             if forge_item_number > 0 && item_phase != "ready"
               button "Back to tracker" -> emit(forge_close_item)
                 with
-                  h=28.0
                   p=6.0
                   @secondary_action
         box
@@ -586,9 +585,8 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                             @text-brand
                         button "Cancel" -> emit(forge_comment_cancel)
                           with
-                            h=24.0
                             p=5.0
-                            @secondary_action
+                            @secondary_action text-11px leading-snug font-medium rounded-5px
                       row
                         with
                           w=fill
@@ -611,7 +609,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                         button "Add comment" -> emit(forge_comment_stage, comment_draft)
                           with
                             disabled=(review_busy || !connected || empty(comment_draft) || comment_cap_reached)
-                            h=28.0
                             p=6.0
                             @secondary_action
                   if comment_cap_reached
@@ -669,9 +666,8 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                           button "Remove" -> emit(forge_comment_drop, staged.anchor)
                             with
                               label="Remove staged comment"
-                              h=24.0
                               p=5.0
-                              @secondary_action
+                              @secondary_action text-11px leading-snug font-medium rounded-5px
                   row
                     with
                       w=fill
@@ -697,7 +693,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                     button "Submit review" -> emit(forge_review_submit, review_draft)
                       with
                         disabled=(review_busy || !connected || empty(forge_item_source_oid) || (empty(review_draft) && !has_staged_comments))
-                        h=28.0
                         p=6.0
                         @primary_action
               col w=fill gap=9.0

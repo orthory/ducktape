@@ -206,7 +206,6 @@ component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
           @text-hint
       button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
         with
-          h=26.0
           p=5.0
           @secondary_action
     if phase == "working"
@@ -217,6 +216,5 @@ component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
           @text-meta
       button "Cancel" #plate-cancel-working -> emit(account_ceremony_cancel)
         with
-          h=26.0
           p=5.0
           @secondary_action

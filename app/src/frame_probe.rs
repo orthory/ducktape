@@ -235,6 +235,7 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
         author: format!("user-{}", seq % 7),
         meta: format!("#{seq}"),
         blocks: backend::paragraph_blocks(&body),
+        edit_body: body.clone(),
         body,
         pending: false,
         rev: 1,

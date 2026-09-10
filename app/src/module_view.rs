@@ -1444,6 +1444,8 @@ pub fn chat_event_surface(event: &ModuleViewEvent) -> crate::CopySurface {
 pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
     match event_text(event, "kind").as_str() {
         "reply" => crate::ComposerKind::Reply,
+        "edit" => crate::ComposerKind::Edit,
+        "thread_edit" => crate::ComposerKind::ThreadEdit,
         _ => crate::ComposerKind::Message,
     }
 }
@@ -1451,6 +1453,24 @@ pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
 /// A refused or failed body, handed back to the composer it was written in.
 pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
     crate::composer_surface::unsent(scope, text, committed);
+    true
+}
+
+/// Seed the native edit composer from canonical blocks, never copy text.
+pub fn chat_composer_edit(
+    scope: &str,
+    messages: &[crate::backend::ChatMessage],
+    seq: i64,
+    rev: i64,
+) -> bool {
+    let Some(message) = messages.iter().find(|message| message.seq == seq) else {
+        return false;
+    };
+    let editable = !message.deleted && !message.pending && message.rev == rev;
+    if !editable {
+        return false;
+    }
+    crate::composer_surface::seed(scope, &message.edit_body);
     true
 }
 
@@ -7898,15 +7918,22 @@ pub(crate) mod tests {
         [first_light_at(1), first_light_at(2)]
     }
 
-    /// A RUN IN FLIGHT, THROUGH THE REAL WIRE. The hint draws under the message
-    /// that summoned it, and the NEXT reading of the same run repaints it: only
-    /// `live_agents` moves between the two frames, so this is the test that
-    /// fails if the timeline memo keys on the messages alone (`host::Timeline`)
-    /// — the hint would sit on "Starting" for the whole run. The hint is a
-    /// hint: the run's activity and its answer preview belong to the run
-    /// panel and never enter the stream.
+    fn chat_run_thread_facts(
+        room: &'static str,
+        messages: &[crate::backend::ChatMessage],
+        thread: &[crate::backend::ChatMessage],
+        live: &[crate::backend::LiveAgentRow],
+    ) -> Option<Vec<u8>> {
+        let bytes = chat_facts_in(room, messages, thread, live)?;
+        let mut props: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        props["active_thread_seq"] = 2.into();
+        Some(serde_json::to_vec(&props).unwrap())
+    }
+
+    /// Run status repaints in its thread through the real host/guest wire.
+    /// Full activity and answer previews remain in the run panel.
     #[test]
-    fn a_run_in_flight_draws_under_its_anchor_and_repaints_as_it_works() {
+    fn a_run_in_flight_draws_in_its_thread_and_repaints_as_it_works() {
         let Some(staged) = staged("chat") else {
             return;
         };
@@ -7915,6 +7942,12 @@ pub(crate) mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
         guest.redraw(&chat_facts_in(
+            "channel-a", &messages, &[], std::slice::from_ref(&starting),
+        ));
+        assert!(button_shown(&guest, "Chief Duck · View thread"));
+        assert!(!button_shown(&guest, "Stop"));
+        assert!(!texts(&guest).iter().any(|text| text == "Starting"));
+        guest.redraw(&chat_run_thread_facts(
             "channel-a",
             &messages,
             &[],
@@ -7944,7 +7977,7 @@ pub(crate) mod tests {
             answer_preview: "the files crate builds clean".into(),
             ..starting
         };
-        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &[working]));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &[working]));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -7985,7 +8018,7 @@ pub(crate) mod tests {
         };
         let messages = anchored_pair();
         let live = live_run("channel-a", "Chief Duck", "Reading the repo");
-        let facts = chat_facts_in("channel-a", &messages, &[], std::slice::from_ref(&live));
+        let facts = chat_run_thread_facts("channel-a", &messages, &[], std::slice::from_ref(&live));
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
         guest.redraw(&facts);
@@ -8019,7 +8052,7 @@ pub(crate) mod tests {
         reply.author = "Chief Duck".into();
         reply.avatar_kind = "agent".into();
         let settled = [messages[0].clone(), messages[1].clone(), reply];
-        guest.redraw(&chat_facts_in("channel-a", &settled, &[], &[]));
+        guest.redraw(&chat_run_thread_facts("channel-a", &settled, &[], &[]));
         let shown = texts(&guest);
         assert!(
             !button_shown(&guest, "Stop"),
@@ -8053,7 +8086,7 @@ pub(crate) mod tests {
         ];
 
         let here = String::from_utf8(
-            chat_facts_in("channel-a", &messages, &[], &reading).expect("props encode"),
+            chat_run_thread_facts("channel-a", &messages, &[], &reading).expect("props encode"),
         )
         .unwrap();
         assert!(here.contains("Chief Duck"), "this room's run is missing");
@@ -8063,7 +8096,7 @@ pub(crate) mod tests {
         );
 
         let there = String::from_utf8(
-            chat_facts_in("channel-b", &messages, &[], &reading).expect("props encode"),
+            chat_run_thread_facts("channel-b", &messages, &[], &reading).expect("props encode"),
         )
         .unwrap();
         assert!(there.contains("Ops Duck"), "that room's run is missing");
@@ -8077,7 +8110,7 @@ pub(crate) mod tests {
         };
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
-        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &reading));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -8089,7 +8122,7 @@ pub(crate) mod tests {
             "{shown:?}"
         );
         // the same reading, the other room on screen
-        guest.redraw(&chat_facts_in("channel-b", &messages, &[], &reading));
+        guest.redraw(&chat_run_thread_facts("channel-b", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Draining the queue"),

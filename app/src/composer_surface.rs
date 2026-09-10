@@ -58,8 +58,9 @@ use ui_lang_wire::SurfaceValue as Value;
 
 use crate::backend::{ChatMember, MentionCandidates, names_at, names_generation, room_scope};
 use crate::editor::{
-    ComposerEvent, MentionQuery, MenuKey, apply_composer_event, complete_mention,
-    composer_toggle_mark, mention_matches, mention_query, rich_composer,
+    ComposerEvent, MentionQuery, MenuKey, apply_mention_event, complete_mention,
+    copy_mention_selection, mention_body, mention_query, paste_mentions, rich_composer,
+    toggle_mention_mark,
 };
 
 /// One composer's state: its words, the unsent body its last failed send
@@ -70,7 +71,55 @@ struct Document {
     content: Content,
     failed: String,
     menu: MenuState,
-    handles: Vec<String>,
+    handles: Vec<chat::client::MentionChoice>,
+    mentions: Vec<(std::ops::Range<usize>, chat::Party)>,
+}
+
+fn restore_document(document: &mut Document, body: &str) {
+    let (_, names) = names_at();
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let (text, mentions) = chat::client::draft_mentions(&body, &names);
+    document.content = Content::with_text(&text);
+    document.mentions = mentions;
+    document.menu = MenuState::default();
+}
+
+fn pick_mention(
+    document: &mut Document,
+    query: &MentionQuery,
+    choice: &chat::client::MentionChoice,
+) {
+    let before = document.content.text();
+    let start = before
+        .split('\n')
+        .take(query.line)
+        .map(|line| line.len() + 1)
+        .sum::<usize>()
+        + query.start;
+    let content = std::mem::take(&mut document.content);
+    document.content = complete_mention(content, query, &choice.label);
+    // A completion replaces an unfinished @query, never an existing token.
+    let removed = query.end - query.start;
+    let inserted = choice.label.len() + 2;
+    for (range, _) in &mut document.mentions {
+        if range.start >= start + removed {
+            range.start = start + inserted + (range.start - start - removed);
+            range.end = start + inserted + (range.end - start - removed);
+        }
+    }
+    document
+        .mentions
+        .push((start..start + 1 + choice.label.len(), choice.party.clone()));
+    document.mentions.sort_by_key(|(range, _)| range.start);
+}
+
+/// Open an existing message as an ID-preserving draft in its own composer.
+pub fn seed(scope: &str, body: &str) {
+    let shared = slot(scope);
+    let mut slot = lock(&shared);
+    restore_document(&mut slot.document, body);
+    slot.document.failed.clear();
+    slot.rev += 1;
 }
 
 /// The shape of the tree the composer was last laid out with: whether the
@@ -81,6 +130,7 @@ struct Document {
 struct Shape {
     banner: bool,
     menu: Option<Menu>,
+    mentions: Vec<std::ops::Range<usize>>,
 }
 
 /// The generations of the two fact stores a document's handles were
@@ -120,7 +170,7 @@ struct MenuState {
 #[derive(Clone, Debug)]
 struct Menu {
     query: MentionQuery,
-    matches: Vec<String>,
+    matches: Vec<chat::client::MentionChoice>,
     selected: usize,
 }
 
@@ -193,7 +243,7 @@ fn current_facts() -> Facts {
 /// the name directory and the room's roster, under the scope itself (a
 /// room), else under the room a thread scope names — and the generations
 /// the stores were read at.
-fn handles(scope: &str) -> (Facts, Vec<String>) {
+fn handles(scope: &str) -> (Facts, Vec<chat::client::MentionChoice>) {
     let (rosters_generation, members) = ROSTERS.with_borrow(|rosters| {
         let members = rosters
             .by_room
@@ -204,11 +254,7 @@ fn handles(scope: &str) -> (Facts, Vec<String>) {
         (rosters.generation, members)
     });
     let (names_generation, directory) = names_at();
-    let handles = MentionCandidates::new(&directory, &members)
-        .handles()
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let handles = MentionCandidates::new(&directory, &members).choices();
     let facts = Facts {
         names: names_generation,
         rosters: rosters_generation,
@@ -326,7 +372,7 @@ pub fn intent(value: &Value) -> Option<crate::module_view::ModuleViewEvent> {
 pub(crate) enum Interaction {
     Editor(ComposerEvent),
     Mark(&'static str),
-    Pick(String),
+    Pick(chat::client::MentionChoice),
     Restore,
     Dismiss,
 }
@@ -365,6 +411,11 @@ impl Composer {
         Shape {
             banner: !document.failed.is_empty(),
             menu,
+            mentions: document
+                .mentions
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect(),
         }
     }
 
@@ -389,12 +440,32 @@ impl Composer {
     /// first row for a new one.
     fn menu(&self, document: &Document) -> Option<Menu> {
         let query = mention_query(&document.content)?;
+        let start = document
+            .content
+            .text()
+            .split('\n')
+            .take(query.line)
+            .map(|line| line.len() + 1)
+            .sum::<usize>()
+            + query.start;
+        let overlaps_token = document
+            .mentions
+            .iter()
+            .any(|(range, _)| start < range.end && start + query.end - query.start > range.start);
+        if overlaps_token {
+            return None;
+        }
         let same_word = document.menu.partial == query.partial;
         if same_word && document.menu.dismissed {
             return None;
         }
-        let handles: Vec<&str> = document.handles.iter().map(String::as_str).collect();
-        let matches = mention_matches(&handles, &query.partial);
+        let needle = query.partial.to_ascii_lowercase();
+        let matches: Vec<_> = document
+            .handles
+            .iter()
+            .filter(|choice| choice.label.to_ascii_lowercase().starts_with(&needle))
+            .cloned()
+            .collect();
         if matches.is_empty() {
             return None;
         }
@@ -418,6 +489,7 @@ impl Composer {
         document: &mut Document,
         painted: &Shape,
         interaction: Interaction,
+        clipboard: &mut dyn Clipboard,
     ) -> Option<Value> {
         match interaction {
             Interaction::Editor(ComposerEvent::Menu(key)) => {
@@ -441,18 +513,18 @@ impl Composer {
                         dismissed: true,
                     },
                     MenuKey::Pick => {
-                        let content = std::mem::take(&mut document.content);
-                        document.content =
-                            complete_mention(content, &menu.query, &menu.matches[menu.selected]);
+                        pick_mention(document, &menu.query, &menu.matches[menu.selected]);
                         MenuState::default()
                     }
                 };
                 None
             }
-            Interaction::Pick(handle) => {
+            Interaction::Pick(choice) => {
                 let menu = painted.menu.as_ref()?;
-                let content = std::mem::take(&mut document.content);
-                document.content = complete_mention(content, &menu.query, &handle);
+                if !menu.matches.contains(&choice) {
+                    return None;
+                }
+                pick_mention(document, &menu.query, &choice);
                 document.menu = MenuState::default();
                 None
             }
@@ -460,11 +532,19 @@ impl Composer {
                 if self.blocked {
                     return None;
                 }
-                let body = document.content.text().trim().to_owned();
+                let body = mention_body(&document.content, &document.mentions)
+                    .trim()
+                    .to_owned();
                 if body.is_empty() {
                     return None;
                 }
-                document.content = Content::new();
+                match self.kind.as_str() {
+                    "edit" | "thread_edit" => {}
+                    _ => {
+                        document.content = Content::new();
+                        document.mentions.clear();
+                    }
+                }
                 let prefix = if self.kind == "reply" {
                     "reply"
                 } else {
@@ -483,9 +563,45 @@ impl Composer {
                     ],
                 })
             }
+            Interaction::Editor(ComposerEvent::Copy) => {
+                if let Some(body) =
+                    copy_mention_selection(&mut document.content, &document.mentions)
+                {
+                    clipboard.write(iced::advanced::clipboard::Kind::Standard, body);
+                }
+                None
+            }
+            Interaction::Editor(ComposerEvent::Cut) => {
+                if self.blocked {
+                    return None;
+                }
+                let body = copy_mention_selection(&mut document.content, &document.mentions)?;
+                clipboard.write(iced::advanced::clipboard::Kind::Standard, body);
+                let content = std::mem::take(&mut document.content);
+                let event = ComposerEvent::Apply(crate::editor::RichAction::Edit(
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Delete,
+                    ),
+                ));
+                document.content = apply_mention_event(content, &mut document.mentions, event);
+                None
+            }
+            Interaction::Editor(ComposerEvent::Apply(crate::editor::RichAction::Edit(
+                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                    body,
+                )),
+            ))) => {
+                if self.blocked {
+                    return None;
+                }
+                let (_, names) = names_at();
+                let content = std::mem::take(&mut document.content);
+                document.content = paste_mentions(content, &mut document.mentions, &body, &names);
+                None
+            }
             Interaction::Editor(event) => {
                 let content = std::mem::take(&mut document.content);
-                document.content = apply_composer_event(content, event);
+                document.content = apply_mention_event(content, &mut document.mentions, event);
                 None
             }
             Interaction::Mark(glyph) => {
@@ -493,7 +609,8 @@ impl Composer {
                     return None;
                 }
                 let content = std::mem::take(&mut document.content);
-                document.content = composer_toggle_mark(content, glyph.into());
+                document.content =
+                    toggle_mention_mark(content, &mut document.mentions, glyph.into());
                 None
             }
             Interaction::Restore => {
@@ -501,8 +618,8 @@ impl Composer {
                 if self.restore_blocked || document.failed.is_empty() || !empty {
                     return None;
                 }
-                document.content = Content::with_text(&document.failed);
-                document.failed.clear();
+                let body = std::mem::take(&mut document.failed);
+                restore_document(document, &body);
                 None
             }
             Interaction::Dismiss => {
@@ -578,6 +695,7 @@ impl Composer {
         let menu = shape.menu.as_ref();
         let editor = rich_composer(
             content,
+            &shape.mentions,
             self.hint.clone(),
             self.blocked,
             menu.is_some(),
@@ -631,9 +749,13 @@ impl Composer {
             mark(glyph("code-brackets"), "code"),
             mark(glyph("quote"), "quote"),
         ];
-        let send = widget::button(widget::text("Send").size(12.5))
+        let label = if matches!(self.kind.as_str(), "edit" | "thread_edit") {
+            "Save"
+        } else {
+            "Send"
+        };
+        let send = widget::button(widget::text(label).size(12.5))
             .padding(if self.compact { [6, 11] } else { [7, 12] })
-            .height(if self.compact { 28 } else { 29 })
             .style(primary_button)
             .on_press_maybe(
                 (!self.blocked && !empty).then_some(Interaction::Editor(ComposerEvent::Submit)),
@@ -702,9 +824,24 @@ fn mention_menu<'a>(menu: &Menu) -> Element<'a, Interaction> {
         .iter()
         .cloned()
         .enumerate()
-        .map(|(index, handle)| {
+        .map(|(index, choice)| {
             let highlighted = index == menu.selected;
-            let label = widget::text(format!("@{handle}")).size(12.5).font(Font {
+            let duplicate = menu
+                .matches
+                .iter()
+                .filter(|other| other.label == choice.label)
+                .count()
+                > 1;
+            let text = if duplicate {
+                format!(
+                    "@{} · {}",
+                    choice.label,
+                    chat::client::mention_token(&choice.party)
+                )
+            } else {
+                format!("@{}", choice.label)
+            };
+            let label = widget::text(text).size(12.5).font(Font {
                 family: iced::font::Family::Name("Geist Mono"),
                 ..Font::DEFAULT
             });
@@ -712,7 +849,7 @@ fn mention_menu<'a>(menu: &Menu) -> Element<'a, Interaction> {
                 .width(Length::Fill)
                 .padding([5, 10])
                 .style(move |theme, status| mention_row(theme, status, highlighted))
-                .on_press(Interaction::Pick(handle))
+                .on_press(Interaction::Pick(choice))
                 .into()
         })
         .collect();
@@ -970,7 +1107,7 @@ impl Widget<Value, iced::Theme, iced::Renderer> for Composer {
                 document, painted, ..
             } = &mut *slot;
             for interaction in interactions {
-                if let Some(submitted) = self.apply(document, painted, interaction) {
+                if let Some(submitted) = self.apply(document, painted, interaction, clipboard) {
                     shell.publish(submitted);
                 }
             }
@@ -1048,7 +1185,12 @@ pub(crate) mod testing {
         let Slot {
             document, painted, ..
         } = &mut *slot;
-        let published = composer.apply(document, painted, interaction);
+        let published = composer.apply(
+            document,
+            painted,
+            interaction,
+            &mut iced::advanced::clipboard::Null,
+        );
         slot.rev += 1;
         published
     }
@@ -1075,10 +1217,15 @@ pub(crate) mod testing {
         let slot = composer.slot.clone();
         let mut slot = lock(&slot);
         composer.paint(&mut slot);
-        slot.painted
-            .menu
-            .as_ref()
-            .map(|menu| (menu.matches.clone(), menu.selected))
+        slot.painted.menu.as_ref().map(|menu| {
+            (
+                menu.matches
+                    .iter()
+                    .map(|choice| choice.label.clone())
+                    .collect(),
+                menu.selected,
+            )
+        })
     }
 
     pub(crate) fn failed(scope: &str) -> String {
@@ -1283,14 +1430,14 @@ mod tests {
         assert_eq!(
             testing::menu_rows(room),
             Some((
-                vec!["cafe0123".into(), "chi-ops".into(), "chiefduck".into()],
+                vec!["cafe0123".into(), "chi-ops".into(), "ChiefDuck".into()],
                 0
             ))
         );
         type_into(room, "CH");
         assert_eq!(
             testing::menu_rows(room),
-            Some((vec!["chi-ops".into(), "chiefduck".into()], 0))
+            Some((vec!["chi-ops".into(), "ChiefDuck".into()], 0))
         );
         type_into(room, "x");
         assert_eq!(testing::menu_rows(room), None, "no handle starts with chx");
@@ -1326,14 +1473,14 @@ mod tests {
         menu_key(room, MenuKey::Up);
         assert_eq!(testing::menu_rows(room).map(|(_, at)| at), Some(1));
         menu_key(room, MenuKey::Pick);
-        assert_eq!(testing::text(room).trim_end(), "@chiefduck");
+        assert_eq!(testing::text(room).trim_end(), "@ChiefDuck");
         assert_eq!(
             testing::menu_rows(room),
             None,
             "a completed word is not a query"
         );
         type_into(room, "and @c");
-        assert_eq!(testing::text(room).trim_end(), "@chiefduck and @c");
+        assert_eq!(testing::text(room).trim_end(), "@ChiefDuck and @c");
 
         menu_key(room, MenuKey::Dismiss);
         assert_eq!(
@@ -1350,9 +1497,12 @@ mod tests {
             "message",
             false,
             false,
-            Interaction::Pick("chi-ops".into()),
+            Interaction::Pick(chat::client::MentionChoice {
+                label: "chi-ops".into(),
+                party: chat::Party::Account(6),
+            }),
         );
-        assert_eq!(testing::text(room).trim_end(), "@chiefduck and @chi-ops");
+        assert_eq!(testing::text(room).trim_end(), "@ChiefDuck and @chi-ops");
     }
 
     /// The menu only ever completes the word under the caret: a completion
@@ -1799,11 +1949,112 @@ mod tests {
     fn a_room_scope_is_its_own_and_a_thread_scope_names_its_room() {
         assert_eq!(room_scope("net\u{1f}general"), "net\u{1f}general");
         assert_eq!(room_scope("net\u{1f}general#42"), "net\u{1f}general");
+        assert_eq!(room_scope("net\u{1f}general#42/edit"), "net\u{1f}general");
         assert_eq!(
             room_scope("net\u{1f}forge:playground:1#7"),
             "net\u{1f}forge:playground:1"
         );
         // a `#` that is not a thread tail stays
         assert_eq!(room_scope("net\u{1f}room#x"), "net\u{1f}room#x");
+    }
+    #[test]
+    fn clipboard_copy_cut_and_paste_keep_atomic_mention_identity() {
+        #[derive(Default)]
+        struct MemoryClipboard(String);
+        impl Clipboard for MemoryClipboard {
+            fn read(&self, _: iced::advanced::clipboard::Kind) -> Option<String> {
+                Some(self.0.clone())
+            }
+            fn write(&mut self, _: iced::advanced::clipboard::Kind, text: String) {
+                self.0 = text;
+            }
+        }
+        let scope = "net\u{1f}atomic-clipboard";
+        let composer = Composer {
+            slot: slot(scope),
+            scope: scope.into(),
+            kind: "message".into(),
+            compact: false,
+            hint: String::new(),
+            blocked: false,
+            restore_blocked: false,
+            failed_note: String::new(),
+        };
+        let mut document = Document {
+            content: Content::with_text("@Selfhost Duck tail"),
+            mentions: vec![(0..14, chat::Party::Account(5))],
+            ..Document::default()
+        };
+        let mut clipboard = MemoryClipboard::default();
+        let painted = Shape::default();
+        document.content.move_to(iced::widget::text_editor::Cursor {
+            position: iced::widget::text_editor::Position { line: 0, column: 6 },
+            selection: Some(iced::widget::text_editor::Position { line: 0, column: 2 }),
+        });
+        composer.apply(
+            &mut document,
+            &painted,
+            Interaction::Editor(ComposerEvent::Copy),
+            &mut clipboard,
+        );
+        assert_eq!(clipboard.0, "<@5>");
+        assert_eq!(document.content.text(), "@Selfhost Duck tail");
+        composer.apply(
+            &mut document,
+            &painted,
+            Interaction::Editor(ComposerEvent::Cut),
+            &mut clipboard,
+        );
+        assert_eq!(document.content.text(), " tail");
+        assert!(document.mentions.is_empty());
+        let paste = Interaction::Editor(ComposerEvent::Apply(crate::editor::RichAction::Edit(
+            Action::Edit(Edit::Paste(std::sync::Arc::new(clipboard.0.clone()))),
+        )));
+        composer.apply(&mut document, &painted, paste, &mut clipboard);
+        assert_eq!(
+            mention_body(&document.content, &document.mentions),
+            "<@5> tail"
+        );
+        assert_eq!(document.mentions[0].1, chat::Party::Account(5));
+    }
+    #[test]
+    fn edit_submission_retains_the_draft_and_identity_for_retry() {
+        for kind in ["edit", "thread_edit", "message", "reply"] {
+            let scope = format!("net\u{1f}retain-submitted-{kind}");
+            let composer = Composer {
+                slot: slot(&scope),
+                scope,
+                kind: kind.into(),
+                compact: false,
+                hint: String::new(),
+                blocked: false,
+                restore_blocked: false,
+                failed_note: String::new(),
+            };
+            let mut document = Document {
+                content: Content::with_text("@Same retry"),
+                mentions: vec![(0..5, chat::Party::Account(5))],
+                ..Document::default()
+            };
+            let submitted = composer.apply(
+                &mut document,
+                &Shape::default(),
+                Interaction::Editor(ComposerEvent::Submit),
+                &mut iced::advanced::clipboard::Null,
+            );
+            assert!(submitted.is_some());
+            match kind {
+                "edit" | "thread_edit" => {
+                    assert_eq!(
+                        mention_body(&document.content, &document.mentions),
+                        "<@5> retry"
+                    );
+                }
+                _ => {
+                    assert!(document.content.text().is_empty());
+                    assert!(document.mentions.is_empty());
+                }
+            }
+        }
     }
 }
