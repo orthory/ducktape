@@ -194,8 +194,6 @@ view
         // are host surfaces the view leaves slots for (module_view.rs).
         chat:
           extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial, live_agents) #chat -> chat_view_event _
-        shell:
-          extern shell_view(dark, connected, shell_surface, shell_setup_open, shell_identity_options, shell_identity, shell_provider, shell_credential, shell_host_node_options, shell_host_node, shell_credentials_loading, shell_terminal, shell_terminal_running, shell_terminal_busy, shell_terminal_title, shell_terminal_error, shell_chat_entries, shell_chat_activity, shell_chat_busy, shell_chat_status, shell_chat_detail, shell_chat_live, shell_chat_saga, shell_detached_saga) #shell -> shell_view_event _
 
         // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
         // strip and the comments rail go in as props; the document is the

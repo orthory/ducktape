@@ -12,7 +12,7 @@
 # identities relative to the workspace instead of an external checkout path.
 [workspace]
 resolver = "2"
-members = ["governance", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "shell", "support/design", "pages/tests/editor-binding-app"]
+members = ["governance", "members", "agents", "node", "explorer", "settings", "chat", "files", "pages", "forge", "support/design", "pages/tests/editor-binding-app"]
 
 [workspace.dependencies]
 ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1533d98e9db3ccb3c265c74612271f7ace59067e" }
