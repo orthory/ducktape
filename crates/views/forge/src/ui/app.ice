@@ -375,12 +375,6 @@ view
       text "Too much display data. Open a smaller directory or item." size=13.0
     if !display_unavailable
       col w=fill h=fill
-        if display_omitted > 0
-          row gap=4.0
-            text display_omitted #display-omitted size=12.5
-            text "rows are not shown." size=12.5
-        if display_shortened
-          text "Some content is shortened for display." size=12.5
         ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
           with
             display_omitted
@@ -470,3 +464,13 @@ view
             forge_open_file -> forge_open_file _
             open_message_link -> open_message_link _
             copy_to_clipboard -> copy_to_clipboard _ _
+        if display_omitted > 0 || display_shortened
+          box #display-notice w=fill h=26.0 px=16.0 bg=muted_bg clip=true
+            row gap=4.0 align=center h=fill
+              if display_omitted > 0
+                text display_omitted #display-omitted size=11.0 @text-meta
+                text "rows omitted" size=11.0 @text-meta
+              if display_omitted > 0 && display_shortened
+                text "·" size=11.0 @text-meta
+              if display_shortened
+                text "Preview shortened" size=11.0 @text-meta
