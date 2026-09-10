@@ -256,12 +256,6 @@ enum ForgeIntent
   copy
   composer
 
-// What a `governance` module view asks of the app: the two writes the
-// Approvals screen makes, routed to the handlers that sign them.
-enum GovIntent
-  vote
-  execute
-
 // what the Members view asks of the app: a clipboard write, an agent's
 // paused state, or a membership ballot
 enum RosterIntent

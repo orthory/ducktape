@@ -69,11 +69,6 @@ pub fn reading_pair(left: &str, right: &str) -> String {
     format!("{left} / {right}")
 }
 
-/// How many proposals are still open — the count the rail pins to Approvals.
-pub fn open_proposals(rows: &[ProposalRow]) -> i64 {
-    rows.iter().filter(|row| row.open).count() as i64
-}
-
 /// The rail's navigation: nine collaboration surfaces plus the node operator
 /// surface, with the active pane flagged. `settings` is not here because the
 /// rail pins it to its own footer beside the account avatar.
@@ -678,17 +673,6 @@ pub(crate) fn now_seconds() -> i64 {
 
 pub fn current_wall_seconds() -> i64 {
     now_seconds()
-}
-
-/// A serde-tagged enum's variant name, whether it rode as a bare string
-/// (unit variant) or as a single-key object (payload variant).
-pub(crate) fn tagged_name(value: &serde_json::Value) -> String {
-    value.as_str().map(str::to_string).unwrap_or_else(|| {
-        value
-            .as_object()
-            .and_then(|tagged| tagged.keys().next().cloned())
-            .unwrap_or_default()
-    })
 }
 
 /// A serde `Vec<u8>` as it arrives over JSON: an array of numbers.

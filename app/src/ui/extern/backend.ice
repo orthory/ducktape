@@ -288,7 +288,6 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
@@ -426,11 +425,6 @@ extern crate::backend
   save_agent(rpc:str, password:str, draft:str) -> bool ! AppError
   // provision the program account under the signing account, then register
   register_agent(rpc:str, password:str, controller:str, draft:str) -> bool ! AppError
-  ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
-  GovernanceData(generation:i64, proposals:[ProposalRow])
-  load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
-  governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError
-  governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
   governance_propose(rpc:str, password:str, action:str, target_key:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])

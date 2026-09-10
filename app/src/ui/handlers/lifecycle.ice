@@ -259,7 +259,6 @@ on workspace_connected(next)
   explorer_sent_query = ""
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  gov_generation = gov_generation + 1
   agents_generation = agents_generation + 1
   // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. The scope
   // fences stop a stale ANSWER from being installed; they cannot un-draw one
@@ -287,7 +286,6 @@ on workspace_connected(next)
     run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
-    run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     flow
       from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
@@ -398,8 +396,10 @@ on live_updated(next)
       forge_generation = forge_generation + 1
       run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.plane
+      // a module view holding an `rpc.live` subscription on this plane is
+      // told first; the serial moving is what draws it
+      views_live_serial = view_live_hit(next.module, views_live_serial)
       members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
-      gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
       account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
       dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
       agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
@@ -409,10 +409,6 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
           try request -> done request
           done -> members_load_selected _
-        flow
-          from done load_request(plane_live_hit(next.kind, next.module, "governance"), connected_rpc, "", gov_generation)
-          try request -> done request
-          done -> governance_load_selected _
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", account_generation)
           try request -> done request
@@ -815,7 +811,6 @@ on select_shell_tab(next)
   explorer_generation = explorer_generation + 1
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
-  gov_generation = gov_generation + 1
   // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
   // `run replace lane=agents_load` aborts work still running on the lane, but
   // it cannot retract a completion the runtime has ALREADY queued — and an
@@ -861,10 +856,6 @@ on select_shell_tab(next)
       from done load_request(tab_reads_plane(shell_tab, "members"), connected_rpc, "", members_generation)
       try request -> done request
       done -> members_load_selected _
-    flow
-      from done load_request(tab_reads_plane(shell_tab, "governance"), connected_rpc, "", gov_generation)
-      try request -> done request
-      done -> governance_load_selected _
     flow
       from done load_request(shell_tab == ShellTab.settings, connected_rpc, "", settings_generation)
       try request -> done request
@@ -916,11 +907,6 @@ on members_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != members_generation
   return if obsolete_request
   run replace lane=members_load load_members(request.rpc, request.generation) -> members_loaded _ | members_failed _
-
-on governance_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != gov_generation
-  return if obsolete_request
-  run replace lane=governance_load load_governance(request.rpc, request.generation) -> governance_loaded _ | governance_failed _
 
 on settings_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != settings_generation

@@ -220,6 +220,7 @@ pub(crate) mod tests {
             hold: Mutex::new(hold),
             hold_status: Mutex::new(None),
             held: tokio::sync::Notify::new(),
+            queries: Mutex::new(BTreeMap::new()),
         };
         fake_node(Arc::new(deployment)).await
     }
@@ -237,6 +238,11 @@ pub(crate) mod tests {
         pub hold_status: Mutex<Option<Arc<tokio::sync::Notify>>>,
         /// Told each time an answer starts waiting on a hold.
         pub held: tokio::sync::Notify,
+        /// What a module query answers, by target: the reads a view makes
+        /// for itself through the kernel's `rpc.query`. A target not here
+        /// answers the registry status, as every query did before views
+        /// read the node.
+        pub queries: Mutex<BTreeMap<String, serde_json::Value>>,
     }
 
     impl FakeDeployment {
@@ -248,7 +254,13 @@ pub(crate) mod tests {
                 hold: Mutex::new(None),
                 hold_status: Mutex::new(None),
                 held: tokio::sync::Notify::new(),
+                queries: Mutex::new(BTreeMap::new()),
             })
+        }
+
+        /// Every `rpc.query` for `target` answers `reply` from now on.
+        pub(crate) fn answer_query(&self, target: &str, reply: serde_json::Value) {
+            self.queries.lock().unwrap().insert(target.to_owned(), reply);
         }
 
         /// The registry now names `artifact` as `module`'s active code,
@@ -276,9 +288,8 @@ pub(crate) mod tests {
                 // answering, as a node does
                 let deployment = deployment.clone();
                 tokio::spawn(async move {
-                    let mut request = vec![0u8; 4096];
-                    let read = socket.read(&mut request).await.unwrap();
-                    let head = String::from_utf8_lossy(&request[..read]).into_owned();
+                    let request = read_request(&mut socket).await;
+                    let head = String::from_utf8_lossy(&request).into_owned();
                     let route = head.split(' ').nth(1).unwrap_or("").to_owned();
                     let (status_line, body) = if route == "/v1/query" {
                         let hold = deployment.hold_status.lock().unwrap().take();
@@ -286,8 +297,17 @@ pub(crate) mod tests {
                             deployment.held.notify_one();
                             hold.notified().await;
                         }
-                        let status = deployment.status.lock().unwrap().clone();
-                        ("200 OK", status.to_string().into_bytes())
+                        // a view's own read names its module; anything
+                        // else is the app's registry read
+                        let target = head
+                            .rsplit("\r\n\r\n")
+                            .next()
+                            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                            .and_then(|ask| ask["target"].as_str().map(str::to_owned));
+                        let answered = target
+                            .and_then(|target| deployment.queries.lock().unwrap().get(&target).cloned());
+                        let reply = answered.unwrap_or_else(|| deployment.status.lock().unwrap().clone());
+                        ("200 OK", reply.to_string().into_bytes())
                     } else if let Some(digest) = route.strip_prefix("/v1/files/blob/") {
                         let hold = deployment.hold.lock().unwrap().take();
                         if let Some(hold) = hold {
@@ -320,6 +340,33 @@ pub(crate) mod tests {
             }
         });
         Client::new(&origin).unwrap()
+    }
+
+    /// One HTTP request off the socket, head and body: the body arrives in
+    /// its own write as often as not, and a query's target is in it.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                return request;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+            let content_length = head
+                .lines()
+                .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::to_owned))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let complete = request.len() >= head_end + 4 + content_length;
+            if complete {
+                return request;
+            }
+        }
     }
 
     fn status_of(hash: &[u8]) -> serde_json::Value {
