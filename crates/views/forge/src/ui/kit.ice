@@ -342,8 +342,12 @@ component FinalityChip(height:i64)
               font=code_semibold
               @text-success_tick
 
+// A TAB IS AS WIDE AS ITS WORDS. The underline below the label is `w=fill`
+// so it spans the label; without `w=shrink` here the column would take that
+// fill for its own width, every tab would fill the row, and three tabs would
+// share the bar in thirds.
 component TabLabel(label:str, count:i64, active:bool)
-  col #root
+  col #root w=shrink
     row
       with
         gap=7.0

@@ -138,7 +138,18 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
               w=fill
               gap=9.0
               align=center
-            RepoCrumb org=org
+            // THE CRUMB IS THE WAY BACK. `org / <repo>` reads as a path, so
+            // the org is the link to the level above it: the repo overview.
+            // Only the crumb is the button — the bar around it is not.
+            button -> emit(forge_close_repo)
+              with
+                label="All repos"
+                p=0.0
+                @ghost_action
+              RepoCrumb org=org
+              active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
+              hovered bg=row_hover text=fg
+              pressed bg=elevated text=fg
             // THE REPOSITORY SWITCHER is the host's own pick list: the host
             // lays the menu out over everything below, hit-tests it and
             // dismisses it, and neither this view nor the app holds an open
@@ -154,6 +165,33 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
               opened-hovered text=brand handle=brand bg=row_hover border=transparent
               menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
               handle arrow size=11.0
+            // THE BRANCH SELECTOR stands beside the repository it belongs to:
+            // the commit the code browse is pinned to is context for every
+            // seat of the repo, so it lives in the repo bar with the repo,
+            // not in the tab row. The pick list names the branch standing at
+            // that commit, or reads the commit itself as its hint once every
+            // branch has moved on; the host draws and dismisses its menu, and
+            // a pick leaves as an intent naming the branch, after which the
+            // browse comes back re-rooted as props.
+            if !empty(branches)
+              row gap=5.0 align=center
+                Icon
+                  with
+                    name="branch"
+                    tone="ink"
+                    px=10.0
+                pick branch_names(branches) pinned_branch(tree_branch) #branch-pick -> emit(forge_pick_branch, _)
+                  with
+                    hint=commit_label(tree_rev)
+                    p=3.0
+                    text-size=11.0
+                    font=code_medium
+                  active text=fg placeholder=fg handle=muted bg=surface border=border border-w=1.0 r=10.0
+                  hovered text=fg placeholder=fg handle=fg bg=row_hover border=border
+                  opened text=brand placeholder=brand handle=brand bg=surface border=brand_line
+                  opened-hovered text=brand placeholder=brand handle=brand bg=row_hover border=brand_line
+                  menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
+                  handle arrow size=9.0
             space w=fill
             // Detail navigation belongs in the persistent repo bar. Keeping
             // it in the scrolling body spent a whole row on a control that
@@ -168,18 +206,77 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
                   h=28.0
                   p=6.0
                   @secondary_action
-            // The repo's own address. Its NAME is typeable; the `?net=`
-            // digest that says which network's `ducktape` this is, is not.
-            button "Copy repo link" -> emit(copy_to_clipboard, duck_forge_repo_link(open_repo, network_chain_id), "Repo link copied")
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
+          space w=1.0 h=1.0
+        // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
+        // state/forge.ice and `filter_forge_items`/`forge_open_count` in
+        // backend.ice since wave 1 with no call site at all, so the
+        // screen piled merged PRs and closed issues into one flat
+        // list. The counts are OPEN work — a PR counts until it
+        // merges, an issue until it closes.
+        //
+        // THE BAR STAYS WHILE AN ITEM IS OPEN. The tabs are the repo's seats,
+        // and an open pull request or issue is one seat's detail, not a new
+        // screen: hiding the bar there made every item a dead end that only
+        // "Back" left. A tab press while an item is open leaves the item and
+        // shows the seat (the host closes the item on `forge.tab`).
+        box
+          with
+            w=fill
+            pl=16.0
+            pr=16.0
+          row
+            with
+              w=fill
+              gap=18.0
+              align=center
+            button -> emit(select_forge_tab, "code")
               with
-                h=28.0
-                p=6.0
-                @secondary_action
-            button "All repos" -> emit(forge_close_repo)
+                label="Browse the code"
+                checked=(tab == "code")
+                p=0.0
+                @ghost_action
+              TabLabel
+                with
+                  label="Code"
+                  count=0
+                  active=(tab == "code")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+              hovered bg=transparent text=fg
+              pressed bg=transparent text=fg
+            button -> emit(select_forge_tab, "pulls")
               with
-                h=28.0
-                p=6.0
-                @secondary_action
+                label="Show pull requests"
+                checked=(tab == "pulls")
+                p=0.0
+                @ghost_action
+              TabLabel
+                with
+                  label="Pull requests"
+                  count=forge_open_count(items, "pr")
+                  active=(tab == "pulls")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+              hovered bg=transparent text=fg
+              pressed bg=transparent text=fg
+            button -> emit(select_forge_tab, "issues")
+              with
+                label="Show issues"
+                checked=(tab == "issues")
+                p=0.0
+                @ghost_action
+              TabLabel
+                with
+                  label="Issues"
+                  count=forge_open_count(items, "issue")
+                  active=(tab == "issues")
+              active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+              hovered bg=transparent text=fg
+              pressed bg=transparent text=fg
+            space w=fill
         box
           with
             w=fill
@@ -188,104 +285,6 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
           space w=1.0 h=1.0
         if forge_item_number <= 0
           col w=fill h=fill
-            // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
-            // state/forge.ice and `filter_forge_items`/`forge_open_count` in
-            // backend.ice since wave 1 with no call site at all, so the
-            // screen piled merged PRs and closed issues into one flat
-            // list. The counts are OPEN work — a PR counts until it
-            // merges, an issue until it closes.
-            box
-              with
-                w=fill
-                pl=16.0
-                pr=16.0
-              row
-                with
-                  w=fill
-                  gap=18.0
-                  align=center
-                button -> emit(select_forge_tab, "code")
-                  with
-                    label="Browse the code"
-                    checked=(tab == "code")
-                    p=0.0
-                    @ghost_action
-                  TabLabel
-                    with
-                      label="Code"
-                      count=0
-                      active=(tab == "code")
-                  active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                  hovered bg=transparent text=fg
-                  pressed bg=transparent text=fg
-                button -> emit(select_forge_tab, "pulls")
-                  with
-                    label="Show pull requests"
-                    checked=(tab == "pulls")
-                    p=0.0
-                    @ghost_action
-                  TabLabel
-                    with
-                      label="Pull requests"
-                      count=forge_open_count(items, "pr")
-                      active=(tab == "pulls")
-                  active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                  hovered bg=transparent text=fg
-                  pressed bg=transparent text=fg
-                button -> emit(select_forge_tab, "issues")
-                  with
-                    label="Show issues"
-                    checked=(tab == "issues")
-                    p=0.0
-                    @ghost_action
-                  TabLabel
-                    with
-                      label="Issues"
-                      count=forge_open_count(items, "issue")
-                      active=(tab == "issues")
-                  active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                  hovered bg=transparent text=fg
-                  pressed bg=transparent text=fg
-                // THE BRANCH SELECTOR. The commit the code browse is pinned
-                // to is context for every repo seat, so it sits in the tab
-                // row rather than charging the content a row of its own. The
-                // pick list names the branch standing at that commit, or
-                // reads the commit itself as its hint once every branch has
-                // moved on; the host draws and dismisses its menu, and a
-                // pick leaves as an intent naming the branch, after which the
-                // browse comes back re-rooted as props.
-                if !empty(branches)
-                  box
-                    with
-                      w=1.0
-                      h=18.0
-                      bg=separator
-                    space w=1.0 h=1.0
-                  row gap=5.0 align=center
-                    Icon
-                      with
-                        name="branch"
-                        tone="ink"
-                        px=10.0
-                    pick branch_names(branches) pinned_branch(tree_branch) #branch-pick -> emit(forge_pick_branch, _)
-                      with
-                        hint=commit_label(tree_rev)
-                        p=3.0
-                        text-size=11.0
-                        font=code_medium
-                      active text=fg placeholder=fg handle=muted bg=surface border=border border-w=1.0 r=10.0
-                      hovered text=fg placeholder=fg handle=fg bg=row_hover border=border
-                      opened text=brand placeholder=brand handle=brand bg=surface border=brand_line
-                      opened-hovered text=brand placeholder=brand handle=brand bg=row_hover border=brand_line
-                      menu text=fg selected-text=fg selected-bg=selected_row bg=surface border=border border-w=1.0 r=11.0 shadow=shadow_popover shadow-y=3.0 shadow-blur=12.0
-                      handle arrow size=9.0
-                space w=fill
-            box
-              with
-                w=fill
-                h=1.0
-                bg=separator
-              space w=1.0 h=1.0
             // One discriminant, one match: Code browses the tree, the
             // other two seats are the same tracker list under different
             // filters.

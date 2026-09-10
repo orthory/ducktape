@@ -161,8 +161,10 @@ component RepoCard(repo:ForgeRepo)
 // ── REPO HEADER ───────────────────────────────────────────────────────────
 
 // The repo bar's crumb: the branch glyph on the brand plate and the org,
-// read before the repository pick list that follows it in the bar. The
-// commit the browse is pinned to is the tab row's selector, not the crumb's.
+// read before the repository pick list and the branch selector that follow
+// it in the bar. THE ROW IS CHROME BECAUSE THE CALLER IS THE BUTTON: the
+// screen mounts it inside the `forge_close_repo` button that leads back to
+// the repo overview, so a button here would be a button inside a button.
 component RepoCrumb(org:str)
   row #root
     with

@@ -3483,7 +3483,6 @@ dependencies = [
  "block2 0.5.1",
  "capability",
  "chat",
- "collaboration",
  "commonware-cryptography",
  "cpal",
  "design",
