@@ -426,7 +426,7 @@ extern crate::backend
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str)
+  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
   AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])

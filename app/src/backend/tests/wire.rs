@@ -666,6 +666,33 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert_eq!(hit.active_thread_seq, 1);
     assert_eq!(hit.thread_target_seq, 3);
     assert_eq!(hit.thread_messages[1].body, "a threaded reply");
+    // A duck://channel/general#3 link supplies only the reply's sequence.
+    // Resolve its canonical thread root instead of looking for reply 3 in
+    // the root-only channel window and reporting "message was not found".
+    let linked_reply = load_chat_hit(origin.clone(), "general".into(), 3, 3, 8)
+        .await
+        .unwrap();
+    assert_eq!(linked_reply.generation, 8);
+    assert_eq!(linked_reply.selected_message_seq, 1);
+    assert_eq!(linked_reply.active_thread_seq, 1);
+    assert_eq!(linked_reply.thread_target_seq, 3);
+    assert_eq!(linked_reply.thread_messages[1].body, "a threaded reply");
+    let linked_root = load_chat_hit(origin.clone(), "general".into(), 1, 1, 9)
+        .await
+        .unwrap();
+    assert_eq!(linked_root.selected_message_seq, 1);
+    assert_eq!(linked_root.active_thread_seq, 0);
+    assert!(linked_root.thread_messages.is_empty());
+    let wrong_thread = load_chat_hit(origin.clone(), "general".into(), 2, 3, 10).await;
+    assert!(
+        wrong_thread.is_err(),
+        "a supplied root must still match the reply"
+    );
+    let missing = load_chat_hit(origin.clone(), "general".into(), 999, 999, 11).await;
+    assert!(
+        missing.is_err(),
+        "an index-clamped neighbor is not the requested message"
+    );
     submit_test(
         &rpc,
         &signer,
