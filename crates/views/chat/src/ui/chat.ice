@@ -265,7 +265,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     add_channel_member_submit()
     remove_channel_member_submit(str)
     close_thread()
-    start_thread_resize()
+    resize_thread(f64, f64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
     begin_thread_message_edit(i64, str, i64)
@@ -1664,7 +1664,7 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
                         p=6.0
                         @secondary_action
         if active_thread_seq > 0 && !channel_settings_open
-          mouse #thread-resize press=emit(start_thread_resize)
+          resize-handle #thread-resize drag=emit(resize_thread, _, _) cursor=resize-horizontal
             box #thread-divider
               with
                 w=10.0

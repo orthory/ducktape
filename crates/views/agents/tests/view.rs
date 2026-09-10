@@ -254,27 +254,30 @@ fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
         node => panic!("fixed journal width: {node:?}"),
     };
     assert_eq!(width(&frame), 400.0);
-    assert!(frame.mouse_interest);
-    let movement = |x| Event::Mouse {
-        event: mouse::Event::CursorMoved { x, y: 30.0 },
-        captured: true,
-    };
-    let frame = tick_native(vec![movement(700.0)]);
-    let Node::MouseArea {
-        on_press: Some(handler),
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
         ..
     } = node_ending(&frame, "/journal-resize")
     else {
         panic!("resize handle")
     };
-    let frame = tick_native(vec![Event::Message(*handler), movement(620.0)]);
+    assert_eq!(*cursor, Some(mouse::Cursor::ResizingHorizontally));
+    let frame = tick_native(vec![Event::Drag {
+        handler: *handler,
+        dx: -80.0,
+        dy: 0.0,
+    }]);
     assert_eq!(width(&frame), 480.0);
     let frame = tick_native(vec![
         Event::Mouse {
             event: mouse::Event::ButtonReleased(mouse::Button::Left),
             captured: true,
         },
-        movement(500.0),
+        Event::Mouse {
+            event: mouse::Event::CursorMoved { x: 500.0, y: 30.0 },
+            captured: true,
+        },
     ]);
     assert_eq!(width(&frame), 480.0);
     assert_eq!(

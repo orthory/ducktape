@@ -195,8 +195,6 @@ state
   thread_message_action:MessageAction = MessageAction.toolbar
   chat_viewport_width = 1280.0
   thread_width = 330.0
-  thread_dragging = false
-  pointer_x = 0.0
   thread_has_more = false
   thread_next_reply_seq = 0
   thread_loading = false
@@ -222,28 +220,13 @@ state
 // view's state asks for the facts again on its own.
 subscribe
   props() -> props_arrived _
-  mouse moved status=any when active_thread_seq > 0 && !channel_settings_open -> thread_pointer_moved _ _
-  mouse released status=any when thread_dragging -> thread_pointer_released _
-  mouse left status=any when thread_dragging -> cancel_thread_resize
 
-on thread_pointer_moved(x, _y)
-  let delta = pointer_x - x
-  pointer_x = x
-  return if !thread_dragging
-  thread_width = thread_width_after_delta(thread_width, delta, chat_viewport_width)
+on thread_resized(dx, _dy)
+  thread_width = thread_width_after_delta(thread_width, -dx, chat_viewport_width)
 
 on chat_viewport_changed(width, _height)
   chat_viewport_width = width
   thread_width = thread_width_after_delta(thread_width, 0.0, width)
-
-on start_thread_resize
-  thread_dragging = true
-
-on thread_pointer_released(_button)
-  thread_dragging = false
-
-on cancel_thread_resize
-  thread_dragging = false
 
 on props_arrived(item)
   host_error = item.error
@@ -291,7 +274,6 @@ on props_arrived(item)
   message_action = message_action_of(next.message_action)
   channel_settings_open = next.channel_settings_open
   active_thread_seq = next.active_thread_seq
-  thread_dragging = thread_dragging && active_thread_seq > 0 && !next.channel_settings_open
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   live_agents = next.live_agents
@@ -457,7 +439,6 @@ on remove_channel_member_submit(key)
   sent = send_remove_member(key)
 
 on close_thread
-  thread_dragging = false
   thread_edit_draft = ""
   sent = send_close_thread()
 
@@ -604,7 +585,7 @@ view
         unarchive_channel_submit -> unarchive_channel_submit
         add_channel_member_submit -> add_channel_member_submit
         remove_channel_member_submit -> remove_channel_member_submit _
-        start_thread_resize -> start_thread_resize
+        resize_thread -> thread_resized _ _
         close_thread -> close_thread
         open_thread_message_actions -> open_thread_message_actions _ _ _
         open_thread_message_reactions -> open_thread_message_reactions _ _ _
