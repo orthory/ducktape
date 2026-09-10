@@ -2781,6 +2781,8 @@ struct Guest {
     tick: TypedFunc<(Vec<u8>,), (Vec<u8>,)>,
     /// The guest's events for its next tick.
     pending: Vec<wire::Event>,
+    /// Requests wait for their frame's native layout, inside this instance only.
+    widget_commands: Vec<(u64, u64, wire::WidgetCommand)>,
     /// The last frame, its `root` kept across `unchanged` ticks and patched
     /// in place by a frame that carries patches instead of a tree.
     frame: wire::Frame,
@@ -3259,6 +3261,7 @@ impl Guest {
     fn settled(&self) -> bool {
         self.fault.is_none()
             && self.pending.is_empty()
+            && self.widget_commands.is_empty()
             && self.inputs.editor_documents_status() == Ok(true)
             && (self.staged || self.frame.requests.is_empty())
     }
@@ -3455,6 +3458,7 @@ impl Guest {
             store,
             tick,
             pending: Vec::new(),
+            widget_commands: Vec::new(),
             frame: wire::Frame::default(),
             frame_reports: Default::default(),
             display_diagnostics: Default::default(),
@@ -3593,6 +3597,8 @@ impl Guest {
             }
         }
         for id in std::mem::take(&mut self.frame.cancels) {
+            self.widget_commands
+                .retain(|(request, _, _)| *request != id);
             if self
                 .pages_document
                 .as_ref()
@@ -3627,6 +3633,7 @@ impl Guest {
         let own = capability == self.module;
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
+            ("host", "widget") => self.widget_request(id, &payload),
             ("pages", "document") if own => pages_document::request(self, id, &payload),
             _ if own && operation == "props" => {
                 self.props_subscription = Some(id);
@@ -3654,6 +3661,69 @@ impl Guest {
 
     fn refuse(&mut self, id: u64, message: String) {
         self.reply(id, Err(message));
+    }
+
+    fn widget_request(&mut self, id: u64, payload: &[u8]) {
+        let admitted = (|| {
+            let mut command: wire::WidgetCommand = wire::decode(payload)?;
+            let exact_payload = wire::encoded_size(&command) == payload.len() as u64;
+            if !exact_payload {
+                return Err("widget request has trailing bytes".into());
+            }
+            command.validate()?;
+            let queue_full = self.widget_commands.len() >= MAX_REQUESTS_PER_TICK;
+            if queue_full {
+                return Err("too many pending widget requests".into());
+            }
+            // Exhaustive by design: adding a command requires reviewing its scope.
+            use wire::WidgetCommand as C;
+            let target = match &command {
+                C::FocusPrevious | C::FocusNext => None,
+                C::Focus { target }
+                | C::Focused { target }
+                | C::CursorFront { target }
+                | C::CursorEnd { target }
+                | C::Cursor { target, .. }
+                | C::SelectAll { target }
+                | C::Select { target, .. }
+                | C::Snap { target, .. }
+                | C::SnapEnd { target }
+                | C::ScrollTo { target, .. }
+                | C::ScrollToKey { target, .. }
+                | C::ScrollBy { target, .. } => Some(target),
+            };
+            fn contains(node: &wire::Node, target: &str) -> bool {
+                node.key() == Some(target)
+                    || node.children().iter().any(|child| contains(child, target))
+            }
+            if let Some(target) = target {
+                let in_scope = self
+                    .frame
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| contains(root, target));
+                if !in_scope {
+                    return Err("widget target is outside this guest tree".into());
+                }
+            }
+            Ok(command)
+        })();
+        match admitted {
+            Ok(command) => self.widget_commands.push((id, self.frame_rev, command)),
+            Err(error) => self.refuse(id, error),
+        }
+    }
+
+    /// Called only on the matching mounted tree after native editor work drains.
+    fn execute_widget_commands(&mut self, mut traverse: impl FnMut(&mut dyn Operation)) {
+        for (id, revision, command) in std::mem::take(&mut self.widget_commands) {
+            let result = if revision == self.frame_rev {
+                view_tree::execute_widget_command(command, &mut traverse)
+            } else {
+                Err("widget request belongs to a replaced frame".into())
+            };
+            self.reply(id, result);
+        }
     }
 
     fn reply(&mut self, id: u64, result: Result<Vec<u8>, String>) {
@@ -3985,6 +4055,34 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
             return;
         };
         if guest.redraw(props) {
+            shell.request_redraw();
+        }
+        let native_frame_ready = same_instance
+            && self.rev == guest.frame_rev
+            && guest.fault.is_none()
+            && !guest.staged
+            && !shell.is_layout_invalid()
+            && !shell.are_widgets_invalid()
+            && !guest.inputs.editor_transactions_pending()
+            && !guest.widget_commands.is_empty();
+        if native_frame_ready {
+            guest.execute_widget_commands(|operation| {
+                self.content
+                    .as_widget_mut()
+                    .operate(tree, layout, renderer, operation);
+                if let Some(mut overlay) = self
+                    .content
+                    .as_widget_mut()
+                    .overlay(tree, layout, renderer, viewport, Vector::ZERO)
+                    .map(overlay::Nested::new)
+                {
+                    let layout = overlay.layout(renderer, viewport.size());
+                    overlay.operate(Layout::new(&layout), renderer, operation);
+                }
+            });
+            shell.request_redraw();
+        }
+        if !guest.widget_commands.is_empty() {
             shell.request_redraw();
         }
         for intent in std::mem::take(&mut guest.intents) {
@@ -6222,6 +6320,885 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn widget_commands_reach_a_mounted_nested_overlay_without_touching_a_sibling() {
+        let _turn = blocking_connection_turn();
+        let path = staged("pages").expect("actual guest instantiation is required");
+        let mounted = fresh("pages");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        let input = |key: &str| wire::Node::Input {
+            options: Default::default(),
+            key: key.into(),
+            placeholder: String::new(),
+            value: "abcd".into(),
+            on_input: 0,
+            on_submit: None,
+            width: None,
+            secure: false,
+            style: Box::default(),
+        };
+        let popup = |key: &str, base, content| wire::Node::Overlay {
+            key: key.into(),
+            padding: 0.0,
+            backdrop: wire::Rgba([0.0; 4]),
+            align_x: wire::AlignX::Left,
+            align_y: wire::AlignY::Top,
+            on_dismiss: None,
+            children: vec![base, content],
+        };
+        guest.frame.root = Some(popup(
+            "outer",
+            wire::Node::empty(),
+            popup("inner", wire::Node::empty(), input("popup-draft")),
+        ));
+        guest.inputs.adopt(guest.frame.root.as_ref().unwrap());
+        // Freeze the fixture projection, not responses: ModuleView still routes
+        // every real host request through the native mounted overlay operation.
+        guest.frame.requests.clear();
+        guest.frame.busy = false;
+        guest.pending.clear();
+        guest.staged = false;
+        guest.ticks = 1;
+        // The base plane is empty. Unlike Float (which also visits its floated
+        // child in base operate), this fixture exposes widgets only in overlays.
+        struct OverlayOnly(Element<'static, Output>);
+        struct OverlayPlane<'a> {
+            content: &'a mut Element<'static, Output>,
+            tree: &'a mut Tree,
+        }
+        impl overlay::Overlay<Output, iced::Theme, iced::Renderer> for OverlayPlane<'_> {
+            fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> layout::Node {
+                self.content.as_widget_mut().layout(
+                    self.tree,
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, bounds),
+                )
+            }
+            fn draw(
+                &self,
+                renderer: &mut iced::Renderer,
+                theme: &iced::Theme,
+                style: &renderer::Style,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+            ) {
+                self.content.as_widget().draw(
+                    self.tree,
+                    renderer,
+                    theme,
+                    style,
+                    layout,
+                    cursor,
+                    &layout.bounds(),
+                );
+            }
+            fn operate(
+                &mut self,
+                layout: Layout<'_>,
+                renderer: &iced::Renderer,
+                operation: &mut dyn Operation,
+            ) {
+                self.content
+                    .as_widget_mut()
+                    .operate(self.tree, layout, renderer, operation);
+            }
+            fn update(
+                &mut self,
+                event: &Event,
+                layout: Layout<'_>,
+                cursor: mouse::Cursor,
+                renderer: &iced::Renderer,
+                clipboard: &mut dyn Clipboard,
+                shell: &mut Shell<'_, Output>,
+            ) {
+                self.content.as_widget_mut().update(
+                    self.tree,
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    &layout.bounds(),
+                );
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                layout: Layout<'a>,
+                renderer: &iced::Renderer,
+            ) -> Option<overlay::Element<'a, Output, iced::Theme, iced::Renderer>> {
+                self.content.as_widget_mut().overlay(
+                    self.tree,
+                    layout,
+                    renderer,
+                    &layout.bounds(),
+                    Vector::ZERO,
+                )
+            }
+        }
+        impl Widget<Output, iced::Theme, iced::Renderer> for OverlayOnly {
+            fn tag(&self) -> tree::Tag {
+                self.0.as_widget().tag()
+            }
+            fn state(&self) -> tree::State {
+                self.0.as_widget().state()
+            }
+            fn children(&self) -> Vec<Tree> {
+                self.0.as_widget().children()
+            }
+            fn diff(&self, tree: &mut Tree) {
+                self.0.as_widget().diff(tree);
+            }
+            fn size(&self) -> Size<Length> {
+                self.0.as_widget().size()
+            }
+            fn layout(
+                &mut self,
+                tree: &mut Tree,
+                renderer: &iced::Renderer,
+                limits: &layout::Limits,
+            ) -> layout::Node {
+                self.0.as_widget_mut().layout(tree, renderer, limits)
+            }
+            fn draw(
+                &self,
+                _: &Tree,
+                _: &mut iced::Renderer,
+                _: &iced::Theme,
+                _: &renderer::Style,
+                _: Layout<'_>,
+                _: mouse::Cursor,
+                _: &Rectangle,
+            ) {
+            }
+            fn overlay<'a>(
+                &'a mut self,
+                tree: &'a mut Tree,
+                _: Layout<'a>,
+                _: &iced::Renderer,
+                _: &Rectangle,
+                _: Vector,
+            ) -> Option<overlay::Element<'a, Output, iced::Theme, iced::Renderer>> {
+                Some(overlay::Element::new(Box::new(OverlayPlane {
+                    content: &mut self.0,
+                    tree,
+                })))
+            }
+        }
+        let content = || {
+            Element::new(OverlayOnly(Element::new(OverlayOnly(
+                widget::text_input("", "abcd")
+                    .id("popup-draft")
+                    .on_input(|text| Output::Edit {
+                        key: "popup-draft".into(),
+                        handler: 0,
+                        text,
+                    })
+                    .into(),
+            ))))
+        };
+        let sibling = content();
+        let module = ModuleView {
+            mounted: mounted.clone(),
+            generation: mounted.lock().unwrap().generation,
+            rev: guest.frame_rev,
+            alive: guest.alive.clone(),
+            content: content(),
+        };
+        mounted.lock().unwrap().slot = Slot::Ready(Box::new(guest));
+        use iced::advanced::renderer::Headless;
+        use iced_test::runtime::{UserInterface, user_interface};
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let size = Size::new(300.0, 220.0);
+        let mut ui = UserInterface::build(
+            Element::new(module),
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut sibling = UserInterface::build(
+            sibling,
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        macro_rules! command {
+            ($command:expr) => {{
+                {
+                    let mut seat = mounted.lock().unwrap();
+                    let Slot::Ready(guest) = &mut seat.slot else {
+                        panic!("fixture unmounted")
+                    };
+                    guest.answer(
+                        wire::Request {
+                            id: 900,
+                            kind: "host.widget".into(),
+                            payload: wire::encode(&$command),
+                        },
+                        &None,
+                    );
+                }
+                ui.update(
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
+                    mouse::Cursor::Unavailable,
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut Vec::new(),
+                );
+                let mut seat = mounted.lock().unwrap();
+                let Slot::Ready(guest) = &mut seat.slot else {
+                    panic!("fixture unmounted")
+                };
+                let Some(wire::Event::Response {
+                    id: 900,
+                    result,
+                    done: true,
+                }) = guest.pending.pop()
+                else {
+                    panic!("overlay host response missing")
+                };
+                result.expect("mounted overlay operation")
+            }};
+        }
+        let focus = || wire::WidgetCommand::Focused {
+            target: "popup-draft".into(),
+        };
+        assert!(!wire::decode::<bool>(&command!(focus())).unwrap());
+        command!(wire::WidgetCommand::Focus {
+            target: "popup-draft".into()
+        });
+        assert!(
+            wire::decode::<bool>(&command!(focus())).unwrap(),
+            "nested popup did not receive native focus"
+        );
+        let other = view_tree::execute_widget_command(focus(), |operation| {
+            sibling.operate(&renderer, operation)
+        })
+        .unwrap();
+        assert!(
+            !wire::decode::<bool>(&other).unwrap(),
+            "the sibling popup acquired focus"
+        );
+        command!(wire::WidgetCommand::Select {
+            target: "popup-draft".into(),
+            start: 1,
+            end: 3
+        });
+        ui.update(
+            &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character("X".into()),
+                modified_key: iced::keyboard::Key::Character("X".into()),
+                physical_key: iced::keyboard::key::Physical::Unidentified(
+                    iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                location: iced::keyboard::Location::Standard,
+                modifiers: Default::default(),
+                text: Some("X".into()),
+                repeat: false,
+            })],
+            mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Vec::new(),
+        );
+        let seat = mounted.lock().unwrap();
+        let Slot::Ready(guest) = &seat.slot else {
+            panic!("fixture unmounted")
+        };
+        assert!(
+            guest.pending.iter().any(|event| matches!(event,
+            wire::Event::Input { text, .. } if text == "aXd")),
+            "typing did not replace the selected native popup text: {:?}",
+            guest.pending
+        );
+    }
+
+    #[test]
+    fn widget_commands_reach_native_focus_input_selection_and_scroll() {
+        use iced::advanced::renderer::Headless;
+        use iced_test::runtime::{UserInterface, user_interface};
+        use wire::WidgetCommand as C;
+        let path = staged("pages").expect("actual guest instantiation is required");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        let input = |key: &str| wire::Node::Input {
+            options: Default::default(),
+            key: key.into(),
+            placeholder: String::new(),
+            value: "abcd".into(),
+            on_input: 0,
+            on_submit: None,
+            width: None,
+            secure: false,
+            style: Box::default(),
+        };
+        // A capability fixture made from the same wire primitives guests publish.
+        guest.frame.root = Some(wire::Node::Linear {
+            max_width: None,
+            clip: false,
+            key: "fixture".into(),
+            wrap: None,
+            axis: wire::Axis::Column,
+            spacing: None,
+            padding: None,
+            width: None,
+            height: None,
+            align: None,
+            background: None,
+            border: None,
+            children: vec![
+                input("draft"),
+                input("second"),
+                wire::Node::Scroll {
+                    on_scroll: None,
+                    virtual_rows: true,
+                    key: "list".into(),
+                    direction: wire::ScrollDirection::Vertical,
+                    width: None,
+                    height: Some(wire::Length::Fixed(100.0)),
+                    bar_hidden: false,
+                    bar_width: None,
+                    bar_margin: None,
+                    scroller_width: None,
+                    bar_spacing: None,
+                    anchor_x: wire::ScrollAnchor::Start,
+                    anchor_y: wire::ScrollAnchor::Start,
+                    auto_scroll: false,
+                    background: None,
+                    border: None,
+                    content: Box::new(wire::Node::KeyedColumn {
+                        key: "rows".into(),
+                        keys: Some((0..20).map(wire::ListKey::Integer).collect()),
+                        background: None,
+                        border: None,
+                        spacing: None,
+                        padding: None,
+                        width: None,
+                        height: None,
+                        max_width: None,
+                        align: None,
+                        virtual_row: Some(30.0),
+                        children: (0..20)
+                            .map(|_| wire::Node::Space {
+                                width: None,
+                                height: Some(wire::Length::Fixed(30.0)),
+                            })
+                            .collect(),
+                    }),
+                },
+            ],
+        });
+        guest.inputs.adopt(guest.frame.root.as_ref().unwrap());
+        guest.pending.clear();
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let size = Size::new(300.0, 220.0);
+        let mut ui = UserInterface::build(
+            guest.render(),
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut sibling = UserInterface::build(
+            guest.render(),
+            size,
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        macro_rules! run {
+            ($command:expr) => {{
+                guest.answer(
+                    wire::Request {
+                        id: 900,
+                        kind: "host.widget".into(),
+                        payload: wire::encode(&$command),
+                    },
+                    &None,
+                );
+                guest.execute_widget_commands(|operation| ui.operate(&renderer, operation));
+                let Some(wire::Event::Response {
+                    id: 900,
+                    result,
+                    done: true,
+                }) = guest.pending.pop()
+                else {
+                    panic!("missing host response")
+                };
+                result.expect("native widget command")
+            }};
+        }
+        macro_rules! focused {
+            ($target:expr) => {
+                wire::decode::<bool>(&run!(C::Focused {
+                    target: $target.into()
+                }))
+                .unwrap()
+            };
+        }
+        assert!(!focused!("draft"));
+        run!(C::Focus {
+            target: "draft".into()
+        });
+        assert!(focused!("draft"));
+        run!(C::FocusNext);
+        assert!(focused!("second"));
+        run!(C::FocusPrevious);
+        assert!(focused!("draft"));
+        let untouched = view_tree::execute_widget_command(
+            C::Focused {
+                target: "draft".into(),
+            },
+            |operation| sibling.operate(&renderer, operation),
+        )
+        .unwrap();
+        assert!(
+            !wire::decode::<bool>(&untouched).unwrap(),
+            "a same-key sibling guest must not change"
+        );
+        for (command, expected) in [
+            (
+                C::CursorFront {
+                    target: "draft".into(),
+                },
+                "Xabcd",
+            ),
+            (
+                C::CursorEnd {
+                    target: "draft".into(),
+                },
+                "abcdX",
+            ),
+            (
+                C::Cursor {
+                    target: "draft".into(),
+                    position: 2,
+                },
+                "abXcd",
+            ),
+            (
+                C::SelectAll {
+                    target: "draft".into(),
+                },
+                "X",
+            ),
+            (
+                C::Select {
+                    target: "draft".into(),
+                    start: 1,
+                    end: 3,
+                },
+                "aXd",
+            ),
+        ] {
+            ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            run!(C::Focus {
+                target: "draft".into()
+            });
+            run!(command);
+            let mut output = Vec::new();
+            ui.update(
+                &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character("X".into()),
+                    modified_key: iced::keyboard::Key::Character("X".into()),
+                    physical_key: iced::keyboard::key::Physical::Unidentified(
+                        iced::keyboard::key::NativeCode::Unidentified,
+                    ),
+                    location: iced::keyboard::Location::Standard,
+                    modifiers: Default::default(),
+                    text: Some("X".into()),
+                    repeat: false,
+                })],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut output,
+            );
+            assert!(
+                output
+                    .iter()
+                    .any(|output| matches!(output, Output::Edit { text, .. } if text == expected)),
+                "{output:?}"
+            );
+        }
+        struct Translation(Option<f32>);
+        impl Operation for Translation {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn iced::advanced::widget::operation::Scrollable,
+            ) {
+                if id == Some(&iced::widget::Id::from("list")) {
+                    self.0 = Some(translation.y);
+                }
+            }
+        }
+        for (command, expected) in [
+            (
+                C::ScrollTo {
+                    target: "list".into(),
+                    x: 0.0,
+                    y: 100.0,
+                },
+                100.0,
+            ),
+            (
+                C::ScrollBy {
+                    target: "list".into(),
+                    x: 0.0,
+                    y: -24.0,
+                },
+                76.0,
+            ),
+            (
+                C::Snap {
+                    target: "list".into(),
+                    x: 0.0,
+                    y: 0.5,
+                },
+                250.0,
+            ),
+            (
+                C::SnapEnd {
+                    target: "list".into(),
+                },
+                500.0,
+            ),
+            (
+                C::ScrollToKey {
+                    target: "list".into(),
+                    key: 3,
+                },
+                90.0,
+            ),
+        ] {
+            run!(command);
+            let mut position = Translation(None);
+            ui.operate(&renderer, &mut position);
+            assert_eq!(position.0, Some(expected));
+        }
+    }
+
+    #[test]
+    fn widget_requests_validate_scope_payload_budget_and_frame() {
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mut guest = Guest::load_from("pages", &path).unwrap();
+        guest.redraw(&None);
+        let target = guest.frame.root.as_ref().unwrap().key().unwrap().to_owned();
+        let command = wire::WidgetCommand::Focus {
+            target: target.clone(),
+        };
+        let request = |id, payload| wire::Request {
+            id,
+            kind: "host.widget".into(),
+            payload,
+        };
+        guest.pending.clear();
+        let mut trailing = wire::encode(&command);
+        trailing.push(0);
+        for payload in [
+            vec![255; 4],
+            trailing,
+            vec![0; MAX_PAYLOAD_BYTES + 1],
+            wire::encode(&wire::WidgetCommand::Focus {
+                target: "OtherGuest/draft".into(),
+            }),
+            wire::encode(&wire::WidgetCommand::Focus {
+                target: "x".repeat(wire::MAX_STRING_BYTES + 1),
+            }),
+            wire::encode(&wire::WidgetCommand::ScrollBy {
+                target: target.clone(),
+                x: f32::NAN,
+                y: 0.0,
+            }),
+        ] {
+            guest.answer(request(99, payload), &None);
+            assert!(guest.widget_commands.is_empty());
+            assert!(matches!(
+                guest.pending.pop(),
+                Some(wire::Event::Response { result: Err(_), .. })
+            ));
+        }
+        for id in 0..MAX_REQUESTS_PER_TICK as u64 {
+            guest.answer(request(id, wire::encode(&command)), &None);
+        }
+        assert_eq!(guest.widget_commands.len(), MAX_REQUESTS_PER_TICK);
+        assert!(!guest.settled(), "native commands hold snapshot admission");
+        guest.answer(request(999, wire::encode(&command)), &None);
+        assert!(matches!(
+            guest.pending.pop(),
+            Some(wire::Event::Response { result: Err(_), .. })
+        ));
+        // A staged cancellation is routed before any mounted traversal.
+        guest.staged = true;
+        guest.frame.cancels = vec![0];
+        guest.redraw(&None);
+        assert!(!guest.widget_commands.iter().any(|(id, _, _)| *id == 0));
+        guest.frame_rev += 1;
+        guest.execute_widget_commands(|_| panic!("old-frame commands must not touch native state"));
+        assert!(guest.widget_commands.is_empty());
+        assert!(
+            guest
+                .pending
+                .iter()
+                .all(|event| matches!(event, wire::Event::Response { result: Err(_), .. }))
+        );
+    }
+
+    #[test]
+    fn pages_links_follow_actual_mounted_editor_focus() {
+        let _turn = blocking_connection_turn();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let mounted = fresh("pages");
+        pages_document::source_changed();
+        let connection = connection().lock().unwrap().rev;
+        let line = "[작업 보기](duck://agents/runs/abc)";
+        let original = "Title\n[작업 보기](duck://agents/runs/abc)";
+        let source = pages_document::source(connection, "network-a", "alpha", original).unwrap();
+        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
+        facts["document_source"] = serde_json::json!(source);
+        {
+            let mut seat = mounted.lock().unwrap();
+            seat.props = Some(serde_json::to_vec(&facts).unwrap());
+            seat.slot = Slot::Ready(Box::new(Guest::load_from("pages", &path).unwrap()));
+        }
+        use iced::advanced::renderer::Headless;
+        use iced_test::runtime::{UserInterface, user_interface};
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let mut ui = UserInterface::build(
+            drawn("pages"),
+            Size::new(1100.0, 700.0),
+            user_interface::Cache::default(),
+            &mut renderer,
+        );
+        let mut pointer = mouse::Cursor::Unavailable;
+        macro_rules! frame {
+            ($event:expr) => {{
+                let mut output = Vec::new();
+                ui.update(
+                    &[$event],
+                    pointer,
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut output,
+                );
+                assert!(
+                    output.iter().all(|event| event.kind == "edited"),
+                    "focus must not navigate: {output:?}"
+                );
+            }};
+        }
+        macro_rules! drain {
+            () => {{
+                loop {
+                    frame!(Event::Window(
+                        window::Event::RedrawRequested(Instant::now())
+                    ));
+                    let seat = mounted.lock().unwrap();
+                    let Slot::Ready(guest) = &seat.slot else {
+                        panic!("Pages unmounted")
+                    };
+                    assert!(guest.fault.is_none(), "{:?}", guest.fault);
+                    if guest.settled()
+                        && !guest.frame.busy
+                        && !guest.inputs.editor_transactions_pending()
+                    {
+                        break;
+                    }
+                }
+            }};
+        }
+        let visible = || {
+            let seat = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &seat.slot else {
+                panic!("Pages unmounted")
+            };
+            let mut visible = String::new();
+            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
+                if let wire::Node::Editor { key, options, .. } = node {
+                    assert_eq!(guest.inputs.editor_document(key).unwrap().text(), original);
+                    let paint = options.presentation.as_ref().unwrap();
+                    visible = paint
+                        .spans
+                        .iter()
+                        .filter(|span| span.line == 1)
+                        .filter(|span| {
+                            paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0
+                        })
+                        .map(|span| &line[span.start as usize..span.end as usize])
+                        .collect();
+                }
+            });
+            visible
+        };
+        drain!();
+        assert_eq!(visible(), "작업 보기");
+        struct EditorBounds(Option<Rectangle>);
+        impl Operation for EditorBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let mut bounds = EditorBounds(None);
+        ui.operate(&renderer, &mut bounds);
+        let bounds = bounds.0.expect("the actual Pages editor is mounted");
+        for (point, expected) in [
+            (iced::Point::new(bounds.x + 40.0, bounds.y + 44.0), line),
+            (
+                iced::Point::new(bounds.x + 40.0, bounds.y - 10.0),
+                "작업 보기",
+            ),
+            (iced::Point::new(bounds.x + 40.0, bounds.y + 44.0), line),
+        ] {
+            let cursor_before = {
+                let seat = mounted.lock().unwrap();
+                let Slot::Ready(guest) = &seat.slot else {
+                    panic!("Pages unmounted")
+                };
+                guest
+                    .inputs
+                    .editor_document("PagesView/root/pages/document")
+                    .unwrap()
+                    .reference()
+                    .cursor
+            };
+            pointer = mouse::Cursor::Available(point);
+            frame!(Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left
+            )));
+            frame!(Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left
+            )));
+            drain!();
+            assert_eq!(visible(), expected);
+            let blurred = expected == "작업 보기";
+            if blurred {
+                let seat = mounted.lock().unwrap();
+                let Slot::Ready(guest) = &seat.slot else {
+                    panic!("Pages unmounted")
+                };
+                assert_eq!(
+                    guest
+                        .inputs
+                        .editor_document("PagesView/root/pages/document")
+                        .unwrap()
+                        .reference()
+                        .cursor,
+                    cursor_before,
+                    "concealing Markdown must not move the cursor"
+                );
+            }
+        }
+        // A newer pending projection must be consumed before an older native
+        // command. Otherwise that command can steal focus before being cancelled.
+        pointer = mouse::Cursor::Available(iced::Point::new(bounds.x + 40.0, bounds.y - 10.0));
+        frame!(Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left
+        )));
+        frame!(Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left
+        )));
+        drain!();
+        {
+            let mut seat = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &mut seat.slot else {
+                panic!("Pages unmounted")
+            };
+            guest.answer(
+                wire::Request {
+                    id: 9999,
+                    kind: "host.widget".into(),
+                    payload: wire::encode(&wire::WidgetCommand::Focus {
+                        target: "PagesView/root/pages/document".into(),
+                    }),
+                },
+                &None,
+            );
+            facts["active_page_title"] = "Renamed".into();
+            seat.props = Some(serde_json::to_vec(&facts).unwrap());
+        }
+        frame!(Event::Window(
+            window::Event::RedrawRequested(Instant::now())
+        ));
+        {
+            let seat = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &seat.slot else {
+                panic!("Pages unmounted")
+            };
+            assert!(
+                guest.widget_commands.iter().any(|(id, _, _)| *id == 9999),
+                "a command executed before the pending projection changed its frame"
+            );
+        }
+        frame!(Event::Window(
+            window::Event::RedrawRequested(Instant::now())
+        ));
+        {
+            let seat = mounted.lock().unwrap();
+            let Slot::Ready(guest) = &seat.slot else {
+                panic!("Pages unmounted")
+            };
+            assert!(
+                guest.pending.iter().any(|event| matches!(
+                    event,
+                    wire::Event::Response {
+                        id: 9999,
+                        result: Err(_),
+                        ..
+                    }
+                )),
+                "the old frame's focus request must be refused"
+            );
+        }
+        let focused = view_tree::execute_widget_command(
+            wire::WidgetCommand::Focused {
+                target: "PagesView/root/pages/document".into(),
+            },
+            |operation| ui.operate(&renderer, operation),
+        )
+        .unwrap();
+        assert!(
+            !wire::decode::<bool>(&focused).unwrap(),
+            "the stale request stole native focus"
+        );
+        drain!();
+    }
+
+    #[test]
     fn pages_document_source_edit_restore_rejects_the_previous_instance_intent() {
         let _turn = blocking_connection_turn();
         let path = staged("pages").expect("actual Pages Wasm is required");
@@ -6606,6 +7583,11 @@ pub(crate) mod tests {
             let Slot::Ready(old) = &mut locked.slot else {
                 unreachable!()
             };
+            settle(old, &props);
+            // This source/restore test owns a real native tree separately from
+            // ModuleView; drain its host operations before snapshot admission.
+            assert!(!old.inputs.editor_transactions_pending());
+            old.execute_widget_commands(|operation| ui.operate(&renderer, operation));
             settle(old, &props);
             assert!(old.settled(), "notification left a pending task");
             let reference = old.inputs.editor_document(&editor_key).unwrap().reference();
