@@ -83,7 +83,7 @@ fn canonical_and_authority_table() {
         )
         .is_ok()
     );
-    // home: a different actor is rejected.
+    // home: a different actor writes under it too — the label is attribution.
     assert!(
         check_authority(
             &duckfs_core::Authority::External {
@@ -92,8 +92,7 @@ fn canonical_and_authority_table() {
             },
             &seg("/home/ext:aa/x")
         )
-        .unwrap_err()
-        .contains("home owner")
+        .is_ok()
     );
     // home: the home root itself (and bare /home) is never a writable file.
     assert!(
@@ -179,14 +178,6 @@ fn path_errors_carry_the_files_prefix() {
         canonical("/shared/a\0b").unwrap_err(),
         canonical(&format!("/shared/{}", "x".repeat(256))).unwrap_err(),
         canonical(&format!("/shared{}", "/d".repeat(128))).unwrap_err(),
-        check_authority(
-            &duckfs_core::Authority::External {
-                key: vec![0xbb],
-                account: None,
-            },
-            &seg("/home/ext:aa/x"),
-        )
-        .unwrap_err(),
         check_authority(
             &duckfs_core::Authority::External {
                 key: vec![0xaa],

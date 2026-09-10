@@ -518,8 +518,6 @@ async fn advance(
 pub async fn acknowledge(
     staged: &mut StagedStore,
     ctx: &dyn Ctx,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     tasks_id: &str,
     conversation_id: String,
@@ -554,19 +552,14 @@ pub async fn acknowledge(
         })?;
     // ONLY the currently authorized binding advances the record. a stale
     // service may report history for inspection; it cannot overwrite this.
+    // the credential names the binding the receipt is for, not the caller:
+    // any authenticated member reports under the live one.
     if binding.detached || binding.credential != binding_credential {
         return Err(Error::Module(format!(
             "binding credential {binding_credential} is stale; the current one is {}{}",
             binding.credential,
             if binding.detached { " (detached)" } else { "" }
         )));
-    }
-    let recipient = live_participant(staged, &receipt.recipient).await?;
-    let by_owner = crate::controls(&recipient.owner, actor, origin);
-    if !(by_owner || authenticates(origin, &binding.principal)) {
-        return Err(Error::Module(
-            "only the bound service key or the participant's owner may acknowledge".into(),
-        ));
     }
     // EXPIRY IS THE DEADLINE'S, NOT A REPORTER'S. `expire` is permissionless
     // precisely because it checks the clock — every caller asking gets the same
@@ -650,18 +643,13 @@ pub async fn expire(
 /// admitted as a new message after their body is pruned.
 pub async fn prune(
     staged: &mut StagedStore,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     conversation_id: String,
     through_seq: u64,
 ) -> Result<u64, Error> {
+    // any authenticated member prunes any conversation; the floor only ever
+    // rises, so a prune is idempotent whoever asks for it.
     let mut conversation = require_conversation(staged, &conversation_id).await?;
-    if !crate::controls(&conversation.owner, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the owner may prune conversation {conversation_id}"
-        )));
-    }
     if through_seq <= conversation.floor_seq {
         return Err(Error::Module(format!(
             "through_seq {through_seq} is at or below the floor {}",

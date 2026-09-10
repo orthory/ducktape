@@ -2297,13 +2297,12 @@ fn get(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
-/// a scripted files actor with REAL pin ownership: decodes `FilesMsg::Pin`/
-/// `Unpin` off the submit payload and enforces the ONE rule `Fs::unpin_apply`
-/// carries (only the creator, keyed on the verified signer, may release a
-/// pin) — the piece [`spawn_files_actor`]'s canned replies don't need to
-/// model, and the one #1865 turns on: the name has to survive the wire
-/// (client encode -> signed JSON body -> axum decode -> module msg decode)
-/// byte-for-byte for the owner check to key on the right entry at all.
+/// a scripted files actor with a REAL pin table: decodes `FilesMsg::Pin`/
+/// `Unpin` off the submit payload and releases a pin by its exact name, as
+/// `Fs::unpin_apply` does — the piece [`spawn_files_actor`]'s canned replies
+/// don't model. the name has to survive the wire (client encode -> signed
+/// JSON body -> axum decode -> module msg decode) byte-for-byte for the
+/// release to find its entry at all.
 fn spawn_pin_actor(
     mut cmds: futures::channel::mpsc::Receiver<NodeCommand>,
     pins: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
@@ -2344,13 +2343,9 @@ fn spawn_pin_actor(
                         }
                         FilesMsg::Unpin { name } => {
                             let mut names = pins.lock().unwrap();
-                            match names.get(&name) {
+                            match names.remove(&name) {
                                 None => Err("files: pin not found".to_string()),
-                                Some(owner) if *owner == origin => {
-                                    names.remove(&name);
-                                    Ok(())
-                                }
-                                Some(_) => Err("files: only the pin owner may unpin".to_string()),
+                                Some(_) => Ok(()),
                             }
                         }
                         other => panic!("unexpected files msg: {other:?}"),
@@ -2366,14 +2361,13 @@ fn spawn_pin_actor(
     });
 }
 
-/// the regression the wire-shape change exists for (#1865): every legal pin
-/// name — including `.`/`..`, which `url` collapses as dot-segments, and a
-/// slash, which splits a path — survives `POST /v1/files/unpin`'s signed JSON
-/// body unmangled, and the module's owner gate keys on that exact name: a
-/// different signer's unpin is refused verbatim, the pin survives the refusal,
-/// and the real owner's unpin (same name, same shape) removes it.
+/// every legal pin name — including `.`/`..`, which `url` collapses as
+/// dot-segments, and a slash, which splits a path — survives
+/// `POST /v1/files/unpin`'s signed JSON body unmangled: a release by another
+/// signer finds the pin by that exact name and removes it, and a second
+/// release of the same name is the module's verbatim "pin not found".
 #[tokio::test]
-async fn unpin_over_http_takes_every_legal_pin_name_and_is_owner_gated() {
+async fn unpin_over_http_takes_every_legal_pin_name() {
     for name in [".", "..", "a/b", "café-🦆"] {
         let (handle, cmd_rx, _events) = local_node();
         let pins = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
@@ -2391,8 +2385,8 @@ async fn unpin_over_http_takes_every_legal_pin_name_and_is_owner_gated() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "pin {name:?} failed");
 
-        // a different signer's unpin reaches the module intact and is refused
-        // by name, not garbled by a route the wire never touches anymore.
+        // another signer's unpin reaches the module intact and releases the
+        // pin by name, not garbled by a route the wire never touches anymore.
         let unpin_body = serde_json::json!({ "name": name });
         let response = app
             .clone()
@@ -2406,16 +2400,14 @@ async fn unpin_over_http_takes_every_legal_pin_name_and_is_owner_gated() {
             .unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::BAD_REQUEST,
-            "a non-owner's unpin {name:?} must be refused"
+            StatusCode::OK,
+            "another signer's unpin {name:?} failed"
         );
-        let body = body_json(response).await;
-        assert_eq!(body["error"], "files: only the pin owner may unpin");
 
         let refs = body_json(app.clone().oneshot(get("/v1/files/refs")).await.unwrap()).await;
         assert!(
-            refs["pins"].get(name).is_some(),
-            "pin {name:?} must survive a refused unpin"
+            refs["pins"].get(name).is_none(),
+            "pin {name:?} must be gone once anyone unpins it"
         );
 
         let response = app
@@ -2423,13 +2415,13 @@ async fn unpin_over_http_takes_every_legal_pin_name_and_is_owner_gated() {
             .oneshot(signed_by(&owner, "POST", "/v1/files/unpin", unpin_body))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "owner unpin {name:?} failed");
-
-        let refs = body_json(app.oneshot(get("/v1/files/refs")).await.unwrap()).await;
-        assert!(
-            refs["pins"].get(name).is_none(),
-            "pin {name:?} must be gone once the owner unpins it"
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a second unpin of {name:?} must find nothing"
         );
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "files: pin not found");
     }
 }
 

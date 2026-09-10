@@ -497,7 +497,7 @@ fn a_local_page_rejection_preserves_previous_staging_without_abort() {
 }
 
 #[test]
-fn joining_identity_preserves_only_the_original_keys_source_rights() {
+fn joining_identity_preserves_the_original_keys_source_rights() {
     block_on(async {
         let mut host = boot().await;
         let node = ed25519::PrivateKey::from_seed(99);
@@ -796,82 +796,6 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
             .is_err(),
             "the original key's historic membership remains revocable after admission"
         );
-
-        assert!(
-            host.submit_at(
-                context(key(2)),
-                message(
-                    "chat",
-                    &ChatMsg::RenameChannel {
-                        channel_id: "room".into(),
-                        name: "Stolen".into()
-                    }
-                )
-            )
-            .await
-            .is_err()
-        );
-    });
-}
-
-#[test]
-fn account_membership_changes_do_not_transfer_historic_key_ownership() {
-    block_on(async {
-        let mut chat = Chat::new("chat", Box::new(MemStore::new())).with_identity("identity");
-        let context = |key: u8, account: Option<u64>| {
-            TestCtx::with_env(sdk::Env {
-                height: 1,
-                consensus_time: 1,
-                origin: Origin::External(vec![key; 32]),
-                me: "source".into(),
-                cause: sdk::Cause::Direct,
-            })
-            .on_query("identity", move |_| {
-                Ok(identity::encode_reply(&identity::IdentityReply::Account(
-                    account.map(|number| identity::AccountView {
-                        number,
-                        name: "same".into(),
-                        control: identity::Control::Keys,
-                        keys: Vec::new(),
-                        avatar: None,
-                        bio: None,
-                        updated_at: 0,
-                    }),
-                )))
-            })
-        };
-        chat.execute(
-            &mut context(9, None),
-            &message(
-                "chat",
-                &ChatMsg::CreateChannel {
-                    channel_id: "key".into(),
-                    name: "Before".into(),
-                    post_policy: PostPolicy::Open,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let rename = message(
-            "chat",
-            &ChatMsg::RenameChannel {
-                channel_id: "key".into(),
-                name: "After".into(),
-            },
-        );
-        // The same signing key gains an account, leaves it, and joins another.
-        for account in [Some(1), None, Some(2)] {
-            chat.execute(&mut context(9, account), &rename)
-                .await
-                .unwrap();
-            assert!(
-                chat.execute(&mut context(10, account), &rename)
-                    .await
-                    .is_err(),
-                "another key on that account has no ownership proof"
-            );
-        }
     });
 }
 

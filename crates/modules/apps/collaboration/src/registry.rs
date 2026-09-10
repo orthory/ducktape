@@ -11,12 +11,12 @@
 
 use sdk::{Error, Origin, StagedStore};
 
+use crate::Party;
 use crate::interface::{
     Binding, BoundPrincipal, Conversation, Credential, EventBody, Participant, Role,
     MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_ROSTER, MAX_SERVICE_KEY_BYTES,
 };
 use crate::store;
-use crate::{controls, Party};
 
 /// ids are compared byte-for-byte everywhere, so an empty or oversized one is
 /// refused at the boundary rather than stored.
@@ -166,17 +166,12 @@ pub async fn register_participant(
 
 pub async fn revoke_participant(
     staged: &mut StagedStore,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     participant_id: String,
 ) -> Result<(), Error> {
     let mut participant = live_participant(staged, &participant_id).await?;
-    if !controls(&participant.owner, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the owner may revoke participant {participant_id}"
-        )));
-    }
+    // any authenticated member revokes any participant; the owner is who
+    // registered it, not a consent the revocation needs.
     // one flag retires EVERY credential at once — the owner's and each
     // binding's. the allocator is left where it is, so no retired number can
     // be handed out again if the id is ever seated afresh.
@@ -237,19 +232,14 @@ pub struct Advanced {
 
 pub async fn set_roster(
     staged: &mut StagedStore,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     conversation_id: String,
     participant_id: String,
     role: Option<Role>,
 ) -> Result<Advanced, Error> {
+    // any authenticated member edits any roster; the conversation's owner is
+    // attribution, not the roster's editor.
     let mut conversation = require_conversation(staged, &conversation_id).await?;
-    if !controls(&conversation.owner, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the owner may edit conversation {conversation_id}"
-        )));
-    }
     let revoking = role.is_none();
     if revoking {
         if !conversation.roster.contains_key(&participant_id) {
@@ -342,8 +332,6 @@ async fn current_credential(
 #[allow(clippy::too_many_arguments)]
 pub async fn bind(
     staged: &mut StagedStore,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     conversation_id: String,
     participant_id: String,
@@ -354,13 +342,10 @@ pub async fn bind(
     check_label("device", &device)?;
     check_principal(&principal)?;
     let mut participant = live_participant(staged, &participant_id).await?;
-    // the OWNER issues the scoped credential. a service cannot promote itself,
-    // and cannot mint a second credential for its own key.
-    if !controls(&participant.owner, actor, origin) {
-        return Err(Error::Module(format!(
-            "only the owner may bind participant {participant_id}"
-        )));
-    }
+    // any authenticated member issues the scoped credential, a service key
+    // for itself included. what the binding authorizes is the PRINCIPAL it
+    // names, never its issuer; the credential CAS below is what keeps one
+    // binding per participant per conversation.
     let mut conversation = require_conversation(staged, &conversation_id).await?;
     if roster_role(&conversation, &participant_id).is_none() {
         return Err(Error::Module(format!(
@@ -424,28 +409,21 @@ pub async fn bind(
 
 pub async fn unbind(
     staged: &mut StagedStore,
-    actor: &Party,
-    origin: &Origin,
     now: u64,
     conversation_id: String,
     participant_id: String,
     expected_credential: Credential,
 ) -> Result<Advanced, Error> {
-    let participant = store::participant(staged, &participant_id)
-        .await?
-        .ok_or_else(|| Error::Module(format!("no participant {participant_id}")))?;
+    // any authenticated member releases any binding, naming the credential it
+    // releases; a revoked participant's bindings stay releasable.
+    if store::participant(staged, &participant_id).await?.is_none() {
+        return Err(Error::Module(format!("no participant {participant_id}")));
+    }
     let Some(mut binding) = store::binding(staged, &conversation_id, &participant_id).await? else {
         return Err(Error::Module(format!(
             "participant {participant_id} has no binding on {conversation_id}"
         )));
     };
-    let by_owner = controls(&participant.owner, actor, origin);
-    let by_service = !binding.detached && authenticates(origin, &binding.principal);
-    if !(by_owner || by_service) {
-        return Err(Error::Module(
-            "only the owner or the bound principal may unbind".into(),
-        ));
-    }
     if expected_credential != binding.credential {
         return Err(Error::Module(format!(
             "binding credential is {}, not the expected {expected_credential}",
