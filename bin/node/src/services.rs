@@ -890,8 +890,8 @@ struct Catalog {
 /// The services signaling to the workspace's own node. A node that is not
 /// running is NOT an error here: nothing signaling is exactly what `list` must
 /// render, and the grants still come off disk.
-fn catalog_now(workspace: &Path) -> Catalog {
-    match read_catalog(workspace) {
+fn catalog_now(base: &str) -> Catalog {
+    match read_catalog(base) {
         Ok(catalog) => catalog,
         // A node that is not running is the ordinary case — `list` must still
         // render the grants — so it stays quiet. Anything else (a 404, a 500,
@@ -909,10 +909,9 @@ fn catalog_now(workspace: &Path) -> Catalog {
     }
 }
 
-fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailure> {
+fn read_catalog(base: &str) -> Result<Catalog, crate::node_http::ReadFailure> {
     use crate::node_http::ReadFailure;
-    let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
-    let body = crate::node_http::get_json(&base, "/v1/services")?;
+    let body = crate::node_http::get_json(base, "/v1/services")?;
     let signaling = body
         .get("signaling")
         .ok_or_else(|| ReadFailure::Rejected("/v1/services carries no `signaling` field".into()))?;
@@ -927,7 +926,11 @@ fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailu
 fn view(args: &ReadArgs) -> Result<(Vec<ServiceRow>, Option<String>), Box<dyn std::error::Error>> {
     let workspace = args.workspace.dir()?;
     let grants = load(&workspace)?;
-    let catalog = catalog_now(&workspace);
+    let service = config::resolve_service(&args.workspace.config_file()?)?;
+    let catalog = match service.http_listen.as_deref() {
+        Some(listen) => catalog_now(&config::http_base_of(listen)),
+        None => Catalog::default(),
+    };
     let all = rows(&catalog.signaling, &grants.grants);
     Ok((only_kind(all, args.kind.as_deref())?, catalog.node_build))
 }
@@ -1063,12 +1066,16 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
+    let listen = service
+        .http_listen
+        .as_deref()
+        .ok_or("this node serves no http surface")?;
     plan_enable_from(
         workspace,
         kind,
         service,
         node_id,
-        catalog_now(workspace).signaling,
+        catalog_now(&config::http_base_of(listen)).signaling,
     )
 }
 
@@ -1234,7 +1241,7 @@ pub(crate) fn commit_enable(
     // can produce, and this is a subset of it.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &catalog_now(workspace).signaling,
+        &catalog_now(base).signaling,
         &plan.capacity,
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
@@ -2051,7 +2058,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     // which `Services::validate` prevents on load.
     let announce = crate::announce::announced_set(
         &services.grants,
-        &catalog_now(&workspace).signaling,
+        &catalog_now(&base).signaling,
         &service.sandbox_capacity,
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
@@ -2094,6 +2101,30 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn enable_reads_the_resolved_node_without_a_workspace_config() {
+        use std::io::{Read, Write};
+        let (dir, mut service) = planning_workspace(&[]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        service.http_listen = Some(listener.local_addr().unwrap().to_string());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(
+                std::str::from_utf8(&request[..count])
+                    .unwrap()
+                    .starts_with("GET /v1/services ")
+            );
+            let body = serde_json::json!({"signaling": [hello_offering("compute", &["claude"])], "build": "test"}).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        assert!(!dir.path().join("node.toml").exists());
+        let plan = plan_enable(dir.path(), "compute", &service, [1; 32]).unwrap();
+        assert_eq!(plan.grant.capabilities, ["claude"]);
+        server.join().unwrap();
+    }
 
     /// A daemon used to compute its hello ONCE and re-send it verbatim until
     /// the process was restarted, so `ducktape agent install`/uninstall on a
