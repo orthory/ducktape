@@ -75,7 +75,12 @@ pub struct FsHistory {
     pub snapshots: Vec<FsSnapshot>,
 }
 
-/// List one duckfs directory (committed head), name order.
+/// List one duckfs directory (committed head), name order — EVERY page of
+/// it. The node answers `ls` a page at a time (256 entries, then a `next`
+/// cursor to echo as `after`); the browser shows the whole directory, so the
+/// pages are walked here and a directory of 300 children lists 300, not 256.
+/// A page that fails after the first is the listing failing: a partial
+/// directory presented as complete hides files.
 pub async fn files_ls(
     rpc: String,
     path: String,
@@ -84,7 +89,7 @@ pub async fn files_ls(
     async {
         let rpc = rpc_client(&rpc)?;
         let listed = rpc.files_get("ls", &[("path", path.as_str())]).await;
-        let reply = match listed {
+        let mut reply = match listed {
             Ok(reply) => reply,
             // A CLIENT reads an uncommitted path as an empty directory, not
             // an error: a fresh workspace has no `/shared` until something
@@ -104,9 +109,17 @@ pub async fn files_ls(
                 });
             }
         };
+        let mut entries = fs_entries(&reply);
+        while let Some(after) = reply["next"].as_str().map(str::to_owned) {
+            reply = rpc
+                .files_get("ls", &[("path", path.as_str()), ("after", after.as_str())])
+                .await
+                .map_err(|error| -> String { error.into() })?;
+            entries.extend(fs_entries(&reply));
+        }
         Ok(FsListing {
             generation,
-            entries: fs_entries(&reply),
+            entries,
             path,
         })
     }
@@ -182,7 +195,7 @@ async fn files_text(rpc: &RpcClient, path: String, generation: i64) -> Result<Fs
         .await?;
     let b64 = reply["b64"].as_str().unwrap_or_default();
     let eof = reply["eof"].as_bool().unwrap_or(true);
-    let bytes = base64_decode(b64).unwrap_or_default();
+    let bytes = base64_decode(b64).ok_or("The node's read page is not valid base64")?;
     let (text, binary) = match String::from_utf8(bytes.clone()) {
         Ok(text)
             if !text
@@ -265,7 +278,8 @@ pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option
                 ],
             )
             .await?;
-        let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
+        let page = base64_decode(reply["b64"].as_str().unwrap_or_default())
+            .ok_or("The node's read page is not valid base64")?;
         let eof = reply["eof"].as_bool().unwrap_or(true);
         bytes.extend_from_slice(&page);
         let past_cap = bytes.len() > MAX_PICTURE_BYTES;
@@ -538,23 +552,20 @@ pub async fn files_diff(
     })
 }
 
+/// The files read lane's wire: standard alphabet, padded — the same engine
+/// duckfs-core encodes with, so both ends share one reading of a byte.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut acc = 0u32;
-        for (i, byte) in chunk.iter().enumerate() {
-            acc |= u32::from(*byte) << (16 - 8 * i);
-        }
-        for i in 0..4 {
-            let live = i * 6 < chunk.len() * 8 + 6 && i <= chunk.len();
-            match live {
-                true => out.push(TABLE[((acc >> (18 - 6 * i)) & 0x3f) as usize] as char),
-                false => out.push('='),
-            }
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decode a `b64` page. `None` is a MALFORMED page — bad padding, trailing
+/// bits, a character off the alphabet — and a caller treats it as the read
+/// failing, never as an empty file: a node that answered garbage did not
+/// answer nothing.
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 /// A child path under the current directory (`/` is the root, never "").
@@ -585,30 +596,6 @@ pub fn files_write_gate(dir: String, me: String) -> String {
         Ok(()) => String::new(),
         Err(reason) => reason.trim_start_matches("files: ").to_string(),
     }
-}
-
-/// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
-pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let value = |c: u8| TABLE.iter().position(|t| *t == c).map(|i| i as u32);
-    let clean: Vec<u8> = input.bytes().filter(|b| !b" \n\r\t".contains(b)).collect();
-    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks(4) {
-        let mut acc = 0u32;
-        let mut bits = 0u32;
-        for byte in chunk {
-            if *byte == b'=' {
-                break;
-            }
-            acc = (acc << 6) | value(*byte)?;
-            bits += 6;
-        }
-        while bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
 }
 
 /// The breadcrumb path one level up. The root is `/` — duckfs only accepts

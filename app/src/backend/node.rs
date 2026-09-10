@@ -1179,11 +1179,7 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
             .iter()
             .map(|agent| (agent.id.clone(), agent.name.clone()))
             .collect();
-        let runs = recent
-            .unwrap_or_default()
-            .into_iter()
-            .map(|run| run_row(run, &names_by_id))
-            .collect();
+        let runs = run_rows(&client, recent.unwrap_or_default(), &names_by_id).await;
         Ok(AgentsData {
             generation,
             agents,
@@ -1272,12 +1268,14 @@ pub struct RunRow {
 }
 
 /// One journal entry of the run the reader opened.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct JournalEntry {
     /// the commit height, rendered
     pub height: String,
     pub kind: String,
     pub summary: String,
+    pub status: String,
+    pub targets: Vec<RunLink>,
 }
 
 /// One place a run touched, as the chip the run panel draws: where it was
@@ -1380,19 +1378,19 @@ async fn run_link(
         url,
     };
     match place {
-        RunPlace::ChatMessage { channel_id, seq } => link(
-            "chat",
-            format!("#{channel_id} · msg {seq}"),
-            duck_channel_message_link(channel_id, height_i64(seq), chain.to_owned()),
-        ),
-        RunPlace::Channel { channel_id } => link(
-            "chat",
-            format!("#{channel_id}"),
-            duck_channel_link(channel_id, chain.to_owned()),
-        ),
+        RunPlace::ChatMessage { channel_id, seq } => {
+            let mut target = journal_chat_target(client, chain, channel_id, Some(seq), None).await;
+            target.relation = relation.into();
+            target
+        }
+        RunPlace::Channel { channel_id } => {
+            let mut target = journal_chat_target(client, chain, channel_id, None, None).await;
+            target.relation = relation.into();
+            target
+        }
         RunPlace::PageBlock { block_id } => match page_block_link(client, chain, &block_id).await {
             Ok(Some((label, url))) => link("page", label, url),
-            _ => link("page", format!("block {block_id}"), String::new()),
+            _ => link("page", "Page block unavailable".into(), String::new()),
         },
         RunPlace::PageThread { thread_id } => {
             let resolved = match view_thread_target(client, &thread_id).await {
@@ -1401,7 +1399,7 @@ async fn run_link(
             };
             match resolved {
                 Ok(Some((label, url))) => link("page", label, url),
-                _ => link("page", format!("thread {thread_id}"), String::new()),
+                _ => link("page", "Page discussion unavailable".into(), String::new()),
             }
         }
         RunPlace::Page { page_id, title } => link(
@@ -1409,20 +1407,30 @@ async fn run_link(
             chip_label(&title),
             duck_page_link(page_id, chain.to_owned()),
         ),
-        RunPlace::Job { job_id } => link("job", format!("job {job_id}"), String::new()),
-        RunPlace::Task { task_id } => link("task", format!("task {task_id}"), String::new()),
+        RunPlace::Job { .. } => link("job", "Job discussion".into(), String::new()),
+        RunPlace::Task { task_id } => {
+            let reply: Result<tasks::WorkReply, _> = client
+                .query(
+                    "tasks",
+                    &tasks::WorkQuery::Task(tasks::TaskQuery::Get { task_id }),
+                )
+                .await;
+            let label = match reply {
+                Ok(tasks::WorkReply::Task(tasks::TaskReply::Task(Some(task)))) => task.title,
+                _ => "Task".into(),
+            };
+            link("task", label, String::new())
+        }
         RunPlace::File { path } => link("file", chip_label(&path), String::new()),
         RunPlace::Module { module_id } => {
             link("module", format!("module {module_id}"), String::new())
         }
-        RunPlace::Conversation { conversation_id } => link(
-            "conversation",
-            chip_label(&format!("conversation {conversation_id}")),
-            String::new(),
-        ),
+        RunPlace::Conversation { .. } => {
+            link("conversation", "Agent conversation".into(), String::new())
+        }
         RunPlace::Run { dispatch_id } => link(
             "run",
-            format!("run {}", short_pubkey(&dispatch_id)),
+            "Delegated run".into(),
             duck_run_link(dispatch_id, chain.to_owned()),
         ),
         RunPlace::ForgeItem { repo, number } => link(
@@ -1430,19 +1438,28 @@ async fn run_link(
             format!("{repo}#{number}"),
             duck_forge_item_link(repo, height_i64(number), chain.to_owned()),
         ),
-        RunPlace::Output { output_ref } => link("output", chip_label(&output_ref), String::new()),
+        RunPlace::Output { .. } => link("output", "Run output".into(), String::new()),
     }
 }
 
 /// Every chip of one run: its origin first, then each place its receipts
 /// touched in journal order.
-async fn run_links(client: &RpcClient, chain: &str, run: runs::index::RunView) -> Vec<RunLink> {
-    let mut links = Vec::with_capacity(run.places.len() + 1);
+async fn run_links(
+    client: &RpcClient,
+    chain: &str,
+    run: runs::index::RunView,
+    targets: &mut Vec<(JournalTarget, RunLink)>,
+) -> Vec<RunLink> {
+    let mut links = Vec::new();
     if let Some(origin) = run.origin {
-        links.push(run_link(client, chain, "from", origin).await);
+        let mut link = cached_journal_target(client, chain, journal_place(origin), targets).await;
+        link.relation = "from".into();
+        links.push(link);
     }
-    for place in run.places {
-        links.push(run_link(client, chain, "touched", place).await);
+    for place in run.places.into_iter().rev().take(128) {
+        let mut link = cached_journal_target(client, chain, journal_place(place), targets).await;
+        link.relation = "touched".into();
+        links.push(link);
     }
     links
 }
@@ -1453,9 +1470,9 @@ async fn run_links(client: &RpcClient, chain: &str, run: runs::index::RunView) -
 /// and a reconnect to the same endpoint is a different session — so a read
 /// started on network A, answering after the app moved to B with that same run
 /// open, would install A's journal under B. The fields below are what make the
-/// comparison identify the OPERATION rather than its subject, exactly as the
-/// messaging panel's do: `link` is the app's `connect_generation`, `account`
-/// the seated account, and `op` a fresh per-dispatch nonce.
+/// comparison identify the OPERATION rather than its subject: `link` is the
+/// app's `connect_generation`, `account` the seated account, and `op` a fresh
+/// per-dispatch nonce.
 #[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
 pub struct RunJournal {
     pub dispatch_id: String,
@@ -1501,18 +1518,18 @@ pub fn journal_in_scope(
 
 /// What a run answers, in the tracker's words.
 fn run_origin(
-    channel_id: &str,
+    _channel_id: &str,
     anchor_seq: u64,
     job_id: &Option<String>,
     delegation_id: &Option<String>,
 ) -> String {
-    if let Some(job_id) = job_id {
-        return format!("job {job_id}");
+    if job_id.is_some() {
+        return "Scheduled job".into();
     }
-    if let Some(delegation_id) = delegation_id {
-        return format!("called by a run · {delegation_id}");
+    if delegation_id.is_some() {
+        return "Agent delegation".into();
     }
-    format!("#{channel_id} · msg {anchor_seq}")
+    format!("Message {anchor_seq}")
 }
 
 fn outcome_word(outcome: runs::RunOutcome) -> &'static str {
@@ -1530,6 +1547,41 @@ fn height_i64(height: u64) -> i64 {
 /// The tracker's row for one journal run; `names` maps agent ids to the
 /// display names the register carries, and an agent the register does not
 /// list is named by its id.
+async fn run_rows(
+    client: &RpcClient,
+    runs: Vec<runs::index::RunView>,
+    names: &BTreeMap<String, String>,
+) -> Vec<RunRow> {
+    use ::chat::index::{ChatViewQuery, ChatViewReply};
+    let mut channels = BTreeMap::new();
+    let mut rows = Vec::with_capacity(runs.len());
+    for run in runs {
+        let chat_origin = matches!(run.origin, Some(runs::index::RunPlace::ChatMessage { .. }));
+        let channel = run.channel_id.clone();
+        if chat_origin && !channels.contains_key(&channel) {
+            let reply: Result<ChatViewReply, _> = client
+                .view(
+                    "chat",
+                    &ChatViewQuery::Channel {
+                        channel_id: channel.clone(),
+                    },
+                )
+                .await;
+            let name = match reply {
+                Ok(ChatViewReply::Channel(Some(info))) => Some(info.channel.name),
+                _ => None,
+            };
+            channels.insert(channel.clone(), name);
+        }
+        let mut row = run_row(run, names);
+        if let Some(Some(name)) = channels.get(&channel) {
+            row.origin = format!("#{name} · {}", row.origin);
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 fn run_row(run: runs::index::RunView, names: &BTreeMap<String, String>) -> RunRow {
     let agent_name = names
         .get(&run.agent_id)
@@ -1612,22 +1664,18 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
                 run_origin(&channel_id, anchor_seq, &job_id, &delegation_id)
             ),
         ),
-        runs::RunFact::SessionOpened { attempt, holder } => (
-            "session opened",
-            format!("on {} · attempt {attempt}", short_pubkey(&holder)),
-        ),
+        runs::RunFact::SessionOpened { attempt, .. } => {
+            ("session opened", format!("Attempt {attempt}"))
+        }
         runs::RunFact::Acted {
-            request_id,
-            lane,
-            operation,
-            result,
-        } => ("acted", action_summary(lane, &operation, &result, &request_id)),
+            operation, result, ..
+        } => ("action", action_description(&operation, &result)),
         runs::RunFact::Settled {
             outcome,
             reason,
             degraded,
-            executing_node,
-            output_ref,
+            executing_node: _,
+            output_ref: _,
             pr,
         } => {
             let mut parts = vec![outcome_word(outcome).to_string()];
@@ -1635,20 +1683,19 @@ fn journal_entry(row: runs::index::JournalRow) -> JournalEntry {
                 parts.push("degraded".into());
             }
             parts.extend(reason);
-            if executing_node != "unknown" {
-                parts.push(format!("on {}", short_pubkey(&executing_node)));
-            }
-            parts.extend(output_ref);
             parts.extend(pr.map(|pr| pr_label(&pr)));
             ("settled", parts.join(" · "))
         }
-        runs::RunFact::ResultActionRefused { request_id } => ("result action refused", request_id),
+        runs::RunFact::ResultActionRefused { .. } => {
+            ("result action refused", "Final action was refused".into())
+        }
         runs::RunFact::PrLinked { pr } => ("pr linked", pr_label(&pr)),
     };
     JournalEntry {
         height: height_label_short(height_i64(row.height)),
         kind: kind.into(),
         summary,
+        ..JournalEntry::default()
     }
 }
 
@@ -1656,39 +1703,526 @@ fn pr_label(pr: &runs::PrRef) -> String {
     format!("PR {}#{}", pr.repo, pr.number)
 }
 
-/// One staged action in the tracker's words: the operation, the lane that
-/// admitted it, what its receipt says it did, and the receipt id.
-fn action_summary(
-    lane: runs::LaneKind,
-    operation: &str,
-    result: &serde_json::Value,
-    request_id: &str,
-) -> String {
-    let lane = match lane {
-        runs::LaneKind::Live => "live",
-        runs::LaneKind::Final => "final",
-    };
-    let mut parts = vec![operation.to_string(), lane.to_string()];
-    receipt_leaves(result, &mut parts);
-    parts.push(request_id.to_string());
-    parts.join(" · ")
+/// The requested operation is independent of its execution status.
+fn action_description(operation: &str, result: &serde_json::Value) -> String {
+    use runs::*;
+    match operation {
+        OP_REACT => format!("React {}", receipt_text(result, "emoji")),
+        OP_UNREACT => format!("Remove reaction {}", receipt_text(result, "emoji")),
+        OP_REPLY => "Reply".into(),
+        OP_CHAT_POST_MESSAGE => "Post message".into(),
+        OP_PAGES_COMMENT => "Comment on page".into(),
+        OP_PAGES_SET_CHECKED => match result.get("checked").and_then(serde_json::Value::as_bool) {
+            Some(true) => "Check todo".into(),
+            Some(false) => "Uncheck todo".into(),
+            None => "Change todo".into(),
+        },
+        OP_PAGES_POST => "Publish page".into(),
+        OP_JOBS_COMMENT => "Comment on job".into(),
+        OP_TASKS_CREATE => "Create task".into(),
+        OP_TASKS_UPDATE_STATUS => format!(
+            "Move task to {}",
+            receipt_text(result, "status").replace('_', " ")
+        ),
+        OP_DUCKFS_WRITE_TEXT => "Write file".into(),
+        OP_MODULES_UPDATE => "Request module deployment".into(),
+        OP_FORGE_OPEN_PR | "forge" => "Open pull request".into(),
+        OP_COLLABORATION_SEND => "Send agent message".into(),
+        OP_COLLABORATION_ACKNOWLEDGE => "Acknowledge agent message".into(),
+        OP_AGENT_CALL => format!("Call {}", receipt_text(result, "callee_agent_id")),
+        OP_SUBMIT => format!("Submit to {}", receipt_text(result, "module")),
+        _ => "Module action".into(),
+    }
 }
 
-/// The scalar leaves of a receipt, each as `key value`, in key order; a
-/// nested object contributes its leaves under their own keys and a null
-/// leaf says nothing.
-fn receipt_leaves(value: &serde_json::Value, out: &mut Vec<String>) {
-    let serde_json::Value::Object(fields) = value else {
-        return;
-    };
-    for (key, value) in fields {
-        match value {
-            serde_json::Value::Null => {}
-            serde_json::Value::Object(_) => receipt_leaves(value, out),
-            serde_json::Value::String(text) => out.push(format!("{key} {text}")),
-            other => out.push(format!("{key} {other}")),
-        }
+fn receipt_text<'a>(result: &'a serde_json::Value, key: &str) -> &'a str {
+    result
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn action_status(status: &runs::ActionStatus) -> String {
+    use dispatch::CallOutcomeSummary;
+    use runs::ActionStatus;
+    match status {
+        ActionStatus::AwaitingProgram => "Queued".into(),
+        ActionStatus::Claimed { .. } => "Running".into(),
+        ActionStatus::Rejected { reason } => format!("Rejected: {reason}"),
+        ActionStatus::Completed { outcome, .. } => match outcome {
+            CallOutcomeSummary::Applied { .. } => "Completed".into(),
+            CallOutcomeSummary::Rejected { reason } => format!("Rejected: {reason}"),
+            CallOutcomeSummary::Refused(_) => "Refused".into(),
+            CallOutcomeSummary::Unrepresentable { .. } => "Outcome unavailable".into(),
+        },
     }
+}
+
+/// Exact target addresses come from the canonical prepared action, never its display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JournalTarget {
+    Chat {
+        channel: String,
+        seq: Option<u64>,
+    },
+    Message {
+        channel: String,
+        thread: Option<u64>,
+        id: String,
+    },
+    Place(runs::index::RunPlace),
+    ForgeRepository(String),
+    ForgeProposal {
+        repo: String,
+        source: String,
+        target: String,
+        candidates: Vec<u64>,
+    },
+    Label {
+        kind: &'static str,
+        label: String,
+    },
+}
+
+fn journal_place(place: runs::index::RunPlace) -> JournalTarget {
+    match place {
+        runs::index::RunPlace::ChatMessage { channel_id, seq } => JournalTarget::Chat {
+            channel: channel_id,
+            seq: Some(seq),
+        },
+        runs::index::RunPlace::Channel { channel_id } => JournalTarget::Chat {
+            channel: channel_id,
+            seq: None,
+        },
+        place => JournalTarget::Place(place),
+    }
+}
+
+async fn cached_journal_target(
+    client: &RpcClient,
+    chain: &str,
+    target: JournalTarget,
+    targets: &mut Vec<(JournalTarget, RunLink)>,
+) -> RunLink {
+    if let Some((_, link)) = targets.iter().find(|(key, _)| key == &target) {
+        return link.clone();
+    }
+    let link = resolve_journal_target(client, chain, target.clone()).await;
+    targets.push((target, link.clone()));
+    link
+}
+
+fn prepared_action_target(request: &runs::ActionRequestView) -> Option<JournalTarget> {
+    match request.target.as_str() {
+        "chat" => match serde_json::from_value::<::chat::ChatMsg>(request.payload.clone()).ok()? {
+            ::chat::ChatMsg::AddReaction {
+                channel_id, seq, ..
+            }
+            | ::chat::ChatMsg::RemoveReaction {
+                channel_id, seq, ..
+            } => Some(JournalTarget::Chat {
+                channel: channel_id,
+                seq: Some(seq),
+            }),
+            ::chat::ChatMsg::PostMessage {
+                channel_id,
+                message_id,
+                thread,
+                ..
+            } => Some(JournalTarget::Message {
+                channel: channel_id,
+                thread,
+                id: message_id,
+            }),
+            _ => None,
+        },
+        "forge" => match serde_json::from_value::<::forge::ForgeMsg>(request.payload.clone())
+            .ok()?
+        {
+            ::forge::ForgeMsg::OpenPr { repo, .. } => Some(JournalTarget::ForgeRepository(repo)),
+            _ => None,
+        },
+        "tasks" => match serde_json::from_value::<tasks::WorkMsg>(request.payload.clone()).ok()? {
+            tasks::WorkMsg::Task(tasks::TaskMsg::CreateTask { title, .. }) => {
+                Some(JournalTarget::Label {
+                    kind: "task",
+                    label: title,
+                })
+            }
+            _ => action_target(&request.operation, &request.result),
+        },
+        _ => action_target(&request.operation, &request.result),
+    }
+}
+
+fn action_target(operation: &str, result: &serde_json::Value) -> Option<JournalTarget> {
+    use runs::index::RunPlace;
+    use runs::*;
+    let text = |key| receipt_text(result, key).to_owned();
+    let number = |key| result.get(key).and_then(serde_json::Value::as_u64);
+    let label = |kind, label: &str| {
+        Some(JournalTarget::Label {
+            kind,
+            label: label.into(),
+        })
+    };
+    match operation {
+        OP_REACT | OP_UNREACT => Some(JournalTarget::Chat {
+            channel: text("channel_id"),
+            seq: number("seq"),
+        }),
+        OP_CHAT_POST_MESSAGE => Some(JournalTarget::Message {
+            channel: text("channel_id"),
+            thread: number("thread"),
+            id: text("message_id"),
+        }),
+        OP_REPLY => {
+            let destination = result.get("destination")?;
+            match receipt_text(destination, "kind") {
+                "chat" => Some(JournalTarget::Message {
+                    channel: receipt_text(destination, "channel_id").into(),
+                    thread: destination
+                        .get("thread")
+                        .and_then(serde_json::Value::as_u64),
+                    id: text("id"),
+                }),
+                "page" => Some(JournalTarget::Place(RunPlace::PageBlock {
+                    block_id: receipt_text(destination, "target").into(),
+                })),
+                "page_thread" => Some(JournalTarget::Place(RunPlace::PageThread {
+                    thread_id: receipt_text(destination, "thread_id").into(),
+                })),
+                "job" => label("job", "Job discussion"),
+                _ => None,
+            }
+        }
+        OP_PAGES_COMMENT => {
+            let target = text("target");
+            let place = match target.is_empty() {
+                true => RunPlace::PageThread {
+                    thread_id: text("thread_id"),
+                },
+                false => RunPlace::PageBlock { block_id: target },
+            };
+            Some(JournalTarget::Place(place))
+        }
+        OP_PAGES_SET_CHECKED => Some(JournalTarget::Place(RunPlace::PageBlock {
+            block_id: text("block_id"),
+        })),
+        OP_PAGES_POST => Some(JournalTarget::Place(RunPlace::Page {
+            page_id: text("page_id"),
+            title: text("title"),
+        })),
+        OP_JOBS_COMMENT => label("job", "Job discussion"),
+        OP_TASKS_CREATE | OP_TASKS_UPDATE_STATUS => Some(JournalTarget::Place(RunPlace::Task {
+            task_id: text("task_id"),
+        })),
+        OP_DUCKFS_WRITE_TEXT => label("file", receipt_text(result, "path")),
+        OP_MODULES_UPDATE => label("module", receipt_text(result, "module_id")),
+        OP_FORGE_OPEN_PR => Some(JournalTarget::ForgeRepository(text("repo"))),
+        OP_COLLABORATION_SEND | OP_COLLABORATION_ACKNOWLEDGE => {
+            label("conversation", "Agent conversation")
+        }
+        OP_AGENT_CALL => Some(JournalTarget::Place(RunPlace::Run {
+            dispatch_id: dispatch_id_for(&delegated_run_id_for(
+                receipt_text(result, "delegation_id"),
+                receipt_text(result, "callee_agent_id"),
+            )),
+        })),
+        OP_SUBMIT => label("module", receipt_text(result, "module")),
+        _ => None,
+    }
+}
+
+async fn journal_chat_target(
+    client: &RpcClient,
+    chain: &str,
+    channel: String,
+    seq: Option<u64>,
+    message: Option<::chat::index::MsgRow>,
+) -> RunLink {
+    use ::chat::index::{ChatViewQuery, ChatViewReply};
+    let channel_reply: Result<ChatViewReply, _> = client
+        .view(
+            "chat",
+            &ChatViewQuery::Channel {
+                channel_id: channel.clone(),
+            },
+        )
+        .await;
+    let room = match channel_reply {
+        Ok(ChatViewReply::Channel(Some(info))) => format!("#{}", info.channel.name),
+        _ => "Chat".into(),
+    };
+    let message = match (message, seq) {
+        (Some(message), _) => Some(message),
+        (None, Some(seq)) => {
+            let reply: Result<ChatViewReply, _> = client
+                .view(
+                    "chat",
+                    &ChatViewQuery::MessagesAround {
+                        channel_id: channel.clone(),
+                        seq,
+                        limit: Some(1),
+                    },
+                )
+                .await;
+            match reply {
+                Ok(ChatViewReply::Messages(rows)) => rows
+                    .into_iter()
+                    .find(|row| row.channel_id == channel && row.seq == seq),
+                _ => None,
+            }
+        }
+        (None, None) => None,
+    };
+    let label = journal_message_label(room, seq, message.as_ref());
+    let url = match seq {
+        Some(seq) => duck_channel_message_link(channel, height_i64(seq), chain.into()),
+        None => duck_channel_link(channel, chain.into()),
+    };
+    RunLink {
+        relation: "target".into(),
+        kind: "chat".into(),
+        label,
+        url,
+    }
+}
+
+fn journal_message_label(
+    room: String,
+    seq: Option<u64>,
+    message: Option<&::chat::index::MsgRow>,
+) -> String {
+    match message {
+        Some(row) => {
+            let author = ::chat::client::author_display(&row.author, &names());
+            let author = match author.starts_with("user ") {
+                true => "Member",
+                false => &author,
+            };
+            let body = match row.deleted {
+                true => "Deleted message".into(),
+                false => chip_label(&row.text).chars().take(120).collect::<String>(),
+            };
+            format!("{room} · {author}: {body}")
+        }
+        None => match seq {
+            Some(seq) => format!("{room} · message {seq} unavailable"),
+            None => room,
+        },
+    }
+}
+
+async fn resolve_journal_target(client: &RpcClient, chain: &str, target: JournalTarget) -> RunLink {
+    match target {
+        JournalTarget::Chat { channel, seq } => {
+            journal_chat_target(client, chain, channel, seq, None).await
+        }
+        JournalTarget::Message {
+            channel,
+            thread,
+            id,
+        } => {
+            use ::chat::index::{ChatViewQuery, ChatViewReply};
+            let reply: Result<ChatViewReply, _> = client
+                .view("chat", &ChatViewQuery::Message { message_id: id })
+                .await;
+            match reply {
+                Ok(ChatViewReply::Message(Some(row))) => {
+                    journal_chat_target(
+                        client,
+                        chain,
+                        row.channel_id.clone(),
+                        Some(row.seq),
+                        Some(row),
+                    )
+                    .await
+                }
+                _ => {
+                    let mut destination =
+                        journal_chat_target(client, chain, channel, thread, None).await;
+                    destination.label = format!("Destination · {}", destination.label);
+                    destination
+                }
+            }
+        }
+        JournalTarget::Place(place) => run_link(client, chain, "target", place).await,
+        JournalTarget::ForgeRepository(repo) => RunLink {
+            relation: "target".into(),
+            kind: "forge".into(),
+            label: format!("Repository {repo}"),
+            url: duck_forge_repo_link(repo, chain.into()),
+        },
+        JournalTarget::ForgeProposal {
+            repo,
+            source,
+            target,
+            candidates,
+        } => {
+            let mut matching = Vec::new();
+            for number in candidates {
+                let reply: Result<::forge::ForgeReply, _> = client
+                    .query(
+                        "forge",
+                        &::forge::ForgeQuery::GetItem {
+                            repo: repo.clone(),
+                            number,
+                        },
+                    )
+                    .await;
+                let Ok(::forge::ForgeReply::Item(Some(item))) = reply else {
+                    continue;
+                };
+                let same_branches = item.source_branch.as_deref() == Some(&source)
+                    && item.target_branch.as_deref() == Some(&target);
+                if same_branches {
+                    matching.push((number, item.summary.title));
+                }
+            }
+            match matching.as_slice() {
+                [(number, title)] => RunLink {
+                    relation: "target".into(),
+                    kind: "forge".into(),
+                    label: format!("{repo}#{number} · {title}"),
+                    url: duck_forge_item_link(repo, height_i64(*number), chain.into()),
+                },
+                _ => RunLink {
+                    relation: "target".into(),
+                    kind: "forge".into(),
+                    label: format!("{repo} · {source} → {target}"),
+                    url: duck_forge_repo_link(repo, chain.into()),
+                },
+            }
+        }
+        JournalTarget::Label { kind, label } => RunLink {
+            relation: "target".into(),
+            kind: kind.into(),
+            label,
+            url: String::new(),
+        },
+    }
+}
+
+async fn action_journal_entry(
+    client: &RpcClient,
+    chain: &str,
+    row: runs::index::JournalRow,
+    requests: &mut BTreeMap<String, Option<runs::ActionRequestView>>,
+    targets: &mut Vec<(JournalTarget, RunLink)>,
+    linked_prs: &[runs::PrRef],
+) -> JournalEntry {
+    let runs::RunFact::Acted {
+        request_id,
+        operation,
+        result,
+        ..
+    } = &row.fact
+    else {
+        let pr = match &row.fact {
+            runs::RunFact::PrLinked { pr } | runs::RunFact::Settled { pr: Some(pr), .. } => {
+                Some(pr.clone())
+            }
+            _ => None,
+        };
+        let mut entry = journal_entry(row);
+        if let Some(pr) = pr {
+            entry.targets.push(
+                cached_journal_target(
+                    client,
+                    chain,
+                    JournalTarget::Place(runs::index::RunPlace::ForgeItem {
+                        repo: pr.repo,
+                        number: pr.number,
+                    }),
+                    targets,
+                )
+                .await,
+            );
+        }
+        return entry;
+    };
+    if !requests.contains_key(request_id) {
+        let reply: Result<runs::RunsReply, _> = client
+            .query(
+                "runs",
+                &runs::RunsQuery::ActionRequest {
+                    request_id: request_id.clone(),
+                },
+            )
+            .await;
+        let request = match reply {
+            Ok(runs::RunsReply::ActionRequest(request)) => request,
+            _ => None,
+        };
+        requests.insert(request_id.clone(), request);
+    }
+    let request = requests.get(request_id).and_then(Option::as_ref);
+    let (status, summary, target) = match request {
+        Some(request) => (
+            action_status(&request.status),
+            action_description(&request.operation, &request.result),
+            prepared_action_target(request),
+        ),
+        None => (
+            "Status unavailable".into(),
+            action_description(operation, result),
+            action_target(operation, result),
+        ),
+    };
+    let target = match request {
+        Some(request) => completed_forge_target(request, linked_prs).or(target),
+        None => target,
+    };
+    let mut entry = journal_entry(row);
+    entry.status = status;
+    entry.summary = summary;
+    if let Some(target) = target {
+        entry
+            .targets
+            .push(cached_journal_target(client, chain, target, targets).await);
+    }
+    entry
+}
+
+/// A PR number is never guessed from the newest repository item. Only this run's
+/// committed PR links can identify it, and its branches must match the action.
+fn completed_forge_target(
+    request: &runs::ActionRequestView,
+    linked_prs: &[runs::PrRef],
+) -> Option<JournalTarget> {
+    let applied = matches!(
+        request.status,
+        runs::ActionStatus::Completed {
+            outcome: dispatch::CallOutcomeSummary::Applied { .. },
+            ..
+        }
+    );
+    if !applied || request.target != "forge" {
+        return None;
+    }
+    let ::forge::ForgeMsg::OpenPr {
+        repo,
+        source_branch,
+        target_branch,
+        ..
+    } = serde_json::from_value(request.payload.clone()).ok()?
+    else {
+        return None;
+    };
+    let candidates = linked_prs
+        .iter()
+        .filter(|pr| pr.repo == repo)
+        .map(|pr| pr.number)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Some(JournalTarget::ForgeProposal {
+        repo,
+        source: source_branch,
+        target: target_branch,
+        candidates,
+    })
 }
 
 /// Every run the journal lists, newest dispatch first.
@@ -1713,10 +2247,7 @@ pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let runs = recent_runs(&client).await?;
-        Ok(runs
-            .into_iter()
-            .map(|run| run_row(run, &BTreeMap::new()))
-            .collect())
+        Ok(run_rows(&client, runs, &BTreeMap::new()).await)
     }
     .await
     .map_err(app_error)
@@ -1726,8 +2257,8 @@ pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
 /// id is the reader closing the journal: nothing is read and the empty journal
 /// comes back at once.
 ///
-/// Infallible on purpose, like the messaging panel's reads: the answer carries
-/// its own scope, and a `Result`'s error arm cannot. A refusal that arrives
+/// Infallible on purpose: the answer carries its own scope, and a `Result`'s
+/// error arm cannot. A refusal that arrives
 /// without its scope has nowhere safe to be shown once the reader has moved to
 /// another network with the same run open.
 #[allow(clippy::too_many_arguments)]
@@ -1787,8 +2318,40 @@ async fn read_run_journal(
     let Some(detail) = detail else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let links = run_links(&client, chain, detail.run).await;
-    let entries = detail.journal.into_iter().map(journal_entry).collect();
+    // Refresh work and its per-refresh caches share the same bound. Older facts remain on-chain.
+    const JOURNAL_ENTRY_LIMIT: usize = 128;
+    let omitted = detail.journal.len().saturating_sub(JOURNAL_ENTRY_LIMIT);
+    let mut entries = Vec::with_capacity(JOURNAL_ENTRY_LIMIT + 1);
+    if omitted > 0 {
+        entries.push(JournalEntry { kind: "history".into(), summary: format!("Showing the latest {JOURNAL_ENTRY_LIMIT} events; {omitted} earlier events are not shown."), ..JournalEntry::default() });
+    }
+    let mut requests = BTreeMap::new();
+    let mut targets = Vec::new();
+    let linked_prs = detail
+        .journal
+        .iter()
+        .skip(omitted)
+        .filter_map(|row| match &row.fact {
+            runs::RunFact::PrLinked { pr } | runs::RunFact::Settled { pr: Some(pr), .. } => {
+                Some(pr.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for row in detail.journal.into_iter().skip(omitted) {
+        entries.push(
+            action_journal_entry(
+                &client,
+                chain,
+                row,
+                &mut requests,
+                &mut targets,
+                &linked_prs,
+            )
+            .await,
+        );
+    }
+    let links = run_links(&client, chain, detail.run, &mut targets).await;
     Ok((entries, links))
 }
 
@@ -2994,7 +3557,10 @@ mod qr_ceremony_tests {
             loop {
                 let mut line = String::new();
                 let read = socket.read_line(&mut line).await.unwrap();
-                assert_ne!(read, 0, "the request must reach the relay before cancellation");
+                assert_ne!(
+                    read, 0,
+                    "the request must reach the relay before cancellation"
+                );
                 let headers_complete = line == "\r\n";
                 if headers_complete {
                     return socket;
@@ -3002,9 +3568,7 @@ mod qr_ceremony_tests {
             }
         };
         let mut socket = {
-            let consume = async {
-                while stream.next().await.is_some() {}
-            };
+            let consume = async { while stream.next().await.is_some() {} };
             tokio::select! {
                 socket = receive_request => socket,
                 () = consume => panic!("the unanswered ceremony ended before cancellation"),
@@ -3085,7 +3649,7 @@ mod journal_summary_tests {
     use super::*;
 
     #[test]
-    fn an_action_reads_as_operation_lane_receipt_and_id() {
+    fn an_action_names_its_operation_without_machine_identifiers() {
         let entry = journal_entry(runs::index::JournalRow {
             height: 309,
             time: 0,
@@ -3096,10 +3660,11 @@ mod journal_summary_tests {
                 result: serde_json::json!({"channel_id": "engineering", "seq": 2, "emoji": "👀"}),
             },
         });
-        assert_eq!(entry.kind, "acted");
-        assert_eq!(
-            entry.summary,
-            "react · live · channel_id engineering · emoji 👀 · seq 2 · action/abc/ack"
+        assert_eq!(entry.kind, "action");
+        assert_eq!(entry.summary, "React 👀");
+        assert!(
+            entry.status.is_empty(),
+            "queue admission alone is not completion"
         );
     }
 
@@ -3118,10 +3683,7 @@ mod journal_summary_tests {
                 }),
             },
         });
-        assert_eq!(
-            entry.summary,
-            "reply · final · channel_id engineering · kind chat · thread 12 · id agent/abc · result/abc/0"
-        );
+        assert_eq!(entry.summary, "Reply");
     }
 
     #[test]
@@ -3136,7 +3698,281 @@ mod journal_summary_tests {
                 result: serde_json::Value::Null,
             },
         });
-        assert_eq!(entry.summary, "forge · final · result/abc/1");
+        assert_eq!(entry.summary, "Open pull request");
+    }
+
+    #[test]
+    fn only_an_applied_program_outcome_means_completed() {
+        use dispatch::CallOutcomeSummary;
+        use runs::ActionStatus;
+        let call = sdk::CallId {
+            requester: "runs".into(),
+            invocation: "request".into(),
+            step: 0,
+        };
+        assert_eq!(action_status(&ActionStatus::AwaitingProgram), "Queued");
+        assert_eq!(
+            action_status(&ActionStatus::Claimed { call: call.clone() }),
+            "Running"
+        );
+        assert_eq!(
+            action_status(&ActionStatus::Completed {
+                call: call.clone(),
+                outcome: CallOutcomeSummary::Applied {
+                    output_digest: [0; 32],
+                    assigned: vec![]
+                }
+            }),
+            "Completed"
+        );
+        assert_eq!(
+            action_status(&ActionStatus::Completed {
+                call,
+                outcome: CallOutcomeSummary::Rejected {
+                    reason: "message deleted".into()
+                }
+            }),
+            "Rejected: message deleted"
+        );
+        assert_eq!(
+            action_status(&ActionStatus::Rejected {
+                reason: "not permitted".into()
+            }),
+            "Rejected: not permitted"
+        );
+    }
+
+    #[test]
+    fn reactions_and_replies_keep_exact_addresses_out_of_the_description() {
+        let receipt =
+            serde_json::json!({"channel_id":"opaque-channel-hash", "seq":42, "emoji":"👍"});
+        assert_eq!(action_description("react", &receipt), "React 👍");
+        assert!(
+            matches!(action_target("react", &receipt), Some(JournalTarget::Chat { channel, seq: Some(42) }) if channel == "opaque-channel-hash")
+        );
+        let receipt = serde_json::json!({"destination":{"kind":"chat","channel_id":"room","thread":42},"id":"new-message"});
+        assert!(
+            matches!(action_target("reply", &receipt), Some(JournalTarget::Message { channel, thread: Some(42), id }) if channel == "room" && id == "new-message")
+        );
+        let url =
+            duck_channel_message_link("opaque-channel-hash".into(), 42, "network#a1b2c3d4".into());
+        assert_eq!(url, "duck://channel/opaque-channel-hash?net=a1b2c3d4#42");
+    }
+
+    #[tokio::test]
+    async fn canonical_reaction_reads_exact_message_and_reuses_receipt_and_preview() {
+        use ::chat::index::{ChannelInfo, ChannelRow, ChatViewReply, MsgRow};
+        use std::io::{BufRead, Read, Write};
+        let request = runs::ActionRequestView {
+            request_id: "receipt-hash".into(),
+            account: 7,
+            generation: 1,
+            run_id: "run-hash".into(),
+            operation: "react".into(),
+            target: "chat".into(),
+            result: serde_json::json!({"channel_id":"room-hash", "seq":42,"emoji":"👀"}),
+            payload: serde_json::to_value(::chat::ChatMsg::AddReaction {
+                channel_id: "room-hash".into(),
+                seq: 42,
+                emoji: "👀".into(),
+            })
+            .unwrap(),
+            status: runs::ActionStatus::AwaitingProgram,
+        };
+        let message = MsgRow {
+            channel_id: "room-hash".into(),
+            seq: 42,
+            message_id: "message-hash".into(),
+            author: "system".into(),
+            height: 1,
+            time: 0,
+            blocks: vec![],
+            text: "Bound and scroll the branch selector".into(),
+            deleted: false,
+            edited: false,
+            rev: 0,
+            edited_at: None,
+            base_rev: None,
+            thread: Some(2),
+            reply_count: 0,
+            last_reply_seq: None,
+            reactions: vec![],
+            tags: vec![],
+        };
+        let deleted = MsgRow {
+            deleted: true,
+            ..message.clone()
+        };
+        let deleted_label = journal_message_label("#Engineering".into(), Some(42), Some(&deleted));
+        assert!(deleted_label.contains("Deleted message"));
+        assert!(!deleted_label.contains("Bound and scroll"));
+        assert_eq!(
+            journal_message_label("#Engineering".into(), Some(42), None),
+            "#Engineering · message 42 unavailable"
+        );
+        let channel = ChannelInfo {
+            channel: ChannelRow {
+                id: "room-hash".into(),
+                name: "Engineering".into(),
+                created_at: 0,
+                post_policy: ::chat::PostPolicy::Open,
+                owner: "system".into(),
+                archived: false,
+                hooks: vec![],
+                huddle: vec![],
+            },
+            head_seq: 42,
+        };
+        let responses = [
+            (
+                "/v1/query",
+                serde_json::to_value(runs::RunsReply::ActionRequest(Some(request))).unwrap(),
+            ),
+            (
+                "/v1/index/chat/view",
+                serde_json::to_value(ChatViewReply::Channel(Some(channel))).unwrap(),
+            ),
+            (
+                "/v1/index/chat/view",
+                serde_json::to_value(ChatViewReply::Messages(vec![message])).unwrap(),
+            ),
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = rpc_client(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for (path, response) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(&format!("POST {path} ")));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if let Some(around) = body.get("messages_around") {
+                    assert_eq!(around["seq"], 42);
+                    assert_eq!(around["limit"], 1);
+                }
+                let response = response.to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+            }
+        });
+        let row = || runs::index::JournalRow {
+            height: 1,
+            time: 0,
+            fact: runs::RunFact::Acted {
+                request_id: "receipt-hash".into(),
+                lane: runs::LaneKind::Live,
+                operation: "react".into(),
+                result: serde_json::Value::Null,
+            },
+        };
+        let mut requests = BTreeMap::new();
+        let mut targets = Vec::new();
+        let entry = action_journal_entry(
+            &client,
+            "network#a1b2c3d4",
+            row(),
+            &mut requests,
+            &mut targets,
+            &[],
+        )
+        .await;
+        assert_eq!(entry.summary, "React 👀");
+        assert_eq!(entry.status, "Queued");
+        assert_eq!(
+            entry.targets[0].url,
+            "duck://channel/room-hash?net=a1b2c3d4#42"
+        );
+        assert!(entry.targets[0].label.contains("#Engineering"));
+        assert!(
+            entry.targets[0]
+                .label
+                .contains("Bound and scroll the branch selector")
+        );
+        server.join().unwrap();
+        // The server is gone: another identical journal fact must use this refresh's cache.
+        let repeated = action_journal_entry(
+            &client,
+            "network#a1b2c3d4",
+            row(),
+            &mut requests,
+            &mut targets,
+            &[],
+        )
+        .await;
+        assert_eq!(entry, repeated);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn every_catalog_action_has_a_semantic_description() {
+        for operation in runs::catalog(None).iter().map(|entry| &entry.name) {
+            assert_ne!(
+                action_description(operation, &serde_json::Value::Null),
+                "Module action",
+                "missing action projection: {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forge_target_uses_only_this_runs_committed_repository_candidates() {
+        let mut request = runs::ActionRequestView {
+            request_id: "r".into(),
+            account: 7,
+            generation: 1,
+            run_id: "run".into(),
+            operation: runs::OP_FORGE_OPEN_PR.into(),
+            target: "forge".into(),
+            result: serde_json::Value::Null,
+            payload: serde_json::to_value(::forge::ForgeMsg::OpenPr {
+                repo: "ducktape".into(),
+                title: "Fix".into(),
+                body: String::new(),
+                source_branch: "fix".into(),
+                target_branch: "dev".into(),
+            })
+            .unwrap(),
+            status: runs::ActionStatus::AwaitingProgram,
+        };
+        let linked = [
+            runs::PrRef {
+                repo: "ducktape".into(),
+                number: 42,
+            },
+            runs::PrRef {
+                repo: "another".into(),
+                number: 99,
+            },
+        ];
+        assert_eq!(completed_forge_target(&request, &linked), None);
+        request.status = runs::ActionStatus::Completed {
+            call: sdk::CallId {
+                requester: "runs".into(),
+                invocation: "r".into(),
+                step: 0,
+            },
+            outcome: dispatch::CallOutcomeSummary::Applied {
+                output_digest: [0; 32],
+                assigned: vec![],
+            },
+        };
+        assert!(
+            matches!(completed_forge_target(&request,&linked),Some(JournalTarget::ForgeProposal {repo,source,target,candidates}) if repo=="ducktape" && source=="fix" && target=="dev" && candidates==[42])
+        );
     }
 }
 
@@ -3156,6 +3992,7 @@ mod run_journal_scope_tests {
                 height: "41".into(),
                 kind: "dispatched".into(),
                 summary: "network A said so".into(),
+                ..JournalEntry::default()
             }],
             rpc: "http://node".into(),
             network: network.into(),
@@ -3178,7 +4015,10 @@ mod run_journal_scope_tests {
         };
         assert!(live("duck-a", 4, 9), "its own scope installs");
         // the SAME run id, the SAME endpoint, the SAME account — another chain
-        assert!(!live("duck-b", 4, 9), "network A's journal installed under B");
+        assert!(
+            !live("duck-b", 4, 9),
+            "network A's journal installed under B"
+        );
         // a reconnect to the same endpoint is a different session
         assert!(!live("duck-a", 5, 9));
         // and a second read of the same run on the same link is a second
@@ -3232,6 +4072,14 @@ mod run_journal_scope_tests {
         .await;
         assert!(closed.entries.is_empty());
         assert!(closed.error.is_empty(), "a close is not a failure");
-        assert!(journal_in_scope(&closed, "http://node", "duck-a", 4, "7", 9, ""));
+        assert!(journal_in_scope(
+            &closed,
+            "http://node",
+            "duck-a",
+            4,
+            "7",
+            9,
+            ""
+        ));
     }
 }

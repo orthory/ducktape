@@ -26,7 +26,7 @@ extern crate::host
   ForgeRepo(name:str, head:str)
   ForgeBranch(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
-  ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
+  ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(seq:i64, author:str, meta:str, blocks:[ChatBlock], initial:str, avatar_kind:str, render_rev:i64)
   ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])
@@ -67,7 +67,6 @@ extern crate::host
   pure branch_names(branches:&[ForgeBranch]) -> [str]
   pure pinned_branch(tree_branch:&str) -> str?
   pure duck_forge_item_link(repo:&str, number:i64, chain_id:&str) -> str
-  pure duck_forge_repo_link(repo:&str, chain_id:&str) -> str
   pure forge_push_command(rpc:&str) -> str
   pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure drafts_cleared_by(scope:&str, draft:&str) -> bool
@@ -365,12 +364,6 @@ view
       text "Too much display data. Open a smaller directory or item." size=13.0
     if !display_unavailable
       col w=fill h=fill
-        if display_omitted > 0
-          row gap=4.0
-            text display_omitted #display-omitted size=12.5
-            text "rows are not shown." size=12.5
-        if display_shortened
-          text "Some content is shortened for display." size=12.5
         ForgeScreen review_draft<->review_draft comment_draft<->comment_draft #forge
           with
             display_omitted
@@ -456,3 +449,13 @@ view
             forge_open_file -> forge_open_file _
             open_message_link -> open_message_link _
             copy_to_clipboard -> copy_to_clipboard _ _
+        if display_omitted > 0 || display_shortened
+          box #display-notice w=fill h=26.0 px=16.0 bg=muted_bg clip=true
+            row gap=4.0 align=center h=fill
+              if display_omitted > 0
+                text display_omitted #display-omitted size=11.0 @text-meta
+                text "rows omitted" size=11.0 @text-meta
+              if display_omitted > 0 && display_shortened
+                text "·" size=11.0 @text-meta
+              if display_shortened
+                text "Preview shortened" size=11.0 @text-meta

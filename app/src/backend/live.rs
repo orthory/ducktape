@@ -1626,20 +1626,6 @@ pub async fn load_channel_window(
     })
 }
 
-/// The reply a search hit points at, when it points at one at all. A hit on the
-/// thread ROOT is answered by the window around it and needs no second read.
-async fn load_hit_reply(
-    rpc: &RpcClient,
-    channel_id: &str,
-    root_seq: u64,
-    target_seq: u64,
-) -> Result<Option<MsgRow>, String> {
-    if target_seq == root_seq {
-        return Ok(None);
-    }
-    load_message_at(rpc, channel_id, target_seq).await.map(Some)
-}
-
 /// Same generation-carrying failure as [`load_channel_window`], same reason.
 pub async fn load_chat_hit(
     rpc: String,
@@ -1652,16 +1638,23 @@ pub async fn load_chat_hit(
         let root_seq = positive_sequence(root_seq)?;
         let target_seq = positive_sequence(target_seq)?;
         let rpc = rpc_client(&rpc)?;
-        // THREE SEQUENTIAL PHASES, CONCURRENT. This used to re-page the channel
-        // list, walk the channel's live tail, THROW that walk away for a window
-        // around the hit, and only then read the reply — the slowest navigation
-        // in the app, with the pane on the loading plate for all of it. The
-        // window and the reply are independent of the channel's row and its
-        // member roll, so the whole thing is one round trip now.
-        let (mut chat, reply) = tokio::try_join!(
-            load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
-            load_hit_reply(&rpc, &channel_id, root_seq, target_seq)
-        )?;
+        // A URI names only its target seq. Resolve its committed thread before
+        // loading the root-only channel window; a reply is not a root itself.
+        // Search results already carry both addresses and keep their parallel read.
+        let root_is_unresolved = root_seq == target_seq;
+        let (root_seq, mut chat, reply) = if root_is_unresolved {
+            let target = load_message_at(&rpc, &channel_id, target_seq).await?;
+            let root_seq = target.thread.unwrap_or(target.seq);
+            let chat = load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq))
+                .await?;
+            (root_seq, chat, target.thread.map(|_| target))
+        } else {
+            let (chat, reply) = tokio::try_join!(
+                load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
+                load_message_at(&rpc, &channel_id, target_seq)
+            )?;
+            (root_seq, chat, Some(reply))
+        };
         let root = chat
             .messages
             .iter()

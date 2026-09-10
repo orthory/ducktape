@@ -37,6 +37,7 @@ pub struct ForgeItem {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChatSpan {
     pub mention: String,
+    pub mention_link: String,
     pub link_text: String,
     pub link: String,
     pub bold_italic: String,
@@ -491,11 +492,6 @@ fn net_query(chain_id: &str) -> String {
 /// `duck://forge/<repo>/<number>?net=…` — one issue or PR.
 pub fn duck_forge_item_link(repo: &str, number: i64, chain_id: &str) -> String {
     format!("duck://forge/{repo}/{number}{}", net_query(chain_id))
-}
-
-/// `duck://forge/<repo>?net=…` — the repo itself.
-pub fn duck_forge_repo_link(repo: &str, chain_id: &str) -> String {
-    format!("duck://forge/{repo}{}", net_query(chain_id))
 }
 
 /// The command that makes a repo: forge IS a git remote, and a repo comes

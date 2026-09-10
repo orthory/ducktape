@@ -289,6 +289,9 @@ on forge_item_loaded(next)
   forge_item_title = next.title
   forge_item_state = next.state
   forge_item_kind = next.kind
+  // The tab bar stays up over an open item, so the lit tab is the item's
+  // own seat — a duck:// link can land a pull request from the Code seat.
+  forge_tab = forge_kind_tab(next.kind)
   forge_item_body = next.body
   forge_item_blocks = next.blocks
   forge_item_author = next.author_name
@@ -509,3 +512,11 @@ on forge_close_item
 
 on select_forge_tab(tab)
   forge_tab = tab
+  // The tab bar stays up over an open item, so a tab press is also the
+  // way out of the item: it leaves the detail and shows the seat. With no
+  // item open there is nothing to leave, and the retirement below bumps
+  // the generation a repo load in flight is keyed on.
+  return if forge_item_number <= 0
+  flow
+    from done true
+    done -> forge_close_item()

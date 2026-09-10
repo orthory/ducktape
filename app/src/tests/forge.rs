@@ -440,38 +440,39 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
 }
 
 /// Forge's repo chrome used to stack three independent rows — crumb, every
-/// branch, then tabs — before a reader reached any code or tracker content.
-/// Keep branch context in the tab row and keep detail navigation in the
-/// persistent repo bar, so neither can quietly grow another empty band.
+/// branch, then tabs — before a reader reached any code or tracker content,
+/// and the tab row vanished under an open item. The repo bar is ONE row:
+/// the crumb (the way back to every repo), the repository pick, the branch
+/// pick beside it, then the detail navigation. The tab bar follows the bar
+/// and stands whether or not an item is open.
 #[test]
 fn forge_layout_keeps_repo_navigation_compact() {
     let screen = inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice"));
 
-    let repo_body = screen
-        .split_once("if forge_item_number <= 0")
-        .expect("repo body")
+    let repo_bar = screen
+        .split_once("RepoCrumb org=org")
+        .expect("the crumb")
         .1
-        .split_once("match tab")
-        .expect("repo navigation boundary")
+        .split_once("emit(select_forge_tab, \"code\")")
+        .expect("the tab bar follows the repo bar")
         .0;
-    let tabs_end = repo_body
-        .find("emit(select_forge_tab, \"issues\")")
-        .expect("issues tab");
-    let selector = repo_body
+    let repo_pick = repo_bar.find("#repo-pick").expect("repository pick");
+    let selector = repo_bar
         .find("pick branch_names(branches) pinned_branch(tree_branch) #branch-pick ")
         .expect("branch selector");
     assert!(
-        repo_body[selector..]
+        repo_bar[selector..]
             .lines()
             .next()
             .is_some_and(|line| line.ends_with(" -> emit(forge_pick_branch, _)")),
         "a pick leaves as the intent naming the branch"
     );
     assert!(
-        tabs_end < selector,
-        "branch context follows the tabs in their shared navigation row"
+        repo_pick < selector,
+        "the branch stands beside the repository it belongs to"
     );
-    assert_eq!(repo_body.matches("#branch-pick").count(), 1);
+    assert_eq!(screen.matches("#branch-pick").count(), 1);
+    assert_eq!(screen.matches("#repo-pick").count(), 1);
     // A switcher's menu is the host's own pick list, laid out over whatever
     // follows it. A `pin` is a positioned child of its parent, painted at the
     // parent's z-order, so the content after the row paints over it.
@@ -479,7 +480,31 @@ fn forge_layout_keeps_repo_navigation_compact() {
         !screen.contains("pin x="),
         "a menu is a pick list, never a pinned child"
     );
-    assert_eq!(screen.matches("#repo-pick").count(), 1);
+
+    // The crumb is the button back to the overview; nothing else in the bar
+    // is a link to it, and the repo's address is the item's, not a button.
+    let crumb = screen
+        .split_once("emit(forge_close_repo)")
+        .expect("the way back")
+        .1;
+    assert!(crumb.contains("\n              RepoCrumb org=org\n"));
+    assert_eq!(screen.matches("emit(forge_close_repo)").count(), 1);
+    assert!(!screen.contains("Copy repo link"));
+
+    // The tab bar is not gated on the item: the gate wraps only the seats.
+    let tabs = screen
+        .find("emit(select_forge_tab, \"code\")")
+        .expect("code tab");
+    let item_gate = screen.find("if forge_item_number <= 0").expect("item gate");
+    assert!(tabs < item_gate, "the tabs stand over an open item");
+    let seats = screen[item_gate..]
+        .split_once("match tab")
+        .expect("the seats")
+        .0;
+    assert!(
+        !seats.contains("select_forge_tab"),
+        "the item gate wraps the seats alone"
+    );
 
     let item_body = screen
         .split_once("if forge_item_number > 0 && item_phase == \"ready\"")
@@ -487,6 +512,36 @@ fn forge_layout_keeps_repo_navigation_compact() {
         .1;
     assert!(item_body.starts_with("\n              BackToList"));
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
+}
+
+/// An open item lights its own seat: the host sets the tab from the item's
+/// kind when it lands, so a duck:// link that opens a pull request from the
+/// Code seat does not leave Code lit over a pull request.
+#[test]
+fn an_open_item_lights_the_tab_of_its_kind() {
+    use crate::module_view::forge_kind_tab;
+    assert_eq!(forge_kind_tab("pr"), crate::ForgeTab::Pulls);
+    assert_eq!(forge_kind_tab("issue"), crate::ForgeTab::Issues);
+    assert_eq!(forge_kind_tab(""), crate::ForgeTab::Code);
+    let handlers = include_str!("../ui/handlers/forge.ice");
+    let landed = handlers
+        .split_once("on forge_item_loaded(next)")
+        .expect("the landing handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(landed.contains("forge_tab = forge_kind_tab(next.kind)"));
+    let after_tab = handlers
+        .split_once("on select_forge_tab(tab)")
+        .expect("the tab handler")
+        .1;
+    // the last handler in the file has no `on` after it
+    let picked = after_tab
+        .split_once("\non ")
+        .map_or(after_tab, |(body, _)| body);
+    assert!(picked.contains("return if forge_item_number <= 0"));
+    assert!(picked.contains("done -> forge_close_item()"));
 }
 
 /// THE duck:// OPEN PLANE ADDS ADDRESSES, NEVER NAVIGATION. `open_message_link`
@@ -520,6 +575,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "-> forge_open_repo _",
         "-> choose_channel _",
         "-> open_chat_search_hit(_, link.seq, link.seq)",
+        "-> choose_dm _",
     ] {
         assert!(
             open.contains(route),

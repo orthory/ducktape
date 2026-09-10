@@ -5,12 +5,43 @@
 use forge_view::host::{
     Body, ChatBlock, CommentStage, DiffLine, ForgeBranch, ForgeItem, ForgeProps, ForgeRepo, Name,
     Number, Path, Tab, TreeEntry, branch_names, commit_label, drafts_cleared_by,
-    duck_forge_item_link, duck_forge_repo_link, filter_forge_items, forge_comment_target,
-    forge_open_count, forge_push_command, pinned_branch, repo_names,
+    duck_forge_item_link, filter_forge_items, forge_comment_target, forge_open_count,
+    forge_push_command, pinned_branch, repo_names,
 };
 use forge_view::{boot_native, tick_native};
 use ui_lang_guest::testing::{has_text, item, pick, press, submit, texts, type_into};
 use ui_lang_guest::wire::Frame;
+
+#[test]
+fn display_limits_use_a_bounded_footer_only_when_content_is_clipped() {
+    use ui_lang_guest::wire::{Length, Node};
+    fn notice(node: &Node) -> Option<&Node> {
+        let is_notice = node
+            .key()
+            .is_some_and(|key| key.ends_with("/display-notice"));
+        if is_notice {
+            return Some(node);
+        }
+        node.children().iter().find_map(|node| notice(node))
+    }
+    let (_, frame) = shown(&overview());
+    assert!(notice(frame.root.as_ref().unwrap()).is_none());
+    assert!(!has_text(&frame, "rows are not shown."));
+    for (omitted, shortened) in [(100, false), (0, true), (100, true)] {
+        let (_, frame) = shown(&ForgeProps {
+            display_omitted: omitted,
+            display_shortened: shortened,
+            ..overview()
+        });
+        let Node::Container { height, .. } = notice(frame.root.as_ref().unwrap()).unwrap() else {
+            panic!("notice is a bounded footer");
+        };
+        assert_eq!(*height, Some(Length::Fixed(26.0)));
+        assert_eq!(has_text(&frame, "rows omitted"), omitted > 0);
+        assert_eq!(has_text(&frame, "Preview shortened"), shortened);
+        assert!(has_text(&frame, "core"));
+    }
+}
 
 fn overview() -> ForgeProps {
     ForgeProps {
@@ -263,6 +294,28 @@ fn the_repository_switcher_lists_the_repos_and_a_pick_names_the_repo_to_the_host
     );
 }
 
+/// The tab bar stays up over an open item, and a tab press there leaves as
+/// the same `forge.tab` intent a press over a list does — the host closes
+/// the item on it. The bar's other exit, the crumb, names the repo overview.
+#[test]
+fn the_tabs_stay_over_an_open_item_and_the_crumb_leads_back_to_every_repo() {
+    let (_, frame) = shown(&item_open());
+    assert!(has_text(&frame, "a pull request"), "{:?}", texts(&frame));
+    assert!(has_text(&frame, "Issues"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Show issues"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "forge.tab");
+    assert_eq!(
+        serde_json::from_slice::<Tab>(&intent.payload).expect("decodes"),
+        Tab {
+            tab: "issues".into()
+        }
+    );
+    let (_, frame) = shown(&item_open());
+    let frame = tick_native(press(&frame, "All repos"));
+    assert_eq!(one_intent(&frame).kind, "forge.close_repo");
+}
+
 #[test]
 fn a_review_leaves_with_its_body_and_a_landed_one_consumes_the_drafts_it_read() {
     let (subscription, frame) = shown(&item_open());
@@ -355,14 +408,6 @@ fn the_readings_repeat_the_apps_words() {
     assert_eq!(
         duck_forge_item_link("ducktape", 58, "mynet#d0cdf950"),
         "duck://forge/ducktape/58?net=d0cdf950"
-    );
-    assert_eq!(
-        duck_forge_repo_link("ducktape", "mynet#d0cdf950"),
-        "duck://forge/ducktape?net=d0cdf950"
-    );
-    assert_eq!(
-        duck_forge_repo_link("ducktape", ""),
-        "duck://forge/ducktape"
     );
     assert_eq!(
         forge_comment_target("src/main.rs", "14", "new"),

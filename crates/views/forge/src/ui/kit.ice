@@ -342,8 +342,12 @@ component FinalityChip(height:i64)
               font=code_semibold
               @text-success_tick
 
+// A TAB IS AS WIDE AS ITS WORDS. The underline below the label is `w=fill`
+// so it spans the label; without `w=shrink` here the column would take that
+// fill for its own width, every tab would fill the row, and three tabs would
+// share the bar in thirds.
 component TabLabel(label:str, count:i64, active:bool)
-  col #root
+  col #root w=shrink
     row
       with
         gap=7.0
@@ -528,7 +532,9 @@ component RichLine(block:ChatBlock, size:f64)
       wrap=word-or-glyph
       color=accent_fg
     for span in block.spans
-      span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand
+      // Span padding expands only the paint, not the text layout. Keep it
+      // below a prose space so ordinary surrounding spaces stay visible.
+      span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium color=brand
       span span.link_text link=span.link underline font=medium color=brand
       span span.bold_italic font=strongitalic
       span span.bold font=strong

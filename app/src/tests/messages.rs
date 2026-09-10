@@ -456,10 +456,21 @@ fn the_message_line_is_one_rich_text_paragraph() {
         .map(str::trim)
         .filter(|line| line.starts_with("span ") && line.contains("bg="))
         .collect();
+    // The plate is ALSO a destination: `link=` carries the account the
+    // mention names, so the widget's own link route opens it on a click and
+    // shows the pointer on hover.
     assert_eq!(
         plated,
-        ["span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand"],
-        "the mention arm alone wears the plate"
+        [
+            "span span.mention link=span.mention_link bg=brand_bg px=1.0 r=4.0 font=medium \
+             color=brand"
+        ],
+        "the mention arm alone wears a plate that leaves prose whitespace visible"
+    );
+    let forge = inlined(include_str!("../../../crates/views/forge/src/ui/kit.ice"));
+    assert!(
+        forge.contains(plated[0]),
+        "Forge uses the same mention spacing"
     );
     // And the underline is the link's rule alone — it marks a destination,
     // not an emphasis (ducktape-ui#604).
@@ -480,6 +491,52 @@ fn the_message_line_is_one_rich_text_paragraph() {
     assert!(handlers.contains(
         "run every open_external_url(url) -> external_url_opened _ | external_url_failed _"
     ));
+}
+
+#[test]
+fn the_mention_plate_leaves_space_before_and_after_the_token() {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{LineHeight, Paragraph as _, Shaping, Span, Text, Wrapping};
+
+    let _renderer = crate::frame_probe::headless_renderer();
+    let source = include_str!("../ui/components/richbody.ice");
+    let padding: f32 = source
+        .lines()
+        .find(|line| line.trim_start().starts_with("span span.mention "))
+        .and_then(|line| line.split_once("px="))
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .expect("the mention plate declares its paint padding")
+        .parse()
+        .unwrap();
+    let spans: [Span<'_, ()>; 5] = [
+        Span::new("before"),
+        Span::new(" "),
+        Span::new("@alice").font(iced::Font {
+            weight: iced::font::Weight::Medium,
+            ..iced::Font::with_name("Geist")
+        }),
+        Span::new(" "),
+        Span::new("after"),
+    ];
+    let paragraph = Paragraph::with_spans(Text {
+        content: spans.as_slice(),
+        bounds: iced::Size::INFINITE,
+        size: iced::Pixels(13.5),
+        line_height: LineHeight::Relative(1.55),
+        font: iced::Font::with_name("Geist"),
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::WordOrGlyph,
+    });
+    let before = paragraph.span_bounds(0)[0];
+    let mention = paragraph.span_bounds(2)[0];
+    let after = paragraph.span_bounds(4)[0];
+    // Native rich text expands the painted plate without advancing glyphs.
+    let leading_gap = mention.x - padding - (before.x + before.width);
+    let trailing_gap = after.x - (mention.x + mention.width + padding);
+    assert!(leading_gap >= 2.0, "leading gap: {leading_gap}px");
+    assert!(trailing_gap >= 2.0, "trailing gap: {trailing_gap}px");
 }
 
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.

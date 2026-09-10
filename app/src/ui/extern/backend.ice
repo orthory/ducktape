@@ -6,7 +6,7 @@ extern crate::backend
   ChatMember(key:str, label:str)
   ChannelRead(channel:str, seq:i64)
   ChannelSwitchFacts(unread_boundary:i64, name:str, archived:bool, members_only:bool)
-  ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
+  ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
@@ -59,20 +59,6 @@ extern crate::backend
   pure bell_title(kind:&str) -> str
   pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str, expected_account:str) -> BellData ! AppError
-  // THE AGENT-MESSAGING PANEL. One authenticated reading of ONE conversation,
-  // and one send under the participant's owner credential. Both carry the
-  // endpoint and chain they ran under: neither is installed after the app has
-  // moved to another network, participant or conversation.
-  MessagingSeat(participant:str, role:str, you:bool)
-  MessagingBinding(present:bool, device:str, credential:str, principal:str, principal_account:str, detached:bool)
-  MessagingMessage(seq:i64, sender:str, recipient:str, kind:str, body:str, body_bytes:i64, shown_bytes:i64, references:str, reply_to:i64, task:str, task_attempt:i64, delivery:str, delivery_reason:str, mine:bool, expires_at:i64, admitted_at:i64)
-  MessagingView(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, topic:str, roster:[MessagingSeat], binding:MessagingBinding, messages:[MessagingMessage], may_read:bool, may_send:bool, denied:str, error:str, history_gap:bool, floor_seq:i64, from_seq:i64, next_seq:i64, page_size:i64, more_before:bool, more_after:bool, undelivered:i64, queued_bytes:i64, max_body_bytes:i64, answered:bool, visibility:str)
-  MessagingSend(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, refusal:str)
-  pure messaging_none() -> MessagingView
-  pure messaging_in_scope(view:&MessagingView, rpc:&str, network:&str, link:i64, account:&str, op:i64, participant:&str, conversation:&str) -> bool
-  pure messaging_send_in_scope(send:&MessagingSend, rpc:&str, network:&str, link:i64, account:&str, op:i64, participant:&str, conversation:&str) -> bool
-  load_messaging(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, from_seq:i64, newest:bool) -> MessagingView
-  send_agent_message(rpc:str, network:str, link:i64, account:str, op:i64, participant:str, conversation:str, kind:str, recipient:str, body:str, reply_to:i64, password:str) -> MessagingSend
   mark_bell_read(rpc:str, password:str, expected_account:str, up_to_seq:i64) -> BellDelta ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
@@ -266,7 +252,7 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(base_snapshot:str, generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, block:str, dispatch:str, channel:str, path:str, rev:str, net:str)
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, block:str, dispatch:str, channel:str, path:str, rev:str, account:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
   pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
   pure duck_page_link(page:str, chain_id:str) -> str
@@ -425,7 +411,7 @@ extern crate::backend
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
-  JournalEntry(height:str, kind:str, summary:str)
+  JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
   AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str])

@@ -13,8 +13,9 @@ pub fn paint(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
+    focused: bool,
 ) -> EditorPresentation {
-    build(state, menu, dark, commented).unwrap_or_default()
+    build(state, menu, dark, commented, focused).unwrap_or_default()
 }
 
 pub fn build(
@@ -22,6 +23,7 @@ pub fn build(
     menu: MenuState,
     dark: bool,
     commented: Vec<i64>,
+    focused: bool,
 ) -> Result<EditorPresentation, PresentationError> {
     // Keep one paint pass inside the desktop tick budget. The canonical editor
     // remains complete when rich presentation is too dense to publish at once.
@@ -38,6 +40,7 @@ pub fn build(
         bottom: 0.0,
     });
     let caret = markdown::Caret {
+        focused,
         line: state.cursor.position.line as usize,
         column: state.cursor.position.column as usize,
         dark,

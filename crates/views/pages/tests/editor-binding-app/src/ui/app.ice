@@ -11,7 +11,7 @@ extern crate::editor_binding
   editor-binding keys(history:HistoryState, menu:MenuState) -> EditorUpdate
 
 extern crate::presentation
-  editor-highlighter paint(menu:MenuState, dark:bool, commented:[i64])
+  editor-highlighter paint(menu:MenuState, dark:bool, commented:[i64], focused:bool)
 
 extern crate::document_ingress
   DocumentSource(reference:bytes)
@@ -70,7 +70,7 @@ view
     editor #document <-> document -> committed _
       with
         key-binding=keys(history, menu)
-        highlighter=paint(menu, paint_dark, commented)
+        highlighter=paint(menu, paint_dark, commented, true)
         w=640.0
         min-h=240.0
         max-h=240.0

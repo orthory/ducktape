@@ -797,7 +797,8 @@ async fn forge_blob_bytes(
         let page: forge::BlobBytesReply =
             serde_json::from_value(page).map_err(|error| error.to_string())?;
         rev = page.rev;
-        let chunk = super::storage::base64_decode(&page.b64).unwrap_or_default();
+        let chunk = super::storage::base64_decode(&page.b64)
+            .ok_or_else(|| "the node's blob page is not valid base64".to_string())?;
         bytes.extend_from_slice(&chunk);
         let announced_past_cap = page.size > MAX_PICTURE_BYTES as i64;
         let past_cap = announced_past_cap || bytes.len() > MAX_PICTURE_BYTES;
@@ -929,7 +930,8 @@ async fn inline_picture_bytes(
         | DuckKind::ForgeItem
         | DuckKind::Channel
         | DuckKind::ChannelMessage
-        | DuckKind::Run => None,
+        | DuckKind::Run
+        | DuckKind::Account => None,
     }
 }
 

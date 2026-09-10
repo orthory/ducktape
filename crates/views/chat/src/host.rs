@@ -37,6 +37,7 @@ pub struct ChatMember {
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ChatSpan {
     pub mention: String,
+    pub mention_link: String,
     pub link_text: String,
     pub link: String,
     pub bold_italic: String,
