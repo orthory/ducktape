@@ -688,12 +688,13 @@ on page_autosave_tick
   return if block_autosave_status == AutosaveStatus.saving
   let text = page_text
   return if text == page_saved_text
-  // An open ``` swallows every line under it when parsed — the save waits
-  // for the close instead of writing (or refusing) a half-typed fence, and
-  // SAYS SO: a stale "✓ synced" over held-back text would be a lie.
+  // An open ``` swallows every line under it when parsed: the plan would
+  // REMOVE every block below it, and removing a block purges its comment
+  // threads. The save waits for the close — quietly. The status drops to
+  // idle (no "✓ synced" over held-back text), and the next tick after the
+  // close writes; no banner lectures the writer about Markdown mid-sentence.
   let fence_open = has_unclosed_fence(text)
   block_autosave_status = AutosaveStatus.idle
-  page_refusal = keep_str(!fence_open, page_refusal, "the ``` fence is open — close it to save")
   return if fence_open
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
