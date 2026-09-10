@@ -207,6 +207,7 @@ on open_agent(id)
 
 // Open the New agent form: empty drafts, the signing account as controller.
 on open_new
+  panel = "registry"
   selected = ""
   creating = true
   can_edit = connected && !empty(account)
@@ -227,9 +228,7 @@ on close_editor
   selected = ""
   creating = false
 
-// ONE SELECTOR FOR THREE MUTUALLY EXCLUSIVE PANELS. Three zero-arg handlers
-// would be three places to forget a panel; the value IS the panel, and the
-// header's three buttons are the only callers.
+// The header selects one panel at a time.
 on choose_panel(next)
   panel = next
 
@@ -359,7 +358,7 @@ view
               text "Runs" size=12.0
           // registering needs an account to control the new agent; a device
           // without one is offered nothing rather than a refusal later
-          if connected && !empty(account) && panel == "registry"
+          if connected && !empty(account)
             button -> open_new
               with
                 label="New agent"
