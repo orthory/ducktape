@@ -129,8 +129,8 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
         "the launch arm no longer opens the onboarding window: {body}"
     );
     assert!(
-        body.contains("task window open console"),
-        "the console arm no longer reopens the console: {body}"
+        body.contains("done -> network_entered()"),
+        "the console arm no longer re-enters the network through the doors' landing: {body}"
     );
     assert!(
         EXTERNS
@@ -265,7 +265,7 @@ fn authentication_operations_always_have_replace_lanes() {
 #[test]
 fn authentication_lanes_retire_before_navigation_and_quit() {
     let onboarding = include_str!("../ui/handlers/onboarding.ice");
-    for name in ["switch_network", "open_account_welcome", "console_opened"] {
+    for name in ["switch_network", "open_account_welcome", "network_entered"] {
         let body = super::ice_handler_body(onboarding, name);
         assert!(
             body.contains("invalidate lane=account_ceremony"),

@@ -87,7 +87,9 @@ on login_skip
   password = ""
   hub_wallet_selected = ""
   onboarding_error = ""
-  task window open console -> console_opened _
+  flow
+    from done true
+    done -> network_entered()
 
 // PASSWORD — the device key is BEGUN here, in the picked network's keystore:
 // a name and 24 words, and nothing on disk yet. The password field's confirm
@@ -247,7 +249,9 @@ on account_probed(next)
   let probe = account_probe(next.exists)
   match probe
     AccountProbe.found
-      task window open console -> console_opened _
+      flow
+        from done true
+        done -> network_entered()
     AccountProbe.missing
       network_name = network_label(hub_chain_id, rpc)
       ceremony_phase = ""
@@ -268,7 +272,9 @@ on account_probe_failed(cause)
 on welcome_skip
   return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
-  task window open console -> console_opened _
+  flow
+    from done true
+    done -> network_entered()
 
 on welcome_cancel
   invalidate lane=ceremony
@@ -319,7 +325,9 @@ on welcome_desktop_done(_ok)
   ceremony_qr = ""
   ceremony_detail = ""
   ceremony_left = ""
-  task window open console -> console_opened _
+  flow
+    from done true
+    done -> network_entered()
 
 on ceremony_stepped(next)
   let phase = ceremony_phase(next)
@@ -332,7 +340,9 @@ on ceremony_stepped(next)
       mutation_phase = MutationPhase.idle
       ceremony_phase = ""
       ceremony_qr = ""
-      task window open console -> console_opened _
+      flow
+        from done true
+        done -> network_entered()
     CeremonyPhase.failed
       mutation_phase = MutationPhase.idle
       ceremony_phase = ""
@@ -351,12 +361,13 @@ on welcome_failed(cause)
   ceremony_left = ""
   onboarding_error = cause.message
 
-// The console window exists: point it at the picked endpoint, remember the
-// pick, close the launch window BY ID, and run the same connect boot the
-// single-window app ran on mount. By id, not the targetless `task window
-// close` this used to be: that compiles to "the oldest window", and the
-// daemon's third window (the popped huddle) can outlive the console, so
-// oldest stopped meaning predecessor.
+// THE DOORS' LANDING — every way into a network (a wallet unlocked, read-only
+// skipped, an account found, a welcome done, the tray's reopen) ends here:
+// point the console at the picked endpoint, remember the pick, and run the
+// connect. The console window does NOT exist yet: `workspace_connected` opens
+// it once the workspace and every module view are in hand, so its first draw
+// shows the network and never a view on its way; the launch window stays up,
+// its doors held, until then (`hub_busy`), and a refused connect shows there.
 //
 // EVERY per-network reading and draft resets to its default here — the pick
 // may name a DIFFERENT network than the last console, and a channel list,
@@ -365,7 +376,7 @@ on welcome_failed(cause)
 // remaining scoped generation bumps are the other half: an in-flight load
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
-on console_opened(id)
+on network_entered
   fs_generation = fs_generation + 1
   fs_preview_path = ""
   fs_preview_entry = no_fs_entry()
@@ -409,12 +420,12 @@ on console_opened(id)
   invalidate lane=shell_terminal
   invalidate lane=shell_chat
   invalidate lane=page_autosave
-  console_win = some(id)
   wall_now = current_wall_seconds()
   connected = false
   loading = true
   status = "Connecting…"
   error = ""
+  onboarding_error = ""
   connected_rpc = rpc
   // Which chain this endpoint serves is the NODE's answer (`node_facts_loaded`);
   // the previous connection's is not it. Until it lands the title is the host.
@@ -606,15 +617,26 @@ on console_opened(id)
   call_video_live = false
   huddle_stage = ""
   call_peers = []
-  // An empty endpoint names no node: keep the adopted window and the
-  // reset above, but launch nothing a "" could never answer.
+  // An empty endpoint names no node: keep the reset above, but launch
+  // nothing a "" could never answer.
   return if empty(connected_rpc)
+  console_entry = ConsoleEntry.entering
   parallel
-    task window close target=window_target(onboarding_win)
     flow
       from run remember_network(connected_rpc)
       discard
     run replace lane=connect connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
+
+// THE CONSOLE WINDOW IS REGISTERED once it is up. `workspace_connected` opened
+// it with the workspace and every view in hand, so nothing it draws is on its
+// way. The launch window it succeeds closes behind it BY ID — a handoff, never
+// the last close (`window_was_closed`) — and by id, not the targetless `task
+// window close`: that compiles to "the oldest window", and the daemon's third
+// window (the popped huddle) can outlive the console, so oldest stopped
+// meaning predecessor.
+on console_opened(id)
+  console_win = some(id)
+  task window close target=window_target(onboarding_win)
 
 // Only a saved remote can be forgotten: a local network is a directory under
 // the ducktape home, and this app deletes none.

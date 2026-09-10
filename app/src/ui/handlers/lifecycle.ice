@@ -1,7 +1,8 @@
 // EVERY BOOT OPENS THE LAUNCH WINDOW — sign in, pick a network, and only
 // then does a console window exist. `onboarding_opened` (handlers/
 // onboarding.ice) loads the hub state and appearance once the window is up;
-// `connect` runs only after a pick, from `console_opened`.
+// `connect` runs only after a pick, from `network_entered`, and the console
+// window opens on its answer (`workspace_connected`).
 on mount
   task window open onboarding -> onboarding_opened _
 
@@ -308,6 +309,24 @@ on workspace_connected(next)
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
+    // the console, if a door is waiting for one: dispatched after the state
+    // above has landed, so the window's first draw is the workspace it
+    // opens onto (a handler match must be a handler's last statement)
+    flow
+      from done true
+      done -> console_entry_answered()
+
+// A DOOR'S CONNECT OPENS THE CONSOLE, onto the workspace and views now in
+// hand; a reconnect's answers into the console that is up, and a windowless
+// daemon's opens nothing — the tray is the way back in.
+on console_entry_answered
+  match console_entry
+    ConsoleEntry.entering
+      console_entry = ConsoleEntry.idle
+      task window open console -> console_opened _
+    ConsoleEntry.idle
+      // nothing to open; an arm carries at least one statement
+      console_entry = ConsoleEntry.idle
 
 on live_updated(next)
   status = next.status
@@ -1154,7 +1173,9 @@ on tray_open
     TrayOpen.launch
       task window open onboarding -> onboarding_opened _
     TrayOpen.console
-      task window open console -> console_opened _
+      flow
+        from done true
+        done -> network_entered()
     TrayOpen.raise
       parallel
         task window focus target=window_target(console_win)
@@ -1342,6 +1363,11 @@ on connect_failed(cause)
   loading = false
   status = "Offline"
   error = cause.message
+  // A DOOR'S FAILURE SHOWS WHERE THE READER IS: the launch window, whose
+  // doors reopen with it (`hub_busy`) while the retry below goes on — a pick
+  // pressed meanwhile abandons this chain by its generation, and a retry that
+  // lands opens the console like the first attempt would have.
+  onboarding_error = keep_str(console_entry == ConsoleEntry.entering, cause.message, onboarding_error)
   run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
 // ONE LOAD FAILED; THE CONNECTION DID NOT SAY ANYTHING. This is the failed arm

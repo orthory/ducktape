@@ -25,7 +25,7 @@ view
           height=block_height
           tier=member_tier(members_rows)
           error=onboarding_error
-          busy=mutation_busy
+          busy=hub_busy
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events

@@ -96,6 +96,13 @@ enum TrayOpen
   console
   raise
 
+// WHETHER A CONNECT'S ANSWER OPENS THE CONSOLE. `entering` from a door
+// (`network_entered`) until the answer that opens the window; `idle` for a
+// reconnect into a console that is up and for a windowless daemon's.
+enum ConsoleEntry
+  idle
+  entering
+
 // WHICH PLATE A MESSAGE ROW WEARS. `selected_row` is the one plate in the app
 // that means "the row you are on"; `brand_wash` is deliberately lighter,
 // because a copy range is a RUN and painting five rows in the you-are-here
