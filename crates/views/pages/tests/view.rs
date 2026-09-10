@@ -270,4 +270,18 @@ fn focus_observations_hide_named_link_syntax_and_ignore_a_late_focus_reply() {
     );
     let next = focus_request(&tick_native(vec![release()]));
     assert_eq!(reply(next, true), "[문서](https://example.com)");
+    // Tab is usually captured by the mounted widgets before this observation.
+    use wire::keyboard::{Key, KeyState, Location, Modifiers, Named, NativeCode, Physical};
+    let tab = wire::Event::Keyboard {
+        event: wire::keyboard::Event::Release(KeyState {
+            key: Key::Named(Named::Tab),
+            modified_key: Key::Named(Named::Tab),
+            physical_key: Physical::Unidentified(NativeCode::Unidentified),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+        }),
+        captured: true,
+    };
+    let tab_query = focus_request(&tick_native(vec![tab]));
+    assert_eq!(reply(tab_query, false), "문서");
 }
