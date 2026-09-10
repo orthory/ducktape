@@ -211,8 +211,7 @@ fn forge_depth_rides_the_established_seams() {
     // the note goes out under an id the send carries on BOTH its routes, so a
     // stale answer can be told from the pending one
     assert!(lifecycle.contains(
-        "run every send_message(connected_rpc, password, forge_item_channel, op, trim(body), \
-         forge_discussion_members) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)"
+        "run every send_message(connected_rpc, password, forge_item_channel, op, trim(body)) -> forge_note_sent(op, _) | forge_note_failed(scope, op, _)"
     ));
 
     // Replace lanes own request freshness. Their payloads keep only the

@@ -223,14 +223,14 @@ fn thread_messages_mirror_the_main_action_system() {
     }
     // Thread edit/delete target the thread selection, never the main one.
     let edit = handlers
-        .split_once("on edit_thread_message_submit(text)\n")
+        .split_once("on edit_thread_message_submit(text, scope, seq, rev)\n")
         .unwrap()
         .1
         .split_once("\non ")
         .unwrap()
         .0;
     assert!(edit.contains(
-        "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members)"
+        "edit_message(connected_rpc, password, active_channel, seq, rev, trim(thread_edit_draft))"
     ));
     let delete = handlers
         .split_once("on delete_thread_message_submit\n")
@@ -498,6 +498,7 @@ fn thread_pagination_preserves_multiple_pending_replies() {
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: backend::paragraph_blocks(body),
         pending: false,

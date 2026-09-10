@@ -54,7 +54,7 @@ extern crate::host
   ChatMember(key:str, label:str)
   ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, edit_body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   ChatSidebarRow(channel:ChatChannel, unread:bool)
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmSidebarRow(peer:DmPeer, unread:bool)
@@ -102,7 +102,6 @@ extern crate::host
   pure send_clear_range() -> bool
   pure send_copy_range() -> bool
   pure send_reaction_submit(emoji:&str) -> bool
-  pure send_edit(text:&str) -> bool
   pure send_delete() -> bool
   pure send_rename(name:&str) -> bool
   pure send_archive() -> bool
@@ -115,7 +114,6 @@ extern crate::host
   pure send_thread_begin_edit(seq:i64, body:&str, rev:i64) -> bool
   pure send_thread_arm_delete(seq:i64, body:&str, rev:i64) -> bool
   pure send_thread_clear_selection() -> bool
-  pure send_thread_edit(text:&str) -> bool
   pure send_thread_delete() -> bool
   pure send_load_thread() -> bool
   pure icon(name:&str) -> bytes
@@ -124,8 +122,8 @@ extern crate::host
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
   pure timeline_of(messages:&[ChatMessage], live_agents:&[LiveRunHint]) -> Timeline
+  pure live_thread_label(agent:&str) -> str
   pure run_in_thread(live:&LiveRunHint, active_thread_seq:i64) -> bool
-  pure rail_owns_run(live:&LiveRunHint, rail_shown:bool, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
   pure thread_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
@@ -140,6 +138,7 @@ extern crate::host
   pure count_label(count:i64) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
+  pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
   // The composers are the app's: it keeps each room's and thread's words,
   // and a submit reaches it without passing through here.
   component chat_composer(scope:str, kind:str, compact:bool, hint:str, blocked:bool, restore_blocked:bool, failed_note:str) -> unit
@@ -397,7 +396,6 @@ on begin_message_edit(seq, body, rev)
   return if seq <= 0
   message_edit_draft = body
   sent = send_begin_edit(seq, body, rev)
-  task widget focus #chat/message-edit
 
 on arm_message_delete(seq, body, rev)
   return if seq <= 0
@@ -413,10 +411,6 @@ on clear_message_selection
 
 on add_reaction_submit(emoji)
   sent = send_reaction_submit(emoji)
-
-on edit_message_submit
-  return if busy || empty(trim(message_edit_draft))
-  sent = send_edit(trim(message_edit_draft))
 
 on delete_message_submit
   sent = send_delete()
@@ -462,7 +456,6 @@ on begin_thread_message_edit(seq, body, rev)
   return if seq <= 0
   thread_edit_draft = body
   sent = send_thread_begin_edit(seq, body, rev)
-  task widget focus #chat/thread-pane/thread-edit
 
 on arm_thread_message_delete(seq, body, rev)
   return if seq <= 0
@@ -475,10 +468,6 @@ on arm_thread_message_delete(seq, body, rev)
 on clear_thread_message_selection
   thread_edit_draft = ""
   sent = send_thread_clear_selection()
-
-on edit_thread_message_submit
-  return if busy || empty(trim(thread_edit_draft))
-  sent = send_thread_edit(trim(thread_edit_draft))
 
 on delete_thread_message_submit
   sent = send_thread_delete()
@@ -578,7 +567,6 @@ view
         arm_message_delete -> arm_message_delete _ _ _
         clear_message_selection -> clear_message_selection
         add_reaction_submit -> add_reaction_submit _
-        edit_message_submit -> edit_message_submit
         delete_message_submit -> delete_message_submit
         rename_channel_submit -> rename_channel_submit
         archive_channel_submit -> archive_channel_submit
@@ -592,7 +580,6 @@ view
         begin_thread_message_edit -> begin_thread_message_edit _ _ _
         arm_thread_message_delete -> arm_thread_message_delete _ _ _
         clear_thread_message_selection -> clear_thread_message_selection
-        edit_thread_message_submit -> edit_thread_message_submit
         delete_thread_message_submit -> delete_thread_message_submit
         load_more_thread -> load_more_thread
         cancel_run -> cancel_run _

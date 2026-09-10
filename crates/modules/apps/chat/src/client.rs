@@ -272,6 +272,7 @@ pub struct ChatMessage {
     pub author: String,
     pub meta: String,
     pub body: String,
+    pub edit_body: String,
     pub blocks: Vec<ChatBlock>,
     pub pending: bool,
     pub rev: i64,
@@ -316,6 +317,7 @@ impl std::hash::Hash for ChatMessage {
             author,
             meta,
             body: _,
+            edit_body: _,
             blocks: _,
             pending,
             rev,
@@ -360,6 +362,7 @@ impl Default for ChatMessage {
             author: String::new(),
             meta: String::new(),
             body: String::new(),
+            edit_body: String::new(),
             blocks: Vec::new(),
             pending: false,
             rev: 0,
@@ -380,13 +383,14 @@ impl Default for ChatMessage {
 
 impl ChatMessage {
     /// The construction seed: a deterministic hash of the rendered content
-    /// (exactly the fields the manual [`Hash`] covers, `render_rev` still at
-    /// its zero default), so a replacement row carrying content the displayed
+    /// (the cheap row hash plus rendered blocks, `render_rev` still at zero),
+    /// so a renamed mention or a replacement row carrying content the displayed
     /// copy never saw arrives with a moved key.
     fn seed_render_rev(mut self) -> Self {
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.hash(&mut hasher);
+        self.blocks.hash(&mut hasher);
         self.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
         self
     }
@@ -877,6 +881,7 @@ pub fn merge_message_edit(
         let stale = row.deleted || row.rev >= content.rev;
         if !stale {
             row.body = content.body.clone();
+            row.edit_body = content.edit_body.clone();
             row.blocks = content.blocks.clone();
             row.rev = content.rev;
             row.edited = true;
@@ -895,6 +900,7 @@ pub fn tombstone_message(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMe
     {
         row.deleted = true;
         row.body = "Message deleted".into();
+        row.edit_body.clear();
         row.blocks = vec![deleted_block()];
         row.reactions = Vec::new();
         row.bump_render_rev();
@@ -994,7 +1000,10 @@ pub fn optimistic_message(
     message_id: String,
     reader: ChatReader<'_>,
 ) -> Vec<ChatMessage> {
-    let blocks = paragraph_blocks(&body);
+    let parsed = parse_message(&body);
+    let blocks = blocks_view_with_names(&parsed, reader.names);
+    let edit_body = draft_body(&parsed);
+    let body = message_body_with_names(&parsed, reader.names);
     // A device with no key cannot sign a send, so the keyless mint is a row
     // with no author to name: it stays unattributed rather than inventing one.
     let (author, initial) = match reader.handle() {
@@ -1023,6 +1032,7 @@ pub fn optimistic_message(
             author,
             meta: "Sending…".into(),
             body,
+            edit_body,
             blocks,
             pending: true,
             rev: 0,
@@ -1290,7 +1300,7 @@ pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
     let blocks = if row.deleted {
         vec![deleted_block()]
     } else {
-        blocks_view(&row.blocks)
+        blocks_view_with_names(&row.blocks, reader.names)
     };
     let view_key = next_message_view_key();
     ChatMessage {
@@ -1302,7 +1312,12 @@ pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
         body: if row.deleted {
             "Message deleted".into()
         } else {
-            message_body(&row.blocks)
+            message_body_with_names(&row.blocks, reader.names)
+        },
+        edit_body: if row.deleted {
+            String::new()
+        } else {
+            draft_body(&row.blocks)
         },
         blocks,
         pending: false,
@@ -1366,10 +1381,10 @@ pub fn mark_message_groups(messages: &mut [ChatMessage]) {
     }
 }
 
-/// Flatten wire blocks back into composer text — the seed for an edit draft.
+/// Flatten wire blocks into copyable text. Editing uses [`draft_body`].
 ///
 /// One `\n` per block boundary, because that is what a block boundary now MEANS
-/// in the composer (`parse_message_with_mentions` makes every typed line its own
+/// in the composer (`parse_message` makes every typed line its own
 /// block). A `\n\n` here re-parsed to the same blocks, but it handed the editor
 /// a blank line the author never typed, and every edit added another.
 pub fn message_body(blocks: &[Block]) -> String {
@@ -1394,13 +1409,134 @@ fn span_text(spans: &[Span]) -> String {
 
 /// Convert wire `Block`s into the render model the view iterates over.
 pub fn blocks_view(blocks: &[Block]) -> Vec<ChatBlock> {
-    blocks.iter().map(block_view).collect()
+    blocks_view_with_names(blocks, &NOBODY_KNOWN)
+}
+
+pub fn blocks_view_with_names(blocks: &[Block], names: &NameDirectory) -> Vec<ChatBlock> {
+    named_blocks(blocks, names).iter().map(block_view).collect()
+}
+
+pub fn message_body_with_names(blocks: &[Block], names: &NameDirectory) -> String {
+    message_body(&named_blocks(blocks, names))
+}
+
+fn named_blocks(blocks: &[Block], names: &NameDirectory) -> Vec<Block> {
+    let mut blocks = blocks.to_vec();
+    for block in &mut blocks {
+        let spans = match block {
+            Block::Paragraph(spans) | Block::Quote(spans) => spans,
+            Block::Code { .. } | Block::Divider => continue,
+        };
+        for span in spans {
+            if let Some(party) = span.marks.iter().find_map(|mark| match mark {
+                Mark::Mention(party) => Some(party),
+                _ => None,
+            }) {
+                span.text = mention_label(party, names);
+            }
+        }
+    }
+    blocks
+}
+
+/// Editable markdown with stable mention identities, independent of display names.
+pub fn draft_body(blocks: &[Block]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Paragraph(spans) => draft_spans(spans),
+            Block::Quote(spans) => format!("> {}", draft_spans(spans)),
+            Block::Code { lang, text } => {
+                format!("```{}\n{text}\n```", lang.as_deref().unwrap_or_default())
+            }
+            Block::Divider => "---".into(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn draft_spans(spans: &[Span]) -> String {
+    spans
+        .iter()
+        .map(|span| {
+            let mut text = span
+                .marks
+                .iter()
+                .find_map(|mark| match mark {
+                    Mark::Mention(party) => Some(mention_token(party)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| span.text.clone());
+            for mark in &span.marks {
+                text = match mark {
+                    Mark::Bold => format!("**{text}**"),
+                    Mark::Italic => format!("_{text}_"),
+                    Mark::Link(url) => format!("[{text}]({url})"),
+                    Mark::Mention(_) => text,
+                };
+            }
+            text
+        })
+        .collect()
+}
+
+/// Display text and UTF-8 byte ranges used by the native editor's mention tokens.
+pub fn draft_mentions(
+    text: &str,
+    names: &NameDirectory,
+) -> (String, Vec<(std::ops::Range<usize>, Party)>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut display = String::new();
+    let mut mentions = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some(consumed) = code_fence_len(&chars, index) {
+            display.extend(&chars[index..index + consumed]);
+            index += consumed;
+            continue;
+        }
+        if let Some((party, consumed)) = mention_at(&chars, index) {
+            let start = display.len();
+            display.push_str(&mention_label(&party, names));
+            mentions.push((start..display.len(), party));
+            index += consumed;
+        } else {
+            display.push(chars[index]);
+            index += 1;
+        }
+    }
+    (display, mentions)
+}
+
+/// Fenced code is literal, including token-shaped text inside it.
+fn code_fence_len(chars: &[char], at: usize) -> Option<usize> {
+    let line_start = at == 0 || chars[at - 1] == '\n';
+    if !line_start {
+        return None;
+    }
+    let mut lines = chars[at..].split_inclusive(|ch| *ch == '\n');
+    let opener = lines.next()?;
+    let opener_text: String = opener.iter().collect();
+    let opens_fence = opener_text.trim().starts_with("```");
+    if !opens_fence {
+        return None;
+    }
+    let mut consumed = opener.len();
+    for line in lines {
+        consumed += line.len();
+        let line_text: String = line.iter().collect();
+        let closes_fence = line_text.trim() == "```";
+        if closes_fence {
+            break;
+        }
+    }
+    Some(consumed)
 }
 
 /// The optimistic row's render blocks: the SAME grammar the send commits
 /// ([`parse_message`]), so a pending row previews what will land instead of
-/// showing raw `**marks**` until the settle replaces it. Roster mentions are
-/// the one divergence — they need the channel members the send resolves.
+/// showing raw `**marks**` until the settle replaces it. Unknown accounts use
+/// an account-number label; named optimistic rows use their reader directory.
 pub fn paragraph_blocks(text: &str) -> Vec<ChatBlock> {
     blocks_view(&parse_message(text))
 }
@@ -1544,7 +1680,7 @@ pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if text.contains('\n') {
         return Vec::new();
     }
-    let spans = inline_spans(text, &MentionCandidates::default());
+    let spans = inline_spans(text);
     let marked = spans.iter().any(|span| !span.marks.is_empty());
     if !marked {
         return Vec::new();
@@ -1679,15 +1815,9 @@ fn count_i64(value: usize) -> i64 {
 /// A rendered break has to be a block boundary rather than a `\n` inside one:
 /// a marked-up line renders as a single rich-text paragraph (`run_spans`),
 /// one paragraph widget per typed line.
+/// Parse canonical `<@account>` and `<@key:hex>` tokens into mention marks.
+/// Display names are never interpreted as recipient identities.
 pub fn parse_message(input: &str) -> Vec<Block> {
-    parse_message_with_mentions(input, &MentionCandidates::default())
-}
-
-/// [`parse_message`] with `@mention` resolution against [`MentionCandidates`]:
-/// a resolved `@handle` becomes a [`Mark::Mention`] span, which the module
-/// fans out to hooks (inbox notifications) on apply. Non-matching `@word`s
-/// stay plain text.
-pub fn parse_message_with_mentions(input: &str, mentions: &MentionCandidates) -> Vec<Block> {
     let lines: Vec<&str> = input.lines().collect();
     let mut blocks = Vec::new();
     let mut index = 0;
@@ -1704,11 +1834,11 @@ pub fn parse_message_with_mentions(input: &str, mentions: &MentionCandidates) ->
             blocks.push(Block::Divider);
             index += 1;
         } else if is_quote {
-            index = push_quote_block(&lines, index, mentions, &mut blocks);
+            index = push_quote_block(&lines, index, &mut blocks);
         } else if is_blank {
             index += 1;
         } else {
-            index = push_paragraph_block(&lines, index, mentions, &mut blocks);
+            index = push_paragraph_block(&lines, index, &mut blocks);
         }
     }
     if blocks.is_empty() {
@@ -1733,27 +1863,17 @@ fn push_code_block(lines: &[&str], start: usize, opener: &str, blocks: &mut Vec<
     if closed { index + 1 } else { index }
 }
 
-fn push_quote_block(
-    lines: &[&str],
-    start: usize,
-    mentions: &MentionCandidates,
-    blocks: &mut Vec<Block>,
-) -> usize {
+fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
     let mut index = start;
     while index < lines.len() && lines[index].trim().starts_with('>') {
         let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        blocks.push(Block::Quote(inline_spans(stripped, mentions)));
+        blocks.push(Block::Quote(inline_spans(stripped)));
         index += 1;
     }
     index
 }
 
-fn push_paragraph_block(
-    lines: &[&str],
-    start: usize,
-    mentions: &MentionCandidates,
-    blocks: &mut Vec<Block>,
-) -> usize {
+fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
     let mut index = start;
     while index < lines.len() {
         let trimmed = lines[index].trim();
@@ -1765,17 +1885,17 @@ fn push_paragraph_block(
         if breaks {
             break;
         }
-        blocks.push(Block::Paragraph(inline_spans(trimmed, mentions)));
+        blocks.push(Block::Paragraph(inline_spans(trimmed)));
         index += 1;
     }
     index
 }
 
-/// Scan a single line of text for inline marks, emitting marked `Span`s. Marks do
-/// not nest; the first matching delimiter wins. Bare `http(s)://` and `duck://`
+/// Scan a single line of text for inline marks, preserving mention identity
+/// inside emphasis. Bare `http(s)://` and `duck://`
 /// runs become `Link`s, as does a `[label](url)` reference — one span whose
 /// text is the label and whose mark carries the target.
-fn inline_spans(text: &str, mentions: &MentionCandidates) -> Vec<Span> {
+fn inline_spans(text: &str) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span> = Vec::new();
     let mut plain = String::new();
@@ -1785,13 +1905,13 @@ fn inline_spans(text: &str, mentions: &MentionCandidates) -> Vec<Span> {
         let reference = reference_at(&chars, index);
         let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
         let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
-        if let Some((target, len)) = mention_at(&chars, index, mentions) {
+        if let Some((target, len)) = mention_at(&chars, index) {
             flush_plain(&mut plain, &mut spans);
             let handle: String = chars[index..index + len].iter().collect();
             spans.push(Span {
                 text: handle,
                 // A directory account is one mark, regardless of its keys.
-                marks: target.parties.iter().cloned().map(Mark::Mention).collect(),
+                marks: vec![Mark::Mention(target)],
             });
             index += len;
         } else if let Some((label, target, len)) = reference {
@@ -1811,17 +1931,17 @@ fn inline_spans(text: &str, mentions: &MentionCandidates) -> Vec<Span> {
             index += len;
         } else if let Some((inner, len)) = bold {
             flush_plain(&mut plain, &mut spans);
-            spans.push(Span {
-                text: inner,
-                marks: vec![Mark::Bold],
-            });
+            spans.extend(inline_spans(&inner).into_iter().map(|mut span| {
+                span.marks.push(Mark::Bold);
+                span
+            }));
             index += len;
         } else if let Some((inner, len)) = italic {
             flush_plain(&mut plain, &mut spans);
-            spans.push(Span {
-                text: inner,
-                marks: vec![Mark::Italic],
-            });
+            spans.extend(inline_spans(&inner).into_iter().map(|mut span| {
+                span.marks.push(Mark::Italic);
+                span
+            }));
             index += len;
         } else {
             plain.push(chars[index]);
@@ -1947,167 +2067,108 @@ fn reference_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
     linkable.then(|| (label, target, url_end + 1 - at))
 }
 
-/// WHO A TYPED `@handle` CAN REACH: the network's ACCOUNT DIRECTORY, by name,
-/// unioned with the channel's own member roster, by key.
-///
-/// The roster alone used to be the whole answer, and it is empty in every
-/// open-policy channel — `#general` has no member rows, so `@orthory` in the
-/// room everybody actually writes in resolved to nothing, no `Mark::Mention`
-/// was minted, and the module's `collect_mentions` had nothing to fan out.
-/// A person is nameable in EVERY room they can be read in, so the directory
-/// is the candidate set and the roster only adds keys the directory has not
-/// registered (an unnamed device, an invited key).
+/// Autocomplete candidates carry identity separately from their display labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MentionCandidates {
-    /// longest handle first, so a greedy scan settles `@orthory-ops` on the
-    /// account of that name instead of on `@orthory`.
-    targets: Vec<MentionTarget>,
+    targets: Vec<MentionChoice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MentionTarget {
-    /// what the writer types after `@`, lowercased.
-    pub handle: String,
-    /// The stable account or explicitly named key this handle addresses.
-    pub parties: Vec<Party>,
+pub struct MentionChoice {
+    pub label: String,
+    pub party: Party,
 }
 
-/// The shortest `@key` fragment that may stand for a member key. A name is
-/// matched WHOLE, so this bounds only the hex-prefix form.
-const MIN_KEY_PREFIX: usize = 4;
-
 impl MentionCandidates {
-    /// The directory (by account name) unioned with `members` (by key). A key
-    /// the directory already names is not re-added under its hex.
     pub fn new(directory: &NameDirectory, members: &[ChatMember]) -> Self {
-        let mut targets = Vec::new();
-        let mut counts = BTreeMap::<String, usize>::new();
-        for name in directory.by_account.values() {
-            *counts.entry(name.to_ascii_lowercase()).or_default() += 1;
-        }
-        for (account, name) in &directory.by_account {
-            let name = name.to_ascii_lowercase();
-            let ambiguous = name.is_empty() || counts.get(&name).copied().unwrap_or(0) > 1;
-            let handle = if ambiguous {
-                format!("account-{account}")
-            } else {
-                name
-            };
-            targets.push(MentionTarget {
-                handle,
-                parties: vec![Party::Account(*account)],
-            });
-        }
-        for member in members {
-            if let Some(number) = member
-                .key
-                .strip_prefix("acct:")
-                .and_then(|id| id.parse::<u64>().ok())
-            {
-                if !directory.by_account.contains_key(&number) {
-                    targets.push(MentionTarget {
-                        handle: format!("account-{number}"),
-                        parties: vec![Party::Account(number)],
-                    });
+        let mut targets: Vec<_> = directory
+            .by_account
+            .keys()
+            .map(|account| {
+                let party = Party::Account(*account);
+                MentionChoice {
+                    label: mention_label(&party, directory)[1..].to_string(),
+                    party,
                 }
+            })
+            .collect();
+        for member in members {
+            let party = match member.key.strip_prefix("acct:") {
+                Some(number) => match number.parse::<u64>() {
+                    Ok(number) => Party::Account(number),
+                    Err(_) => continue,
+                },
+                None => {
+                    let key = member_key_bytes(member);
+                    let registered = directory.account_of(&hex_encode(&key)).is_some();
+                    if registered {
+                        continue;
+                    }
+                    Party::Key(key)
+                }
+            };
+            let already_listed = targets.iter().any(|target| target.party == party);
+            if already_listed {
                 continue;
             }
-            let key = member_key_bytes(member);
-            if directory.name_of(&hex_encode(&key)).is_some() {
-                continue;
-            }
-            targets.push(MentionTarget {
-                handle: member
-                    .key
-                    .strip_prefix("user:")
-                    .unwrap_or(&member.key)
-                    .to_ascii_lowercase(),
-                parties: vec![Party::Key(key)],
+            targets.push(MentionChoice {
+                label: mention_label(&party, directory)[1..].to_string(),
+                party,
             });
         }
-        targets.sort_by(|left, right| {
-            right
-                .handle
-                .len()
-                .cmp(&left.handle.len())
-                .then_with(|| left.handle.cmp(&right.handle))
-        });
+        targets.sort_by_key(|choice| choice.label.to_lowercase());
         Self { targets }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
-    }
-
-    /// Every handle a composer could offer, longest first — the autocomplete's
-    /// source and the parser's.
-    pub fn handles(&self) -> Vec<&str> {
-        self.targets
-            .iter()
-            .map(|target| target.handle.as_str())
-            .collect()
-    }
-
-    /// The target a typed word names: a WHOLE account name, else a key the
-    /// word prefixes. Both case-insensitive.
-    fn resolve(&self, word: &str) -> Option<&MentionTarget> {
-        let needle = word.to_ascii_lowercase();
-        let names_an_account = |target: &&MentionTarget| target.handle == needle;
-        let prefixes_a_key = |target: &&MentionTarget| {
-            needle.len() >= MIN_KEY_PREFIX && target.handle.starts_with(&needle)
-        };
-        self.targets
-            .iter()
-            .find(names_an_account)
-            .or_else(|| self.targets.iter().find(prefixes_a_key))
+    pub fn choices(&self) -> Vec<MentionChoice> {
+        self.targets.clone()
     }
 }
 
-/// A character that may sit inside a typed handle. Account names carry `-`,
-/// `_` and `.` (`orthory-ops` is one account), so the scan cannot stop at the
-/// first non-alphanumeric — it takes them all and then backs off. The
-/// composer's mention menu reads the word under the caret by the same rule,
-/// so what it offers is exactly what this parser will resolve.
+pub fn mention_token(party: &Party) -> String {
+    match party {
+        Party::Account(account) => format!("<@{account}>"),
+        Party::Key(key) => format!("<@key:{}>", hex_encode(key)),
+        Party::Module(_) | Party::System => String::new(),
+    }
+}
+
+pub fn mention_label(party: &Party, names: &NameDirectory) -> String {
+    match party {
+        Party::Account(account) => names
+            .by_account
+            .get(account)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| format!("@account-{account}"), |name| format!("@{name}")),
+        Party::Key(key) => format!("@{}", names.member_label(&hex_encode(key))),
+        Party::Module(module) => format!("@{module}"),
+        Party::System => "@system".into(),
+    }
+}
+
+/// Characters accepted in an autocomplete search query, never an identity parser.
 pub fn handle_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 
-/// If `chars[at..]` opens an `@mention` — `@` plus a handle
-/// [`MentionCandidates`] resolves — the matched target and the consumed
-/// length (the `@` included).
-///
-/// LONGEST MATCH FIRST, then shed TRAILING PUNCTUATION one character at a
-/// time: `@orthory-ops.` scans `orthory-ops.`, which names nobody, then
-/// `orthory-ops`, which does. Only `-`, `_` and `.` are shed — backing off
-/// through letters instead would let `@zoe1` mention `zoe` and leave a
-/// stray `1`.
-fn mention_at<'a>(
-    chars: &[char],
-    at: usize,
-    mentions: &'a MentionCandidates,
-) -> Option<(&'a MentionTarget, usize)> {
-    let opens = chars[at] == '@' && (at == 0 || chars[at - 1].is_whitespace());
-    if !opens || mentions.is_empty() {
+fn mention_at(chars: &[char], at: usize) -> Option<(Party, usize)> {
+    let opens = chars.get(at) == Some(&'<') && chars.get(at + 1) == Some(&'@');
+    if !opens {
         return None;
     }
-    let mut word: Vec<char> = chars[at + 1..]
-        .iter()
-        .copied()
-        .take_while(|c| handle_char(*c))
-        .collect();
-    loop {
-        let candidate: String = word.iter().collect();
-        if let Some(target) = mentions.resolve(&candidate) {
-            return Some((target, 1 + word.len()));
+    let end = chars[at + 2..].iter().position(|c| *c == '>')? + at + 2;
+    let id: String = chars[at + 2..end].iter().collect();
+    let party = match id.strip_prefix("key:") {
+        Some(key) => Party::Key(hex_bytes(key)?),
+        None => {
+            let decimal = !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit());
+            if !decimal {
+                return None;
+            }
+            Party::Account(id.parse().ok()?)
         }
-        let sheds = word
-            .last()
-            .is_some_and(|last| !last.is_ascii_alphanumeric());
-        if !sheds {
-            return None;
-        }
-        word.pop();
-    }
+    };
+    Some((party, end + 1 - at))
 }
 
 /// True when any `Mark::Mention` in `blocks` addresses one of `keys` — the
@@ -2282,14 +2343,25 @@ mod tests {
         let names = NameDirectory::from_accounts([&human, &program]);
         assert_eq!(author_display("acct:1", &names), "same");
         assert_eq!(author_display("acct:2", &names), "bot");
-        let blocks = parse_message_with_mentions("ping @bot", &MentionCandidates::new(&names, &[]));
+        let blocks = parse_message("ping <@2>");
         assert!(mentions_reach(&blocks, &[Party::Account(2)]));
         let collision = account(3, "same", vec![vec![3; 32]]);
         let names = NameDirectory::from_accounts([&human, &collision]);
         let candidates = MentionCandidates::new(&names, &[]);
-        assert!(candidates.handles().contains(&"account-1"));
-        assert!(candidates.handles().contains(&"account-3"));
-        assert!(!candidates.handles().contains(&"same"));
+        assert_eq!(
+            candidates
+                .choices()
+                .iter()
+                .map(|choice| choice.party.clone())
+                .collect::<Vec<_>>(),
+            vec![Party::Account(1), Party::Account(3)]
+        );
+        assert!(
+            candidates
+                .choices()
+                .iter()
+                .all(|choice| choice.label == "same")
+        );
     }
 
     #[test]
@@ -2867,63 +2939,67 @@ mod tests {
             .collect()
     }
 
-    /// The bug: `#general` is an open channel with an EMPTY member roster, so
-    /// the roster-only candidate set resolved no name at all in the one room
-    /// everybody writes in. The directory is the candidate set now.
     #[test]
-    fn an_account_name_mentions_in_a_channel_with_no_roster() {
-        let mentions = MentionCandidates::new(&directory(), &[]);
-        let blocks = parse_message_with_mentions("ping @orthory about it", &mentions);
-        // both of that account's keys, so the mention reaches the PERSON.
+    fn canonical_mentions_keep_identity_through_names_and_edits() {
+        let original = account(2, "Selfhost Duck", Vec::new());
+        let duplicate = account(3, "Selfhost Duck", Vec::new());
+        let names = NameDirectory::from_accounts([&original, &duplicate]);
+        let choices = MentionCandidates::new(&names, &[]).choices();
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].label, "Selfhost Duck");
+        assert_eq!(choices[1].label, "Selfhost Duck");
+        assert_ne!(choices[0].party, choices[1].party);
+        let text = "안녕 <@2>, **ship it**\n> <@3>\n```rs\nlet x = 1;\n```\n---";
+        let blocks = parse_message(text);
         assert_eq!(mention_parties(&blocks), vec![Party::Account(2)]);
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("paragraph expected");
-        };
-        assert!(spans.iter().any(|span| span.text == "@orthory"));
-    }
-
-    /// A hyphenated name is one handle, and the longer one wins: `@orthory-ops`
-    /// must not settle on `orthory` and leave `-ops` as text.
-    #[test]
-    fn a_hyphenated_name_wins_over_its_own_prefix() {
-        let mentions = MentionCandidates::new(&directory(), &[]);
-        let blocks = parse_message_with_mentions("cc @orthory-ops", &mentions);
-        assert_eq!(mention_parties(&blocks), vec![Party::Account(3)]);
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("paragraph expected");
-        };
-        assert!(spans.iter().any(|span| span.text == "@orthory-ops"));
-    }
-
-    /// Trailing punctuation is sentence, not handle.
-    #[test]
-    fn a_trailing_dot_is_shed_from_a_handle() {
-        let mentions = MentionCandidates::new(&directory(), &[]);
-        let blocks = parse_message_with_mentions("done @orthory-ops. thanks", &mentions);
-        assert_eq!(mention_parties(&blocks), vec![Party::Account(3)]);
-        assert_eq!(message_body(&blocks), "done @orthory-ops. thanks");
-    }
-
-    #[test]
-    fn a_roster_key_still_resolves_beside_the_directory() {
-        let members = vec![ChatMember {
-            key: "f00dbeef".into(),
-            label: "f00dbeef".into(),
-        }];
-        let mentions = MentionCandidates::new(&directory(), &members);
-        let blocks = parse_message_with_mentions("hi @f00d and @eddy", &mentions);
+        assert_eq!(draft_body(&blocks), text);
+        assert_eq!(parse_message(&draft_body(&blocks)), blocks);
+        let view = blocks_view_with_names(&blocks, &names);
+        assert_eq!(view[0].spans[1].mention, "@Selfhost Duck");
+        assert_eq!(view[0].spans[1].mention_link, "duck://account/2");
+        let renamed = account(2, "Claude Peer", Vec::new());
+        let names = NameDirectory::from_accounts([&renamed]);
         assert_eq!(
-            mention_parties(&blocks),
-            vec![Party::Key(vec![0xf0, 0x0d, 0xbe, 0xef]), Party::Account(1)]
+            blocks_view_with_names(&blocks, &names)[0].spans[1].mention,
+            "@Claude Peer"
         );
+        assert_eq!(draft_body(&blocks), text);
+        let (display, ranges) = draft_mentions("안녕 <@2> and <@3>", &names);
+        assert_eq!(display, "안녕 @Claude Peer and @account-3");
+        assert_eq!(&display[ranges[0].0.clone()], "@Claude Peer");
+        assert_eq!(ranges[0].1, Party::Account(2));
+        assert_eq!(ranges[1].1, Party::Account(3));
+        let code = "```\n<@2>\n```\n<@2>";
+        let (display, ranges) = draft_mentions(code, &names);
+        assert_eq!(display, "```\n<@2>\n```\n@Claude Peer");
+        assert_eq!(ranges.len(), 1);
+        let emphasized = parse_message("**<@2>**");
+        assert_eq!(mention_parties(&emphasized), vec![Party::Account(2)]);
+        assert_eq!(parse_message(&draft_body(&emphasized)), emphasized);
+    }
+
+    #[test]
+    fn display_names_and_malformed_tokens_never_choose_recipients() {
+        let text = "@orthory @orthory-ops <@+2> <@key:xyz> <@>";
+        let blocks = parse_message(text);
+        assert!(mention_parties(&blocks).is_empty());
+        assert_eq!(message_body(&blocks), text);
+    }
+
+    #[test]
+    fn key_tokens_preserve_the_whole_key() {
+        let party = Party::Key(vec![0xf0, 0x0d, 0xbe, 0xef]);
+        let token = mention_token(&party);
+        assert_eq!(token, "<@key:f00dbeef>");
+        let blocks = parse_message(&format!("hi {token} and <@1>"));
+        assert_eq!(mention_parties(&blocks), vec![party, Party::Account(1)]);
+        assert_eq!(draft_body(&blocks), "hi <@key:f00dbeef> and <@1>");
     }
 
     #[test]
     fn a_mention_reaches_every_key_of_the_account_it_names() {
         let names = directory();
-        let blocks =
-            parse_message_with_mentions("@orthory ping", &MentionCandidates::new(&names, &[]));
-        // Both device keys resolve to the same canonical mention recipient.
+        let blocks = parse_message("<@2> ping");
         assert!(mentions_reach(&blocks, &names.parties_of(&[0xbb, 0x22])));
         assert!(mentions_reach(&blocks, &names.parties_of(&[0xcc, 0x33])));
         assert!(!mentions_reach(&blocks, &names.parties_of(&[0xdd, 0x44])));
@@ -2946,68 +3022,6 @@ mod tests {
         // a person may name a channel this and it stays a channel.
         assert!(!is_derived_dm_channel("dm-standup"));
         assert!(!is_derived_dm_channel(&derived.to_ascii_uppercase()));
-    }
-
-    #[test]
-    fn mentions_resolve_against_the_member_roster() {
-        let roster =
-            |members: &[ChatMember]| MentionCandidates::new(&NameDirectory::default(), members);
-        let members = vec![
-            ChatMember {
-                key: "a1b2c3d4e5f6".into(),
-                label: "a1b2c3d4…".into(),
-            },
-            ChatMember {
-                key: "zoe".into(),
-                label: "zoe".into(),
-            },
-        ];
-        let blocks = parse_message_with_mentions("ping @a1b2 about the deploy", &roster(&members));
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("paragraph expected");
-        };
-        let mention = spans
-            .iter()
-            .find(|span| span.marks.iter().any(|m| matches!(m, Mark::Mention(_))))
-            .expect("a mention span");
-        assert_eq!(mention.text, "@a1b2");
-        let Mark::Mention(Party::Key(bytes)) = &mention.marks[0] else {
-            panic!("user mention expected");
-        };
-        assert_eq!(bytes, &vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
-
-        // a printable (non-hex) identity keeps its own bytes
-        let blocks = parse_message_with_mentions("hey @zoe1 no — @zoea", &roster(&members));
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("paragraph expected");
-        };
-        // "@zoe1" prefix-matches nothing ("zoe" is shorter than the needle);
-        // four-char rule also keeps short "@zoe" plain.
-        assert!(
-            spans
-                .iter()
-                .all(|span| span.marks.iter().all(|m| !matches!(m, Mark::Mention(_))))
-        );
-
-        // an unknown @word stays plain text
-        let blocks = parse_message_with_mentions("email @someone", &roster(&members));
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("paragraph expected");
-        };
-        assert!(spans.iter().all(|span| span.marks.is_empty()));
-
-        // rendered mentions land in the mention arm
-        let view = blocks_view(&parse_message_with_mentions(
-            "cc @a1b2c3",
-            &roster(&members),
-        ));
-        assert!(view[0].rich);
-        assert!(
-            view[0]
-                .spans
-                .iter()
-                .any(|span| span.mention.starts_with("@a1b2c3"))
-        );
     }
 
     #[test]
