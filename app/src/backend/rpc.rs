@@ -48,6 +48,30 @@ pub(crate) async fn seated_write(
     submit_raw_frame(rpc, target, frame).await
 }
 
+/// A data-plane signer over the key ALREADY SEATED, or the locked refusal:
+/// the kernel's reader queries and raw-bytes writes for a module view, which
+/// carries no password of its own.
+pub(crate) async fn seated_data_plane_signer(
+    rpc: &RpcClient,
+) -> Result<ducktape_rpc::WriteAuth, String> {
+    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+    let key = {
+        let session = SIGNER.lock().await;
+        let Some(signer) = session.as_ref() else {
+            return Err("the local user key is locked; enter its password".into());
+        };
+        signer.key.clone()
+    };
+    Ok(std::sync::Arc::new(
+        move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        },
+    ))
+}
+
 /// Submit a frame signed ELSEWHERE — by a passkey or a wallet in the browser
 /// (`authpage`), never this device's key — through the same funnel, so the
 /// block it lands in is noted for the reads that follow.
