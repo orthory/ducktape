@@ -1,9 +1,12 @@
-// MEMBERS, as a module-owned view: the roster the host pushes, filtered and
-// listed, with the one record the reader opened beside it. The chain's own
-// words throughout — validator / resident / agent — and the plates are the
-// kit's shapes spelled flat in the wire's vocabulary (no named fonts,
-// `wrap=none`, line heights or component uses cross the tree wire); the
-// theme file is the desktop app's own.
+// MEMBERS, as a module-owned view. The kernel pushes session facts only
+// (`session()` — one item per change); the roster is read here through
+// `rpc.status` / `rpc.peers` / `rpc.query`, re-read on every valset block
+// (`rpc.live`), filtered and listed, with the one record the reader opened
+// beside it — and its writes leave as `op.submit` the kernel signs. The
+// chain's own words throughout — validator / resident / agent — and the
+// plates are the kit's shapes spelled flat in the wire's vocabulary (no
+// named fonts, `wrap=none`, line heights or component uses cross the tree
+// wire); the theme file is the desktop app's own.
 app MembersView
   title "Members"
   palette active_palette
@@ -19,45 +22,73 @@ enum MembersFilter
   validators
 
 extern crate::host
-  HostError(message:str)
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
-  MembersProps(rows:[MemberRow], admin:bool, connected:bool, answered:bool, dark:bool)
-  stream props() -> MembersProps ! HostError
+  Session(connected:bool, admin:bool, dark:bool)
+  SessionItem(next:Session, error:str)
+  RosterItem(rows:[MemberRow], height:i64, error:str)
+  ActItem(key:str, error:str)
+  subscription session() -> SessionItem
+  // the roster, read by this view: once per connection, then again on
+  // every valset block
+  subscription roster(connection:i64) -> RosterItem
+  // every write's outcome, as the kernel answers it
+  subscription acts() -> ActItem
+  pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str
   pure filter_members(rows:&[MemberRow], filter:MembersFilter) -> [MemberRow]
   pure initials_of(name:&str) -> str
   pure initial_of(name:&str) -> str
-  pure copy(text:&str, label:&str) -> bool
-  pure agent_status(agent_id:&str, paused:bool) -> bool
-  pure propose(action:&str, key:&str) -> bool
+  sync copy(text:&str, label:&str) -> bool
+  sync agent_status(agent_id:&str, paused:bool) -> bool
+  sync propose(action:&str, key:&str, height:i64) -> bool
 
 state
   active_palette:palette[AppTheme] = AppTheme.app
   rows:[MemberRow] = []
   admin = false
   connected = false
+  // moves when the session comes up: the roster is read afresh
+  connection_serial:i64 = 0
   answered = false
   host_error = ""
   filter:MembersFilter = MembersFilter.all
   selected = ""
-  // a write's acknowledgement — `host::notify` returns nothing to bind, and
-  // the host's answer arrives as the next roster
+  // the node height the roster was read at — what a ballot's proposal id
+  // is minted from
+  height:i64 = 0
+  // the member a signed write is in flight for, or empty
+  acting = ""
+  // a clipboard write's acknowledgement — an intent returns nothing to bind
   sent = false
 
-on mount
-  stream every props() -> props_changed _ | props_failed _
+// Subscriptions, not mount tasks, so a replacement restored from this
+// view's state asks for the session and the roster again on its own.
+subscribe
+  session() -> session_arrived _
+  roster(connection_serial) when connected -> roster_arrived _
+  acts() -> act_done _
 
-on props_changed(next)
-  rows = next.rows
+on session_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
+  connection_serial = connection_serial_after(connected, next.connected, connection_serial)
   admin = next.admin
   connected = next.connected
-  answered = next.answered
   active_palette = AppTheme.app
   return if !next.dark
   active_palette = AppTheme.app_dark
 
-on props_failed(error)
-  host_error = error.message
+on roster_arrived(item)
+  host_error = item.error
+  answered = true
+  return if !empty(item.error)
+  rows = item.rows
+  height = item.height
+
+on act_done(item)
+  acting = ""
+  host_error = item.error
 
 on pick_filter(next)
   filter = next
@@ -68,11 +99,18 @@ on open_member(key)
 on copy_key(text, label)
   sent = copy(text, label)
 
+// One signed write at a time: the kernel's answer frees the next.
 on set_agent_status(agent_id, paused)
-  sent = agent_status(agent_id, paused)
+  return if !connected || !empty(acting)
+  acting = agent_id
+  let _sent = agent_status(agent_id, paused)
 
+// A membership move is a BALLOT: this opens the proposal, the network
+// settles it on the Approvals screen.
 on open_ballot(action, key)
-  sent = propose(action, key)
+  return if !connected || !admin || !empty(acting)
+  acting = key
+  let _sent = propose(action, key, height)
 
 view
   box #root

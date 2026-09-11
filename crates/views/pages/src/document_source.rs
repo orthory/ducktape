@@ -16,6 +16,7 @@ pub struct Navigation {
 /// The document bytes remain in the canonical host editor, never in an intent.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Accepted {
+    pub comment_draft: String,
     pub source: Vec<u8>,
     pub reference: Vec<u8>,
     pub navigation: Vec<u8>,
