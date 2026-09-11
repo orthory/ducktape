@@ -134,10 +134,12 @@ fn a_block_and_a_refresh_both_re_read_the_window() {
         live_frame.requests
     );
 
+    // Refresh moves the serial the ledger subscription is keyed by, so the
+    // stream restarts: the live subscription is re-opened beside the read.
     let frame = tick_native(press(&frame, "Refresh"));
     assert_eq!(
         kinds(&frame.requests),
-        ["rpc.blocks"],
+        ["rpc.live", "rpc.blocks"],
         "{:?}",
         frame.requests
     );
@@ -226,7 +228,9 @@ fn a_search_that_lost_a_source_says_which_one_and_keeps_no_chip_for_it() {
     let frame = tick_native(events);
 
     for expected in [
-        "user 48cedb0…",
+        // the app's name directory does not cross the view wire, so a user
+        // is named by the shortened key rather than by their account name
+        "user 48cedb0d…",
         "the needle is here",
         "general · #12",
         "Files did not answer — these results are incomplete.",
