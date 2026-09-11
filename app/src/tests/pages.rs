@@ -518,9 +518,8 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     assert_eq!(app.buffer_page, "alpha");
 }
 
-/// Comments float over the document as a card on its right edge, NOT as a
-/// docked rail: a rail took its width off the document for as long as it
-/// stayed open, so pressing the count reflowed every line being read.
+/// Opening comments preserves the document layout and leaves input outside
+/// the floating card available.
 #[test]
 fn block_comments_float_a_card_over_the_document() {
     let _turn = crate::module_view::tests::blocking_connection_turn();

@@ -6677,7 +6677,9 @@ pub(crate) mod tests {
                     break;
                 }
                 ui.update(
-                    &[Event::Window(window::Event::RedrawRequested(Instant::now()))],
+                    &[Event::Window(
+                        window::Event::RedrawRequested(Instant::now()),
+                    )],
                     mouse::Cursor::Available(outside),
                     &mut renderer,
                     &mut iced::advanced::clipboard::Null,
@@ -6705,6 +6707,13 @@ pub(crate) mod tests {
                 );
                 renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
             };
+            ui.update(
+                &[],
+                mouse::Cursor::Available(outside),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
             let before = capture(&mut ui, &mut renderer);
             let mut outputs = Vec::new();
             ui.update(
@@ -6726,14 +6735,13 @@ pub(crate) mod tests {
                     })
                     .collect()
             };
-            assert_ne!(
-                region(&before, editor.x as usize + 10, 220),
-                region(&after, editor.x as usize + 10, 220),
+            assert!(
+                region(&before, editor.x as usize + 10, 220)
+                    != region(&after, editor.x as usize + 10, 220),
                 "wheel outside the card must scroll the document"
             );
-            assert_eq!(
-                region(&before, 800, 250),
-                region(&after, 800, 250),
+            assert!(
+                region(&before, 800, 250) == region(&after, 800, 250),
                 "scrolling the document must not scroll the card"
             );
             let directory =
