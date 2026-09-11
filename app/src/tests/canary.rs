@@ -255,7 +255,7 @@ fn capture(renderer: &mut iced::Renderer, module: &str, path: &Path) -> Vec<u8> 
         // the Approvals tab under the props the seal is judged on; every
         // other module's tree as it stands, a read-only client's
         let element = if module == "governance" {
-            crate::module_view::governance_view(false, true, false, true, "", &[])
+            crate::module_view::governance_view(false, true, false)
         } else {
             drawn(owned)
         };
