@@ -331,7 +331,6 @@ on close_block_comments
 on open_block_comment_thread(id, target)
   return if !empty(host_error)
   sent = open_thread(id, target, block_comment_draft)
-  block_comment_draft = ""
 
 on resolve_thread_submit(resolved)
   return if !empty(host_error)
@@ -345,7 +344,6 @@ on close_block_comment_thread
   comment_anchor_y = -1.0
   return if !empty(host_error)
   sent = close_thread(block_comment_draft)
-  block_comment_draft = ""
 
 on load_more_block_comments
   return if !empty(host_error)
@@ -386,7 +384,6 @@ on document_committed(next)
   let opens_comment = comment_navigation(next.interaction) && !busy
   comment_anchor_y = comment_anchor_after_navigation(opens_comment, pointer_y, comment_anchor_y)
   sent = edited(document_installed, next.reference, next.interaction, seeded(opens_comment, block_comment_draft, ""))
-  block_comment_draft = seeded(opens_comment, "", block_comment_draft)
 
 // The sensor is the window measure the sidebar clamp needs, and it keys
 // nothing — `#root/pages/document` is still the editor's path.
