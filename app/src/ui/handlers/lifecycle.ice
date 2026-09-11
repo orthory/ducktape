@@ -221,10 +221,15 @@ on live_updated(next)
       run replace lane=live_resync live_resync_load(connected_rpc, active_channel, next.load_chat, next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.chat
       // THE TIMELINE IS NOT FOLDED HERE ANY MORE — the chat view re-reads its
-      // own room on the same block. What this fold still owns is what the
-      // rest of the app reads off the same deltas: the channel list and the
-      // read cursors the bell and the tray paint from, and the room's roster
-      // the composers complete mentions against.
+      // own room on the same block, and so does every other view holding an
+      // `rpc.live` subscription on the chat plane (a forge item's
+      // discussion): a chat block reaches the app as this kind, never as a
+      // plane, so this arm is the only one that can tell them. What the fold
+      // below still owns is what the rest of the app reads off the same
+      // deltas: the channel list and the read cursors the bell and the tray
+      // paint from, and the room's roster the composers complete mentions
+      // against.
+      views_live_serial = view_live_hit(next.module, views_live_serial)
       let folded_chat = fold_live_chat(next.chat, channels, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, history_view, shell_tab == ShellTab.chat, active_channel_name, active_channel_archived, active_channel_members_only)
       channels = folded_chat.channels
       channel_members = folded_chat.channel_members
