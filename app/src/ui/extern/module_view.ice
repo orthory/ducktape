@@ -9,10 +9,16 @@ extern crate::module_view
   // Test seam: Ice reads extern structs but cannot construct one, and a
   // scenario that presses a view's control has no view to press it in.
   pure view_event(kind:str, detail:str) -> ModuleViewEvent
-  component governance_view(dark:bool, connected:bool, admin:bool, answered:bool, voting:&str, rows:&[ProposalRow]) -> ModuleViewEvent
-  pure gov_intent(event:&ModuleViewEvent) -> GovIntent
-  pure gov_event_proposal(event:&ModuleViewEvent) -> str
-  pure gov_event_approves(event:&ModuleViewEvent) -> bool
+  // Approvals speaks the KERNEL CONTRACT: session facts go in, the view
+  // reads and writes the node through the kernel (`rpc.*`, `op.submit`),
+  // and the one event back is the kernel's `badge` (`count`).
+  component governance_view(dark:bool, connected:bool, admin:bool) -> ModuleViewEvent
+  // a block moved a module's plane: every `rpc.live` subscription its view
+  // holds is told; the serial moves when one was, so the redraw follows
+  sync view_live_hit(module:&str, serial:i64) -> i64
+  // the node's height as the app last heard it: a height that moved is a
+  // hit on the `block` plane every view reading the feed subscribes to
+  sync view_block_hit(height:i64, serial:i64) -> i64
   component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
   component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent

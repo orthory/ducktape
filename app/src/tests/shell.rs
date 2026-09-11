@@ -338,13 +338,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_generation",
         ),
         (
-            "load_governance",
-            "governance_load",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
-        ),
-        (
             "load_agents",
             "agents_load",
             "agents_load_selected",
@@ -381,12 +374,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_load_selected",
             "valset",
             "members_generation",
-        ),
-        (
-            "load_governance",
-            "governance_load_selected",
-            "governance",
-            "gov_generation",
         ),
         (
             "load_account",
@@ -451,7 +438,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("files_list_selected", "fs_generation"),
         ("files_history_selected", "fs_generation"),
         ("members_load_selected", "members_generation"),
-        ("governance_load_selected", "gov_generation"),
         ("settings_load_selected", "settings_generation"),
         ("peers_load_selected", "node_peers_generation"),
         ("agents_load_selected", "agents_generation"),

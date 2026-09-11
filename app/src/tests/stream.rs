@@ -934,9 +934,8 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
         }));
     };
 
-    let (members, gov, agents, account, dm, fs) = (
+    let (members, agents, account, dm, fs) = (
         app.members_generation,
-        app.gov_generation,
         app.agents_generation,
         app.account_generation,
         app.dm_peers_generation,
@@ -945,11 +944,11 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
 
     plane(&mut app, "valset");
     assert_eq!(app.members_generation, members + 1, "valset feeds members");
-    assert_eq!(app.gov_generation, gov, "and nothing else");
-    assert_eq!(app.fs_generation, fs);
+    assert_eq!(app.fs_generation, fs, "and nothing else");
 
+    // the governance plane is the governance VIEW's to re-read, through the
+    // kernel's `rpc.live`; no app reading moves for it
     plane(&mut app, "governance");
-    assert_eq!(app.gov_generation, gov + 1);
     assert_eq!(
         app.members_generation,
         members + 1,
