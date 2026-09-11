@@ -1,13 +1,13 @@
 //! agent-session-lane scenarios against the sim: the mid-run write door whose
-//! ACL lives in consensus (#423/#429). module_gaps.rs's C4 proved the lever —
-//! over /v1/submit the sim stamps a caller-named origin verbatim, so the
-//! signed-frame lane's two forgeries become legitimate control: claim a run's
-//! saga lease with a chosen "executing node" (`SagaMsg::Accept`), `OpenAgentSession`
-//! as that lease-holder, and act as the bound 32-byte session key. what these pin,
+//! rules live in consensus. the lever: over /v1/submit the sim stamps a
+//! caller-named origin verbatim, so the signed-frame lane's two forgeries
+//! become legitimate control: claim a run's saga lease with a chosen
+//! "executing node" (`SagaMsg::Accept`), `OpenAgentSession` as that
+//! lease-holder, and act as the bound 32-byte session key. what these pin,
 //! all with EXACT rejection strings from `runs/src/sessions.rs`:
 //!
 //! - the per-session action budget (`MAX_ACTIONS_PER_SESSION`) is exact: the
-//!   grant is spent to the boundary, and the next action refuses.
+//!   budget is spent to the boundary, and the next action refuses.
 //! - one key per attempt: a different key cannot replace the live binding.
 //! - only the bound key may act: a different 32-byte origin, session open, is
 //!   refused at the ACL rung (not the unknown-session rung).
@@ -44,14 +44,14 @@ const WRONG: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 /// budget rung enforces, and the number its exact refusal string carries.
 const BUDGET: u32 = runs::MAX_ACTIONS_PER_SESSION;
 
-/// register agent `scribe` (granted `allowed`), open channel `room` with an
-/// anchor message, request an explicit run against it, and read back its
-/// (run_id, saga_id). the sim announces no provider pool, so the run's saga
-/// attempt stays UNASSIGNED — claimable by the first `Accept`.
-fn stage_run(sim: &Sim, allowed: Value) -> (String, String) {
+/// register agent `scribe`, open channel `room` with an anchor message,
+/// request an explicit run against it, and read back its (run_id, saga_id).
+/// the sim announces no provider pool, so the run's saga attempt stays
+/// UNASSIGNED — claimable by the first `Accept`.
+fn stage_run(sim: &Sim) -> (String, String) {
     let controller =
         harness::key_origin(&commonware_cryptography::ed25519::PrivateKey::from_seed(41));
-    for (target, operation) in harness::model_setup("scribe", "text", allowed) {
+    for (target, operation) in harness::model_setup("scribe", "text") {
         sim.submit_ok(target, operation, Some(&controller));
     }
     sim.submit_ok("chat", create_channel("room", "Room"), None);
@@ -121,21 +121,25 @@ fn post_action(run_id: &str, request_id: &str) -> Value {
 
 // ── (a) the budget is spent to its exact boundary ───────
 
-/// a session granted `chat.post_message` may act exactly `MAX_ACTIONS_PER_SESSION`
-/// times; the action right after the boundary refuses with the budget string,
+/// a session may act exactly `MAX_ACTIONS_PER_SESSION` times; the action
+/// right after the boundary refuses with the budget string,
 /// and the counter never advances past the cap.
 #[test]
 fn a_session_spends_its_action_budget_to_the_exact_boundary() {
     let storage = tempfile::tempdir().expect("storage dir");
     let node_hex = node_hex();
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
-    let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
+    let (run_id, saga_id) = stage_run(&sim);
     claim_and_open(&sim, &saga_id, &run_id);
 
-    // spend the whole grant — each applied action mints its own chat post
+    // spend the whole budget — each applied action mints its own chat post
     // (`agent/{run}/post/s{n}`, unique per counter) and advances the counter.
     for n in 0..BUDGET {
-        sim.submit_ok("runs", post_action(&run_id, &format!("p{n}")), Some(SESSION));
+        sim.submit_ok(
+            "runs",
+            post_action(&run_id, &format!("p{n}")),
+            Some(SESSION),
+        );
     }
     let sessions = sim.query("runs", json!("agent_sessions"));
     assert_eq!(
@@ -166,7 +170,7 @@ fn a_different_key_cannot_replace_the_same_attempts_session() {
     let storage = tempfile::tempdir().expect("storage dir");
     let node_hex = node_hex();
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
-    let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
+    let (run_id, saga_id) = stage_run(&sim);
     claim_and_open(&sim, &saga_id, &run_id);
 
     // Even the rightful lease holder cannot replace the current attempt's key.
@@ -200,7 +204,7 @@ fn only_the_bound_session_key_may_act_on_the_run() {
     let storage = tempfile::tempdir().expect("storage dir");
     let node_hex = node_hex();
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
-    let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
+    let (run_id, saga_id) = stage_run(&sim);
     claim_and_open(&sim, &saga_id, &run_id);
 
     // a stranger's 32-byte key: the session IS open, so this passes the
@@ -239,7 +243,7 @@ fn only_the_lease_holder_may_open_the_agent_session() {
     let storage = tempfile::tempdir().expect("storage dir");
     let node_hex = node_hex();
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
-    let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
+    let (run_id, saga_id) = stage_run(&sim);
     announce_node_as_text_provider(&sim);
 
     // NODE claims the lease; no session is opened yet.

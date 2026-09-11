@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// [`crate::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Each action is a catalog envelope {"operation":"<name>","target":{...},"input":{...}} — the same shape the live ducktape_action tool takes, without request_id. ducktape_actions lists every operation with its target and input schema, the grant it needs and the lanes it admits; use only operations your model configuration allows. reply_blocks are your reply to the run's source and Ducktape posts them; the reply operation is live only, for progress posted mid-run through ducktape_action, and is refused in the final response. An action with an explicit destination names its target, e.g. {"operation":"tasks.create","input":{"title":"..."}} or {"operation":"chat.post_message","target":{"channel_id":"general","thread":12},"input":{"content":[{"type":"text","text":"..."}]}}. modules.update is final-response only: {"operation":"modules.update","input":{"module_id":"hello","artifact":"hello.module","code_hash":"<lowercase SHA-256>","after":50}}. The artifact path is relative to your forge checkout; Ducktape binds it to the host-pushed output commit. The file contains the prebuilt canonical ModuleArtifact (component and optional mapper); code_hash is SHA-256 of that file. It requires a changed forge output; the program queues it and each validator stages the pinned artifact and votes; query runs ModuleUpdate for activation. forge.open_pr is final-response only: {"operation":"forge.open_pr","target":{"repo":"app"},"input":{"source_branch":"agent/x","target_branch":"dev","title":"...","body":"..."}} opens a pull request from a branch you pushed to that forge repository, under the forge_push cap that admitted the push; Ducktape appends the run's breadcrumb to the body and reports an open PR that already sources the branch instead of opening a second one. agent.call is live only: call peers through ducktape_action mid-run and read their results with ducktape_query. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Each action is a catalog envelope {"operation":"<name>","target":{...},"input":{...}} — the same shape the live ducktape_action tool takes, without request_id. ducktape_actions lists every operation with its target and input schema and the lanes it admits. reply_blocks are your reply to the run's source and Ducktape posts them; the reply operation is live only, for progress posted mid-run through ducktape_action, and is refused in the final response. An action with an explicit destination names its target, e.g. {"operation":"tasks.create","input":{"title":"..."}} or {"operation":"chat.post_message","target":{"channel_id":"general","thread":12},"input":{"content":[{"type":"text","text":"..."}]}}. modules.update is final-response only: {"operation":"modules.update","input":{"module_id":"hello","artifact":"hello.module","code_hash":"<lowercase SHA-256>","after":50}}. The artifact path is relative to your forge checkout; Ducktape binds it to the host-pushed output commit. The file contains the prebuilt canonical ModuleArtifact (component and optional mapper); code_hash is SHA-256 of that file. It requires a changed forge output; the program queues it and each validator stages the pinned artifact and votes; query runs ModuleUpdate for activation. forge.open_pr is final-response only: {"operation":"forge.open_pr","target":{"repo":"app"},"input":{"source_branch":"agent/x","target_branch":"dev","title":"...","body":"..."}} opens a pull request from a branch you pushed to that forge repository; Ducktape appends the run's breadcrumb to the body and reports an open PR that already sources the branch instead of opening a second one. agent.call is live only: call peers through ducktape_action mid-run and read their results with ducktape_query; at most 8 calls are live at once across the whole recursive tree, and completed calls release their slot. submit carries any module's own message verbatim as your program account, in either lane: {"operation":"submit","target":{"module":"forge"},"input":{"merge_pr":{...}}}; the module decides on its own rules and its verdict is the receipt's outcome. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -90,16 +90,6 @@ struct RunEnvelope<'a> {
     context: Option<String>,
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
-    /// whether this agent's committed `duckfs_read` caps cover the global skill
-    /// library (`crate::SKILL_LIBRARY_PREFIX`). the HOST cannot work this out —
-    /// it has no registry to ask — so the composer states it, and the assembler
-    /// emits the library paragraph only when it is true.
-    ///
-    /// a fact ABOUT the caps, never a widening of them: the answer comes from
-    /// `ModelRecord::library_readable`, which is `permits(DuckfsRead(..))` — the
-    /// same call the MCP tool plane gates the real read on. so the document can
-    /// only advertise a door that will actually open.
-    library_readable: bool,
     result_contract: ResultContractEnvelope,
 }
 
@@ -138,10 +128,6 @@ pub(crate) enum WorkspaceSource {
         /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
         /// surface and an audit/M2 signal.
         branch_born: bool,
-        /// the compose-height verdict from the agent's committed
-        /// `forge_push` cap for this repo. the host may act on this fact but
-        /// cannot widen it.
-        forge_push: bool,
     },
 }
 
@@ -240,13 +226,13 @@ pub(crate) fn resolve_skills(
 /// to the shared library by CONSTRUCTION (`/shared/skills/<name>`).
 ///
 /// this is the one place a run gains skills it was not curated with, and the
-/// ro-mount that materializes them runs on the node's duckfs authority with no
-/// read-cap gate — so a requester must never get to name a raw path. taking
-/// NAMES, not refs, means a requester can only ever point at a library entry:
-/// the name is canonicalized as the last segment of the library prefix, so a
-/// `/` or `..` in it fails to resolve to a single entry and is refused. no
-/// pinned snapshot, no `always` — a requester offers a library skill on demand;
-/// only an owner's own record inlines a persona.
+/// ro-mount that materializes them runs on the node's duckfs authority — so a
+/// requester must never get to name a raw path. taking NAMES, not refs, means a
+/// requester can only ever point at a library entry: the name is canonicalized
+/// as the last segment of the library prefix, so a `/` or `..` in it fails to
+/// resolve to a single entry and is refused. no pinned snapshot, no `always` —
+/// a requester offers a library skill on demand; only an owner's own record
+/// inlines a persona.
 pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> {
     // the SAME ceiling the agent record's own curation carries — the resolved
     // set is bounded there, and an unbounded request would otherwise commit a
@@ -308,7 +294,6 @@ fn envelope(
         context: portable.context,
         workspace: portable.workspace,
         skills: portable.skills,
-        library_readable: agent.library_readable(),
         result_contract: ResultContractEnvelope {
             ducktape_runner_result: RUNNER_RESULT_MARKER,
             sink: portable.sink,
@@ -478,13 +463,11 @@ mod tests {
             owner: RunOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
-            allowed_actions: vec![],
             status: ModelStatus::Active,
             role: crate::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
-            caps: crate::ResourceCaps::default(),
             skills,
         }
     }
@@ -574,6 +557,17 @@ mod tests {
         }
     }
 
+    /// the contract tells the model the live-call bound as a number, and that
+    /// number is the one the session lane enforces — the two never drift.
+    #[test]
+    fn the_contract_states_the_live_call_bound_the_session_lane_enforces() {
+        let stated = format!(
+            "at most {} calls are live at once",
+            crate::model::MAX_DELEGATIONS_PER_RUN
+        );
+        assert!(STRICT_OUTPUT_INSTRUCTION.contains(&stated), "{stated}");
+    }
+
     #[test]
     fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
@@ -647,54 +641,6 @@ mod tests {
         assert_eq!(
             skills[1]["always"], false,
             "an on-demand skill is indexed, not inlined"
-        );
-    }
-
-    /// the library grant the host assembles on is READ OFF THE CAPS, never
-    /// assumed: an agent whose `duckfs_read` covers the library prefix composes
-    /// `library_readable: true` and is told the library exists; one without the
-    /// grant composes `false` and is never pointed at a door the MCP tool plane
-    /// would refuse it (the caps ARE that refusal — same `permits` call).
-    #[test]
-    fn the_envelope_states_the_agents_library_read_grant() {
-        let compose = |caps: crate::ResourceCaps| {
-            let mut agent = agent_with_skills(Vec::new());
-            agent.caps = caps;
-            let payload = render_payload(
-                "runs",
-                &agent,
-                &run_id("general", 1),
-                &[],
-                PortableInputs {
-                    workspace: duckfs_workspace(&agent, None),
-                    skills: Vec::new(),
-                    sink: WireSink::Chain,
-                    context: None,
-                },
-            );
-            parse(&payload)["library_readable"].clone()
-        };
-
-        assert_eq!(
-            compose(crate::ResourceCaps::default()),
-            Value::Bool(false),
-            "the empty default grants nothing, so the agent hears nothing about the library"
-        );
-        assert_eq!(
-            compose(crate::ResourceCaps {
-                duckfs_read: vec![crate::SKILL_LIBRARY_PREFIX.into()],
-                ..Default::default()
-            }),
-            Value::Bool(true),
-            "the grant the app pre-fills is the grant the assembler acts on"
-        );
-        assert_eq!(
-            compose(crate::ResourceCaps {
-                duckfs_read: vec!["/shared/agent-workspaces/bot".into()],
-                ..Default::default()
-            }),
-            Value::Bool(false),
-            "an unrelated read grant is not a library grant"
         );
     }
 
@@ -1046,7 +992,6 @@ mod tests {
                 commit: commit.clone(),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {
@@ -1081,7 +1026,7 @@ mod tests {
         assert_eq!(v["workspace"]["branch_born"], false);
         assert!(
             payload.contains(&format!(
-                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false,"forge_push":false}}"#
+                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
             )),
             "the forge workspace field order is part of the committed bytes: {payload}"
         );
@@ -1110,7 +1055,6 @@ mod tests {
                 commit: "cd".repeat(20),
                 branch: "feature/x".into(),
                 branch_born: true,
-                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {

@@ -19,7 +19,7 @@ use std::time::Duration;
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
 use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
-use runs::{ACTION_CHAT_POST, ModelMsg, ResourceCaps};
+use runs::ModelMsg;
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -510,8 +510,8 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
     assert_eq!(issue_channel, format!("forge:{REPO}:1"));
 
     // ---- the agent (no prompt pin — a persona is a curated `Always` skill now,
-    //      and this leg needs none; forge caps naming the repo LITERALLY) and the
-    //      program binding that receives source-owned attribution.
+    //      and this leg needs none) and the program binding that receives
+    //      source-owned attribution.
     let program_account = common::provision_model_program(&cluster, 0, AGENT_ID);
     cluster.submit(
         0,
@@ -522,13 +522,7 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
                 agent_id: AGENT_ID.into(),
                 display_name: AGENT_ID.into(),
                 capability: provider.tag.clone(),
-                allowed_actions: vec![ACTION_CHAT_POST.into()],
                 recipe_hash: None,
-                caps: Some(ResourceCaps {
-                    forge_read: vec![REPO.into()],
-                    forge_push: vec![REPO.into()],
-                    ..Default::default()
-                }),
                 skills: None,
             },
         }),

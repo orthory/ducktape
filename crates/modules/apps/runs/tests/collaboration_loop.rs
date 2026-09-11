@@ -8,7 +8,10 @@ use support::*;
 fn response(task: Option<&str>) -> Vec<u8> {
     let response = runs::AgentResponse {
         reply_blocks: Vec::new(),
-        actions: task.into_iter().map(|id| create_task(id, "From model result")).collect(),
+        actions: task
+            .into_iter()
+            .map(|id| create_task(id, "From model result"))
+            .collect(),
         commit_message: None,
     };
     sdk::wire::encode(&serde_json::json!({
@@ -22,43 +25,132 @@ fn response(task: Option<&str>) -> Vec<u8> {
 }
 
 async fn saga(network: &Network, run: &runs::PendingRun) -> String {
-    let bytes = network.host.query("dispatch", &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
-        receiver: "runs".into(), dispatch_id: run.dispatch_id.clone(),
-    })).await.unwrap();
-    let dispatch::DispatchReply::Dispatch(Some(view)) = dispatch::decode_reply(&bytes).unwrap() else { panic!("dispatch"); };
-    let dispatch::DispatchStatus::AwaitingResult { saga_id } = view.status else { panic!("awaiting result"); };
+    let bytes = network
+        .host
+        .query(
+            "dispatch",
+            &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
+                receiver: "runs".into(),
+                dispatch_id: run.dispatch_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let dispatch::DispatchReply::Dispatch(Some(view)) = dispatch::decode_reply(&bytes).unwrap()
+    else {
+        panic!("dispatch");
+    };
+    let dispatch::DispatchStatus::AwaitingResult { saga_id } = view.status else {
+        panic!("awaiting result");
+    };
     saga_id
 }
 
-async fn settle(network: &mut Network, run: &runs::PendingRun, outcome: Result<Vec<u8>, String>, accepted: bool) {
+async fn settle(
+    network: &mut Network,
+    run: &runs::PendingRun,
+    outcome: Result<Vec<u8>, String>,
+    accepted: bool,
+) {
     let saga_id = saga(network, run).await;
     if !accepted {
-        network.submit(provider(), msg("saga", &saga::SagaMsg::Accept { saga_id: saga_id.clone(), attempt: 0 })).await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::Accept {
+                        saga_id: saga_id.clone(),
+                        attempt: 0,
+                    },
+                ),
+            )
+            .await;
     }
-    network.submit(provider(), msg("saga", &saga::SagaMsg::OracleResult { saga_id, attempt: 0, outcome, usage: None })).await;
+    network
+        .submit(
+            provider(),
+            msg(
+                "saga",
+                &saga::SagaMsg::OracleResult {
+                    saga_id,
+                    attempt: 0,
+                    outcome,
+                    usage: None,
+                },
+            ),
+        )
+        .await;
     network.drain().await;
-    let state = network.host.query("dispatch", &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch { receiver: "runs".into(), dispatch_id: run.dispatch_id.clone() })).await.unwrap();
-    assert!(!network.runs().await.iter().any(|pending| pending.run_id == run.run_id), "run failed to settle: {}", String::from_utf8_lossy(&state));
+    let state = network
+        .host
+        .query(
+            "dispatch",
+            &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
+                receiver: "runs".into(),
+                dispatch_id: run.dispatch_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !network
+            .runs()
+            .await
+            .iter()
+            .any(|pending| pending.run_id == run.run_id),
+        "run failed to settle: {}",
+        String::from_utf8_lossy(&state)
+    );
 }
 
 async fn job(network: &Network, id: &str) -> tasks::Job {
-    let bytes = network.host.query("tasks", &tasks::encode_job_query(&tasks::JobsQuery::Get { job_id: id.into() })).await.unwrap();
-    let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&bytes).unwrap() else { panic!("job"); };
+    let bytes = network
+        .host
+        .query(
+            "tasks",
+            &tasks::encode_job_query(&tasks::JobsQuery::Get { job_id: id.into() }),
+        )
+        .await
+        .unwrap();
+    let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&bytes).unwrap() else {
+        panic!("job");
+    };
     job
 }
 
 async fn job_submit(network: &mut Network, id: &str, model: &str) {
-    network.submit(member(), Msg { target: "tasks".into(), payload: tasks::encode_job_msg(&tasks::JobsMsg::Submit {
-        job_id: id.into(), kind: format!("agent/{model}"), spec: "Do the requested work".into(),
-    }) }).await;
+    network
+        .submit(
+            member(),
+            Msg {
+                target: "tasks".into(),
+                payload: tasks::encode_job_msg(&tasks::JobsMsg::Submit {
+                    job_id: id.into(),
+                    kind: format!("agent/{model}"),
+                    spec: "Do the requested work".into(),
+                }),
+            },
+        )
+        .await;
 }
 
 async fn job_network() -> Network {
     let mut network = Network::new().await;
     let run_id = network.provision().await;
-    let run = network.runs().await.into_iter().find(|run| run.run_id == run_id).unwrap();
+    let run = network
+        .runs()
+        .await
+        .into_iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap();
     settle(&mut network, &run, Ok(response(None)), true).await;
-    network.submit(member(), msg("runs", &runs::RunsMsg::EnableJobWorker { enabled: true })).await;
+    network
+        .submit(
+            member(),
+            msg("runs", &runs::RunsMsg::EnableJobWorker { enabled: true }),
+        )
+        .await;
     network
 }
 
@@ -72,14 +164,26 @@ fn job_submission_commits_before_its_program_requests_model_work() {
         network.drain().await;
         let processing = job(&network, "one").await;
         assert_eq!(processing.status, tasks::JobStatus::Processing);
-        assert_eq!(processing.claim.unwrap().worker, tasks::Party::Module("runs".into()));
+        assert_eq!(
+            processing.claim.unwrap().worker,
+            tasks::Party::Module("runs".into())
+        );
         let run = network.runs().await.pop().unwrap();
         assert_eq!(run.job_id.as_deref(), Some("one"));
         settle(&mut network, &run, Ok(response(Some("from-job"))), false).await;
         assert_eq!(job(&network, "one").await.status, tasks::JobStatus::Done);
-        let detail = network.host.query("runs", &runs::encode_query(&runs::RunsQuery::RecentRuns)).await.unwrap();
+        let detail = network
+            .host
+            .query("runs", &runs::encode_query(&runs::RunsQuery::RecentRuns))
+            .await
+            .unwrap();
         let task = network.task("from-job").await;
-        assert!(task.is_some(), "job {:?}, runs {}", job(&network, "one").await, String::from_utf8_lossy(&detail));
+        assert!(
+            task.is_some(),
+            "job {:?}, runs {}",
+            job(&network, "one").await,
+            String::from_utf8_lossy(&detail)
+        );
         assert_eq!(task.unwrap().owner, tasks::Party::Account(2));
         assert!(network.runs().await.is_empty());
     });
@@ -91,11 +195,24 @@ fn unknown_model_jobs_stay_pending_and_cancellation_finalizes_with_detail() {
         let mut network = job_network().await;
         job_submit(&mut network, "unknown", "missing").await;
         network.drain().await;
-        assert_eq!(job(&network, "unknown").await.status, tasks::JobStatus::Pending);
+        assert_eq!(
+            job(&network, "unknown").await.status,
+            tasks::JobStatus::Pending
+        );
         job_submit(&mut network, "failed", "builder").await;
         network.drain().await;
         let run = network.runs().await.pop().unwrap();
-        network.submit(member(), msg("runs", &runs::RunsMsg::CancelRun { run_id: run.run_id.clone() })).await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::CancelRun {
+                        run_id: run.run_id.clone(),
+                    },
+                ),
+            )
+            .await;
         network.drain().await;
         let failed = job(&network, "failed").await;
         assert_eq!(failed.status, tasks::JobStatus::Failed);
@@ -113,14 +230,33 @@ fn reusing_a_pruned_job_id_creates_a_fresh_program_invocation_and_run() {
         network.drain().await;
         let first = network.runs().await.pop().unwrap();
         settle(&mut network, &first, Ok(response(None)), false).await;
-        network.submit(member(), Msg { target: "tasks".into(), payload: tasks::encode_job_msg(&tasks::JobsMsg::Prune { job_id: "episode".into() }) }).await;
+        network
+            .submit(
+                member(),
+                Msg {
+                    target: "tasks".into(),
+                    payload: tasks::encode_job_msg(&tasks::JobsMsg::Prune {
+                        job_id: "episode".into(),
+                    }),
+                },
+            )
+            .await;
         job_submit(&mut network, "episode", "builder").await;
         network.drain().await;
         let second = network.runs().await.pop().unwrap();
         assert_ne!(first.run_id, second.run_id);
         assert!(second.job_claim_height > first.job_claim_height);
-        settle(&mut network, &second, Ok(response(Some("second-episode"))), false).await;
-        assert_eq!(network.task("second-episode").await.unwrap().owner, tasks::Party::Account(2));
+        settle(
+            &mut network,
+            &second,
+            Ok(response(Some("second-episode"))),
+            false,
+        )
+        .await;
+        assert_eq!(
+            network.task("second-episode").await.unwrap().owner,
+            tasks::Party::Account(2)
+        );
     });
 }
 
@@ -128,30 +264,6 @@ fn reusing_a_pruned_job_id_creates_a_fresh_program_invocation_and_run() {
 fn job_runs_post_live_and_final_replies_under_the_program_account() {
     block_on(async {
         let mut network = job_network().await;
-        network
-            .submit(
-                member(),
-                msg(
-                    "runs",
-                    &runs::RunsMsg::ConfigureModel {
-                        operation: runs::ModelMsg::UpdateModel {
-                            agent_id: "builder".into(),
-                            display_name: None,
-                            capability: None,
-                            allowed_actions: Some(
-                                runs::KNOWN_ACTIONS
-                                    .iter()
-                                    .map(|action| (*action).into())
-                                    .collect(),
-                            ),
-                            recipe_hash: None,
-                            caps: None,
-                            skills: None,
-                        },
-                    },
-                ),
-            )
-            .await;
         job_submit(&mut network, "discussion", "builder").await;
         network.drain().await;
         let run = network

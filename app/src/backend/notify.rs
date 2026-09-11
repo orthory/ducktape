@@ -304,7 +304,7 @@ pub(crate) fn chat_arrival(
         in_my_dm: in_my_dm(&channel_id),
         channel_id,
         author: ::chat::client::author_display(&handle, names),
-        body: ::chat::client::message_body(&blocks),
+        body: ::chat::client::message_body_with_names(&blocks, names),
         mentions_me: ::chat::client::mentions_reach(&blocks, &parties),
         authored_by_me: me.is_some_and(|key| names.owns_handle(&handle, key)),
     })
@@ -574,7 +574,7 @@ mod tests {
             channel_id: "notifications-test".into(),
             message_id: "m".into(),
             blocks: vec![::chat::Block::Paragraph(vec![::chat::Span {
-                text: "Hello Reader".into(),
+                text: "@Old Name".into(),
                 marks: vec![::chat::Mark::Mention(::chat::Party::Key(key.to_vec()))],
             }])],
             thread: None,
@@ -587,7 +587,7 @@ mod tests {
         .unwrap();
         let arrival = chat_arrival(&payload, Some(&assigned), &names, Some(&key)).unwrap();
         assert_eq!(arrival.author, "Reporter");
-        assert_eq!(arrival.body, "Hello Reader");
+        assert_eq!(arrival.body, "@Reader");
         assert!(arrival.mentions_me);
         assert!(!arrival.authored_by_me);
         assert!(chat_arrival(&payload, None, &names, Some(&key)).is_none());

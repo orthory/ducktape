@@ -1,9 +1,8 @@
 //! `ducktape mcp` — the agent tool plane.
 //!
-//! a stdio MCP server that gives a Ducktape agent run typed access to the
-//! network it is running inside: read chat, tasks, pages, forge items and the
-//! duckfs filesystem; write the same five things its registered grant already
-//! allowed it to write.
+//! a stdio MCP server that gives a Ducktape agent run access to the network
+//! it is running inside: read any module, and write to any module as the
+//! run's own program account.
 //!
 //! ## why this is a separate process and not a library
 //!
@@ -19,10 +18,9 @@
 //!
 //! two environment variables, set by the node's provisioner and inherited down
 //! the runner into this process: `DUCKTAPE_NODE` (which node) and
-//! `DUCKTAPE_RUN_AGENT` (which agent). NOTHING about the agent's permissions
-//! travels in the environment — owner, allowed actions and resource caps are
-//! read back from the committed registry, so the gate always reflects the grant
-//! consensus actually holds. see `identity`.
+//! `DUCKTAPE_RUN_AGENT` (which agent). the agent's record itself never travels
+//! in the environment — it is read back from the committed registry, so what
+//! the model sees is what consensus actually holds. see `identity`.
 //!
 //! ## failure posture
 //!
@@ -116,18 +114,18 @@ fn initialize() -> Value {
         "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
         // where the "how to work in Ducktape" guide lives — it ships with the
         // binary, so it can never describe a tool this binary does not have.
-        "instructions": guide::GUIDE.as_str(),
+        "instructions": guide::GUIDE,
     })
 }
 
 /// dispatch one `tools/call`.
 ///
 /// EVERY outcome here is a `result`, never a JSON-RPC `error` — a tool that
-/// refuses (a denied action, a module rejection, an unknown tool name) must
-/// reach the MODEL as content it can read and adapt to, not the runner as a
-/// broken server it should give up on. that is the difference between an agent
-/// that says "I lack the chat.post grant" and one whose tool plane silently
-/// dies.
+/// refuses (a module rejection, an unreachable endpoint, an unknown tool name)
+/// must reach the MODEL as content it can read and adapt to, not the runner as
+/// a broken server it should give up on. that is the difference between an
+/// agent that says "chat refused that message" and one whose tool plane
+/// silently dies.
 fn call(run: &identity::Run, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return tool_failure("a tools/call needs a \"name\"");

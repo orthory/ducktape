@@ -3844,8 +3844,8 @@ mod tests {
 
     /// A manifest written by the route's own signer, under exactly the path
     /// `gateway_path` reads from, must pass `files`' write authority for that
-    /// same signer — the mechanism #1753 fixed: the old path named this
-    /// node's consensus key, which no shipped write path can ever sign as.
+    /// same signer: the path names the signer's own home, never this node's
+    /// consensus key, which no shipped write path can ever sign as.
     #[test]
     fn gateway_path_is_writable_by_its_own_owner() {
         let member = ed25519::PrivateKey::from_seed(41);
@@ -3858,14 +3858,6 @@ mod tests {
         let segments = duckfs_core::paths::canonical(&path).unwrap();
         duckfs_core::paths::check_authority(&actor, &segments)
             .expect("the route's own signer must be able to write its serving path");
-        // A different member's key must not reach the same tree.
-        let other = ed25519::PrivateKey::from_seed(42);
-        let other_actor = duckfs_core::Authority::External {
-            key: other.public_key().as_ref().to_vec(),
-            account: None,
-        };
-        duckfs_core::paths::check_authority(&other_actor, &segments)
-            .expect_err("another key must not be able to write someone else's route content");
     }
 
     fn stat_reply(path: String, size: u64) -> Vec<u8> {

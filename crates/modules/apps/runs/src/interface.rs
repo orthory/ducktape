@@ -1,9 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{
-    ActionEnvelope, DelegationRequest, LaneKind, ModelRecord, OperationView, ReplyBlock,
-    ResourceCaps,
-};
+use crate::{ActionEnvelope, DelegationRequest, LaneKind, OperationView, ReplyBlock};
 use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +33,7 @@ pub struct PendingRun {
     pub job_id: Option<String>,
     /// the jobs claim height a job-backed run is bound to; chat runs use 0.
     pub job_claim_height: u64,
-    /// The origin that called runs to create this work; it may cancel the
-    /// run alongside the program's current controller.
+    /// The origin that called runs to create this work.
     pub requester: RunOrigin,
     pub created_at: u64,
 }
@@ -281,10 +277,9 @@ pub enum RunsMsg {
         enabled: bool,
     },
     /// Ask the configured program to run this model against a channel anchor.
-    /// The authenticated requester retains cancellation/reassignment authority.
     /// Calls for an already dispatched model/anchor are deterministic no-ops.
-    /// External callers must have chat post standing; the eventual program
-    /// execution also passes the target's own account authorization.
+    /// The eventual program execution passes each target's own account
+    /// authorization.
     RequestRun {
         agent_id: String,
         channel_id: String,
@@ -306,16 +301,14 @@ pub enum RunsMsg {
         #[serde(default)]
         skills: Vec<String>,
     },
-    /// cancel a PENDING run — only the run-creating origin or the agent's
-    /// owner. cancels the underlying dispatch in the same block; the plane's
-    /// Err("cancelled") delivery then prunes the entry (and finalizes a
-    /// job-backed run's job) through the one result path.
+    /// cancel a PENDING run. cancels the underlying dispatch in the same
+    /// block; the plane's Err("cancelled") delivery then prunes the entry (and
+    /// finalizes a job-backed run's job) through the one result path.
     CancelRun {
         run_id: String,
     },
-    /// fence the current attempt and move the run to another provider. gated
-    /// exactly like cancellation; `attempt` prevents a delayed click from
-    /// revoking a newer assignment.
+    /// fence the current attempt and move the run to another provider.
+    /// `attempt` prevents a delayed click from revoking a newer assignment.
     ReassignRun {
         run_id: String,
         attempt: u32,
@@ -333,11 +326,10 @@ pub enum RunsMsg {
     /// works with nobody at a keyboard — and it is correct cross-node, because
     /// the lease names the node actually executing the run.
     ///
-    /// the OWNER's authority is deliberately not asked for here, because
-    /// consensus already holds it: `ModelRecord { owner, allowed_actions, caps }`
-    /// IS the capability grant — registering an agent with `chat.post` is the
-    /// act of authorizing it. what this op adds is not authority but PROOF: that
-    /// an op came from this agent's run and no other.
+    /// no owner signature is asked for: a run acts as its program account, and
+    /// what that account may do is each target module's own rule. what this op
+    /// adds is not authority but PROOF: that an op came from this agent's run
+    /// and no other.
     OpenAgentSession {
         run_id: String,
         attempt: u32,
@@ -355,20 +347,19 @@ pub enum RunsMsg {
     /// lane, whose caller-supplied origin `bin/node` discards outright.
     ///
     /// the envelope is decoded against the module-owned catalog and validated
-    /// against the SAME `allowed_actions` + caps the response path validates,
-    /// by the same code: the tool plane must never become a second, wider
-    /// permission vocabulary. `request_id` names the logical invocation within
-    /// the run: an exact retry answers the same receipt, a reuse with different
-    /// bytes is refused.
+    /// by the SAME code the response path validates: the tool plane must never
+    /// become a second vocabulary. `request_id` names the logical invocation
+    /// within the run: an exact retry answers the same receipt, a reuse with
+    /// different bytes is refused.
     AgentAction {
         run_id: String,
         request_id: String,
         action: ActionEnvelope,
     },
     /// Start one peer agent call while the caller is still running. The bound
-    /// session key authorizes the request; `subagent_budget` bounds concurrent
-    /// live calls across the root tree, and the callee executes with caller ∩
-    /// callee authority.
+    /// session key authorizes the request; the root tree holds at most
+    /// [`crate::MAX_DELEGATIONS_PER_RUN`] live calls, and the callee executes
+    /// as itself.
     ExecuteDelegation {
         run_id: String,
         request_id: String,
@@ -414,52 +405,6 @@ pub struct AgentSession {
     pub opened_at: u64,
     /// Actions admitted across all attempts; rotation never resets ids or budget.
     pub actions: u32,
-}
-
-/// the ADMISSION CEILING a delegated run carries: the CALLER's own grant,
-/// frozen at the moment of the call. it is never authority of its own — every
-/// read intersects it with the callee's LIVE record ([`Self::apply`]), so a
-/// later owner revocation narrows the run immediately while a later widening
-/// cannot escape what the caller originally granted.
-///
-/// consensus applies it on every write (`agent_for_run`); the read plane must
-/// apply the SAME ceiling, which is what [`RunsQuery::RunAuthority`] is for —
-/// a peer's MCP server re-fetching the callee's standing record would gate its
-/// reads on the callee's full caps, i.e. on a grant this run never had.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunAuthority {
-    pub allowed_actions: Vec<String>,
-    pub caps: ResourceCaps,
-}
-
-impl RunAuthority {
-    pub(crate) fn from_record(record: &ModelRecord) -> Self {
-        Self {
-            allowed_actions: record.allowed_actions.clone(),
-            caps: record.caps.clone(),
-        }
-    }
-
-    /// `record` narrowed to this ceiling — the ONE definition, shared by the
-    /// consensus write path and the host-side read plane.
-    pub fn apply(&self, record: &ModelRecord) -> ModelRecord {
-        let mut ceiling = record.clone();
-        ceiling.allowed_actions = self.allowed_actions.clone();
-        ceiling.caps = self.caps.clone();
-        ceiling.scoped_for_call(record)
-    }
-}
-
-/// one in-flight run's ceiling, as [`RunsQuery::RunAuthority`] answers it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RunAuthorityView {
-    pub run_id: String,
-    pub agent_id: String,
-    /// `None` for an ordinary run — nothing narrows it but the agent's own
-    /// committed record.
-    pub authority: Option<RunAuthority>,
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -508,12 +453,6 @@ pub enum RunsQuery {
     Delegations {
         caller_run_id: String,
     },
-    /// one IN-FLIGHT run's admission ceiling — the read plane's half of
-    /// [`RunAuthority`]. `None` when the run is not in flight, which a caller
-    /// must treat as a refusal: an unknown run proves no ceiling.
-    RunAuthority {
-        run_id: String,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -528,9 +467,6 @@ pub enum RunsReply {
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
     Delegations(Vec<DelegationView>),
-    /// boxed only to keep the reply enum small — serde is transparent over
-    /// `Box`, so the wire shape is the bare view or `null`.
-    RunAuthority(Option<Box<RunAuthorityView>>),
 }
 
 // ---- codecs -------------------------------------------------------------------

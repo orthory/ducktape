@@ -56,7 +56,7 @@ use capability::{CapabilityQuery, CapabilityReply};
 use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, SandboxStage, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
-use runs::{ACTION_CHAT_POST, ModelMsg};
+use runs::ModelMsg;
 use runs::{RunsMsg, RunsQuery, RunsReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -312,9 +312,7 @@ fn register_model(cluster: &Cluster, idx: usize, agent_id: &str, tag: &str) -> u
                 agent_id: agent_id.into(),
                 display_name: agent_id.into(),
                 capability: tag.into(),
-                allowed_actions: vec![ACTION_CHAT_POST.into()],
                 recipe_hash: None,
-                caps: None,
                 skills: None,
             },
         }),

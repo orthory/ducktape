@@ -381,11 +381,7 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
 /// Provision the model's real keyless account and its program under the first
 /// account in a fresh scenario. The caller submits all three operations as the
 /// same 32-byte controller key.
-pub fn model_setup(
-    agent_id: &str,
-    capability: &str,
-    allowed_actions: serde_json::Value,
-) -> Vec<(&'static str, serde_json::Value)> {
+pub fn model_setup(agent_id: &str, capability: &str) -> Vec<(&'static str, serde_json::Value)> {
     vec![
         ("identity", create("model-controller")),
         (
@@ -402,7 +398,6 @@ pub fn model_setup(
                 "agent_id": agent_id,
                 "display_name": agent_id,
                 "capability": capability,
-                "allowed_actions": allowed_actions,
             }}}}),
         ),
     ]

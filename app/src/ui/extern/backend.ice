@@ -8,7 +8,7 @@ extern crate::backend
   ChannelSwitchFacts(unread_boundary:i64, name:str, archived:bool, members_only:bool)
   ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, edit_body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
   CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
@@ -367,15 +367,14 @@ extern crate::backend
   pure picture_caption(width:i64, height:i64) -> str
   component picture(surface:str, path:str) -> unit
   AgentSkill(name:str, source_prefix:str, source_snapshot:str, always:bool)
-  AgentCaps(forge_read:[str], forge_push:[str], duckfs_read:[str], duckfs_write:[str], tools:[str], secrets:[str], pages_write:[str], subagent_budget:i64)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, allowed_actions:[str], caps:AgentCaps, skills:[AgentSkill])
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, controller:str, live:bool, skills:[AgentSkill])
   // the run tracker: every run off the runs journal, and the journal of
   // the one the reader opened
   RunRow(run_id:str, dispatch_id:str, agent_id:str, agent_name:str, origin:str, state:str, dispatched:str, settled:str, attempt:i64, holder:str, actions:i64, degraded:bool, reason:str, output_ref:str, pr_number:i64)
   JournalEntry(height:str, kind:str, summary:str, status:str, targets:[RunLink])
   RunLink(relation:str, kind:str, label:str, url:str)
   RunJournal(dispatch_id:str, entries:[JournalEntry], links:[RunLink], rpc:str, network:str, link:i64, account:str, op:i64, error:str)
-  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str], actions:[str])
+  AgentsData(generation:i64, agents:[AgentRow], runs:[RunRow], capabilities:[str])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   load_run_journal(rpc:str, network:str, link:i64, account:str, op:i64, dispatch_id:str) -> RunJournal
   pure journal_in_scope(journal:&RunJournal, rpc:&str, network:&str, link:i64, account:&str, op:i64, dispatch_id:&str) -> bool
@@ -442,6 +441,7 @@ extern crate::backend
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
+  pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -515,12 +515,12 @@ extern crate::backend
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   pure reaction_refusal(archived:bool, banner:str) -> str
-  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
+  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, after_reply_seq:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64) -> LiveThreadData ! AppError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
-  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str, members:[ChatMember]) -> bool ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError

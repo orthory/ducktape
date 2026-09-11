@@ -14,7 +14,7 @@ extern crate::module_view
   pure gov_event_proposal(event:&ModuleViewEvent) -> str
   pure gov_event_approves(event:&ModuleViewEvent) -> bool
   component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str], actions:&[str]) -> ModuleViewEvent
+  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure roster_intent(event:&ModuleViewEvent) -> RosterIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
@@ -58,6 +58,7 @@ extern crate::module_view
   pure event_int(event:&ModuleViewEvent, field:&str) -> i64
   pure event_num(event:&ModuleViewEvent, field:&str) -> f64
   sync chat_composer_unsent(scope:&str, text:&str, committed:bool) -> bool
+  sync chat_composer_edit(scope:&str, messages:&[ChatMessage], seq:i64, rev:i64) -> bool
   // the room's roster for the composers over it: what `@` may complete to,
   // by the same rule the send resolves
   sync chat_composer_roster(scope:&str, members:&[ChatMember]) -> bool

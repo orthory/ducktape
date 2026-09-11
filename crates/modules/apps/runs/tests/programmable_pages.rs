@@ -17,32 +17,6 @@ async fn configure_pages(network: &mut Network) {
         .submit(
             member(),
             msg(
-                "runs",
-                &runs::RunsMsg::ConfigureModel {
-                    operation: runs::ModelMsg::UpdateModel {
-                        agent_id: "builder".into(),
-                        display_name: None,
-                        capability: None,
-                        allowed_actions: Some(vec![
-                            runs::ACTION_CHAT_POST.into(),
-                            runs::ACTION_PAGES_COMMENT.into(),
-                            runs::ACTION_PAGES_SET_CHECKED.into(),
-                        ]),
-                        recipe_hash: None,
-                        caps: Some(runs::ResourceCaps {
-                            pages_write: vec!["spec".into()],
-                            ..Default::default()
-                        }),
-                        skills: None,
-                    },
-                },
-            ),
-        )
-        .await;
-    network
-        .submit(
-            member(),
-            msg(
                 "pages",
                 &pages::PageMsg::CreatePage {
                     page_id: "spec".into(),
@@ -191,9 +165,9 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
             let receipt = network
                 .action(&runs::action_request_id(&run.run_id, "tick"))
                 .await;
-            // a page grant ticks the todo under the program's authority; the
-            // block keeps its author — pages records who wrote a block, and a
-            // tick is not a rewrite.
+            // the run ticks the todo under the program's authority; the block
+            // keeps its author — pages records who wrote a block, and a tick
+            // is not a rewrite.
             assert!(
                 matches!(
                     receipt.status,
@@ -202,7 +176,7 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                         ..
                     }
                 ),
-                "the granted page write applies under program authority: {receipt:?}"
+                "the page write applies under program authority: {receipt:?}"
             );
             let pages::PageReply::Block(Some(todo)) = page(
                 &network,
