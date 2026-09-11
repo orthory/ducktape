@@ -107,91 +107,6 @@ fn merge_builder_reports_conflicts_and_builds_nothing() {
     assert_eq!(paths, vec!["a.txt".to_string()]);
 }
 
-#[test]
-fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
-    let rev = "1".repeat(40);
-    let tree = tree_data(
-        serde_json::json!({ "tree": {
-            "rev": rev,
-            "born": true,
-            "entries": [{
-                "path": "src/lib.rs",
-                "name": "lib.rs",
-                "kind": "file"
-            }],
-            "truncated": true
-        }}),
-        "core".into(),
-        "src".into(),
-    )
-    .unwrap();
-    assert_eq!(tree.rev, "1".repeat(40));
-    assert!(tree.born);
-    assert!(tree.truncated);
-    assert_eq!(tree.entries[0].path, "src/lib.rs");
-
-    let text = blob_view(
-        serde_json::json!({ "blob": {
-            "rev": "1".repeat(40),
-            "path": "src/lib.rs",
-            "text": "one\ntwo\n",
-            "size": 8,
-            "truncated": true,
-            "binary": false
-        }}),
-        "core".into(),
-    )
-    .unwrap();
-    assert_eq!(text.lines, 2);
-    assert!(text.truncated && !text.binary);
-
-    let binary = blob_view(
-        serde_json::json!({ "blob": {
-            "rev": "1".repeat(40),
-            "path": "asset.bin",
-            "text": "",
-            "size": 400,
-            "truncated": false,
-            "binary": true
-        }}),
-        "core".into(),
-    )
-    .unwrap();
-    assert!(binary.binary);
-    assert_eq!(binary.lines, 0);
-
-    assert_eq!(
-        blob_view(serde_json::json!({ "blob": null }), "core".into()).unwrap_err(),
-        "the requested file was not found"
-    );
-}
-
-/// THE FORGE REPO LIST IS THE ONE UNSCOPED SLICE. Every other slice here is
-/// keyed on what the forge pane has open. Off the forge tab this reloads
-/// nothing, and reaching the (unreachable) node is what a lost gate looks like.
-#[tokio::test(flavor = "current_thread")]
-async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
-    let data = forge_live_refresh(
-        "http://127.0.0.1:9".into(),
-        String::new(),
-        0,
-        crate::LiveKind::Forge,
-        "forge".into(),
-        ForgeRefresh::default(),
-        false,
-        4,
-    )
-    .await
-    .expect("a closed forge pane loads nothing, so nothing can fail");
-
-    assert_eq!(data.generation, 4);
-    assert!(
-        !data.repos_loaded,
-        "an unloaded list must leave the handler's keep alone"
-    );
-    assert!(data.repos.is_empty());
-}
-
 /// A WEB PICTURE IS ONE CAPPED GET. The bytes come back as served; a
 /// response that announces more than the viewer takes, one that streams more
 /// than it announced (or announced nothing), and one without a body to show
@@ -306,15 +221,4 @@ async fn a_web_picture_never_points_the_reader_at_its_own_machine() {
             .is_none(),
         "only a web URL is fetched"
     );
-}
-
-/// THE FORGE TREE'S ROOT IS "", NOT "/". `fs_parent` answers for duckfs,
-/// whose root is `/`; a committed path's directory is spelled the way
-/// `forge_tree` is asked for it, so a root file's deep link lands on the
-/// tree the browser is waiting for.
-#[test]
-fn a_committed_paths_directory_is_spelled_like_the_tree() {
-    assert_eq!(forge_parent("README.md".into()), "");
-    assert_eq!(forge_parent("docs/guide.md".into()), "docs");
-    assert_eq!(forge_parent("a/b/c.rs".into()), "a/b");
 }

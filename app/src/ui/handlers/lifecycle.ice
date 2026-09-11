@@ -240,8 +240,6 @@ on workspace_connected(next)
   agents_open_run = ""
   agents_live = false
   account_generation = account_generation + 1
-  forge_generation = forge_generation + 1
-  forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   dm_peers_generation = dm_peers_generation + 1
@@ -256,7 +254,6 @@ on workspace_connected(next)
       try request -> done request
       done -> peers_load_selected _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
-    run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -294,12 +291,9 @@ on live_updated(next)
     LiveKind.ready
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
-      forge_generation = forge_generation + 1
-      parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.chat
-      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
       channels = folded_chat.channels
       messages = folded_chat.messages
       has_older_history = folded_chat.has_older_history
@@ -322,7 +316,6 @@ on live_updated(next)
       active_channel_archived = folded_chat.active_channel_archived
       active_channel_members_only = folded_chat.active_channel_members_only
       post_refusal = folded_chat.post_refusal
-      forge_discussion = folded_chat.forge_discussion
       return if !folded_chat.refresh_chat
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
@@ -352,9 +345,6 @@ on live_updated(next)
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
       run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(false, true), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-    LiveKind.forge
-      forge_generation = forge_generation + 1
-      run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.plane
       // a module view holding an `rpc.live` subscription on this plane is
       // told first; the serial moving is what draws it
@@ -383,13 +373,13 @@ on live_updated(next)
           try request -> done request
           done -> names_moved_selected _
     LiveKind.resync
-      return if !next.load_chat && !next.load_pages && !forge_live_hit(next.kind, next.module)
-      hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
-      hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
-      forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
-      parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+      // A replay the stream could not fold: every module view holding an
+      // `rpc.live` subscription on the plane it names re-reads first.
+      views_live_serial = view_live_hit(next.module, views_live_serial)
+      return if !next.load_chat && !next.load_pages
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on live_resynced(next)
   return if next.generation != hydration_generation
@@ -745,8 +735,6 @@ on select_shell_tab(next)
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
   members_generation = members_generation + 1
   account_generation = account_generation + 1
-  forge_generation = forge_generation + 1
-  forge_list_phase = keep_forge_phase(shell_tab == ShellTab.forge, ForgePhase.loading, forge_list_phase)
   // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
   // other loader here draws only its own tab, so a bump that discards a
   // still-flying CONNECT load is re-earned the moment that tab is opened. The
@@ -778,10 +766,6 @@ on select_shell_tab(next)
       from done load_request(tab_reads_plane(shell_tab, "account"), connected_rpc, "", account_generation)
       try request -> done request
       done -> account_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.forge, connected_rpc, "", forge_generation)
-      try request -> done request
-      done -> forge_load_selected _
 
 // Conditional effects are selected one update before launch. The selector's
 // optional `try` emits no message when false. A newer intent, tab, or network
@@ -820,12 +804,6 @@ on names_moved_selected(request)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-
-on forge_load_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation
-  let unmounted = shell_tab != ShellTab.forge
-  return if obsolete_request || unmounted
-  run replace lane=forge_load load_forge(request.rpc, request.generation) -> forge_loaded _ | forge_list_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is

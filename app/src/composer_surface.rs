@@ -1235,6 +1235,18 @@ pub(crate) mod testing {
         slot.document.content.text()
     }
 
+    /// The labels seated under `scope` — what an `@` in that composer may
+    /// complete to, before the name directory is folded in.
+    pub(crate) fn roster_of(scope: &str) -> Vec<String> {
+        ROSTERS.with_borrow(|rosters| {
+            rosters
+                .by_room
+                .get(scope)
+                .map(|members| members.iter().map(|member| member.label.clone()).collect())
+                .unwrap_or_default()
+        })
+    }
+
     /// The mention menu's rows over the scope's words, and the highlighted
     /// one — as the next frame paints them for an unblocked box.
     pub(crate) fn menu_rows(scope: &str) -> Option<(Vec<String>, usize)> {
