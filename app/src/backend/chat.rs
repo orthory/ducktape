@@ -796,11 +796,8 @@ pub async fn load_page_threads(
             return Ok(BlockThreadListData {
                 generation,
                 target: String::new(),
-                from: 0,
                 threads: Vec::new(),
                 total: 0,
-                next_from: 0,
-                has_more: false,
             });
         }
         let page_id = required_id(page_id, "page")?;
@@ -813,15 +810,14 @@ pub async fn load_page_threads(
             .into_iter()
             .map(|thread| page_comment_thread(thread, &names))
             .collect();
-        let total = count_i64(threads.len());
+        // The OPEN threads: the header chip and the page-scope title count
+        // what is outstanding, matching every margin badge under them.
+        let total = count_i64(threads.iter().filter(|thread| !thread.resolved).count());
         Ok(BlockThreadListData {
             generation,
             target: page_id,
-            from: 0,
             threads,
             total,
-            next_from: 0,
-            has_more: false,
         })
     }
     .await;
@@ -831,37 +827,16 @@ pub async fn load_page_threads(
     })
 }
 
-pub async fn load_block_comment_page(
-    rpc: String,
-    target: String,
-    thread_id: String,
-    from: i64,
-    generation: i64,
-) -> Result<BlockCommentData, HydrationError> {
-    let result = async {
-        let target = required_id(target, "block")?;
-        let thread_id = required_id(thread_id, "comment thread")?;
-        let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
-        let rpc = rpc_client(&rpc)?;
-        query_block_comment_page(&rpc, &target, &thread_id, from, generation)
-            .await?
-            .ok_or_else(|| "comment thread was not found".to_string())
-    }
-    .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
+/// Add a comment. An EMPTY `thread_id` opens a fresh thread on `target` — the
+/// card's new-thread composer; a thread id replies into that thread. The
+/// caller reloads the page's threads either way, so nothing is read back here.
 pub async fn post_block_comment(
     rpc: String,
     password: String,
     target: String,
     thread_id: String,
     text: String,
-    generation: i64,
-) -> Result<BlockCommentData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let target = required_id(target, "block")?;
         let text = bounded_text(text, "comment", 16 * 1024)?;
@@ -871,9 +846,9 @@ pub async fn post_block_comment(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::AddComment {
-                thread_id: thread_id.clone(),
+                thread_id,
                 comment_id: fresh_id("comment"),
-                target: target.clone(),
+                target,
                 text,
                 anchor: None,
                 mentions: Vec::new(),
@@ -881,10 +856,7 @@ pub async fn post_block_comment(
             password,
         )
         .await?;
-        query_block_comment_page(&rpc, &target, &thread_id, 0, generation)
-            .await
-            .and_then(|page| page.ok_or_else(|| "comment thread was not found".to_string()))
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }

@@ -483,13 +483,11 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
     );
 
     // THE WHOLE MODULE'S LANE, not just this function. `PageQuery` is pages'
-    // DISPATCH read surface, and exactly one arm of it legitimately remains:
-    // `CommentThread`. Two reasons, and both have to stop holding before it
-    // moves — the index guest serves grouped `ThreadRow`s through
-    // `threads_for_targets`, not the `ThreadView` this reply carries; and its
-    // one caller is `add_block_comment`'s read of the comment it JUST posted,
-    // where the canonical lane is read-after-write by construction. Anything
-    // else appearing here is a pages read crawling back onto the select loop.
+    // DISPATCH read surface and the app is off it entirely: `CommentThread`
+    // was the last arm standing, read per comment thread the card opened, and
+    // the card opens none — one grouped `threads_for_targets` on the view lane
+    // answers every thread WITH its comments. Anything appearing here is a
+    // pages read crawling back onto the select loop.
     //
     // WALKED, never listed. A hand-written list of files is a rule carrying its
     // own escape hatch: `PageQuery` is imported once (`backend/mod.rs`) and
@@ -498,7 +496,6 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
     // dropped into it would pass this test silently. Only this file is skipped,
     // and for the reason the chat pin skips its own prose: a sweep over raw
     // source cannot tell the banned symbol from the string that bans it.
-    const KEPT: &str = "CommentThread";
     let backend = backend_sources();
     assert!(
         backend.iter().any(|(name, _)| name == "load.rs"),
@@ -511,14 +508,13 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
                 .chars()
                 .take_while(char::is_ascii_alphanumeric)
                 .collect();
-            assert_eq!(arm, KEPT, "{name} reads pages::{arm} on the dispatch lane");
-            arms.push(arm);
+            arms.push(format!("{name} reads pages::{arm}"));
         }
     }
     assert_eq!(
         arms,
-        [KEPT],
-        "the ONE kept dispatch read, exactly once — a second call site is a \
+        Vec::<String>::new(),
+        "every pages read is on the index view lane — a dispatch read is a \
          lane decision, not a copy-paste"
     );
 }

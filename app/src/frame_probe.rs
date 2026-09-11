@@ -99,7 +99,7 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
     // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
     // externs borrowing their list and string arguments
-    // (`subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
+    // (`subpage_blocks`, `comment_scope_label`, `comment_compose_hint`, and
     // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
     // externs cloning them per frame.
     ScreenProbe {
@@ -442,20 +442,24 @@ fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
         backend::BlockThreadListData {
             generation,
             target: "page".into(),
-            from: 0,
             threads: (0..PAGE_ROWS)
                 .map(|index| backend::PageCommentThread {
                     id: format!("thread-{index}"),
                     target: format!("block-{index}"),
                     author: format!("reviewer-{}", index % 7),
-                    meta: format!("#{index}"),
+                    meta: "1 comment".into(),
                     resolved: false,
                     comment_count: 1,
+                    comments: vec![backend::PageComment {
+                        id: format!("comment-{index}"),
+                        ordinal: 1,
+                        author: format!("reviewer-{}", index % 7),
+                        meta: "#1".into(),
+                        text: format!("A note on block {index}."),
+                    }],
                 })
                 .collect(),
             total: PAGE_ROWS as i64,
-            next_from: 0,
-            has_more: false,
         },
     ));
     assert_eq!(app.blocks.len(), PAGE_ROWS);

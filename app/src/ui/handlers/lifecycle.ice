@@ -61,7 +61,6 @@ on reconnect
   invalidate lane=thread
   invalidate lane=live_thread
   invalidate lane=block_threads
-  invalidate lane=block_comments
   invalidate lane=live_resync
   invalidate lane=page_autosave
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
@@ -124,19 +123,12 @@ on reconnect
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
+  inline_comment_target = ""
+  block_comments_pinned = false
   block_comment_threads = []
   block_comment_rows = []
   block_comment_thread_total = 0
-  block_comment_threads_next_from = 0
-  block_comment_threads_has_more = false
   block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  active_thread_target = ""
-  active_thread_anchor = ""
-  block_thread_comments = []
-  block_thread_comments_next_from = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
   page_text = installed_page_text(page_text, true, "")
@@ -229,8 +221,7 @@ on workspace_connected(next)
   pages = next.pages
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   // The blocks in hand are this page's, and every route into a connect blanks
@@ -339,8 +330,7 @@ on live_updated(next)
       pages = apply_page_rename(pages, next.pages)
       active_page_title = apply_page_title(active_page_title, next.pages, active_page)
       blocks = apply_page_text(blocks, next.pages)
-      block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-      active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+      block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
       let observed = current_page_document(network_chain_id, buffer_page, page_text)
       page_text = observed.text
       let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
@@ -551,22 +541,16 @@ on live_resynced(next)
   block_comments_open = block_comments_open && !empty(block_comments_target)
   block_comment_threads = retain_selected_comment_threads(block_comment_threads, block_comments_target)
   block_comment_thread_total = retain_selected_i64(block_comment_thread_total, block_comments_target)
-  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, block_comments_target)
-  block_comment_threads_has_more = block_comment_threads_has_more && !empty(block_comments_target)
   block_comment_threads_loading = block_comment_threads_loading && !empty(block_comments_target)
-  active_block_comment_thread = retain_selected_string(active_block_comment_thread, block_comments_target)
-  block_thread_comments = retain_selected_comments(block_thread_comments, block_comments_target)
-  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, block_comments_target)
-  block_thread_comments_has_more = block_thread_comments_has_more && !empty(block_comments_target)
-  block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
+  inline_comment_target = retain_selected_string(inline_comment_target, block_comments_target)
+  block_comments_pinned = block_comments_pinned && !empty(block_comments_target)
   block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
   pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
   page_delete_armed = page_delete_armed && active_page == keep_str(pages_answer_is_current, next.active_page, active_page)
   block_comment_thread_total = keep_i64(pages_answer_is_current, next.comment_thread_total, block_comment_thread_total)
   commented_block_hits = keep_strs(pages_answer_is_current, next.commented_block_hits, commented_block_hits)
   active_page = keep_str(pages_answer_is_current, next.active_page, active_page)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   // The header title is fold-owned too — same #1041 rule as the row above,
   // and it must hold HERE because the editor rebuild below reads it as line 0.
   // `active_page_parent` is not: no fold writes a parent, so it stays the
@@ -649,15 +633,12 @@ on live_resynced(next)
   // block-anchored one out of the open rail on the next pages event.
   // `load_page_threads` fans out over the page AND its blocks, and answers on
   // the handler pages.ice already routes its own loads through. It ignores a
-  // closed rail, so a page event with no rail open costs one refused query and
+  // closed card, so a page event with no card open costs one refused query and
   // never touches the banner.
   //
-  // The list is all that refreshes live. An OPEN thread's replies do not: a task
-  // group must be the final statement in a handler, so the comment-page load
-  // cannot be guarded on `active_block_comment_thread`, and firing it unguarded
-  // asks the node for thread "" — whose failure paints `block_comment_page_failed`
-  // over the rail every time anyone edits the page. Replies still arrive on post
-  // and on reopen; a page-scoped comment refresh in backend.rs closes the gap.
+  // ONE QUERY CARRIES THE WHOLE CONVERSATION — every thread WITH its comments —
+  // so a live refresh brings the replies with it and there is no second, per-
+  // thread load to keep in step.
   parallel
     run replace lane=live_thread refresh_live_thread(connected_rpc, active_channel, active_thread_seq) -> live_thread_refreshed _ | live_thread_refresh_failed _
     run replace lane=block_threads load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _

@@ -91,19 +91,18 @@ selected_message_seq > 0 || message_action != MessageAction.editing)"
     assert!(lifecycle.contains(
         "block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)"
     ));
-    // The list callback may open the chosen inline thread, but never reloads
-    // its own page thread list.
+    // The list callback installs what landed and asks for nothing more: the
+    // one query already carried every thread WITH its comments.
     let pages_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
     let comment_callbacks = pages_handlers
         .split_once("on block_threads_loaded(next)\n")
         .unwrap()
         .1
-        .split_once("\non load_more_block_threads")
+        .split_once("\non block_threads_failed")
         .unwrap()
         .0;
-    assert!(!comment_callbacks.contains("load_page_threads("));
-    assert!(comment_callbacks.contains("return if empty(inline_comment_target)"));
-    assert!(comment_callbacks.contains("selected == active_block_comment_thread"));
+    assert!(!comment_callbacks.contains("run "));
+    assert!(comment_callbacks.contains("commented_block_hits = commented_targets_of("));
 }
 
 #[test]
@@ -537,7 +536,9 @@ fn block_comments_float_a_card_over_the_document() {
     assert_eq!(opening.next(), Some("box w=fill h=fill p=16.0"));
     assert_eq!(
         opening.next(),
-        Some("float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset")
+        Some(
+            "float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset"
+        )
     );
     assert_eq!(
         opening.next(),
@@ -565,20 +566,40 @@ fn block_comments_float_a_card_over_the_document() {
     let components = inlined(include_str!("../../../crates/views/pages/src/ui/rows.ice"));
     assert!(!components.contains("component BlockActionsMenu"));
 
+    // ONE SCOPE, NO DRILL-DOWN. The card lists that scope's threads expanded,
+    // each with its own Resolve and its own reply box; there is no row that
+    // opens a thread and no second load behind one.
+    assert!(!pages.contains("open_block_comment_thread"));
+    assert!(!pages.contains("load_more_block_comments"));
+    assert!(components.contains("component PageCommentThreadCard("));
+    assert!(components.contains("-> emit(resolve_thread_submit, thread.id, true)"));
+    assert!(components.contains("-> emit(post_thread_reply, thread.id)"));
+    assert!(components.contains("#thread-reply(thread.id)"));
+    // The page's own group header is text; a block's is the way into its scope.
+    assert!(pages.contains("-> emit(narrow_comment_scope, comment_group.target)"));
+    assert!(pages.contains("-> emit(widen_comment_scope)"));
+
     let handlers = inlined(include_str!("../ui/handlers/pages.ice"));
-    assert!(handlers.contains("on post_block_comment_submit"));
-    // A NEW comment anchors on the CARET's block (the thread's own target on
-    // a reply) — never blindly on the page.
+    assert!(handlers.contains("on post_block_comment_submit(thread_id)"));
+    // A REPLY inherits its thread's anchor; the composer takes the card's
+    // scope. One resolver decides, and refuses a thread the list has lost.
     assert!(handlers.contains(
-        "run every post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
+        "let post_target = comment_post_target(block_comment_threads, thread_id, scope_target)"
     ));
+    assert!(handlers.contains("return if empty(post_target)"));
     assert!(handlers.contains(
-        "let fresh_target = keep_str(!empty(inline_comment_target), inline_comment_target, caret_target)"
+        "run every post_block_comment(connected_rpc, password, post_target, thread_id, pending_block_comment)"
     ));
-    // Opening a thread rides the thread's OWN anchor — a block-anchored
-    // thread opened with the page id is refused by the node.
-    assert!(handlers.contains("on open_block_comment_thread(event)"));
-    assert!(handlers.contains("let target = event_text(event, \"target\")"));
+    // Narrowing and widening re-slice threads already in hand: no round trip.
+    for scope_handler in [
+        "on narrow_block_comments(target)",
+        "on widen_block_comments",
+    ] {
+        let rest = handlers.split_once(scope_handler).unwrap().1;
+        let body = rest.split_once("\non ").map_or(rest, |(body, _)| body);
+        assert!(!body.contains("run "), "{scope_handler} must not reload");
+        assert!(body.contains("block_comment_rows = "), "{scope_handler}");
+    }
     // The guest editor shares the screen's document slot and keeps comment
     // counts in its declarative presentation, under the comments card.
     let guest_source = include_str!("../../../crates/views/pages/src/ui/app.ice");
@@ -586,54 +607,52 @@ fn block_comments_float_a_card_over_the_document() {
     let guest = inlined(guest_source);
     assert!(guest.contains("document_marks = next.comment_marks"));
     let view = inlined(include_str!("../ui/view.ice"));
-    assert!(view.contains(", blocks, commented_block_hits, caret_comment_target,"));
-    assert!(pages.contains("-> emit(resolve_thread_submit, true)"));
+    assert!(view.contains(", blocks, commented_block_hits, orphaned_comment_drafts,"));
+    assert!(view.contains(", inline_comment_target, block_comments_pinned,"));
 }
 
+/// A REPLY INHERITS ITS THREAD'S ANCHOR; the composer takes the card's scope.
+///
+/// The node validates the `(thread_id, target)` pair, so a reply to a
+/// block-anchored thread posted with the page id is refused outright — and a
+/// thread id the list no longer carries must post NOWHERE rather than land on
+/// the scope as if it were a new thread, which would silently split a
+/// conversation the reader thought she was answering.
 #[test]
-fn comment_pages_merge_by_identity_and_ordinal() {
+fn a_reply_takes_its_threads_anchor_and_a_new_thread_takes_the_scope() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
-    let thread = |id: &str, count: i64| backend::PageCommentThread {
+    let thread = |id: &str, target: &str| backend::PageCommentThread {
         id: id.into(),
-        target: "page".into(),
+        target: target.into(),
         author: "user".into(),
-        meta: count.to_string(),
+        meta: "1 comment".into(),
         resolved: false,
-        comment_count: count,
+        comment_count: 1,
+        comments: Vec::new(),
     };
-    let comment = |ordinal, text: &str| backend::PageComment {
-        id: format!("comment-{ordinal}"),
-        ordinal,
-        author: "user".into(),
-        meta: format!("#{ordinal}"),
-        text: text.into(),
-    };
-
-    let threads = backend::append_page_comment_threads(
-        vec![thread("b", 1), thread("a", 1)],
-        vec![thread("b", 2), thread("c", 1)],
+    let threads = vec![thread("on-seven", "block-7"), thread("on-page", "page")];
+    assert_eq!(
+        backend::comment_post_target(threads.clone(), "on-seven".into(), "page".into()),
+        "block-7"
     );
     assert_eq!(
-        threads
-            .iter()
-            .map(|thread| thread.id.as_str())
-            .collect::<Vec<_>>(),
-        ["a", "b", "c"]
+        backend::comment_post_target(threads.clone(), "on-page".into(), "block-7".into()),
+        "page"
     );
-    assert_eq!(threads[1].comment_count, 2);
-
-    let comments = backend::append_page_comments(
-        vec![comment(1, "first"), comment(3, "old")],
-        vec![comment(2, "second"), comment(3, "new")],
+    // No thread id: the card's scope, whatever it is showing.
+    assert_eq!(
+        backend::comment_post_target(threads.clone(), String::new(), "block-7".into()),
+        "block-7"
     );
     assert_eq!(
-        comments
-            .iter()
-            .map(|comment| comment.ordinal)
-            .collect::<Vec<_>>(),
-        [1, 2, 3]
+        backend::comment_post_target(threads.clone(), String::new(), "page".into()),
+        "page"
     );
-    assert_eq!(comments[2].text, "new");
+    // A thread that left the list between the render and the press.
+    assert_eq!(
+        backend::comment_post_target(threads, "gone".into(), "page".into()),
+        ""
+    );
 }
 
 /// A REMOTE RENAME REACHES LINE 0, WHICH IS WHERE THE SAVE READS THE TITLE.
@@ -1174,19 +1193,10 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     app.mutation_phase = MutationPhase::Idle;
     app.active_page = "page".into();
     app.block_comments_open = true;
-    // the rail is DOCUMENT-scoped: its anchor is the page it was opened
+    // the card is DOCUMENT-scoped: its anchor is the page it was opened
     // on, never the block selection that opened it.
     app.block_comments_target = "page".into();
     app.block_comment_draft = "draft stays".into();
-    app.block_comment_threads_has_more = true;
-    app.active_block_comment_thread = "deleted-thread".into();
-    app.block_thread_comments = vec![backend::PageComment {
-        id: "stale-comment".into(),
-        ordinal: 1,
-        author: "user".into(),
-        meta: "#1".into(),
-        text: "stale".into(),
-    }];
 
     // a pages comment op arrives: the delta starts the debounced reload
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
@@ -1203,19 +1213,16 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     }));
     let resync_generation = app.hydration_generation;
     let stale_generation = app.block_comments_generation;
-    let _ = app.__update(__DucktapeMessage::LoadMoreBlockThreads);
+    // a write bumps the generation, and every earlier reply is dropped whole
+    let _ = app.__update(__DucktapeMessage::ThreadResolved(true));
     assert_ne!(app.block_comments_generation, stale_generation);
 
-    // a comment refresh from a superseded generation is dropped whole
     let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
         backend::BlockThreadListData {
             generation: stale_generation,
             target: "page".into(),
-            from: 0,
             threads: Vec::new(),
             total: 0,
-            next_from: 0,
-            has_more: false,
         },
     ));
     assert_eq!(app.block_comment_draft, "draft stays");
@@ -1244,32 +1251,46 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
         backend::BlockThreadListData {
             generation,
             target: app.block_comments_target.clone(),
-            from: 0,
             threads: vec![backend::PageCommentThread {
                 id: "thread-1".into(),
                 target: "page".into(),
                 author: "user".into(),
-                meta: "1".into(),
+                meta: "2 comments".into(),
                 resolved: false,
-                comment_count: 1,
+                comment_count: 2,
+                comments: vec![
+                    backend::PageComment {
+                        id: "c1".into(),
+                        ordinal: 1,
+                        author: "user".into(),
+                        meta: "#1".into(),
+                        text: "opened".into(),
+                    },
+                    backend::PageComment {
+                        id: "c2".into(),
+                        ordinal: 2,
+                        author: "other".into(),
+                        meta: "#2".into(),
+                        text: "answered".into(),
+                    },
+                ],
             }],
             total: 3,
-            next_from: 0,
-            has_more: false,
         },
     ));
 
     assert_eq!(app.block_comment_thread_total, 3);
     assert_eq!(app.block_comment_draft, "draft stays");
     assert!(!app.block_comment_threads_loading);
-    // the live refresh carries the THREAD LIST only. An open comment page
-    // is not reloaded under the reader — a task group must be a handler's
-    // final statement, so the reply load cannot be guarded on an open
-    // thread, and firing it unguarded queries thread "" and paints its
-    // failure over the rail on every page edit. Replies arrive on post and
-    // on reopen instead.
-    assert_eq!(app.active_block_comment_thread, "deleted-thread");
-    assert_eq!(app.block_thread_comments.len(), 1);
+    // ONE QUERY CARRIES THE WHOLE CONVERSATION, so a live refresh brings
+    // every thread's replies with it — there is no second, per-thread load
+    // left to go stale under the reader.
+    assert_eq!(app.block_comment_threads[0].comments.len(), 2);
+    assert_eq!(app.block_comment_rows.len(), 1);
+    assert_eq!(
+        app.block_comment_rows[0].thread.comments[1].text,
+        "answered"
+    );
 }
 
 #[test]
@@ -1300,11 +1321,8 @@ fn block_comment_recovery_always_unlocks_mutations() {
         backend::BlockThreadListData {
             generation: 8,
             target: "block-1".into(),
-            from: 0,
             threads: Vec::new(),
             total: 0,
-            next_from: 0,
-            has_more: false,
         },
     ));
     assert_eq!(recovered.mutation_phase, MutationPhase::Idle);
@@ -1325,11 +1343,8 @@ fn block_comment_recovery_always_unlocks_mutations() {
         backend::BlockThreadListData {
             generation: 8,
             target: "block-1".into(),
-            from: 0,
             threads: Vec::new(),
             total: 0,
-            next_from: 0,
-            has_more: false,
         },
     ));
     assert_eq!(
@@ -1401,8 +1416,11 @@ fn an_armed_page_delete_answers_escape_and_seals_the_document() {
     );
 }
 
+/// A BADGE OPENS ITS BLOCK'S CONVERSATION, WHOLE — every thread on it, and
+/// only that block's. The card is then the block's: the widen affordance is
+/// withheld, because the page was never what the badge pointed at.
 #[test]
-fn a_document_comment_badge_opens_its_own_thread_and_rejects_old_replies() {
+fn a_document_comment_badge_scopes_the_card_to_its_block_and_pins_it_there() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
@@ -1411,15 +1429,27 @@ fn a_document_comment_badge_opens_its_own_thread_and_rejects_old_replies() {
     app.block_comments_open = true;
     app.block_comments_target = "page".into();
     app.inline_comment_target = "block-b".into();
+    app.block_comments_pinned = true;
     app.block_comments_generation = 10;
     app.block_comment_threads_loading = true;
+    app.blocks = vec![
+        page_block("block-a", "page", "Paragraph A"),
+        page_block("block-b", "page", "Paragraph B"),
+    ];
     let thread = |id: &str, target: &str, resolved| backend::PageCommentThread {
         id: id.into(),
         target: target.into(),
         resolved,
         author: "Reader".into(),
-        meta: String::new(),
+        meta: "1 comment".into(),
         comment_count: 1,
+        comments: vec![backend::PageComment {
+            id: format!("{id}-1"),
+            ordinal: 1,
+            author: "Reader".into(),
+            meta: "#1".into(),
+            text: format!("said on {id}"),
+        }],
     };
     let threads = vec![
         thread("other", "block-a", false),
@@ -1430,47 +1460,79 @@ fn a_document_comment_badge_opens_its_own_thread_and_rejects_old_replies() {
         backend::BlockThreadListData {
             generation: 10,
             target: "page".into(),
-            from: 0,
             threads,
-            total: 3,
-            next_from: 0,
-            has_more: false,
+            total: 2,
         },
     ));
-    assert_eq!(app.active_block_comment_thread, "wanted");
-    assert_eq!(app.active_thread_target, "block-b");
-    assert!(app.block_thread_comments_loading);
+    assert!(!app.block_comment_threads_loading);
+    // The scope's threads, resolved one included — the card files that one
+    // behind its own toggle rather than dropping it.
     assert_eq!(app.block_comment_rows.len(), 2);
     assert!(
         app.block_comment_rows
             .iter()
             .all(|row| row.thread.target == "block-b")
     );
-    let _ = app.__update(__DucktapeMessage::BlockCommentPageLoaded(
-        backend::BlockCommentData {
-            generation: 9,
-            target: "block-a".into(),
-            thread_id: "other".into(),
-            from: 0,
-            comments: Vec::new(),
-            next_from: 0,
-            has_more: false,
-        },
-    ));
-    assert!(
-        app.block_thread_comments_loading,
-        "the old thread must not complete this load"
-    );
-    let _ = app.__update(__DucktapeMessage::CloseBlockCommentThread);
-    assert!(app.inline_comment_target.is_empty());
-    assert_eq!(app.block_comment_rows.len(), 3);
-    assert!(app.active_block_comment_thread.is_empty());
-    app.inline_comment_target = "block-b".into();
-    app.caret_comment_target = "block-a".into();
-    app.block_comment_draft = "A new comment on B".into();
-    let _ = app.__update(__DucktapeMessage::PostBlockCommentSubmit);
+    assert_eq!(app.block_comment_rows[0].anchor, "“Paragraph B”");
+    // The comments came with the threads: nothing is loading behind the card.
     assert_eq!(
-        app.active_thread_target, "block-b",
-        "moving the caret must not retarget the open composer"
+        app.block_comment_rows[1].thread.comments[0].text,
+        "said on wanted"
     );
+    // A resolved thread marks no line, so only the open one lights a badge.
+    assert_eq!(app.commented_block_hits, ["block-a", "block-b"]);
+
+    // WIDENING IS REFUSED while the card is pinned to its badge's block …
+    let _ = app.__update(__DucktapeMessage::WidenBlockComments);
+    assert_eq!(app.inline_comment_target, "block-b");
+    // … and a chip-opened card widens back to every thread on the page.
+    app.block_comments_pinned = false;
+    let _ = app.__update(__DucktapeMessage::WidenBlockComments);
+    assert!(app.inline_comment_target.is_empty());
+    assert_eq!(
+        app.block_comment_rows.len(),
+        3,
+        "no round trip, just a re-slice"
+    );
+    // Narrowing to a group header re-slices the same threads back down.
+    let _ = app.__update(__DucktapeMessage::NarrowBlockComments("block-a".into()));
+    assert_eq!(app.inline_comment_target, "block-a");
+    assert_eq!(app.block_comment_rows.len(), 1);
+    assert_eq!(app.block_comment_rows[0].thread.id, "other");
+}
+
+/// THE COMPOSER TAKES THE CARD'S SCOPE AND A REPLY TAKES ITS THREAD'S ANCHOR,
+/// and a thread id the list has lost posts nowhere at all.
+#[test]
+fn a_post_anchors_on_its_thread_or_on_the_cards_scope() {
+    let _turn = crate::module_view::tests::blocking_connection_turn();
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected = true;
+    app.mutation_phase = MutationPhase::Idle;
+    app.active_page = "page".into();
+    app.block_comments_open = true;
+    app.block_comments_target = "page".into();
+    app.inline_comment_target = "block-b".into();
+    app.block_comment_threads = vec![backend::PageCommentThread {
+        id: "on-a".into(),
+        target: "block-a".into(),
+        author: "Reader".into(),
+        meta: "1 comment".into(),
+        resolved: false,
+        comment_count: 1,
+        comments: Vec::new(),
+    }];
+
+    // A thread nobody is carrying any more: refused, and the draft is kept.
+    app.block_comment_draft = "into the void".into();
+    let _ = app.__update(__DucktapeMessage::PostBlockCommentSubmit("gone".into()));
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
+    assert_eq!(app.block_comment_draft, "into the void");
+
+    // A reply rides its OWN thread's anchor, not the card's scope.
+    let _ = app.__update(__DucktapeMessage::PostBlockCommentSubmit("on-a".into()));
+    assert_eq!(app.mutation_phase, MutationPhase::BlockComment);
+    assert_eq!(app.pending_block_comment, "into the void");
+    assert!(app.block_comment_draft.is_empty());
 }

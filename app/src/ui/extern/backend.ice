@@ -27,10 +27,9 @@ extern crate::backend
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
-  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
-  BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
+  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64, comments:[PageComment])
+  BlockThreadListData(generation:i64, target:str, threads:[PageCommentThread], total:i64)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageSearchData(hits:[PageSearchHit])
   PaletteSearchData(chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
@@ -109,8 +108,6 @@ extern crate::backend
   // Chat's message/thread menus still place themselves this way; the name is
   // the pages block menu it was written for, which no longer exists.
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  pure append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
-  pure append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
   pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
@@ -359,7 +356,7 @@ extern crate::backend
   pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
   pure keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
   pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
-  pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
+  pure comment_post_target(threads:[PageCommentThread], thread_id:str, scope:str) -> str
   pure initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   pure frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
   pure first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
@@ -372,7 +369,6 @@ extern crate::backend
   pure retain_selected_string(value:str, selected_id:str) -> str
   pure retain_selected_i64(value:i64, selected_id:str) -> i64
   pure retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
-  pure retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
   pure scope_key(scope:&str, id:&str) -> str
   pure reaction_palette() -> [str]
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
@@ -421,8 +417,7 @@ extern crate::backend
   search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
-  load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
-  post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
+  post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str) -> bool ! AppError
   resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
   open_external_url(url:str) -> bool ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
