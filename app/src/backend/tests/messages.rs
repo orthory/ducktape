@@ -595,13 +595,32 @@ async fn timeline_pages_past_thread_only_traffic() {
     assert_eq!(last.messages[0].body, "reply 256");
     assert_eq!(last.next_reply_seq, 0);
     assert!(!last.has_more);
-    let sparse = load_thread(origin, "general".into(), 1, 258, 10)
+    let early = load_chat_hit(origin.clone(), "general".into(), 3, 3, 10)
         .await
         .unwrap();
-    assert_eq!(sparse.target_seq, 258);
-    assert_eq!(sparse.next_reply_seq, 0);
-    assert_eq!(sparse.messages.len(), 2);
-    assert_eq!(sparse.messages[1].body, "reply 256");
+    assert_eq!(early.thread_target_seq, 3);
+    assert_eq!(early.thread_messages.len(), 257);
+    assert_eq!(early.thread_messages[1].body, "reply 0");
+    assert_eq!(early.thread_messages[256].body, "reply 255");
+    assert!(early.thread_has_more);
+    assert_eq!(
+        thread_page_cursor(&early.thread_messages, early.thread_has_more),
+        257
+    );
+    let boundary = load_thread(origin.clone(), "general".into(), 1, 257, 11)
+        .await
+        .unwrap();
+    assert_eq!(boundary.messages.len(), 258);
+    assert_eq!(boundary.messages[257].body, "reply 256");
+    assert!(!boundary.has_more);
+    let late = load_thread(origin, "general".into(), 1, 258, 12)
+        .await
+        .unwrap();
+    assert_eq!(late.target_seq, 258);
+    assert_eq!(late.next_reply_seq, 0);
+    assert_eq!(late.messages.len(), 258);
+    assert_eq!(late.messages[1].body, "reply 0");
+    assert_eq!(late.messages[257].body, "reply 256");
     sim.shutdown();
 }
 

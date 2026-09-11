@@ -1427,14 +1427,52 @@ fn named_blocks(blocks: &[Block], names: &NameDirectory) -> Vec<Block> {
             Block::Paragraph(spans) | Block::Quote(spans) => spans,
             Block::Code { .. } | Block::Divider => continue,
         };
-        for span in spans {
-            if let Some(party) = span.marks.iter().find_map(|mark| match mark {
-                Mark::Mention(party) => Some(party),
-                _ => None,
-            }) {
-                span.text = mention_label(party, names);
-            }
-        }
+        *spans = spans
+            .iter()
+            .flat_map(|span| {
+                if let Some(party) = span.marks.iter().find_map(|mark| match mark {
+                    Mark::Mention(party) => Some(party),
+                    _ => None,
+                }) {
+                    return vec![Span {
+                        text: mention_label(party, names),
+                        marks: span.marks.clone(),
+                    }];
+                }
+                let is_link = span.marks.iter().any(|mark| matches!(mark, Mark::Link(_)));
+                let needs_token_resolution = !is_link && span.text.contains("<@");
+                if !needs_token_resolution {
+                    return vec![span.clone()];
+                }
+                // Agent paragraph payloads can carry canonical tokens as text.
+                // Resolve those same IDs without interpreting names as identities.
+                let (text, mentions) = draft_mentions(&span.text, names);
+                let mut rendered = Vec::new();
+                let mut offset = 0;
+                for (range, party) in mentions {
+                    if offset < range.start {
+                        rendered.push(Span {
+                            text: text[offset..range.start].into(),
+                            marks: span.marks.clone(),
+                        });
+                    }
+                    let mut marks = span.marks.clone();
+                    marks.push(Mark::Mention(party));
+                    rendered.push(Span {
+                        text: text[range.clone()].into(),
+                        marks,
+                    });
+                    offset = range.end;
+                }
+                if offset < text.len() {
+                    rendered.push(Span {
+                        text: text[offset..].into(),
+                        marks: span.marks.clone(),
+                    });
+                }
+                rendered
+            })
+            .collect();
     }
     blocks
 }
@@ -1643,8 +1681,8 @@ fn mention_link(party: &Party) -> String {
     }
 }
 
-/// One [`ChatSpan`] per inline run, exact text preserved — the paragraph
-/// widget wraps natively, so no word splitting happens here anymore.
+/// Inline runs with unpainted thin-space gaps around mention plates.
+/// The paragraph wraps natively without splitting runs into words.
 fn run_spans(spans: &[Span]) -> Vec<ChatSpan> {
     let mut out = Vec::new();
     for span in spans {
@@ -1658,8 +1696,17 @@ fn run_spans(spans: &[Span]) -> Vec<ChatSpan> {
                 rendered.link = url;
             }
             SpanArm::Mention(link) => {
+                // Paint-only padding cannot separate a plate from adjacent prose.
+                let gap = ChatSpan {
+                    plain: "\u{2009}".into(),
+                    ..ChatSpan::default()
+                };
+                out.push(gap.clone());
                 rendered.mention = span.text.clone();
                 rendered.mention_link = link;
+                out.push(rendered);
+                out.push(gap);
+                continue;
             }
             SpanArm::BoldItalic => rendered.bold_italic = span.text.clone(),
             SpanArm::Bold => rendered.bold = span.text.clone(),
@@ -2293,10 +2340,10 @@ mod tests {
             },
         ];
         let rendered = run_spans(&spans);
-        assert_eq!(rendered[0].mention, "@zoe");
-        assert_eq!(rendered[0].mention_link, "duck://account/7");
-        assert_eq!(rendered[1].mention, "@a1b2");
-        assert_eq!(rendered[1].mention_link, "");
+        assert_eq!(rendered[1].mention, "@zoe");
+        assert_eq!(rendered[1].mention_link, "duck://account/7");
+        assert_eq!(rendered[4].mention, "@a1b2");
+        assert_eq!(rendered[4].mention_link, "");
     }
 
     fn committed(seq: i64, author: &str) -> ChatMessage {
@@ -2940,6 +2987,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_plain_tokens_resolve_without_losing_surrounding_text() {
+        let user = account(3, "Selfhost Duck", Vec::new());
+        let names = NameDirectory::from_accounts([&user]);
+        let blocks = vec![
+            Block::paragraph("before <@3> yoyo"),
+            Block::Code {
+                lang: None,
+                text: "<@3>".into(),
+            },
+        ];
+        let view = blocks_view_with_names(&blocks, &names);
+        assert_eq!(view[0].spans[0].plain, "before ");
+        assert_eq!(view[0].spans[2].mention, "@Selfhost Duck");
+        assert_eq!(view[0].spans[2].mention_link, "duck://account/3");
+        assert_eq!(view[0].spans[4].plain, " yoyo");
+        assert_eq!(view[0].spans[1].plain, "\u{2009}");
+        assert_eq!(view[0].spans[3].plain, "\u{2009}");
+        assert_eq!(view[1].text, "<@3>");
+        assert_eq!(
+            message_body_with_names(&blocks[..1], &names),
+            "before @Selfhost Duck yoyo"
+        );
+        assert_eq!(draft_body(&blocks[..1]), "before <@3> yoyo");
+    }
+
+    #[test]
     fn canonical_mentions_keep_identity_through_names_and_edits() {
         let original = account(2, "Selfhost Duck", Vec::new());
         let duplicate = account(3, "Selfhost Duck", Vec::new());
@@ -2955,12 +3028,12 @@ mod tests {
         assert_eq!(draft_body(&blocks), text);
         assert_eq!(parse_message(&draft_body(&blocks)), blocks);
         let view = blocks_view_with_names(&blocks, &names);
-        assert_eq!(view[0].spans[1].mention, "@Selfhost Duck");
-        assert_eq!(view[0].spans[1].mention_link, "duck://account/2");
+        assert_eq!(view[0].spans[2].mention, "@Selfhost Duck");
+        assert_eq!(view[0].spans[2].mention_link, "duck://account/2");
         let renamed = account(2, "Claude Peer", Vec::new());
         let names = NameDirectory::from_accounts([&renamed]);
         assert_eq!(
-            blocks_view_with_names(&blocks, &names)[0].spans[1].mention,
+            blocks_view_with_names(&blocks, &names)[0].spans[2].mention,
             "@Claude Peer"
         );
         assert_eq!(draft_body(&blocks), text);

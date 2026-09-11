@@ -841,3 +841,15 @@ pub(crate) fn tone_of(dark: bool) -> crate::Tone {
 pub fn no_dm_peer() -> DmPeer {
     DmPeer::default()
 }
+
+/// Navigation reveals the addressed row once; live updates retain reading position.
+pub fn message_target_key(messages: &[ChatMessage], target: i64, changed: bool) -> i64 {
+    let should_reveal = changed && target > 0;
+    if !should_reveal {
+        return 0;
+    }
+    messages
+        .iter()
+        .find(|row| row.seq == target)
+        .map_or(0, |row| row.view_key)
+}
