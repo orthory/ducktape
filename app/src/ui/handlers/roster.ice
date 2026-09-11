@@ -105,30 +105,11 @@ on account_op_failed(cause)
   account_busy = false
   error = cause.message
 
-on agents_loaded(next)
-  return if next.generation != agents_generation
-  agents_answered = true
-  agents_rows = next.agents
-  agents_runs = next.runs
-  agents_capabilities = next.capabilities
-  // the open journal follows the register: the op that moved the register
-  // may have moved the open run too
-  return if empty(agents_open_run)
-  agents_journal_op = agents_journal_op + 1
-  run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
-
-// THE JOURNAL READ, INSTALLED ONLY IN ITS OWN SCOPE. The run id is the
-// subject, not the identity: two networks can carry the same one, and a
-// reconnect to the same endpoint is a different session — so a read started on
-// A, answering after the app moved to B with that run still open, would install
-// A's journal under B. Success AND refusal meet the same fence, which is why
-// the read is infallible and carries its scope in the answer: an error arm has
-// nowhere to put one.
 // THE RUN PANEL, ON ONE RUN. Every door that opens a run — the runs list, a
 // chat hint's "View run", the run chip on a message a run posted, a bell, a
-// duck://run link — comes through here: the agents tab, the run named, and
-// its journal read under a fresh op so a slower earlier read cannot land over
-// it. An empty id closes the panel.
+// duck://run link — comes through here: the agents tab and the run named,
+// which the session push carries to the view. The journal itself is the
+// view's own read. An empty id closes the panel.
 on open_run_panel(dispatch_id)
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
@@ -142,19 +123,6 @@ on open_run_panel(dispatch_id)
   shell_tab = ShellTab.agents
   agents_open_run = dispatch_id
   agents_opened = agents_opened + 1
-  agents_journal = empty_run_journal()
-  agents_journal_op = agents_journal_op + 1
-  run replace lane=agent_journal load_run_journal(connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run) -> agent_journal_loaded _
-
-on agent_journal_loaded(next)
-  return if !journal_in_scope(next, connected_rpc, network_chain_id, connect_generation, account_number, agents_journal_op, agents_open_run)
-  agents_journal = next
-  return if empty(next.error)
-  error = next.error
-
-on agents_failed(cause)
-  return if cause.generation != agents_generation
-  agents_answered = true
 
 // The Approvals view speaks the kernel contract: its reads and writes go
 // through the kernel, and the one event it hands the app is the tab badge.
@@ -193,19 +161,16 @@ on dm_peers_loaded(next)
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation
 
-// What the Agents view asks of the app. A pause is the same owner-gated
-// write the Members record offers; a save rewrites one record from the
-// editor's whole draft; a register provisions the program account under the
-// signing account and registers the draft against it. The endpoint, the key
-// and the writes are this handler's; the view only ever hands over what the
-// reader typed.
+// What the Agents view still asks of the app. Its reads and its own writes
+// go through the kernel; what is left is whether any of its agents is
+// working (the rail's pulse), the ONE write it cannot sign — a registration
+// first provisions the agent's program account and binds the runs module's
+// own composed program — and two navigations.
 on agents_view_event(event)
   return if !connected
   match agents_intent(event)
-    AgentsIntent.status
-      run every set_agent_status(connected_rpc, password, event_text(event, "agent_id"), event_flag(event, "paused")) -> agent_status_set _ | mutation_failed _
-    AgentsIntent.save
-      run every save_agent(connected_rpc, password, event.detail) -> agent_status_set _ | mutation_failed _
+    AgentsIntent.badge
+      agents_live = event_int(event, "count") > 0
     AgentsIntent.register
       run every register_agent(connected_rpc, password, account_number, event.detail) -> agent_status_set _ | mutation_failed _
     AgentsIntent.open_run
@@ -220,14 +185,12 @@ on agents_view_event(event)
         from done event_text(event, "url")
         done -> open_message_link _
 
-// Every committed agent write lands here: pause, resume, save, register. The
-// pause payload is the DESIRED state and it is named for the backend
-// parameter it becomes: `true` PAUSES, `false` resumes. The registry is the
-// authority on whether the signing owner may apply any of them. The register
-// is re-read under a fresh generation, and `agents_committed` tells the view
-// the drafts it held were consumed.
+// A committed agent write lands here: an agent's pause from the Members
+// record, or a registration from the Agents view. The pause payload is the
+// DESIRED state and it is named for the backend parameter it becomes:
+// `true` PAUSES, `false` resumes. The registry is the authority on whether
+// the signing owner may apply either. The register itself is the Agents
+// view's to re-read: the block the write lands in reaches it through
+// `rpc.live`.
 on agent_status_set(_result)
-  agents_committed = agents_committed + 1
-  agents_generation = agents_generation + 1
   error = ""
-  run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _

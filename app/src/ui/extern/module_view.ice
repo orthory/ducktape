@@ -23,7 +23,10 @@ extern crate::module_view
   // reads the roster off the node and signs its writes through `op.submit`;
   // the one event back is the clipboard intent
   component members_view(dark:bool, connected:bool, admin:bool) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
+  // Agents speaks it as well: session facts go in — the run another tab
+  // opened for the reader among them, which the kernel has no other door
+  // for — and the view reads and writes the node itself.
+  component agents_view(dark:bool, connected:bool, account:&str, open_run:&str, opened:i64) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool

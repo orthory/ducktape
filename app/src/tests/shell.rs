@@ -322,7 +322,7 @@ fn peer_readers_use_the_names_the_node_serves() {
 /// an already-running replace lane.
 ///
 /// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
-/// writer, so its governance/agents runs must NOT carry a second
+/// writer, so its governance run must NOT carry a second
 /// `shell_tab ==` gate. Gating both leaves the approvals badge dark until you
 /// open Approvals — which is the one thing the badge exists to spare you.
 #[test]
@@ -336,13 +336,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "members_load_selected",
             "members",
             "members_generation",
-        ),
-        (
-            "load_agents",
-            "agents_load",
-            "agents_load_selected",
-            "agents",
-            "agents_generation",
         ),
         (
             "load_account",
@@ -397,23 +390,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         );
     }
 
-    // THE AGENTS PROJECTION IS THE ONE PLANE TWO MODULES WRITE, so its live
-    // arm is the one that does not ride `plane_live_hit`: `agent` commits the
-    // registration and `runs` commits the liveness `AgentRow.live` is read
-    // from (`agents_with_a_run_in_flight`). BOTH lines take the predicate —
-    // a bump without the load refetches nothing, and a load without the bump
-    // answers on a generation `agents_loaded` rejects. Narrow either back to
-    // `"agent"` and the Forge seat's dot goes dark for the length of a run.
-    for line in [
-        "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
-        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n          try request -> done request\n          done -> agents_load_selected _",
-    ] {
-        assert!(
-            lifecycle.contains(line),
-            "the agents live arm must ride the two-module predicate: {line}"
-        );
-    }
-
     // THE SETTINGS FACTS ARE THE INLINE HALF OF THE SAME GATE. No module
     // commits a key file or the local prefs, so they get no
     // `tab_reads_plane` row and no live arm — just the tab that draws them.
@@ -437,7 +413,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("members_load_selected", "members_generation"),
         ("settings_load_selected", "settings_generation"),
         ("peers_load_selected", "node_peers_generation"),
-        ("agents_load_selected", "agents_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
         ("forge_load_selected", "forge_generation"),
@@ -509,61 +484,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     assert_ne!(
         app.settings_generation, in_flight,
         "entering Settings must issue a fresh read"
-    );
-}
-
-/// THE AGENTS BUMP IS THE SAME HALF, AND `run replace` DOES NOT COVER IT.
-/// Replacing a lane aborts work still running there, but it cannot retract a
-/// completion the runtime has already queued — that reply is delivered
-/// anyway, and an unconditional bump on the way out is precisely what makes
-/// `agents_loaded` throw it away. The Forge seat's live dot reads those rows
-/// on EVERY tab, so opening the destination pane does not re-earn them: the
-/// next `agent` or `runs` op does, and for a run that just started that op is
-/// the one that ends it.
-#[test]
-fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-
-    // the run's own commit is what asks for the rows; its generation is the
-    // one the reply below carries.
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: LiveKind::Plane,
-        status: "Live".into(),
-        height: 12,
-        module: "runs".into(),
-        ..backend::LiveUpdate::default()
-    }));
-    let in_flight = app.agents_generation;
-
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
-    let _ = app.__update(__DucktapeMessage::AgentsLoaded(backend::AgentsData {
-        generation: in_flight,
-        agents: vec![backend::AgentRow {
-            id: "agent-1".into(),
-            name: "ChiefDuck".into(),
-            initials: "CH".into(),
-            capability: "mock-llm-1".into(),
-            status: "active".into(),
-            owner_handle: String::new(),
-            controller: String::new(),
-            live: true,
-            skills: Vec::new(),
-        }],
-        runs: Vec::new(),
-        capabilities: Vec::new(),
-    }));
-    assert!(
-        backend::any_agent_active(&app.agents_rows),
-        "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
-    );
-
-    // and the tab that DOES draw the rows still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Agents));
-    assert_ne!(
-        app.agents_generation, in_flight,
-        "entering Agents must issue a fresh read"
     );
 }
 
