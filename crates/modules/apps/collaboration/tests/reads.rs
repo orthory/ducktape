@@ -93,7 +93,7 @@ fn a_program_account_reads_as_the_participant_it_is() {
             mut module, chat, ..
         } = scene("c1");
         let agent = Party::Account(42);
-        chat.borrow_mut().channel("c1", &[agent.clone()]);
+        chat.borrow_mut().channel("c1", std::slice::from_ref(&agent));
         let ctx = as_program(&chat, 1, 42);
         assert!(matches!(
             read(&module, &ctx, &agent, None, events("c1")).await,
@@ -107,7 +107,7 @@ fn a_program_account_reads_as_the_participant_it_is() {
         );
         // a program principal bound to a KEY participant reads that channel.
         let holder = party(1);
-        chat.borrow_mut().channel("c1", &[holder.clone()]);
+        chat.borrow_mut().channel("c1", std::slice::from_ref(&holder));
         let mut ctx = at(&chat, 1, Origin::External(key(1)));
         ok(
             &mut module,

@@ -57,6 +57,9 @@ const NETWORK: &str = "parity-net";
 /// event that requested it.
 const M1_SEQ: u64 = 1;
 const M2_SEQ: u64 = 2;
+/// posted but never requested: the refusals that must not hit the
+/// idempotent-repeat check name this one.
+const M3_SEQ: u64 = 3;
 
 /// a fixed-reply sibling: enough of `identity` and `tasks` for the module's
 /// two cross-module reads to resolve, identically on both runtimes.
@@ -101,8 +104,8 @@ fn party(byte: u8) -> Party {
     Party::Key(vec![byte; 32])
 }
 
-/// a chat sibling holding ONE open channel, `c1`, and two messages in it —
-/// `m1` at sequence 1 and `m2` at sequence 2, both posted by alice's service
+/// a chat sibling holding ONE open channel, `c1`, and three messages in it —
+/// `m1`, `m2` and `m3` at sequences 1, 2 and 3, all posted by alice's service
 /// key. Every party may read `c1` and nothing else exists. Its writes (the
 /// seating follow-ups a bind emits) are accepted and discarded, identically
 /// on both runtimes.
@@ -132,6 +135,7 @@ impl Module for ChatStub {
                 let seq = match message_id.as_str() {
                     "m1" => Some(M1_SEQ),
                     "m2" => Some(M2_SEQ),
+                    "m3" => Some(M3_SEQ),
                     _ => None,
                 };
                 chat::ChatReply::Message(seq.map(|seq| chat::MessageView {
@@ -407,7 +411,7 @@ fn refused() -> Vec<(u8, Msg, &'static str)> {
         ),
         (
             SERVICE,
-            deliver("m2", MessageKind::Notice, 400 + TTL),
+            deliver("m3", MessageKind::Notice, 400 + TTL),
             "more than",
         ),
         (
@@ -417,7 +421,7 @@ fn refused() -> Vec<(u8, Msg, &'static str)> {
         ),
         (
             9,
-            deliver("m2", MessageKind::Notice, 400),
+            deliver("m3", MessageKind::Notice, 400),
             "not posted by this origin",
         ),
     ]

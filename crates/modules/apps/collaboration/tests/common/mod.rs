@@ -139,7 +139,7 @@ impl FakeChat {
     fn answer(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let reply = match chat::decode_query(req).map_err(Error::Module)? {
             chat::ChatQuery::Access { channel_id, party } => {
-                let standing = self.channels.get(&channel_id).map_or(false, |channel| {
+                let standing = self.channels.get(&channel_id).is_some_and(|channel| {
                     channel.members.contains(&party) || !party.is_person()
                 });
                 chat::ChatReply::Access(chat::ChannelAccess {
