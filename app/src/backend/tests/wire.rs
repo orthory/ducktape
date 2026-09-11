@@ -923,27 +923,6 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
     );
 }
 
-/// Model configuration and run activity share the runs plane. Generic program
-/// changes are not model-registry changes.
-#[test]
-fn the_agents_plane_hit_tracks_models_and_current_identity_control() {
-    for (kind, module, want) in [
-        (crate::LiveKind::Plane, "agent", false),
-        (crate::LiveKind::Plane, "runs", true),
-        (crate::LiveKind::Plane, "identity", true),
-        (crate::LiveKind::Plane, "valset", false),
-        (crate::LiveKind::Chat, "agent", false),
-        (crate::LiveKind::Chat, "runs", false),
-        (crate::LiveKind::Resync, "runs", false),
-    ] {
-        assert_eq!(
-            agents_plane_hit(kind, module.into()),
-            want,
-            "{kind:?} / {module}"
-        );
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
     let gate = Arc::new(tokio::sync::Semaphore::new(1));

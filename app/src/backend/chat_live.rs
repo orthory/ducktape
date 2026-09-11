@@ -99,32 +99,6 @@ impl From<&LiveAgentRow> for LiveRunHint {
     }
 }
 
-/// The progress of the run the reader has open in the run panel: the same
-/// reading the chat hint is cut from, drawn in full where there is room for
-/// it. `present` is false when that run is not in flight on this node —
-/// settled, or never dispatched here.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct LiveRun {
-    pub present: bool,
-    pub status: String,
-    pub activity: Vec<LiveActivity>,
-    pub answer_preview: String,
-}
-
-/// The open run's progress out of the node's live reading; an absent run
-/// reads as not present.
-pub fn live_run_for(rows: &[LiveAgentRow], dispatch_id: &str) -> LiveRun {
-    let Some(row) = rows.iter().find(|row| row.dispatch_id == dispatch_id) else {
-        return LiveRun::default();
-    };
-    LiveRun {
-        present: true,
-        status: row.status.clone(),
-        activity: row.activity.clone(),
-        answer_preview: row.answer_preview.clone(),
-    }
-}
-
 /// One reading of the node's pending runs, stamped with the connection it was
 /// taken over: the endpoint, the chain that endpoint was serving, and the
 /// connect attempt.

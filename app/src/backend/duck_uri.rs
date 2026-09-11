@@ -178,12 +178,6 @@ pub fn duck_page_link(page: String, chain_id: String) -> String {
     format!("duck://page/{page}{}", net_query(&chain_id))
 }
 
-/// `duck://page/<id>?net=…#<block>` — one block of a page: the page opens
-/// and the block is the landing. The query precedes the fragment.
-pub fn duck_page_block_link(page: String, block: String, chain_id: String) -> String {
-    format!("duck://page/{page}{}#{block}", net_query(&chain_id))
-}
-
 /// `duck://run/<dispatch_id>?net=…` — one agent run, by the dispatch id that
 /// addresses it everywhere outside the runs module.
 pub fn duck_run_link(dispatch_id: String, chain_id: String) -> String {

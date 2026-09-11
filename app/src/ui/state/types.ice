@@ -257,12 +257,11 @@ enum RosterIntent
   agent_status
   propose
 
-// what the Agents view asks of the app: an agent's paused state, a record
-// rewritten from the editor's draft, a new agent registered from one, or the
-// journal of a run the reader opened
+// what the Agents view asks of the app: how many of its agents are working
+// (the rail's pulse), a new agent registered from the editor's draft, or a
+// place to open — the reads and the other writes are the view's own
 enum AgentsIntent
-  status
-  save
+  badge
   register
   open_run
   open_link

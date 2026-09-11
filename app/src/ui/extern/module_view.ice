@@ -20,7 +20,10 @@ extern crate::module_view
   // hit on the `block` plane every view reading the feed subscribes to
   sync view_block_hit(height:i64, serial:i64) -> i64
   component members_view(dark:bool, connected:bool, admin:bool, answered:bool, rows:&[MemberRow]) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
+  // Agents speaks the KERNEL CONTRACT too: session facts go in — the run
+  // another tab opened for the reader among them, which the kernel has no
+  // other door for — and the view reads and writes the node itself.
+  component agents_view(dark:bool, connected:bool, account:&str, open_run:&str, opened:i64) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure roster_intent(event:&ModuleViewEvent) -> RosterIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
