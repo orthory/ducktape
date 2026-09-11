@@ -4557,7 +4557,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
- "windows 0.54.0",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -10980,7 +10980,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "ui-lang-build",
 ]
@@ -10988,7 +10988,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-build"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "atomicwrites",
  "fs2",
@@ -11001,7 +11001,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-components"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "alacritty_terminal",
  "iced",
@@ -11012,7 +11012,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "qrcode 0.14.1",
  "serde",
@@ -11023,7 +11023,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -11055,7 +11055,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-template"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "serde",
  "serde_json",
@@ -11064,7 +11064,7 @@ dependencies = [
 [[package]]
 name = "ui-lang-wire"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=ef27ff4c97c8b50bc10db730e9cfb6b4055a2939#ef27ff4c97c8b50bc10db730e9cfb6b4055a2939"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a690672adeb349594ce199f2cbbd33eaaa14ea23#a690672adeb349594ce199f2cbbd33eaaa14ea23"
 dependencies = [
  "bincode",
  "iced_core",
