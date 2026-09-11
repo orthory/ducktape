@@ -30,12 +30,12 @@ extern crate::module_view
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool
-  component node_view(dark:bool, connected:bool, admin:bool, tier:&str, status:&str, loading:bool, module_rows:&[ModuleRow], node_key:&str, node_data_dir:&str, node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:&str, node_quorum_label:&str, node_version:&str, node_root_hash:&str, sync_line:&str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:&str, node_peers:&[PeerRow], wall_now:i64, timeline:&NodeLogTimelineState, source:&str) -> ModuleViewEvent
-  pure node_intent(event:&ModuleViewEvent) -> NodeIntent
-  pure node_event_tab(event:&ModuleViewEvent) -> NodeTab
-  // what the reader did in the native log ring since the last drain,
-  // applied to the timeline the app holds
-  pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
+  // Node speaks the KERNEL CONTRACT too: only what no `/v1` route publishes
+  // goes in — this seat's standing, the app's connection reading, the
+  // daemon's workspace directory and the clock — and the view reads the
+  // node's own status, peers, registry and log ring for itself. The one
+  // intent back is the clipboard.
+  component node_view(dark:bool, connected:bool, admin:bool, tier:&str, status:&str, data_dir:&str, wall_now:i64) -> ModuleViewEvent
   // The Explorer speaks the KERNEL CONTRACT: session facts go in (the two
   // node facts are the titlebar's own, so the screen cannot disagree with
   // it), the view reads the block window and runs its search through the

@@ -1,8 +1,17 @@
-//! This node's operator screen as a module-owned view: status, standing,
-//! peers, the log ring and the code registry, drawn from the facts the
-//! desktop app pushes. Tab changes, the log filter, the modules load and a
-//! clipboard copy leave as intents; the live log timeline itself is a host
-//! surface the app renders in the Activity tab's slot.
+//! This node's operator screen as a view on the kernel contract: status,
+//! standing, peers, the log ring and the code registry, rendered from a
+//! wasm component the desktop app loads from a file.
+//!
+//! The kernel pushes session facts only (`node.props`: connected, dark, this
+//! seat's admin standing and tier, the app's connection reading, the
+//! daemon's workspace directory and the wall clock). The node's own facts,
+//! its peers and its code registry are read here through the kernel's
+//! `rpc.status` / `rpc.peers` / `rpc.query`, re-read on every `rpc.live` hit
+//! for the `block` plane, and the log ring arrives through `rpc.stream` on
+//! the node's own `logs` topic — the timeline is this view's state, not the
+//! app's. Retuning the running node's tracing filter leaves as one
+//! `rpc.admin` POST the kernel signs with the seated key; the clipboard is
+//! the one intent left, because it is an OS door.
 
 pub mod host;
 
