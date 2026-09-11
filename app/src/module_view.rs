@@ -6625,6 +6625,7 @@ pub(crate) mod tests {
                 guest.deliver(output);
             }
             settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
             assert!(
                 guest.intents.iter().any(|event| event.kind == "post"),
                 "the card must receive its own click"
@@ -6660,6 +6661,7 @@ pub(crate) mod tests {
                 guest.deliver(output);
             }
             settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
             let mut outputs = Vec::new();
             ui.update(
                 &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
@@ -6678,10 +6680,24 @@ pub(crate) mod tests {
                 &mut iced::advanced::clipboard::Null,
                 &mut outputs,
             );
-            for output in outputs {
-                guest.deliver(output);
+            // Native redraws drain editor input queued behind the pointer transaction.
+            loop {
+                for output in outputs.drain(..) {
+                    guest.deliver(output);
+                }
+                settle_documents(&mut guest, &props);
+                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+                if !guest.inputs.editor_transactions_pending() {
+                    break;
+                }
+                ui.update(
+                    &[Event::Window(window::Event::RedrawRequested(Instant::now()))],
+                    mouse::Cursor::Available(outside),
+                    &mut renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut outputs,
+                );
             }
-            settle_documents(&mut guest, &props);
             assert!(
                 guest
                     .inputs
