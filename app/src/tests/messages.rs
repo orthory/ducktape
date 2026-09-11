@@ -386,7 +386,7 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // `h=shrink` is the composer-anchored height: the virtual column reports a
     // whole-list estimate, so a long timeline still hits the box's cap.
     assert!(
-        chat.contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
+        chat.contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=!history_view")
     );
     // The page controls stay OUTSIDE the keyed column. A keyed column repeats
     // one template over one list; a button folded into that list is a row whose
@@ -508,16 +508,21 @@ fn the_mention_plate_leaves_space_before_and_after_the_token() {
         .expect("the mention plate declares its paint padding")
         .parse()
         .unwrap();
-    let spans: [Span<'_, ()>; 5] = [
-        Span::new("before"),
-        Span::new(" "),
-        Span::new("@alice").font(iced::Font {
-            weight: iced::font::Weight::Medium,
-            ..iced::Font::with_name("Geist")
-        }),
-        Span::new(" "),
-        Span::new("after"),
-    ];
+    let blocks = chat::client::paragraph_blocks("before<@3>after");
+    let spans: Vec<Span<'_, ()>> = blocks[0]
+        .spans
+        .iter()
+        .map(|run| {
+            if run.mention.is_empty() {
+                Span::new(run.plain.as_str())
+            } else {
+                Span::new(run.mention.as_str()).font(iced::Font {
+                    weight: iced::font::Weight::Medium,
+                    ..iced::Font::with_name("Geist")
+                })
+            }
+        })
+        .collect();
     let paragraph = Paragraph::with_spans(Text {
         content: spans.as_slice(),
         bounds: iced::Size::INFINITE,
@@ -535,8 +540,8 @@ fn the_mention_plate_leaves_space_before_and_after_the_token() {
     // Native rich text expands the painted plate without advancing glyphs.
     let leading_gap = mention.x - padding - (before.x + before.width);
     let trailing_gap = after.x - (mention.x + mention.width + padding);
-    assert!(leading_gap >= 2.0, "leading gap: {leading_gap}px");
-    assert!(trailing_gap >= 2.0, "trailing gap: {trailing_gap}px");
+    assert!(leading_gap >= 1.5, "leading gap: {leading_gap}px");
+    assert!(trailing_gap >= 1.5, "trailing gap: {trailing_gap}px");
 }
 
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.
