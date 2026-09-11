@@ -1034,3 +1034,11 @@ pub fn copy_range_label(count: i64) -> String {
         count => format!("{count} messages selected"),
     }
 }
+
+/// A forward page cursor is the last loaded reply, only when more exist.
+pub fn thread_page_cursor(messages: &[ChatMessage], has_more: bool) -> i64 {
+    match has_more {
+        true => messages.last().map_or(0, |message| message.seq),
+        false => 0,
+    }
+}

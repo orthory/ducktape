@@ -12,10 +12,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use collaboration::{
-    decode_reply, encode_msg, encode_query, Collaboration, CollaborationMsg, CollaborationQuery,
-    CollaborationReply, DenyReason, MessageId, MessageKind, ProtectedRead, Role, SendRequest,
+    Collaboration, CollaborationMsg, CollaborationQuery, CollaborationReply, DenyReason, Party,
+    ProtectedRead, decode_reply, encode_msg, encode_query,
 };
-use commonware_runtime::{deterministic, Runner as _};
+use commonware_runtime::{Runner as _, deterministic};
 use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
@@ -32,6 +32,10 @@ fn as_user(byte: u8, height: u64) -> BlockContext {
     }
 }
 
+fn party(byte: u8) -> Party {
+    Party::Key(vec![byte; 32])
+}
+
 fn msg(payload: CollaborationMsg) -> Msg {
     Msg {
         target: MODULE.into(),
@@ -40,7 +44,7 @@ fn msg(payload: CollaborationMsg) -> Msg {
 }
 
 /// a fixed-reply sibling: enough of `identity` and `tasks` for the module's
-/// two cross-module reads to resolve under the real host's query routing.
+/// cross-module reads to resolve under the real host's query routing.
 struct Stub {
     id: ModuleId,
     reply: Vec<u8>,
@@ -78,6 +82,63 @@ fn tasks_stub() -> Stub {
     }
 }
 
+/// a chat sibling holding ONE channel, `c1`, whose members are keys 1 and 2,
+/// and ONE message, `m1`, posted by key 1 at sequence 1. its writes (the
+/// seating follow-ups a bind emits) are accepted and discarded.
+struct ChatStub;
+
+#[async_trait::async_trait(?Send)]
+impl Module for ChatStub {
+    fn id(&self) -> ModuleId {
+        "chat".into()
+    }
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let reply = match chat::decode_query(req).map_err(Error::Module)? {
+            chat::ChatQuery::Access { channel_id, party } => {
+                let member = channel_id == "c1" && (party == party_of(1) || party == party_of(2));
+                chat::ChatReply::Access(chat::ChannelAccess {
+                    may_read: member,
+                    may_post: member,
+                })
+            }
+            chat::ChatQuery::Message { message_id } => chat::ChatReply::Message(
+                (message_id == "m1").then(|| chat::MessageView {
+                    channel_id: "c1".into(),
+                    seq: 1,
+                    head: chat::MessageHead {
+                        message_id: "m1".into(),
+                        author: party_of(1),
+                        origin: Origin::External(vec![1; 32]),
+                        content_origin: Origin::External(vec![1; 32]),
+                        blocks: vec![chat::Block::paragraph("please review")],
+                        created_at: 1,
+                        rev: 0,
+                        revision: 1,
+                        edited_at: None,
+                        base_rev: None,
+                        deleted: false,
+                        thread: None,
+                        reply_count: 0,
+                        last_reply_seq: None,
+                    },
+                }),
+            ),
+            other => return Err(Error::Module(format!("unserved {other:?}"))),
+        };
+        Ok(chat::encode_reply(&reply))
+    }
+}
+
+fn party_of(byte: u8) -> Party {
+    party(byte)
+}
+
 /// a module that, when dispatched, issues ONE collaboration read and records
 /// the reply. Its dispatch carries the submitting origin, so this is the
 /// authenticated read lane exercised through the real host.
@@ -111,89 +172,56 @@ async fn genesis(context: commonware_runtime::deterministic::Context, prober: Pr
             MODULE,
             "identity",
             "tasks",
+            "chat",
             Box::new(store),
             TTL,
             NETWORK,
         )),
         Box::new(identity_stub()),
         Box::new(tasks_stub()),
+        Box::new(ChatStub),
         Box::new(prober),
     ])
     .expect("genesis composes")
 }
 
-/// alice registers herself and a conversation, seats herself and bob, and
-/// sends bob one notice. Returns the host.
-async fn conversation_with_one_message(host: &mut Host) {
-    host.submit_at(
-        as_user(1, 1),
-        msg(CollaborationMsg::RegisterParticipant {
-            participant_id: "alice".into(),
-            display_name: "alice".into(),
-            agent_account: None,
-        }),
-    )
-    .await
-    .expect("alice registers");
+/// bob binds a service key on `c1`, and alice asks that her chat message `m1`
+/// be delivered to him.
+async fn one_delivery(host: &mut Host) {
     host.submit_at(
         as_user(2, 1),
-        msg(CollaborationMsg::RegisterParticipant {
-            participant_id: "bob".into(),
-            display_name: "bob".into(),
-            agent_account: None,
+        msg(CollaborationMsg::Bind {
+            channel_id: "c1".into(),
+            participant: party(2),
+            device: "laptop".into(),
+            principal: collaboration::BoundPrincipal::ServiceKey(vec![0x5f; 32]),
+            expected_credential: 0,
         }),
     )
     .await
-    .expect("bob registers");
-    host.submit_at(
-        as_user(1, 2),
-        msg(CollaborationMsg::CreateConversation {
-            conversation_id: "c1".into(),
-            topic: "review".into(),
-        }),
-    )
-    .await
-    .expect("the conversation is created");
-    for who in ["alice", "bob"] {
-        host.submit_at(
-            as_user(1, 3),
-            msg(CollaborationMsg::SetRoster {
-                conversation_id: "c1".into(),
-                participant_id: who.into(),
-                role: Some(Role::Member),
-            }),
-        )
-        .await
-        .expect("the roster is set");
-    }
+    .expect("bob binds");
     host.submit_at(
         as_user(1, 4),
-        msg(CollaborationMsg::Send(SendRequest {
-            conversation_id: "c1".into(),
-            sender_participant_id: "alice".into(),
-            message_id: MessageId {
-                generation: 1,
-                sequence: 1,
-            },
-            recipient_participant_id: "bob".into(),
-            kind: MessageKind::Notice,
-            reply_to: None,
+        msg(CollaborationMsg::Deliver(collaboration::DeliverRequest {
+            channel_id: "c1".into(),
+            message_id: "m1".into(),
+            recipient: party(2),
+            kind: collaboration::MessageKind::Notice,
             task: None,
-            body: "please review".into(),
-            expires_at: 500,
             references: Vec::new(),
+            expires_at: 500,
         })),
     )
     .await
-    .expect("the message is admitted");
+    .expect("the delivery is requested");
 }
 
 fn events_read() -> Vec<u8> {
     encode_query(&CollaborationQuery::Read {
-        participant_id: "alice".into(),
+        participant: party(1),
         via: None,
         read: ProtectedRead::Events {
-            conversation_id: "c1".into(),
+            channel_id: "c1".into(),
             from_seq: 1,
             limit: 16,
         },
@@ -213,7 +241,7 @@ fn the_hosts_public_query_lane_reads_nothing_and_a_dispatch_read_is_served() {
         let root0 = host.module_root(MODULE).unwrap();
         let app0 = host.root_hash();
 
-        conversation_with_one_message(&mut host).await;
+        one_delivery(&mut host).await;
         assert_ne!(host.module_root(MODULE).unwrap(), root0);
         assert_ne!(host.root_hash(), app0);
 
@@ -223,7 +251,7 @@ fn the_hosts_public_query_lane_reads_nothing_and_a_dispatch_read_is_served() {
         assert_eq!(
             decode_reply(&bytes).unwrap(),
             CollaborationReply::Denied(DenyReason::Unauthenticated),
-            "the node's unauthenticated read lane must not serve conversation content"
+            "the node's unauthenticated read lane must not serve delivery records"
         );
 
         // the AUTHENTICATED lane: the same request from inside a dispatch that
@@ -242,12 +270,10 @@ fn the_hosts_public_query_lane_reads_nothing_and_a_dispatch_read_is_served() {
             let [CollaborationReply::Events(page)] = served.as_slice() else {
                 panic!("the authenticated read is served: {served:?}");
             };
-            let collaboration::EventPage::Page { messages, .. } = page else {
-                panic!("a page, not a gap");
-            };
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].body, "please review");
-            assert_eq!(messages[0].sender, "alice");
+            assert_eq!(page.deliveries.len(), 1);
+            assert_eq!(page.deliveries[0].message_id, "m1");
+            assert_eq!(page.deliveries[0].sender, party(1));
+            assert_eq!(page.deliveries[0].recipient, party(2));
         }
 
         // and bob's key gets nothing when it asks to read as alice, through
@@ -264,7 +290,7 @@ fn the_hosts_public_query_lane_reads_nothing_and_a_dispatch_read_is_served() {
         assert_eq!(
             seen.borrow()[1],
             CollaborationReply::Denied(DenyReason::NotReader),
-            "the dispatch origin decides, not the participant_id in the payload"
+            "the dispatch origin decides, not the participant in the payload"
         );
     });
 }
@@ -278,34 +304,28 @@ fn a_refused_op_rolls_the_block_back_and_leaves_the_root_untouched() {
             seen: Rc::new(RefCell::new(Vec::new())),
         };
         let mut host = genesis(context, prober).await;
-        conversation_with_one_message(&mut host).await;
+        one_delivery(&mut host).await;
         let settled = host.module_root(MODULE).unwrap();
         let app = host.root_hash();
 
-        // bob's key naming alice as the sender: refused at admission.
+        // bob asking to deliver alice's message: not his words, refused.
         let refusal = host
             .submit_at(
                 as_user(2, 7),
-                msg(CollaborationMsg::Send(SendRequest {
-                    conversation_id: "c1".into(),
-                    sender_participant_id: "alice".into(),
-                    message_id: MessageId {
-                        generation: 1,
-                        sequence: 2,
-                    },
-                    recipient_participant_id: "bob".into(),
-                    kind: MessageKind::Notice,
-                    reply_to: None,
+                msg(CollaborationMsg::Deliver(collaboration::DeliverRequest {
+                    channel_id: "c1".into(),
+                    message_id: "m1".into(),
+                    recipient: party(1),
+                    kind: collaboration::MessageKind::Notice,
                     task: None,
-                    body: "not from alice".into(),
-                    expires_at: 500,
                     references: Vec::new(),
+                    expires_at: 500,
                 })),
             )
             .await
             .unwrap_err();
         assert!(
-            format!("{refusal:?}").contains("not authorized to send as"),
+            format!("{refusal:?}").contains("not posted by this origin"),
             "{refusal:?}"
         );
         assert_eq!(

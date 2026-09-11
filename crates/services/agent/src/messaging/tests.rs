@@ -177,10 +177,7 @@ fn deliver(seq: u64, binding_generation: u64) -> Box<wire::Deliver> {
         participant: "p-recipient".to_string(),
         seq,
         binding_generation,
-        message_id: wire::MessageId {
-            generation: 2,
-            sequence: seq,
-        },
+        message_id: format!("m-{seq}"),
         sender: "p-sender".to_string(),
         kind: wire::Kind::Question,
         task: None,
@@ -544,10 +541,7 @@ async fn recovery_reports_an_unknown_delivery_and_does_not_replay_it() {
                     participant: "p-recipient".to_string(),
                     binding_generation: 1,
                     sender: "p-sender".to_string(),
-                    message_id: wire::MessageId {
-                        generation: 2,
-                        sequence: 7,
-                    },
+                    message_id: "m-7".to_string(),
                     expires_at: 2_000,
                     digest: digest_of(&deliver(7, 1)),
                     state: State::Queued,
@@ -580,7 +574,7 @@ async fn recovery_reports_an_unknown_delivery_and_does_not_replay_it() {
     assert_eq!(reason.as_deref(), Some("crashed_after_provider_input"));
     // the sender's identity survives, so an explicit retry can reuse it.
     assert_eq!(sender, "p-sender");
-    assert_eq!(message_id.sequence, 7);
+    assert_eq!(message_id, "m-7");
     // nothing was bound, and nothing was offered: recovery reports.
     assert_eq!(plane.bound(), 0);
     let _ = std::fs::remove_dir_all(&dir);

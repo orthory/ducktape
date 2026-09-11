@@ -493,7 +493,7 @@ async fn load_thread_window(
     let target_seq = u64::try_from(target_seq).unwrap_or(0);
     let rpc = rpc_client(&rpc)?;
     if target_seq > 0 {
-        return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
+        return load_target_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
     }
     load_thread_data(&rpc, &channel_id, root_seq).await
 }

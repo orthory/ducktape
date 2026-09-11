@@ -221,6 +221,7 @@ pub(crate) mod tests {
             hold_status: Mutex::new(None),
             held: tokio::sync::Notify::new(),
             queries: Mutex::new(BTreeMap::new()),
+            files_lanes: Mutex::new(BTreeMap::new()),
         };
         fake_node(Arc::new(deployment)).await
     }
@@ -243,6 +244,10 @@ pub(crate) mod tests {
         /// answers the registry status, as every query did before views
         /// read the node.
         pub queries: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// What a `/v1/files/<lane>` read answers, by lane: the duckfs reads
+        /// a view makes for itself through the kernel's `files.get`. A lane
+        /// not here is not found.
+        pub files_lanes: Mutex<BTreeMap<String, serde_json::Value>>,
     }
 
     impl FakeDeployment {
@@ -255,12 +260,21 @@ pub(crate) mod tests {
                 hold_status: Mutex::new(None),
                 held: tokio::sync::Notify::new(),
                 queries: Mutex::new(BTreeMap::new()),
+                files_lanes: Mutex::new(BTreeMap::new()),
             })
         }
 
         /// Every `rpc.query` for `target` answers `reply` from now on.
         pub(crate) fn answer_query(&self, target: &str, reply: serde_json::Value) {
             self.queries.lock().unwrap().insert(target.to_owned(), reply);
+        }
+
+        /// Every `files.get` on `lane` answers `reply` from now on.
+        pub(crate) fn answer_files(&self, lane: &str, reply: serde_json::Value) {
+            self.files_lanes
+                .lock()
+                .unwrap()
+                .insert(lane.to_owned(), reply);
         }
 
         /// The registry now names `artifact` as `module`'s active code,
@@ -324,6 +338,15 @@ pub(crate) mod tests {
                         };
                         match served {
                             Some(artifact) => ("200 OK", artifact.encode()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    } else if let Some(lane) = route.strip_prefix("/v1/files/") {
+                        // a view's own duckfs read: the lane names it, the
+                        // query string carries its params
+                        let lane = lane.split('?').next().unwrap_or_default();
+                        let answered = deployment.files_lanes.lock().unwrap().get(lane).cloned();
+                        match answered {
+                            Some(reply) => ("200 OK", reply.to_string().into_bytes()),
                             None => ("404 Not Found", Vec::new()),
                         }
                     } else {

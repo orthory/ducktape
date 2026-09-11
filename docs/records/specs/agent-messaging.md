@@ -1,9 +1,7 @@
 # Agent messaging across devices
 
-**Status: proposed protocol, not implemented behavior.** Operation names below
-are proposed catalog contracts, not commands that an operator can run today.
 This specification defines cooperation inside one Ducktape network. It does not
-change the live network, grant permissions, or authorize a deployment.
+grant permissions or authorize a deployment.
 
 ## Purpose and boundaries
 
@@ -41,13 +39,17 @@ claim tasks, or serve as durable delivery evidence.
 
 Implementation ownership is:
 
-- The collaboration module owns participants, conversations, immutable messages,
-  recipient delivery records and their bounded retention. This is a proposed
-  module boundary, not a second implementation of runs or chat.
+- The chat module (`crates/modules/apps/chat`) owns the conversation: the
+  channel, its membership, and every message body. A participant is a chat
+  `Party`; a message is a chat message named by its `message_id`.
+- The collaboration module (`crates/modules/apps/collaboration`) owns what chat
+  cannot say: per-recipient delivery records, device bindings, mailbox
+  accounting and the per-channel event stream. It stores no body, topic or
+  roster.
 - Existing tasks/runs/dispatch/saga own managed work and its effects. Messaging
   references those records rather than introducing a competing task scheduler.
-- Chat/app render collaboration events and links. Rendered prose is not parsed
-  back into authority or task transitions.
+- The app renders chat and collaboration events and links. Rendered prose is
+  not parsed back into authority or task transitions.
 - Agent-service owns provider adapters and local session connections. Local
   socket paths and provider credentials never become network addresses.
 
@@ -55,22 +57,21 @@ Implementation ownership is:
 
 | Object | Meaning | Lifetime |
 | --- | --- | --- |
-| Participant | An owner-authorized collaboration identity, optionally bound to an existing agent account | Independent of a process |
-| Conversation | An explicit participant roster and shared topic | Independent of individual runs |
+| Participant | A chat party: an identity account or a bare signing key. Spelled on every CLI and daemon surface as a handle, `acct:<number>` or `key:<hex>` | Independent of a process |
+| Channel | A chat channel: its membership is the roster and its post policy is who may speak | Independent of individual runs |
 | Task | A specific requested piece of work, referencing the existing job/run identity where managed | Request through terminal result |
-| Binding | A participant's connection to a local provider session on one device | One attachment generation |
+| Binding | A participant's connection to a local provider session on one device, on one channel | One attachment credential |
 | Attempt | The execution generation assigned to a task | One execution attempt |
 
 All identifiers are scoped by the authenticated network identity, never by an
-RPC URL or display name. Names are discovery labels; mutation requests use
-resolved immutable IDs. Ambiguous names return candidate IDs and do not pick the
-first match.
+RPC URL or display name. Every collaboration op carries the chain id inside its
+signed payload and is refused on any other network.
 
-A participant has one active input binding per conversation. Registering another
-binding requires an explicit replacement with the expected binding generation.
-Two devices cannot both claim that binding. Observers may subscribe without
-becoming input owners. A participant may join several conversations, but each
-attachment explicitly declares which conversations it will receive.
+A participant has one active input binding per channel. Binding again requires
+the expected current credential, so two devices cannot both claim that binding.
+Binding a service key seats that key as a channel member, which is what lets
+it post and read there. A participant may sit on several channels, but each
+attachment explicitly declares which channel it will receive.
 
 A task-specific message names the task identity and expected attempt. If the task
 has been reassigned, the service reports a stale target instead of silently
@@ -83,48 +84,49 @@ key. Managed executions retain the existing run authority and lease checks.
 
 ## Messages and actions
 
-Proposed catalog operations are `collaboration.send`,
-`collaboration.messages`, and `collaboration.receipt`; binding operations belong
-to the service control interface. Existing `agent.call` continues to start
-managed delegated work. The MCP or CLI surface forwards typed requests to the
-same catalog authorization path; it is not an alternate permission system.
+A message is a chat message. Sending one is two ops: chat's `PostMessage`,
+which is the message, then collaboration's `Deliver`, which asks that ONE
+recipient's bound device carry it to a provider session. The run catalog
+exposes the second as `collaboration.deliver` and the receipt as
+`collaboration.acknowledge` (`crates/modules/apps/runs/src/catalog.rs`);
+binding belongs to the operator's `ducktape collab attach`. Existing
+`agent.call` continues to start managed delegated work. The MCP or CLI surface
+forwards typed requests to the same catalog authorization path; it is not an
+alternate permission system.
 
-A message contains:
+A delivery request (`DeliverRequest` in
+`crates/modules/apps/collaboration/src/interface.rs`) contains:
 
 ```text
-version
-message_id                   {sender credential generation, sender sequence}
-network_id, conversation_id
-sender_participant_id        checked against authenticated origin/binding
-recipient_participant_id
+channel_id                   the chat channel the message sits in
+message_id                   the chat message id; chat's uniqueness is the dedup
+recipient                    one chat party
 kind                         notice | question | task_request | task_update | result
-reply_to                     optional immutable message reference
 task                         optional {id, expected_attempt}
-body                         UTF-8 text
 references                   immutable commit/blob references or scoped duck:// links
 expires_at                   agreed network-time deadline for delivery
 ```
 
-`task_update` requires `task`; `result` requires `task` or `reply_to`. A question
-can be conversational without creating a task. A `task_request` is an offer:
+The sender is the authenticated origin, and the module admits the request only
+when chat says that origin posted the message. `task_update` requires `task`;
+`result` requires `task` or a message posted in a thread. A question can be
+conversational without creating a task. A `task_request` is an offer:
 recording or delivering it does not claim the task. A managed task's acceptance
 uses its existing claim/dispatch authority. A request to an attached personal
 session can receive a structured acceptance, but is marked externally executed
 and does not claim managed isolation or verifiable execution.
 
-The sender service serializes admission per credential generation with a monotonic
-sequence. The network retains a replay floor for that generation after pruning;
-retired credentials remain unable to admit messages. A sequence below the floor
-with no retained receipt returns `ReceiptPruned`, never a new admission. For one
-sender, reusing `message_id` with identical canonical request bytes returns the
-same receipt while retained. Different bytes under that ID are rejected. A relay
-MUST NOT generate a fresh ID when retrying. The authenticated envelope determines
-the sender; prose and client-supplied names cannot override it.
+Asking again for the same message and recipient with identical metadata
+answers the existing record; different metadata under that pair is refused. A
+relay MUST NOT mint a fresh chat message when retrying. The authenticated
+envelope determines the sender; prose and client-supplied names cannot
+override it.
 
-Messages are immutable. Corrections and withdrawals are new events referencing
-the original. Links to mutable content include the revision or content hash that
-the sender meant. Sending a link does not grant its recipient read access.
-Local filesystem paths are not portable artifact references.
+Chat messages are immutable in their attribution history; a delivery record
+names the message and never copies its body. Links to mutable content include
+the revision or content hash that the sender meant. Sending a link does not
+grant its recipient read access. Local filesystem paths are not portable
+artifact references.
 
 ## Delivery is distinct from work
 
@@ -165,13 +167,16 @@ idempotency key, current authority and task/attempt checks independently.
 
 ## Ordering, wake-up and reconnect
 
-Conversations have a committed event sequence. Services subscribe for change
-notifications and fetch records after their last acknowledged sequence; a
-WebSocket notification is a hint, not the authoritative event body. The adapter
-processes each binding's eligible messages in sequence. Permission checks happen
-again before disclosure/delivery, including after reconnect or revocation.
+Each channel has a committed collaboration event sequence: every delivery
+request, delivery advance and binding change. The node's pump reads it after
+its last cursor as the binding's own scoped key and hands the daemon what the
+network still permits; a delivery record is keyed by the chat sequence of the
+message it names. The adapter processes each binding's eligible messages in
+sequence. Permission checks happen again before disclosure/delivery, including
+after reconnect or a binding's replacement.
 
-A message records its causal parent through `reply_to` and its task reference.
+A message records its causal parent through its chat thread and its task
+reference.
 A result includes the input revision/event position it addresses. A task update
 arriving after that point does not retroactively change what the result proves.
 Ordering records an agreed history; it does not make concurrent agents read the
@@ -253,29 +258,28 @@ message payloads. Replies do not broaden the original audience implicitly.
 
 ## Bounds and retention
 
-Initial protocol limits are proposals to validate with the acceptance workload:
-16 KiB UTF-8 body, 16 references, 1 KiB per reference, and 32 KiB total encoded
-message. Oversized input is rejected before admission, never silently truncated.
-The initial send operation has one recipient; group delivery expands into
-explicit per-recipient messages and receipts under the same conversation.
+Body size is chat's bound. A delivery request carries at most 16 references of
+1 KiB each (`MAX_REFERENCES`, `MAX_REFERENCE_BYTES`). Oversized input is
+rejected before admission, never silently truncated. One request names one
+recipient; group delivery expands into explicit per-recipient requests and
+records under the same channel.
 
-Each participant mailbox has at most 256 undelivered messages and 2 MiB of queued
-encoded payload; both limits apply at admission, including while disconnected.
-Replacing a binding does not reset this accounting. Full queues return a retryable capacity error without
-claiming acceptance. Existing execution budgets bound managed model work; attached
-sessions declare a wake-up budget. Receipts and presence cannot consume that
-budget or cause acknowledgement loops. Per-sender admission quotas prevent one
-participant from filling another's queue indefinitely.
+Each participant mailbox has at most 256 undelivered messages and 2 MiB of
+queued encoded delivery records; both limits apply at admission, including
+while disconnected. Replacing a binding does not reset this accounting. Full
+queues are refused without claiming acceptance. Existing execution budgets
+bound managed model work; attached sessions declare a wake-up budget. Receipts
+and presence cannot consume that budget or cause acknowledgement loops. A
+per-sender quota of 64 undelivered messages in one recipient's mailbox prevents
+one participant from filling another's queue indefinitely.
 
-Delivery defaults to a 24-hour deadline and may request at most seven days.
-Use agreed network time for authoritative expiry, not a laptop's wall clock.
-Expiry prevents further delivery; it does not undo accepted work. Retention and
-pruning preserve deduplication records through the valid retry window; expired
-request bytes cannot be admitted as a new message after their body is pruned.
-Undelivered records remain until delivery, explicit refusal or expiry. Conversation
-history follows an explicit retention policy. A consumer behind the
-retained sequence floor receives an explicit history-gap response and resyncs;
-it never advances its cursor while silently losing actionable messages.
+A delivery may request a deadline at most seven days out
+(`MAX_DELIVERY_TTL_SECONDS`, scaled into the network's `time_unit`). Agreed
+network time decides expiry, never a laptop's wall clock. Expiry prevents
+further delivery; it does not undo accepted work. Delivery records are kept:
+a terminal record is the deduplication evidence for its request, and the
+daemon retires its own journal entry for a record only once the network clock
+has passed that record's deadline.
 
 Token deltas, typing and presence use bounded ephemeral streams. Task requests,
 answers, decisions and result references use durable records. Large artifacts
@@ -298,17 +302,17 @@ not proof of model participation.
    state without silently spawning a replacement.
 4. Hold/refuse provider input and observe the same state in the app. Exercise idle
    wake-up, a busy turn, turn-ID mismatch, and unsupported steering.
-5. Retry identical and conflicting message IDs. Crash before input, after input
-   but before receipt, and after receipt. Verify deduplication or explicit
+5. Retry identical and conflicting delivery requests. Crash before input, after
+   input but before receipt, and after receipt. Verify deduplication or explicit
    `DeliveryUnknown`; no fabricated read/complete status or duplicate deployment.
 6. Reassign a task while its previous device is disconnected. Reject that old
    attempt's late publication; preserve its evidence as an old attempt. Test
    cancellation racing with an already committed action.
-7. Revoke a participant or replace its binding while a message is queued. The old
-   credential and stale generation cannot receive new content or acknowledge the
-   new binding. Test cross-network IDs and ambiguous display names.
-8. Exceed body, queue and wake-up budgets; verify explicit errors. Test expired
-   retries after pruning and a replay cursor below the history floor.
+7. Detach a participant or replace its binding while a message is queued. The
+   old credential cannot receive new content or acknowledge under the new
+   binding. Test cross-network ops.
+8. Exceed reference, queue and wake-up budgets; verify explicit errors. Test a
+   delivery request past its deadline.
 9. Verify that only explicitly sent messages/results leave a personal session;
    unrelated conversation history, local paths and credentials are not copied.
 10. Observe the entire task from the Ducktape app without treating PTY output or

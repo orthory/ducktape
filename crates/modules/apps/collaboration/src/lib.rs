@@ -1,17 +1,20 @@
-//! the `collaboration` module — the NETWORK side of agent messaging.
+//! the `collaboration` module — the DELIVERY side of agent messaging.
 //!
 //! People and agents exchange explicit messages and results across devices
-//! without knowing each other's IP, local path or provider session id. This
-//! module owns the durable half of that: participants, conversations,
-//! bindings, immutable messages, per-recipient delivery receipts and their
-//! bounded retention.
+//! without knowing each other's IP, local path or provider session id. The
+//! conversation is a chat channel and every message is a chat message; this
+//! module owns the half chat cannot: bindings (which device carries a
+//! participant's mail), per-recipient delivery records and their bounded
+//! mailbox accounting.
 //!
 //! ## what it deliberately does NOT own
 //!
-//! * **Managed work.** A message may REFERENCE a `tasks` job and the attempt
+//! * **Content.** No body, topic or roster is stored here. A delivery names a
+//!   chat message by id, and the recipient must be able to read the channel
+//!   by chat's own rule (`ChatQuery::Access`).
+//! * **Managed work.** A delivery may REFERENCE a `tasks` job and the attempt
 //!   its sender meant; this module reads that record to fence a stale target
-//!   and never creates, claims or schedules one. There is no second scheduler
-//!   here.
+//!   and never creates, claims or schedules one.
 //! * **Provider adapters.** Local socket paths, provider session ids and
 //!   credentials never become network addresses. A [`Binding`] carries an
 //!   opaque device LABEL and a scoped public key, nothing else.
@@ -31,9 +34,8 @@
 //!
 //! Writes resolve their actor from `sdk::Env::origin`; reads resolve their
 //! caller from the query context's origin (see [`read`]). Nothing on the wire
-//! asserts an identity — `sender_participant_id` and the read's
-//! `participant_id` say which of the caller's OWN identities it is acting as,
-//! and the module verifies that claim against committed state.
+//! asserts an identity — a participant is a chat [`Party`], and the module
+//! verifies that the caller IS that party or holds its binding.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -45,12 +47,12 @@ pub use interface::*;
 #[cfg(feature = "guest")]
 mod guest;
 
-mod mailbox;
+mod bindings;
+mod delivery;
 mod read;
-mod registry;
 mod store;
 
-pub use mailbox::{MAX_PRUNE_SPAN, MAX_REASON_BYTES, QUEUE_FULL, RECEIPT_PRUNED};
+pub use delivery::{MAX_REASON_BYTES, QUEUE_FULL};
 pub use store::MAX_RECORD_BYTES;
 
 use sdk::{
@@ -58,7 +60,7 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 
-/// lowercase hex — the one rendering digests take on this wire.
+/// lowercase hex — the one rendering keys take on this wire.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use core::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -73,6 +75,7 @@ pub struct Collaboration {
     id: ModuleId,
     identity: ModuleId,
     tasks: ModuleId,
+    chat: ModuleId,
     /// the ceiling on a delivery deadline, IN THIS NETWORK'S `consensus_time`
     /// unit. a constructor parameter and not a constant, because
     /// `consensus_time` is a block height on the validator lanes and a
@@ -96,6 +99,7 @@ impl Collaboration {
         id: impl Into<ModuleId>,
         identity: impl Into<ModuleId>,
         tasks: impl Into<ModuleId>,
+        chat: impl Into<ModuleId>,
         store: Box<dyn MerkleStore>,
         max_delivery_ttl: u64,
         network: impl Into<String>,
@@ -104,6 +108,7 @@ impl Collaboration {
             id: id.into(),
             identity: identity.into(),
             tasks: tasks.into(),
+            chat: chat.into(),
             max_delivery_ttl,
             network: network.into(),
             staged: StagedStore::new(store),
@@ -128,10 +133,10 @@ impl Collaboration {
     }
 }
 
-/// The source actor is an account when identity knows it, otherwise the
+/// The actor is an account when identity knows it, otherwise the
 /// authenticated key or module remains a distinct non-account principal — the
-/// `tasks` convention verbatim, so one origin resolves to one actor string
-/// across every module that attributes work.
+/// `chat` convention verbatim, so one origin resolves to the same party here
+/// as it does when it posts.
 pub(crate) async fn actor_from_origin(ctx: &dyn Ctx, identity: &str) -> Result<Party, Error> {
     match &ctx.env().origin {
         Origin::Program(account) => {
@@ -183,16 +188,6 @@ pub(crate) async fn actor_from_origin(ctx: &dyn Ctx, identity: &str) -> Result<P
     }
 }
 
-/// Key-owned records remain controlled by that signer after account admission.
-/// Account-owned records are controlled by the resolved account, including its
-/// other keys. Admission never silently transfers a key-owned record.
-pub(crate) fn controls(owner: &Party, actor: &Party, origin: &Origin) -> bool {
-    match owner {
-        Party::Key(key) => matches!(origin, Origin::External(signer) if signer == key),
-        Party::Account(_) | Party::Module(_) | Party::System => owner == actor,
-    }
-}
-
 async fn identity_reply(
     ctx: &dyn Ctx,
     identity: &str,
@@ -200,6 +195,41 @@ async fn identity_reply(
 ) -> Result<identity::IdentityReply, Error> {
     let bytes = ctx.query(identity, &identity::encode_query(&query)).await?;
     identity::decode_reply(&bytes).map_err(Error::Module)
+}
+
+/// one party's standing in one channel, by chat's own gate. an unknown
+/// channel answers all-false, so every caller fails closed on it.
+pub(crate) async fn chat_access(
+    ctx: &dyn Ctx,
+    chat: &str,
+    channel_id: &str,
+    party: &Party,
+) -> Result<chat::ChannelAccess, Error> {
+    let query = chat::ChatQuery::Access {
+        channel_id: channel_id.to_string(),
+        party: party.clone(),
+    };
+    let bytes = ctx.query(chat, &chat::encode_query(&query)).await?;
+    let chat::ChatReply::Access(access) = chat::decode_reply(&bytes).map_err(Error::Module)? else {
+        return Err(Error::Module("chat returned an unexpected reply".into()));
+    };
+    Ok(access)
+}
+
+/// one chat message by its client-minted id, wherever it is.
+pub(crate) async fn chat_message(
+    ctx: &dyn Ctx,
+    chat: &str,
+    message_id: &str,
+) -> Result<Option<chat::MessageView>, Error> {
+    let query = chat::ChatQuery::Message {
+        message_id: message_id.to_string(),
+    };
+    let bytes = ctx.query(chat, &chat::encode_query(&query)).await?;
+    let chat::ChatReply::Message(view) = chat::decode_reply(&bytes).map_err(Error::Module)? else {
+        return Err(Error::Module("chat returned an unexpected reply".into()));
+    };
+    Ok(view)
 }
 
 impl Collaboration {
@@ -210,100 +240,49 @@ impl Collaboration {
         let origin = ctx.env().origin.clone();
         let now = ctx.env().consensus_time;
         match msg {
-            CollaborationMsg::RegisterParticipant {
-                participant_id,
-                display_name,
-                agent_account,
-            } => {
-                registry::register_participant(
-                    &mut self.staged,
-                    &actor,
-                    &origin,
-                    now,
-                    participant_id,
-                    display_name,
-                    agent_account,
-                )
-                .await?;
-                self.stamp_registry(ctx, actor);
-                Ok(())
-            }
-            CollaborationMsg::RevokeParticipant { participant_id } => {
-                registry::revoke_participant(&mut self.staged, now, participant_id).await?;
-                self.stamp_registry(ctx, actor);
-                Ok(())
-            }
-            CollaborationMsg::CreateConversation {
-                conversation_id,
-                topic,
-            } => {
-                registry::create_conversation(
-                    &mut self.staged,
-                    &actor,
-                    &origin,
-                    now,
-                    conversation_id,
-                    topic,
-                )
-                .await?;
-                self.stamp_registry(ctx, actor);
-                Ok(())
-            }
-            CollaborationMsg::SetRoster {
-                conversation_id,
-                participant_id,
-                role,
-            } => {
-                let advanced = registry::set_roster(
-                    &mut self.staged,
-                    now,
-                    conversation_id.clone(),
-                    participant_id,
-                    role,
-                )
-                .await?;
-                self.stamp_conversation(ctx, actor, conversation_id, advanced.seq);
-                Ok(())
-            }
             CollaborationMsg::Bind {
-                conversation_id,
-                participant_id,
+                channel_id,
+                participant,
                 device,
                 principal,
                 expected_credential,
             } => {
-                let advanced = registry::bind(
+                let advanced = bindings::bind(
                     &mut self.staged,
+                    ctx,
+                    &self.chat,
                     now,
-                    conversation_id.clone(),
-                    participant_id,
+                    channel_id.clone(),
+                    participant,
                     device,
                     principal,
                     expected_credential,
                 )
                 .await?;
-                self.stamp_conversation(ctx, actor, conversation_id, advanced.seq);
+                self.stamp(ctx, actor, channel_id, advanced.seq);
                 Ok(())
             }
             CollaborationMsg::Unbind {
-                conversation_id,
-                participant_id,
+                channel_id,
+                participant,
                 expected_credential,
             } => {
-                let advanced = registry::unbind(
+                let advanced = bindings::unbind(
                     &mut self.staged,
+                    ctx,
+                    &self.chat,
                     now,
-                    conversation_id.clone(),
-                    participant_id,
+                    channel_id.clone(),
+                    participant,
                     expected_credential,
                 )
                 .await?;
-                self.stamp_conversation(ctx, actor, conversation_id, advanced.seq);
+                self.stamp(ctx, actor, channel_id, advanced.seq);
                 Ok(())
             }
-            CollaborationMsg::Send(request) => {
-                let conversation_id = request.conversation_id.clone();
-                let admitted = mailbox::send(
+            CollaborationMsg::Deliver(request) => {
+                let channel_id = request.channel_id.clone();
+                let requested = delivery::deliver(
                     &mut self.staged,
                     ctx,
                     &actor,
@@ -311,88 +290,73 @@ impl Collaboration {
                     now,
                     self.max_delivery_ttl,
                     &self.tasks,
+                    &self.chat,
                     request,
                 )
                 .await?;
-                // an idempotent retry stages nothing and notifies nobody: the
-                // conversation did not advance, and re-announcing would make a
+                // an idempotent repeat stages nothing and notifies nobody: the
+                // channel did not advance, and re-announcing would make a
                 // relay's retry look like new mail.
-                if admitted.replayed {
-                    ctx.set_output(encode_reply(&CollaborationReply::SendState(
-                        SendState::Admitted {
-                            seq: admitted.seq,
-                            digest: admitted.digest,
-                        },
-                    )));
+                if requested.replayed {
+                    ctx.set_output(encode_reply(&CollaborationReply::Delivery(Some(
+                        requested.delivery,
+                    ))));
                     return Ok(());
                 }
-                self.stamp_conversation(ctx, actor, conversation_id, admitted.seq);
+                self.stamp(ctx, actor, channel_id, requested.seq);
                 Ok(())
             }
             CollaborationMsg::Acknowledge {
-                conversation_id,
+                channel_id,
                 seq,
+                recipient,
                 binding_credential,
                 state,
                 reason,
             } => {
-                let advanced = mailbox::acknowledge(
+                let advanced = delivery::acknowledge(
                     &mut self.staged,
                     ctx,
                     now,
                     &self.tasks,
-                    conversation_id.clone(),
+                    &self.chat,
+                    channel_id.clone(),
                     seq,
+                    recipient,
                     binding_credential,
                     state,
                     reason,
                 )
                 .await?;
-                self.stamp_conversation(ctx, actor, conversation_id, advanced.seq);
+                self.stamp(ctx, actor, channel_id, advanced.seq);
                 Ok(())
             }
             CollaborationMsg::ExpireMessage {
-                conversation_id,
+                channel_id,
                 seq,
+                recipient,
             } => {
                 let advanced =
-                    mailbox::expire(&mut self.staged, now, conversation_id.clone(), seq).await?;
-                self.stamp_conversation(ctx, actor, conversation_id, advanced.seq);
-                Ok(())
-            }
-            CollaborationMsg::Prune {
-                conversation_id,
-                through_seq,
-            } => {
-                mailbox::prune(&mut self.staged, now, conversation_id, through_seq).await?;
-                self.stamp_registry(ctx, actor);
+                    delivery::expire(&mut self.staged, now, channel_id.clone(), seq, recipient)
+                        .await?;
+                self.stamp(ctx, actor, channel_id, advanced.seq);
                 Ok(())
             }
         }
     }
 
-    fn stamp_registry(&self, ctx: &mut dyn Ctx, actor: Party) {
-        ctx.set_assigned(encode_assigned(&CollaborationAssigned::Registry { actor }));
-    }
-
-    /// the conversation moved: stamp what the module assigned, and emit the
-    /// cursor HINT. the authoritative body is the committed event stream a
-    /// consumer fetches after its last acknowledged sequence — this says only
-    /// "there is something past your cursor".
-    fn stamp_conversation(
-        &self,
-        ctx: &mut dyn Ctx,
-        actor: Party,
-        conversation_id: String,
-        seq: u64,
-    ) {
-        ctx.set_assigned(encode_assigned(&CollaborationAssigned::Conversation {
-            conversation_id: conversation_id.clone(),
+    /// the channel's event stream moved: stamp what the module assigned, and
+    /// emit the cursor HINT. the authoritative body is the committed event
+    /// stream a consumer fetches after its last acknowledged sequence — this
+    /// says only "there is something past your cursor".
+    fn stamp(&self, ctx: &mut dyn Ctx, actor: Party, channel_id: String, seq: u64) {
+        ctx.set_assigned(encode_assigned(&CollaborationAssigned::Advanced {
+            channel_id: channel_id.clone(),
             seq,
             actor,
         }));
-        ctx.set_output(encode_event(&CollaborationEvent::ConversationAdvanced {
-            conversation_id,
+        ctx.set_output(encode_event(&CollaborationEvent::ChannelAdvanced {
+            channel_id,
             seq,
         }));
     }
@@ -438,7 +402,7 @@ impl Module for Collaboration {
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         let CollaborationQuery::Read {
-            participant_id,
+            participant,
             via,
             read,
         } = decode_query(req).map_err(Error::Module)?;
@@ -446,7 +410,8 @@ impl Module for Collaboration {
             &self.staged,
             ctx,
             &self.identity,
-            &participant_id,
+            &self.chat,
+            &participant,
             via.as_deref(),
             read,
         )

@@ -335,13 +335,11 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // duplication wearing the costume of defence in depth.
 }
 
-/// The duckfs root is `/`, never "": the module's path check is `starts_with('/')`,
-/// so the crumb's "" root answered every root open with a 400.
+/// A dropped file's target is composed under the directory the view stands
+/// in, and the duckfs root is `/`, never "": the module's path check is
+/// `starts_with('/')`, so a "" root answered every root write with a 400.
 #[test]
-fn the_files_root_is_a_slash() {
-    assert_eq!(fs_parent("/shared".into()), "/");
-    assert_eq!(fs_parent("/".into()), "/");
-    assert_eq!(fs_parent("/shared/reports".into()), "/shared");
+fn a_dropped_file_lands_under_its_directory() {
     assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
     assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
 }

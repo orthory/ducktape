@@ -81,7 +81,7 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
 #[test]
 fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(chat.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    assert!(chat.contains("scroll #thread-stream dir=vertical w=fill h=fill anchor-y=end auto=(thread_target_seq <= 0)"));
     assert!(chat.contains(
         "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
     ));

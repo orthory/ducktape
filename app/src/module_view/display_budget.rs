@@ -91,22 +91,6 @@ pub(super) fn forge(mut props: Value) -> Vec<u8> {
     serde_json::to_vec(&props).expect("forge props encode")
 }
 
-/// The read remains the edit seed. Only its separate preview crosses as a
-/// rendered Surface argument, and display clipping never changes read status.
-pub(super) fn files(mut props: Value) -> Vec<u8> {
-    props["preview_display_text"] = props["preview_text"].clone();
-    let arrays = ["entries", "directories", "history", "diff"];
-    project(
-        &mut props,
-        &arrays,
-        &["preview_text"],
-        "preview_display_text",
-    );
-    props["preview_display_clipped"] =
-        (props["preview_display_text"] != props["preview_text"]).into();
-    serde_json::to_vec(&props).expect("files props encode")
-}
-
 fn project(props: &mut Value, arrays: &[&str], source_fields: &[&str], preview: &str) {
     let mut pending = Vec::with_capacity(arrays.len());
     for key in arrays {
@@ -179,22 +163,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn source_and_route_identity_survive_display_clipping() {
-        let source = "한글".repeat(12_000);
-        let input = json!({"preview_text": source, "preview_truncated": false,
-            "preview_path": "/shared/source", "entries": [{"key": 17, "path": "/shared/entry", "name": "entry"}],
-            "directories": [], "history": [], "diff": []});
-        let result: Value = serde_json::from_slice(&files(input)).unwrap();
-        assert_eq!(result["preview_text"], source);
-        assert_eq!(result["preview_truncated"], false);
-        assert_eq!(result["preview_path"], "/shared/source");
-        assert_eq!(result["entries"][0]["key"], 17);
-        assert_eq!(result["entries"][0]["path"], "/shared/entry");
-        assert_eq!(result["preview_display_clipped"], true);
-        assert!(result["preview_display_text"].as_str().unwrap().len() < source.len());
-    }
-
-    #[test]
     fn counted_omissions_keep_the_newest_contiguous_tail() {
         let rows: Vec<_> = (0..100)
             .map(|n| json!({"id": n, "body": "note".repeat(700)}))
@@ -212,14 +180,17 @@ mod tests {
         }
     }
 
+    /// A prop that is neither a list nor a display source cannot be cut, so
+    /// an oversized one gets an explicit unavailable view — never a changed
+    /// identity.
     #[test]
-    fn oversized_identity_gets_an_explicit_unavailable_view_not_a_changed_path() {
-        let path = "/".repeat(20_000);
-        let result: Value =
-            serde_json::from_slice(&files(json!({"path": path, "preview_text": "original"})))
-                .unwrap();
-        assert_eq!(result["path"], path);
-        assert_eq!(result["preview_text"], "original");
+    fn oversized_identity_gets_an_explicit_unavailable_view_not_a_changed_value() {
+        let title = "t".repeat(20_000);
+        let result: Value = serde_json::from_slice(&forge(
+            json!({"forge_item_title": title.clone(), "forge_item_body": "", "file_text": ""}),
+        ))
+        .unwrap();
+        assert_eq!(result["forge_item_title"], title);
         assert_eq!(result["display_unavailable"], true);
     }
 }

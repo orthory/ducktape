@@ -1636,10 +1636,10 @@ fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
                 run_id: run.clone(),
                 request_id: "task-update".into(),
                 action: ActionEnvelope::new(
-                    runs::OP_COLLABORATION_SEND,
-                    Some(serde_json::json!({"conversation_id":"review", "participant_id":"alice"})),
-                    serde_json::json!({"credential":7,"sequence":3,"recipient_participant_id":"bob",
-                    "kind":"task_update","body":"progress","expires_at":900,
+                    runs::OP_COLLABORATION_DELIVER,
+                    Some(serde_json::json!({"channel_id":"review"})),
+                    serde_json::json!({"message_id":"m3","recipient":"acct:7",
+                    "kind":"task_update","expires_at":900,
                     "task":{"id":"review-task","expected_attempt":7}}),
                 ),
             }),
@@ -1650,8 +1650,8 @@ fn a_live_task_update_retains_its_attempt_on_both_runtimes() {
             .await;
         assert_eq!(receipt.target, "collaboration");
         let request: collaboration::Request = serde_json::from_value(receipt.payload).unwrap();
-        let collaboration::CollaborationMsg::Send(send) = request.op else {
-            panic!("expected Send")
+        let collaboration::CollaborationMsg::Deliver(send) = request.op else {
+            panic!("expected Deliver")
         };
         assert_eq!(send.kind, collaboration::MessageKind::TaskUpdate);
         assert_eq!(
