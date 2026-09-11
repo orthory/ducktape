@@ -4047,12 +4047,6 @@ pub(crate) mod tests {
         assert_eq!(retained.entries[0].hash, [99; 32]);
     }
 
-    fn event(kind: &str, detail: &str) -> ModuleViewEvent {
-        ModuleViewEvent {
-            kind: kind.into(),
-            detail: detail.into(),
-        }
-    }
 
     /// Only the operations a module declares reach the app; the props
     /// subscription and the log are the host's, everything else is refused.
