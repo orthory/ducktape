@@ -1,52 +1,55 @@
 state
+  // THE TIMELINE IS NOT HERE. The Chat tab is a module-owned view on the
+  // kernel contract (`crates/views/chat`): it reads its own room, its threads
+  // and its search off the index, and it signs its own writes. What stays is
+  // what the rest of the app reads — the sidebar the bell and the tray share,
+  // the room the whole app navigates to, the huddle, and the composers, which
+  // are host surfaces whose words never cross the wire.
   channels:[ChatChannel] = []
   rooms:[ChatSidebarRow] = []
-  messages:[ChatMessage] = []
   chat_generation:i64 = 0
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
-  unread_marker_seq:i64 = 0
   active_channel = ""
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
+  // THE ROOM'S ROSTER IS THE COMPOSERS' — the mention menu's candidates, and
+  // the post gate re-read at delivery (`submit_verdict`). Cached at the same
+  // writes as its inputs; evaluating the gate in the view would clone the
+  // member list once per composer per frame.
   channel_members:[ChatMember] = []
-  // Cached at the same writes as its inputs; evaluating the list-taking gate
-  // in the view would clone the member list once per composer per frame.
   post_refusal = ""
-  channel_settings_open = false
-  // THE COPY RANGE'S TWO ENDS, as seqs. `copy_anchor_seq` is where the reader
-  // clicked and `copy_head_seq` is where they shift-clicked, in either
-  // direction; 0 is no range. Seqs and not indices because history prepends —
-  // an index names a different message the moment an older page merges in.
-  // `copy_surface` says which list they address; see `CopySurface`.
-  copy_anchor_seq:i64 = 0
-  copy_head_seq:i64 = 0
-  copy_surface:CopySurface = CopySurface.nowhere
-  selected_message_seq:i64 = 0
-  selected_message_rev:i64 = 0
-  message_action:MessageAction = MessageAction.toolbar
-  message_edit_draft = ""
-  active_thread_seq:i64 = 0
-  thread_target_seq:i64 = 0
-  thread_messages:[ChatMessage] = []
-  live_agents:[LiveAgentRow] = []
-  thread_next_reply_seq:i64 = 0
-  thread_has_more = false
-  thread_loading = false
-  thread_generation:i64 = 0
-  thread_selected_seq:i64 = 0
-  thread_selected_rev:i64 = 0
-  thread_message_action:MessageAction = MessageAction.toolbar
-  thread_edit_draft = ""
-  history_loading = false
+  // THE SEQ A LANDING OPENS THE WINDOW AROUND — a search hit, or a
+  // `duck://channel/<id>#<seq>`. It is an input to the view's own read key,
+  // so moving it re-reads the room around that message; 0 is the live tail.
+  chat_land_seq:i64 = 0
+  // THE ROW THE EDIT COMPOSER WAS OPENED ON. The view decides which rows may
+  // be edited and hands over the markdown; the app remembers the revision so
+  // the save is the compare-and-set the menu was armed for.
+  chat_edit_seq:i64 = 0
+  chat_edit_rev:i64 = 0
   // A refused or failed send hands its words back to the composer it came
   // from; the composer is a host surface, so the hand-off is a call.
   composer_stashed = false
   // the roster hand-off's acknowledgement (`chat_composer_roster`)
   composer_roster_set = false
+  // the edit seed's acknowledgement (`chat_composer_seed`)
+  composer_seeded = false
+  // EVERY AGENT RUN THIS NODE HOLDS, for the whole node. Which of them reach
+  // the screen is decided in the chat seat, against the room on screen when
+  // the frame is built.
+  live_agents:[LiveAgentRow] = []
   // Moves once per admitted send: the view snaps its stream to the tail on it.
   chat_sent_serial:i64 = 0
+  // EVERY SEND STILL IN FLIGHT. The view's timeline is its own reading of the
+  // index, which cannot know about an operation no block carries yet — so the
+  // admitted sends live here and the view paints them at the tail of the
+  // surface each was written in.
+  chat_pending_sends:[PendingSend] = []
+  // Moves on every ⌘C over the chat tab. The chord is a keyboard
+  // subscription, which is the app's door; the rows it lifts are the view's.
+  chat_copy_chord_serial:i64 = 0
   channel_draft = ""
   channel_create_open = false
   channel_create_members_only = false
@@ -56,24 +59,13 @@ state
   // so no app state can be handed to the wrong room — and neither is the
   // failed-send stash, which followed the reader out of the room its words
   // were written in until a slice keyed it to that room (ducktape-ui#698).
-  chat_search_hits:[ChatSearchHit] = []
-  chat_search_phase:SearchPhase = SearchPhase.idle
-  // THE STRING THE FLOAT'S ZERO-HIT ARM IS SPEAKING FOR — the query a search
-  // was actually SENT for, `""` while no answer stands. The phase alone could
-  // not carry it: this box is enter-to-submit with no `change=` route, so a
-  // keystroke writes the draft and runs no handler, and `done` went on
-  // standing over a string the node never saw. Only the WITH-HITS arm may
-  // outlive the box — rows stay until a new query is sent or the box is
-  // cleared, exactly as the pages hits float does; see `screens/chat.ice`.
-  chat_search_query = ""
-  history_view = false
-  has_older_history = false
-  // IS THE READER LOOKING AT NOW? The stream is bottom-anchored, so its offset
-  // counts from the tail and `chat_scrolled` publishes this on every real scroll
-  // step (`near_scroll_tail`). It gates the "Jump to latest" float, and it is
-  // TRUE by default because every route that mounts a fresh timeline mounts it
-  // at the tail — a room switch, a landing, a send.
+  //
+  // IS THE READER LOOKING AT NOW? The stream is bottom-anchored, and the view
+  // publishes the offset on every real scroll step. The app takes one thing
+  // off it: `history_view`, which is what keeps the live fold from marking a
+  // room read while she is above the tail or parked on a landing.
   chat_at_tail = true
+  history_view = false
   // THE CHAIN THE ROOMS ON SCREEN WERE LEARNED FROM. A workspace switch does
   // not change the endpoint, so a console can live right through one with no
   // reconnect at all — and every resync fold only ever ADDS rows. Compared

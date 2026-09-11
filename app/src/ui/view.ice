@@ -187,12 +187,14 @@ view
                       active bg=transparent text=muted r=7.0
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
-        // Chat is a MODULE-OWNED VIEW: the facts go in as props — the mutation
-        // lock as a flag, the enums by name — and every act comes back as an
-        // intent the handler signs. The drafts are the view's; the composers
-        // are host surfaces the view leaves slots for (module_view.rs).
+        // Chat is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts go
+        // in — who the reader is, the room the app is in, the sidebar the bell
+        // and the tray share, the huddle, the sends in flight — and the view
+        // reads its own room and signs its own writes. What comes back is what
+        // another plane steers (a room, a link, a run) and the composers'
+        // submit, which are host surfaces the view leaves slots for.
         chat:
-          extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial, live_agents) #chat -> chat_view_event _
+          extern chat_view(dark, connected, connected_rpc, network_name, network_chain_id, status, block_height, account_number, settings_user_key, dm_peers_generation, rooms, dm_rows, channel_create_open, active_channel, active_dm_peer, active_dm, chat_land_seq, unread_boundary, mutation_phase, loading, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, shift_held, chat_copy_chord_serial, chat_sent_serial, chat_pending_sends, live_agents) #chat -> chat_view_event _
 
         // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
         // strip and the comments rail go in as props; the document is the
@@ -283,7 +285,7 @@ view
               dismiss_toast -> dismiss_toast
               close_palette -> close_palette
               palette_changed -> palette_changed _
-              open_chat_search_hit -> open_chat_search_hit _ _ _
+              open_chat_search_hit -> open_chat_search_hit _ _
               open_page_search_hit -> open_page_search_hit _ _
         bell:
           stack w=fill h=fill

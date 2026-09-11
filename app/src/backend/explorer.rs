@@ -100,18 +100,17 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 // surface is flat, and the reading must see every layer at once to name the
 // topmost. Scoping lives HERE rather than in the call sites' argument lists —
 // a conjunction per caller is one guard per rung to forget.
-#[allow(clippy::too_many_arguments)]
+//
+// THE CHAT TAB HOLDS NO RUNG. Its menus, its drawer and its rail belong to the
+// chat view (`crates/views/chat`), which dismisses its own layers — a key the
+// kernel contract carries no door for.
 pub fn topmost_overlay(
     shell_tab: crate::ShellTab,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
     page_delete_armed: bool,
 ) -> String {
-    let on_chat = shell_tab == crate::ShellTab::Chat;
     let on_pages = shell_tab == crate::ShellTab::Pages;
     if palette_open {
         return "palette".into();
@@ -121,28 +120,6 @@ pub fn topmost_overlay(
     }
     if channel_create_open {
         return "channel_create".into();
-    }
-    // THE DRAWER UNMOUNTS THE THREAD RAIL — `if active_thread_seq > 0 &&
-    // !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
-    // flag on the way in, so the same rule the tab scoping states one level up
-    // applies here: a rung answers only while its surface is mounted. Without
-    // the term, opening a thread action and then Channel details was a
-    // mouse-reachable state where the first Escape wiped a half-typed
-    // `thread_edit_draft` and left the drawer standing. It cannot be expressed
-    // by moving one rung in the ladder's total order — the stream's own menu
-    // really does float over the drawer and must stay above it.
-    if on_chat && !channel_settings_open && thread_message_action != crate::MessageAction::Toolbar {
-        return "thread_menu".into();
-    }
-    if on_chat && message_action != crate::MessageAction::Toolbar {
-        return "message_menu".into();
-    }
-    // BELOW the stream's message menu, which floats over the drawer. The drawer
-    // had no rung at all: it shipped with an `×` and no keyboard exit while
-    // every other overlay in the app answered Escape. Measured on the running
-    // app — Escape over an open Channel details changed exactly zero pixels.
-    if on_chat && channel_settings_open {
-        return "channel_settings".into();
     }
     // The pages block-actions menu and insert row used to sit here, and the
     // comments rail is a persistent panel with its own close. THE ARMED DELETE
@@ -173,9 +150,6 @@ pub fn escape_target(
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
     page_delete_armed: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -188,9 +162,6 @@ pub fn escape_target(
         palette_open,
         bell_open,
         channel_create_open,
-        thread_message_action,
-        message_action,
-        channel_settings_open,
         page_delete_armed,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows
@@ -200,14 +171,6 @@ pub fn escape_target(
         return String::new();
     }
     topmost
-}
-
-pub fn close_message_action(close: bool, current: crate::MessageAction) -> crate::MessageAction {
-    if close {
-        crate::MessageAction::Toolbar
-    } else {
-        current
-    }
 }
 
 /// True when the live connection is in a state the shell should banner:

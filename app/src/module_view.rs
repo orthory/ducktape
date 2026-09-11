@@ -559,257 +559,147 @@ pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
 
 // ---------- the chat seat ----------
 
-/// The chat view's props, as one document — a struct rather than a `json!`
-/// literal because the macro recurses once per field and this screen has
-/// more than the compiler's default limit.
+/// The chat view's session facts, as one document — a struct rather than a
+/// `json!` literal because the macro recurses once per field.
 #[derive(serde::Serialize)]
 struct ChatProps<'a> {
     dark: bool,
+    connected: bool,
     endpoint: &'a str,
     network_name: &'a str,
     network_chain_id: &'a str,
     status: &'a str,
     block_height: i64,
-    search_phase: &'static str,
-    search_query: &'a str,
-    search_hits: &'a [crate::backend::ChatSearchHit],
+    me: String,
+    me_key: &'a str,
+    names_serial: i64,
     rooms: &'a [crate::backend::ChatSidebarRow],
     dm_rows: &'a [crate::backend::DmSidebarRow],
     channel_create_open: bool,
-    connected: bool,
-    loading: bool,
-    busy: bool,
     active_channel: &'a str,
     active_dm_peer: &'a str,
     active_dm: &'a crate::backend::DmPeer,
-    active_channel_name: &'a str,
-    active_channel_archived: bool,
-    active_channel_members_only: bool,
-    channel_members: &'a [crate::backend::ChatMember],
-    post_refusal: &'a str,
+    land_seq: i64,
+    unread_boundary: i64,
+    busy: bool,
+    loading: bool,
     huddle_joined: bool,
     huddle_channel: &'a str,
     huddle_channel_name: &'a str,
     huddle_joined_at: i64,
     huddle_now: i64,
     call_muted: bool,
-    messages: &'a [crate::backend::ChatMessage],
-    has_older_history: bool,
-    history_view: bool,
-    at_live_tail: bool,
-    history_loading: bool,
-    unread_boundary: i64,
-    unread_marker_seq: i64,
-    selected_message_seq: i64,
-    selected_message_rev: i64,
-    message_action: &'static str,
-    channel_settings_open: bool,
-    active_thread_seq: i64,
-    thread_target_seq: i64,
-    thread_messages: std::borrow::Cow<'a, [crate::backend::ChatMessage]>,
-    thread_selected_seq: i64,
-    thread_selected_rev: i64,
-    thread_message_action: &'static str,
-    thread_has_more: bool,
-    thread_next_reply_seq: i64,
-    thread_loading: bool,
-    copy_anchor_seq: i64,
-    copy_head_seq: i64,
-    copy_surface: &'static str,
+    shift_held: bool,
+    copy_chord_serial: i64,
     sent_serial: i64,
+    pending_sends: &'a [crate::backend::PendingSend],
     /// THIS ROOM'S runs only, as hints: the reading is taken for the whole
-    /// node, and [`encode_chat_props`] cuts it to `active_channel` on the way
-    /// out.
+    /// node and cut to `active_channel` on the way out.
     live_agents: Vec<crate::backend::LiveRunHint>,
 }
 
-/// The Chat tab: the room list, the stream, the rail and the drawer as the
-/// app holds them, drawn by the `chat` view. Its intents come back one per
-/// act ([`chat_intent`]), carrying what the reader chose or typed; the two
-/// composers are host surfaces (`crate::composer_surface`), whose submit
-/// comes back as `composer`.
+/// The Chat tab, drawn by the `chat` view over the KERNEL CONTRACT: the app
+/// pushes session facts only — who the reader is, which room the app is in,
+/// the sidebar the bell and the tray share, the huddle, the sends in flight —
+/// and the view reads the room itself through `rpc.view` / `rpc.live`, writing
+/// reactions, edits, deletes, renames and membership as `op.submit`.
+///
+/// What still comes back as an intent is what another plane of the app steers
+/// or owns: the room to open (`duck://` links, notifications, the tray), the
+/// huddle, a link or a copy, a run to stop or open, and the seed for the edit
+/// composer — because the composers are HOST SURFACES (`chat_composer`), whose
+/// submit arrives as `composer`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the Ice extern hands the screen's facts one by one"
 )]
 pub fn chat_view(
     dark: bool,
+    connected: bool,
     endpoint: &str,
     network_name: &str,
     network_chain_id: &str,
     status: &str,
     block_height: i64,
-    search_phase: crate::SearchPhase,
-    search_query: &str,
-    search_hits: &[crate::backend::ChatSearchHit],
+    account_number: &str,
+    user_key: &str,
+    names_serial: i64,
     rooms: &[crate::backend::ChatSidebarRow],
     dm_rows: &[crate::backend::DmSidebarRow],
     channel_create_open: bool,
-    connected: bool,
-    loading: bool,
-    mutation_phase: crate::MutationPhase,
     active_channel: &str,
     active_dm_peer: &str,
     active_dm: &crate::backend::DmPeer,
-    active_channel_name: &str,
-    active_channel_archived: bool,
-    active_channel_members_only: bool,
-    channel_members: &[crate::backend::ChatMember],
-    post_refusal: &str,
+    land_seq: i64,
+    unread_boundary: i64,
+    mutation_phase: crate::MutationPhase,
+    loading: bool,
     huddle_joined: bool,
     huddle_channel: &str,
     huddle_channel_name: &str,
     huddle_joined_at: i64,
     huddle_now: i64,
     call_muted: bool,
-    messages: &[crate::backend::ChatMessage],
-    has_older_history: bool,
-    history_view: bool,
-    at_live_tail: bool,
-    history_loading: bool,
-    unread_boundary: i64,
-    unread_marker_seq: i64,
-    selected_message_seq: i64,
-    selected_message_rev: i64,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
-    active_thread_seq: i64,
-    thread_target_seq: i64,
-    thread_messages: &[crate::backend::ChatMessage],
-    thread_selected_seq: i64,
-    thread_selected_rev: i64,
-    thread_message_action: crate::MessageAction,
-    thread_has_more: bool,
-    thread_next_reply_seq: i64,
-    thread_loading: bool,
-    copy_anchor_seq: i64,
-    copy_head_seq: i64,
-    copy_surface: crate::CopySurface,
+    shift_held: bool,
+    copy_chord_serial: i64,
     sent_serial: i64,
+    pending_sends: &[crate::backend::PendingSend],
     live_agents: &[crate::backend::LiveAgentRow],
 ) -> Element<'static, ModuleViewEvent> {
     let props = ChatProps {
         dark,
+        connected,
         endpoint,
         network_name,
         network_chain_id,
         status,
         block_height,
-        search_phase: search_phase_name(search_phase),
-        search_query,
-        search_hits,
+        me: reader_handle(account_number, user_key),
+        me_key: user_key,
+        names_serial,
         rooms,
         dm_rows,
         channel_create_open,
-        connected,
-        loading,
-        busy: mutation_phase != crate::MutationPhase::Idle,
         active_channel,
         active_dm_peer,
         active_dm,
-        active_channel_name,
-        active_channel_archived,
-        active_channel_members_only,
-        channel_members,
-        post_refusal,
+        land_seq,
+        unread_boundary,
+        busy: mutation_phase != crate::MutationPhase::Idle,
+        loading,
         huddle_joined,
         huddle_channel,
         huddle_channel_name,
         huddle_joined_at,
         huddle_now,
         call_muted,
-        messages,
-        has_older_history,
-        history_view,
-        at_live_tail,
-        history_loading,
-        unread_boundary,
-        unread_marker_seq,
-        selected_message_seq,
-        selected_message_rev,
-        message_action: message_action_name(message_action),
-        channel_settings_open,
-        active_thread_seq,
-        thread_target_seq,
-        thread_messages: std::borrow::Cow::Borrowed(thread_messages),
-        thread_selected_seq,
-        thread_selected_rev,
-        thread_message_action: message_action_name(thread_message_action),
-        thread_has_more,
-        thread_next_reply_seq,
-        thread_loading,
-        copy_anchor_seq,
-        copy_head_seq,
-        copy_surface: copy_surface_name(copy_surface),
+        shift_held,
+        copy_chord_serial,
         sent_serial,
-        live_agents: Vec::new(),
+        pending_sends,
+        // THIS IS THE ONLY PLACE A RUN IS MATCHED TO A ROOM: the reading
+        // covers the whole node, so a row from a room the reader left cannot
+        // reach the screen no matter which handler moved `active_channel`.
+        live_agents: live_agents_within(live_agents, active_channel, LIVE_AGENT_TEXT_BUDGET),
     };
-    module_view("chat", encode_chat_props(props, live_agents))
+    module_view("chat", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// Text bytes a guest's big list or blob may put on one frame: the wire
-/// spends 64 KiB of text per frame and EMPTIES whatever comes after, and the
-/// newest messages come last — a busy room's hot window (256 rows) drew its
-/// newest messages blank. The rest of the frame (rooms, names, times, the
-/// rail) lives in the headroom.
-const TIMELINE_TEXT_BUDGET: usize = 48 << 10;
-
-/// Bytes the live agent cards may take out of [`TIMELINE_TEXT_BUDGET`]. They
-/// draw INSIDE the stream, under their anchors, so they spend the timeline's
-/// budget rather than the chrome's headroom — and this ceiling is what keeps a
-/// room with a great many runs in flight from blanking the messages they sit
-/// under.
-const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
-
-/// The facts encoded for the view, the timelines held to
-/// [`TIMELINE_TEXT_BUDGET`]: the newest messages that fit, oldest dropped
-/// first, and a clipped stream says so through `has_older_history` (the
-/// thread through `thread_has_more`, its root always kept) so the view still
-/// offers what was left behind as history.
-///
-/// The live agent rows are narrowed to `active_channel` here, and THIS IS THE
-/// ONLY PLACE a run is matched to a room: the reading covers the whole node, so
-/// a row from a room the reader left cannot reach the screen no matter which of
-/// the eight handlers that move `active_channel` she got here through.
-fn encode_chat_props(
-    mut props: ChatProps<'_>,
-    live_rows: &[crate::backend::LiveAgentRow],
-) -> Vec<u8> {
-    let live = live_agents_within(live_rows, props.active_channel, LIVE_AGENT_TEXT_BUDGET);
-    // THE LIVE HINTS ARE SERVED FIRST. A run in flight is the most perishable
-    // thing on the frame and the one the reader is waiting on, so it takes its
-    // bytes before the scrollback it sits in does.
-    let timelines =
-        TIMELINE_TEXT_BUDGET.saturating_sub(live.iter().map(live_text_bytes).sum::<usize>());
-    props.live_agents = live;
-    let (stream, stream_clipped) = newest_within(props.messages, timelines);
-    let stream_spent: usize = stream.iter().map(text_bytes).sum();
-    props.messages = stream;
-    props.has_older_history |= stream_clipped;
-    let thread = &*props.thread_messages;
-    // the root is drawn as its own block above the replies: it stays
-    let root = usize::from(
-        thread
-            .first()
-            .is_some_and(|message| message.thread_seq == 0),
-    );
-    let (replies, thread_clipped) = newest_within(
-        &thread[root..],
-        timelines
-            .saturating_sub(stream_spent + thread[..root].iter().map(text_bytes).sum::<usize>()),
-    );
-    if thread_clipped {
-        props.thread_messages =
-            std::borrow::Cow::Owned(thread[..root].iter().chain(replies).cloned().collect());
-        props.thread_has_more = true;
+/// The reader as the chat index spells her: her account when identity has
+/// resolved one, else the bare key she signs with. `reacted by me` and the
+/// post gate hang on this, so it is spelled once, here.
+fn reader_handle(account_number: &str, user_key: &str) -> String {
+    match account_number.is_empty() {
+        true => format!("user:{user_key}"),
+        false => format!("acct:{account_number}"),
     }
-    serde_json::to_vec(&props).expect("props encode")
 }
 
-/// The bytes a message puts on the wire as text.
-fn text_bytes(message: &crate::backend::ChatMessage) -> usize {
-    message.body.len() + message.author.len() + message.meta.len()
-}
+/// Bytes the live agent cards may take on one frame. The wire spends 64 KiB
+/// of text per frame and EMPTIES whatever comes after; the cards draw inside
+/// the stream, so this ceiling is what keeps a room with a great many runs in
+/// flight from blanking the messages they sit under.
+const LIVE_AGENT_TEXT_BUDGET: usize = 6 << 10;
 
 /// The bytes a live run hint puts on the wire as text.
 fn live_text_bytes(hint: &crate::backend::LiveRunHint) -> usize {
@@ -845,21 +735,6 @@ fn live_agents_within(
     kept
 }
 
-/// The newest tail of `messages` whose text fits `budget`, and whether
-/// anything older was left out.
-fn newest_within(
-    messages: &[crate::backend::ChatMessage],
-    budget: usize,
-) -> (&[crate::backend::ChatMessage], bool) {
-    let mut spent = 0;
-    let mut start = messages.len();
-    while start > 0 && spent + text_bytes(&messages[start - 1]) <= budget {
-        spent += text_bytes(&messages[start - 1]);
-        start -= 1;
-    }
-    (&messages[start..], start > 0)
-}
-
 /// The head of `text` that fits `budget`, cut on a char boundary, and
 /// whether anything was cut.
 fn head_within(text: &str, budget: usize) -> (&str, bool) {
@@ -873,89 +748,28 @@ fn head_within(text: &str, budget: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-fn search_phase_name(phase: crate::SearchPhase) -> &'static str {
-    match phase {
-        crate::SearchPhase::Idle => "idle",
-        crate::SearchPhase::Searching => "searching",
-        crate::SearchPhase::Done => "done",
-    }
-}
-
-fn message_action_name(action: crate::MessageAction) -> &'static str {
-    match action {
-        crate::MessageAction::Toolbar => "toolbar",
-        crate::MessageAction::More => "more",
-        crate::MessageAction::Reactions => "reactions",
-        crate::MessageAction::Editing => "editing",
-        crate::MessageAction::Delete => "delete",
-    }
-}
-
-fn copy_surface_name(surface: crate::CopySurface) -> &'static str {
-    match surface {
-        crate::CopySurface::Nowhere => "nowhere",
-        crate::CopySurface::Timeline => "timeline",
-        crate::CopySurface::Thread => "thread",
-    }
-}
-
+/// The act a chat intent names. The door ([`intents_of`]) refuses every kind
+/// this does not list, so the wildcard is unreachable in practice; it verdicts
+/// the link copy, whose handler refuses an empty link.
 pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
     use crate::ChatIntent as Intent;
     match event.kind.as_str() {
-        "search" => Intent::Search,
-        "clear_search" => Intent::ClearSearch,
         "open_hit" => Intent::OpenHit,
         "toggle_create" => Intent::ToggleCreate,
         "choose_channel" => Intent::ChooseChannel,
         "choose_dm" => Intent::ChooseDm,
-        "toggle_settings" => Intent::ToggleSettings,
         "show_huddle" => Intent::ShowHuddle,
         "leave_huddle" => Intent::LeaveHuddle,
         "join_huddle" => Intent::JoinHuddle,
-        "load_history" => Intent::LoadHistory,
         "scrolled" => Intent::Scrolled,
         "open_link" => Intent::OpenLink,
         "copy" => Intent::Copy,
         "copy_link" => Intent::CopyLink,
-        "add_reaction" => Intent::AddReaction,
-        "remove_reaction" => Intent::RemoveReaction,
-        "open_thread" => Intent::OpenThread,
-        "message_actions" => Intent::MessageActions,
-        "message_reactions" => Intent::MessageReactions,
         "begin_edit" => Intent::BeginEdit,
-        "arm_delete" => Intent::ArmDelete,
-        "press" => Intent::Press,
-        "clear_range" => Intent::ClearRange,
-        "copy_range" => Intent::CopyRange,
-        "reaction_submit" => Intent::ReactionSubmit,
-        "delete" => Intent::Delete,
-        "rename" => Intent::Rename,
-        "archive" => Intent::Archive,
-        "unarchive" => Intent::Unarchive,
-        "add_member" => Intent::AddMember,
-        "remove_member" => Intent::RemoveMember,
-        "close_thread" => Intent::CloseThread,
-        "thread_actions" => Intent::ThreadActions,
-        "thread_reactions" => Intent::ThreadReactions,
-        "thread_begin_edit" => Intent::ThreadBeginEdit,
-        "thread_arm_delete" => Intent::ThreadArmDelete,
-        "thread_clear_selection" => Intent::ThreadClearSelection,
-        "thread_delete" => Intent::ThreadDelete,
-        "load_thread" => Intent::LoadThread,
         "cancel_run" => Intent::CancelRun,
         "open_run" => Intent::OpenRun,
         "composer" => Intent::Composer,
-        _ => Intent::ClearSelection,
-    }
-}
-
-/// The surface a `press` intent names; a name the view has no surface for
-/// is nowhere, which draws no range.
-pub fn chat_event_surface(event: &ModuleViewEvent) -> crate::CopySurface {
-    match event_text(event, "surface").as_str() {
-        "timeline" => crate::CopySurface::Timeline,
-        "thread" => crate::CopySurface::Thread,
-        _ => crate::CopySurface::Nowhere,
+        _ => Intent::CopyLink,
     }
 }
 
@@ -975,21 +789,12 @@ pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
     true
 }
 
-/// Seed the native edit composer from canonical blocks, never copy text.
-pub fn chat_composer_edit(
-    scope: &str,
-    messages: &[crate::backend::ChatMessage],
-    seq: i64,
-    rev: i64,
-) -> bool {
-    let Some(message) = messages.iter().find(|message| message.seq == seq) else {
-        return false;
-    };
-    let editable = !message.deleted && !message.pending && message.rev == rev;
-    if !editable {
-        return false;
-    }
-    crate::composer_surface::seed(scope, &message.edit_body);
+/// Open the native edit composer on the body the view handed over. The view
+/// decides WHETHER a row is editable (it holds the revisions); what it cannot
+/// do is type — the editor is a host surface with an IME and a retained
+/// document — so the markdown it opens on crosses as this seed.
+pub fn chat_composer_seed(scope: &str, body: &str) -> bool {
+    crate::composer_surface::seed(scope, body);
     true
 }
 
@@ -1164,48 +969,21 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         // the explorer view reads and searches through the kernel: the only
         // thing it asks the app for is the clipboard
         "explorer" => &["copy"],
+        // the chat view reads its own room and signs its own writes; what is
+        // left at the door is what another plane of the app steers or owns
         "chat" => &[
-            "search",
-            "clear_search",
             "open_hit",
             "toggle_create",
             "choose_channel",
             "choose_dm",
-            "toggle_settings",
             "show_huddle",
             "leave_huddle",
             "join_huddle",
-            "load_history",
             "scrolled",
             "open_link",
             "copy",
             "copy_link",
-            "add_reaction",
-            "remove_reaction",
-            "open_thread",
-            "message_actions",
-            "message_reactions",
             "begin_edit",
-            "arm_delete",
-            "clear_selection",
-            "press",
-            "clear_range",
-            "copy_range",
-            "reaction_submit",
-            "delete",
-            "rename",
-            "archive",
-            "unarchive",
-            "add_member",
-            "remove_member",
-            "close_thread",
-            "thread_actions",
-            "thread_reactions",
-            "thread_begin_edit",
-            "thread_arm_delete",
-            "thread_clear_selection",
-            "thread_delete",
-            "load_thread",
             "cancel_run",
             "open_run",
         ],
@@ -2852,6 +2630,12 @@ impl Guest {
             );
             return;
         }
+        // a test standing in for the node answers its own reads first
+        #[cfg(test)]
+        if let Some(bytes) = tests::canned_read(&kind, &payload) {
+            self.reply(id, Ok(bytes));
+            return;
+        }
         let (capability, operation) = kind.split_once('.').unwrap_or((kind.as_str(), ""));
         // the kernel contract first: what every view may ask, module-free
         if kernel::answer(self, capability, operation, id, &payload) {
@@ -3510,9 +3294,11 @@ pub(crate) mod tests {
         // the agents view signs its own pause and save through `op.submit`
         assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 43);
-        assert!(!chat.contains(&"edit"));
-        assert!(!chat.contains(&"thread_edit"));
+        assert_eq!(chat.len(), 14);
+        // the writes the view signs for itself are nobody's intent
+        for signed in ["react", "edit", "delete", "rename", "search", "mark_read"] {
+            assert!(!chat.contains(&signed), "{signed} is an op.submit now");
+        }
         assert!(chat.contains(&"choose_channel"));
         assert!(
             chat.contains(&"cancel_run"),
@@ -3537,12 +3323,11 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 5] = [
+        let other_route_only: [(&str, &str, &[&str]); 4] = [
             ("agents", "agents_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &["composer"]),
             ("pages", "pages_intent", &["edited"]),
-            ("chat", "chat_intent", &["composer"]),
         ];
         let snake = |variant: &str| -> String {
             let mut word = String::new();
@@ -3592,7 +3377,7 @@ pub(crate) mod tests {
     }
 
     /// Every text in the tree the host holds, in tree order.
-    fn texts(guest: &Guest) -> Vec<String> {
+    pub(super) fn texts(guest: &Guest) -> Vec<String> {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut texts = Vec::new();
         root.for_each_mut(&mut |node| {
@@ -3605,7 +3390,7 @@ pub(crate) mod tests {
 
     /// The message index the button labelled `name` — by its `label=`, or
     /// by the text it shows — would send.
-    fn button_message(guest: &Guest, name: &str) -> u32 {
+    pub(super) fn button_message(guest: &Guest, name: &str) -> u32 {
         let mut root = guest.frame.root.clone().expect("a tree");
         let mut message = None;
         root.for_each_mut(&mut |node| {
@@ -3651,26 +3436,6 @@ pub(crate) mod tests {
                 texts(guest)
             )
         })
-    }
-
-    /// Whether a button showing `name` is on the frame at all.
-    ///
-    /// A BUTTON'S LABEL IS NOT A TEXT NODE, so `texts()` never contains it and
-    /// asserting over that list says nothing about a button either way — an
-    /// `any(== "Stop")` fails on a button that is plainly there, and the
-    /// `!any(== "Stop")` twin passes whether it is there or not.
-    fn button_shown(guest: &Guest, name: &str) -> bool {
-        let mut root = guest.frame.root.clone().expect("a tree");
-        let mut found = false;
-        root.for_each_mut(&mut |node| {
-            if let wire::Node::Button { label, content, .. } = node
-                && (label.as_deref() == Some(name)
-                    || matches!(content, wire::ButtonContent::Label(text) if text == name))
-            {
-                found = true;
-            }
-        });
-        found
     }
 
     /// The bundled component, end to end through the host, on the kernel
@@ -3971,7 +3736,8 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Chat view through the host: the rooms and the stream,
+    /// The bundled Chat view through the host: the SESSION facts (the rooms
+    /// the bell and the tray share — the stream the view reads for itself),
     /// a room pressed that leaves as `choose_channel`, the composer slot
     /// the host paints per room, and its submit crossing as the `composer`
     /// intent rather than a guest request.
@@ -3980,13 +3746,18 @@ pub(crate) mod tests {
         let Some(staged) = staged("chat") else {
             return;
         };
+        // NO NODE, ON PURPOSE — and the turn is what makes that true. The view
+        // reads its own room through the kernel, so a sibling test's seated
+        // client would answer those reads off-thread and land their replies in
+        // the middle of this one.
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         assert!(guest.surfaces.contains_key("chat_composer"));
         guest.redraw(&None);
         let props = chat_facts();
         guest.redraw(&props);
         let shown = texts(&guest);
-        for expected in ["testnet", "general", "ops", "first light"] {
+        for expected in ["testnet", "general", "ops"] {
             assert!(
                 shown.iter().any(|text| text == expected),
                 "missing {expected:?} in {shown:?}"
@@ -4005,7 +3776,10 @@ pub(crate) mod tests {
         );
 
         // a submit in the host's composer is the `composer` intent, and an
-        // edit there never reaches the guest
+        // edit there never reaches the guest. What the ROOM's own reads left
+        // waiting is not the composer's doing, so the seam is what the two
+        // deliveries ADD — nothing.
+        let waiting = guest.pending.len();
         guest.deliver(Output::Surface {
             handler: None,
             value: wire::SurfaceValue::Record {
@@ -4025,7 +3799,12 @@ pub(crate) mod tests {
             handler: None,
             value: wire::SurfaceValue::Unit,
         });
-        assert!(guest.pending.is_empty());
+        assert_eq!(
+            guest.pending.len(),
+            waiting,
+            "the host's composer queued an event for the guest: {:?}",
+            guest.pending
+        );
         assert_eq!(guest.intents.len(), 1);
         assert_eq!(guest.intents[0].kind, "composer");
         assert!(guest.intents[0].detail.contains(r#""body":"hello""#));
@@ -4056,26 +3835,44 @@ pub(crate) mod tests {
             }
         }
         let _turn = blocking_connection_turn();
-        let rows: Vec<_> = (1..=60)
+        // The landing is a SESSION fact (`land_seq`) and the conversation is
+        // the view's own read: the notification names a reply, the window
+        // comes back around it, and the row's thread seats the rail.
+        let root = chat_row_of(1, "Root of the conversation", None);
+        let replies: Vec<_> = (2..=60)
             .map(|seq| {
                 let body = format!("Reply {seq}: {}", "conversation context ".repeat(8));
-                crate::backend::ChatMessage {
-                    blocks: chat::client::paragraph_blocks(&body),
-                    body,
-                    thread_seq: if seq == 1 { 0 } else { 1 },
-                    ..first_light_at(seq)
-                }
+                chat_row_of(seq, &body, Some(1))
             })
             .collect();
-        let bytes = chat_facts_with(&rows[..1], &rows).unwrap();
-        let mut facts: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        facts["active_thread_seq"] = 1.into();
-        facts["thread_target_seq"] = 31.into();
-        let props = Some(serde_json::to_vec(&facts).unwrap());
+        let mut around = vec![root.clone()];
+        around.extend(replies.iter().cloned());
+        can_reads([
+            ("all", chat_accounts_reply()),
+            ("channel", chat_channel_reply()),
+            ("messages_around", serde_json::json!({ "messages": around })),
+            // a landing asks one more question than a tail read does: whether
+            // anything is older than the window it centred
+            (
+                "roots",
+                serde_json::json!({ "roots": { "roots": [], "has_more": false }}),
+            ),
+            ("members", chat_members_reply()),
+            (
+                "thread",
+                serde_json::json!({ "thread": { "root": root, "replies": replies,
+                    "has_more": false, "next_reply_seq": null }}),
+            ),
+        ]);
+        let props = chat_facts_in("channel-a", 31, &[]);
         let path = staged("chat").expect("actual Chat Wasm is required");
         let mut guest = Guest::load_from("chat", &path).unwrap();
         guest.redraw(&None);
-        guest.redraw(&props);
+        for _ in 0..32 {
+            if !guest.redraw(&props) {
+                break;
+            }
+        }
         assert_eq!(guest.widget_commands.len(), 1, "{:?}", guest.fault);
         assert!(matches!(
             &guest.widget_commands[0].2,
@@ -4596,6 +4393,46 @@ pub(crate) mod tests {
     /// Set by a test: the next candidate's first frame traps.
     pub(super) static FIRST_FRAME_TRAPS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    thread_local! {
+        /// What a test answers the reads a kernel-contract view makes for
+        /// itself, so a HOST contract — a native overlay, a retained one, a
+        /// pointer drag — can be driven against a real view with no node
+        /// behind it. Per-thread, so one test's node is never another's, and
+        /// empty everywhere else: an empty table leaves every request to the
+        /// kernel exactly as production does.
+        static CANNED_READS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>> =
+            const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    }
+
+    /// The canned answer for one request, looked up by the NAME OF THE QUERY
+    /// it asks (`roots`, `channel`, `thread`, …) — the one thing that tells a
+    /// view's reads apart, since they all leave as `rpc.view`. A read that
+    /// carries no query is looked up by its kind.
+    pub(super) fn canned_read(kind: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        CANNED_READS.with(|canned| {
+            let canned = canned.borrow();
+            if canned.is_empty() {
+                return None;
+            }
+            let ask: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+            let named = ask["query"]
+                .as_object()
+                .and_then(|query| query.keys().next().cloned());
+            canned.get(named.as_deref().unwrap_or(kind)).cloned()
+        })
+    }
+
+    /// Cans the node this thread's view reads: every answer by the name of
+    /// the query that asks for it.
+    pub(super) fn can_reads(answers: impl IntoIterator<Item = (&'static str, serde_json::Value)>) {
+        CANNED_READS.with(|canned| {
+            let mut canned = canned.borrow_mut();
+            for (named, reply) in answers {
+                canned.insert(named.to_owned(), reply.to_string().into_bytes());
+            }
+        });
+    }
 
     /// The session facts a kernel-contract view is pushed: connected, as an
     /// admin. Governance and members take the same three.
@@ -6796,44 +6633,78 @@ pub(crate) mod tests {
     }
 
     pub(super) fn chat_facts() -> Option<Vec<u8>> {
-        chat_facts_with(&[first_light()], &[])
+        chat_facts_in("channel-a", 0, &[])
     }
 
-    fn first_light() -> crate::backend::ChatMessage {
-        crate::backend::ChatMessage {
-            id: "m1".into(),
-            view_key: 1,
-            seq: 1,
-            author: "mallard".into(),
-            meta: "h 84,912".into(),
-            body: "first light".into(),
-            blocks: crate::backend::paragraph_blocks("first light"),
-            show_author: true,
-            initial: "M".into(),
-            avatar_kind: "human".into(),
-            height: 84_912,
-            time: 84_912,
-            rev: 1,
-            ..Default::default()
-        }
+    fn chat_row(seq: i64) -> serde_json::Value {
+        chat_row_of(seq, "first light", None)
     }
 
-    /// The chat facts with `messages` as the stream, encoded the way the
-    /// host encodes them.
-    fn chat_facts_with(
-        messages: &[crate::backend::ChatMessage],
-        thread: &[crate::backend::ChatMessage],
-    ) -> Option<Vec<u8>> {
-        chat_facts_in("channel-a", messages, thread, &[])
+    /// One committed row as the index answers it — `thread` naming the root it
+    /// replies to, for the rows a landing seats a rail on.
+    fn chat_row_of(seq: i64, text: &str, thread: Option<i64>) -> serde_json::Value {
+        serde_json::json!({
+            "channel_id": "channel-a", "seq": seq, "message_id": format!("m{seq}"),
+            "author": "acct:7", "height": 84_912, "time": 84_912,
+            "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
+            "text": text, "deleted": false, "edited": false, "rev": 0,
+            "edited_at": null, "base_rev": null, "thread": thread,
+            "reply_count": 0, "last_reply_seq": null, "reactions": [], "tags": []
+        })
     }
 
-    /// The same, reading `room` and carrying the node's live agent rows — the
-    /// two facts the live cards are decided by. Always the WHOLE node's rows:
-    /// narrowing them to `room` is what the host is on the hook for.
+    fn chat_accounts_reply() -> serde_json::Value {
+        serde_json::json!({ "accounts": [
+            { "number": 7, "name": "mallard", "control": { "person": {} },
+              "keys": [{ "pubkey": [0xaa] }] }
+        ]})
+    }
+
+    fn chat_channel_reply() -> serde_json::Value {
+        serde_json::json!({ "channel": {
+            "id": "channel-a", "name": "general", "created_at": 1,
+            "post_policy": "open", "owner": "acct:7", "archived": false,
+            "hooks": [], "huddle": [], "head_seq": 1
+        }})
+    }
+
+    fn chat_members_reply() -> serde_json::Value {
+        serde_json::json!({ "members": {
+            "members": [{ "party": "acct:7", "height": 1, "time": 1 }],
+            "has_more": false
+        }})
+    }
+
+    /// The node a chat view reads, canned for this thread: the identity
+    /// directory, the room record, one message, the roster and its thread.
+    /// A HOST contract driven against the real view needs a room on screen,
+    /// and under the kernel contract the view reads that room for itself.
+    pub(super) fn can_the_chat_room() {
+        can_reads([
+            ("all", chat_accounts_reply()),
+            ("channel", chat_channel_reply()),
+            (
+                "roots",
+                serde_json::json!({ "roots": { "roots": [chat_row(1)], "has_more": false }}),
+            ),
+            ("members", chat_members_reply()),
+            (
+                "thread",
+                serde_json::json!({ "thread": { "root": chat_row(1), "replies": [],
+                    "has_more": false, "next_reply_seq": null }}),
+            ),
+        ]);
+    }
+
+    /// The chat SESSION facts, encoded the way the host encodes them. NO
+    /// TIMELINE: under the kernel contract the view reads its own room's
+    /// messages off the index, so what the app pushes is who the reader is,
+    /// which room she is in, and the runs the node has in flight — always the
+    /// WHOLE node's rows, because narrowing them to `room` is what the host is
+    /// on the hook for.
     fn chat_facts_in(
         room: &'static str,
-        messages: &[crate::backend::ChatMessage],
-        thread: &[crate::backend::ChatMessage],
+        land_seq: i64,
         live: &[crate::backend::LiveAgentRow],
     ) -> Option<Vec<u8>> {
         let general = crate::backend::ChatChannel {
@@ -6858,372 +6729,91 @@ pub(crate) mod tests {
         ];
         let props = ChatProps {
             dark: false,
+            connected: true,
             endpoint: "http://127.0.0.1:1",
             network_name: "testnet",
             network_chain_id: "testnet#abcd",
             status: "Live",
             block_height: 84_912,
-            search_phase: "idle",
-            search_query: "",
-            search_hits: &[],
+            me: "acct:7".into(),
+            me_key: "aa",
+            names_serial: 0,
             rooms: &rooms,
             dm_rows: &[],
             channel_create_open: false,
-            connected: true,
-            loading: false,
-            busy: false,
             active_channel: room,
             active_dm_peer: "",
             active_dm: &crate::backend::DmPeer::default(),
-            active_channel_name: "general",
-            active_channel_archived: false,
-            active_channel_members_only: false,
-            channel_members: &[],
-            post_refusal: "",
+            land_seq,
+            unread_boundary: 0,
+            busy: false,
+            loading: false,
             huddle_joined: false,
             huddle_channel: "",
             huddle_channel_name: "",
             huddle_joined_at: 0,
             huddle_now: 0,
             call_muted: false,
-            messages,
-            has_older_history: false,
-            history_view: false,
-            at_live_tail: true,
-            history_loading: false,
-            unread_boundary: 0,
-            unread_marker_seq: 0,
-            selected_message_seq: 0,
-            selected_message_rev: 0,
-            message_action: "toolbar",
-            channel_settings_open: false,
-            active_thread_seq: 0,
-            thread_target_seq: 0,
-            thread_messages: std::borrow::Cow::Borrowed(thread),
-            thread_selected_seq: 0,
-            thread_selected_rev: 0,
-            thread_message_action: "toolbar",
-            thread_has_more: false,
-            thread_next_reply_seq: 0,
-            thread_loading: false,
-            copy_anchor_seq: 0,
-            copy_head_seq: 0,
-            copy_surface: "nowhere",
+            shift_held: false,
+            copy_chord_serial: 0,
             sent_serial: 0,
-            live_agents: Vec::new(),
+            pending_sends: &[],
+            live_agents: live_agents_within(live, room, LIVE_AGENT_TEXT_BUDGET),
         };
-        Some(encode_chat_props(props, live))
+        Some(serde_json::to_vec(&props).expect("props encode"))
     }
 
-    /// A busy room's whole hot window through the real wire: the newest
-    /// message must still read, and the clipped older ones are offered as
-    /// history.
+    /// `head_within` never cuts inside a char. It is the last of the host's
+    /// text budgets: every stream it used to clip is a view's own read now.
     #[test]
-    fn the_newest_message_of_a_busy_room_still_reads_through_the_wire() {
-        let Some(staged) = staged("chat") else {
-            return;
-        };
-        // 40 rows of 2 KB: past the wire's 64 KiB frame budget, and few
-        // enough rows that the guest lays them out inside one tick
-        const ROWS: i64 = 40;
-        let messages: Vec<_> = (1..=ROWS)
-            .map(|seq| {
-                let body = format!("m{seq} {}", "x".repeat(2_000));
-                crate::backend::ChatMessage {
-                    blocks: crate::backend::paragraph_blocks(&body),
-                    body,
-                    ..first_light_at(seq)
-                }
-            })
-            .collect();
-        let props = chat_facts_with(&messages, &[]);
-        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        let newest = format!("m{ROWS} ");
-        assert!(
-            shown.iter().any(|text| text.starts_with(&newest)),
-            "the newest message is blank (fault {:?}): last texts {:?}",
-            guest.fault,
-            shown
-                .iter()
-                .rev()
-                .take(6)
-                .map(|text| &text[..text.len().min(24)])
-                .collect::<Vec<_>>()
-        );
-        let props_text = String::from_utf8(props.unwrap()).unwrap();
-        assert!(
-            props_text.contains(r#""has_older_history":true"#),
-            "the clip is history"
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// `head_within` never cuts inside a char; the discussion budget keeps
-    /// the landing note whole and the newest notes.
-    #[test]
-    fn the_text_head_and_the_discussion_split_hold_their_budgets() {
+    fn the_text_head_holds_its_budget() {
         assert_eq!(head_within("abc", 3), ("abc", false));
         // "한" is 3 bytes: a 4-byte budget cuts before the second char
         assert_eq!(head_within("한글", 4), ("한", true));
         assert_eq!(head_within("한글", 6), ("한글", false));
-        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
-            author: String::new(),
-            meta: String::new(),
-            body: "x".repeat(bytes),
-            ..first_light_at(seq)
-        };
-        let landing = row(9, 100);
-        let notes = [row(1, 100), row(2, 100), row(3, 100)];
-        let (kept, clipped) = newest_within(&notes, 300usize.saturating_sub(text_bytes(&landing)));
-        assert_eq!(kept.iter().map(|m| m.seq).collect::<Vec<_>>(), [2, 3]);
-        assert!(clipped);
     }
-
-    fn first_light_at(seq: i64) -> crate::backend::ChatMessage {
-        crate::backend::ChatMessage {
-            id: format!("m{seq}"),
-            view_key: seq,
-            seq,
-            ..first_light()
-        }
-    }
-
-    const CHIEF_RUN: &str = "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck";
 
     /// One pending run of `agent`, anchored at seq 2 of `room`.
     fn live_run(room: &str, agent: &str, status: &str) -> crate::backend::LiveAgentRow {
         crate::backend::LiveAgentRow {
             channel_id: room.into(),
             anchor_seq: 2,
-            run_id: CHIEF_RUN.into(),
+            run_id: "chat\u{1f}channel-a\u{1f}2\u{1f}chiefduck".into(),
             agent: agent.into(),
             status: status.into(),
             ..Default::default()
         }
     }
 
-    fn anchored_pair() -> [crate::backend::ChatMessage; 2] {
-        [first_light_at(1), first_light_at(2)]
-    }
-
-    fn chat_run_thread_facts(
-        room: &'static str,
-        messages: &[crate::backend::ChatMessage],
-        thread: &[crate::backend::ChatMessage],
-        live: &[crate::backend::LiveAgentRow],
-    ) -> Option<Vec<u8>> {
-        let bytes = chat_facts_in(room, messages, thread, live)?;
-        let mut props: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        props["active_thread_seq"] = 2.into();
-        Some(serde_json::to_vec(&props).unwrap())
-    }
-
-    /// Run status repaints in its thread through the real host/guest wire.
-    /// Full activity and answer previews remain in the run panel.
-    #[test]
-    fn a_run_in_flight_draws_in_its_thread_and_repaints_as_it_works() {
-        let Some(staged) = staged("chat") else {
-            return;
-        };
-        let messages = anchored_pair();
-        let starting = live_run("channel-a", "Chief Duck", "Starting");
-        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&chat_facts_in(
-            "channel-a", &messages, &[], std::slice::from_ref(&starting),
-        ));
-        assert!(button_shown(&guest, "Chief Duck · View thread"));
-        assert!(!button_shown(&guest, "Stop"));
-        assert!(!texts(&guest).iter().any(|text| text == "Starting"));
-        guest.redraw(&chat_run_thread_facts(
-            "channel-a",
-            &messages,
-            &[],
-            std::slice::from_ref(&starting),
-        ));
-        let shown = texts(&guest);
-        for expected in ["Chief Duck", "AGENT", "Starting"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} (fault {:?}) in {shown:?}",
-                guest.fault
-            );
-        }
-
-        let working = crate::backend::LiveAgentRow {
-            status: "Reading the repo".into(),
-            activity: vec![
-                crate::backend::LiveActivity {
-                    label: "Command: cargo test".into(),
-                    done: true,
-                },
-                crate::backend::LiveActivity {
-                    label: "Reasoning".into(),
-                    done: false,
-                },
-            ],
-            answer_preview: "the files crate builds clean".into(),
-            ..starting
-        };
-        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &[working]));
-        let shown = texts(&guest);
-        assert!(
-            shown.iter().any(|text| text == "Reading the repo"),
-            "the run's status never reached the frame: {shown:?}"
-        );
-        for progress in [
-            "Command: cargo test",
-            "Reasoning",
-            "the files crate builds clean",
-        ] {
-            assert!(
-                !shown.iter().any(|text| text == progress),
-                "the run's progress is the run panel's, not the stream's: {progress:?} in {shown:?}"
-            );
-        }
-        assert!(
-            button_shown(&guest, "View run"),
-            "no way from the hint to the run panel (fault {:?}): {:?}",
-            guest.fault,
-            texts(&guest)
-        );
-        assert!(
-            !shown.iter().any(|text| text == "Starting"),
-            "the stale status is still drawn: {shown:?}"
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// STOP LEAVES AS A CANCEL, AND A SETTLED RUN TAKES ITS CARD WITH IT. The
-    /// row lives exactly as long as the run is pending in `runs`, so the block
-    /// that posts the reply is the block that prunes it — cancelled and
-    /// completed reconcile through that one path, and nothing of the run is
-    /// left on the frame beside the committed message.
-    #[test]
-    fn stopping_a_run_leaves_as_a_cancel_and_a_settled_run_drops_its_card() {
-        let Some(staged) = staged("chat") else {
-            return;
-        };
-        let messages = anchored_pair();
-        let live = live_run("channel-a", "Chief Duck", "Reading the repo");
-        let facts = chat_run_thread_facts("channel-a", &messages, &[], std::slice::from_ref(&live));
-        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&facts);
-        assert!(
-            button_shown(&guest, "Stop"),
-            "no way to stop the run (fault {:?}): {:?}",
-            guest.fault,
-            texts(&guest)
-        );
-
-        guest.deliver(Output::Activate(button_message(&guest, "Stop")));
-        guest.redraw(&facts);
-        let fired = std::mem::take(&mut guest.intents);
-        let [intent] = fired.as_slice() else {
-            panic!("one intent, got {fired:?}");
-        };
-        assert_eq!(intent.kind, "cancel_run", "{intent:?}");
-        // the app's own half of the seam: the press becomes the intent the
-        // handler signs, carrying the run it names. Read through the DECODER,
-        // not compared to a JSON string: a run id's separator is an escape on
-        // the wire, so a literal comparison pins the encoder's escaping and
-        // calls it a seam.
-        assert!(matches!(chat_intent(intent), crate::ChatIntent::CancelRun));
-        assert_eq!(event_text(intent, "run_id"), CHIEF_RUN);
-
-        // THE RUN SETTLED: its pending entry pruned in the block that posted
-        // the reply, so the reading no longer carries it.
-        let mut reply = first_light_at(3);
-        reply.body = "the files crate builds clean".into();
-        reply.blocks = crate::backend::paragraph_blocks(&reply.body);
-        reply.author = "Chief Duck".into();
-        reply.avatar_kind = "agent".into();
-        let settled = [messages[0].clone(), messages[1].clone(), reply];
-        guest.redraw(&chat_run_thread_facts("channel-a", &settled, &[], &[]));
-        let shown = texts(&guest);
-        assert!(
-            !button_shown(&guest, "Stop"),
-            "the settled run left its Stop behind: {shown:?}"
-        );
-        assert!(
-            !shown.iter().any(|text| text == "Reading the repo"),
-            "the settled run left its status behind: {shown:?}"
-        );
-        assert!(
-            shown
-                .iter()
-                .any(|text| text == "the files crate builds clean"),
-            "the committed reply did not take the card's place: {shown:?}"
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// ROOM ISOLATION, DECIDED BY THE HOST. The reading covers the whole node,
-    /// so the room on screen is the only thing that picks rows out of it — and
-    /// it is picked at encode time, which is why no handler that moves
-    /// `active_channel` has to remember this lane exists. Asserted on the
-    /// PRODUCTION PROPS as well as the frame: a row the encoder kept would
-    /// reach a guest that happened not to draw it today.
+    /// ROOM ISOLATION, DECIDED BY THE HOST. A run lives in this process, not on
+    /// the chain, so it reaches the view as a session fact — and the reading
+    /// covers the WHOLE node. The room on screen is what picks rows out of it,
+    /// and it is picked at encode time, which is why no handler that moves
+    /// `active_channel` has to remember this lane exists. What the view then
+    /// DRAWS of a run — the door under its anchor, the card in its thread, and
+    /// Stop leaving as a cancel — is the view's own test.
     #[test]
     fn the_room_on_screen_decides_which_of_the_nodes_runs_are_drawn() {
-        let messages = anchored_pair();
         let reading = [
             live_run("channel-a", "Chief Duck", "Reading the repo"),
             live_run("channel-b", "Ops Duck", "Draining the queue"),
         ];
 
-        let here = String::from_utf8(
-            chat_run_thread_facts("channel-a", &messages, &[], &reading).expect("props encode"),
-        )
-        .unwrap();
+        let here =
+            String::from_utf8(chat_facts_in("channel-a", 0, &reading).expect("props encode")).unwrap();
         assert!(here.contains("Chief Duck"), "this room's run is missing");
         assert!(
             !here.contains("Ops Duck"),
             "another room's run crossed to the view: {here}"
         );
 
-        let there = String::from_utf8(
-            chat_run_thread_facts("channel-b", &messages, &[], &reading).expect("props encode"),
-        )
-        .unwrap();
+        let there =
+            String::from_utf8(chat_facts_in("channel-b", 0, &reading).expect("props encode")).unwrap();
         assert!(there.contains("Ops Duck"), "that room's run is missing");
         assert!(
             !there.contains("Chief Duck"),
             "the room she left kept its run on the frame: {there}"
         );
-
-        let Some(staged) = staged("chat") else {
-            return;
-        };
-        let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &reading));
-        let shown = texts(&guest);
-        assert!(
-            shown.iter().any(|text| text == "Reading the repo"),
-            "(fault {:?}) {shown:?}",
-            guest.fault
-        );
-        assert!(
-            !shown.iter().any(|text| text == "Draining the queue"),
-            "{shown:?}"
-        );
-        // the same reading, the other room on screen
-        guest.redraw(&chat_run_thread_facts("channel-b", &messages, &[], &reading));
-        let shown = texts(&guest);
-        assert!(
-            shown.iter().any(|text| text == "Draining the queue"),
-            "{shown:?}"
-        );
-        assert!(
-            !shown.iter().any(|text| text == "Reading the repo"),
-            "the room she left kept its card: {shown:?}"
-        );
-        assert!(guest.fault.is_none());
     }
 
     /// A room full of runs cannot blank the messages they sit under: the cards
@@ -7260,44 +6850,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The budget keeps the newest, drops the oldest, says so; the thread
-    /// keeps its root.
-    #[test]
-    fn the_timeline_budget_drops_the_oldest_first_and_keeps_the_thread_root() {
-        let row = |seq: i64, bytes: usize| crate::backend::ChatMessage {
-            author: String::new(),
-            meta: String::new(),
-            body: "x".repeat(bytes),
-            ..first_light_at(seq)
-        };
-        let stream = [row(1, 100), row(2, 100), row(3, 100)];
-        assert_eq!(newest_within(&stream, 250).0.len(), 2);
-        assert_eq!(newest_within(&stream, 250).0[0].seq, 2);
-        assert!(newest_within(&stream, 250).1);
-        assert_eq!(newest_within(&stream, 300), (&stream[..], false));
-
-        let big = TIMELINE_TEXT_BUDGET / 2;
-        let root = crate::backend::ChatMessage {
-            thread_seq: 0,
-            ..row(10, 10)
-        };
-        let reply = |seq| crate::backend::ChatMessage {
-            thread_seq: 10,
-            ..row(seq, big)
-        };
-        let thread = [root, reply(11), reply(12), reply(13)];
-        let facts: serde_json::Value =
-            serde_json::from_slice(&chat_facts_with(&[], &thread).unwrap()).unwrap();
-        assert_eq!(facts["thread_has_more"], true);
-        let kept: Vec<i64> = facts["thread_messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|message| message["seq"].as_i64().unwrap())
-            .collect();
-        assert_eq!(kept, [10, 13], "the root, then the newest reply that fits");
-    }
-
     /// The facts a module's host pushes, and one word of them the tree
     /// shows — what a swap must carry from A into B's first tree.
     fn facts(module: &str) -> (Option<Vec<u8>>, &'static str) {
@@ -7305,7 +6857,7 @@ pub(crate) mod tests {
             "governance" => (session_props(), "prop-1"),
             "files" => (files_facts(), "README.md"),
             "pages" => (pages_facts(), "Alpha"),
-            "chat" => (chat_facts(), "first light"),
+            "chat" => (chat_facts(), "general"),
             // forge reads its whole screen off the node; what the session
             // alone paints is the network it is reading
             _ => (forge_facts(), "duckhouse"),

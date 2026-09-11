@@ -170,7 +170,7 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7, 7));
+    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
     assert!(!app.palette_open);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 }
@@ -1209,43 +1209,6 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
     );
 }
 
-/// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
-///
-/// Channel details unmounts the rail — `if active_thread_seq > 0 &&
-/// !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
-/// flag on the way in, so opening a thread action and then the drawer is a
-/// mouse-reachable state where the ladder's first rung named a menu nobody
-/// could see: the press wiped a half-typed `thread_edit_draft` and left the
-/// drawer standing. Same rule as the tab scoping, one level down — a rung
-/// answers only while its surface is mounted.
-#[test]
-fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Chat;
-    app.active_channel = "general".into();
-    app.thread_selected_seq = 7;
-    app.thread_message_action = MessageAction::Editing;
-    app.thread_edit_draft = "half typed".into();
-    app.channel_settings_open = true;
-
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert!(
-        !app.channel_settings_open,
-        "the first Escape closes the drawer the reader is looking at"
-    );
-    assert_eq!(
-        app.thread_edit_draft, "half typed",
-        "and leaves the unmounted rail's draft where she left it"
-    );
-    assert_eq!(app.thread_message_action, MessageAction::Editing);
-
-    // With the drawer down the rail is mounted again, and its rung answers.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
-    assert_eq!(app.thread_edit_draft, "");
-}
-
 /// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
 ///
 /// #1132 scoped every per-tab rung in `topmost_overlay` by reading
@@ -1447,26 +1410,10 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.shell_tab = ShellTab::Chat;
-    app.selected_message_seq = 4;
-    app.selected_message_rev = 2;
-    app.message_action = MessageAction::More;
-    app.message_edit_draft = "half typed".into();
-    app.thread_selected_seq = 7;
-    app.thread_selected_rev = 1;
-    app.thread_message_action = MessageAction::Editing;
-    app.thread_edit_draft = "half typed too".into();
     app.page_delete_armed = true;
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
 
-    assert_eq!(app.message_action, MessageAction::Toolbar);
-    assert_eq!(app.message_edit_draft, "");
-    assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
-    assert_eq!(app.thread_edit_draft, "");
-    assert_eq!(app.thread_selected_seq, 0);
-    assert_eq!(app.thread_selected_rev, 0);
     assert!(
         !app.page_delete_armed,
         "an armed delete never rides a tab move"
@@ -1484,22 +1431,16 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
     // from the seat that is already active, and Settings' rows emit their own
     // tab while the reader is on it — so an unconditional retire is one click
-    // from destroying an inline edit on the screen she never left.
+    // from destroying an armed confirm on the screen she never left.
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
-    app.shell_tab = ShellTab::Chat;
-    app.selected_message_seq = 4;
-    app.selected_message_rev = 2;
-    app.message_action = MessageAction::Editing;
-    app.message_edit_draft = "still typing".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(
-        app.message_edit_draft, "still typing",
+    app.shell_tab = ShellTab::Pages;
+    app.page_delete_armed = true;
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
+    assert!(
+        app.page_delete_armed,
         "clicking the tab you are on retires nothing"
     );
-    assert_eq!(app.message_action, MessageAction::Editing);
-    assert_eq!(app.selected_message_seq, 4);
-    assert_eq!(app.selected_message_rev, 2);
 }
 
 /// THE FIVE IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only

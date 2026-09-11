@@ -38,22 +38,14 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
-    // The evicted inline edit is rescued to the composer of the room it was
-    // in, not to an app-wide plate (ducktape-ui#698). The DESTINATION is the
-    // half worth pinning: `active_channel` still names the room being LEFT
-    // here — its own assignment is further down the handler — so the rescue
-    // cannot surface over the room the resync is carrying her to.
-    assert!(refresh.contains(
-        "composer_stashed = chat_composer_unsent(composer_scope(connected_rpc, active_channel), \
-keep_str(message_action == MessageAction.editing, message_edit_draft, \"\"), \
-selected_message_seq > 0 || message_action != MessageAction.editing)"
-    ));
+    // THE INLINE EDIT IS THE CHAT VIEW'S NOW, and so is the row it was armed
+    // on: a resync carries the room, and the view re-reads it. What the app
+    // still holds of an edit in flight is the row it named, which a resync
+    // that moved the room cannot keep pointing at.
+    assert!(!refresh.contains("message_edit_draft"));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
     assert_no_polling(&lifecycle);
     assert!(lifecycle.contains("run replace lane=live_resync live_resync_load(connected_rpc"));
-    assert!(lifecycle.contains("run replace lane=live_thread refresh_live_thread(connected_rpc"));
-    assert!(lifecycle.contains("parallel\n    run replace lane=live_thread refresh_live_thread("));
     // Page-scoped state waits for a reply that answers for the page in hand —
     // a resync issued before a mutation moved the selection speaks for a
     // document nobody is on. And the fold-owned fields (#1041) additionally
@@ -135,13 +127,13 @@ fn context_destroying_page_handlers_recover_drafts() {
 
 /// THE STREAM'S LOAD FLAG IS NOT THE RAIL'S, AND THE RAIL'S SEND SAID SO.
 ///
-/// `reply_composer_event` refused on `loading` — a term neither the reply
-/// editor, its marks row nor its Send button wears — so in the one state that
-/// can raise it under an open rail the reader saw a fully lit Send, pressed it,
+/// The reply submit refused on `loading` — a term neither the reply editor,
+/// its marks row nor its Send button wears — so in the one state that can
+/// raise it under an open rail the reader saw a fully lit Send, pressed it,
 /// and got nothing: no post, no error, no banner. Every chat-plane writer of
-/// `loading = true` zeroes `active_thread_seq` in the same handler, so the term
-/// never fired for a chat load at all; the state it caught was a PAGES load
-/// still in flight behind a cross-tab bounce.
+/// `loading = true` closes the room the rail belongs to, so the term never
+/// fired for a chat load at all; the state it caught was a PAGES load still in
+/// flight behind a cross-tab bounce.
 #[test]
 fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
     let _turn = crate::module_view::tests::blocking_connection_turn();
@@ -149,17 +141,16 @@ fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
-    app.active_thread_seq = 7;
     // What `open_page_search_hit` leaves behind: the stream's flag up, the rail
     // untouched, and `select_shell_tab` back to Chat clears neither.
     app.loading = true;
     submit(&mut app, ComposerKind::Reply, "on it");
     assert_eq!(
-        app.thread_messages.len(),
+        app.chat_pending_sends.len(),
         1,
         "a Send the surface draws as live must actually send"
     );
-    assert!(app.thread_messages[0].pending);
+    assert_eq!(app.chat_pending_sends[0].thread_seq, RAIL_THREAD_SEQ);
 }
 
 // The dirty gate makes the tick FIRE; these two guards make it WAIT. An
@@ -904,11 +895,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
         pages: vec![page_item("page", "Old Name"), page_item("other", "Other")],
         active_page_title: "Old Name".into(),
         fold_serial: request_fold_serial,
-        ..live_refresh(
-            resync_generation,
-            "",
-            Vec::new(),
-            "page",
+        ..live_refresh(resync_generation, "", "page",
             vec![
                 page_block("b1", "page", "body"),
                 page_block("b2", "page", "inserted"),
@@ -1001,11 +988,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
         comment_thread_total: 4,
         commented_block_hits: vec!["b1".into()],
         fold_serial: request_fold_serial,
-        ..live_refresh(
-            resync_generation,
-            "",
-            Vec::new(),
-            "page",
+        ..live_refresh(resync_generation, "", "page",
             vec![page_block("b1", "page", "body")],
         )
     }));
@@ -1087,11 +1070,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
         pages: vec![page_item("page", "Doc")],
         active_page_title: "Doc".into(),
         fold_serial: request_fold_serial,
-        ..live_refresh(
-            resync_generation,
-            "",
-            Vec::new(),
-            "page",
+        ..live_refresh(resync_generation, "", "page",
             vec![
                 page_block("b1", "page", "body"),
                 page_block("b2", "page", "inserted"),
@@ -1168,11 +1147,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
         pages: vec![page_item("page", "Renamed Again")],
         active_page_title: "Renamed Again".into(),
         fold_serial: app.pages_fold_serial,
-        ..live_refresh(
-            app.hydration_generation,
-            "",
-            Vec::new(),
-            "page",
+        ..live_refresh(app.hydration_generation, "", "page",
             vec![page_block("b1", "page", "body")],
         )
     }));
@@ -1228,11 +1203,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     assert_eq!(app.block_comment_draft, "draft stays");
 
     // the scoped reload lands and re-arms the comment refresh
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
-        resync_generation,
-        "",
-        Vec::new(),
-        "page",
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(resync_generation, "", "page",
         vec![backend::PageBlock {
             key: 0,
             id: "block-1".into(),

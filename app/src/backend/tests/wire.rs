@@ -218,7 +218,7 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
 
     // The joining resident: nothing folded yet, so no id resolves — including
     // the one the sidebar is asking for.
-    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network")
         .await
         .expect("an unseen room is an empty console, not a failed load");
     assert!(
@@ -252,7 +252,7 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
     )
     .await;
 
-    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network")
         .await
         .expect("an unseen room is a landing, not a failed load");
     assert_eq!(
@@ -260,7 +260,6 @@ async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
         "the id nothing answers for resolves to the landing channel"
     );
     assert_eq!(landed.active_channel_name, "Engineering");
-    assert_eq!(landed.messages.len(), 1, "and it lands with its timeline");
     sim.shutdown();
 }
 
@@ -345,7 +344,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
 
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.channels[0].name, "General");
-    assert_eq!(chat.messages[0].body, "hello from the app");
     let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
     assert_eq!(pages.active_page_title, "Welcome");
     assert_eq!(pages.blocks[0].text, "A signed page block");
@@ -484,58 +482,14 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     wait_for_block(&mut live, base_height + 3).await;
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.active_channel_name, "General");
-    assert_eq!(chat.messages[0].body, "hello, edited");
-    assert!(chat.messages[0].edited);
-    assert_eq!(chat.messages[0].reply_count, 1);
-    assert_eq!(chat.messages[0].reactions[0].emoji, "👍");
-    let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
-    assert_eq!(thread.messages.len(), 2);
-    assert_eq!(thread.messages[1].body, "a threaded reply");
-    let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3, 7)
-        .await
-        .unwrap();
-    // ONE ROW BACK, NOT A PRE-CLICK LIST SNAPSHOT. Search navigation reads only
-    // the selected channel row; carrying a list back would revert deltas the
-    // live stream folded during the round trip (`upsert_channel_rows`).
-    assert_eq!(
-        hit.channels
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["general"]
-    );
-    assert_eq!(hit.generation, 7);
-    assert_eq!(hit.selected_message_seq, 1);
-    assert_eq!(hit.active_thread_seq, 1);
-    assert_eq!(hit.thread_target_seq, 3);
-    assert_eq!(hit.thread_messages[1].body, "a threaded reply");
-    // A duck://channel/general#3 link supplies only the reply's sequence.
-    // Resolve its canonical thread root instead of looking for reply 3 in
-    // the root-only channel window and reporting "message was not found".
-    let linked_reply = load_chat_hit(origin.clone(), "general".into(), 3, 3, 8)
-        .await
-        .unwrap();
-    assert_eq!(linked_reply.generation, 8);
-    assert_eq!(linked_reply.selected_message_seq, 1);
-    assert_eq!(linked_reply.active_thread_seq, 1);
-    assert_eq!(linked_reply.thread_target_seq, 3);
-    assert_eq!(linked_reply.thread_messages[1].body, "a threaded reply");
-    let linked_root = load_chat_hit(origin.clone(), "general".into(), 1, 1, 9)
-        .await
-        .unwrap();
-    assert_eq!(linked_root.selected_message_seq, 1);
-    assert_eq!(linked_root.active_thread_seq, 0);
-    assert!(linked_root.thread_messages.is_empty());
-    let wrong_thread = load_chat_hit(origin.clone(), "general".into(), 2, 3, 10).await;
-    assert!(
-        wrong_thread.is_err(),
-        "a supplied root must still match the reply"
-    );
-    let missing = load_chat_hit(origin.clone(), "general".into(), 999, 999, 11).await;
-    assert!(
-        missing.is_err(),
-        "an index-clamped neighbor is not the requested message"
-    );
+    // THE EDIT, THE REPLY AND THE REACTION ARE THE VIEW'S TO READ. What the
+    // app still reads of a room is its record and its rosters; the rows those
+    // three ops changed are read back in `chat-view`'s own tests.
+    let edited = load_messages(&rpc, "general").await.unwrap();
+    assert_eq!(edited[0].body, "hello, edited");
+    assert!(edited[0].edited);
+    assert_eq!(edited[0].reply_count, 1);
+    assert_eq!(edited[0].reactions[0].emoji, "👍");
     submit_test(
         &rpc,
         &signer,
@@ -674,7 +628,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         "the reply echoes the fold serial the request snapshotted (#1041)"
     );
     assert!(refreshed.chat_loaded && refreshed.pages_loaded);
-    assert_eq!(refreshed.messages[1].body, "arrived on the next block");
+    assert_eq!(refreshed.active_channel_name, "General");
     assert_eq!(refreshed.active_page, "welcome");
     sim.shutdown();
 }

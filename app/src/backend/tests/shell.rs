@@ -367,27 +367,18 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     use iced::keyboard::{Key, key::Named};
 
     let escape = Key::Named(Named::Escape);
-    let target = |tab: ShellTab,
-                  palette: bool,
-                  bell: bool,
-                  create: bool,
-                  thread_action: MessageAction,
-                  action: MessageAction,
-                  drawer: bool| {
+    let target = |tab: ShellTab, palette: bool, bell: bool, create: bool| {
         escape_target(
             escape.clone(),
             tab,
             palette,
             bell,
             create,
-            thread_action,
-            action,
-            drawer,
             false,
         )
     };
 
-    // Not Escape → nothing, whatever is open.
+    // Not Escape -> nothing, whatever is open.
     assert_eq!(
         escape_target(
             Key::Character("x".into()),
@@ -395,111 +386,15 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             true,
             true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
             true,
         ),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            true,
-            true,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        ""
-    );
-    // The ladder order is the z-order: bell over the create modal, menus
-    // after both, thread menu over the stream's, popovers last.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            true,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        "bell"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            true,
-            MessageAction::More,
-            MessageAction::More,
-            true,
-        ),
-        "channel_create"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::More,
-            MessageAction::More,
-            false,
-        ),
-        "thread_menu"
-    );
-    // AND THE DRAWER OUTRANKS THE THREAD MENU WHEN IT IS OPEN. The rail is not
-    // mounted while Channel details is up (`if active_thread_seq > 0 &&
-    // !channel_settings_open`, `screens/chat.ice`), so a ⋯ flag left set behind
-    // it names no layer on screen — this test used to pin the opposite verdict,
-    // where the first Escape wiped `thread_edit_draft` and left the drawer
-    // standing.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::More,
-            MessageAction::Toolbar,
-            true,
-        ),
-        "channel_settings"
-    );
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Editing,
-            true,
-        ),
-        "message_menu"
-    );
-    // THE DRAWER SITS UNDER THE STREAM'S MENU, which floats over Channel
-    // details, so it wins.
-    // It had no rung at all — an `×` and no keyboard exit, while every other
-    // overlay answered Escape. Measured: Escape over an open drawer changed
-    // exactly zero pixels on the running app.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            true,
-        ),
-        "channel_settings"
-    );
+    assert_eq!(target(ShellTab::Chat, true, true, true), "");
+    // The ladder order is the z-order: bell over the create modal.
+    assert_eq!(target(ShellTab::Chat, false, true, true), "bell");
+    assert_eq!(target(ShellTab::Chat, false, false, true), "channel_create");
     // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
     // the Pages screen — so it is a rung, and it answers only from Pages.
     let armed = |tab: ShellTab, page_delete: bool| {
@@ -509,37 +404,23 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             false,
             false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
             page_delete,
         )
     };
     assert_eq!(armed(ShellTab::Pages, true), "page_delete");
     assert_eq!(armed(ShellTab::Chat, true), "");
 
-    // Nothing transient open → Escape is a no-op. The pages block menus are
-    // gone with the surfaces they dismissed.
-    assert_eq!(
-        target(
-            ShellTab::Chat,
-            false,
-            false,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-        ),
-        ""
-    );
+    // Nothing transient open -> Escape is a no-op. THE CHAT RUNGS ARE GONE
+    // WITH THE CHAT SCREEN: its menus and its details drawer are the view's
+    // own layers now, dismissed inside the view.
+    assert_eq!(target(ShellTab::Chat, false, false, false), "");
 }
 
 // A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
-// clears menu state (`select_shell_tab` leaves every menu flag set), so a
-// ⋯ menu opened on Chat is still SET while Pages is on screen —
-// unscoped, that stale flag ate the first Escape on every other tab. The
-// palette, bell and create modal are mounted OUTSIDE the tab
-// match in `components/shell.ice` and keep answering from every tab.
+// clears overlay state, so a layer armed on one tab is still SET while
+// another is on screen — unscoped, that stale flag ate the first Escape
+// everywhere else. The palette, bell and create modal are mounted OUTSIDE the
+// tab match in `components/shell.ice` and keep answering from every tab.
 #[test]
 fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     use iced::keyboard::{Key, key::Named};
@@ -547,72 +428,21 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     let escape = Key::Named(Named::Escape);
     let none = String::new();
 
-    // One closure per reader, the sibling test's `target` shape: tab first,
-    // then one argument per layer.
-    let overlay =
-        |tab: ShellTab, thread_action: MessageAction, action: MessageAction, drawer: bool| {
-            topmost_overlay(
-                tab,
-                false,
-                false,
-                false,
-                thread_action,
-                action,
-                drawer,
-                false,
-            )
-        };
-    let target = |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            bell,
-            create,
-            thread_action,
-            MessageAction::Toolbar,
-            false,
-            false,
-        )
+    let overlay = |tab: ShellTab, page_delete: bool| {
+        topmost_overlay(tab, false, false, false, page_delete)
+    };
+    let target = |tab: ShellTab, bell: bool, create: bool| {
+        escape_target(escape.clone(), tab, false, bell, create, false)
     };
 
-    // A stale chat menu names no layer from another tab — for BOTH readers.
-    let stale_thread_menu =
-        |tab: ShellTab| overlay(tab, MessageAction::More, MessageAction::Toolbar, false);
-    assert_eq!(stale_thread_menu(ShellTab::Chat), "thread_menu");
-    assert_eq!(stale_thread_menu(ShellTab::Pages), none);
-    assert_eq!(stale_thread_menu(ShellTab::Explorer), none);
-
-    // Same for the stream's menu and the details drawer.
-    assert_eq!(
-        overlay(
-            ShellTab::Files,
-            MessageAction::Toolbar,
-            MessageAction::Editing,
-            false,
-        ),
-        none
-    );
-    assert_eq!(
-        overlay(
-            ShellTab::Pages,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            true,
-        ),
-        none
-    );
+    // A stale armed delete names no layer from another tab — for BOTH readers.
+    assert_eq!(overlay(ShellTab::Pages, true), "page_delete");
+    assert_eq!(overlay(ShellTab::Chat, true), none);
 
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
-    assert_eq!(
-        target(ShellTab::Governance, true, false, MessageAction::Toolbar),
-        "bell"
-    );
-    assert_eq!(
-        target(ShellTab::Node, false, true, MessageAction::Toolbar),
-        "channel_create"
-    );
+    assert_eq!(target(ShellTab::Governance, true, false), "bell");
+    assert_eq!(target(ShellTab::Node, false, true), "channel_create");
 }
 
 #[test]
@@ -781,22 +611,6 @@ checkpoint_blocks = 32
         workspace_endpoint(&dir).as_deref(),
         Some("http://127.0.0.1:8844")
     );
-}
-
-#[test]
-fn membership_removal_preserves_the_exact_stored_party() {
-    let key = "ab".repeat(32);
-    assert_eq!(member_party("acct:42").unwrap(), ::chat::Party::Account(42));
-    assert_eq!(
-        member_party(&key).unwrap(),
-        ::chat::Party::Key(vec![0xab; 32])
-    );
-    assert_eq!(
-        member_party(&format!("user:{key}")).unwrap(),
-        ::chat::Party::Key(vec![0xab; 32])
-    );
-    assert!(member_party("module:chat").is_err());
-    assert!(member_party("acct:invalid").is_err());
 }
 
 #[test]

@@ -674,7 +674,7 @@ test palette_overlay_contract
         dismiss_toast -> dismiss_toast
         close_palette -> close_palette
         palette_changed -> palette_changed _
-        open_chat_search_hit -> open_chat_search_hit _ _ _
+        open_chat_search_hit -> open_chat_search_hit _ _
         open_page_search_hit -> open_page_search_hit _ _
   target field = #overlays/palette-input
   expect exists field
@@ -719,7 +719,7 @@ test palette_backdrop_takes_the_pointer
           dismiss_toast -> dismiss_toast
           close_palette -> close_palette
           palette_changed -> palette_changed _
-          open_chat_search_hit -> open_chat_search_hit _ _ _
+          open_chat_search_hit -> open_chat_search_hit _ _
           open_page_search_hit -> open_page_search_hit _ _
   target beneath = #beneath
   target field = #overlays/palette-input
