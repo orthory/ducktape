@@ -379,6 +379,20 @@ pub fn keep_str(keep: bool, next: &str, current: &str) -> String {
     if keep { next } else { current }.to_owned()
 }
 
+/// The page list's narrowest and widest, in logical pixels: under the first a
+/// page title is a column of syllables, over the second the list is reading
+/// the document's own room.
+const SIDEBAR_MINIMUM: f64 = 180.0;
+const SIDEBAR_MAXIMUM: f64 = 420.0;
+
+/// Where a drag on the list's edge leaves it. The document keeps at least half
+/// the window whatever the reader drags, so a narrow console cannot be dragged
+/// down to a sliver of page.
+pub fn sidebar_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(SIDEBAR_MINIMUM, SIDEBAR_MAXIMUM);
+    (width + delta).clamp(SIDEBAR_MINIMUM, maximum)
+}
+
 /// A search answer is standing when the query it was sent for is still what
 /// the box holds and the round trip is over.
 pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
