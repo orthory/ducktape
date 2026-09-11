@@ -3,7 +3,7 @@
 // readings arrive as props, interaction-local state stays here, and only
 // application effects leave as named events the view root turns into intents.
 
-component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, omitted:i64, diff_omitted:i64, preview_display_clipped:bool)
+component FilesScreen(tree_width:f64, preview_pane_height:f64, object_width:f64, path:str, parent:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, edit_context:str, edit_blocked:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str, omitted:i64, diff_omitted:i64, preview_display_clipped:bool)
   lifetime retained
   emits
     open_message_link(str)
@@ -19,6 +19,9 @@ component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], dire
     fs_begin_edit(str)
     fs_cancel_edit(str)
     fs_save_edit(str)
+    resize_tree(f64, f64)
+    resize_preview(f64, f64)
+    resize_object(f64, f64)
   state
     history_open = false
   on fs_toggle_history
@@ -160,18 +163,18 @@ component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], dire
         bg=separator
       space w=1.0 h=1.0
     row w=fill h=fill
-      // 206px directory pane. `files_ls` loads one level at a time, so this
+      // Resizable directory pane. `files_ls` loads one level at a time, so this
       // is the current level's directories, not a recursively expanded tree
       // — depth stays 0 until a per-level expansion state exists.
-      box
+      box #tree-pane
         with
-          w=206.0
+          w=tree_width
           h=fill
           bg=sidebar
           clip=true
         col w=fill h=fill
           // The artifact's A1 header. Without it a level with no
-          // subdirectories rendered a blank 206px column that reads as a
+          // subdirectories rendered a blank column that reads as a
           // broken pane rather than an empty one. The subtitle states
           // what duckfs IS and needs no reading to back it.
           //
@@ -245,12 +248,14 @@ component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], dire
                       depth=0.0
                     forward
                       fs_open_dir
-      box
-        with
-          w=1.0
-          h=fill
-          bg=separator
-        space w=1.0 h=1.0
+      resize-handle #tree-resize drag=emit(resize_tree, _, _) cursor=resize-horizontal
+        box #tree-divider
+          with
+            w=10.0
+            h=fill
+            align-x=start
+          box w=1.0 h=fill bg=separator
+            space w=1.0 h=1.0
       col w=fill h=fill
         // NOT CONNECTED IS NOT EMPTY. The listing and the snapshot log both
         // arrive over the node; with it down this pane used to plate "Empty
@@ -394,13 +399,15 @@ component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], dire
                       fs_open_dir
                       fs_open_file
             if !empty(preview_path)
-              col w=fill h=300.0
-                box
+              resize-handle #preview-resize drag=emit(resize_preview, _, _) cursor=resize-vertical
+                box #preview-divider
                   with
                     w=fill
-                    h=1.0
-                    bg=separator
-                  space w=1.0 h=1.0
+                    h=10.0
+                    align-y=start
+                  box w=fill h=1.0 bg=separator
+                    space w=1.0 h=1.0
+              col #preview-pane w=fill h=preview_pane_height
                 box
                   with
                     w=fill
@@ -508,4 +515,13 @@ component FilesScreen(path:str, parent:str, listed:bool, entries:[FsEntry], dire
                                 extern forge_code(cached_source, preview_path, dark) #fs-code
       if connected
         if !empty(preview_entry.path)
-          ObjectPanel entry=preview_entry
+          resize-handle #object-resize drag=emit(resize_object, _, _) cursor=resize-horizontal
+            box #object-divider
+              with
+                w=10.0
+                h=fill
+                bg=sidebar
+                align-x=center
+              box w=2.0 h=fill bg=separator
+                space w=2.0 h=1.0
+          ObjectPanel #object-panel entry=preview_entry width=object_width

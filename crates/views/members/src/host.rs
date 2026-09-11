@@ -436,6 +436,11 @@ pub(crate) fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -
         .collect()
 }
 
+pub fn member_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.5).clamp(260.0, 520.0);
+    (width + delta).clamp(260.0, maximum)
+}
+
 /// Two letters for a machine principal: the first of each of two words, else
 /// the first two alphanumerics.
 pub fn initials_of(name: &str) -> String {

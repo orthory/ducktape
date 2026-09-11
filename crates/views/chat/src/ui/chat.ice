@@ -213,7 +213,7 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveRunHint], timeline:Timeline, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(sidebar_width:f64, details_width:f64, thread_width:f64, endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, busy:bool, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], live_agents:[LiveRunHint], timeline:Timeline, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
     cancel_run(str)
@@ -252,6 +252,8 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
     add_channel_member_submit()
     remove_channel_member_submit(str)
     close_thread()
+    resize_sidebar(f64, f64)
+    resize_details(f64, f64)
     resize_thread(f64, f64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
@@ -278,9 +280,9 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
   on thread_resized(_width, height)
     thread_height = height
   row w=fill h=fill
-    box
+    box #channel-sidebar
       with
-        w=236.0
+        w=sidebar_width
         h=fill
         bg=sidebar
         clip=true
@@ -523,12 +525,14 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
         // No account footer: the rail's avatar and Settings already carry the
         // signed-in identity, and a "Not signed in" fallback under a live
         // conversation was pure noise.
-    box
-      with
-        w=1.0
-        h=fill
-        bg=separator
-      space w=1.0 h=1.0
+    resize-handle #sidebar-resize drag=emit(resize_sidebar, _, _) cursor=resize-horizontal
+      box #sidebar-divider
+        with
+          w=10.0
+          h=fill
+          align-x=start
+        box w=1.0 h=fill bg=separator
+          space w=1.0 h=1.0
     box
       with
         w=fill
@@ -1371,15 +1375,18 @@ component ChatScreen(thread_width:f64, endpoint:str, network_name:str, network_c
         // the archive act alone at the bottom where a destructive control
         // belongs. It stopped being an unlabeled pile of input rows.
         if channel_settings_open && !empty(active_channel)
-          box
+          resize-handle #details-resize drag=emit(resize_details, _, _) cursor=resize-horizontal
+            box #details-divider
+              with
+                w=10.0
+                h=fill
+                bg=sidebar
+                align-x=center
+              box w=2.0 h=fill bg=separator
+                space w=2.0 h=1.0
+          box #details-pane
             with
-              w=1.0
-              h=fill
-              bg=separator
-            space w=1.0 h=1.0
-          box
-            with
-              w=320.0
+              w=details_width
               h=fill
               bg=sidebar
             col w=fill h=fill

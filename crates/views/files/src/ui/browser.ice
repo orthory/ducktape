@@ -1,6 +1,6 @@
-// FILES — the duckfs read surface, in the artifact's three panes: a 206px
-// content-addressed tree, an object table with real columns, and a 306px
-// object panel. Everything here is painted from what `EntryInfo` actually
+// FILES — the duckfs read surface, in the artifact's three reader-sized panes:
+// a content-addressed tree, an object table with real columns, and an object
+// panel. Everything here is painted from what `EntryInfo` actually
 // carries — path, name, kind, size and the content address.
 //
 // FOUR DELIBERATE OMISSIONS, decided by the campaign and not to be
@@ -356,18 +356,12 @@ component ObjectRowFace(entry:FsEntry)
               font=code
               @text-hint
 
-// The 306px object panel: identity, then the machine values behind it. The
+// The resizable object panel: identity, then the machine values behind it. The
 // artifact's kind chip is an uppercased file extension; Ice cannot split a
 // string, so the chip carries the kind duckfs itself reports.
 //
-component ObjectPanel(entry:FsEntry)
-  row #root w=306.0 h=fill
-    box
-      with
-        w=1.0
-        h=fill
-        bg=separator
-      space w=1.0 h=1.0
+component ObjectPanel(entry:FsEntry, width:f64)
+  row #root w=width h=fill
     box
       with
         w=fill
@@ -462,7 +456,7 @@ component ObjectPanel(entry:FsEntry)
 // One machine value, in the artifact's own r8 pill rather than the app's
 // `KeyValueRow` — the pills are separate outlines, not a divided card. Clipped
 // for the same reason the table cells are: a 64-hex object id is wider than
-// this 306px panel and would otherwise paint outside the pill's own border.
+// the panel and would otherwise paint outside the pill's own border.
 component ObjectFact(label:str, value:str)
   box #root
     with

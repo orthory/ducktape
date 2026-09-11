@@ -127,6 +127,86 @@ fn with_preview(frame: &Frame, body: &str) -> Frame {
     tick_native(vec![answer(page, &read(body))])
 }
 
+fn node_ending(frame: &Frame, suffix: &str) -> Node {
+    fn find(node: &Node, suffix: &str) -> Option<Node> {
+        if node.key().is_some_and(|key| key.ends_with(suffix)) {
+            return Some(node.clone());
+        }
+        node.children().iter().find_map(|child| find(child, suffix))
+    }
+    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+}
+
+#[test]
+fn every_browser_split_drags_with_the_cursor_its_axis_uses() {
+    use ui_lang_guest::wire::{Event, Length, mouse};
+
+    let (frame, _) = connected_with_listing();
+    let frame = with_preview(&frame, "hello");
+    let fixed = |frame: &Frame, suffix: &str, vertical: bool| {
+        let (width, height) = match node_ending(frame, suffix) {
+            Node::Container { width, height, .. } | Node::Linear { width, height, .. } => {
+                (width, height)
+            }
+            node => panic!("fixed pane {suffix}: {node:?}"),
+        };
+        match vertical {
+            true => height,
+            false => width,
+        }
+    };
+    let drag = |frame: &Frame, suffix: &str, dx: f64, dy: f64, cursor| {
+        let Node::ResizeHandle {
+            on_drag: Some(handler),
+            cursor: actual,
+            ..
+        } = node_ending(frame, suffix)
+        else {
+            panic!("resize handle {suffix}")
+        };
+        assert_eq!(actual, Some(cursor));
+        tick_native(vec![Event::Drag { handler, dx, dy }])
+    };
+
+    assert_eq!(
+        fixed(&frame, "/tree-pane", false),
+        Some(Length::Fixed(206.0))
+    );
+    let frame = drag(
+        &frame,
+        "/tree-resize",
+        40.0,
+        0.0,
+        mouse::Cursor::ResizingHorizontally,
+    );
+    assert_eq!(
+        fixed(&frame, "/tree-pane", false),
+        Some(Length::Fixed(246.0))
+    );
+    let frame = drag(
+        &frame,
+        "/preview-resize",
+        0.0,
+        -50.0,
+        mouse::Cursor::ResizingVertically,
+    );
+    assert_eq!(
+        fixed(&frame, "/preview-pane", true),
+        Some(Length::Fixed(350.0))
+    );
+    let frame = drag(
+        &frame,
+        "/object-resize",
+        -60.0,
+        0.0,
+        mouse::Cursor::ResizingHorizontally,
+    );
+    assert_eq!(
+        fixed(&frame, "/object-panel/root", false),
+        Some(Length::Fixed(366.0))
+    );
+}
+
 /// At boot the view asks for the session only; connected, it lists the
 /// directory itself and folds the rows, the counts and the snapshot rail.
 #[test]

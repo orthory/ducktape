@@ -55,6 +55,11 @@ pub fn journal_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
     (width + delta).clamp(280.0, maximum)
 }
 
+pub fn editor_width_after_delta(width: f64, delta: f64, viewport: f64) -> f64 {
+    let maximum = (viewport * 0.55).clamp(320.0, 640.0);
+    (width + delta).clamp(320.0, maximum)
+}
+
 /// One curated skill: a duckfs subtree, pinned at a snapshot or tracking the
 /// committed head (an empty `source_snapshot`), loaded always (the persona)
 /// or on demand.

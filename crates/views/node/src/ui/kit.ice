@@ -255,7 +255,7 @@ component MemberFactRow(label:str, value:str)
       // `word-or-glyph`, because the value is usually a 64-character hex key
       // and word wrapping cannot break an unbroken token: the text's minimum
       // intrinsic width became the whole key, which pushed this card wider
-      // than the 312px panel and let the pane clip cut the key mid-digit at
+      // than its panel and let the pane clip cut the key mid-digit at
       // the window edge. A key you cannot read in full is not a key.
       text value
         with

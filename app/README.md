@@ -205,8 +205,8 @@ guards hold the Ice sources to both authorities.
 - Scale: 22 display · 20 screen title · 16 section · 14 pane header · 13.5
   body · 13 list · 12.5 caption · 12 machine value · 11/10.5 meta · 10 field
   label · 9.5 navigation · 9 badge.
-- Frame: 1280×800 default, 40px titlebar, 74px permanent rail, 236px module
-  sidebar, flexible content, and a 300px detail panel when present.
+- Frame: 1280×800 default, 40px titlebar, 74px permanent rail, a 236px default
+  module sidebar, flexible content, and reader-sized split panes where present.
 - Depth: cards stay paper-flat; floating bars/popovers use `0 3px 12px /.13`,
   brand tiles/toasts use `0 6px 18px /.22`, and modal sheets use
   `0 24px 60px /.30` with warm `#282622` ink.

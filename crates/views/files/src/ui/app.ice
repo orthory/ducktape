@@ -1,6 +1,6 @@
 // FILES, as a module-owned view on the KERNEL CONTRACT: the duckfs browser —
-// the crumb bar, the write bar, the 206px tree, the object table, the preview
-// and the 306px object panel. The kernel pushes session facts only
+// the crumb bar, the write bar, the resizable tree, the object table, the preview
+// and the resizable object panel. The kernel pushes session facts only
 // (`session()`: connected, dark, and the chain a draft belongs to); the
 // listing, the snapshot history, the preview and a snapshot diff are read HERE
 // through `files.get`, re-read on every files block (`rpc.live`), and a mkdir /
@@ -69,6 +69,9 @@ extern crate::host
   pure height_label(height:i64) -> str
   pure picture_caption(width:i64, height:i64) -> str
   pure markdown_path(path:&str) -> bool
+  pure tree_width_after_delta(width:f64, delta:f64, viewport:f64, object_width:f64) -> f64
+  pure preview_height_after_delta(height:f64, delta:f64, viewport:f64) -> f64
+  pure object_width_after_delta(width:f64, delta:f64, viewport:f64, tree_width:f64) -> f64
   // the app's own surfaces, painted into the slots the preview leaves
   component picture(surface:str, path:str) -> unit
   component forge_code(source:str, path:str, dark:bool) -> unit
@@ -123,6 +126,11 @@ state
   draft_id:i64 = 0
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
+  viewport_width = 1280.0
+  viewport_height = 700.0
+  tree_width = 206.0
+  preview_pane_height = 300.0
+  object_width = 306.0
 
 derived
   refusal = write_refusal(path)
@@ -139,6 +147,22 @@ subscribe
   preview(generation, preview_path) when connected && !empty(preview_path) -> preview_arrived _
   diff(generation, diff_from) when connected && !empty(diff_from) -> diff_arrived _
   acts() -> act_done _
+
+on tree_resized(dx, _dy)
+  tree_width = tree_width_after_delta(tree_width, dx, viewport_width, object_width)
+
+on preview_resized(_dx, dy)
+  preview_pane_height = preview_height_after_delta(preview_pane_height, -dy, viewport_height)
+
+on object_resized(dx, _dy)
+  object_width = object_width_after_delta(object_width, -dx, viewport_width, tree_width)
+
+on viewport_changed(width, height)
+  viewport_width = width
+  viewport_height = height
+  tree_width = tree_width_after_delta(tree_width, 0.0, width, object_width)
+  preview_pane_height = preview_height_after_delta(preview_pane_height, 0.0, height)
+  object_width = object_width_after_delta(object_width, 0.0, width, tree_width)
 
 on session_arrived(item)
   notice = keep_str(!empty(item.error), item.error, notice)
@@ -367,51 +391,58 @@ view
       row gap=4.0
         text omitted #display-omitted size=12.5
         text "rows are not shown." size=12.5
-    box #root
-      with
-        w=fill
-        h=fill
-        bg=bg
-      FilesScreen new_name<->new_name draft<->draft
+    sensor show=viewport_changed resize=viewport_changed
+      box #root
         with
-          omitted
-          diff_omitted
-          path
-          parent=fs_parent(path)
-          listed
-          entries
-          directories
-          connected
-          loading
-          preview_path
-          preview_entry
-          delete_target
-          diff_from
-          diff
-          history
-          preview_truncated
-          preview_binary
-          editing=draft_here
-          edit_context
-          edit_blocked=(draft_parked || empty(preview_base) || empty(chain))
-          preview_text=preview_display_text
-          preview_display_clipped=preview_clipped
-          dark
-          preview_picture
-          preview_width
-          preview_height
-          write_refusal=refusal
-        events
-          open_message_link -> open_link_at _
-          fs_open_dir -> open_dir_at _
-          fs_open_file -> open_file_at _
-          fs_mkdir_submit -> mkdir_submit
-          fs_new_file_submit -> new_file_submit
-          fs_arm_delete -> arm_delete_at _
-          fs_disarm_delete -> disarm_delete_now
-          fs_delete_submit -> delete_submit
-          fs_close_diff -> close_diff_now
-          fs_show_diff -> show_diff_of _
-          fs_begin_edit -> begin_edit _
-          fs_cancel_edit -> cancel_edit _
-          fs_save_edit -> save_edit _
+          w=fill
+          h=fill
+          bg=bg
+        FilesScreen new_name<->new_name draft<->draft
+          with
+            tree_width
+            preview_pane_height
+            object_width
+            omitted
+            diff_omitted
+            path
+            parent=fs_parent(path)
+            listed
+            entries
+            directories
+            connected
+            loading
+            preview_path
+            preview_entry
+            delete_target
+            diff_from
+            diff
+            history
+            preview_truncated
+            preview_binary
+            editing=draft_here
+            edit_context
+            edit_blocked=(draft_parked || empty(preview_base) || empty(chain))
+            preview_text=preview_display_text
+            preview_display_clipped=preview_clipped
+            dark
+            preview_picture
+            preview_width
+            preview_height
+            write_refusal=refusal
+          events
+            open_message_link -> open_link_at _
+            fs_open_dir -> open_dir_at _
+            fs_open_file -> open_file_at _
+            fs_mkdir_submit -> mkdir_submit
+            fs_new_file_submit -> new_file_submit
+            fs_arm_delete -> arm_delete_at _
+            fs_disarm_delete -> disarm_delete_now
+            fs_delete_submit -> delete_submit
+            fs_close_diff -> close_diff_now
+            fs_show_diff -> show_diff_of _
+            fs_begin_edit -> begin_edit _
+            fs_cancel_edit -> cancel_edit _
+            fs_save_edit -> save_edit _
+            resize_tree -> tree_resized _ _
+            resize_preview -> preview_resized _ _
+            resize_object -> object_resized _ _
