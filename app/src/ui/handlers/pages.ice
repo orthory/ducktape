@@ -72,6 +72,7 @@ on pages_view_event(event)
         from done true
         done -> close_block_comments()
     PagesIntent.open_thread
+      block_comment_draft = event_text(event, "comment_draft")
       flow
         from done event
         done -> open_block_comment_thread _
@@ -84,6 +85,7 @@ on pages_view_event(event)
         from done true
         done -> load_more_block_threads()
     PagesIntent.close_thread
+      block_comment_draft = event_text(event, "comment_draft")
       flow
         from done true
         done -> close_block_comment_thread()
@@ -164,6 +166,7 @@ on open_page_search_hit(page_id, _block_id)
   page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -218,6 +221,7 @@ on choose_page(id)
   page_search_query = ""
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -276,27 +280,13 @@ on use_orphaned_comment_draft(draft)
 
 on discard_orphaned_comment_draft(draft)
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
-// THE COMMENTS RAIL IS DOCUMENT-SCOPED. The artifact lists every comment on the
-// page under one `N comments` label and never involves a block selection
-// (Liquid Glass:940-941). `load_page_threads` asks the node's own plural
-// `ThreadsForTargets` query for the page AND all of its blocks at once, so the
-// rail opens on a page, not on a block.
-//
-// The comment TARGET is therefore the page: a thread opened from here anchors
-// on the document, which the module explicitly allows ("a block or page id",
-// pages/src/interface.rs:278). A thread that some earlier build anchored on a
-// block still LISTS here, but its comment page cannot be opened — the node
-// validates the thread's own target against the one asked for, and `ThreadRow`
-// reaches the app without it.
-// One header control, so one handler: the open state flips first and every
-// rail field is reset from it, then the guard below decides whether there is
-// anything to load. Closing keeps the half-typed comment through the orphan
-// guard, exactly as the rail's own × does.
+// The header opens all comments. Document badges open only their own anchor.
 on toggle_block_comments
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = !block_comments_open
+  inline_comment_target = ""
   block_comments_target = keep_str(block_comments_open, active_page, "")
   block_comment_threads = []
   block_comment_rows = []
@@ -323,6 +313,7 @@ on close_block_comments
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -343,13 +334,24 @@ on close_block_comments
 on block_threads_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   commented_block_hits = commented_targets_of(next.threads, active_page)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
   error = ""
+  return if empty(inline_comment_target)
+  let selected = comment_thread_for_target(block_comment_threads, inline_comment_target, active_block_comment_thread)
+  return if empty(selected) || selected == active_block_comment_thread
+  active_block_comment_thread = selected
+  active_thread_target = inline_comment_target
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = true
+  run replace lane=block_comments load_block_comment_page(connected_rpc, active_thread_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
 
 // The pagination machinery stays wired, and the document query answers in one
 // page (`has_more` false), so this only fires if that ever changes.
@@ -363,7 +365,7 @@ on load_more_block_threads
 on block_threads_page_loaded(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = append_page_comment_threads(block_comment_threads, next.threads)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -379,6 +381,9 @@ on open_block_comment_thread(event)
   let id = event_text(event, "id")
   let target = event_text(event, "target")
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(id)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = id
   // The thread's OWN anchor, not the page: the node validates a comment read
@@ -439,6 +444,11 @@ on thread_resolve_failed(cause)
   error = cause.message
 
 on close_block_comment_thread
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
+  inline_comment_target = ""
+  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   invalidate lane=block_comments
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = ""
@@ -459,7 +469,8 @@ on post_block_comment_submit
   // A reply stays on its thread's anchor; a NEW comment anchors on the block
   // the caret sits in — the Notion gesture — and on the page from the title
   // line (or before any edit placed the caret).
-  let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  let caret_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  let fresh_target = keep_str(!empty(inline_comment_target), inline_comment_target, caret_target)
   active_thread_target = keep_str(!empty(active_block_comment_thread), active_thread_target, fresh_target)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   block_comments_generation = block_comments_generation + 1
@@ -502,7 +513,7 @@ on block_comment_post_failed(cause)
 on block_threads_recovered(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || !block_comments_open
   block_comment_threads = next.threads
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   block_comment_thread_total = next.total
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
@@ -518,6 +529,7 @@ on block_threads_recovery_failed(cause)
 on pages_updated(next)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -599,6 +611,7 @@ on pages_mutated(next)
   page_create_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
+  inline_comment_target = ""
   block_comments_target = ""
   block_comment_threads = []
   block_comment_rows = []
@@ -637,26 +650,37 @@ on page_edited(event)
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the user moving on from it.
   page_refusal = ""
-  // A margin-badge press opens the comments rail. Every rail field is already
-  // at its reset value whenever the rail is closed (every close path resets
-  // them), so opening is just the flip plus the thread load. A badge press
-  // with the rail already open is a no-op.
-  let page_rail_open = document.comment_line >= 0 && !block_comments_open && !loading && mutation_phase == MutationPhase.idle && !empty(active_page)
-  block_comments_generation = block_comments_generation + keep_i64(page_rail_open, 1, 0)
-  block_comments_open = block_comments_open || page_rail_open
-  block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
-  block_comment_threads_loading = block_comment_threads_loading || page_rail_open
-  // A link press goes through the ONE open plane (`open_message_link`), not
-  // straight to the OS: a page cites `duck://` addresses as readily as a chat
-  // message does, and only that plane knows the module table and the
-  // network scope. It never touched the buffer either way. The two runs are
-  // exclusive by event kind; each backend treats an empty argument as "not my
-  // turn" and answers without side effects.
   let page_link = document.link
-  return if empty(page_link) && !page_rail_open
+  return if empty(page_link) && document.comment_line < 0
   parallel
     run every duck_echo_str(page_link) -> open_message_link _ | external_url_failed _
-    run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+    flow
+      from done event
+      done -> open_document_comments _
+
+on open_document_comments(event)
+  let document = accept_page_document(event, network_chain_id, active_page)
+  return if !document.accepted || document.comment_line < 0
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, document.comment_draft)
+  block_comment_draft = ""
+  pages_seed_rev = pages_seed_rev + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
+  invalidate lane=block_comments
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = true
+  block_comments_target = active_page
+  let target = block_at_line_target(blocks, document.comment_line)
+  inline_comment_target = keep_str(!empty(target), target, active_page)
+  caret_comment_target = inline_comment_target
+  block_comment_threads_loading = true
+  block_comment_rows = []
+  active_block_comment_thread = ""
+  active_thread_target = inline_comment_target
+  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+  block_thread_comments = []
+  block_thread_comments_loading = false
+  block_thread_comments_has_more = false
+  run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
 
@@ -710,7 +734,7 @@ on page_autosave_tick
 on page_document_saved(next)
   pages = next.data.pages
   blocks = next.data.blocks
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+  block_comment_rows = comment_rows_for_target(page_comment_thread_rows(blocks, block_comment_threads, active_page), inline_comment_target)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent

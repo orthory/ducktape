@@ -21,7 +21,7 @@ extern crate::host
   PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
-  pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
+  pure edited(source:bytes, reference:bytes, navigation:bytes, comment_draft:&str) -> bool
   pure installed(document:&editor, source:bytes) -> bool
   pure toggle_create() -> bool
   pure create(title:&str, comment_draft:&str) -> bool
@@ -37,10 +37,10 @@ extern crate::host
   pure discard_draft(draft:&str) -> bool
   pure toggle_comments(comment_draft:&str) -> bool
   pure close_comments(comment_draft:&str) -> bool
-  pure open_thread(id:&str, target:&str) -> bool
+  pure open_thread(id:&str, target:&str, comment_draft:&str) -> bool
   pure resolve(resolved:bool) -> bool
   pure more_threads() -> bool
-  pure close_thread() -> bool
+  pure close_thread(comment_draft:&str) -> bool
   pure more_comments() -> bool
   pure post(text:&str) -> bool
   pure copy(text:&str, label:&str) -> bool
@@ -49,6 +49,11 @@ extern crate::host
   pure keep_str(keep:bool, next:&str, current:&str) -> str
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure initials_of(name:&str) -> str
+  pure comment_anchor_after_props(current_page:&str, next_page:&str, open:bool, anchor:f64) -> f64
+  pure comment_anchor_after_navigation(opens:bool, pointer:f64, anchor:f64) -> f64
+  pure comment_navigation(navigation:bytes) -> bool
+  pure comment_card_offset(anchor_y:f64, viewport_height:f64) -> f64
+  pure comment_card_height(thread:&str, anchor_y:f64, viewport_height:f64) -> f64
   pure seeded(moved:bool, seed:&str, draft:&str) -> str
 
 extern crate::editor_binding
@@ -78,6 +83,8 @@ extern crate::document_ingress
   subscription document_source(source:DocumentSource) -> DocumentItem
 
 state
+  pointer_y:f64 = 0.0
+  comment_anchor_y:f64 = -1.0
   document_focused = false
   focus_query:i64 = 0
   document_paint:PreparedPresentation = empty_presentation()
@@ -101,6 +108,7 @@ state
   // she has the `⋯` menu open. Neither leaves this view, and neither is
   // persisted — a fresh window opens on the default again.
   pages_viewport_width = 1280.0
+  pages_viewport_height = 700.0
   sidebar_width = 230.0
   page_menu_open = false
   page_create_open = false
@@ -141,12 +149,16 @@ state
 // subscription, not a mount task, so a replacement restored from this
 // view's state asks for the facts again on its own.
 subscribe
+  mouse moved status=any -> comment_pointer_moved _ _
   mouse released status=any -> document_pointer_released _
   keyboard release status=any -> document_key_released _
   window focused -> document_window_focused
   window unfocused -> document_window_unfocused
   document_source(document_source_ref) when !empty(document_source_ref.reference) && document_source_ref.reference != document_installed -> document_arrived _
   props() -> props_arrived _
+
+on comment_pointer_moved(_x, y)
+  pointer_y = y
 
 on document_pointer_released(_button)
   focus_query = focus_query + 1
@@ -179,8 +191,9 @@ on document_focus_checked(query, source, focused)
 on sidebar_resized(dx, _dy)
   sidebar_width = sidebar_width_after_delta(sidebar_width, dx, pages_viewport_width)
 
-on pages_viewport_changed(width, _height)
+on pages_viewport_changed(width, height)
   pages_viewport_width = width
+  pages_viewport_height = height
   sidebar_width = sidebar_width_after_delta(sidebar_width, 0.0, width)
 
 on toggle_page_menu
@@ -199,6 +212,7 @@ on props_arrived(item)
   page_link = next.page_link
   pages = next.pages
   page_create_open = next.page_create_open
+  comment_anchor_y = comment_anchor_after_props(active_page, next.active_page, next.block_comments_open, comment_anchor_y)
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
@@ -302,19 +316,22 @@ on discard_orphaned_comment_draft(draft)
   sent = discard_draft(draft)
 
 on toggle_block_comments
+  comment_anchor_y = -1.0
   return if !empty(host_error)
   return if loading || busy || empty(active_page)
   sent = toggle_comments(block_comment_draft)
   block_comment_draft = ""
 
 on close_block_comments
+  comment_anchor_y = -1.0
   return if !empty(host_error)
   sent = close_comments(block_comment_draft)
   block_comment_draft = ""
 
 on open_block_comment_thread(id, target)
   return if !empty(host_error)
-  sent = open_thread(id, target)
+  sent = open_thread(id, target, block_comment_draft)
+  block_comment_draft = ""
 
 on resolve_thread_submit(resolved)
   return if !empty(host_error)
@@ -325,8 +342,10 @@ on load_more_block_threads
   sent = more_threads()
 
 on close_block_comment_thread
+  comment_anchor_y = -1.0
   return if !empty(host_error)
-  sent = close_thread()
+  sent = close_thread(block_comment_draft)
+  block_comment_draft = ""
 
 on load_more_block_comments
   return if !empty(host_error)
@@ -364,7 +383,10 @@ on document_committed(next)
   document_history = next.history
   document_menu = next.menu
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
-  sent = edited(document_installed, next.reference, next.interaction)
+  let opens_comment = comment_navigation(next.interaction) && !busy
+  comment_anchor_y = comment_anchor_after_navigation(opens_comment, pointer_y, comment_anchor_y)
+  sent = edited(document_installed, next.reference, next.interaction, seeded(opens_comment, block_comment_draft, ""))
+  block_comment_draft = seeded(opens_comment, "", block_comment_draft)
 
 // The sensor is the window measure the sidebar clamp needs, and it keys
 // nothing — `#root/pages/document` is still the editor's path.
@@ -398,6 +420,8 @@ view
           subpages
           orphaned_comment_drafts
           block_comments_open
+          comments_height=comment_card_height(active_thread, comment_anchor_y, pages_viewport_height)
+          comments_offset=comment_card_offset(comment_anchor_y, pages_viewport_height)
           thread_total
           comment_rows
           threads_loading

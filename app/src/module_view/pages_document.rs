@@ -120,6 +120,7 @@ pub(super) type Pending = Option<(u64, Transfer)>;
 
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct AcceptedDocument {
+    pub comment_draft: String,
     pub accepted: bool,
     pub text: String,
     pub cursor_line: i64,
@@ -145,11 +146,16 @@ fn accept_inner(
     network: &str,
     page: &str,
 ) -> Option<AcceptedDocument> {
-    if event.kind != "edited" || event.detail.len() > 16 * 1024 {
+    // A comment navigation carries one bounded draft in addition to metadata.
+    let max_envelope = 16 * 1024 + 6 * wire::MAX_STRING_BYTES;
+    if event.kind != "edited" || event.detail.len() > max_envelope {
         return None;
     }
     let envelope: Envelope = serde_json::from_str(&event.detail).ok()?;
     let accepted = envelope.accepted;
+    if accepted.comment_draft.len() > wire::MAX_STRING_BYTES {
+        return None;
+    }
     let reference: wire::editor_document::EditorDocumentRef =
         wire::decode(&accepted.reference).ok()?;
     let registry = super::registry().lock().ok()?;
@@ -188,6 +194,7 @@ fn accept_inner(
         .show(identity, document.text(), reference.cursor)
         .ok()?;
     Some(AcceptedDocument {
+        comment_draft: accepted.comment_draft,
         accepted: true,
         text: document.text().to_owned(),
         cursor_line: i64::from(reference.cursor.position.line),
