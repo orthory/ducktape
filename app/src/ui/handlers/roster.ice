@@ -162,32 +162,14 @@ on governance_view_event(event)
   return if event.kind != "badge"
   gov_open = event_int(event, "count")
 
-// What the Members view asks of the app. `copy` is the same act as
-// `copy_to_clipboard`; the ballot shares `gov_voting` with vote/execute — one
-// governance write is in flight — and an agent's pause is an owner-gated
-// write, immediate, no ballot.
+// What the Members view asks of the app. It speaks the kernel contract for
+// everything it reads and signs; the clipboard is the one OS door left, and
+// it is the same act as `copy_to_clipboard`.
 on members_view_event(event)
-  return if !connected
-  match roster_intent(event)
-    RosterIntent.copy
-      toast = event_text(event, "label")
-      toast_age = 0
-      task clipboard write event_text(event, "text")
-    RosterIntent.agent_status
-      run every set_agent_status(connected_rpc, password, event_text(event, "agent_id"), event_flag(event, "paused")) -> agent_status_set _ | mutation_failed _
-    RosterIntent.propose
-      return if !empty(gov_voting) || empty(event_text(event, "key"))
-      gov_voting = event_text(event, "key")
-      run every governance_propose(connected_rpc, password, event_text(event, "action"), gov_voting) -> gov_acted _ | gov_act_failed _
-
-// The register itself is the governance view's to re-read: the block the
-// proposal lands in reaches it through `rpc.live`.
-on gov_acted(_result)
-  gov_voting = ""
-
-on gov_act_failed(cause)
-  gov_voting = ""
-  error = cause.message
+  return if !connected || event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 on members_loaded(next)
   return if next.generation != members_generation

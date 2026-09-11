@@ -200,15 +200,22 @@ view
         pages:
           extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
-        // Files is a MODULE-OWNED VIEW: the listing, the preview, the
-        // history and the write refusal go in as props; every navigation
-        // and every write comes back as an intent the handler signs. Whether
-        // the rows on hand describe the path in the crumb (`listed`) is
-        // computed here, once.
+        // Files is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the chain among them, because a draft belongs to the
+        // network it was read on — and the view lists the directory, reads
+        // the preview and the history, and writes through `op.submit` for
+        // itself. The pictures, the highlighted reader and the Markdown
+        // document are the app's surfaces, painted into the slots it leaves.
         files:
           extern files_view(dark, connected, network_chain_id) #files -> files_view_event _
+        // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads the roster off the node itself and
+        // writes through `op.submit` (signed with the seated key). The
+        // app's own `members_rows` stays — it is the SESSION fact of who
+        // this node is on this network, which the rail, the forge gate and
+        // the approvals gate all read.
         members:
-          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
+          extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
           // the register whole, with the editor's pick lists and the signing
           // account; every write comes back as an intent the roster handler

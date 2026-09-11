@@ -324,6 +324,7 @@ pub struct MenuView {
 
 const BLOCK_ITEMS: &[(&str, &str)] = &[
     ("turn", "Turn into…"),
+    ("comment", "Comment"),
     ("duplicate", "Duplicate"),
     ("move-up", "Move up"),
     ("move-down", "Move down"),
@@ -458,6 +459,7 @@ impl Menu {
             return (EditorDecision::Noop, Self::opened(Kind::Turn { line }));
         }
         let decision = match tag {
+            "comment" => EditorDecision::Noop,
             "duplicate" => duplicate(document, line),
             "move-up" => move_block(document, line, -1),
             "move-down" => move_block(document, line, 1),
