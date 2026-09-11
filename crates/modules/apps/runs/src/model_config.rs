@@ -1,4 +1,6 @@
 //! Model configuration belongs to runs; identity remains the account authority.
+//! Any submitter may configure any model: the record confers no authority, so
+//! there is nothing a configuration could escalate.
 use super::*;
 use capability::validate_tag;
 
@@ -64,25 +66,6 @@ fn is_scoped_duckfs_prefix(prefix: &str) -> bool {
 // ---- the module -----------------------------------------------------------
 
 impl RunsModule {
-    /// every granted action must come from the known vocabulary, so a grant
-    /// always means something; duplicates collapse into the sorted set. the
-    /// [`EVERY`] entry subsumes any names beside it: the stored grant is then
-    /// exactly `["*"]`, so "all" reads the same however it was written.
-    pub(super) fn validate_actions(actions: Vec<String>) -> Result<Vec<String>, Error> {
-        let mut set = BTreeSet::new();
-        for action in actions {
-            let known = action == EVERY || KNOWN_ACTIONS.contains(&action.as_str());
-            if !known {
-                return Err(Error::Module(format!("unknown action: {action}")));
-            }
-            set.insert(action);
-        }
-        if set.contains(EVERY) {
-            return Ok(vec![EVERY.to_string()]);
-        }
-        Ok(set.into_iter().collect())
-    }
-
     /// a recipe hash is empty (unset) or exactly [`RECIPE_HASH_LEN`] bytes.
     fn validate_recipe_hash(recipe_hash: &[u8]) -> Result<(), Error> {
         if !recipe_hash.is_empty() && recipe_hash.len() != RECIPE_HASH_LEN {
@@ -92,29 +75,6 @@ impl RunsModule {
             )));
         }
         Ok(())
-    }
-
-    /// canonicalize the D3 caps: reject empty entries, then sort+dedup every
-    /// list so the committed record is canonical — one valid byte encoding
-    /// per state, and `permits` reads the same shape everywhere. budget needs
-    /// no normalization.
-    fn validate_caps(mut caps: ResourceCaps) -> Result<ResourceCaps, Error> {
-        for list in [
-            &mut caps.forge_read,
-            &mut caps.forge_push,
-            &mut caps.duckfs_read,
-            &mut caps.duckfs_write,
-            &mut caps.tools,
-            &mut caps.secrets,
-            &mut caps.pages_write,
-        ] {
-            if list.iter().any(|s| s.is_empty()) {
-                return Err(Error::Module("cap entries must be non-empty".into()));
-            }
-            list.sort();
-            list.dedup();
-        }
-        Ok(caps)
     }
 
     /// a skill ref must carry a name that is [`is_skill_mount_name`] (the
@@ -232,54 +192,22 @@ impl RunsModule {
         Ok(generation)
     }
 
-    pub(super) async fn acting_account(ctx: &dyn Ctx) -> Result<sdk::AccountNumber, Error> {
-        match &ctx.env().origin {
-            Origin::Program(account) => Ok(*account),
-            Origin::External(key) => {
-                let bytes = ctx
-                    .query(
-                        "identity",
-                        &identity::encode_query(&identity::IdentityQuery::OfKey {
-                            key: key.clone(),
-                        }),
-                    )
-                    .await?;
-                let identity::IdentityReply::Account(Some(view)) =
-                    identity::decode_reply(&bytes).map_err(Error::Module)?
-                else {
-                    return Err(Error::Module(
-                        "model configuration requires an account".into(),
-                    ));
-                };
-                Ok(view.number)
-            }
-            Origin::Module(_) | Origin::System => Err(Error::Module(
-                "model configuration requires an account".into(),
-            )),
-        }
-    }
-
-    pub(super) async fn control_model(
+    /// a model serves a live program account executed by this module's agent
+    /// module; any other account has no program a run could act through.
+    pub(super) async fn program_model(
         &self,
         ctx: &dyn Ctx,
         account: sdk::AccountNumber,
     ) -> Result<(), Error> {
-        let actor = Self::acting_account(ctx).await?;
-        let identity::Control::Program {
-            controller,
-            executor,
-            ..
-        } = self.account_control(ctx, account).await?
+        let identity::Control::Program { executor, .. } =
+            self.account_control(ctx, account).await?
         else {
             return Err(Error::Module(
                 "model requires a live program account".into(),
             ));
         };
-        let may_configure = executor == self.agent && (actor == controller || actor == account);
-        if !may_configure {
-            return Err(Error::Module(
-                "only the program or its current controller may configure its model".into(),
-            ));
+        if executor != self.agent {
+            return Err(Error::Module("program executor does not match".into()));
         }
         Ok(())
     }
@@ -296,12 +224,10 @@ impl RunsModule {
         Ok(())
     }
 
-    async fn controlled_model(&self, ctx: &dyn Ctx, id: &str) -> Result<ModelRecord, Error> {
-        let Some(record) = self.model(id).cloned() else {
-            return Err(Error::Module(format!("unknown model: {id}")));
-        };
-        self.control_model(ctx, record.account).await?;
-        Ok(record)
+    fn registered_model(&self, id: &str) -> Result<ModelRecord, Error> {
+        self.model(id)
+            .cloned()
+            .ok_or_else(|| Error::Module(format!("unknown model: {id}")))
     }
 
     pub(super) async fn configure_model(
@@ -315,12 +241,10 @@ impl RunsModule {
                 agent_id,
                 display_name,
                 capability,
-                allowed_actions,
                 recipe_hash,
-                caps,
                 skills,
             } => {
-                self.control_model(ctx, account).await?;
+                self.program_model(ctx, account).await?;
                 validate_agent_id(&agent_id).map_err(Error::Module)?;
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
@@ -349,13 +273,11 @@ impl RunsModule {
                     owner,
                     display_name,
                     capability: capability.clone(),
-                    allowed_actions: Self::validate_actions(allowed_actions)?,
                     status: ModelStatus::Active,
                     role: ModelRole::default(),
                     created_at: ctx.env().consensus_time,
                     updated_at: ctx.env().consensus_time,
                     recipe_hash,
-                    caps: Self::validate_caps(caps.unwrap_or_default())?,
                     skills,
                 };
                 self.stage_model(record)?;
@@ -371,12 +293,10 @@ impl RunsModule {
                 agent_id,
                 display_name,
                 capability,
-                allowed_actions,
                 recipe_hash,
-                caps,
                 skills,
             } => {
-                let mut record = self.controlled_model(ctx, &agent_id).await?;
+                let mut record = self.registered_model(&agent_id)?;
                 if let Some(name) = display_name {
                     Self::validate_non_empty("display_name", &name)?;
                     record.display_name = name;
@@ -394,15 +314,9 @@ impl RunsModule {
                     }
                     record.capability = capability;
                 }
-                if let Some(actions) = allowed_actions {
-                    record.allowed_actions = Self::validate_actions(actions)?;
-                }
                 if let Some(hash) = recipe_hash {
                     Self::validate_recipe_hash(&hash)?;
                     record.recipe_hash = hash;
-                }
-                if let Some(caps) = caps {
-                    record.caps = Self::validate_caps(caps)?;
                 }
                 if let Some(skills) = skills {
                     Self::validate_skills(&skills)?;
@@ -420,7 +334,7 @@ impl RunsModule {
                     .await
             }
             ModelMsg::DeregisterModel { agent_id } => {
-                self.controlled_model(ctx, &agent_id).await?;
+                self.registered_model(&agent_id)?;
                 self.pending_models.insert(agent_id.clone(), None);
                 self.apply_model_change(ctx, ModelChange::Deregistered { agent_id })
             }
@@ -433,7 +347,7 @@ impl RunsModule {
         id: String,
         status: ModelStatus,
     ) -> Result<(), Error> {
-        let mut record = self.controlled_model(ctx, &id).await?;
+        let mut record = self.registered_model(&id)?;
         record.status = status;
         record.updated_at = ctx.env().consensus_time;
         self.stage_model(record)

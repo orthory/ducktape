@@ -179,7 +179,6 @@ pub fn agents_view(
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
-    actions: &[String],
 ) -> Element<'static, ModuleViewEvent> {
     module_view(
         "agents",
@@ -196,7 +195,6 @@ pub fn agents_view(
             journal,
             live,
             capabilities,
-            actions,
         ),
     )
 }
@@ -217,7 +215,6 @@ pub(crate) fn agents_props(
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
-    actions: &[String],
 ) -> Vec<u8> {
     // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
     // guest draws nothing with, and `link`/`account`/`op` are the fence the app
@@ -239,7 +236,6 @@ pub(crate) fn agents_props(
         "journal": book,
         "live": live,
         "capabilities": capabilities,
-        "actions": actions,
         "account": account,
         "committed": committed,
         "connected": connected,
@@ -4531,12 +4527,6 @@ pub(crate) mod tests {
             owner_handle: "eddy".into(),
             controller: "7".into(),
             live: false,
-            allowed_actions: vec!["chat.post".into()],
-            caps: crate::backend::AgentCaps {
-                forge_read: vec!["ducktape".into()],
-                pages_write: vec!["*".into()],
-                ..Default::default()
-            },
             skills: vec![
                 skill("review", true),
                 skill("style", false),
@@ -4556,7 +4546,6 @@ pub(crate) mod tests {
             &crate::backend::RunJournal::default(),
             &crate::backend::LiveRun::default(),
             &["claude".into(), "review".into()],
-            &["chat.post".into(), "tasks.create".into()],
         ));
         guest.redraw(&props);
         let shown = texts(&guest);
@@ -4622,7 +4611,6 @@ pub(crate) mod tests {
             1,
             &journal,
             &crate::backend::LiveRun::default(),
-            &[],
             &[],
         ));
         guest.redraw(&None);

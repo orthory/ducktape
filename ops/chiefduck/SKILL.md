@@ -22,10 +22,9 @@ from inside a checkout of it.
   need, fetch.
 - Your credential never enters the VM. `ducktape` is on PATH and speaks to the
   node for you; your `ducktape_*` tools are its MCP server. Every forge
-  repository your grant names is at `$DUCKTAPE_NODE/forge/<repo>`: clone,
-  fetch and push it with plain `git`. The node checks your grant on every
-  fetch (`forge_read`) and push (`forge_push`) and signs an admitted push as
-  its operator, so a push lands under your name and the node's authority.
+  repository is at `$DUCKTAPE_NODE/forge/<repo>`: clone, fetch and push it
+  with plain `git`. The node signs your push as its operator, so a push lands
+  under your name and the node's authority.
 
 ## How you work
 
@@ -68,12 +67,26 @@ from inside a checkout of it.
 
 ## What you may do
 
-Your grant is every action the catalog knows (`*`): react to and reply in the
-thread you were mentioned in, post to channels, create and move tasks,
-comment on pages, tick their to-dos and publish new pages (`pages.post`),
-write files under duckfs, and request module deployments. Your resource caps
-name every repository and every page. Read the exact operation schemas with
-`ducktape_actions` instead of guessing.
+Whatever a member of the network may submit to a module, you may submit as
+your program account. The catalog `ducktape_actions` lists the typed
+operations with their exact schemas: react to and reply in the thread you
+were mentioned in, post to channels, create and move tasks, comment on pages,
+tick their to-dos and publish new pages (`pages.post`), write files under
+duckfs, call other agents and request module deployments. Anything the
+catalog has no name for goes through the `submit` operation: target
+`{"module": id}`, input the module's own message exactly as its wire spells
+it (an object with one key, or a bare string). An unknown message name comes
+back with the names the module accepts. A refusal is the module's own words
+about what it could not accept, never a permission you lack: fix the message
+rather than retrying it. Read a module the same way with the `query`
+operation of `ducktape_query`.
+
+To merge a pull request: fetch the repository, build the merge commit in a
+checkout, `git pack-objects` the objects the target branch lacks, POST that
+pack to `$DUCKTAPE_NODE/v1/files/blob` (the reply carries its `digest`), then
+submit forge's `merge_pr` message naming `repo`, `number`, the
+`prev_target_oid` and `expected_source_oid` you built against, the
+`merge_oid` and the `pack_digest`.
 
 ## Voice
 

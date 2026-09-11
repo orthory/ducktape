@@ -1,5 +1,4 @@
 use super::*;
-use crate::{ACTION_PAGES_COMMENT, ACTION_PAGES_POST, ACTION_PAGES_SET_CHECKED};
 use pages::PageMsg;
 
 fn page_trigger_thread() -> pages::ThreadView {
@@ -29,8 +28,7 @@ fn page_trigger_thread() -> pages::ThreadView {
 
 #[test]
 fn pages_triggered_run_replies_in_the_same_comment_thread() {
-    let mut registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
-    registry.get_mut("bot").unwrap().caps.pages_write = vec!["p1".into()];
+    let registry = registry(&["bot"]);
     let mut m = module()
         .with_files_module("files")
         .with_pages_module("pages");
@@ -97,7 +95,7 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
 
 #[test]
 fn inline_page_composer_keeps_the_exact_source_when_page_context_is_bounded() {
-    let registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    let registry = registry(&["bot"]);
     let model = registry.get("bot").unwrap();
     let mut module = module().with_pages_module("pages");
     module.models = registry.clone();
@@ -131,16 +129,14 @@ fn inline_page_composer_keeps_the_exact_source_when_page_context_is_bounded() {
     );
 }
 
-// ---- the pages effects lane (M2) ---------------------------------------------
-// pages.comment / pages.set_checked applied at the run boundary: grant + cap
-// gated, probe-guarded, and — unlike the task lane — degrading PER ACTION.
+// ---- the pages effects lane ---------------------------------------------------
+// pages.comment / pages.set_checked applied at the run boundary: probe-guarded,
+// and — unlike the task lane — degrading PER ACTION.
 
-/// a pages-wired module holding one pending run for "bot" (granted `actions`,
-/// pages_write = `caps`), plus the registry and the run id.
-fn awaiting_pages_run(actions: &[&str], caps: &[&str]) -> (RunsModule, Registry, String) {
-    let mut registry = registry(&[("bot", actions)]);
-    registry.get_mut("bot").unwrap().caps.pages_write =
-        caps.iter().map(|s| s.to_string()).collect();
+/// a pages-wired module holding one pending run for "bot", plus the registry
+/// and the run id.
+fn awaiting_pages_run() -> (RunsModule, Registry, String) {
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry).with_pages_module("pages");
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -191,8 +187,7 @@ fn assert_delivered(m: &mut RunsModule, run_id: &str) {
 
 #[test]
 fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["p1"]);
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     // the target is a BLOCK id — the cap resolves its owning page "p1".
     deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
@@ -225,11 +220,9 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
 }
 
 #[test]
-fn a_page_root_target_and_a_wildcard_cap_also_pass_the_gate() {
-    // the target IS the page id (a root names itself as its page) and the
-    // grant is the literal wildcard.
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+fn a_page_root_target_names_itself_as_its_page() {
+    // the target IS the page id (a root names itself as its page).
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     deliver(&mut m, &mut ctx, &run_id, comment_effect("p1"));
     assert_eq!(ctx.page_msgs().len(), 1);
@@ -237,55 +230,8 @@ fn a_page_root_target_and_a_wildcard_cap_also_pass_the_gate() {
 }
 
 #[test]
-fn a_cap_denied_pages_action_degrades_and_the_run_still_delivers() {
-    // granted the ACTION but pages_write covers a different page.
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["other-page"]);
-    let mut ctx = delivery_ctx(&registry);
-    deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
-
-    assert!(ctx.page_msgs().is_empty(), "the denied comment is dropped");
-    assert!(
-        ctx.notes()
-            .iter()
-            .any(|n| n.contains("lacks pages_write for p1")),
-        "the deny leaves a breadcrumb: {:?}",
-        ctx.notes()
-    );
-    assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts");
-    assert_delivered(&mut m, &run_id);
-}
-
-#[test]
-fn an_ungranted_pages_action_degrades_instead_of_failing_the_run() {
-    // pages.comment is NOT in allowed_actions — unlike a task action, the
-    // grant miss degrades this action alone (decision 6's scoping).
-    let (mut m, registry, run_id) = awaiting_pages_run(&[ACTION_CHAT_POST], &["*"]);
-    let mut ctx = delivery_ctx(&registry);
-    deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
-
-    assert!(ctx.page_msgs().is_empty());
-    assert!(
-        ctx.notes()
-            .iter()
-            .any(|n| n.contains("not allowed to pages.comment")),
-        "{:?}",
-        ctx.notes()
-    );
-    assert_eq!(ctx.chat_msgs().len(), 1);
-    assert_delivered(&mut m, &run_id);
-}
-
-#[test]
 fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
-    let (mut m, registry, run_id) = awaiting_pages_run(
-        &[
-            ACTION_CHAT_POST,
-            ACTION_PAGES_COMMENT,
-            ACTION_PAGES_SET_CHECKED,
-        ],
-        &["*"],
-    );
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     // three actions: a ghost target, an empty body, and one VALID todo flip —
     // the bad ones degrade, the good one still applies.
@@ -322,17 +268,13 @@ fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
 
 #[test]
 fn set_checked_requires_a_todo_block_and_carries_no_attribution() {
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_SET_CHECKED], &["p1"]);
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     deliver(
         &mut m,
         &mut ctx,
         &run_id,
-        vec![
-            set_page_checked("b-p", true),
-            set_page_checked("b-t", true),
-        ],
+        vec![set_page_checked("b-p", true), set_page_checked("b-t", true)],
     );
 
     let msgs = ctx.page_msgs();
@@ -357,8 +299,7 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
     // anyone can mint pages ids, so the deterministic thread/comment ids are
     // squattable and the target's thread list is cappable — each probe must
     // catch its case (an emitted op pages rejects would abort the block).
-    let (_, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+    let (_, registry, run_id) = awaiting_pages_run();
     let rid = dispatch_id_for(&run_id);
     for (ctx, needle) in [
         (
@@ -375,7 +316,7 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
         ),
     ] {
         let mut m2 = {
-            let (m2, ..) = awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+            let (m2, ..) = awaiting_pages_run();
             m2
         };
         let mut ctx = ctx;
@@ -401,17 +342,13 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
     // emit and the second AddComment would abort the delivery block
     // (TooManyThreads). the accounting makes the second DEGRADE instead.
     let cap = pages::MAX_THREADS_PER_TARGET;
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry).with_page_target_threads("b-p", cap - 1);
     deliver(
         &mut m,
         &mut ctx,
         &run_id,
-        vec![
-            page_comment("b-p", "first"),
-            page_comment("b-p", "second"),
-        ],
+        vec![page_comment("b-p", "first"), page_comment("b-p", "second")],
     );
 
     let msgs = ctx.page_msgs();
@@ -435,8 +372,7 @@ fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
     // hashing the run id keeps the minted id short, hex, escape-free, so the
     // comment LANDS regardless of the channel — the structural immunization.
     let channel = "c".repeat(400);
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
-    registry.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
+    let registry = registry(&["bot"]);
     let mut m = module().with_pages_module("pages");
     m.models = registry.clone();
     commit(&mut m);
@@ -487,11 +423,7 @@ fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
 fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
     // the same run on a module WITHOUT with_pages_module: the forge-unwired
     // pattern — breadcrumb, no pages msg, delivery proceeds.
-    let registry = {
-        let mut r = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
-        r.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
-        r
-    };
+    let registry = { registry(&["bot"]) };
     let mut m = configured(&registry);
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -514,18 +446,17 @@ fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
 #[test]
 fn task_actions_keep_their_all_or_nothing_lane() {
     // a response mixing a VALID pages action with an INVALID task action
-    // still fails the whole run — decision 6 scopes the degrade to the two
-    // pages actions only; the task lane is untouched.
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
-    let mut ctx = delivery_ctx(&registry);
+    // still fails the whole run — the degrade is scoped to the pages
+    // actions only; the task lane is untouched.
+    let (mut m, registry, run_id) = awaiting_pages_run();
+    let mut ctx = delivery_ctx(&registry).with_task("t9");
     deliver(
         &mut m,
         &mut ctx,
         &run_id,
         vec![
             page_comment("b-p", "hi"),
-            // tasks.create was never granted — the strict lane fails the run.
+            // the task id is already taken — the strict lane fails the run.
             create_task("t9", "nope"),
         ],
     );
@@ -561,8 +492,7 @@ fn report_post() -> ActionEnvelope {
 
 #[test]
 fn a_page_post_publishes_a_titled_page_with_its_body_under_the_every_page_cap() {
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_POST], &["*"]);
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     deliver(&mut m, &mut ctx, &run_id, vec![report_post()]);
 
@@ -597,36 +527,14 @@ fn a_page_post_publishes_a_titled_page_with_its_body_under_the_every_page_cap() 
 }
 
 #[test]
-fn a_page_post_needs_its_grant_the_every_page_cap_and_a_bounded_title() {
+fn a_page_post_needs_a_bounded_non_empty_title() {
     let long_title = "t".repeat(pages::MAX_PAGE_TITLE_LEN + 1);
     let body = serde_json::json!([{"type": "text", "text": "body"}]);
-    for (actions, caps, action, needle) in [
-        (
-            vec![ACTION_CHAT_POST],
-            vec!["*"],
-            report_post(),
-            "not allowed to pages.post",
-        ),
-        (
-            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
-            vec!["p1"],
-            report_post(),
-            "lacks pages_write for agent/",
-        ),
-        (
-            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
-            vec!["*"],
-            page_post("   ", body.clone()),
-            "requires a non-empty title",
-        ),
-        (
-            vec![ACTION_CHAT_POST, ACTION_PAGES_POST],
-            vec!["*"],
-            page_post(long_title.as_str(), body.clone()),
-            "pages' cap",
-        ),
+    for (action, needle) in [
+        (page_post("   ", body.clone()), "requires a non-empty title"),
+        (page_post(long_title.as_str(), body.clone()), "pages' cap"),
     ] {
-        let (mut m, registry, run_id) = awaiting_pages_run(&actions, &caps);
+        let (mut m, registry, run_id) = awaiting_pages_run();
         let mut ctx = delivery_ctx(&registry);
         deliver(&mut m, &mut ctx, &run_id, vec![action]);
         assert!(ctx.page_msgs().is_empty(), "the refused post emits nothing");
@@ -646,8 +554,7 @@ fn same_block_page_cap_degrades_the_overflow_page_post_without_aborting() {
     // committed-only probe is blind to the first post's staged page, so
     // without same-block accounting both would emit and the second create
     // would abort the delivery block (TooManyPages).
-    let (mut m, registry, run_id) =
-        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_POST], &["*"]);
+    let (mut m, registry, run_id) = awaiting_pages_run();
     let mut ctx = delivery_ctx(&registry);
     // delivery_ctx already holds "p1".
     for index in 1..pages::MAX_PAGES - 1 {

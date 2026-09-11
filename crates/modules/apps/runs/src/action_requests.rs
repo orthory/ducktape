@@ -89,7 +89,6 @@ pub(super) struct ActionRequest {
     pub publication: Publication,
     pub scope: RequestScope,
     pub model_id: String,
-    pub grant: RunAuthority,
     /// `Some` for a catalog invocation; the claim re-checks the schema pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<Invocation>,
@@ -207,13 +206,13 @@ impl RunsModule {
         let Some(model) = self.model(&request.model_id) else {
             return Err(Error::Module("run model was removed".into()));
         };
-        let unchanged_grant = model.account == request.view.account
-            && model.status == ModelStatus::Active
-            && RunAuthority::from_record(model) == request.grant;
-        if !unchanged_grant {
+        if model.account != request.view.account {
             return Err(Error::Module(
-                "run model authority changed after this action was proposed".into(),
+                "run model no longer serves the account this action was proposed for".into(),
             ));
+        }
+        if model.status != ModelStatus::Active {
+            return Err(Error::Module("run model is paused".into()));
         }
         match &request.scope {
             RequestScope::Result => Ok(()),
@@ -237,8 +236,7 @@ impl RunsModule {
         let Some(invocation) = &request.invocation else {
             return Ok(());
         };
-        let current = crate::operation_view(&request.view.operation)
-            .map(|view| view.schema_digest);
+        let current = crate::operation_view(&request.view.operation).map(|view| view.schema_digest);
         if current.as_deref() != Some(invocation.schema_digest.as_str()) {
             return Err(Error::Module(
                 "operation schema changed since this action was proposed".into(),
@@ -582,8 +580,8 @@ impl RunsModule {
                 }
             }
         }
-        // A grant or lease change is not a terminal receipt: the program may
-        // already have authorized a target call. A generation change fences
+        // A lease change is not a terminal receipt: the program may already
+        // have authorized a target call. A generation change fences
         // every such call permanently, so it can terminate a waiting request.
         let control = self.account_control(ctx, view.account).await?;
         let same_generation = matches!(control, identity::Control::Program { generation, executor, standing: identity::ProgramStanding::Active, .. } if generation == view.generation && executor == self.agent);

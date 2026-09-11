@@ -213,7 +213,7 @@ view
           // the register whole, with the editor's pick lists and the signing
           // account; every write comes back as an intent the roster handler
           // signs
-          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities, agents_actions) #agents -> agents_view_event _
+          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
         // the code browse's listing and file, and the discussion go in as
         // props; every act comes back as an intent the handler signs. The

@@ -28,14 +28,9 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// stand the node up and register `AGENT_ID` with exactly `allowed_actions`
-    /// — the grant every assertion in the calling test is written against.
-    pub fn start(allowed_actions: &[&str]) -> Self {
-        Self::start_with_forge_read(allowed_actions, &[])
-    }
-
-    /// Stand the same real node up with an explicitly bounded Forge read cap.
-    pub fn start_with_forge_read(allowed_actions: &[&str], forge_read: &[&str]) -> Self {
+    /// stand the node up and register `AGENT_ID` as the model every assertion
+    /// in the calling test is written against.
+    pub fn start() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("ducktape mcp-e2e")
             .tempdir()
@@ -146,7 +141,7 @@ impl Harness {
             created.get("height").is_some(),
             "identity creation: {created}"
         );
-        harness.register_model(AGENT_ID, "Quackbot", allowed_actions, forge_read);
+        harness.register_model(AGENT_ID, "Quackbot");
         harness
     }
 
@@ -154,13 +149,7 @@ impl Harness {
         self.daemon.node_url()
     }
 
-    pub fn register_model(
-        &self,
-        id: &str,
-        name: &str,
-        allowed_actions: &[&str],
-        forge_read: &[&str],
-    ) -> u64 {
+    pub fn register_model(&self, id: &str, name: &str) -> u64 {
         let provisioned = self.submit(
             "agent",
             serde_json::to_value(agent::AgentMsg::Provision {
@@ -202,16 +191,8 @@ impl Harness {
                     agent_id: id.into(),
                     display_name: name.into(),
                     capability: "codex".into(),
-                    allowed_actions: allowed_actions
-                        .iter()
-                        .map(|action| (*action).into())
-                        .collect(),
                     recipe_hash: None,
                     skills: None,
-                    caps: Some(runs::ResourceCaps {
-                        forge_read: forge_read.iter().map(|repo| (*repo).into()).collect(),
-                        ..Default::default()
-                    }),
                 },
             })
             .unwrap(),
@@ -236,7 +217,7 @@ impl Harness {
             chat::ChatMsg::PostMessage {
                 channel_id: "mcp-read".into(),
                 message_id: "anchor".into(),
-                blocks: vec![chat::Block::paragraph("read the current grant")],
+                blocks: vec![chat::Block::paragraph("read the current record")],
                 thread: None,
             },
         ] {
