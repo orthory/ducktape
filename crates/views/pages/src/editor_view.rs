@@ -1,6 +1,6 @@
 //! The Pages presentation consumer: native-compatible comment badges and an
 //! explicit plain-editor notice when the complete presentation cannot be used.
-use crate::{document_source::CommentMark, editor_binding::MenuState};
+use crate::{document_sync::CommentMark, editor_binding::MenuState};
 use ui_lang_guest::{Editor, EditorStateView, wire};
 use wire::editor_presentation::{EditorMargin, EditorPresentation, PresentationError};
 

@@ -54,9 +54,12 @@ extern crate::module_view
   // a dropped file lands in.
   component files_view(dark:bool, connected:bool, chain:&str, route:&str, route_serial:i64) -> ModuleViewEvent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
-  // The guest owns the document editor. The app supplies a bounded source
-  // stream and reconciles accepted edits with persistence and navigation.
-  component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, blocks:&[PageBlock], commented_block_hits:&[str], orphaned_comment_drafts:&[str], page_text:&str, buffer_page:&str, block_comments_open:bool, scope_target:&str, scope_pinned:bool, thread_total:i64, comment_rows:&[PageCommentThreadRow], threads_loading:bool) -> ModuleViewEvent
+  // Pages speaks the KERNEL CONTRACT: session facts go in — the chain,
+  // because a `duck://page/…` address carries it, and the page a link asked
+  // the app to open — and the view reads the workspace, the document and its
+  // comments off the node itself and signs its writes through `op.submit`.
+  // The intents back are the two OS doors: the clipboard and the open plane.
+  component pages_view(dark:bool, connected:bool, network_chain_id:&str, route_page:&str, route_serial:i64) -> ModuleViewEvent
   pure pages_intent(event:&ModuleViewEvent) -> PagesIntent
   // The Forge tab: the register the app holds and the item it has open,
   // the code browse's listing and file, and the discussion — whose note

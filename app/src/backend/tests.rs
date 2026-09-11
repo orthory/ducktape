@@ -126,7 +126,7 @@ async fn next_change(
         // the assertion that binds the arm.
         assert!(update.height > 0, "a tip carries the head it was sent with");
         assert!(
-            !update.load_chat && !update.load_pages,
+            !update.load_chat,
             "a tip must not trigger a load — that is a 1 Hz poll on an idle chain"
         );
     }
@@ -140,7 +140,7 @@ async fn wait_for_block(
 ) {
     loop {
         let update = live.next().await.expect("live stream ended");
-        let folded = matches!(update.kind, crate::LiveKind::Chat | crate::LiveKind::Pages);
+        let folded = matches!(update.kind, crate::LiveKind::Chat | crate::LiveKind::Plane);
         if folded && update.height >= min_height {
             return;
         }
@@ -263,31 +263,6 @@ fn backend_fn<'a>(source: &'a str, declaration: &str) -> &'a str {
         .split("\n}\n")
         .next()
         .unwrap_or_else(|| panic!("{declaration} body"))
-}
-
-/// Every backend module's source, this test file excepted — the lane pins
-/// above sweep the whole crate rather than the handful of files that happen to
-/// hold a read today.
-fn backend_sources() -> Vec<(String, String)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
-    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
-        .expect("the backend tree is readable")
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|kind| kind == "rs"))
-        .filter(|path| path.file_name().is_some_and(|name| name != "tests.rs"))
-        .map(|path| {
-            let source = std::fs::read_to_string(&path).expect("a backend module reads");
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            (name, source)
-        })
-        .collect();
-    out.sort();
-    out
 }
 
 /// A stub node whose `/v1/index/pages/view` replies carry a SCRIPTED fold

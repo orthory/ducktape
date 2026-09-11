@@ -649,7 +649,15 @@ fn composer_font(weight: Weight, style: FontStyle) -> Font {
     }
 }
 
-pub use crate::pages::inline::{Inline, inline_marks};
+// The composer's emphasis grammar is the pages editor's, character for
+// character — one scanner, so a `**bold**` typed in a room and a `**bold**`
+// typed in a document can never drift apart.
+#[path = "../../crates/views/pages/src/editor_inline.rs"]
+// The pages guest also reads document links out of a line; the composer only
+// needs the emphasis half.
+#[allow(dead_code)]
+mod inline;
+pub use inline::{Inline, inline_marks};
 
 fn inline_format(kind: &Inline) -> Format {
     match kind {

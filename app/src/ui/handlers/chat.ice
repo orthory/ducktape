@@ -349,7 +349,7 @@ on message_send_failed(cause)
   return if active_channel != cause.scope_id || !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 // Same rule as `message_send_failed`: a reply belongs to its thread, and
 // `cause.thread_seq` is the only thing that can name the box it came from
@@ -361,7 +361,7 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id || !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on thread_reply_sent(next)
   chat_pending_sends = send_settled(chat_pending_sends, next.operation_id)

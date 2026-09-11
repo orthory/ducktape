@@ -559,13 +559,13 @@ fn the_live_chat_batch_budget_counts_invisible_frames() {
         }],
         ..LiveUpdate::default()
     };
-    let pages = LiveUpdate {
-        kind: crate::LiveKind::Pages,
+    let plane = LiveUpdate {
+        kind: crate::LiveKind::Plane,
         status: "Live".into(),
         height: 4,
         ..LiveUpdate::default()
     };
-    let batched = batch_live_updates(vec![chat(1), chat(2), pages.clone(), chat(3)]);
+    let batched = batch_live_updates(vec![chat(1), chat(2), plane.clone(), chat(3)]);
     assert_eq!(
         batched
             .iter()
@@ -573,10 +573,10 @@ fn the_live_chat_batch_budget_counts_invisible_frames() {
             .collect::<Vec<_>>(),
         [
             (crate::LiveKind::Chat, 2, 2),
-            (crate::LiveKind::Pages, 0, 4),
+            (crate::LiveKind::Plane, 0, 4),
             (crate::LiveKind::Chat, 1, 3),
         ],
-        "two chat frames fold into one; the pages frame closes the batch"
+        "two chat frames fold into one; the plane frame closes the batch"
     );
 }
 

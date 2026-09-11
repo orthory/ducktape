@@ -489,7 +489,6 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
     }
 }
 
-
 /// The forge code reader's row metrics. One place on purpose: the shape lint
 /// in `app/src/tests.rs` pins these against `DiffRow`'s Ice metrics so the
 /// source and patch surfaces cannot drift apart.

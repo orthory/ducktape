@@ -49,9 +49,9 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
         presses,
         [
             "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
-            "keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, \
-             palette_open, bell_open, channel_create_open, \
-             page_delete_armed)) -> global_key_pressed _",
+            "keyboard press key=escape status=captured when \
+             !empty(topmost_overlay(palette_open, bell_open, channel_create_open)) -> \
+             global_key_pressed _",
             "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
             "keyboard press status=ignored when shell_tab == ShellTab.chat -> \
              copy_chord_pressed _",
@@ -304,9 +304,7 @@ fn a_resync_never_eats_the_message_being_typed() {
     let composer = composer_scope(&app);
     type_into(&composer, "half a paragraph, mid-word");
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(4, "general", "",
-        Vec::new(),
-    )));
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(4, "general")));
 
     assert_eq!(
         composer_text(&composer),
@@ -429,8 +427,9 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     // and it carries the inline edit's text: nothing is being edited here, so
     // there is no body for it to hand anyone.
     let general = composer_scope(&app);
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation, "dm-with-alice", "",
-        Vec::new(),
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "dm-with-alice",
     )));
 
     assert_eq!(app.active_channel, "dm-with-alice");
@@ -449,24 +448,6 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
         "the incident started at",
         "they are still waiting in #private-ops, where she typed them"
     );
-}
-
-#[test]
-fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.rpc = "http://node".into();
-    app.connected_rpc = "http://node".into();
-    app.active_page = "page".into();
-    app.block_comment_draft = "unfinished comment".into();
-
-    let _ = app.__update(__DucktapeMessage::Reconnect);
-
-    // A half-typed COMMENT still survives a reconnect. The page body does not
-    // need the same rescue: it is one buffer whose every keystroke is already
-    // heading for the node on the save tick, and it is reinstalled from the
-    // node's own text on the next load.
-    assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
 }
 
 /// BOTH COMPOSERS ARE RE-ASKED AT DELIVERY, AND BOTH ARE PINNED HERE. A
@@ -759,16 +740,16 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
         "and the escape ladder still runs below the guard"
     );
 
-    // The pages chord is the third take, so it is driven too.
+    // AND THE PAGES DOCUMENT'S UNDO IS THE GUEST'S: the chord bubbles to the
+    // widget that holds the caret, so the app's global handler sees it and
+    // names no move at all.
     app.shell_tab = ShellTab::Pages;
-    app.page_text = ("one").to_string();
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
         iced::keyboard::key::Code::KeyZ,
     )));
-    assert_eq!(
-        app.page_text.clone(),
-        "one",
-        "the global handler cannot mutate the guest-owned undo buffer"
+    assert!(
+        app.error.is_empty(),
+        "the global handler has nothing to say about a chord the view owns"
     );
 }
 
@@ -1048,8 +1029,9 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
     assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 
     // a resync belonging to an abandoned chain answers for nothing
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation - 1, "general", "",
-        Vec::new(),
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation - 1,
+        "general",
     )));
     assert_eq!(
         app.mutation_phase,
@@ -1057,8 +1039,9 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
         "a stale answer is not it"
     );
 
-    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(app.hydration_generation, "general", "",
-        Vec::new(),
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
     )));
     assert_eq!(
         app.mutation_phase,

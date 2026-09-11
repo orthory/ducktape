@@ -84,34 +84,18 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 /// it would otherwise move. Every keyboard route that ignores this list routes
 /// a key at the screen BEHIND the layer the reader is looking at.
 ///
-/// EVERY PER-TAB RUNG IS SCOPED TO THE TAB THAT MOUNTS ITS SURFACE, because no
-/// tab switch clears any of this state — `select_shell_tab` leaves every one
-/// of these flags set. A flag left set on the tab you came from
-/// names a layer that is no longer on screen: Escape then "closes" an
-/// invisible menu while the visible screen swallows the press, and the scroll
-/// reader refuses to move a pane nothing is actually covering. Which scope a
-/// rung gets is read off the slot layout in `components/shell.ice`, not
-/// guessed: `slot chat` / `slot forge` sit inside `match tab`, so their menus
-/// are per-tab mounts, while `slot palette` and `slot bell` sit OUTSIDE it —
-/// the palette, the bell and the create modal ride every tab and stay global
-/// on purpose.
+/// NO PER-TAB RUNG IS LEFT, so the ladder takes no tab. The chat tab's menus,
+/// drawer and rail belong to the chat view (`crates/views/chat`); the pages
+/// tab's armed delete, block menu and comments card belong to the pages view
+/// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
+/// Each guest paints its own scrim and dismisses its own layers — a key the
+/// kernel contract carries no door for. What is enumerated here is what rides
+/// EVERY tab, which is why `slot palette` and `slot bell` sit OUTSIDE the
+/// `match tab` in `components/shell.ice`.
 //
-// One argument per layer, plus the tab that scopes them: the Ice extern
-// surface is flat, and the reading must see every layer at once to name the
-// topmost. Scoping lives HERE rather than in the call sites' argument lists —
-// a conjunction per caller is one guard per rung to forget.
-//
-// THE CHAT TAB HOLDS NO RUNG. Its menus, its drawer and its rail belong to the
-// chat view (`crates/views/chat`), which dismisses its own layers — a key the
-// kernel contract carries no door for.
-pub fn topmost_overlay(
-    shell_tab: crate::ShellTab,
-    palette_open: bool,
-    bell_open: bool,
-    channel_create_open: bool,
-    page_delete_armed: bool,
-) -> String {
-    let on_pages = shell_tab == crate::ShellTab::Pages;
+// One argument per layer: the Ice extern surface is flat, and the reading must
+// see every layer at once to name the topmost.
+pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open: bool) -> String {
     if palette_open {
         return "palette".into();
     }
@@ -121,49 +105,32 @@ pub fn topmost_overlay(
     if channel_create_open {
         return "channel_create".into();
     }
-    // The pages block-actions menu and insert row used to sit here, and the
-    // comments rail is a persistent panel with its own close. THE ARMED DELETE
-    // IS NEITHER: it paints a scrim and a confirm over the canvas, and it
-    // shipped with the mouse as its only exit. `pages_ready` in
-    // `handlers/overlays.ice` names it for the same reason — a layer that eats
-    // the mouse must eat the keyboard, or Cmd/Ctrl+Z mutates (and autosaves)
-    // the document the reader is being asked to confirm the deletion of.
-    if on_pages && page_delete_armed {
-        return "page_delete".into();
-    }
+    // THE CHAT, PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the
+    // keyboard inside its tab and answers Escape itself — the chat menus and
+    // drawer, the pages armed delete, the comments card. The guest paints the
+    // scrim, so the guest owns the exit.
+    //
     // The forge's repository and branch switchers are the host's own pick
     // lists: the host dismisses their menus itself, so they hold no rung.
     String::new()
 }
 
 /// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own. Menus, popovers, the create modal, the bell and
-/// the channel drawer close; the thread and comments rails keep their explicit
-/// × — closing one from a global key would also have to adjudicate its
-/// half-typed drafts. The drawer carries no such debt: its only opener
-/// re-seeds the name draft from the live channel name on every open, so its
-/// rung leaks nothing the × doesn't.
-#[allow(clippy::too_many_arguments)]
+/// rung Escape does not own: an open palette swallows the key itself. What is
+/// left after the views took their own layers is the palette, the bell and the
+/// create modal, all three of which ride every tab.
 pub fn escape_target(
     logical: iced::keyboard::Key,
-    shell_tab: crate::ShellTab,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    page_delete_armed: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
     let not_escape = logical != Key::Named(Named::Escape);
     if not_escape {
         return String::new();
     }
-    let topmost = topmost_overlay(
-        shell_tab,
-        palette_open,
-        bell_open,
-        channel_create_open,
-        page_delete_armed,
-    );
+    let topmost = topmost_overlay(palette_open, bell_open, channel_create_open);
     // `palette_key_action` owns the palette's keys — an open palette swallows
     // Escape, so the ladder yields rather than naming a rung.
     let palette_owns_it = topmost == "palette";

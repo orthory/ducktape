@@ -1736,7 +1736,7 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
         })
         .collect();
     assert!(
-        list_taking.len() > 50,
+        list_taking.len() > 30,
         "the extern sweep found the declarations, not an empty file"
     );
 
