@@ -189,6 +189,12 @@ view
           text height_label(head) size=13.0 @text-muted
           if !empty(sync_line)
             text sync_line size=13.0 @text-muted
+        // A READ THAT WAS REFUSED SAYS SO. The window and the search are this
+        // view's own reads now; a refusal that paints nothing leaves the empty
+        // plate below asserting "No blocks yet" about a node that answered
+        // nothing.
+        if !empty(host_error)
+          text host_error #host-error size=12.0 @text-danger
         // THE QUERY BOX, on the artifact's own 1.5px ink outline.
         box w=fill max-w=860.0
           row
@@ -401,7 +407,11 @@ view
             with
               title="Not connected"
               description="Click the network name in the titlebar to pick or reconnect a network."
-        if connected && empty(hits) && empty(blocks) && !loading && empty(trim(query))
+        // A REFUSED READ IS NOT AN EMPTY CHAIN, so the refusal above stands
+        // down this plate the same way `!connected` does: "No blocks yet" is a
+        // claim about what the node HOLDS, and a read that never answered
+        // cannot support it.
+        if connected && empty(hits) && empty(blocks) && !loading && empty(trim(query)) && empty(host_error)
           // Same set, same words as the subtitle above. This plate already said
           // "non-empty", which was right and was the only place on the screen
           // that knew — two dialects for one set is how the subtitle drifted

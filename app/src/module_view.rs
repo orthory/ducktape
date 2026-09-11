@@ -377,55 +377,29 @@ pub fn node_log_timeline_drain(
 
 // ---------- the explorer seat ----------
 
-/// The Explorer tab: the ledger and the answer to the last workspace search
-/// as the app holds them, drawn by the `explorer` view. Its intents come
-/// back as `refresh`, `copy` (`text`, `label`), `search` (`query`) and
-/// `clear`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
+/// The Explorer tab, drawn by the `explorer` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, and the two node
+/// facts the titlebar already holds, so the screen's head and the titlebar's
+/// cannot disagree. The view reads the block window itself through
+/// `rpc.blocks` (re-read on `rpc.live` for the `block` plane) and runs the
+/// workspace search over `rpc.query` / `rpc.view`. The one intent that comes
+/// back is `copy` (`text`, `label`) — the clipboard is an OS door.
 pub fn explorer_view(
     dark: bool,
     connected: bool,
-    loading: bool,
-    blocks: &[crate::backend::ExplorerBlock],
-    ops: &[crate::backend::ExplorerOp],
     head: i64,
     sync_line: &str,
-    hits: &[crate::backend::ExplorerHit],
-    kinds: &[crate::backend::KindCount],
-    partial: &str,
-    searching: bool,
-    sent_query: &str,
 ) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "connected": connected,
-        "loading": loading,
         "dark": dark,
-        "blocks": blocks,
-        "ops": ops,
         "head": head,
         "sync_line": sync_line,
-        "hits": hits,
-        "kinds": kinds,
-        "partial": partial,
-        "searching": searching,
-        "sent_query": sent_query,
     });
     module_view(
         "explorer",
         serde_json::to_vec(&props).expect("props encode"),
     )
-}
-
-pub fn explorer_intent(event: &ModuleViewEvent) -> crate::ExplorerIntent {
-    match event.kind.as_str() {
-        "refresh" => crate::ExplorerIntent::Refresh,
-        "search" => crate::ExplorerIntent::Search,
-        "clear" => crate::ExplorerIntent::Clear,
-        _ => crate::ExplorerIntent::Copy,
-    }
 }
 
 // ---------- the settings seat ----------
@@ -1691,7 +1665,9 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "open_link",
         ],
         "node" => &["copy", "tab", "log_filter"],
-        "explorer" => &["refresh", "copy", "search", "clear"],
+        // the explorer view reads and searches through the kernel: the only
+        // thing it asks the app for is the clipboard
+        "explorer" => &["copy"],
         "chat" => &[
             "search",
             "clear_search",
@@ -4110,11 +4086,10 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 9] = [
+        let other_route_only: [(&str, &str, &[&str]); 8] = [
             ("members", "roster_intent", &[]),
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
-            ("explorer", "explorer_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
             ("pages", "pages_intent", &["edited"]),
@@ -4803,140 +4778,72 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Explorer view through the host: the ledger, then a
-    /// search that leaves as an intent and lands back as props.
+    /// The bundled Explorer view end to end through the host, on the kernel
+    /// contract: it boots on the offline plate, and once the session says
+    /// connected it reads the block window itself — an `rpc.live`
+    /// subscription on the `block` plane that the kernel keeps, and an
+    /// `rpc.blocks` the kernel refuses here (no node), so the refusal is what
+    /// the screen shows. A block on that plane makes it read again. What the
+    /// window folds to is pinned in the view's own tests, which drive the same
+    /// compiled Ice through the wire.
     #[test]
-    fn the_staged_explorer_view_boots_takes_the_ledger_and_asks_for_a_search() {
+    fn the_staged_explorer_view_boots_and_reads_its_window_through_the_kernel() {
         let Some(staged) = staged("explorer") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
         guest.redraw(&None);
-        let props = Some(
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "the offline plate is what an unconnected Explorer shows"
+        );
+
+        let session = Some(
             serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": [{"height": 84912, "hash": "9f3e", "commit": "c0ffee", "op_count": 1}],
-                "ops": [{"height": 84912, "proposer": "val-1", "target": "chat",
-                         "disposition": "applied", "op_hash": "ab12cd34", "payload": "post",
-                         "trace": "chat · 1 msg"}],
-                "head": 84912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
+                "connected": true, "dark": false, "head": 84_912, "sync_line": "live"
             }))
             .expect("props encode"),
         );
-        guest.redraw(&props);
+        guest.redraw(&session);
+        assert_eq!(
+            guest.live_subscriptions.len(),
+            1,
+            "the view holds one `rpc.live` subscription for the block plane"
+        );
+        assert_eq!(guest.live_subscriptions[0].1, "block");
+        // no node behind the kernel: the read is refused, and the view says
+        // so in place
+        while guest.redraw(&session) {}
         let shown = texts(&guest);
-        for expected in ["Explorer", "h 84,912"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        guest.deliver(Output::Activate(button_message(&guest, "Refresh")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "refresh".into(),
-                detail: "null".into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// EVERY DIGEST THE LEDGER PUBLISHES REACHES THE SCREEN WHOLE, IN HEX.
-    /// The rows are the node's own `GET /v1/blocks` shape, the props are what
-    /// `explorer_window` makes of them — the production conversion, not a
-    /// hand-built prop — and the reader is the bundled wasm guest. Nothing
-    /// between the two may cut a digest or leave one in decimal: the block
-    /// hash on the list row, the commit hash and the op hash in the detail,
-    /// and the `new_oid` inside the payload all read `0x` and every character
-    /// — and the copy intent carries the bare key the blob route takes.
-    #[test]
-    fn the_staged_explorer_view_shows_every_published_digest_whole_and_in_hex() {
-        let Some(staged) = staged("explorer") else {
-            return;
-        };
-        let hash = "9f3e".repeat(16);
-        let commit = "c0ffee11".repeat(8);
-        let op_hash = "dd".repeat(32);
-        let oid: Vec<u8> = (1..=20).collect();
-        let rows = vec![serde_json::json!({
-            "height": 84_912,
-            "hash": hash,
-            "commit_hash": commit,
-            "ops": [{
-                "proposer": "cc".repeat(32),
-                "target": "forge",
-                "disposition": "applied",
-                "op_hash": op_hash,
-                "payload": serde_json::to_string(&serde_json::json!({
-                    "push": { "new_oid": oid }
-                }))
-                .expect("payload encodes"),
-                "operations": []
-            }]
-        })];
-        let ledger = crate::backend::explorer_window(1, &rows);
-
-        let mut guest = Guest::load_from("explorer", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "connected": true, "loading": false, "dark": false,
-                "blocks": ledger.blocks, "ops": ledger.ops,
-                "head": 84_912, "sync_line": "live",
-                "hits": [], "kinds": [], "partial": "", "searching": false, "sent_query": ""
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-
-        let whole = format!("0x{hash}");
-        let listed = texts(&guest);
         assert!(
-            listed.contains(&whole),
-            "the list row carries the whole block hash: {listed:?}"
-        );
-        // and nothing on it is a cut-down version of that hash — the guard
-        // that fails the moment a landmark form comes back.
-        let abbreviated = listed
-            .iter()
-            .find(|text| text.starts_with("0x9f3e") && **text != whole);
-        assert!(
-            abbreviated.is_none(),
-            "the list carries the whole hash, not {abbreviated:?}"
-        );
-
-        guest.deliver(Output::Activate(button_message(&guest, "Inspect block")));
-        guest.redraw(&props);
-        let opened = texts(&guest);
-        for expected in [format!("0x{commit}"), format!("0x{op_hash}")] {
-            assert!(
-                opened.iter().any(|text| text == &expected),
-                "missing {expected:?} in {opened:?}"
-            );
-        }
-        assert!(
-            opened
+            shown
                 .iter()
-                .any(|text| text
-                    .contains("\"new_oid\": \"0x0102030405060708090a0b0c0d0e0f1011121314\"")),
-            "the payload's digest is hex too: {opened:?}"
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+        assert!(
+            !guest.redraw(&session),
+            "an unchanged session leaves the view quiet"
         );
 
-        // AND THE CLIPBOARD GETS THE KEY, not the reading of it: `0x` is for
-        // the eye, and `GET /v1/files/blob/{op_hash}` takes the bare digest.
-        guest.deliver(Output::Activate(button_message(&guest, "Copy op hash")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "copy".into(),
-                detail: format!(r#"{{"text":"{op_hash}","label":"Op hash copied"}}"#),
-            }]
-        );
-        assert!(guest.fault.is_none());
+        // a block: the live item lands and the view reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The bundled Settings view through the host: the facts, then a

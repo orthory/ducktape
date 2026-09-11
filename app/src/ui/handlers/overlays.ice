@@ -1,61 +1,14 @@
 // THE WINDOW LAYERS — the bell, the command palette and the block explorer.
 // `global_key_pressed` lives here because the palette is what it opens.
 
-on refresh_explorer
-  return if !connected || explorer_loading
-  explorer_generation = explorer_generation + 1
-  explorer_loading = true
-  run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-
-on explorer_loaded(next)
-  return if next.generation != explorer_generation
-  explorer_loading = false
-  explorer_blocks = next.blocks
-  explorer_ops = next.ops
-
-on explorer_failed(cause)
-  return if cause.generation != explorer_generation
-  explorer_loading = false
-  error = cause.message
-
-// THE EXPLORER IS A MODULE-OWNED VIEW: the ledger goes in as props, and what
-// the reader does comes back as an intent. A search is run here, on the
-// view's behalf — the guest sees no endpoint — and answered through the
-// props; `explorer_sent_query` is captured at the send and sent from the
-// capture, so the string asked about and the string the zero-hit plate
-// speaks for cannot drift apart.
+// THE EXPLORER SPEAKS THE KERNEL CONTRACT: it reads the block window and
+// runs its workspace search itself, so the only thing it asks the app for is
+// the clipboard — an OS door no view holds.
 on explorer_view_event(event)
-  match explorer_intent(event)
-    ExplorerIntent.refresh
-      return if !connected || explorer_loading
-      explorer_generation = explorer_generation + 1
-      explorer_loading = true
-      run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-    ExplorerIntent.copy
-      toast = event_text(event, "label")
-      toast_age = 0
-      task clipboard write event_text(event, "text")
-    ExplorerIntent.search
-      return if !connected || explorer_searching || empty(event_text(event, "query"))
-      explorer_searching = true
-      explorer_hits = []
-      explorer_kinds = []
-      explorer_partial = ""
-      explorer_sent_query = event_text(event, "query")
-      run replace lane=workspace_search search_workspace(connected_rpc, explorer_sent_query) -> explorer_results_loaded _
-    ExplorerIntent.clear
-      invalidate lane=workspace_search
-      explorer_hits = []
-      explorer_kinds = []
-      explorer_partial = ""
-      explorer_searching = false
-      explorer_sent_query = ""
-
-on explorer_results_loaded(next)
-  explorer_hits = next.hits
-  explorer_kinds = next.kinds
-  explorer_partial = next.partial
-  explorer_searching = false
+  return if event.kind != "copy"
+  toast = event_text(event, "label")
+  toast_age = 0
+  task clipboard write event_text(event, "text")
 
 on close_palette
   invalidate lane=palette_search

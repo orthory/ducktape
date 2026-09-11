@@ -261,7 +261,6 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/state/core.ice"),
         include_str!("../ui/state/chat.ice"),
         include_str!("../ui/state/shell.ice"),
-        include_str!("../ui/state/explorer.ice"),
         include_str!("../ui/state/roster.ice"),
         include_str!("../ui/state/forge.ice"),
         include_str!("../ui/state/node.ice"),
