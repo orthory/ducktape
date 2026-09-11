@@ -28,71 +28,6 @@ pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
 
-pub fn merge_pending_blocks(
-    canonical: Vec<PageBlock>,
-    current: Vec<PageBlock>,
-    current_page: String,
-    next_page: String,
-    settled_id: String,
-) -> Vec<PageBlock> {
-    if current_page != next_page {
-        return canonical;
-    }
-    let canonical_ids = canonical
-        .iter()
-        .map(|block| block.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut pending_by_anchor = BTreeMap::<String, Vec<PageBlock>>::new();
-    let mut anchor = String::new();
-    for block in current {
-        if canonical_ids.contains(&block.id) {
-            anchor = block.id;
-        } else if block.pending && block.id != settled_id {
-            pending_by_anchor
-                .entry(anchor.clone())
-                .or_default()
-                .push(block);
-        }
-    }
-    if pending_by_anchor.is_empty() {
-        return canonical;
-    }
-    let mut merged = pending_by_anchor.remove("").unwrap_or_default();
-    for block in canonical {
-        let id = block.id.clone();
-        merged.push(block);
-        merged.extend(pending_by_anchor.remove(&id).unwrap_or_default());
-    }
-    merged.extend(pending_by_anchor.into_values().flatten());
-    merged
-}
-
-pub fn append_page_comment_threads(
-    threads: Vec<PageCommentThread>,
-    next: Vec<PageCommentThread>,
-) -> Vec<PageCommentThread> {
-    threads
-        .into_iter()
-        .chain(next)
-        .map(|thread| (thread.id.clone(), thread))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
-pub fn append_page_comments(
-    comments: Vec<PageComment>,
-    next: Vec<PageComment>,
-) -> Vec<PageComment> {
-    comments
-        .into_iter()
-        .chain(next)
-        .map(|comment| (comment.ordinal, comment))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
-}
-
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
     if keep_pending {
         return current;
@@ -113,14 +48,6 @@ pub fn remember_failed_draft(
         return pending;
     }
     format!("{existing}\n{pending}")
-}
-
-pub fn retain_for_endpoint(value: String, current: String, next: String) -> String {
-    if current == next {
-        value
-    } else {
-        String::new()
-    }
 }
 
 pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
@@ -504,16 +431,6 @@ pub fn room_scope(scope: &str) -> String {
     scope.to_owned()
 }
 
-/// The clicked page's title, from the index the sidebar is already drawn from
-/// — the header has to move with the click, not with the round trip. Falls
-/// back to the current title while the id is not in the list yet.
-pub fn page_display_title(pages: Vec<PageItem>, page: String, current: String) -> String {
-    pages
-        .iter()
-        .find(|row| row.id == page)
-        .map_or(current, |row| row.title.clone())
-}
-
 /// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id
 /// (no channel selected / disconnected) is inert.
 pub fn mark_channel_read(
@@ -737,121 +654,6 @@ pub fn thread_root_seed(
         .collect()
 }
 
-pub fn remember_orphaned_comment_drafts(
-    mut drafts: Vec<String>,
-    blocks: Vec<PageBlock>,
-    selected_id: String,
-    current: String,
-) -> Vec<String> {
-    if selected_block_missing(&blocks, &selected_id) {
-        append_recovered_draft(&mut drafts, current);
-    }
-    drafts
-}
-
-/// The live-resync twin of [`remember_orphaned_comment_drafts`]: the rail's
-/// anchor is the PAGE, so the half-typed comment is orphaned only when that
-/// page itself vanished from the index — never merely because a resync ran.
-pub fn remember_orphaned_page_comment(
-    mut drafts: Vec<String>,
-    pages: Vec<PageItem>,
-    target: String,
-    draft: String,
-) -> Vec<String> {
-    let page_gone = !target.is_empty() && !pages.iter().any(|page| page.id == target);
-    if page_gone {
-        append_recovered_draft(&mut drafts, draft);
-    }
-    drafts
-}
-
-pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec<String> {
-    if let Some(index) = drafts.iter().position(|draft| draft == &recovered) {
-        drafts.remove(index);
-    }
-    drafts
-}
-
-/// The commented BLOCK ids in a thread list — the page's own id marks no line.
-pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) -> Vec<String> {
-    let mut targets: Vec<String> = threads
-        .into_iter()
-        .filter(|thread| !thread.resolved && thread.target != page_id)
-        .map(|thread| thread.target)
-        .collect();
-    // NOT deduplicated — see `load::commented_targets`. The repetition is the
-    // per-line thread count the margin chip spells.
-    targets.sort();
-    targets
-}
-
-/// The open thread's resolved flag, read off the rail's own list.
-pub fn thread_is_resolved(threads: &[PageCommentThread], id: &str) -> bool {
-    threads
-        .iter()
-        .find(|thread| thread.id == id)
-        .is_some_and(|thread| thread.resolved)
-}
-
-pub fn retain_selected_string(value: String, selected_id: String) -> String {
-    if selected_id.is_empty() {
-        String::new()
-    } else {
-        value
-    }
-}
-
-pub fn retain_selected_i64(value: i64, selected_id: String) -> i64 {
-    if selected_id.is_empty() { 0 } else { value }
-}
-
-pub fn retain_selected_comment_threads(
-    threads: Vec<PageCommentThread>,
-    selected_id: String,
-) -> Vec<PageCommentThread> {
-    if selected_id.is_empty() {
-        Vec::new()
-    } else {
-        threads
-    }
-}
-
-pub fn retain_selected_comments(
-    comments: Vec<PageComment>,
-    selected_id: String,
-) -> Vec<PageComment> {
-    if selected_id.is_empty() {
-        Vec::new()
-    } else {
-        comments
-    }
-}
-
-fn selected_block_missing(blocks: &[PageBlock], selected_id: &str) -> bool {
-    !selected_id.is_empty() && !blocks.iter().any(|block| block.id == selected_id)
-}
-
-fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
-    let should_append = !draft.is_empty() && !drafts.iter().any(|current| current == &draft);
-    if should_append {
-        drafts.push(draft);
-    }
-}
-
-pub fn scope_key(scope: &str, id: &str) -> String {
-    format!("{scope}\0{id}")
-}
-
-pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
-    let below = (pointer_y - 4.0).max(0.0);
-    let below_fits = below + 190.0 <= viewport_height;
-    if below_fits {
-        below
-    } else {
-        (pointer_y - 190.0).max(0.0)
-    }
-}
-
 pub(crate) struct Tip {
     pub(crate) height: i64,
     pub(crate) status: String,
@@ -1056,5 +858,14 @@ pub fn copy_range_label(count: i64) -> String {
     match count {
         1 => "1 message selected".to_owned(),
         count => format!("{count} messages selected"),
+    }
+}
+
+/// `12` — the bell's unread count on its seat. Zero reads as nothing at all,
+/// because a badge that says "0" is louder than the absence it reports.
+pub fn count_label(count: i64) -> String {
+    match count > 0 {
+        true => count.to_string(),
+        false => String::new(),
     }
 }

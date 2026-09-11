@@ -194,11 +194,13 @@ view
         chat:
           extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial, live_agents) #chat -> chat_view_event _
 
-        // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
-        // strip and the comments rail go in as props; the document is the
-        // app's editor, painted into the view's slot by the host.
+        // Pages is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the chain a `duck://page/…` address carries, and the page a
+        // link asked the app to open — and the view reads the workspace, the
+        // document and its comments off the node itself and signs its writes
+        // through `op.submit`.
         pages:
-          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
+          extern pages_view(dark, connected, network_chain_id, page_route, page_route_serial) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW: the listing, the preview, the
         // history and the write refusal go in as props; every navigation

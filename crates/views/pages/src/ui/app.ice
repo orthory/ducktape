@@ -1,3 +1,11 @@
+// PAGES, as a module-owned view. The kernel pushes session facts only
+// (`session()` — one item per change, plus the page a `duck://` link asked
+// for); the workspace, the open document, its comment threads and the search
+// are read here through `rpc.view`, re-read on every pages block
+// (`rpc.live`), and every write — a create, a delete, a comment, a resolve,
+// and each op of a document save — leaves as `op.submit` the kernel signs.
+// The document editor, its history and its presentation have always been
+// this view's; now so is the text in it.
 app PagesView
   title "Pages"
   palette active_palette
@@ -18,38 +26,57 @@ extern crate::host
   PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
-  PropsItem(next:PagesProps, error:str)
-  subscription props() -> PropsItem
-  pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
-  pure installed(document:&editor, source:bytes) -> bool
-  pure toggle_create() -> bool
-  pure create(title:&str, comment_draft:&str) -> bool
-  pure choose(id:&str, comment_draft:&str) -> bool
-  pure search(query:&str) -> bool
-  pure sidebar_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
-  pure clear_search() -> bool
-  pure arm_delete() -> bool
-  pure disarm_delete() -> bool
-  pure delete(comment_draft:&str) -> bool
-  pure open_hit(page_id:&str, block_id:&str, comment_draft:&str) -> bool
-  pure use_draft(draft:&str, comment_draft:&str) -> bool
-  pure discard_draft(draft:&str) -> bool
-  pure toggle_comments(comment_draft:&str) -> bool
-  pure close_comments(comment_draft:&str) -> bool
-  pure open_thread(id:&str, target:&str) -> bool
-  pure resolve(resolved:bool) -> bool
-  pure more_threads() -> bool
-  pure close_thread() -> bool
-  pure more_comments() -> bool
-  pure post(text:&str) -> bool
-  pure copy(text:&str, label:&str) -> bool
+  Session(connected:bool, dark:bool, chain:str, route_page:str, route_serial:i64)
+  SessionItem(next:Session, error:str)
+  RegisterItem(pages:[PageItem], active_page:str, active_page_title:str, active_page_parent:str, blocks:[PageBlock], subpages:[Subpage], document:str, comment_rows:[PageCommentThreadRow], thread_total:i64, commented_hits:[str], error:str)
+  ThreadItem(thread_id:str, comments:[PageComment], resolved:bool, error:str)
+  SearchItem(query:str, hits:[PageSearchHit], error:str)
+  ActItem(page:str, thread:str, error:str)
+  SaveItem(written:bool, refusal:str, document:str, error:str)
+  subscription session() -> SessionItem
+  // the workspace, read by this view: once per connection and per page
+  // picked, then again on every pages block
+  subscription register(page:str, serial:i64) -> RegisterItem
+  // the open thread's comments, on the same terms
+  subscription thread(thread_id:str, target:str, serial:i64) -> ThreadItem
+  // one answer per query the reader sends
+  subscription search(query:str, serial:i64) -> SearchItem
+  // every write's outcome, as the kernel answers it
+  subscription acts() -> ActItem
+  subscription saves() -> SaveItem
+  pure connection_serial_after(was_connected:bool, connected:bool, serial:i64) -> i64
+  pure route_arrived(serial:i64, seen:i64) -> bool
+  sync create(title:&str) -> bool
+  sync delete(page_id:&str) -> bool
+  sync post(text:&str, target:&str, thread_id:&str) -> bool
+  sync resolve(thread_id:&str, resolved:bool) -> bool
+  sync save(page_id:&str, text:&str, saved:&str) -> bool
+  sync copy(text:&str, label:&str) -> bool
+  sync open_link(link:&str) -> bool
   pure icon(name:&str) -> bytes
   pure count_label(count:i64) -> str
   pure keep_str(keep:bool, next:&str, current:&str) -> str
+  pure keep_i64(keep:bool, next:i64, current:i64) -> i64
+  pure sidebar_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure initials_of(name:&str) -> str
-  pure seeded(moved:bool, seed:&str, draft:&str) -> str
+  pure page_address(page_id:&str, chain:&str) -> str
+  pure page_display_title(pages:&[PageItem], id:&str, current:&str) -> str
+  pure compose_hint_of(blocks:&[PageBlock], target:&str, page_id:&str) -> str
+  pure comment_marks(blocks:&[PageBlock], hits:&[str]) -> [CommentMark]
+  pure commented_lines(blocks:&[PageBlock], hits:&[str]) -> [i64]
+  pure anchor_label(blocks:&[PageBlock], target:&str, page_id:&str) -> str
+  pure block_at_line(blocks:&[PageBlock], line:i64) -> str
+  pure document_text(document:&editor) -> str
+  pure document_editor(text:&str) -> editor
+  pure install_decision(text:&str, current_page:&str, next_page:&str, saved:&str, canonical:&str) -> bool
+  pure has_unclosed_fence(text:&str) -> bool
+  pure saved_baseline(written:bool, canonical:&str, submitted:&str) -> str
+  pure baseline_at_submitted_title(canonical:&str, submitted:&str) -> str
+  pure remember_draft(drafts:&[str], draft:&str) -> [str]
+  pure forget_draft(drafts:&[str], draft:&str) -> [str]
+  pure navigation_link(interaction:bytes) -> str
+  pure navigation_comment_line(interaction:bytes) -> i64
 
 extern crate::editor_binding
   HistoryState(snapshot:bytes)
@@ -59,7 +86,8 @@ extern crate::editor_binding
   pure initial_menu() -> MenuState
   editor-binding keys(history:HistoryState, menu:MenuState) -> EditorUpdate
 
-extern crate::document_source
+extern crate::document_sync
+  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, checked:bool, prefix:str, child_count:i64)
   CommentMark(line:i64, count:i64)
 
 extern crate::editor_view
@@ -67,15 +95,8 @@ extern crate::editor_view
   pure presentation_notice(document:&editor, prepared:&PreparedPresentation) -> str
   pure empty_presentation() -> PreparedPresentation
   editor-highlighter paint(prepared:PreparedPresentation)
+  pure cursor_line(document:&editor) -> i64
   pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark], focused:bool) -> PreparedPresentation
-
-extern crate::document_ingress
-  DocumentSource(reference:bytes)
-  DocumentItem(notice:str, source:bytes, text:str, cursor:bytes, error:str)
-  pure source_reference(reference:bytes) -> DocumentSource
-  pure empty_source() -> DocumentSource
-  pure document_editor(text:str, cursor:bytes) -> editor
-  subscription document_source(source:DocumentSource) -> DocumentItem
 
 state
   document_focused = false
@@ -84,19 +105,26 @@ state
   document:editor = ""
   document_history:HistoryState = initial_history()
   document_menu:MenuState = initial_menu()
-  document_source_ref:DocumentSource = empty_source()
-  document_installed:bytes = bytes()
   document_error = ""
-  document_source_error = ""
   document_dark = false
   document_commented:[i64] = []
   document_marks:[CommentMark] = []
   active_palette:palette[AppTheme] = AppTheme.app
+  // the session, as the kernel pushes it
   connected = false
+  chain = ""
+  route_serial:i64 = 0
+  // moves when the session comes up, when a page is picked, and after every
+  // write: the register is read afresh
+  register_serial:i64 = 0
   loading = false
+  // ONE WRITE AT A TIME. Every act takes this lock and the act's outcome
+  // releases it; the document save keeps its own (`autosave`).
   busy = false
+  host_error = ""
   page_link = ""
   pages:[PageItem] = []
+  blocks:[PageBlock] = []
   // CHROME, NOT FACTS: how wide the reader dragged the page list and whether
   // she has the `⋯` menu open. Neither leaves this view, and neither is
   // persisted — a fresh window opens on the default again.
@@ -110,6 +138,7 @@ state
   page_searching = false
   page_search_hits:[PageSearchHit] = []
   page_search_query = ""
+  page_search_serial:i64 = 0
   page_delete_armed = false
   autosave = "idle"
   page_refusal = ""
@@ -119,60 +148,388 @@ state
   thread_total:i64 = 0
   comment_rows:[PageCommentThreadRow] = []
   threads_loading = false
-  threads_has_more = false
   active_thread = ""
+  active_thread_target = ""
   thread_resolved = false
   active_thread_anchor = ""
   comments:[PageComment] = []
   comments_loading = false
-  comments_has_more = false
   compose_hint = ""
-  // the last seed the app pushed: the count moves once per hand-back
-  seed_rev:i64 = 0
-  // the reader's own: the three drafts the screen edits
+  commented_hits:[str] = []
+  // where a NEW comment anchors: the block the caret sits in
+  caret_comment_target = ""
+  // the reader's own: the three drafts the screen edits, and what a refused
+  // write hands back
   page_draft = ""
   page_search_draft = ""
   block_comment_draft = ""
-  host_error = ""
+  pending_page = ""
+  pending_comment = ""
+  // The document is one editor buffer. Drift from the last saved text is the
+  // dirty signal; `buffer_page` names what that buffer actually contains.
+  page_saved_text = ""
+  buffer_page = ""
+  page_inflight_text = ""
   // a write's acknowledgement — `host::notify` returns nothing to bind
   sent = false
 
-// The facts are the host's: one subscription, one item per change. A
-// subscription, not a mount task, so a replacement restored from this
-// view's state asks for the facts again on its own.
+// Subscriptions, not mount tasks, so a replacement restored from this view's
+// state asks for the session and re-reads the workspace on its own.
 subscribe
   mouse released status=any -> document_pointer_released _
   keyboard release status=any -> document_key_released _
   window focused -> document_window_focused
   window unfocused -> document_window_unfocused
-  document_source(document_source_ref) when !empty(document_source_ref.reference) && document_source_ref.reference != document_installed -> document_arrived _
-  props() -> props_arrived _
+  session() -> session_arrived _
+  register(active_page, register_serial) when connected -> register_arrived _
+  thread(active_thread, active_thread_target, register_serial) when connected && !empty(active_thread) -> thread_arrived _
+  search(page_search_query, page_search_serial) when connected && !empty(page_search_query) -> search_arrived _
+  acts() -> act_done _
+  saves() -> save_done _
+  // THE PAGE SAVES ON A GATED TICK, not per keystroke: the editor's edits
+  // land in `document` without passing through a handler on the way to the
+  // node, so dirtiness is the buffer's drift from `page_saved_text`.
+  every 900ms when (connected && !loading && !busy && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick
+
+on session_arrived(item)
+  host_error = item.error
+  return if !empty(item.error)
+  let next = item.next
+  register_serial = connection_serial_after(connected, next.connected, register_serial)
+  connected = next.connected
+  chain = next.chain
+  document_dark = next.dark
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  // A `duck://page/…` link the app was asked to open. The serial moves once
+  // per ask, so the same link twice opens the page twice. The register
+  // re-keys on `active_page`, so moving it IS the navigation — and the
+  // page-move reset lives in `register_arrived`, where EVERY way a page can
+  // move is observed.
+  let route_moved = route_arrived(next.route_serial, route_serial) && !empty(next.route_page) && next.route_page != active_page
+  route_serial = next.route_serial
+  active_page = keep_str(route_moved, next.route_page, active_page)
+  loading = loading || route_moved
+  page_link = page_address(active_page, chain)
+  active_palette = AppTheme.app
+  return if !next.dark
+  active_palette = AppTheme.app_dark
+
+// A PICK ABANDONS THE RAIL'S DRAFT: it is kept as a recovered draft on the
+// page it belonged to, offered back when the reader returns.
+//
+// THE SWITCH IS VISIBLE NOW: the clicked page takes the sidebar highlight and
+// the header title, and the previous document leaves the pane, before the
+// round trip — a click that repaints nothing for the seconds a page load
+// takes reads as a dead app. Only `active_page` moves; `buffer_page` stays
+// where the text came from, which is what keeps the landing load a MOVE
+// rather than a refresh.
+on choose_page(id)
+  return if !empty(host_error) || empty(id)
+  return if loading || busy
+  return if id == active_page
+  active_page = id
+  active_page_title = page_display_title(pages, id, active_page_title)
+  active_page_parent = ""
+  blocks = []
+  page_link = page_address(id, chain)
+  loading = true
+
+on register_arrived(item)
+  host_error = item.error
+  loading = false
+  return if !empty(item.error)
+  // THE PAGE MOVED WHEN THE BUFFER IS NOT ALREADY THIS PAGE'S — a pick, a
+  // `duck://` link, a create landing, a delete falling back. One place, so
+  // every route through it drops the rail, the search and the armed delete
+  // belonging to the page being left, and keeps its unsent comment as a
+  // recovered draft.
+  let page_moved = item.active_page != buffer_page
+  orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, keep_str(page_moved, block_comment_draft, ""))
+  block_comment_draft = keep_str(page_moved, "", block_comment_draft)
+  block_comments_open = block_comments_open && !page_moved
+  active_thread = keep_str(page_moved, "", active_thread)
+  active_thread_target = keep_str(page_moved, "", active_thread_target)
+  comments_loading = comments_loading && !page_moved
+  caret_comment_target = keep_str(page_moved, "", caret_comment_target)
+  page_searching = page_searching && !page_moved
+  // The hits and the comments themselves need no clearing: both panels are
+  // gated on the strings above, so dropping those takes them off the screen.
+  page_search_query = keep_str(page_moved, "", page_search_query)
+  page_delete_armed = page_delete_armed && !page_moved
+  autosave = keep_str(page_moved, "idle", autosave)
+  pages = item.pages
+  blocks = item.blocks
+  subpages = item.subpages
+  active_page_title = item.active_page_title
+  active_page_parent = item.active_page_parent
+  thread_total = item.thread_total
+  comment_rows = item.comment_rows
+  commented_hits = item.commented_hits
+  threads_loading = false
+  document_commented = commented_lines(item.blocks, item.commented_hits)
+  document_marks = comment_marks(item.blocks, item.commented_hits)
+  compose_hint = compose_hint_of(item.blocks, caret_comment_target, item.active_page)
+  active_thread_anchor = anchor_label(item.blocks, active_thread_target, item.active_page)
+  page_link = page_address(item.active_page, chain)
+  // ONE INSTALL DECISION, decided against the page the BUFFER holds — never
+  // against `active_page`, which moved to the clicked page the moment it was
+  // clicked — and applied to buffer and baseline together: the incoming
+  // page's text lands when the page MOVED or a clean buffer actually differs;
+  // a dirty buffer on the SAME page is the reader mid-typing through a
+  // reload, and a reload must never eat keystrokes.
+  let install = install_decision(document_text(document), buffer_page, item.active_page, page_saved_text, item.document)
+  active_page = item.active_page
+  // The buffer now holds THIS page. Unconditional on purpose: the install is
+  // refused only when the decision already found the page unchanged.
+  buffer_page = item.active_page
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  return if !install
+  page_saved_text = item.document
+  page_refusal = ""
+  document = document_editor(item.document)
+  document_menu = initial_menu()
+  document_focused = false
+  document_error = ""
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+
+on thread_arrived(item)
+  host_error = item.error
+  comments_loading = false
+  return if !empty(item.error)
+  return if item.thread_id != active_thread
+  comments = item.comments
+  thread_resolved = item.resolved
+
+on search_arrived(item)
+  host_error = item.error
+  page_searching = false
+  return if item.query != page_search_query
+  page_search_hits = item.hits
+
+on act_done(item)
+  busy = false
+  host_error = item.error
+  register_serial = register_serial + 1
+  // A REFUSED WRITE HANDS ITS WORDS BACK: the field cleared when the act
+  // left, and the reader must not have to retype them.
+  let refused = !empty(item.error)
+  page_draft = keep_str(refused, pending_page, page_draft)
+  block_comment_draft = keep_str(refused, pending_comment, block_comment_draft)
+  pending_page = ""
+  pending_comment = ""
+  return if refused
+  page_create_open = false
+  page_delete_armed = false
+  active_page = keep_str(!empty(item.page), item.page, active_page)
+  active_thread = keep_str(!empty(item.thread), item.thread, active_thread)
+
+on save_done(item)
+  autosave = "error"
+  host_error = item.error
+  return if !empty(item.error)
+  host_error = ""
+  page_refusal = item.refusal
+  // The baseline is the node's own text after a write, and the submitted text
+  // after a no-op. Either way anything typed during the round trip stays
+  // dirty, and a depth change that takes one nest step per tick keeps ticking
+  // until the buffer and the node agree.
+  page_saved_text = baseline_at_submitted_title(saved_baseline(item.written, item.document, page_inflight_text), page_inflight_text)
+  autosave = "saved"
+  register_serial = register_serial + keep_i64(item.written, 1, 0)
+  return if empty(item.refusal)
+  // A REFUSED PLAN ROLLS THE BUFFER BACK — but only when nothing was typed
+  // since the tick submitted. Otherwise the buffer is kept (the newest words
+  // must survive), the baseline moves to the node's text, and the still-dirty
+  // buffer re-plans on the next tick with the refusal line explaining why.
+  let untouched = document_text(document) == page_inflight_text
+  page_saved_text = baseline_at_submitted_title(item.document, page_inflight_text)
+  autosave = "idle"
+  return if !untouched
+  document = document_editor(item.document)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+
+on page_autosave_tick
+  return if !empty(host_error)
+  // NEVER WRITE A BUFFER INTO A PAGE IT DOES NOT BELONG TO. `active_page`
+  // moves the instant the reader clicks; the buffer only becomes that page's
+  // when a load lands and stamps `buffer_page`.
+  return if busy || loading || empty(active_page) || active_page != buffer_page
+  // One op chain at a time: a multi-op save routinely outlives the tick, and
+  // a second chain against the same page defeats the ordering rule the
+  // awaited loop exists for.
+  return if autosave == "saving"
+  let text = document_text(document)
+  return if text == page_saved_text
+  // An open ``` swallows every line under it when parsed: the plan would
+  // REMOVE every block below it, and removing a block purges its comment
+  // threads. The save waits for the close — quietly. The status drops to idle
+  // (no "✓ synced" over held-back text), and the next tick after the close
+  // writes; no banner lectures the writer about Markdown mid-sentence.
+  autosave = "idle"
+  return if has_unclosed_fence(text)
+  autosave = "saving"
+  page_inflight_text = text
+  sent = save(active_page, text, page_saved_text)
+
+on toggle_page_create
+  return if !empty(host_error)
+  page_create_open = !page_create_open
+
+// The title leaves with the act; the field clears here — a refused create
+// hands it back.
+on create_page_submit
+  return if !empty(host_error)
+  return if loading || busy || !connected || empty(trim(page_draft))
+  busy = true
+  pending_page = trim(page_draft)
+  page_draft = ""
+  sent = create(pending_page)
+
+on arm_page_delete
+  return if !empty(host_error)
+  return if loading || busy || empty(active_page)
+  page_menu_open = false
+  page_delete_armed = true
+
+on disarm_page_delete
+  page_delete_armed = false
+
+on delete_page_submit
+  return if !empty(host_error)
+  return if loading || busy || empty(active_page) || !page_delete_armed
+  busy = true
+  page_delete_armed = false
+  orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
+  block_comment_draft = ""
+  sent = delete(active_page)
+
+on search_pages_submit
+  return if !empty(host_error)
+  return if page_searching || empty(trim(page_search_draft))
+  page_searching = true
+  page_search_hits = []
+  page_search_query = trim(page_search_draft)
+  page_search_serial = page_search_serial + 1
+
+on clear_page_search
+  page_search_draft = ""
+  page_search_hits = []
+  page_searching = false
+  page_search_query = ""
+
+on open_page_search_hit(page_id, _block_id)
+  return if !empty(host_error)
+  return if loading || busy
+  flow
+    from done page_id
+    done -> choose_page _
+
+on use_orphaned_comment_draft(draft)
+  return if !empty(host_error)
+  return if loading || busy || !empty(trim(block_comment_draft))
+  block_comment_draft = draft
+  block_comments_open = true
+  orphaned_comment_drafts = forget_draft(orphaned_comment_drafts, draft)
+
+on discard_orphaned_comment_draft(draft)
+  orphaned_comment_drafts = forget_draft(orphaned_comment_drafts, draft)
+
+// THE COMMENTS RAIL IS DOCUMENT-SCOPED: the register already read every
+// thread anchored to the page or any of its blocks, so opening the rail is
+// the flip alone. Closing keeps the half-typed comment through the orphan
+// guard, exactly as the rail's own × does.
+on toggle_block_comments
+  return if !empty(host_error)
+  return if loading || busy || empty(active_page)
+  orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
+  block_comment_draft = ""
+  block_comments_open = !block_comments_open
+  active_thread = ""
+  active_thread_target = ""
+  active_thread_anchor = ""
+  thread_resolved = false
+  comments = []
+  comments_loading = false
+
+on close_block_comments
+  orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
+  block_comment_draft = ""
+  block_comments_open = false
+  active_thread = ""
+  active_thread_target = ""
+  active_thread_anchor = ""
+  thread_resolved = false
+  comments = []
+  comments_loading = false
+
+// The thread's OWN anchor, not the page: the node validates a comment read
+// against the thread's target, so a block-anchored thread opened with the
+// page id is refused — the rail could list it but never open it.
+on open_block_comment_thread(id, target)
+  return if !empty(host_error)
+  return if busy || comments_loading || empty(id)
+  active_thread = id
+  active_thread_target = target
+  active_thread_anchor = anchor_label(blocks, target, active_page)
+  comments = []
+  comments_loading = true
+
+on close_block_comment_thread
+  active_thread = ""
+  active_thread_target = ""
+  active_thread_anchor = ""
+  thread_resolved = false
+  comments = []
+  comments_loading = false
+
+on resolve_thread_submit(resolved)
+  return if !empty(host_error)
+  return if loading || busy || !block_comments_open || empty(active_thread)
+  busy = true
+  sent = resolve(active_thread, resolved)
+
+// The comment leaves with the act and the field clears; a post the node
+// refused hands it back.
+on post_block_comment_submit
+  return if !empty(host_error)
+  return if loading || busy || comments_loading || !block_comments_open || empty(active_page) || empty(trim(block_comment_draft))
+  busy = true
+  pending_comment = trim(block_comment_draft)
+  block_comment_draft = ""
+  // A reply stays on its thread's anchor; a NEW comment anchors on the block
+  // the caret sits in — the Notion gesture — and on the page from the title
+  // line (or before any edit placed the caret).
+  let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)
+  active_thread_target = keep_str(!empty(active_thread), active_thread_target, fresh_target)
+  active_thread_anchor = anchor_label(blocks, active_thread_target, active_page)
+  comments_loading = true
+  sent = post(pending_comment, active_thread_target, active_thread)
+
+on copy_to_clipboard(text, label)
+  sent = copy(text, label)
 
 on document_pointer_released(_button)
   focus_query = focus_query + 1
   let query = focus_query
-  let source = document_installed
-  task widget focused #root/pages/document -> document_focus_checked query source _
+  task widget focused #root/pages/document -> document_focus_checked query _
 
 on document_key_released(_key)
   focus_query = focus_query + 1
   let query = focus_query
-  let source = document_installed
-  task widget focused #root/pages/document -> document_focus_checked query source _
+  task widget focused #root/pages/document -> document_focus_checked query _
 
 on document_window_focused
   focus_query = focus_query + 1
   let query = focus_query
-  let source = document_installed
-  task widget focused #root/pages/document -> document_focus_checked query source _
+  task widget focused #root/pages/document -> document_focus_checked query _
 
 on document_window_unfocused
   focus_query = focus_query + 1
   document_focused = false
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
 
-on document_focus_checked(query, source, focused)
-  return if query != focus_query || source != document_installed || focused == document_focused
+on document_focus_checked(query, focused)
+  return if query != focus_query || focused == document_focused
   document_focused = focused
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
 
@@ -189,182 +546,22 @@ on toggle_page_menu
 on close_page_menu
   page_menu_open = false
 
-on props_arrived(item)
-  host_error = item.error
-  return if !empty(item.error)
-  let next = item.next
-  connected = next.connected
-  loading = next.loading
-  busy = next.busy
-  page_link = next.page_link
-  pages = next.pages
-  page_create_open = next.page_create_open
-  active_page = next.active_page
-  active_page_title = next.active_page_title
-  active_page_parent = next.active_page_parent
-  page_searching = next.page_searching
-  page_search_hits = next.page_search_hits
-  page_search_query = next.page_search_query
-  page_delete_armed = next.page_delete_armed
-  autosave = next.autosave
-  page_refusal = next.page_refusal
-  subpages = next.subpages
-  orphaned_comment_drafts = next.orphaned_comment_drafts
-  block_comments_open = next.block_comments_open
-  thread_total = next.thread_total
-  comment_rows = next.comment_rows
-  threads_loading = next.threads_loading
-  threads_has_more = next.threads_has_more
-  active_thread = next.active_thread
-  thread_resolved = next.thread_resolved
-  active_thread_anchor = next.active_thread_anchor
-  comments = next.comments
-  comments_loading = next.comments_loading
-  comments_has_more = next.comments_has_more
-  compose_hint = next.compose_hint
-  // THE APP HANDS A DRAFT BACK ONLY WHEN THE SEED MOVED — a recovered
-  // comment taken up, a failed post returned, a failed page create
-  // returned. Every other push leaves the reader's fields alone.
-  let moved = next.seed_rev != seed_rev
-  seed_rev = next.seed_rev
-  page_draft = seeded(moved, next.page_seed, page_draft)
-  block_comment_draft = seeded(moved, next.comment_seed, block_comment_draft)
-  document_source_ref = source_reference(next.document_source)
-  document_source_error = next.document_error
-  document_dark = next.dark
-  document_commented = next.commented_lines
-  document_marks = next.comment_marks
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
-  active_palette = AppTheme.app
-  return if !next.dark
-  active_palette = AppTheme.app_dark
-
-// Failed facts may leave a different target on the host. Keep drafts and
-// readable content, but reject even queued actions until valid facts recover.
-on toggle_page_create
-  return if !empty(host_error)
-  sent = toggle_create()
-
-// The title leaves with the act; the field clears here, as the app's
-// handler used to clear it — a refused create hands it back as a seed.
-on create_page_submit
-  return if !empty(host_error)
-  return if loading || busy || !connected || empty(trim(page_draft))
-  sent = create(trim(page_draft), block_comment_draft)
-  page_draft = ""
-
-// A PICK ABANDONS THE RAIL'S DRAFT: it leaves with the act, for the app to
-// keep as a recovered draft on the page it belonged to.
-on choose_page(id)
-  return if !empty(host_error)
-  return if loading || busy
-  sent = choose(id, block_comment_draft)
-  block_comment_draft = ""
-
-on search_pages_submit
-  return if !empty(host_error)
-  return if page_searching || empty(trim(page_search_draft))
-  sent = search(trim(page_search_draft))
-
-on clear_page_search
-  return if !empty(host_error)
-  sent = clear_search()
-  page_search_draft = ""
-
-// The menu's one item leaves with the act: the dialog it opens is the next
-// thing the reader answers, and the menu must not be waiting behind it.
-on arm_page_delete
-  return if !empty(host_error)
-  page_menu_open = false
-  sent = arm_delete()
-
-on disarm_page_delete
-  return if !empty(host_error)
-  sent = disarm_delete()
-
-on delete_page_submit
-  return if !empty(host_error)
-  sent = delete(block_comment_draft)
-
-on open_page_search_hit(page_id, block_id)
-  return if !empty(host_error)
-  return if loading || busy
-  sent = open_hit(page_id, block_id, block_comment_draft)
-  block_comment_draft = ""
-
-on use_orphaned_comment_draft(draft)
-  return if !empty(host_error)
-  return if loading || busy || !empty(trim(block_comment_draft))
-  sent = use_draft(draft, block_comment_draft)
-
-on discard_orphaned_comment_draft(draft)
-  return if !empty(host_error)
-  sent = discard_draft(draft)
-
-on toggle_block_comments
-  return if !empty(host_error)
-  return if loading || busy || empty(active_page)
-  sent = toggle_comments(block_comment_draft)
-  block_comment_draft = ""
-
-on close_block_comments
-  return if !empty(host_error)
-  sent = close_comments(block_comment_draft)
-  block_comment_draft = ""
-
-on open_block_comment_thread(id, target)
-  return if !empty(host_error)
-  sent = open_thread(id, target)
-
-on resolve_thread_submit(resolved)
-  return if !empty(host_error)
-  sent = resolve(resolved)
-
-on load_more_block_threads
-  return if !empty(host_error)
-  sent = more_threads()
-
-on close_block_comment_thread
-  return if !empty(host_error)
-  sent = close_thread()
-
-on load_more_block_comments
-  return if !empty(host_error)
-  sent = more_comments()
-
-// The comment leaves with the act and the field clears, as the app's
-// handler used to clear it; a post the node refused hands it back as a seed.
-on post_block_comment_submit
-  return if !empty(host_error)
-  return if busy || threads_loading || comments_loading || empty(trim(block_comment_draft))
-  sent = post(trim(block_comment_draft))
-  block_comment_draft = ""
-
-on copy_to_clipboard(text, label)
-  return if !empty(host_error)
-  sent = copy(text, label)
-
-on document_arrived(item)
-  return if item.source != document_source_ref.reference
-  document_error = item.error
-  return if !empty(item.error)
-  document = document_editor(item.text, item.cursor)
-  document_installed = item.source
-  sent = installed(document, document_installed)
-  document_menu = initial_menu()
-  document_focused = false
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
-  focus_query = focus_query + 1
-  let query = focus_query
-  let source = document_installed
-  task widget focused #root/pages/document -> document_focus_checked query source _
-
+// An accepted edit moves the caret, and the caret's block is where the next
+// comment anchors. A link press goes through the app's ONE open plane; a
+// margin badge press opens the comments rail.
 on document_committed(next)
-  return if !empty(host_error)
   document_history = next.history
   document_menu = next.menu
   document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
-  sent = edited(document_installed, next.reference, next.interaction)
+  let comment_line = navigation_comment_line(next.interaction)
+  caret_comment_target = block_at_line(blocks, keep_i64(comment_line >= 0, comment_line, cursor_line(document)))
+  compose_hint = compose_hint_of(blocks, caret_comment_target, active_page)
+  // The refusal describes an edit that was already rolled back; the next
+  // keystroke is the reader moving on from it.
+  page_refusal = ""
+  sent = open_link(navigation_link(next.interaction))
+  return if comment_line < 0 || block_comments_open || loading || busy || empty(active_page)
+  block_comments_open = true
 
 // The sensor is the window measure the sidebar clamp needs, and it keys
 // nothing — `#root/pages/document` is still the editor's path.
@@ -401,13 +598,11 @@ view
           thread_total
           comment_rows
           threads_loading
-          threads_has_more
           active_thread
           thread_resolved
           active_thread_anchor
           comments
           comments_loading
-          comments_has_more
           compose_hint
         events
           toggle_page_create -> toggle_page_create
@@ -428,17 +623,13 @@ view
           close_block_comments -> close_block_comments
           open_block_comment_thread -> open_block_comment_thread _ _
           resolve_thread_submit -> resolve_thread_submit _
-          load_more_block_threads -> load_more_block_threads
           close_block_comment_thread -> close_block_comment_thread
-          load_more_block_comments -> load_more_block_comments
           post_block_comment_submit -> post_block_comment_submit
           copy_to_clipboard -> copy_to_clipboard _ _
         document:
           col w=fill h=fill
             if !empty(presentation_notice(document, document_paint))
               text presentation_notice(document, document_paint) @text-muted
-            if !empty(document_source_error)
-              text document_source_error @text-danger
             if !empty(document_error)
               text document_error @text-danger
             editor #document <-> document -> document_committed _
@@ -450,6 +641,6 @@ view
                 wrap=word
                 font=ui
                 hint="Write something… `#` for a heading, `-` for a list"
-                disabled=(!empty(host_error) || loading || !connected || empty(document_source_ref.reference) || document_installed != document_source_ref.reference)
+                disabled=(!empty(host_error) || loading || !connected || empty(active_page) || active_page != buffer_page)
               active bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0
               disabled bg=fg/0 value=document_ink placeholder=hint selection=document_selection border-w=0.0

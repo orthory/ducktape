@@ -3,100 +3,11 @@ use super::*;
 /// THE ZERO-HIT PLATE SPEAKS FOR A QUERY, AND A BOOL COULD NOT CARRY ONE —
 /// page search is enter-to-submit with no `change=` route, so a keystroke runs
 /// no handler and only `trim(draft) == query` can retire the plate (the full
-/// rationale lives on the plate arm in `screens/pages.ice`). This test walks
-/// the query's whole lifetime: captured at submit, standing through a zero-hit
-/// answer, abandoned by the draft, dropped by navigation and by failure.
+/// rationale lives on the plate arm in the view's own `pages.ice`). The query's
+/// lifetime is the pages view's own state now; what the app still pins is the
+/// SHAPE of the arm that reads it, on both surfaces that render a page hit.
 #[test]
 fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
-    // Draft -> submit -> empty answer: the state a standing plate reads.
-    let answered_pages = |draft: &str| {
-        let (mut app, _) = Ducktape::__boot();
-        app.connected = true;
-        app.loading = false;
-        app.page_search_draft = draft.into();
-        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
-        // nothing, which is why the plate cannot fire on the first keystroke.
-        assert!(app.page_search_query.is_empty());
-        assert!(!app.page_searching);
-        let _ = app.__update(__DucktapeMessage::SearchPagesSubmit);
-        assert!(app.page_searching, "the round trip is not an answer either");
-        let _ = app.__update(__DucktapeMessage::PageSearchLoaded(
-            backend::PageSearchData { hits: vec![] },
-        ));
-        app
-    };
-
-    // The submit captures the TRIMMED query — the same string the node is
-    // asked about — and the empty answer leaves it standing. All five of the
-    // plate arm's terms hold jointly in this state.
-    let mut pages = answered_pages("  zzz  ");
-    assert!(pages.connected);
-    assert!(pages.page_search_hits.is_empty());
-    assert!(!pages.page_searching);
-    assert!(!pages.page_search_query.is_empty());
-    assert_eq!(pages.page_search_draft.trim(), pages.page_search_query);
-    assert_eq!(pages.page_search_query, "zzz");
-
-    // THE CLASS THE BOOL COULD NOT COVER: one more character runs no handler,
-    // so the query stays put while the draft walks away from it, and the arm
-    // stops matching without anything having been told.
-    pages.page_search_draft = "zzzq".into();
-    assert_eq!(pages.page_search_query, "zzz");
-    assert_ne!(pages.page_search_draft.trim(), pages.page_search_query);
-
-    // Every handler that drops the hits drops the query with them.
-    for leaving in [
-        __DucktapeMessage::OpenPageSearchHit("page".into(), "block".into()),
-        __DucktapeMessage::ChoosePage("next".into()),
-        __DucktapeMessage::ClearPageSearch,
-    ] {
-        let mut app = answered_pages("zzz");
-        assert_eq!(app.page_search_query, "zzz");
-        let _ = app.__update(leaving);
-        assert!(
-            app.page_search_query.is_empty(),
-            "opening a hit or navigating must not leave the plate standing"
-        );
-    }
-
-    // A FAILED search never ran, so it found nothing in no sense the plate may
-    // report: the query goes, and `error` carries the cause instead.
-    let (mut failed, _) = Ducktape::__boot();
-    failed.loading = false;
-    failed.page_search_draft = "zzz".into();
-    let _ = failed.__update(__DucktapeMessage::SearchPagesSubmit);
-    let _ = failed.__update(__DucktapeMessage::PageSearchFailed(backend::AppError {
-        message: "node refused".into(),
-        committed: false,
-    }));
-    assert!(!failed.page_searching);
-    assert!(failed.page_search_query.is_empty());
-    assert_eq!(failed.error, "node refused");
-
-    // AN EMPTY QUERY GATES THE REPLY HANDLERS: no search is standing, so a
-    // reply the dismissal could not invalidate is dropped on arrival instead
-    // of resurrecting the float and clobbering `error`.
-    let (mut dismissed, _) = Ducktape::__boot();
-    dismissed.error = "standing error".into();
-    let _ = dismissed.__update(__DucktapeMessage::PageSearchLoaded(
-        backend::PageSearchData {
-            hits: vec![stale_page_hit()],
-        },
-    ));
-    assert!(
-        dismissed.page_search_hits.is_empty(),
-        "a reply with no standing query must not restore the hits float"
-    );
-    assert_eq!(dismissed.error, "standing error", "nor clobber the banner");
-    let _ = dismissed.__update(__DucktapeMessage::PageSearchFailed(backend::AppError {
-        message: "late failure".into(),
-        committed: false,
-    }));
-    assert_eq!(
-        dismissed.error, "standing error",
-        "a failure nobody is waiting on must not raise a banner"
-    );
-
     // THE ARM. The plate may not be keyed on a flag, and may not fire during
     // the round trip its own submit opened.
     let pages_screen = inlined(include_str!("../../../crates/views/pages/src/ui/pages.ice"));
@@ -388,28 +299,16 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
 }
 
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
-/// and `pages_mutated` land you somewhere new exactly the way the pickers do;
-/// each must take the hits and the standing answer with it (pages: the query;
-/// chat: the phase back to idle), or the results float — the one that actually
-/// occludes the room or page you just landed in — travels along.
+/// lands you somewhere new exactly the way the pickers do, and must take the
+/// hits and the standing answer with it (the phase back to idle), or the
+/// results float — the one that actually occludes the room you just landed in
+/// — travels along.
 ///
-/// This is a DISMISSAL POLICY, not a truth requirement: both searches pass an
-/// empty scope and are workspace-wide, so the answer would still be true where
+/// This is a DISMISSAL POLICY, not a truth requirement: the search passes an
+/// empty scope and is workspace-wide, so the answer would still be true where
 /// you landed. The reason to drop it is that it is in the way.
 #[test]
 fn the_navigation_resets_take_the_hits_and_the_answer() {
-    let pages_mutated = || {
-        __DucktapeMessage::PagesMutated(backend::PagesData {
-            pages: Vec::new(),
-            blocks: Vec::new(),
-            active_page: "fresh".into(),
-            active_page_title: "Fresh".into(),
-            active_page_parent: String::new(),
-            comment_thread_total: 0,
-            commented_block_hits: Vec::new(),
-        })
-    };
-
     // A CREATE LANDS YOU IN THE NEW CHANNEL — the same dismissal
     // `choose_channel` and `choose_dm` already perform: the lane invalidate
     // dropped any reply in flight, so nothing else would ever move the phase
@@ -427,19 +326,6 @@ fn the_navigation_resets_take_the_hits_and_the_answer() {
         created.chat_search_phase,
         SearchPhase::Idle,
         "the invalidated lane drops the reply; the reset must move the phase"
-    );
-
-    let (mut mutated, _) = Ducktape::__boot();
-    mutated.loading = false;
-    mutated.page_search_query = "zzz".into();
-    mutated.page_search_hits = vec![stale_page_hit()];
-    mutated.page_searching = true;
-    let _ = mutated.__update(pages_mutated());
-    assert!(mutated.page_search_query.is_empty());
-    assert!(mutated.page_search_hits.is_empty());
-    assert!(
-        !mutated.page_searching,
-        "the invalidated lane drops the reply; the reset must lower the flag"
     );
 }
 
@@ -555,9 +441,9 @@ fn a_single_failed_load_does_not_report_the_connection_offline() {
     app.loading = true;
     app.status = "Live".into();
 
-    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: app.chat_generation,
         message: "the channel did not load".into(),
-        committed: false,
     }));
 
     assert_eq!(

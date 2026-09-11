@@ -272,7 +272,7 @@ fn post_commit_hydration_errors_are_not_retryable() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn chat_and_pages_round_trip_over_signed_frames() {
+async fn chat_round_trips_over_signed_frames() {
     let _names = crate::backend::seed_names(crate::backend::NameDirectory::empty());
     let storage = tempfile::tempdir().unwrap();
     let sim = simnode::boot(
@@ -313,83 +313,11 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         }),
     )
     .await;
-    submit_test(
-        &rpc,
-        &signer,
-        3,
-        "pages",
-        pages::encode_msg(&PageMsg::CreatePage {
-            page_id: "welcome".into(),
-            title: "Welcome".into(),
-            blocks: Vec::new(),
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        4,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: None,
-            block: NewBlock {
-                id: "intro".into(),
-                kind: BlockKind::Paragraph,
-                text: "A signed page block".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.channels[0].name, "General");
     assert_eq!(chat.messages[0].body, "hello from the app");
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(pages.active_page_title, "Welcome");
-    assert_eq!(pages.blocks[0].text, "A signed page block");
 
     let origin = rpc.origin().to_string();
-    let loaded_page = load_page(origin.clone(), "welcome".into()).await.unwrap();
-    assert_eq!(loaded_page.active_page, "welcome");
-    assert_eq!(loaded_page.blocks[0].text, "A signed page block");
-
-    // A SAVE AGAINST A PAGE THE INDEX DOES NOT HOLD MUST REFUSE, NOT RETARGET.
-    // `load_pages_data` answers a missing id with `pages.first()` — here that is
-    // `welcome`, a real page full of real blocks. Without the guard in
-    // `save_page_document` this call plans one buffer against another page's
-    // blocks and emits removes against ITS ids. It refuses before any write, so
-    // the password never has to be real.
-    //
-    // THE TITLE MUST MATCH THE PAGE IT WOULD FALL BACK TO, or this test proves
-    // nothing: a differing title makes the title write fire first, and it dies
-    // `BlockNotFound` on the id that does not exist. That accident is the only
-    // thing standing between today's code and the corruption — and it does not
-    // happen when the titles agree, which two untitled pages always do. With
-    // the title matched, the body plan is `remove every line`.
-    let stray = save_page_document(
-        origin.clone(),
-        String::new(),
-        "no-such-page".into(),
-        "Welcome\n".into(),
-        "Welcome\n".into(),
-    )
-    .await;
-    // ASSERT THE REASON, NOT JUST THE FAILURE. An unsigned save fails anyway —
-    // at the signer, several steps after the plan was already built against the
-    // wrong page's blocks. Only the message separates "refused before planning"
-    // from "planned the damage, then could not sign it".
-    let refusal = stray.expect_err("a save must not retarget to another page");
-    assert_eq!(
-        refusal.message, "page was not found",
-        "the save must refuse on the page it cannot find, before it plans or signs anything"
-    );
-    let after = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(
-        after.blocks[0].text, "A signed page block",
-        "the refused save must not have touched the page it fell back to"
-    );
     // the module views load from whatever node connects last: take the
     // turn the deployment tests take, so this node is not theirs
     let _turn = crate::module_view::tests::connection_turn().await;
@@ -432,10 +360,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         "the delta carries the module-assigned sequence from the feed stamp"
     );
     assert_eq!(message.body, "arrived on the next block");
-    assert!(
-        !changed.load_chat && !changed.load_pages,
-        "a folded chat delta requires no reload"
-    );
+    assert!(!changed.load_chat, "a folded chat delta requires no reload");
     assert!(changed.height > workspace.height);
     let base_height = changed.height;
     // Production drops this payload when the generated LiveUpdated reducer
@@ -536,146 +461,12 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         missing.is_err(),
         "an index-clamped neighbor is not the requested message"
     );
-    submit_test(
-        &rpc,
-        &signer,
-        9,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: Some("intro".into()),
-            block: NewBlock {
-                id: "heading".into(),
-                kind: BlockKind::Heading2,
-                text: "Nested work".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        10,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "heading".into(),
-            after: None,
-            block: NewBlock {
-                id: "todo".into(),
-                kind: BlockKind::Todo,
-                text: "Ship the editor".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        11,
-        "pages",
-        pages::encode_msg(&PageMsg::SetChecked {
-            block_id: "todo".into(),
-            checked: true,
-        }),
-    )
-    .await;
-    submit_test(
-        &rpc,
-        &signer,
-        12,
-        "pages",
-        pages::encode_msg(&PageMsg::InsertBlock {
-            parent: "welcome".into(),
-            after: Some("heading".into()),
-            block: NewBlock {
-                id: "child".into(),
-                kind: BlockKind::Page,
-                text: "Child page".into(),
-                marks: Vec::new(),
-            },
-        }),
-    )
-    .await;
-
-    wait_for_block(&mut live, base_height + 7).await;
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
-    assert_eq!(pages.pages[0].id, "welcome");
-    assert_eq!(pages.pages[1].id, "child");
-    assert_eq!(pages.pages[1].prefix, "  ");
-    assert_eq!(pages.blocks[2].id, "todo");
-    assert_eq!(pages.blocks[2].prefix, "  ");
-    assert!(pages.blocks[2].checked);
-
-    submit_test(
-        &rpc,
-        &signer,
-        13,
-        "pages",
-        pages::encode_msg(&PageMsg::AddComment {
-            thread_id: "thread-live".into(),
-            comment_id: "comment-live".into(),
-            target: "intro".into(),
-            text: "temporary".into(),
-            anchor: None,
-            mentions: Vec::new(),
-        }),
-    )
-    .await;
-    wait_for_block(&mut live, base_height + 8).await;
-    let threads = load_page_threads(origin.clone(), "welcome".into(), 1)
+    let refreshed = live_resync_load(origin, "general".into(), true, false, 7, 0)
         .await
         .unwrap();
-    assert!(
-        threads
-            .threads
-            .iter()
-            .any(|thread| thread.id == "thread-live"),
-        "the live comment's thread is on the page rail"
-    );
-    submit_test(
-        &rpc,
-        &signer,
-        14,
-        "pages",
-        pages::encode_msg(&PageMsg::DeleteComment {
-            comment_id: "comment-live".into(),
-        }),
-    )
-    .await;
-    wait_for_block(&mut live, base_height + 9).await;
-    let threads = load_page_threads(origin.clone(), "welcome".into(), 2)
-        .await
-        .unwrap();
-    assert!(
-        !threads
-            .threads
-            .iter()
-            .any(|thread| thread.id == "thread-live"),
-        "the deleted comment's thread is gone from the page rail"
-    );
-
-    let refreshed = live_resync_load(
-        origin,
-        "general".into(),
-        "welcome".into(),
-        "both".into(),
-        false,
-        7,
-        3,
-        0,
-    )
-    .await
-    .unwrap();
     assert_eq!(refreshed.generation, 7);
-    assert_eq!(
-        refreshed.fold_serial, 3,
-        "the reply echoes the fold serial the request snapshotted (#1041)"
-    );
-    assert!(refreshed.chat_loaded && refreshed.pages_loaded);
+    assert!(refreshed.chat_loaded);
     assert_eq!(refreshed.messages[1].body, "arrived on the next block");
-    assert_eq!(refreshed.active_page, "welcome");
     sim.shutdown();
 }
 
@@ -718,8 +509,8 @@ async fn a_runs_op_asks_the_agents_projection_to_refetch() {
     assert_eq!(update.module, "runs", "the module IS the whole payload");
     assert_eq!(update.height, 7);
     assert!(
-        !update.load_chat && !update.load_pages,
-        "the signal buys the agents projection, not a chat or pages slice"
+        !update.load_chat,
+        "the signal buys the agents projection, not a chat slice"
     );
 }
 
@@ -829,7 +620,7 @@ fn a_tip_carries_the_head_and_loads_nothing() {
     let tip = live_update(crate::LiveKind::Tip, "Live · block 41", 41);
     assert_eq!(tip.height, 41, "the head is the tip's entire payload");
     assert!(
-        !tip.load_chat && !tip.load_pages,
+        !tip.load_chat,
         "a tip must not trigger a load — that is a 1 Hz poll on an idle chain"
     );
     assert!(

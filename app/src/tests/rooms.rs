@@ -246,14 +246,12 @@ fn a_landing_in_another_room_retires_the_dm_header() {
         app.hydration_generation,
         "general",
         vec![message(9, "in the room she was moved to", false)],
-        "",
-        Vec::new(),
     )));
     assert!(app.active_dm_peer.is_empty());
 
     // BUT A RESYNC THAT MOVED NO ROOM DERIVES NOTHING. `choose_dm` names the
     // peer optimistically and leaves `active_channel` on the room being left
-    // for the several blocks `open_dm` takes to answer; a pages-only resync
+    // for the several blocks `open_dm` takes to answer; a plane-only resync
     // landing in that window would otherwise derive the peer against the OLD
     // room and blank him, and `chat_updated` then derives "" from "" — the DM
     // opens under a `#` for good.
@@ -261,13 +259,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     app.active_channel = "general".into();
     let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
         chat_loaded: false,
-        ..live_refresh(
-            app.hydration_generation,
-            "general",
-            Vec::new(),
-            "",
-            Vec::new(),
-        )
+        ..live_refresh(app.hydration_generation, "general", Vec::new())
     }));
     assert_eq!(
         app.active_dm_peer, peer,
@@ -277,15 +269,13 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     // NOR DOES A CHAT-CARRYING ONE INSIDE THAT SAME WINDOW. `live_resync_load`
     // is launched with today's `active_channel`, so a `ready`/`Lagged{chat}`
     // resync lands `chat_loaded` on the room being LEFT — deriving against it
-    // blanks the peer just as permanently as the pages-only case above.
+    // blanks the peer just as permanently as the plane-only case above.
     app.active_dm_peer = peer.into();
     app.active_channel = "general".into();
     app.loading = true;
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
-        Vec::new(),
-        "",
         Vec::new(),
     )));
     assert_eq!(
@@ -353,12 +343,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.message_action = MessageAction::Editing;
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
-    app.page_text = ("node a page body").to_string();
-    app.page_saved_text = "node a page body".into();
-    app.block_comments_open = true;
-    app.block_comments_target = "same-id".into();
-    app.block_comment_draft = "node a comment".into();
-    app.page_search_draft = "node a search".into();
+    // The page a `duck://page/…` address asked for is the one pages fact the
+    // app still holds — and it named the network being left.
+    app.page_route = "node-a-page".into();
     app.forge_list_phase = ForgePhase::Ready;
     app.forge_repo = "same-repo".into();
     app.forge_repo_phase = ForgePhase::Ready;
@@ -387,11 +374,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
     assert_eq!(app.active_thread_seq, 0);
-    assert!(page_document_text(&app).is_empty());
-    assert!(app.page_saved_text.is_empty());
-    assert!(!app.block_comments_open);
-    assert!(app.block_comments_target.is_empty());
-    assert!(app.block_comment_draft.is_empty());
+    assert!(app.page_route.is_empty());
     // NODE B'S ROOM IS NODE B'S. Same channel id, other endpoint, other
     // instance — and node A's words are still under node A's key, which is
     // the half a `message_drafts = []` clear used to get wrong by throwing
@@ -411,7 +394,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
         "node a draft",
         "and it is still node A's, waiting where it was typed"
     );
-    assert!(app.page_search_draft.is_empty());
     assert_eq!(app.forge_list_phase, ForgePhase::Idle);
     assert!(app.forge_repo.is_empty());
     assert_eq!(app.forge_repo_phase, ForgePhase::Idle);
@@ -425,9 +407,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 
-    let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+    let _ = app.__update(__DucktapeMessage::ChatLoadFailed(backend::HydrationError {
+        generation: app.chat_generation,
         message: "offline".into(),
-        committed: false,
     }));
     assert_eq!(app.connected_rpc, "http://node-b");
 }
@@ -739,13 +721,7 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
     );
 
     // the resync answers off a snapshot taken before either of them
-    let mut landed = live_refresh(
-        app.hydration_generation,
-        "general",
-        Vec::new(),
-        "",
-        Vec::new(),
-    );
+    let mut landed = live_refresh(app.hydration_generation, "general", Vec::new());
     landed.channels = vec![room("general", 10), room("eng", 40)];
     let _ = app.__update(__DucktapeMessage::LiveResynced(landed));
 
@@ -809,14 +785,7 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     // survived roughly one keystroke without this.
     let plane_only = backend::LiveRefresh {
         chat_loaded: false,
-        pages_loaded: false,
-        ..live_refresh(
-            app.hydration_generation,
-            "general",
-            Vec::new(),
-            "",
-            Vec::new(),
-        )
+        ..live_refresh(app.hydration_generation, "general", Vec::new())
     };
     let _ = app.__update(__DucktapeMessage::LiveResynced(plane_only));
     assert_eq!(

@@ -43,9 +43,12 @@ extern crate::module_view
   component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64, rpc:&str, chain:&str, connection:i64, preview_base:&str, save_reply:&FsSaveHistory) -> ModuleViewEvent
   pure files_intent(event:&ModuleViewEvent) -> FilesIntent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
-  // The guest owns the document editor. The app supplies a bounded source
-  // stream and reconciles accepted edits with persistence and navigation.
-  component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_text:&str, buffer_page:&str, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent
+  // Pages speaks the KERNEL CONTRACT: session facts go in — the chain,
+  // because a `duck://page/…` address carries it, and the page a link asked
+  // the app to open — and the view reads the workspace, the document and its
+  // comments off the node itself and signs its writes through `op.submit`.
+  // The intents back are the two OS doors: the clipboard and the open plane.
+  component pages_view(dark:bool, connected:bool, network_chain_id:&str, route_page:&str, route_serial:i64) -> ModuleViewEvent
   pure pages_intent(event:&ModuleViewEvent) -> PagesIntent
   // The Forge tab: the register the app holds and the item it has open,
   // the code browse's listing and file, and the discussion — whose note

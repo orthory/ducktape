@@ -784,7 +784,6 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
         status: "Live".into(),
         height: -1,
         load_chat: true,
-        load_pages: true,
         ..backend::LiveUpdate::default()
     }));
     assert_eq!(
@@ -1800,7 +1799,6 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     app.thread_selected_rev = 1;
     app.thread_message_action = MessageAction::Editing;
     app.thread_edit_draft = "half typed too".into();
-    app.page_delete_armed = true;
     app.fs_delete_target = "/shared/report.md".into();
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
@@ -1813,11 +1811,10 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.thread_edit_draft, "");
     assert_eq!(app.thread_selected_seq, 0);
     assert_eq!(app.thread_selected_rev, 0);
-    assert!(
-        !app.page_delete_armed,
+    assert_eq!(
+        app.fs_delete_target, "",
         "an armed delete never rides a tab move"
     );
-    assert_eq!(app.fs_delete_target, "");
 
     // The disconnected path returns before the generation bumps, and retires
     // the same set — the clear sits above both early returns, like `error`.

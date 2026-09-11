@@ -1100,7 +1100,6 @@ pub fn forge_live_hit(kind: crate::LiveKind, module: String) -> bool {
         | crate::LiveKind::Tip
         | crate::LiveKind::Chat
         | crate::LiveKind::Bell
-        | crate::LiveKind::Pages
         | crate::LiveKind::Plane => false,
     }
 }

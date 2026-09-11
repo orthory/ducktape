@@ -6,7 +6,6 @@ enum LiveKind
   ready
   chat
   bell
-  pages
   forge
   plane
   resync
@@ -162,12 +161,6 @@ enum NodeTab
   activity
   modules
 
-enum AutosaveStatus
-  idle
-  saving
-  saved
-  error
-
 // The duck:// module table's verdict on a clicked or embedded link
 // (`resolve_duck_link`): which existing navigation it maps onto. `unknown` is
 // a malformed/unknown ref; `web` is an http(s) URL for the OS opener;
@@ -308,31 +301,10 @@ enum SettingsIntent
   dark
   notifications
 
-// What the pages view asks of the app, one per act the screen offers.
-// The drafts are the view's: a create carries its title, a search its
-// query, a post its text, and the acts that abandon the rail's comment
-// carry it for the recovered-drafts plate.
+// What the pages view still asks of the app: the two OS doors. Everything
+// else it reads and signs itself through the kernel contract.
 enum PagesIntent
-  toggle_create
-  create
-  choose
-  search
-  clear_search
-  arm_delete
-  disarm_delete
-  delete
-  open_hit
-  use_draft
-  discard_draft
-  edited
-  toggle_comments
-  close_comments
-  open_thread
-  resolve
-  more_threads
-  close_thread
-  more_comments
-  post
+  open_link
   copy
 // what the Chat view asks of the app: one variant per act the screen offers,
 // each carrying only what the reader chose or typed — the drafts are the view's

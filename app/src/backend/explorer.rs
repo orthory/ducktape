@@ -119,11 +119,9 @@ pub fn topmost_overlay(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
-    page_delete_armed: bool,
     fs_delete_target: &str,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
-    let on_pages = shell_tab == crate::ShellTab::Pages;
     let on_files = shell_tab == crate::ShellTab::Files;
     if palette_open {
         return "palette".into();
@@ -156,17 +154,8 @@ pub fn topmost_overlay(
     if on_chat && channel_settings_open {
         return "channel_settings".into();
     }
-    // The pages block-actions menu and insert row used to sit here, and the
-    // comments rail is a persistent panel with its own close. THE ARMED DELETE
-    // IS NEITHER: it paints a scrim and a confirm over the canvas, and it
-    // shipped with the mouse as its only exit. `pages_ready` in
-    // `handlers/overlays.ice` names it for the same reason — a layer that eats
-    // the mouse must eat the keyboard, or Cmd/Ctrl+Z mutates (and autosaves)
-    // the document the reader is being asked to confirm the deletion of.
-    if on_pages && page_delete_armed {
-        return "page_delete".into();
-    }
-    // The same confirm one screen over: `fs_delete_target` arms a scrim and a
+    // The Pages layers are the pages view's own — it holds the keyboard inside
+    // its tab and answers Escape itself. `fs_delete_target` arms a scrim and a
     // `ConfirmDelete` over duckfs (`screens/storage.ice`), and it had no
     // keyboard exit either — the state the channel drawer was in before #1132
     // gave it a rung. A destructive confirm is the LAST layer that should need
@@ -196,7 +185,6 @@ pub fn escape_target(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
-    page_delete_armed: bool,
     fs_delete_target: String,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -212,7 +200,6 @@ pub fn escape_target(
         thread_message_action,
         message_action,
         channel_settings_open,
-        page_delete_armed,
         &fs_delete_target,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows

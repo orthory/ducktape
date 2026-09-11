@@ -60,19 +60,13 @@ on reconnect
   account_ceremony_detail = ""
   account_ceremony_left = ""
   invalidate lane=chat_search
-  invalidate lane=page_search
   invalidate lane=palette_search
   invalidate lane=chat_load
-  invalidate lane=page_load
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  invalidate lane=block_threads
-  invalidate lane=block_comments
   invalidate lane=live_resync
   invalidate lane=files_preview
-  invalidate lane=page_autosave
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.idle
@@ -120,49 +114,15 @@ on reconnect
   invalidate lane=live_thread
   thread_loading = false
   pending_channel = ""
-  chat_search_hits = []
-  chat_search_phase = SearchPhase.idle
-  chat_search_query = ""
-  pages = []
-  blocks = []
-  active_page = ""
-  active_page_title = ""
-  active_page_parent = ""
-  pending_page = ""
-  block_comments_generation = block_comments_generation + 1
-  block_comments_open = false
-  block_comments_target = ""
-  block_comment_threads = []
-  block_comment_rows = []
-  block_comment_thread_total = 0
-  block_comment_threads_next_from = 0
-  block_comment_threads_has_more = false
-  block_comment_threads_loading = false
-  active_block_comment_thread = ""
-  active_thread_target = ""
-  active_thread_anchor = ""
-  block_thread_comments = []
-  block_thread_comments_next_from = 0
-  block_thread_comments_has_more = false
-  block_thread_comments_loading = false
-  block_comment_draft = ""
-  pending_block_comment = ""
-  page_text = installed_page_text(page_text, true, "")
-  page_cursor_line = 0
-  page_saved_text = ""
-  buffer_page = ""
-  page_refusal = ""
-  block_autosave_status = AutosaveStatus.idle
-  page_delete_armed = false
   // The DRAFT survives — it is the chat view's own now, and a typed-but-never-
   // submitted query produced nothing this reset needs to discard; this
   // handler's doctrine is that typed drafts live through a reconnect. The
   // ANSWER does not: hits, flag and query go together, and the emptied query
   // is what keeps the zero-hit plate from reading the emptied list as a
   // search that matched nothing.
-  page_search_hits = []
-  page_searching = false
-  page_search_query = ""
+  chat_search_hits = []
+  chat_search_phase = SearchPhase.idle
+  chat_search_query = ""
   // The lane invalidate above dropped any palette reply in flight — park the
   // phase idle, or the palette reopens onto a permanent "Searching…".
   palette_search_phase = SearchPhase.idle
@@ -234,16 +194,6 @@ on workspace_connected(next)
   channel_members = next.channel_members
   composer_roster_set = chat_composer_roster(composer_scope(connected_rpc, active_channel), channel_members)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
-  pages = next.pages
-  blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
-  active_page = next.active_page
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  active_page_title = next.active_page_title
-  active_page_parent = next.active_page_parent
-  // The blocks in hand are this page's, and every route into a connect blanks
-  // the buffer first — so this is the page the document state belongs to.
-  buffer_page = next.active_page
   connected = true
   loading = false
   mutation_phase = MutationPhase.idle
@@ -318,7 +268,7 @@ on live_updated(next)
       hydration_retry_attempt = 0
       forge_generation = forge_generation + 1
       parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, next.load_chat, next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
         run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.chat
       let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
@@ -348,7 +298,7 @@ on live_updated(next)
       return if !folded_chat.refresh_chat
       hydration_generation = hydration_generation + 1
       hydration_retry_attempt = 0
-      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.bell
       bell_read_through = keep_i64(next.bell.kind == "read" && next.bell.up_to_seq > bell_read_through, next.bell.up_to_seq, bell_read_through)
       bell_clear_through = keep_i64(next.bell.kind == "cleared" && next.bell.up_to_seq > bell_clear_through, next.bell.up_to_seq, bell_clear_through)
@@ -357,24 +307,6 @@ on live_updated(next)
       bell_presentations = merge_bell_presentations(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations, [])
       return if next.bell.kind != "delivered"
       run replace lane=bell_context load_bell_presentations(connected_rpc, bell_missing_items(bell_visible_items(bell_items, account_number, settings_user_key), bell_presentations)) -> bell_context_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
-    LiveKind.pages
-      // Text deltas fold locally. Structural deltas fold what they can, then
-      // resync Pages once; no chat, bell, forge, or plane reducer participates.
-      pages_fold_serial = keep_i64(pages_delta_folds(next.pages), pages_fold_serial + 1, pages_fold_serial)
-      pages = apply_page_rename(pages, next.pages)
-      active_page_title = apply_page_title(active_page_title, next.pages, active_page)
-      blocks = apply_page_text(blocks, next.pages)
-      block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-      active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-      let observed = current_page_document(network_chain_id, buffer_page, page_text)
-      page_text = observed.text
-      let folded_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
-      page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
-      page_saved_text = folded_saved
-      return if !next.load_pages
-      hydration_generation = hydration_generation + 1
-      hydration_retry_attempt = 0
-      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(false, true), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     LiveKind.forge
       forge_generation = forge_generation + 1
       run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
@@ -416,12 +348,12 @@ on live_updated(next)
           try request -> done request
           done -> files_list_selected _
     LiveKind.resync
-      return if !next.load_chat && !next.load_pages && !forge_live_hit(next.kind, next.module)
-      hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
-      hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
+      return if !next.load_chat && !forge_live_hit(next.kind, next.module)
+      hydration_generation = keep_i64(next.load_chat, hydration_generation + 1, hydration_generation)
+      hydration_retry_attempt = keep_i64(next.load_chat, 0, hydration_retry_attempt)
       forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
       parallel
-        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, next.load_chat, next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
         run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
 
 on live_resynced(next)
@@ -510,7 +442,7 @@ on live_resynced(next)
   // ONLY WHEN THE ROOM ACTUALLY MOVED, for the same reason every line above it
   // is gated: `choose_dm` names the peer optimistically and leaves the room
   // being left in `active_channel` for the several blocks `open_dm` takes to
-  // answer (a CreateChannel write plus two membership seats). A pages-only
+  // answer (a CreateChannel write plus two membership seats). A plane-only
   // resync landing in that window derives the peer against the OLD room and
   // blanks it, and `chat_updated` then derives "" from "" — the DM opens under
   // a `#` and the channel's own name, until the reader re-clicks it.
@@ -557,86 +489,6 @@ on live_resynced(next)
   channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
-  // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
-  // several queries to answer, so a mutation landing in between leaves it
-  // speaking for a document nobody is on — measured on a page create. The page
-  // LIST's structure is never stale (it is the whole index either way) and
-  // still lands; everything scoped to ONE page waits for a reply that
-  // answers for the page in hand.
-  let pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
-  // A TEXT FOLD THAT LANDED WHILE THIS REPLY WAS IN FLIGHT OWNS WHAT IT WROTE
-  // (#1041). The serial the request snapshotted no longer matching means a
-  // rename or a body edit folded after the reply's reads left — and text
-  // folds are the ONLY pages writes that can land inside a still-current
-  // window, because every structural delta sets `load_pages`, bumps the
-  // generation, and orphans this very reply at the guard above. So the
-  // divergence is exactly the folded titles and block texts: those keep the
-  // fold's value, while the structure the read was issued for still lands
-  // from the reply. Discarding the pages half wholesale here would trade one
-  // staleness for the other — the defect both of #1041's rejected designs
-  // shared.
-  let pages_fold_outran_reply = next.fold_serial != pages_fold_serial
-  pages = keep_pages(next.pages_loaded, keep_folded_page_titles(pages_fold_outran_reply, next.pages, pages), pages)
-  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(keep_folded_block_texts(pages_fold_outran_reply, next.blocks, blocks), blocks, buffer_page, next.active_page, ""), blocks)
-  orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
-  // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
-  // the PAGE it was opened on, never a block selection — keyed on
-  // `selected_block_id` it closed itself, and threw the half-typed comment away,
-  // the moment the user clicked off the block whose ⋮ menu opened it. So the
-  // target is the one thing reconciled against the page identity here, and every
-  // other rail field keys on the target: one line decides the whole rail.
-  block_comments_target = retain_for_endpoint(block_comments_target, active_page, keep_str(pages_answer_is_current, next.active_page, active_page))
-  block_comments_open = block_comments_open && !empty(block_comments_target)
-  block_comment_threads = retain_selected_comment_threads(block_comment_threads, block_comments_target)
-  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, block_comments_target)
-  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, block_comments_target)
-  block_comment_threads_has_more = block_comment_threads_has_more && !empty(block_comments_target)
-  block_comment_threads_loading = block_comment_threads_loading && !empty(block_comments_target)
-  active_block_comment_thread = retain_selected_string(active_block_comment_thread, block_comments_target)
-  block_thread_comments = retain_selected_comments(block_thread_comments, block_comments_target)
-  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, block_comments_target)
-  block_thread_comments_has_more = block_thread_comments_has_more && !empty(block_comments_target)
-  block_thread_comments_loading = block_thread_comments_loading && !empty(block_comments_target)
-  block_comment_draft = retain_selected_string(block_comment_draft, block_comments_target)
-  pending_block_comment = retain_selected_string(pending_block_comment, block_comments_target)
-  page_delete_armed = page_delete_armed && active_page == keep_str(pages_answer_is_current, next.active_page, active_page)
-  block_comment_thread_total = keep_i64(pages_answer_is_current, next.comment_thread_total, block_comment_thread_total)
-  commented_block_hits = keep_strs(pages_answer_is_current, next.commented_block_hits, commented_block_hits)
-  active_page = keep_str(pages_answer_is_current, next.active_page, active_page)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  // The header title is fold-owned too — same #1041 rule as the row above,
-  // and it must hold HERE because the editor rebuild below reads it as line 0.
-  // `active_page_parent` is not: no fold writes a parent, so it stays the
-  // reply's.
-  active_page_title = keep_str(pages_answer_is_current && !pages_fold_outran_reply, next.active_page_title, active_page_title)
-  active_page_parent = keep_str(pages_answer_is_current, next.active_page_parent, active_page_parent)
-  // AFTER the title lands, because the title is line 0 of the buffer. The
-  // canonical text only replaces the buffer when the editor is CLEAN and the
-  // text actually differs — a rebuilt `Content` throws the cursor to the
-  // origin, so the saved baseline and the buffer move on one shared decision.
-  let observed = current_page_document(network_chain_id, buffer_page, page_text)
-  page_text = observed.text
-  let resynced_saved = refreshed_page_saved(page_text, active_page_title, blocks, page_saved_text, observed.ready)
-  page_text = refreshed_page_buffer(page_text, active_page_title, blocks, page_saved_text, observed.ready)
-  page_saved_text = resynced_saved
-  // The buffer's own page follows the buffer, and only when this resync
-  // actually carried page news AND the buffer moved with it.
-  //
-  // A dirty buffer refused the refresh above and still belongs to the page it
-  // was typed in — a resync that lands on another page (this one was deleted)
-  // must not claim it, or the next load would read the switch as a refresh and
-  // keep the old text under the new page's title.
-  //
-  // `pages_answer_is_current` is the other half and it is the load-bearing one.
-  // A CHAT-ONLY resync arrives with `pages_loaded == false`, so `blocks` keeps
-  // whatever it holds — which, in the window `choose_page` opens, is empty —
-  // and the refresh above canonicalises `title + []` into a document that never
-  // came from the node. Claiming that as the new page's buffer hands
-  // `page_autosave_tick` a fabricated document it is willing to write: the
-  // page would be overwritten with a blank one it never loaded.
-  let resynced_buffer_is_clean = page_text == page_saved_text
-  buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   // THE RECOVERY'S TERMINAL. `mutation_failed` parks the lock at "recovering"
   // for a write the node COMMITTED and then failed to read back, and launches
   // this resync to learn what actually landed — but nothing ever released it:
@@ -644,15 +496,7 @@ on live_resynced(next)
   // it can no longer pass, so the whole sidebar stayed disabled (and the
   // titlebar stuck on "Syncing…") until Settings → Reconnect. The state the
   // lock was protecting is known good exactly here, and `live_resync_failed`
-  // retries forever, so this is the one landing that can end it — the same
-  // shape `block_threads_recovered`/`_recovery_failed` already uses in pages.
-  //
-  // IT RELEASES EITHER ORIGIN'S RECOVERY — `block_comment_post_failed` parks the
-  // same phase, and this landing cannot tell whose it is holding. That is a
-  // sidebar unlocked while the comment rail is still refetching, no worse; what
-  // it must NOT become is a lock released twice, so those two pages terminals
-  // now take the same `== "recovering"` term rather than flatly writing "idle"
-  // over whatever mutation started in the gap.
+  // retries forever, so this is the one landing that can end it.
   //
   // AND IT IS STILL ORPHANABLE — the known ceiling, named here because the guard
   // at the top of this handler is where it bites. `mutation_failed` bumps
@@ -663,12 +507,11 @@ on live_resynced(next)
   // that are NOT are the two acts that deliberately run outside the lock — a
   // message send (`chat_composer_event`, `reply_composer_event`) and a
   // reaction tap (`add_reaction_submit`, `add_reaction_at`,
-  // `remove_reaction_at`) — plus two LANDINGS rather than acts,
-  // `chat_load_failed` and `failed` (the `load_page` error arm below): their
-  // launchers are all gated on the lock, but a switch already in flight when
-  // `mutation_failed` parked it lands under "recovering", and `mutation_failed`
-  // invalidates neither the `chat_load` nor the `page_load` lane. None of the
-  // seven launch a replacement on the `live_resync` lane, so any of them inside
+  // `remove_reaction_at`) — plus one LANDING rather than an act,
+  // `chat_load_failed`: its launchers are all gated on the lock, but a switch
+  // already in flight when `mutation_failed` parked it lands under
+  // "recovering", and `mutation_failed` does not invalidate the `chat_load`
+  // lane. None of them launch a replacement on the `live_resync` lane, so any inside
   // the recovery's round trip leaves the lock held with no terminal again, and
   // Settings → Reconnect (whitelisted for "recovering" at the top of this file)
   // is the escape. `connect_failed` bumps ungated too and is deliberately NOT on
@@ -680,25 +523,8 @@ on live_resynced(next)
   // unconditional.
   mutation_phase = mutation_phase_after_recovery(mutation_phase)
   error = ""
-  block_comments_generation = block_comments_generation + 1
-  // The rail's live refresh must ask the SAME question the rail was filled
-  // from. The old refresh asked `ThreadsForTargets` for the target ALONE, so
-  // with a page target it found only page-anchored threads and wiped every
-  // block-anchored one out of the open rail on the next pages event.
-  // `load_page_threads` fans out over the page AND its blocks, and answers on
-  // the handler pages.ice already routes its own loads through. It ignores a
-  // closed rail, so a page event with no rail open costs one refused query and
-  // never touches the banner.
-  //
-  // The list is all that refreshes live. An OPEN thread's replies do not: a task
-  // group must be the final statement in a handler, so the comment-page load
-  // cannot be guarded on `active_block_comment_thread`, and firing it unguarded
-  // asks the node for thread "" — whose failure paints `block_comment_page_failed`
-  // over the rail every time anyone edits the page. Replies still arrive on post
-  // and on reopen; a page-scoped comment refresh in backend.rs closes the gap.
   parallel
     run replace lane=live_thread refresh_live_thread(connected_rpc, active_channel, active_thread_seq) -> live_thread_refreshed _ | live_thread_refresh_failed _
-    run replace lane=block_threads load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
     // Same close-if-ended mirror as `workspace_connected` — this is the fold
     // the steady state pays (a roster change forces a chat resync into here).
     task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -708,7 +534,7 @@ on live_resync_failed(cause)
   status = "Sync delayed"
   error = "Live sync interrupted. Retrying…"
   hydration_retry_attempt = hydration_retry_attempt + 1
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, pages_fold_serial, hydration_retry_attempt) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, hydration_retry_attempt) -> live_resynced _ | live_resync_failed _
 
 on live_thread_refreshed(next)
   return if next.channel_id != active_channel || next.root_seq != active_thread_seq
@@ -760,7 +586,7 @@ on select_shell_tab(next)
   // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
   // these surfaces is mounted under an arm of `match tab`. Left set, an armed
   // delete confirm comes back on the tab round trip one click from deleting a
-  // page the reader has forgotten she armed, and a ⋯ menu is not state anyone
+  // file the reader has forgotten she armed, and a ⋯ menu is not state anyone
   // expects to return to. The escape ladder's tab scoping still stands beside
   // this — a rung must not answer for a surface that is off screen however the
   // flag got there — and the same retire is what `open_chat_search_hit`,
@@ -775,7 +601,6 @@ on select_shell_tab(next)
   thread_selected_rev = keep_i64(moved, 0, thread_selected_rev)
   thread_message_action = close_message_action(moved, thread_message_action)
   thread_edit_draft = keep_str(moved, "", thread_edit_draft)
-  page_delete_armed = page_delete_armed && !moved
   fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
@@ -902,7 +727,7 @@ on names_moved_selected(request)
   return if obsolete_request
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on forge_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation
@@ -964,7 +789,7 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target)) -> global_key_pressed _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, fs_delete_target)) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows: a close just unregisters the slot (below).
   // The process leaves only when someone says so — the tray's Quit, or ⌘Q.
@@ -1039,10 +864,6 @@ subscribe
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
-  // Poll the hydrated page even while the app mirror looks clean: a guest
-  // replacement may preserve edits whose old-instance notification is refused.
-  // The handler reads the canonical document before its dirty/no-op check.
-  every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick
 
 // CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
 // This unregisters the slot the closed window held; on a Mac the daemon goes
@@ -1241,20 +1062,12 @@ on mutation_failed(cause)
   thread_edit_draft = message_text_after_failure(thread_edit_draft, mutation_phase, cause.committed)
   mutation_phase = mutation_failure_phase(cause.committed)
   channel_draft = restore_draft(channel_draft, pending_channel, cause.committed)
-  page_draft = restore_draft(page_draft, pending_page, cause.committed)
-  pages_seed_rev = pages_seed_rev + 1
   pending_channel = ""
-  pending_page = ""
   error = cause.message
   return if !cause.committed
-  // The lane invalidation discards the in-flight save's reply without
-  // aborting its write, so the status reset is the inseparable other half.
-  // Otherwise the "saving" guard holds the tick forever.
-  invalidate lane=page_autosave
-  block_autosave_status = AutosaveStatus.idle
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, true, false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on dismiss_error
   error = ""
@@ -1308,17 +1121,3 @@ on connect_failed(cause)
   onboarding_error = keep_str(console_entry == ConsoleEntry.entering, cause.message, onboarding_error)
   run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _
 
-// ONE LOAD FAILED; THE CONNECTION DID NOT SAY ANYTHING. This is the failed arm
-// of `load_chat`, `open_dm`, `load_chat_hit` and the three page routes, and it
-// used to write `status = "Offline"` — the connection's own word, over a live
-// socket. `connected` stays true, so nothing reconnects and nothing corrects
-// it: the sidebar dot goes red and the titlebar pill reads Offline until the
-// next block's `live_updated` overwrites the status, up to 3s on a quiet chain.
-// A single `/v1/query` blocking past the RPC timeout is ordinary (see
-// `connect_failed` above), so this arm says what it knows — the load failed —
-// and leaves the connection's word to the connection's own handlers.
-on failed(cause)
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  loading = false
-  error = cause.message

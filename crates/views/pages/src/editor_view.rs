@@ -1,6 +1,6 @@
 //! The Pages presentation consumer: native-compatible comment badges and an
 //! explicit plain-editor notice when the complete presentation cannot be used.
-use crate::{document_source::CommentMark, editor_binding::MenuState};
+use crate::{document_sync::CommentMark, editor_binding::MenuState};
 use ui_lang_guest::{Editor, EditorStateView, wire};
 use wire::editor_presentation::{EditorMargin, EditorPresentation, PresentationError};
 
@@ -77,6 +77,12 @@ fn reference(state: EditorStateView<'_>) -> Vec<u8> {
         state.revision,
         state.cursor,
     ))
+}
+
+/// The line the caret sits on: the anchor a new comment takes when no margin
+/// badge named one.
+pub fn cursor_line(document: &Editor) -> i64 {
+    i64::from(document.cursor().position.line)
 }
 
 pub fn presentation_notice(document: &Editor, prepared: &PreparedPresentation) -> String {

@@ -133,7 +133,6 @@ daemon Ducktape
       app-id "dev.ducktape.app"
 
 use "extern/backend.ice"
-use "extern/editor.ice"
 use "extern/call.ice"
 use "extern/module_view.ice"
 use "ducktape-ui/recipes.ice"

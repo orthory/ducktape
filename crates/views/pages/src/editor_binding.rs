@@ -155,7 +155,7 @@ impl BindingState {
             action,
         );
         self.menu = successor;
-        let mut navigation = crate::document_source::Navigation::default();
+        let mut navigation = crate::document_sync::Navigation::default();
         match action {
             wire::editor_presentation::EditorInteraction::Margin { line } => {
                 navigation.comment_line = Some(*line);

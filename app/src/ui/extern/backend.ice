@@ -15,29 +15,17 @@ extern crate::backend
   ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta()
-  PagesDelta(kind:str, block_id:str, text:str)
-  LiveRefresh(generation:i64, fold_serial:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_seq:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_seq:i64, has_more:bool)
   LiveThreadData(channel_id:str, root_seq:i64, messages:[ChatMessage])
   HistoryPageData(channel_id:str, messages:[ChatMessage], has_more:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(hits:[ChatSearchHit])
-  PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
-  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
-  PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
-  PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
-  BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageSearchData(hits:[PageSearchHit])
   PaletteSearchData(chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
-  // `refusal` is not a failure: the write was NOT attempted because carrying it
-  // out would have destroyed records. `document` is the canonical text either
-  // way — the buffer takes it, which is what rolls an illegal edit back.
-  DocumentSaveResult(written:bool, refusal:str, data:PagesData, document:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
   BellItem(seq:i64, change_seq:i64, source:str, reason:str, kind:str, actor:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellPresentation(seq:i64, title:str, detail:str, target:BellTarget, object:str, number:i64, anchor:str)
@@ -61,7 +49,7 @@ extern crate::backend
   load_bell(rpc:str, expected_account:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, expected_account:str, up_to_seq:i64) -> BellDelta ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
-  LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:[ChatDelta], pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
+  LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, debounce:bool, chat:[ChatDelta], bell:BellDelta, forge:ForgeRefresh)
   ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, forge_discussion:[ChatMessage], refresh_chat:bool)
   AppError(message:str, committed:bool)
   LiveActivity(label:str, done:bool)
@@ -78,8 +66,7 @@ extern crate::backend
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
   pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, has_older_history:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, forge_discussion:[ChatMessage], forge_item_channel:str, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
-  pure resync_planes(load_chat:bool, load_pages:bool) -> str
-  live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, fold_serial:i64, attempt:i64) -> LiveRefresh ! HydrationError
+  live_resync_load(rpc:str, channel_id:str, load_chat:bool, debounce:bool, generation:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
   sync fresh_operation_id(prefix:str) -> str
   sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
@@ -106,14 +93,7 @@ extern crate::backend
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
   pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface) -> CopyRange
   pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
-  pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
-  // Chat's message/thread menus still place themselves this way; the name is
-  // the pages block menu it was written for, which no longer exists.
-  pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  pure append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
-  pure append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
-  pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
   join_network(blob:secret) -> WorkspaceInit ! AppError
@@ -193,8 +173,8 @@ extern crate::backend
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, fs_delete_target:&str) -> str
+  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, fs_delete_target:str) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord
@@ -393,7 +373,6 @@ extern crate::backend
   save_appearance(mode:Appearance) -> bool
   load_desktop_notifications() -> bool
   save_desktop_notifications(enabled:bool) -> bool
-  pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase
   pure mutation_phase_after_recovery(current:MutationPhase) -> MutationPhase
   pure message_seq_after_failure(current:i64, phase:MutationPhase, committed:bool) -> i64
@@ -426,31 +405,16 @@ extern crate::backend
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
   pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
-  // The page header title of a page that
-  // has only just been clicked, read from the list already in hand.
-  pure page_display_title(pages:[PageItem], page:str, current:str) -> str
   pure keep_channels(loaded:bool, chain_moved:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   pure chain_moved(held:str, live:str) -> bool
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
-  pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
-  pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
-  pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
-  pure apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
-  pure apply_page_title(title:str, delta:PagesDelta, active_page:str) -> str
-  pure apply_page_rename(pages:[PageItem], delta:PagesDelta) -> [PageItem]
-  pure pages_delta_folds(delta:PagesDelta) -> bool
-  pure keep_folded_page_titles(fold_outran_reply:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
-  pure keep_folded_block_texts(fold_outran_reply:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure plane_live_hit(kind:LiveKind, module:str, want:str) -> bool
   pure agents_plane_hit(kind:LiveKind, module:str) -> bool
   pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
   pure keep_str(loaded:bool, next:&str, current:&str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool
   pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
-  pure keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
-  pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
-  pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
   pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
   pure keep_branches(loaded:bool, next:[ForgeBranch], current:[ForgeBranch]) -> [ForgeBranch]
   pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
@@ -463,13 +427,6 @@ extern crate::backend
   pure thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   pure retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   pure thread_root_seed(messages:[ChatMessage], thread:[ChatMessage], seq:i64) -> [ChatMessage]
-  pure remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
-  pure remove_recovered_draft(drafts:[str], recovered:str) -> [str]
-  pure retain_selected_string(value:str, selected_id:str) -> str
-  pure retain_selected_i64(value:i64, selected_id:str) -> i64
-  pure retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
-  pure retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
-  pure scope_key(scope:&str, id:&str) -> str
   pure reaction_palette() -> [str]
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
   // with the generation of the switch they belong to, so `chat_load_failed` can
@@ -515,31 +472,7 @@ extern crate::backend
   // that needs a run already on screen has no other way to seat one.
   pure live_agent_row(channel_id:str, anchor_seq:i64, run_id:str, agent:str, status:str) -> LiveAgentRow
   search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
-  load_page(rpc:str, page_id:str) -> PagesData ! AppError
-  load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
-  load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
-  post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
-  resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
   open_external_url(url:str) -> bool ! AppError
-  create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
-  delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
-  // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops
-  // out — see backend/document.rs for the ordering rule and the refusal.
-  save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str) -> DocumentSaveResult ! AppError
-  // The buffer a page opens on: its TITLE as line 0, its blocks under it.
-  pure page_document_text(title:str, blocks:[PageBlock]) -> str
-  pure subpage_blocks(blocks:&[PageBlock]) -> [PageBlock]
   pure count_label(count:i64) -> str
-  // A live resync replaces the buffer ONLY when it is clean and the node's
-  // text differs; both read the same decision so buffer and baseline move
-  // together.
-  sync refreshed_page_buffer(document:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
-  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str, ready:bool) -> str
-  pure saved_baseline(written:bool, canonical:str, submitted:str) -> str
-  pure baseline_at_submitted_title(canonical:str, submitted:str) -> str
-  pure install_decision(text:str, current_page:str, next_page:str, saved:str, canonical:str) -> bool
-  sync installed_page_text(document:str, install:bool, canonical:str) -> str
-  sync rolled_back_text(document:str, untouched:bool, canonical:str) -> str
-  pure remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
   search_pages(rpc:str, page_id:str, text:str) -> PageSearchData ! AppError
   palette_search(rpc:str, text:str) -> PaletteSearchData ! AppError

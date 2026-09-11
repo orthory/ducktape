@@ -34,7 +34,6 @@ const ROWS: i64 = 256;
 const CHANNELS: i64 = 24;
 const WINDOW: Size = Size::new(1440.0, 900.0);
 const HUDDLE_WINDOW: Size = Size::new(320.0, 460.0);
-const PAGE_ROWS: usize = 128;
 /// One full thread page plus its root. The root rail deliberately is not
 /// subject to the 256-root hot-window cap.
 const THREAD_ROWS: i64 = backend::THREAD_HOT_WINDOW_LIMIT as i64;
@@ -95,19 +94,7 @@ struct ScreenProbe {
 
 const SCREEN_PROBES: &[ScreenProbe] = &[
     // Each ceiling sits between the optimized baseline and the smallest
-    // one-change negative control measured with this deterministic fixture:
-    // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
-    // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
-    // externs borrowing their list and string arguments
-    // (`subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
-    // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
-    // externs cloning them per frame.
-    ScreenProbe {
-        label: "pages comments build+layout",
-        size: WINDOW,
-        fixture: console_in_page_comments,
-        allocation_ceiling: 30_000,
-    },
+    // one-change negative control measured with this deterministic fixture.
     // 13,089 with the keyed (seq, render_rev) lazy vs 18,836 with the plain
     // row-hashing lazy vs 54,599 with no quiet-arm `lazy` at all — the
     // negative control that gates. Removing the rail's `virtual-row=` moves
@@ -391,78 +378,6 @@ fn console_in_chat_with_thread_and_rows(
     (app, console)
 }
 
-fn console_on(tab: ShellTab) -> (Ducktape, iced::window::Id) {
-    let (mut app, _) = Ducktape::__boot();
-    let console = iced::window::Id::unique();
-    app.console_win = Some(console);
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab));
-    assert_eq!(app.shell_tab, tab, "the probe mounts the requested screen");
-    (app, console)
-}
-
-fn probe_page_block(index: usize) -> backend::PageBlock {
-    backend::PageBlock {
-        key: index as i64,
-        id: format!("block-{index}"),
-        parent: "page".into(),
-        kind: "Text".into(),
-        text: format!(
-            "Page paragraph {index} gives the comment rail a stable, non-empty anchor label."
-        ),
-        pending: false,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-    }
-}
-
-fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on(ShellTab::Pages);
-    let blocks: Vec<_> = (0..PAGE_ROWS).map(probe_page_block).collect();
-    let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
-        pages: vec![backend::PageItem {
-            id: "page".into(),
-            title: "Performance notes".into(),
-            parent: String::new(),
-            prefix: String::new(),
-            child_count: 0,
-        }],
-        blocks,
-        active_page: "page".into(),
-        active_page_title: "Performance notes".into(),
-        active_page_parent: String::new(),
-        comment_thread_total: PAGE_ROWS as i64,
-        commented_block_hits: Vec::new(),
-    }));
-    let _ = app.__update(__DucktapeMessage::ToggleBlockComments);
-    let generation = app.block_comments_generation;
-    let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
-        backend::BlockThreadListData {
-            generation,
-            target: "page".into(),
-            from: 0,
-            threads: (0..PAGE_ROWS)
-                .map(|index| backend::PageCommentThread {
-                    id: format!("thread-{index}"),
-                    target: format!("block-{index}"),
-                    author: format!("reviewer-{}", index % 7),
-                    meta: format!("#{index}"),
-                    resolved: false,
-                    comment_count: 1,
-                })
-                .collect(),
-            total: PAGE_ROWS as i64,
-            next_from: 0,
-            has_more: false,
-        },
-    ));
-    assert_eq!(app.blocks.len(), PAGE_ROWS);
-    assert_eq!(app.block_comment_threads.len(), PAGE_ROWS);
-    assert!(app.block_comments_open);
-    (app, console)
-}
 
 fn probe_huddle_participant(index: usize) -> backend::HuddleParticipant {
     backend::HuddleParticipant {
@@ -720,20 +635,13 @@ fn flip_loading_under(label: &'static str, mut app: Ducktape, console: iced::win
     let mut flips = Phase::new(label);
     for frame in 0..FRAMES {
         let raise = frame % 2 == 0;
-        // An empty failure message keeps the error banner out of the frame,
-        // so the delta between two frames is the flag and nothing else.
-        let flip = if raise {
-            __DucktapeMessage::ChoosePage("probe-page".into())
-        } else {
-            __DucktapeMessage::Failed(backend::AppError {
-                message: String::new(),
-                committed: false,
-            })
-        };
+        // THE FLAG AND NOTHING ELSE. Every handler that moves `loading` moves
+        // a room or a banner with it, so the delta between two frames would be
+        // the whole screen; written straight onto the field, it is the one bit
+        // this probe is measuring the rebuild cost of.
         cache = flips
             .sample(|| {
-                let _ = app.__update(flip);
-                assert_eq!(app.loading, raise, "the fixture must move the flag");
+                app.loading = raise;
                 UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
             })
             .into_cache();
@@ -962,7 +870,7 @@ fn large_screens_stay_under_their_allocation_ceilings() {
 }
 
 fn probe_large_screens() {
-    eprintln!("large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows");
+    eprintln!("large screen frame probes: {THREAD_ROWS} thread rows, {HUDDLE_ROWS} huddle rows");
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();
         let allocations = probe_unchanged_build(probe.label, app, window, probe.size);

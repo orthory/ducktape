@@ -53,8 +53,6 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
         5,
         "general",
         vec![message(7, "root", false)],
-        "",
-        Vec::new(),
     )));
     assert_eq!(refresh.active_thread_seq, 7);
     assert_eq!(refresh.thread_generation, 7);
@@ -426,8 +424,6 @@ fn a_resync_that_closes_the_rail_leaves_the_reply_it_closes_over() {
         4,
         "general",
         vec![message(7, "the root", true)],
-        "",
-        Vec::new(),
     )));
     assert_eq!(
         app.active_thread_seq, 0,

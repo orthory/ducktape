@@ -15,8 +15,8 @@ use ::chat::{ChatMsg, PostPolicy};
 use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::{FutureExt as _, StreamExt as _};
-use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
-use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
+use pages::BlockKind;
+use pages::index::{PageRow, PagesViewQuery, PagesViewReply};
 use tokio::sync::OwnedSemaphorePermit;
 use zeroize::Zeroizing;
 
@@ -42,7 +42,6 @@ pub use ::forge::client::{
     ReviewRow as ForgeReview,
 };
 pub use inbox::client::{BellDelta, BellItem};
-pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
@@ -146,86 +145,6 @@ pub struct ChatSearchData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct PageItem {
-    pub id: String,
-    pub title: String,
-    pub parent: String,
-    pub prefix: String,
-    pub child_count: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct PageBlock {
-    pub key: i64,
-    pub id: String,
-    pub parent: String,
-    pub kind: String,
-    pub text: String,
-    pub pending: bool,
-    pub checked: bool,
-    pub prefix: String,
-    pub child_count: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct PagesData {
-    pub pages: Vec<PageItem>,
-    pub blocks: Vec<PageBlock>,
-    pub active_page: String,
-    pub active_page_title: String,
-    pub active_page_parent: String,
-    /// Every open comment thread on the page or its blocks — the header count
-    /// the surface wears BEFORE the rail is ever opened.
-    pub comment_thread_total: i64,
-    /// The block ids carrying at least one unresolved thread, for the
-    /// commented-line washes in the document.
-    pub commented_block_hits: Vec<String>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct PageCommentThread {
-    pub id: String,
-    /// The block (or page) id the thread anchors to — the wire always carried
-    /// it; dropping it here was what made block-anchored threads unopenable.
-    pub target: String,
-    pub author: String,
-    pub meta: String,
-    pub resolved: bool,
-    pub comment_count: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct PageComment {
-    pub id: String,
-    pub ordinal: i64,
-    pub author: String,
-    pub meta: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockThreadListData {
-    pub generation: i64,
-    pub target: String,
-    pub from: i64,
-    pub threads: Vec<PageCommentThread>,
-    pub total: i64,
-    pub next_from: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockCommentData {
-    pub generation: i64,
-    pub target: String,
-    pub thread_id: String,
-    pub from: i64,
-    pub comments: Vec<PageComment>,
-    pub next_from: i64,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct PageSearchHit {
     pub page_id: String,
     /// The title of the page the block lives in. The index's hit row carries
@@ -257,13 +176,6 @@ pub struct WorkspaceData {
     pub active_channel_members_only: bool,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
-    pub pages: Vec<PageItem>,
-    pub blocks: Vec<PageBlock>,
-    pub active_page: String,
-    pub active_page_title: String,
-    pub active_page_parent: String,
-    pub comment_thread_total: i64,
-    pub commented_block_hits: Vec<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -311,18 +223,16 @@ pub struct LiveUpdate {
     pub height: i64,
     /// the module needing a scoped resync (`kind == LiveKind::Resync`).
     pub module: String,
-    /// which plane(s) the handler must reload (`ready` = both after the
-    /// subscribe→hydrate ordering race; `resync` = the lagged plane; a pages
-    /// delta = the pages plane, debounced). chat deltas set neither.
+    /// whether the handler must reload the chat slices (`ready` after the
+    /// subscribe→hydrate ordering race, or a `resync` of the chat plane).
+    /// chat deltas set it false: they fold.
     pub load_chat: bool,
-    pub load_pages: bool,
-    /// trail 100ms so a burst of pages ops coalesces into one reload.
+    /// trail 100ms so a burst of ops coalesces into one reload.
     pub debounce: bool,
     /// Ordered chat deltas. Consecutive, already-ready chat frames are
     /// published together so one network burst costs one reducer pass and one
     /// view rebuild per bounded batch, not one of each per operation.
     pub chat: Vec<ChatDelta>,
-    pub pages: PagesDelta,
     pub bell: BellDelta,
     /// one committed forge op's invalidation scope (`kind == LiveKind::Forge`).
     pub forge: ForgeRefresh,
@@ -371,10 +281,8 @@ impl Default for LiveUpdate {
             height: 0,
             module: String::new(),
             load_chat: false,
-            load_pages: false,
             debounce: false,
             chat: Vec::new(),
-            pages: PagesDelta::default(),
             bell: BellDelta::default(),
             forge: ForgeRefresh::default(),
             permit: LivePermit::default(),
@@ -387,7 +295,6 @@ mod app_dirs;
 mod bell;
 mod chat;
 mod chat_live;
-mod document;
 mod duck_uri;
 mod explorer;
 mod forge;
@@ -413,7 +320,6 @@ pub(crate) use app_dirs::cache_dir;
 pub use bell::*;
 pub use chat::*;
 pub use chat_live::*;
-pub use document::*;
 pub use duck_uri::*;
 pub use explorer::*;
 pub use forge::*;

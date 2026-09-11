@@ -83,8 +83,6 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
         app.hydration_generation,
         "general",
         vec![message(7, "root", false)],
-        "",
-        Vec::new(),
     )));
     assert!(
         app.messages[0].reactions.is_empty(),
@@ -120,8 +118,6 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
             message(45, "still on screen", false),
             message(50, "the tail", false),
         ],
-        "",
-        Vec::new(),
     )));
     assert_eq!(
         app.messages.iter().map(|row| row.seq).collect::<Vec<_>>(),

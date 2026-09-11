@@ -7,10 +7,8 @@ pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> L
         height,
         module: String::new(),
         load_chat: kind == crate::LiveKind::Ready,
-        load_pages: kind == crate::LiveKind::Ready,
         debounce: false,
         chat: Vec::new(),
-        pages: PagesDelta::default(),
         bell: BellDelta::default(),
         forge: ForgeRefresh::default(),
         permit: LivePermit::default(),
@@ -39,7 +37,6 @@ pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
     let mut update = live_update(crate::LiveKind::Resync, "Live · resyncing", height);
     update.module = module.to_string();
     update.load_chat = module == "chat";
-    update.load_pages = module == "pages";
     update
 }
 
@@ -118,119 +115,6 @@ pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
         BlockKind::Code => "Code",
         BlockKind::Callout => "Callout",
         BlockKind::Divider => "Divider",
-    }
-}
-
-pub(crate) fn parse_block_kind(kind: &str) -> Result<BlockKind, String> {
-    match kind {
-        "Page" => Ok(BlockKind::Page),
-        "Text" => Ok(BlockKind::Paragraph),
-        "Heading 1" => Ok(BlockKind::Heading1),
-        "Heading 2" => Ok(BlockKind::Heading2),
-        "Heading 3" => Ok(BlockKind::Heading3),
-        "Bullet" => Ok(BlockKind::Bulleted),
-        "Number" => Ok(BlockKind::Numbered),
-        "Todo" => Ok(BlockKind::Todo),
-        "Toggle" => Ok(BlockKind::Toggle),
-        "Quote" => Ok(BlockKind::Quote),
-        "Code" => Ok(BlockKind::Code),
-        "Callout" => Ok(BlockKind::Callout),
-        "Divider" => Ok(BlockKind::Divider),
-        _ => Err("choose a valid block type".into()),
-    }
-}
-
-/// What the pages MODULE accepts for one block's text, named for the error
-/// message. The app never invents its own cap: a tighter one refuses text the
-/// node would have taken, with no app-side way to shorten a block that some
-/// other signer already landed. A `Page` block's text is its title.
-fn block_text_bound(kind: BlockKind) -> (&'static str, usize) {
-    if kind == BlockKind::Page {
-        return ("page title", pages::MAX_PAGE_TITLE_LEN);
-    }
-    ("block text", pages::MAX_BLOCK_LEN)
-}
-
-pub(crate) fn bounded_new_block_text(kind: BlockKind, text: String) -> Result<String, String> {
-    if kind == BlockKind::Divider {
-        return Ok(String::new());
-    }
-    let (field, limit) = block_text_bound(kind);
-    // Only a page title must be non-empty. An empty BLOCK is a blank line —
-    // the thing Enter-Enter makes — and the node accepts it; rejecting it here
-    // put every save after a blank line into a permanent retry loop.
-    if kind == BlockKind::Page && text.trim().is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    bounded_exact_text(text, field, limit)
-}
-
-pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Result<String, String> {
-    if kind == BlockKind::Divider {
-        return Ok(String::new());
-    }
-    let (field, limit) = block_text_bound(kind);
-    bounded_exact_text(text, field, limit)
-}
-
-pub(crate) fn block_move(
-    blocks: &[pages::Block],
-    block_id: &str,
-    direction: &str,
-) -> Result<(Option<String>, Option<String>), String> {
-    let block = blocks
-        .iter()
-        .find(|block| block.id == block_id)
-        .ok_or_else(|| "block was not found".to_string())?;
-    let parent_id = block
-        .parent
-        .as_deref()
-        .ok_or_else(|| "top-level pages cannot move inside their own document".to_string())?;
-    let parent = blocks
-        .iter()
-        .find(|block| block.id == parent_id)
-        .ok_or_else(|| "block parent was not found".to_string())?;
-    let index = parent
-        .children
-        .iter()
-        .position(|child| child == block_id)
-        .ok_or_else(|| "block is missing from its parent".to_string())?;
-    match direction {
-        "up" if index > 0 => Ok((
-            Some(parent.id.clone()),
-            index
-                .checked_sub(2)
-                .map(|index| parent.children[index].clone()),
-        )),
-        "down" if index + 1 < parent.children.len() => Ok((
-            Some(parent.id.clone()),
-            Some(parent.children[index + 1].clone()),
-        )),
-        "indent" if index > 0 => {
-            let new_parent = blocks
-                .iter()
-                .find(|block| block.id == parent.children[index - 1])
-                .ok_or_else(|| "previous block was not found".to_string())?;
-            Ok((
-                Some(new_parent.id.clone()),
-                new_parent.children.last().cloned(),
-            ))
-        }
-        "outdent" => {
-            let promotes_page = block.kind == BlockKind::Page && parent.parent.is_none();
-            if promotes_page {
-                return Ok((None, None));
-            }
-            let grandparent = parent
-                .parent
-                .clone()
-                .ok_or_else(|| "block is already at the top level".to_string())?;
-            Ok((Some(grandparent), Some(parent.id.clone())))
-        }
-        "up" => Err("block is already first".into()),
-        "down" => Err("block is already last".into()),
-        "indent" => Err("block needs a previous sibling to indent under".into()),
-        _ => Err("choose a valid block move".into()),
     }
 }
 

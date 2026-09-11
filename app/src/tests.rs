@@ -12,8 +12,6 @@ mod font_fallback;
 mod forge;
 mod huddle_live;
 mod messages;
-mod page_autosave_gate;
-mod pages;
 mod rooms;
 mod sends;
 mod settings;
@@ -324,11 +322,6 @@ fn restore_composer(scope: &str, blocked: bool) {
     let _ = composer::interact(scope, "message", false, blocked, Interaction::Restore);
 }
 
-/// The page document's text, the way the save tick reads it.
-fn page_document_text(app: &Ducktape) -> String {
-    app.page_text.clone()
-}
-
 fn default_ice_color(name: &str) -> iced::Color {
     // 2.0 allows ONE theme contract and one palette, so the kit's theme moved
     // out of the vendored copy into the app's own file.
@@ -365,12 +358,9 @@ fn live_refresh(
     generation: i64,
     active_channel: &str,
     messages: Vec<backend::ChatMessage>,
-    active_page: &str,
-    blocks: Vec<backend::PageBlock>,
 ) -> backend::LiveRefresh {
     backend::LiveRefresh {
         generation,
-        fold_serial: 0,
         chat_loaded: true,
         channels: Vec::new(),
         messages,
@@ -381,14 +371,6 @@ fn live_refresh(
         active_channel_members_only: false,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
-        pages_loaded: true,
-        pages: Vec::new(),
-        blocks,
-        active_page: active_page.into(),
-        active_page_title: active_page.into(),
-        comment_thread_total: 0,
-        commented_block_hits: Vec::new(),
-        active_page_parent: String::new(),
     }
 }
 
@@ -466,13 +448,6 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         active_channel_members_only: false,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
-        pages: Vec::new(),
-        blocks: Vec::new(),
-        active_page: String::new(),
-        active_page_title: String::new(),
-        active_page_parent: String::new(),
-        comment_thread_total: 0,
-        commented_block_hits: Vec::new(),
     }
 }
 
@@ -502,67 +477,8 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the page document's write clock: the guest editor's edits never
-            // pass through a handler, so the app mirror cannot know the buffer
-            // is dirty — the tick reads the canonical document while a page is
-            // open on a connected node and its handler makes the dirty/no-op
-            // call. It exists only while a page is open, and no other tick may.
-            "every 900ms when (connected && !loading && !empty(active_page) && active_page == buffer_page) -> page_autosave_tick",
         ]
     );
-}
-
-fn page_item(id: &str, title: &str) -> backend::PageItem {
-    backend::PageItem {
-        id: id.into(),
-        title: title.into(),
-        parent: String::new(),
-        prefix: String::new(),
-        child_count: 0,
-    }
-}
-
-fn page_block(id: &str, page: &str, text: &str) -> backend::PageBlock {
-    backend::PageBlock {
-        key: 0,
-        id: id.into(),
-        parent: page.into(),
-        kind: "Text".into(),
-        text: text.into(),
-        pending: false,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-    }
-}
-
-fn page_load(id: &str, title: &str, body: &str) -> backend::PagesData {
-    backend::PagesData {
-        pages: vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")],
-        blocks: vec![page_block(&format!("{id}-1"), id, body)],
-        active_page: id.into(),
-        active_page_title: title.into(),
-        active_page_parent: String::new(),
-        comment_thread_total: 0,
-        commented_block_hits: Vec::new(),
-    }
-}
-
-/// The app on Alpha, its document loaded and its buffer clean.
-fn reading_alpha() -> Ducktape {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    app.pages = vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")];
-    app.active_page = "alpha".into();
-    app.active_page_title = "Alpha".into();
-    app.active_page_parent = "Root".into();
-    app.blocks = vec![page_block("alpha-1", "alpha", "alpha body")];
-    app.page_text = "Alpha\nalpha body".into();
-    app.page_saved_text = "Alpha\nalpha body".into();
-    app.buffer_page = "alpha".into();
-    app
 }
 
 fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {

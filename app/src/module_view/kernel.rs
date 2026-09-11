@@ -27,6 +27,9 @@
 //!   never carries a password, an endpoint or a key.
 //! - `host.badge` `<count>` — the tab badge, handed to the app as the
 //!   `badge` event with `{"count": N}` in its detail.
+//! - `host.id` `<prefix>` — one id, unique on this device, for a module
+//!   whose records are addressed by ids its WRITER mints. A view has no
+//!   clock and no entropy of its own, so the app mints it.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
@@ -41,6 +44,9 @@ use super::{Guest, ModuleViewEvent, Slot, wire};
 const MAX_BLOCKS: usize = 1_000;
 /// The most a `blob.get` may pull: a frame's worth, as the loader's own cap.
 const MAX_BLOB_BYTES: usize = 16 << 20;
+/// The longest `host.id` prefix: a word naming the kind of record, not a
+/// payload of its own.
+const MAX_ID_PREFIX: usize = 32;
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
@@ -151,6 +157,19 @@ pub(super) fn answer(
                     guest.reply(id, Ok(Vec::new()));
                 }
                 None => guest.refuse(id, "`host.badge` carries no count".into()),
+            }
+        }
+        ("host", "id") => {
+            let prefix = std::str::from_utf8(payload).unwrap_or_default().trim();
+            let named = !prefix.is_empty()
+                && prefix.len() <= MAX_ID_PREFIX
+                && prefix.bytes().all(|byte| byte.is_ascii_alphanumeric());
+            match named {
+                true => guest.reply(
+                    id,
+                    Ok(crate::backend::fresh_id(prefix).into_bytes()),
+                ),
+                false => guest.refuse(id, "`host.id` names no prefix".into()),
             }
         }
         _ => return false,
@@ -339,12 +358,25 @@ fn query(
     })
 }
 
+/// One index-tier view read, AFTER the module's fold has caught up with
+/// everything this client knows it wrote.
+///
+/// A derived read model folds BEHIND the block loop, so a view read fired on
+/// the heels of this view's own `op.submit` answers a tier that predates it:
+/// the moved block back where it was, the deleted line still alive, the line
+/// just typed missing. A module whose records the view then plans against
+/// (the pages document save) turns that into a DUPLICATE write, so the wait
+/// belongs on the kernel's read rather than in each view that has to
+/// remember it. `crate::backend::await_seen_fold` waits for nothing when
+/// nothing is outstanding, which is every read a view makes that did not
+/// just write.
 fn view(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
     Box::pin(async move {
         let target = target_of(&ask)?;
+        crate::backend::await_seen_fold(&client, &target, &ask["query"]).await;
         let reply: serde_json::Value = client
             .view(&target, &ask["query"])
             .await

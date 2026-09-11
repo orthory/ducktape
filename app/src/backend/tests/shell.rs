@@ -463,7 +463,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             thread_action,
             action,
             drawer,
-            false,
             String::new(),
         )
     };
@@ -478,7 +477,6 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
-            true,
             true,
             "/shared/q3.md".into(),
         ),
@@ -582,9 +580,11 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "channel_settings"
     );
-    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
-    // the Pages screen — so it is a rung, and it answers only from Pages.
-    let armed = |tab: ShellTab, page_delete: bool, fs_delete: &str| {
+    // THE FILES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
+    // the Files screen — so it is a rung, and it answers only from Files. The
+    // Pages layers are the pages view's own now: it holds the keyboard inside
+    // its tab and answers Escape itself.
+    let armed = |tab: ShellTab, fs_delete: &str| {
         escape_target(
             escape.clone(),
             tab,
@@ -594,14 +594,12 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             false,
-            page_delete,
             fs_delete.into(),
         )
     };
-    assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
-    assert_eq!(armed(ShellTab::Chat, true, ""), "");
-    assert_eq!(armed(ShellTab::Files, false, "/shared/q3.md"), "fs_delete");
-    assert_eq!(armed(ShellTab::Node, false, "/shared/q3.md"), "");
+    assert_eq!(armed(ShellTab::Files, "/shared/q3.md"), "fs_delete");
+    assert_eq!(armed(ShellTab::Node, "/shared/q3.md"), "");
+    assert_eq!(armed(ShellTab::Pages, "/shared/q3.md"), "");
 
     // Nothing transient open → Escape is a no-op. The pages block menus are
     // gone with the surfaces they dismissed.
@@ -644,7 +642,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
                 thread_action,
                 action,
                 drawer,
-                false,
                 "",
             )
         };
@@ -657,7 +654,6 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             create,
             thread_action,
             MessageAction::Toolbar,
-            false,
             false,
             String::new(),
         )

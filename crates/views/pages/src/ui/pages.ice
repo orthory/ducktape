@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
+component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -21,9 +21,7 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
     close_block_comments()
     open_block_comment_thread(str, str)
     resolve_thread_submit(bool)
-    load_more_block_threads()
     close_block_comment_thread()
-    load_more_block_comments()
     post_block_comment_submit()
     copy_to_clipboard(str, str)
   row w=fill h=fill
@@ -735,15 +733,6 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                               PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
                                 forward
                                   open_block_comment_thread
-                            if threads_has_more
-                              button "More" -> emit(load_more_block_threads)
-                                with
-                                  disabled=(threads_loading || busy)
-                                  p=4.0
-                                  @secondary_action text-11px leading-snug font-medium
-                                active bg=transparent text=muted r=6.0
-                                hovered bg=fg/9 text=fg
-                                pressed bg=fg/14
                       if !empty(active_thread)
                         row
                           with
@@ -791,15 +780,6 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                           col w=fill gap=1.0
                             for page_comment in comments
                               PageCommentCard comment=page_comment
-                            if comments_has_more
-                              button "More" -> emit(load_more_block_comments)
-                                with
-                                  disabled=(comments_loading || busy)
-                                  p=4.0
-                                  @secondary_action text-11px leading-snug font-medium
-                                active bg=transparent text=muted r=6.0
-                                hovered bg=fg/9 text=fg
-                                pressed bg=fg/14
                       if empty(active_thread)
                         text compose_hint
                           with

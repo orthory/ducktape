@@ -19,8 +19,6 @@
 mod display_budget;
 mod kernel;
 
-pub(crate) mod pages_document;
-
 pub use kernel::{block_hit as view_block_hit, live_hit as view_live_hit};
 
 use std::collections::{HashMap, VecDeque};
@@ -822,139 +820,36 @@ pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict
 
 // ---------- the pages seat ----------
 
-/// Pages supplies metadata and a stable source identity. Document bytes use
-/// bounded chunks, and accepted guest edits feed the existing app save buffer.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
+/// Pages speaks the KERNEL CONTRACT: session facts go in — the chain the
+/// titlebar names, because a `duck://page/…` address carries it, and the page
+/// a link asked the app to open — and the view reads the workspace, the
+/// document and its comments off the node itself and signs its writes through
+/// `op.submit`. The one event back is the kernel's `badge`, plus the two OS
+/// doors (the clipboard and the open plane) the app still owns.
 pub fn pages_view(
     dark: bool,
     connected: bool,
-    loading: bool,
-    mutation_phase: crate::MutationPhase,
     network_chain_id: &str,
-    pages: &[crate::backend::PageItem],
-    page_create_open: bool,
-    page_draft: &str,
-    block_comment_draft: &str,
-    seed_rev: i64,
-    active_page: &str,
-    active_page_title: &str,
-    active_page_parent: &str,
-    page_searching: bool,
-    page_search_hits: &[crate::backend::PageSearchHit],
-    page_search_query: &str,
-    page_delete_armed: bool,
-    autosave: crate::AutosaveStatus,
-    page_refusal: &str,
-    blocks: &[crate::backend::PageBlock],
-    commented_block_hits: &[String],
-    caret_comment_target: &str,
-    active_thread_anchor: &str,
-    orphaned_comment_drafts: &[String],
-    page_text: &str,
-    buffer_page: &str,
-    block_comments_open: bool,
-    thread_total: i64,
-    threads: &[crate::backend::PageCommentThread],
-    comment_rows: &[crate::pages::PageCommentThreadRow],
-    threads_loading: bool,
-    threads_has_more: bool,
-    active_thread: &str,
-    comments: &[crate::backend::PageComment],
-    comments_loading: bool,
-    comments_has_more: bool,
+    route_page: &str,
+    route_serial: i64,
 ) -> Element<'static, ModuleViewEvent> {
-    let source = if loading || active_page.is_empty() || buffer_page != active_page {
-        Ok(Vec::new())
-    } else {
-        pages_document::source(
-            connection().lock().expect("views rpc").rev,
-            network_chain_id,
-            active_page,
-            page_text,
-        )
-    };
-    let (source, source_error) = match source {
-        Ok(source) => (source, String::new()),
-        Err(error) => (Vec::new(), error.to_owned()),
-    };
-    let autosave = match autosave {
-        crate::AutosaveStatus::Idle => "idle",
-        crate::AutosaveStatus::Saving => "saving",
-        crate::AutosaveStatus::Saved => "saved",
-        crate::AutosaveStatus::Error => "error",
-    };
-    let subpages: Vec<serde_json::Value> = crate::backend::subpage_blocks(blocks)
-        .into_iter()
-        .map(|block| serde_json::json!({ "id": block.id, "title": block.text }))
-        .collect();
     let props = serde_json::json!({
-        "document_source": source,
-        "document_error": source_error,
-        "comment_marks": crate::pages::comment_marks(blocks, commented_block_hits).into_iter().map(|(line, count)| crate::pages::guest_document::CommentMark { line: line as i64, count: count as i64 }).collect::<Vec<_>>(),
-        "commented_lines": crate::pages::commented_lines(blocks, commented_block_hits),
         "dark": dark,
         "connected": connected,
-        "loading": loading,
-        "busy": mutation_phase != crate::MutationPhase::Idle,
-        "page_link": crate::backend::duck_page_link(active_page.to_owned(), network_chain_id.to_owned()),
-        "pages": pages,
-        "page_create_open": page_create_open,
-        "active_page": active_page,
-        "active_page_title": active_page_title,
-        "active_page_parent": active_page_parent,
-        "page_searching": page_searching,
-        "page_search_hits": page_search_hits,
-        "page_search_query": page_search_query,
-        "page_delete_armed": page_delete_armed,
-        "autosave": autosave,
-        "page_refusal": page_refusal,
-        "subpages": subpages,
-        "orphaned_comment_drafts": orphaned_comment_drafts,
-        "block_comments_open": block_comments_open,
-        "thread_total": thread_total,
-        "comment_rows": comment_rows,
-        "threads_loading": threads_loading,
-        "threads_has_more": threads_has_more,
-        "active_thread": active_thread,
-        "thread_resolved": crate::backend::thread_is_resolved(threads, active_thread),
-        "active_thread_anchor": active_thread_anchor,
-        "comments": comments,
-        "comments_loading": comments_loading,
-        "comments_has_more": comments_has_more,
-        "compose_hint": crate::pages::comment_compose_hint(blocks, caret_comment_target, active_page),
-        "seed_rev": seed_rev,
-        "page_seed": page_draft,
-        "comment_seed": block_comment_draft,
+        "chain": network_chain_id,
+        "route_page": route_page,
+        "route_serial": route_serial,
     });
     module_view("pages", serde_json::to_vec(&props).expect("props encode"))
 }
 
+/// The two OS doors the pages view still asks the app for: a `duck://`
+/// address pressed in a document goes through the ONE open plane, and a
+/// clipboard copy is the clipboard.
 pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
     use crate::PagesIntent as Intent;
     match event.kind.as_str() {
-        "toggle_create" => Intent::ToggleCreate,
-        "create" => Intent::Create,
-        "choose" => Intent::Choose,
-        "search" => Intent::Search,
-        "clear_search" => Intent::ClearSearch,
-        "arm_delete" => Intent::ArmDelete,
-        "disarm_delete" => Intent::DisarmDelete,
-        "delete" => Intent::Delete,
-        "open_hit" => Intent::OpenHit,
-        "use_draft" => Intent::UseDraft,
-        "discard_draft" => Intent::DiscardDraft,
-        "edited" => Intent::Edited,
-        "toggle_comments" => Intent::ToggleComments,
-        "close_comments" => Intent::CloseComments,
-        "open_thread" => Intent::OpenThread,
-        "resolve" => Intent::Resolve,
-        "more_threads" => Intent::MoreThreads,
-        "close_thread" => Intent::CloseThread,
-        "more_comments" => Intent::MoreComments,
-        "post" => Intent::Post,
+        "open_link" => Intent::OpenLink,
         _ => Intent::Copy,
     }
 }
@@ -1628,15 +1523,6 @@ fn surfaces_of(module: &str) -> Surfaces {
     surfaces
 }
 
-/// The intent a host surface's event comes back as, by module: the node's
-/// log ring, the pages document.
-fn surface_intent(module: &str) -> &'static str {
-    match module {
-        "pages" => "edited",
-        _ => "log_timeline",
-    }
-}
-
 /// The operations a view may ask of the app, by module. An intent outside
 /// the list is refused at the door, never handed to a handler.
 fn intents_of(module: &str) -> &'static [&'static str] {
@@ -1755,28 +1641,11 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "dark",
             "notifications",
         ],
-        "pages" => &[
-            "toggle_create",
-            "create",
-            "choose",
-            "search",
-            "clear_search",
-            "arm_delete",
-            "disarm_delete",
-            "delete",
-            "open_hit",
-            "use_draft",
-            "discard_draft",
-            "toggle_comments",
-            "close_comments",
-            "open_thread",
-            "resolve",
-            "more_threads",
-            "close_thread",
-            "more_comments",
-            "post",
-            "copy",
-        ],
+        // pages speaks the kernel contract: every read is `rpc.view` and
+        // every write `op.submit`. What is left are the two OS doors — the
+        // clipboard, and the open plane a `duck://` link in a document goes
+        // through.
+        "pages" => &["copy", "open_link"],
         _ => &[],
     }
 }
@@ -1854,7 +1723,6 @@ pub fn connected(client: &ducktape_rpc::Client) -> Loads {
         let mut connection = connection().lock().expect("views rpc");
         connection.rev += 1;
         connection.client = Some(client.clone());
-        pages_document::source_changed();
         connection.clone()
     };
     for module in crate::backend::view_source::MODULE_OWNED {
@@ -2261,7 +2129,6 @@ fn spawn_load(
                     log_source(module, fresh.hash.as_ref(), "Failed", generation, reason);
                     return;
                 }
-                pages_document::retain_source(old, &mut fresh);
                 fresh.pictures = std::mem::take(&mut old.pictures);
                 if let Some(root) = &mut fresh.frame.root {
                     fresh.pictures.adopt(root);
@@ -2543,9 +2410,6 @@ struct Guest {
     /// The guest's `<module>.props` subscription, once it asked, and the
     /// props it was last given on it.
     props_subscription: Option<u64>,
-    pages_document: pages_document::Pending,
-    pages_source: pages_document::InstalledSource,
-    pages_instance: Option<String>,
     props_sent: Option<Vec<u8>>,
     /// Separates Files save acknowledgements across fresh guest instances.
     files_save_namespace: Option<String>,
@@ -3215,10 +3079,6 @@ impl Guest {
             pictures: Pictures::default(),
             surfaces: surfaces_of(module),
             props_subscription: None,
-            pages_document: None,
-            pages_source: Default::default(),
-            pages_instance: (module == "pages")
-                .then(|| crate::backend::fresh_operation_id("pages-view".into())),
             props_sent: None,
             files_save_namespace: (module == "files")
                 .then(|| crate::backend::fresh_operation_id("files-view".into())),
@@ -3273,8 +3133,10 @@ impl Guest {
             if self.module == "chat" || self.module == "forge" {
                 self.intents.extend(crate::composer_surface::intent(&value));
             } else {
+                // the node's log ring: the only other host surface, and it
+                // only says that something happened
                 self.intents.push(ModuleViewEvent {
-                    kind: surface_intent(self.module).into(),
+                    kind: "log_timeline".into(),
                     detail: String::new(),
                 });
             }
@@ -3317,7 +3179,6 @@ impl Guest {
         }
         self.sync_props(props);
         self.replies.drain_into(&mut self.pending);
-        pages_document::drive(self);
         if self.staged {
             // a replacement's first tree is already here; only its
             // requests and cancels are still to route
@@ -3345,13 +3206,6 @@ impl Guest {
         for id in std::mem::take(&mut self.frame.cancels) {
             self.widget_commands
                 .retain(|(request, _, _)| *request != id);
-            if self
-                .pages_document
-                .as_ref()
-                .is_some_and(|(pending, _)| *pending == id)
-            {
-                self.pages_document = None;
-            }
             if self.props_subscription == Some(id) {
                 self.props_subscription = None;
             }
@@ -3360,7 +3214,6 @@ impl Guest {
         self.fault.is_none()
             && (self.frame.busy
                 || !self.pending.is_empty()
-                || self.pages_document.is_some()
                 || self.inputs.editor_documents_status() == Ok(false))
     }
 
@@ -3385,14 +3238,11 @@ impl Guest {
         let declared_intent = own && intents_of(self.module).contains(&operation);
         match (capability, operation) {
             ("host", "widget") => self.widget_request(id, &payload),
-            ("pages", "document") if own => pages_document::request(self, id, &payload),
             _ if own && operation == "props" => {
                 self.props_subscription = Some(id);
                 self.props_sent = None;
                 self.sync_props(props);
             }
-            ("pages", "edited") if own => pages_document::emit(self, id, &payload),
-            ("pages", "installed") if own => pages_document::installed(self, &payload),
             _ if declared_intent => self.intents.push(ModuleViewEvent {
                 kind: operation.to_owned(),
                 detail: String::from_utf8_lossy(&payload).into_owned(),
@@ -3571,7 +3421,6 @@ impl Guest {
                     }
                 }
                 self.frame = frame;
-                pages_document::verify_installed(self);
             }
             Err(trap) => {
                 let reason = panic_message(&mut self.store).unwrap_or(trap);
@@ -4074,7 +3923,7 @@ pub(crate) mod tests {
             ("node", "node_intent", &["log_timeline"]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
-            ("pages", "pages_intent", &["edited"]),
+            ("pages", "pages_intent", &[]),
             ("chat", "chat_intent", &["composer"]),
             ("files", "files_intent", &[]),
         ];
@@ -4225,6 +4074,156 @@ pub(crate) mod tests {
             }
         });
         found
+    }
+
+    /// `host.id` MINTS FOR A WRITER WITH NO CLOCK. A wasm view has neither
+    /// entropy nor a wall clock, so a module whose records are addressed by
+    /// ids its writer mints (pages, forge) cannot make one for itself. The
+    /// door is module-free — a PREFIX naming the kind of record, never a
+    /// module name — and it is bounded on both ends: an empty, an
+    /// over-long, or a non-alphanumeric prefix is a payload smuggled in as
+    /// a name and is refused.
+    #[test]
+    fn the_kernel_mints_an_id_for_a_named_prefix_and_refuses_a_payload() {
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
+
+        let answered = |guest: &mut Guest, id: u64, prefix: &[u8]| {
+            assert!(
+                kernel::answer(guest, "host", "id", id, prefix),
+                "`host.id` is the kernel's"
+            );
+            guest
+                .pending
+                .drain(..)
+                .find_map(|event| match event {
+                    wire::Event::Response { id: at, result, .. } if at == id => Some(result),
+                    _ => None,
+                })
+                .expect("the door answers in place")
+        };
+
+        let first = answered(&mut guest, 1, b"page").expect("a named prefix is minted");
+        let second = answered(&mut guest, 2, b"page").expect("a named prefix is minted");
+        let first = String::from_utf8(first).expect("an id is text");
+        let second = String::from_utf8(second).expect("an id is text");
+        assert!(first.starts_with("page-"), "{first}");
+        assert_ne!(first, second, "two mints on one device never collide");
+
+        for payload in [
+            &b""[..],
+            b"   ",
+            b"page/../..",
+            b"a page",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let refusal = answered(&mut guest, 3, payload)
+                .expect_err("a prefix that is not one word is refused");
+            assert_eq!(refusal, "`host.id` names no prefix", "for {payload:?}");
+        }
+    }
+
+    /// `rpc.view` READS THE MODULE'S INDEX TIER FOR ANY VIEW THAT ASKS, off
+    /// the window thread and answered at the view's next redraw. The FOLD
+    /// WAIT it runs first is the pages document save's correctness (its
+    /// placement is pinned in `backend/tests/docs.rs`); this is the runtime
+    /// proof that the door is wired, that it terminates, and that the
+    /// reply is the node's own JSON — synchronised on the kernel's own
+    /// answer through `Replies::wait_idle`, never on a clock.
+    #[test]
+    fn the_kernels_view_read_answers_the_nodes_reply_off_the_window_thread() {
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
+        let ask = |target: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "target": target, "query": { "list_pages": { "after": null, "limit": null } }
+            }))
+            .expect("the ask encodes")
+        };
+        let answered = |guest: &mut Guest, id: u64| {
+            guest.replies.wait_idle();
+            guest.replies.drain_into(&mut guest.pending);
+            guest
+                .pending
+                .drain(..)
+                .find_map(|event| match event {
+                    wire::Event::Response { id: at, result, .. } if at == id => Some(result),
+                    _ => None,
+                })
+                .expect("the kernel answers the read")
+        };
+
+        // NO NODE: the door refuses in place rather than hanging the view.
+        assert!(
+            kernel::answer(&mut guest, "rpc", "view", 7, &ask("pages")),
+            "`rpc.view` is the kernel's"
+        );
+        let refusal = answered(&mut guest, 7).expect_err("there is no node behind the kernel yet");
+        assert_eq!(refusal, "not connected to a node");
+
+        // A NODE: one request leaves, and the reply the guest gets back is
+        // the index tier's own.
+        let node = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the stub node");
+        let origin = node.block_on(stub_index_node(r#"{"pages":{"pages":[],"has_more":false}}"#));
+        let client = crate::backend::rpc_client(&origin).expect("a client for the stub node");
+        connection().lock().expect("views rpc").client = Some(client);
+
+        assert!(kernel::answer(&mut guest, "rpc", "view", 8, &ask("pages")));
+        let reply = answered(&mut guest, 8).expect("the stub node answered");
+        let reply: serde_json::Value = serde_json::from_slice(&reply).expect("a reply decodes");
+        assert_eq!(
+            reply,
+            serde_json::json!({ "pages": { "pages": [], "has_more": false } }),
+            "the view gets the node's own reply, not a rewrapping of it"
+        );
+
+        // AND THE TARGET IS VALIDATED, so a view cannot ask the node for a
+        // path of its own choosing.
+        assert!(kernel::answer(&mut guest, "rpc", "view", 9, &ask("../secrets")));
+        let refusal = answered(&mut guest, 9).expect_err("a target that is not a module id");
+        assert!(refusal.contains("module"), "{refusal}");
+    }
+
+    /// A one-request stub node for the kernel's index reads: it answers the
+    /// first `/v1/index/<module>/view` with `body` and closes, so nothing
+    /// can share its socket with a later probe.
+    async fn stub_index_node(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stub node");
+        let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while let Ok(read) = stream.read(&mut chunk).await {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        origin
     }
 
     /// The bundled component, end to end through the host, on the kernel
@@ -4629,45 +4628,61 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none());
     }
 
-    /// The bundled Pages view through the host: the sidebar and the header,
-    /// a pick that leaves as an intent carrying the rail's draft, and the
-    /// document slot the host paints — what the reader does in it comes back
-    /// as the `edited` intent rather than going to the guest.
+    /// The bundled Pages view through the host: session facts in, the
+    /// workspace read for itself through the kernel, and one `rpc.live`
+    /// subscription on the pages plane. The document editor, its history and
+    /// its presentation have always been the guest's; now so is everything it
+    /// renders.
     #[test]
-    fn the_staged_pages_view_boots_takes_the_facts_and_owns_the_document() {
+    fn the_staged_pages_view_reads_its_workspace_through_the_kernel() {
         let Some(staged) = staged("pages") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("pages", &staged).expect("the view loads");
-        assert!(!guest.surfaces.contains_key("page_document"));
-        guest.redraw(&None);
+        let no_props = None;
+        guest.redraw(&no_props);
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
         assert!(
             texts(&guest).iter().any(|text| text == "Not connected"),
             "{:?}",
             texts(&guest)
         );
+        // The host paints nothing for this view: the document slot the app
+        // used to own left with the loads.
+        assert!(!guest.surfaces.contains_key("page_document"));
+
         let props = pages_facts();
         guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["Pages", "Alpha", "Beta", "✓ synced"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert!(surface_names(&guest).is_empty());
-
-        guest.deliver(Output::Activate(button_message(&guest, "Beta")));
-        guest.redraw(&props);
         assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "choose".into(),
-                detail: r#"{"id":"beta","comment_draft":""}"#.into(),
-            }]
+            guest.live_subscriptions,
+            [(guest.live_subscriptions[0].0, "pages".to_string())],
+            "the view holds one `rpc.live` subscription, on the pages plane"
         );
+        while guest.redraw(&props) {}
+        assert!(
+            texts(&guest).iter().any(|text| text == "Pages"),
+            "{:?}",
+            texts(&guest)
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
 
-        assert!(guest.fault.is_none());
+        // a block on the pages plane: the live item lands and the view reads
+        // again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&props);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// The bundled Chat view through the host: the rooms and the stream,
@@ -6333,1151 +6348,13 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn pages_floating_comments_preserve_document_layout_and_pointer_routing() {
-        use iced::advanced::renderer::Headless as _;
-        use iced_test::runtime::{UserInterface, user_interface};
-
-        struct Bounds {
-            editor: Option<Rectangle>,
-            focused: bool,
-            post: Option<Rectangle>,
-            card: Option<Rectangle>,
-            card_text: Option<Rectangle>,
-        }
-        impl Operation for Bounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
-                if id
-                    == Some(&iced::widget::Id::from(
-                        "PagesView/root/pages/comments-card",
-                    ))
-                {
-                    self.card = Some(bounds);
-                }
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&iced::widget::Id>,
-                bounds: Rectangle,
-                state: &mut dyn iced::advanced::widget::operation::Focusable,
-            ) {
-                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
-                    self.editor = Some(bounds);
-                    self.focused = state.is_focused();
-                }
-            }
-            fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
-                if text == "No comments yet" {
-                    self.card_text = Some(bounds);
-                }
-                if text == "Post" {
-                    self.post = Some(bounds);
-                }
-            }
-        }
-        let _turn = blocking_connection_turn();
-        pages_document::source_changed();
-        let connection = connection().lock().unwrap().rev;
-        let original = (0..80)
-            .map(|n| format!("Paragraph {n}: editable document text.\n"))
-            .collect::<String>();
-        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
-        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
-        facts["document_source"] = serde_json::json!(source);
-        facts["comment_seed"] = "A comment".into();
-        facts["seed_rev"] = 1.into();
-        let path = staged("pages").expect("actual Pages Wasm is required");
-        let mut guest = Guest::load_from("pages", &path).unwrap();
-        let mut renderer = crate::frame_probe::headless_renderer();
-        let size = Size::new(1100.0, 700.0);
-        let mut closed_bounds = None;
-        for open in [false, true] {
-            facts["block_comments_open"] = open.into();
-            let props = Some(serde_json::to_vec(&facts).unwrap());
-            settle_documents(&mut guest, &props);
-            let mut ui = UserInterface::build(
-                guest.render(),
-                size,
-                user_interface::Cache::default(),
-                &mut renderer,
-            );
-            let mut bounds = Bounds {
-                editor: None,
-                focused: false,
-                post: None,
-                card: None,
-                card_text: None,
-            };
-            ui.operate(&renderer, &mut bounds);
-            let editor = bounds.editor.expect("document editor");
-            if !open {
-                closed_bounds = Some(editor);
-                continue;
-            }
-            assert_eq!(
-                Some(editor),
-                closed_bounds,
-                "comments must not resize or move the document"
-            );
-            let card = bounds.card.expect("comment card bounds");
-            let translation = Vector::new(size.width - card.x - card.width - 16.0, 0.0);
-            let post = bounds.post.expect("floating Post button").center() + translation;
-            let card_point = bounds.card_text.expect("comment card content").center() + translation;
-            assert!(
-                editor.contains(card_point),
-                "comments must overlap the document, not dock beside it"
-            );
-            let key = "PagesView/root/pages/document";
-            let cursor = guest
-                .inputs
-                .editor_document(key)
-                .unwrap()
-                .reference()
-                .cursor;
-            let mut covered = Vec::new();
-            ui.update(
-                &[
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                ],
-                mouse::Cursor::Available(card_point),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut covered,
-            );
-            ui.operate(&renderer, &mut bounds);
-            assert!(
-                !bounds.focused,
-                "the card must shield the covered editor from clicks"
-            );
-            for output in covered {
-                guest.deliver(output);
-            }
-            let mut outputs = Vec::new();
-            ui.update(
-                &[
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                ],
-                mouse::Cursor::Available(post),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-            for output in outputs {
-                guest.deliver(output);
-            }
-            settle_documents(&mut guest, &props);
-            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-            assert!(
-                guest.intents.iter().any(|event| event.kind == "post"),
-                "the card must receive its own click"
-            );
-            assert_eq!(
-                guest
-                    .inputs
-                    .editor_document(key)
-                    .unwrap()
-                    .reference()
-                    .cursor,
-                cursor,
-                "clicking the card must not move the underlying caret"
-            );
-            let outside = iced::Point::new(editor.x + 60.0, editor.y + 20.0);
-            let mut outputs = Vec::new();
-            ui.update(
-                &[
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                ],
-                mouse::Cursor::Available(outside),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-            ui.operate(&renderer, &mut bounds);
-            assert!(
-                bounds.focused,
-                "the positioning layer must not intercept clicks outside the card"
-            );
-            for output in outputs {
-                guest.deliver(output);
-            }
-            settle_documents(&mut guest, &props);
-            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-            let mut outputs = Vec::new();
-            ui.update(
-                &[Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character("X".into()),
-                    modified_key: iced::keyboard::Key::Character("X".into()),
-                    physical_key: iced::keyboard::key::Physical::Unidentified(
-                        iced::keyboard::key::NativeCode::Unidentified,
-                    ),
-                    location: iced::keyboard::Location::Standard,
-                    modifiers: iced::keyboard::Modifiers::default(),
-                    text: Some("X".into()),
-                    repeat: false,
-                })],
-                mouse::Cursor::Available(outside),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-            // Native redraws drain editor input queued behind the pointer transaction.
-            loop {
-                for output in outputs.drain(..) {
-                    guest.deliver(output);
-                }
-                settle_documents(&mut guest, &props);
-                ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-                if !guest.inputs.editor_transactions_pending() {
-                    break;
-                }
-                ui.update(
-                    &[Event::Window(
-                        window::Event::RedrawRequested(Instant::now()),
-                    )],
-                    mouse::Cursor::Available(outside),
-                    &mut renderer,
-                    &mut iced::advanced::clipboard::Null,
-                    &mut outputs,
-                );
-            }
-            assert!(
-                guest
-                    .inputs
-                    .editor_document(key)
-                    .unwrap()
-                    .text()
-                    .contains('X'),
-                "document typing must remain live beside the card"
-            );
-            let capture = |ui: &mut UserInterface<'_, Output, iced::Theme, iced::Renderer>,
-                           renderer: &mut iced::Renderer| {
-                ui.draw(
-                    renderer,
-                    &iced::Theme::Light,
-                    &renderer::Style {
-                        text_color: iced::Color::BLACK,
-                    },
-                    mouse::Cursor::Unavailable,
-                );
-                renderer.screenshot(Size::new(1100, 700), 1.0, iced::Color::WHITE)
-            };
-            ui.update(
-                &[],
-                mouse::Cursor::Available(outside),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut Vec::new(),
-            );
-            let before = capture(&mut ui, &mut renderer);
-            let mut outputs = Vec::new();
-            ui.update(
-                &[Event::Mouse(mouse::Event::WheelScrolled {
-                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -5.0 },
-                })],
-                mouse::Cursor::Available(outside),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-            let after = capture(&mut ui, &mut renderer);
-            let region = |pixels: &[u8], x: usize, width: usize| -> Vec<u8> {
-                (150..500)
-                    .flat_map(|y| {
-                        pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
-                            .iter()
-                            .copied()
-                    })
-                    .collect()
-            };
-            assert!(
-                region(&before, editor.x as usize + 10, 220)
-                    != region(&after, editor.x as usize + 10, 220),
-                "wheel outside the card must scroll the document"
-            );
-            assert!(
-                region(&before, 800, 250) == region(&after, 800, 250),
-                "scrolling the document must not scroll the card"
-            );
-            let directory =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
-            std::fs::create_dir_all(&directory).unwrap();
-            image::RgbaImage::from_raw(1100, 700, after)
-                .unwrap()
-                .save(directory.join("floating-comments.png"))
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn pages_links_follow_actual_mounted_editor_focus() {
-        let _turn = blocking_connection_turn();
-        let path = staged("pages").expect("actual Pages Wasm is required");
-        let mounted = fresh("pages");
-        pages_document::source_changed();
-        let connection = connection().lock().unwrap().rev;
-        let line = "[작업 보기](duck://agents/runs/abc)";
-        let original = "Title\n[작업 보기](duck://agents/runs/abc)";
-        let source = pages_document::source(connection, "network-a", "alpha", original).unwrap();
-        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
-        facts["document_source"] = serde_json::json!(source);
-        {
-            let mut seat = mounted.lock().unwrap();
-            seat.props = Some(serde_json::to_vec(&facts).unwrap());
-            seat.slot = Slot::Ready(Box::new(Guest::load_from("pages", &path).unwrap()));
-        }
-        use iced::advanced::renderer::Headless;
-        use iced_test::runtime::{UserInterface, user_interface};
-        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
-            iced::Font::DEFAULT,
-            iced::Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .unwrap();
-        let mut ui = UserInterface::build(
-            drawn("pages"),
-            Size::new(1100.0, 700.0),
-            user_interface::Cache::default(),
-            &mut renderer,
-        );
-        let mut pointer = mouse::Cursor::Unavailable;
-        macro_rules! frame {
-            ($event:expr) => {{
-                let mut output = Vec::new();
-                ui.update(
-                    &[$event],
-                    pointer,
-                    &mut renderer,
-                    &mut iced::advanced::clipboard::Null,
-                    &mut output,
-                );
-                assert!(
-                    output.iter().all(|event| event.kind == "edited"),
-                    "focus must not navigate: {output:?}"
-                );
-            }};
-        }
-        macro_rules! drain {
-            () => {{
-                loop {
-                    frame!(Event::Window(
-                        window::Event::RedrawRequested(Instant::now())
-                    ));
-                    let seat = mounted.lock().unwrap();
-                    let Slot::Ready(guest) = &seat.slot else {
-                        panic!("Pages unmounted")
-                    };
-                    assert!(guest.fault.is_none(), "{:?}", guest.fault);
-                    if guest.settled()
-                        && !guest.frame.busy
-                        && !guest.inputs.editor_transactions_pending()
-                    {
-                        break;
-                    }
-                }
-            }};
-        }
-        let visible = || {
-            let seat = mounted.lock().unwrap();
-            let Slot::Ready(guest) = &seat.slot else {
-                panic!("Pages unmounted")
-            };
-            let mut visible = String::new();
-            guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-                if let wire::Node::Editor { key, options, .. } = node {
-                    assert_eq!(guest.inputs.editor_document(key).unwrap().text(), original);
-                    let paint = options.presentation.as_ref().unwrap();
-                    visible = paint
-                        .spans
-                        .iter()
-                        .filter(|span| span.line == 1)
-                        .filter(|span| {
-                            paint.formats[span.format as usize].size.unwrap_or(14.0) > 1.0
-                        })
-                        .map(|span| &line[span.start as usize..span.end as usize])
-                        .collect();
-                }
-            });
-            visible
-        };
-        drain!();
-        assert_eq!(visible(), "작업 보기");
-        struct EditorBounds(Option<Rectangle>);
-        impl Operation for EditorBounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&iced::widget::Id>,
-                bounds: Rectangle,
-                _: &mut dyn iced::advanced::widget::operation::Focusable,
-            ) {
-                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
-                    self.0 = Some(bounds);
-                }
-            }
-        }
-        let mut bounds = EditorBounds(None);
-        ui.operate(&renderer, &mut bounds);
-        let bounds = bounds.0.expect("the actual Pages editor is mounted");
-        for (point, expected) in [
-            (iced::Point::new(bounds.x + 40.0, bounds.y + 44.0), line),
-            (
-                iced::Point::new(bounds.x + 40.0, bounds.y - 10.0),
-                "작업 보기",
-            ),
-            (iced::Point::new(bounds.x + 40.0, bounds.y + 44.0), line),
-        ] {
-            let cursor_before = {
-                let seat = mounted.lock().unwrap();
-                let Slot::Ready(guest) = &seat.slot else {
-                    panic!("Pages unmounted")
-                };
-                guest
-                    .inputs
-                    .editor_document("PagesView/root/pages/document")
-                    .unwrap()
-                    .reference()
-                    .cursor
-            };
-            pointer = mouse::Cursor::Available(point);
-            frame!(Event::Mouse(mouse::Event::ButtonPressed(
-                mouse::Button::Left
-            )));
-            frame!(Event::Mouse(mouse::Event::ButtonReleased(
-                mouse::Button::Left
-            )));
-            drain!();
-            assert_eq!(visible(), expected);
-            let blurred = expected == "작업 보기";
-            if blurred {
-                let seat = mounted.lock().unwrap();
-                let Slot::Ready(guest) = &seat.slot else {
-                    panic!("Pages unmounted")
-                };
-                assert_eq!(
-                    guest
-                        .inputs
-                        .editor_document("PagesView/root/pages/document")
-                        .unwrap()
-                        .reference()
-                        .cursor,
-                    cursor_before,
-                    "concealing Markdown must not move the cursor"
-                );
-            }
-        }
-        // A newer pending projection must be consumed before an older native
-        // command. Otherwise that command can steal focus before being cancelled.
-        pointer = mouse::Cursor::Available(iced::Point::new(bounds.x + 40.0, bounds.y - 10.0));
-        frame!(Event::Mouse(mouse::Event::ButtonPressed(
-            mouse::Button::Left
-        )));
-        frame!(Event::Mouse(mouse::Event::ButtonReleased(
-            mouse::Button::Left
-        )));
-        drain!();
-        {
-            let mut seat = mounted.lock().unwrap();
-            let Slot::Ready(guest) = &mut seat.slot else {
-                panic!("Pages unmounted")
-            };
-            guest.answer(
-                wire::Request {
-                    id: 9999,
-                    kind: "host.widget".into(),
-                    payload: wire::encode(&wire::WidgetCommand::Focus {
-                        target: "PagesView/root/pages/document".into(),
-                    }),
-                },
-                &None,
-            );
-            facts["active_page_title"] = "Renamed".into();
-            seat.props = Some(serde_json::to_vec(&facts).unwrap());
-        }
-        frame!(Event::Window(
-            window::Event::RedrawRequested(Instant::now())
-        ));
-        {
-            let seat = mounted.lock().unwrap();
-            let Slot::Ready(guest) = &seat.slot else {
-                panic!("Pages unmounted")
-            };
-            assert!(
-                guest.widget_commands.iter().any(|(id, _, _)| *id == 9999),
-                "a command executed before the pending projection changed its frame"
-            );
-        }
-        frame!(Event::Window(
-            window::Event::RedrawRequested(Instant::now())
-        ));
-        {
-            let seat = mounted.lock().unwrap();
-            let Slot::Ready(guest) = &seat.slot else {
-                panic!("Pages unmounted")
-            };
-            assert!(
-                guest.pending.iter().any(|event| matches!(
-                    event,
-                    wire::Event::Response {
-                        id: 9999,
-                        result: Err(_),
-                        ..
-                    }
-                )),
-                "the old frame's focus request must be refused"
-            );
-        }
-        let focused = view_tree::execute_widget_command(
-            wire::WidgetCommand::Focused {
-                target: "PagesView/root/pages/document".into(),
-            },
-            |operation| ui.operate(&renderer, operation),
-        )
-        .unwrap();
-        assert!(
-            !wire::decode::<bool>(&focused).unwrap(),
-            "the stale request stole native focus"
-        );
-        drain!();
-    }
-
-    #[test]
-    fn pages_document_source_edit_restore_rejects_the_previous_instance_intent() {
-        let _turn = blocking_connection_turn();
-        let path = staged("pages").expect("actual Pages Wasm is required");
-        let mounted = fresh("pages");
-        pages_document::source_changed();
-        let connection = connection().lock().unwrap().rev;
-        let paragraph =
-            "A substantial paragraph keeps its complete source and ordinary body text. ".repeat(18);
-        let block = format!(
-            "## Heading\n- [ ] 한글 paragraph with **bold** and _emphasis_.\n  - Nested text and https://example.com/page\n```\nlet value = 42;\n```\n> Quoted paragraph\n{paragraph}\n"
-        );
-        let original = format!("한글 👍🏽\n{}", block.repeat(200));
-        let source = pages_document::source(connection, "network-a", "alpha", &original).unwrap();
-        let mut facts: serde_json::Value = serde_json::from_slice(&pages_facts().unwrap()).unwrap();
-        facts["document_source"] = serde_json::json!(source);
-        let props = Some(serde_json::to_vec(&facts).unwrap());
-        let settle = |guest: &mut Guest, props: &Option<Vec<u8>>| {
-            for _ in 0..128 {
-                let busy = guest.redraw(props);
-                assert!(guest.fault.is_none(), "{:?}", guest.fault);
-                if !busy && guest.inputs.editor_documents_status() == Ok(true) {
-                    return;
-                }
-            }
-            panic!(
-                "Pages document did not settle: frame busy={} pending={:?} staged={:?} source_pending={} documents={:?} texts={:?}",
-                guest.frame.busy,
-                guest.pending,
-                guest.staged,
-                guest.pages_document.is_some(),
-                guest.inputs.editor_documents_status(),
-                texts(guest)
-            );
-        };
-        let mut guest = Guest::load_from("pages", &path).unwrap();
-        settle(&mut guest, &props);
-        let mut keys = Vec::new();
-        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor { key, .. } = node {
-                keys.push(key.clone());
-            }
-        });
-        assert_eq!(keys.len(), 1, "Pages has one canonical document editor");
-        let editor_key = keys.pop().unwrap();
-        let document = guest.inputs.editor_document(&editor_key).unwrap();
-        assert_eq!(
-            document.text(),
-            original,
-            "bounded bootstrap lost source bytes"
-        );
-        drop(document);
-        let mut spans = 0;
-        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor { options, .. } = node {
-                spans = options.presentation.as_ref().unwrap().spans.len();
-            }
-        });
-        assert!(
-            spans > 4000,
-            "representative Markdown must stay richly formatted"
-        );
-        assert!(
-            !texts(&guest)
-                .iter()
-                .any(|text| text.starts_with("Formatting is unavailable"))
-        );
-        let before_theme = guest
-            .inputs
-            .editor_document(&editor_key)
-            .unwrap()
-            .reference();
-        facts["dark"] = true.into();
-        facts["commented_lines"] = serde_json::json!([2]);
-        facts["comment_marks"] = serde_json::json!([{"line": 2, "count": 3}]);
-        let props = Some(serde_json::to_vec(&facts).unwrap());
-        settle(&mut guest, &props);
-        assert_eq!(
-            guest
-                .inputs
-                .editor_document(&editor_key)
-                .unwrap()
-                .reference(),
-            before_theme
-        );
-        let mut comment_badge = false;
-        guest.frame.root.clone().unwrap().for_each_mut(&mut |node| {
-            if let wire::Node::Editor { options, .. } = node {
-                comment_badge = options
-                    .presentation
-                    .as_ref()
-                    .unwrap()
-                    .affordances
-                    .margins
-                    .iter()
-                    .any(|mark| mark.line == 2 && mark.count == 3);
-            }
-        });
-        assert!(
-            comment_badge,
-            "theme/comment props did not rebuild the prepared presentation"
-        );
-        guest.intents.clear();
-        use iced::advanced::renderer::Headless;
-        use iced_test::runtime::{UserInterface, user_interface};
-        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
-            iced::Font::DEFAULT,
-            iced::Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .unwrap();
-        let size = iced::Size::new(1100.0, 700.0);
-        let mut ui = UserInterface::build(
-            guest.render(),
-            size,
-            user_interface::Cache::default(),
-            &mut renderer,
-        );
-        struct EditorBounds<'a>(&'a str, Option<Rectangle>, bool);
-        impl Operation for EditorBounds<'_> {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn focusable(
-                &mut self,
-                id: Option<&iced::widget::Id>,
-                bounds: Rectangle,
-                state: &mut dyn iced::advanced::widget::operation::Focusable,
-            ) {
-                if id == Some(&iced::widget::Id::from(self.0.to_owned())) {
-                    self.1 = Some(bounds);
-                    self.2 = state.is_focused();
-                }
-            }
-        }
-        let mut bounds = EditorBounds(&editor_key, None, false);
-        ui.operate(&renderer, &mut bounds);
-        let bounds = bounds.1.expect("Pages document has native editor bounds");
-        // Click inside the first Korean/emoji line, beyond its left padding.
-        let pointer = mouse::Cursor::Available(iced::Point::new(bounds.x + 88.0, bounds.y + 10.0));
-        let mut outputs = Vec::new();
-        ui.update(
-            &[
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            ],
-            pointer,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut outputs,
-        );
-        let mut clicked_focus = EditorBounds(&editor_key, None, false);
-        ui.operate(&renderer, &mut clicked_focus);
-        assert!(clicked_focus.2, "pointer did not focus the editor");
-        for output in outputs {
-            guest.deliver(output);
-        }
-        settle(&mut guest, &props);
-        let cursor = guest
-            .inputs
-            .editor_document(&editor_key)
-            .unwrap()
-            .reference()
-            .cursor;
-        assert_eq!(
-            cursor.position.line, 0,
-            "pointer missed the first rendered line"
-        );
-        let insertion = cursor.position.column as usize;
-        assert!(
-            insertion > 0 && insertion <= original.find('\n').unwrap(),
-            "pointer left the caret at the origin or another line"
-        );
-        assert!(original.is_char_boundary(insertion));
-        assert!(cursor.selection.is_none());
-        // A second press must replace the first selection anchor before any
-        // subsequent drag or edit. Drive the native queue and actual Pages guest.
-        macro_rules! pointer_step {
-            ($event:expr, $point:expr) => {{
-                let point = $point;
-                let mut outputs = Vec::new();
-                ui.update(
-                    &[$event],
-                    mouse::Cursor::Available(point),
-                    &mut renderer,
-                    &mut iced::advanced::clipboard::Null,
-                    &mut outputs,
-                );
-                loop {
-                    for output in outputs.drain(..) {
-                        guest.deliver(output);
-                    }
-                    settle(&mut guest, &props);
-                    ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-                    if !guest.inputs.editor_transactions_pending() {
-                        break;
-                    }
-                    ui.update(
-                        &[Event::Window(
-                            window::Event::RedrawRequested(Instant::now()),
-                        )],
-                        mouse::Cursor::Available(point),
-                        &mut renderer,
-                        &mut iced::advanced::clipboard::Null,
-                        &mut outputs,
-                    );
-                }
-                guest
-                    .inputs
-                    .editor_document(&editor_key)
-                    .unwrap()
-                    .reference()
-                    .cursor
-            }};
-        }
-        let a = iced::Point::new(bounds.x + 66.0, bounds.y + 10.0);
-        let a_end = iced::Point::new(bounds.x + 100.0, bounds.y + 10.0);
-        let b = iced::Point::new(bounds.x + 140.0, bounds.y + 10.0);
-        let b_end = iced::Point::new(bounds.x + 80.0, bounds.y + 10.0);
-        let first = pointer_step!(
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            a
-        );
-        let first_drag = pointer_step!(
-            Event::Mouse(mouse::Event::CursorMoved { position: a_end }),
-            a_end
-        );
-        assert_eq!(
-            first_drag.selection,
-            Some(first.position),
-            "first drag must establish A"
-        );
-        let first_released = pointer_step!(
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            a_end
-        );
-        let first_moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: b }), b);
-        assert_eq!(
-            first_moved, first_released,
-            "first selection followed the pointer after release"
-        );
-        let second = pointer_step!(
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            b
-        );
-        assert_ne!(
-            second.position, first.position,
-            "second press must land away from A"
-        );
-        assert_eq!(
-            second.selection, None,
-            "new Pages press B retained first drag anchor A"
-        );
-        let second_drag = pointer_step!(
-            Event::Mouse(mouse::Event::CursorMoved { position: b_end }),
-            b_end
-        );
-        assert_eq!(
-            second_drag.selection,
-            Some(second.position),
-            "second drag must anchor at B, not A"
-        );
-        let released = pointer_step!(
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            b_end
-        );
-        let moved = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
-        assert_eq!(
-            moved, released,
-            "movement after release must not change selection"
-        );
-        // Repeat without guest redraws between inputs: the next drag arrives
-        // while the previous press/selection/release still await acknowledgment.
-        for (event, point) in [
-            (mouse::Event::ButtonPressed(mouse::Button::Left), a),
-            (mouse::Event::CursorMoved { position: a_end }, a_end),
-            (mouse::Event::ButtonReleased(mouse::Button::Left), a_end),
-            (mouse::Event::ButtonPressed(mouse::Button::Left), b),
-            (mouse::Event::CursorMoved { position: b_end }, b_end),
-            (mouse::Event::ButtonReleased(mouse::Button::Left), b_end),
-        ] {
-            let mut outputs = Vec::new();
-            ui.update(
-                &[Event::Mouse(event)],
-                mouse::Cursor::Available(point),
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-            for output in outputs {
-                guest.deliver(output);
-            }
-        }
-        let burst = pointer_step!(Event::Mouse(mouse::Event::CursorMoved { position: a }), a);
-        assert_eq!(
-            burst, released,
-            "queued second drag must use B and stop on release"
-        );
-        let restored = pointer_step!(
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            pointer.position().unwrap()
-        );
-        assert_eq!(
-            restored, cursor,
-            "restore the original caret for the edit below"
-        );
-        pointer_step!(
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-            pointer.position().unwrap()
-        );
-        let mut expected = original.clone();
-        expected.insert(insertion, 'X');
-        guest.intents.clear();
-        // Rebuild after the click: the native caret must survive the guest echo.
-        ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-        let mut rebuilt_focus = EditorBounds(&editor_key, None, false);
-        ui.operate(&renderer, &mut rebuilt_focus);
-        assert!(rebuilt_focus.2, "guest echo lost native editor focus");
-        let key = |value: &str, modifiers| {
-            Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Character(value.into()),
-                modified_key: iced::keyboard::Key::Character(value.into()),
-                physical_key: iced::keyboard::key::Physical::Unidentified(
-                    iced::keyboard::key::NativeCode::Unidentified,
-                ),
-                location: iced::keyboard::Location::Standard,
-                modifiers,
-                text: Some(value.into()),
-                repeat: false,
-            })
-        };
-        let mut outputs = Vec::new();
-        ui.update(
-            &[key("X", iced::keyboard::Modifiers::default())],
-            mouse::Cursor::Unavailable,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut outputs,
-        );
-        // Native redraws replay input queued behind the pointer transaction.
-        // This is the app event loop, not a focus repair or a synthetic edit.
-        for _ in 0..32 {
-            for output in outputs.drain(..) {
-                guest.deliver(output);
-            }
-            settle(&mut guest, &props);
-            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
-            if !guest.inputs.editor_transactions_pending() {
-                break;
-            }
-            ui.update(
-                &[Event::Window(
-                    window::Event::RedrawRequested(Instant::now()),
-                )],
-                mouse::Cursor::Unavailable,
-                &mut renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut outputs,
-            );
-        }
-        assert_eq!(
-            guest.inputs.editor_document(&editor_key).unwrap().text(),
-            expected,
-            "native typing did not retain the clicked caret after redraw replay"
-        );
-        let delayed = guest
-            .intents
-            .iter()
-            .find(|event| event.kind == "edited")
-            .unwrap()
-            .clone();
-        mounted.lock().unwrap().slot = Slot::Ready(Box::new(guest));
-        // Hold the edit intent: the app mirror has not observed these words.
-        assert_eq!(
-            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
-            source,
-            "autosave echo must not replace the guest document source"
-        );
-        facts["autosave"] = "Saved just now".into();
-        let props = Some(serde_json::to_vec(&facts).unwrap());
-        let (snapshot, reference) = {
-            let mut locked = mounted.lock().unwrap();
-            let Slot::Ready(old) = &mut locked.slot else {
-                unreachable!()
-            };
-            settle(old, &props);
-            // This source/restore test owns a real native tree separately from
-            // ModuleView; drain its host operations before snapshot admission.
-            assert!(!old.inputs.editor_transactions_pending());
-            old.execute_widget_commands(|operation| ui.operate(&renderer, operation));
-            settle(old, &props);
-            assert!(old.settled(), "notification left a pending task");
-            let reference = old.inputs.editor_document(&editor_key).unwrap().reference();
-            (old.snapshot().unwrap(), reference)
-        };
-        let bytes = std::fs::read(&path).unwrap();
-        let component = Guest::compile(&bytes, "Pages replacement").unwrap();
-        let mut successor = Guest::instantiate("pages", &component, "Pages replacement").unwrap();
-        successor.restore(&snapshot, "Pages replacement").unwrap();
-        successor.first_frame("Pages replacement").unwrap();
-        assert_eq!(
-            successor
-                .inputs
-                .editor_document(&editor_key)
-                .unwrap()
-                .reference(),
-            reference
-        );
-        assert_eq!(
-            successor
-                .inputs
-                .editor_document(&editor_key)
-                .unwrap()
-                .text(),
-            expected
-        );
-        {
-            let mut locked = mounted.lock().unwrap();
-            let Slot::Ready(old) = &locked.slot else {
-                unreachable!()
-            };
-            successor
-                .inputs
-                .retain_restored_projections(&old.inputs, successor.frame.root.as_ref().unwrap())
-                .unwrap();
-            pages_document::retain_source(old, &mut successor);
-            locked.slot = Slot::Ready(Box::new(successor));
-        }
-        let refused =
-            pages_document::accept_page_document(delayed, "network-a".into(), "alpha".into());
-        assert!(
-            !refused.accepted,
-            "same-reference old instance intent was admitted after restore"
-        );
-        assert!(refused.text.is_empty() && refused.link.is_empty());
-        let mut locked = mounted.lock().unwrap();
-        let Slot::Ready(restored) = &mut locked.slot else {
-            unreachable!()
-        };
-        settle(restored, &props);
-        assert_eq!(
-            restored.inputs.editor_document(&editor_key).unwrap().text(),
-            expected
-        );
-        assert!(
-            restored.pages_document.is_none(),
-            "completed source was retransferred after restore"
-        );
-        drop(locked);
-        let make_app = || {
-            let (mut app, _) = crate::Ducktape::__boot();
-            app.connected = true;
-            app.loading = false;
-            app.network_chain_id = "network-a".into();
-            app.active_page = "alpha".into();
-            app.buffer_page = "alpha".into();
-            app.page_text = original.clone();
-            app.page_saved_text = original.clone();
-            app.page_inflight_text = original.clone();
-            app.block_autosave_status = crate::AutosaveStatus::Saving;
-            app
-        };
-        let mut refused_app = make_app();
-        let _ = refused_app.__update(crate::__DucktapeMessage::PageDocumentSaved(
-            crate::backend::DocumentSaveResult {
-                written: false,
-                refusal: "The submitted edit was refused".into(),
-                document: original.clone(),
-                data: crate::backend::PagesData {
-                    pages: Vec::new(),
-                    blocks: Vec::new(),
-                    active_page: "alpha".into(),
-                    active_page_title: "한글 👍🏽".into(),
-                    active_page_parent: String::new(),
-                    comment_thread_total: 0,
-                    commented_block_hits: Vec::new(),
-                },
-            },
-        ));
-        assert_eq!(
-            refused_app.page_text, expected,
-            "late refusal rolled back unobserved canonical typing"
-        );
-        assert_eq!(
-            pages_document::source(connection, "network-a", "alpha", &expected).unwrap(),
-            source,
-            "refusal replaced the source despite newer canonical typing"
-        );
-        let mut polled_app = make_app();
-        assert_eq!(polled_app.page_text, polled_app.page_saved_text);
-        let recipe_ids = |app: &crate::Ducktape| {
-            use iced_test::runtime::futures::subscription;
-            use std::hash::Hasher as _;
-            let mut ids: Vec<_> = subscription::into_recipes(app.__subscription())
-                .into_iter()
-                .map(|recipe| {
-                    let mut hash = subscription::Hasher::default();
-                    recipe.hash(&mut hash);
-                    hash.finish()
-                })
-                .collect();
-            ids.sort_unstable();
-            ids
-        };
-        let clean_recipes = recipe_ids(&polled_app);
-        polled_app.page_saved_text.push('!');
-        assert_eq!(
-            clean_recipes,
-            recipe_ids(&polled_app),
-            "clean app mirror removed the canonical reconciliation timer"
-        );
-        polled_app.page_saved_text.pop();
-        // Exercise the real subscription: a direct handler call would hide a
-        // dirty-mirror gate that never polls this preserved canonical edit.
-        let tick = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                use iced_test::runtime::futures::{futures::StreamExt, subscription};
-                let streams = subscription::into_recipes(polled_app.__subscription())
-                    .into_iter()
-                    .map(|recipe| {
-                        // Test builds drive `every` from redraw time, not wall time.
-                        let event = subscription::Event::Interaction {
-                            window: iced::window::Id::unique(),
-                            event: iced::Event::Window(iced::window::Event::RedrawRequested(
-                                std::time::Instant::now() + std::time::Duration::from_secs(1),
-                            )),
-                            status: iced::event::Status::Ignored,
-                        };
-                        recipe.stream(Box::pin(
-                            iced_test::runtime::futures::futures::stream::iter([event]),
-                        ))
-                    });
-                let mut messages =
-                    iced_test::runtime::futures::futures::stream::select_all(streams);
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    while let Some(message) = messages.next().await {
-                        if matches!(message, crate::__DucktapeMessage::PageAutosaveTick) {
-                            return message;
-                        }
-                    }
-                    panic!("the active page subscription ended before autosave");
-                })
-                .await
-                .expect("clean mirror prevented the real autosave subscription from polling")
-            });
-        let _ = polled_app.__update(tick);
-        assert_eq!(
-            polled_app.page_text, expected,
-            "restored edit never reached autosave without another key"
-        );
-        assert_eq!(
-            polled_app.page_inflight_text, original,
-            "the existing write was replaced"
-        );
-        let mut fresh = Guest::load_from("pages", &path).unwrap();
-        settle(&mut fresh, &props);
-        assert_eq!(
-            fresh.inputs.editor_document(&editor_key).unwrap().text(),
-            expected,
-            "fresh guest bootstrap discarded unsaved edits"
-        );
-        let mut locked = mounted.lock().unwrap();
-        let Slot::Ready(restored) = &mut locked.slot else {
-            unreachable!()
-        };
-        let mut ui = UserInterface::build(restored.render(), size, ui.into_cache(), &mut renderer);
-        let modifiers = if cfg!(target_os = "macos") {
-            iced::keyboard::Modifiers::LOGO
-        } else {
-            iced::keyboard::Modifiers::CTRL
-        };
-        let mut outputs = Vec::new();
-        ui.update(
-            &[key("z", modifiers)],
-            mouse::Cursor::Unavailable,
-            &mut renderer,
-            &mut iced::advanced::clipboard::Null,
-            &mut outputs,
-        );
-        assert!(
-            !outputs.is_empty(),
-            "restored editor lost focus or its Undo route"
-        );
-        for output in outputs {
-            restored.deliver(output);
-        }
-        settle(restored, &props);
-        assert_eq!(
-            restored.inputs.editor_document(&editor_key).unwrap().text(),
-            original,
-            "native Undo after no-init restore must preserve guest history"
-        );
-        drop(locked);
-        pages_document::source_changed();
-        pages_document::source(connection, "network-a", "alpha", "replacement source").unwrap();
-        let deferred = pages_document::current_page_document(
-            "network-a".into(),
-            "alpha".into(),
-            "new mirror".into(),
-        );
-        assert!(
-            !deferred.ready,
-            "old canonical editor was treated as a newly installed source"
-        );
-        assert_eq!(deferred.text, "new mirror");
-    }
-
+    /// The pages view's session facts: the chain because a `duck://page/…`
+    /// address carries it, and the page a link asked the app to open.
     fn pages_facts() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "document_source": [], "document_error": "", "commented_lines": [], "comment_marks": [],
-                "dark": false, "connected": true, "loading": false, "busy": false,
-                "page_link": "duck://pages/alpha",
-                "pages": [
-                    {"id": "alpha", "title": "Alpha", "parent": "", "prefix": "", "child_count": 0},
-                    {"id": "beta", "title": "Beta", "parent": "", "prefix": "", "child_count": 0}
-                ],
-                "page_create_open": false, "active_page": "alpha",
-                "active_page_title": "Alpha", "active_page_parent": "",
-                "page_searching": false, "page_search_hits": [], "page_search_query": "",
-                "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
-                "subpages": [], "orphaned_comment_drafts": [],
-                "block_comments_open": false, "thread_total": 0, "comment_rows": [],
-                "threads_loading": false, "threads_has_more": false, "active_thread": "",
-                "thread_resolved": false, "active_thread_anchor": "", "comments": [],
-                "comments_loading": false, "comments_has_more": false, "compose_hint": "",
-                "seed_rev": 0, "page_seed": "", "comment_seed": ""
+                "dark": false, "connected": true, "chain": "mynet#d0cdf950",
+                "route_page": "", "route_serial": 0
             }))
             .expect("props encode"),
         )
