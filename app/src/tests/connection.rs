@@ -263,10 +263,7 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
     // collide with the prefixed names, because the match is anchored at the
     // start of the line. A module-owned view keeps its own pair in its own
     // crate, checked by its own tests.
-    const PAIRED: [(&str, &str); 2] = [
-        ("page_search_hits", "page_search_query"),
-        ("chat_search_hits", "chat_search_query"),
-    ];
+    const PAIRED: [(&str, &str); 1] = [("chat_search_hits", "chat_search_query")];
     let mut walked = 0;
     for (path, source) in ice_sources() {
         for (handler, body) in ice_handlers(&source) {
@@ -292,7 +289,7 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
         }
     }
     assert!(
-        walked >= 10,
+        walked >= 8,
         "the walk found only {walked} hit-dropping handlers, so it is not \
          reading the sources it claims to"
     );
@@ -732,13 +729,14 @@ fn a_failed_connect_retries_instead_of_giving_up() {
 
     // The handler re-runs the connect, and the reply is generation-guarded.
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
-    let arm = lifecycle
+    let arm_rest = lifecycle
         .split_once("on connect_failed(cause)")
         .expect("connect owns its failure arm, not the shared one")
-        .1
-        .split_once("\non ")
-        .expect("the arm ends")
-        .0;
+        .1;
+    // The arm ends at the next handler, or at the end of the file when it is
+    // the last one — which it is, now that the pages handlers are the pages
+    // view's.
+    let arm = arm_rest.split_once("\non ").map_or(arm_rest, |(arm, _)| arm);
     assert!(
         arm.contains("hydration_retry_attempt = hydration_retry_attempt + 1"),
         "the attempt climbs"
@@ -773,21 +771,16 @@ fn a_failed_connect_retries_instead_of_giving_up() {
          successful connect and nothing retries"
     );
 
-    // The SHARED `failed` arm still belongs to the six page/chat loaders that
-    // route to it, and must NOT have grown a connect retry.
-    // `on failed` is the LAST handler in the file, so there may be no `\non `
-    // after it to cut at — take the remainder when there is not.
-    let shared_rest = lifecycle
-        .split_once("on failed(cause)")
-        .expect("the shared arm")
-        .1;
-    let shared = shared_rest
-        .split_once("\non ")
-        .map_or(shared_rest, |(arm, _)| arm);
-    assert!(
-        !shared.contains("run connect("),
-        "a failed page load must not restart the workspace connect"
-    );
+    // THE SHARED `failed` ARM IS GONE WITH THE LOADERS THAT ROUTED TO IT: the
+    // page loads belong to the pages view, which reads and refuses for
+    // itself. A run that resurrects it must route somewhere named, never into
+    // a catch-all one `run connect(` away from restarting the workspace.
+    for (path, source) in ice_sources() {
+        assert!(
+            !source.contains("on failed(") && !source.contains("| failed _"),
+            "{path} brought back the shared failure arm"
+        );
+    }
 }
 
 /// THE BEHAVIOUR THE SWEEPS ABOVE ONLY SPELL. Boot the console, drop the

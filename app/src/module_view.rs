@@ -2289,6 +2289,11 @@ struct Guest {
     /// The guest's `rpc.stream` subscriptions, each holding the node socket
     /// the kernel opened for it: retired with the cancel, and with the guest.
     streams: Vec<(u64, kernel::NodeStream)>,
+    /// The guest's `clock.ticks` subscriptions: the period it asked for and
+    /// the instant its next item is due. A module has no clock of its own,
+    /// so an Ice `every` in a view is this list — driven from the window
+    /// thread's own redraw, never from a thread that would have to wake it.
+    clocks: Vec<kernel::Clock>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -2953,6 +2958,7 @@ impl Guest {
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
             streams: Vec::new(),
+            clocks: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3040,6 +3046,8 @@ impl Guest {
         }
         self.sync_props(props);
         self.replies.drain_into(&mut self.pending);
+        self.pending
+            .extend(kernel::ticked(&mut self.clocks, std::time::Instant::now()));
         if self.staged {
             // a replacement's first tree is already here; only its
             // requests and cancels are still to route
@@ -3074,6 +3082,7 @@ impl Guest {
             // dropping the stream aborts it: the node socket goes with the
             // subscription the view abandoned
             self.streams.retain(|(stream, _)| *stream != id);
+            self.clocks.retain(|clock| clock.id != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -3528,6 +3537,12 @@ impl Widget<ModuleViewEvent, iced::Theme, iced::Renderer> for ModuleView {
                 iced::time::Instant::now() + LOAD_POLL,
             ));
         }
+        // A `clock.ticks` subscription is a DEADLINE, not a poll: the shell
+        // draws the frame the view's own `every` is waiting for, and nothing
+        // burns a frame before it.
+        if let Some(due) = kernel::next_tick(&guest.clocks) {
+            shell.request_redraw_at(window::RedrawRequest::At(due));
+        }
         let native_frame_ready = same_instance
             && self.rev == guest.frame_rev
             && guest.fault.is_none()
@@ -3961,6 +3976,84 @@ pub(crate) mod tests {
         }
     }
 
+    /// A MODULE HAS NO CLOCK, so an Ice `every` in a view is the kernel's:
+    /// one item per period, on a deadline the window thread keeps. Driven
+    /// through the real guest and the real redraw — the instant is the
+    /// argument, so the rule is decided rather than waited for, and the
+    /// answers are drained through `Replies` exactly as a node call's are.
+    #[test]
+    fn the_kernels_clock_ticks_once_per_period_and_re_arms() {
+        let Some(staged) = staged("governance") else {
+            return;
+        };
+        let _turn = blocking_connection_turn();
+        let mut guest = Guest::load_from("governance", &staged).expect("the view loads");
+
+        // A PERIOD, NOT A PAYLOAD: the bytes are `every`'s own i64 LE millis,
+        // and a period the window thread would spin on is refused.
+        for payload in [
+            Vec::new(),
+            b"900".to_vec(),
+            0_i64.to_le_bytes().to_vec(),
+            1_i64.to_le_bytes().to_vec(),
+            (-900_i64).to_le_bytes().to_vec(),
+            (24 * 60 * 60 * 1_000_i64).to_le_bytes().to_vec(),
+        ] {
+            let id = 40 + payload.len() as u64;
+            assert!(kernel::answer(&mut guest, "clock", "ticks", id, &payload));
+            guest.replies.wait_idle();
+            guest.replies.drain_into(&mut guest.pending);
+            let refusal = guest
+                .pending
+                .drain(..)
+                .find_map(|event| match event {
+                    wire::Event::Response { id: at, result, .. } if at == id => result.err(),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the kernel refuses {payload:?}"));
+            assert_eq!(refusal, "`clock.ticks` names no period");
+            assert!(guest.clocks.is_empty(), "for {payload:?}");
+        }
+
+        // A NAMED PERIOD is kept, and nothing is due before it.
+        let armed = std::time::Instant::now();
+        assert!(kernel::answer(
+            &mut guest,
+            "clock",
+            "ticks",
+            7,
+            &900_i64.to_le_bytes()
+        ));
+        let due = kernel::next_tick(&guest.clocks).expect("the clock is armed");
+        assert!(due >= armed + std::time::Duration::from_millis(900));
+        assert!(kernel::ticked(&mut guest.clocks, due - Duration::from_millis(1)).is_empty());
+
+        // AT THE DEADLINE: one item, and the next period armed from it —
+        // one item however far behind, so a window that slept owes the view
+        // a tick, not the minutes it missed.
+        let late = due + Duration::from_secs(60);
+        let items = kernel::ticked(&mut guest.clocks, late);
+        assert!(
+            matches!(
+                items.as_slice(),
+                [wire::Event::Response { id: 7, result: Ok(bytes), done: false }] if bytes.is_empty()
+            ),
+            "{items:?}"
+        );
+        assert_eq!(
+            kernel::next_tick(&guest.clocks),
+            Some(late + Duration::from_millis(900)),
+            "the period is re-armed from the tick that was taken"
+        );
+
+        // AND A CANCEL RETIRES IT: the view that stopped asking stops being
+        // told, and the shell has no deadline left to draw for.
+        guest.frame.cancels = vec![7];
+        guest.staged = true;
+        guest.redraw(&None);
+        assert!(kernel::next_tick(&guest.clocks).is_none());
+    }
+
     /// `rpc.view` READS THE MODULE'S INDEX TIER FOR ANY VIEW THAT ASKS, off
     /// the window thread and answered at the view's next redraw. The FOLD
     /// WAIT it runs first is the pages document save's correctness (its
@@ -4004,11 +4097,7 @@ pub(crate) mod tests {
 
         // A NODE: one request leaves, and the reply the guest gets back is
         // the index tier's own.
-        let node = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime for the stub node");
-        let origin = node.block_on(stub_index_node(r#"{"pages":{"pages":[],"has_more":false}}"#));
+        let origin = stub_index_node(r#"{"pages":{"pages":[],"has_more":false}}"#);
         let client = crate::backend::rpc_client(&origin).expect("a client for the stub node");
         connection().lock().expect("views rpc").client = Some(client);
 
@@ -4028,20 +4117,21 @@ pub(crate) mod tests {
         assert!(refusal.contains("module"), "{refusal}");
     }
 
-    /// A one-request stub node for the kernel's index reads: it answers the
-    /// first `/v1/index/<module>/view` with `body` and closes, so nothing
-    /// can share its socket with a later probe.
-    async fn stub_index_node(body: &'static str) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the stub node");
+    /// A stub node for the kernel's index reads: it answers every
+    /// `/v1/index/<module>/view` with `body` and closes the socket, so the
+    /// kernel's own fold probe and the read behind it each get a clean
+    /// connection. Blocking sockets on a plain thread — the kernel's runtime
+    /// is the one under test, and a stub sharing it would be driven by it.
+    fn stub_index_node(body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stub node");
         let origin = format!("http://{}", listener.local_addr().expect("stub address"));
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 2048];
-                while let Ok(read) = stream.read(&mut chunk).await {
+                while let Ok(read) = stream.read(&mut chunk) {
                     if read == 0 {
                         break;
                     }
@@ -4054,8 +4144,8 @@ pub(crate) mod tests {
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         });
         origin
@@ -5836,6 +5926,28 @@ pub(crate) mod tests {
         );
     }
 
+    /// The workspace the pages view reads for itself, one entry per query
+    /// shape it asks the index tier with: the page list, the open page's
+    /// blocks, and the comment threads anchored on them.
+    fn pages_register_reply() -> serde_json::Value {
+        serde_json::json!({
+            "list_pages": { "pages": {
+                "pages": [{ "id": "alpha", "title": "Alpha", "parent": null }],
+                "has_more": false, "next_after": null
+            }},
+            "get_page": { "page": {
+                "blocks": [
+                    { "block_id": "alpha", "parent": null, "kind": "page",
+                      "text": "Alpha", "checked": false, "children": ["alpha-1"] },
+                    { "block_id": "alpha-1", "parent": "alpha", "kind": "paragraph",
+                      "text": "the first paragraph", "checked": false, "children": [] }
+                ],
+                "next_after": null
+            }},
+            "threads_for_targets": { "threads": [] }
+        })
+    }
+
     /// The pages view's session facts: the chain because a `duck://page/…`
     /// address carries it, and the page a link asked the app to open.
     fn pages_facts() -> Option<Vec<u8>> {
@@ -6600,6 +6712,7 @@ pub(crate) mod tests {
             node.answer_query("governance", proposals_reply());
             node.answer_files("ls", files_listing_reply());
             node.answer_files("history", serde_json::json!({ "snapshots": [] }));
+            node.answer_view("pages", pages_register_reply());
             let client = fake_node(node.clone()).await;
 
             let mounted = fresh(module);
@@ -6654,9 +6767,19 @@ pub(crate) mod tests {
                 );
                 let ticks = guest.ticks;
                 // the first redraw routes the staged requests without another
-                // tick, and the view is quiet after it
-                assert!(!guest.redraw(&None), "{module}");
+                // tick, and the only thing left to do after it is the native
+                // install of a restored editor document — a view that owns one
+                // is not quiet until that lands, and nothing else may keep it
+                // busy.
+                let busy = guest.redraw(&None);
                 assert_eq!(guest.ticks, ticks, "{module}");
+                assert_eq!(
+                    busy,
+                    guest.inputs.editor_documents_status() == Ok(false),
+                    "{module}: busy={busy} pending={:?}",
+                    guest.pending
+                );
+                settle_documents(guest, &None);
                 assert!(
                     guest.props_subscription.is_some(),
                     "{module}: the restored view asked for its props again"

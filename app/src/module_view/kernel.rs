@@ -38,6 +38,10 @@
 //! - `host.id` `<prefix>` — one id, unique on this device, for a module
 //!   whose records are addressed by ids its WRITER mints. A view has no
 //!   clock and no entropy of its own, so the app mints it.
+//! - `clock.ticks` `<period, i64 ms little-endian>` — a subscription that
+//!   gets one item per period. A wasm module has no clock, so an Ice
+//!   `every`/`repeat` in a view is this door; the window thread keeps the
+//!   deadline and the shell draws the frame it comes due on.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
@@ -195,6 +199,17 @@ pub(super) fn answer(
                 None => guest.refuse(id, "`host.badge` carries no count".into()),
             }
         }
+        ("clock", "ticks") => {
+            let period = tick_period(payload);
+            match period {
+                Some(period) => guest.clocks.push(Clock {
+                    id,
+                    period,
+                    due: std::time::Instant::now() + period,
+                }),
+                None => guest.refuse(id, "`clock.ticks` names no period".into()),
+            }
+        }
         ("host", "id") => {
             let prefix = std::str::from_utf8(payload).unwrap_or_default().trim();
             let named = !prefix.is_empty()
@@ -273,6 +288,56 @@ fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
 /// A node stream the kernel is running for one subscription. Dropped with
 /// the guest that asked, or with the cancel that retires it — and dropping
 /// it ends the socket, so a view that is replaced leaves nothing reading.
+/// One `clock.ticks` subscription: the period the view asked for, and when
+/// its next item is due.
+pub(super) struct Clock {
+    pub(super) id: u64,
+    period: std::time::Duration,
+    due: std::time::Instant,
+}
+
+/// The shortest and longest period a view may ask the clock for. Below the
+/// floor a tick is a spin the window thread pays for every frame; above the
+/// ceiling it is not a period but a date, which a view has no business
+/// keeping — it reads the node for that.
+const MIN_TICK_MS: i64 = 16;
+const MAX_TICK_MS: i64 = 60 * 60 * 1_000;
+
+/// A `clock.ticks` payload: the period in milliseconds, little-endian, as
+/// `ui_lang_guest::every` writes it.
+fn tick_period(payload: &[u8]) -> Option<std::time::Duration> {
+    let millis = i64::from_le_bytes(<[u8; 8]>::try_from(payload).ok()?);
+    let named = (MIN_TICK_MS..=MAX_TICK_MS).contains(&millis);
+    named.then(|| std::time::Duration::from_millis(millis as u64))
+}
+
+/// Every clock item due at `now`, and the deadline re-armed for each. The
+/// instant is an argument so the rule is decided, not timed: the widget
+/// hands it `Instant::now()`, a test hands it the deadline it chose.
+pub(super) fn ticked(clocks: &mut [Clock], now: std::time::Instant) -> Vec<wire::Event> {
+    let mut items = Vec::new();
+    for clock in clocks.iter_mut() {
+        if clock.due > now {
+            continue;
+        }
+        // ONE ITEM PER REDRAW, however far behind: a window that was not
+        // drawn for a minute owes the view one tick, not four thousand.
+        clock.due = now + clock.period;
+        items.push(wire::Event::Response {
+            id: clock.id,
+            result: Ok(Vec::new()),
+            done: false,
+        });
+    }
+    items
+}
+
+/// When the nearest clock item comes due, for the redraw the widget asks
+/// the shell to schedule.
+pub(super) fn next_tick(clocks: &[Clock]) -> Option<std::time::Instant> {
+    clocks.iter().map(|clock| clock.due).min()
+}
+
 pub(super) struct NodeStream(tokio::task::JoinHandle<()>);
 
 impl Drop for NodeStream {

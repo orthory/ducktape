@@ -222,6 +222,7 @@ pub(crate) mod tests {
             held: tokio::sync::Notify::new(),
             queries: Mutex::new(BTreeMap::new()),
             files_lanes: Mutex::new(BTreeMap::new()),
+            index_views: Mutex::new(BTreeMap::new()),
         };
         fake_node(Arc::new(deployment)).await
     }
@@ -248,6 +249,11 @@ pub(crate) mod tests {
         /// a view makes for itself through the kernel's `files.get`. A lane
         /// not here is not found.
         pub files_lanes: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// What an index-tier read answers, by module then by the query's own
+        /// first key — a view reads its register with several shapes down the
+        /// one `rpc.view` door, and each shape wants its own reply. A module
+        /// or a shape not here is not found.
+        pub index_views: Mutex<BTreeMap<String, serde_json::Value>>,
     }
 
     impl FakeDeployment {
@@ -261,6 +267,7 @@ pub(crate) mod tests {
                 held: tokio::sync::Notify::new(),
                 queries: Mutex::new(BTreeMap::new()),
                 files_lanes: Mutex::new(BTreeMap::new()),
+                index_views: Mutex::new(BTreeMap::new()),
             })
         }
 
@@ -275,6 +282,15 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .insert(lane.to_owned(), reply);
+        }
+
+        /// Every `rpc.view` on `module` answers out of `shapes`: an object
+        /// whose keys are the query keys the view asks with.
+        pub(crate) fn answer_view(&self, module: &str, shapes: serde_json::Value) {
+            self.index_views
+                .lock()
+                .unwrap()
+                .insert(module.to_owned(), shapes);
         }
 
         /// The registry now names `artifact` as `module`'s active code,
@@ -338,6 +354,27 @@ pub(crate) mod tests {
                         };
                         match served {
                             Some(artifact) => ("200 OK", artifact.encode()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    } else if let Some(module) = route
+                        .strip_prefix("/v1/index/")
+                        .and_then(|rest| rest.strip_suffix("/view"))
+                    {
+                        // a view's own index-tier read: the route names the
+                        // module, the body's first key names the shape
+                        let shape = head
+                            .rsplit("\r\n\r\n")
+                            .next()
+                            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                            .and_then(|ask| {
+                                ask.as_object()?.keys().next().map(String::clone)
+                            });
+                        let answered = shape.and_then(|shape| {
+                            let views = deployment.index_views.lock().unwrap();
+                            views.get(module)?.get(&shape).cloned()
+                        });
+                        match answered {
+                            Some(reply) => ("200 OK", reply.to_string().into_bytes()),
                             None => ("404 Not Found", Vec::new()),
                         }
                     } else if let Some(lane) = route.strip_prefix("/v1/files/") {

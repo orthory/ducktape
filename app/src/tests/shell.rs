@@ -1047,9 +1047,12 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .any(|line| line.trim_start().starts_with("reply_draft =")),
         "root state reclaimed `reply_draft`"
     );
+    // The page's own address is the pages view's, like everything else on
+    // that screen: the app holds the page a `duck://` link asked for and
+    // nothing more.
     let page_handlers = inlined(include_str!("../ui/handlers/pages.ice"));
     assert!(!root_state.contains("page_link"));
-    assert!(page_handlers.contains("let page_link = document.link"));
+    assert!(!page_handlers.contains("page_link"));
 
     let native_surfaces = concat!(
         include_str!("../backend/live.rs"),
