@@ -23,7 +23,7 @@ pub(super) fn tools() -> Vec<Tool> {
                       of the catalog ducktape_actions lists (reply, react, unreact, \
                       chat.post_message, tasks.create, tasks.update_status, pages.comment, \
                       pages.set_checked, pages.post, jobs.comment, duckfs.write_text, \
-                      collaboration.send, collaboration.acknowledge, agent.call, submit); \
+                      collaboration.deliver, collaboration.acknowledge, agent.call, submit); \
                       target and input follow that entry's schemas — \
                       reply, react and unreact take no target and act on the message this run \
                       was called from. submit carries ANY module's own message: target is \

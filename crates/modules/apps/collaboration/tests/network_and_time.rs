@@ -9,27 +9,36 @@
 
 mod common;
 
-use collaboration::{max_delivery_ttl, CollaborationMsg};
+use collaboration::{CollaborationMsg, max_delivery_ttl};
 use common::*;
 use futures::executor::block_on;
-use sdk::{genesis_config::TimeUnit, Module, Origin};
+use sdk::{Module, Origin, genesis_config::TimeUnit};
 
 #[test]
 fn an_op_addressed_to_another_network_is_refused_before_it_is_read() {
     block_on(async {
-        let mut module = module();
-        let mut ctx = at(1, Origin::External(key(1)));
+        let Scene {
+            mut module,
+            chat,
+            alice,
+            ..
+        } = scene("c1");
+        let mut ctx = at(&chat, 1, Origin::External(key(1)));
         let refusal = module
-            .execute(&mut ctx, &on_network("other-net", register("alice")))
+            .execute(
+                &mut ctx,
+                &on_network("other-net", bind("c1", &alice, key(0x5e), 0)),
+            )
             .await
             .unwrap_err();
         assert!(
             format!("{refusal:?}").contains("not this network"),
             "{refusal:?}"
         );
+        module.abort_block().await.unwrap();
 
         // the op is otherwise perfectly valid: name this network and it lands.
-        ok(&mut module, &mut ctx, register("alice")).await;
+        ok(&mut module, &mut ctx, bind("c1", &alice, key(0x5e), 0)).await;
     });
 }
 
@@ -40,11 +49,15 @@ fn a_blank_chain_id_binds_no_network_and_admits_nothing() {
     // blank would COLLAPSE every unnamed network into one replay domain, which
     // is exactly the thing the binding exists to prevent.
     block_on(async {
+        let Scene { chat, alice, .. } = scene("c1");
         let mut module = module_on("", MAX_TTL);
-        let mut ctx = at(1, Origin::External(key(1)));
+        let mut ctx = at(&chat, 1, Origin::External(key(1)));
         for network in ["", NETWORK, "other-net"] {
             let refusal = module
-                .execute(&mut ctx, &on_network(network, register("alice")))
+                .execute(
+                    &mut ctx,
+                    &on_network(network, bind("c1", &alice, key(0x5e), 0)),
+                )
                 .await
                 .unwrap_err();
             assert!(
@@ -58,9 +71,6 @@ fn a_blank_chain_id_binds_no_network_and_admits_nothing() {
 
 #[test]
 fn the_time_unit_scales_the_delivery_ceiling_it_does_not_relabel_it() {
-    // the same wall-clock span, in each lane's own unit. a height lane counts
-    // blocks and a millisecond lane counts milliseconds, so the ceiling that
-    // means "seven days" differs by exactly the unit's rate.
     assert_eq!(TimeUnit::Height.per_second(), 1);
     assert_eq!(TimeUnit::Millis.per_second(), 1_000);
     assert_eq!(
@@ -76,15 +86,18 @@ fn a_millis_lane_admits_the_deadline_a_height_lane_calls_too_far_out() {
     // single compiled-in constant would have to be wrong on one of them — which
     // is why the ceiling rides genesis config instead.
     block_on(async {
+        let scene = scene("c1");
+        let bob = scene.bob.clone();
+        scene.alice_posts("c1", "m1");
         let now = 1;
         let deadline = now + max_delivery_ttl(TimeUnit::Height) + 1;
 
-        let mut height = seated(module_on(NETWORK, max_delivery_ttl(TimeUnit::Height))).await;
-        let mut ctx = at(now, Origin::External(key(1)));
+        let mut height = module_on(NETWORK, max_delivery_ttl(TimeUnit::Height));
+        let mut ctx = scene.as_alice(now);
         let refusal = apply(
             &mut height,
             &mut ctx,
-            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, deadline)),
+            CollaborationMsg::Deliver(deliver("c1", "m1", &bob, deadline)),
         )
         .await
         .unwrap_err();
@@ -93,27 +106,26 @@ fn a_millis_lane_admits_the_deadline_a_height_lane_calls_too_far_out() {
             "the height lane must refuse a deadline past its ceiling: {refusal:?}"
         );
 
-        let mut millis = seated(module_on(NETWORK, max_delivery_ttl(TimeUnit::Millis))).await;
-        let mut ctx = at(now, Origin::External(key(1)));
+        let mut millis = module_on(NETWORK, max_delivery_ttl(TimeUnit::Millis));
+        let mut ctx = scene.as_alice(now);
         ok(
             &mut millis,
             &mut ctx,
-            CollaborationMsg::Send(note("c1", "alice", "bob", 1, 1, deadline)),
+            CollaborationMsg::Deliver(deliver("c1", "m1", &bob, deadline)),
         )
         .await;
 
         // and the millisecond lane still HAS a ceiling — it is scaled, not
         // removed.
-        let mut ctx = at(now, Origin::External(key(1)));
+        scene.alice_posts("c1", "m2");
+        let mut ctx = scene.as_alice(now);
         let refusal = apply(
             &mut millis,
             &mut ctx,
-            CollaborationMsg::Send(note(
+            CollaborationMsg::Deliver(deliver(
                 "c1",
-                "alice",
-                "bob",
-                1,
-                2,
+                "m2",
+                &bob,
                 now + max_delivery_ttl(TimeUnit::Millis) + 1,
             )),
         )
@@ -124,23 +136,4 @@ fn a_millis_lane_admits_the_deadline_a_height_lane_calls_too_far_out() {
             "{refusal:?}"
         );
     });
-}
-
-/// the `scene` setup against a caller-supplied module: two participants owned
-/// by two keys, both seated on `c1`.
-async fn seated(mut module: collaboration::Collaboration) -> collaboration::Collaboration {
-    let mut owner_a = at(1, Origin::External(key(1)));
-    ok(&mut module, &mut owner_a, register("alice")).await;
-    ok(&mut module, &mut owner_a, conversation("c1")).await;
-    let mut owner_b = at(1, Origin::External(key(2)));
-    ok(&mut module, &mut owner_b, register("bob")).await;
-    for participant in ["alice", "bob"] {
-        ok(
-            &mut module,
-            &mut owner_a,
-            seat("c1", participant, Some(collaboration::Role::Member)),
-        )
-        .await;
-    }
-    module
 }
