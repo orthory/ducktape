@@ -7,7 +7,6 @@ mod bell;
 mod canary;
 mod connection;
 mod design;
-mod files_draft;
 mod font_fallback;
 mod huddle_live;
 mod messages;

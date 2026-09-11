@@ -200,13 +200,14 @@ view
         pages:
           extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
-        // Files is a MODULE-OWNED VIEW: the listing, the preview, the
-        // history and the write refusal go in as props; every navigation
-        // and every write comes back as an intent the handler signs. Whether
-        // the rows on hand describe the path in the crumb (`listed`) is
-        // computed here, once.
+        // Files is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the chain among them, because a draft belongs to the
+        // network it was read on — and the view lists the directory, reads
+        // the preview and the history, and writes through `op.submit` for
+        // itself. The pictures, the highlighted reader and the Markdown
+        // document are the app's surfaces, painted into the slots it leaves.
         files:
-          extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes, connected_rpc, network_chain_id, connect_generation, fs_preview_base, fs_save_reply) #files -> files_view_event _
+          extern files_view(dark, connected, network_chain_id, fs_route, fs_route_serial) #files -> files_view_event _
         // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
         // facts go in, the view reads the roster off the node itself and
         // writes through `op.submit` (signed with the seated key). The

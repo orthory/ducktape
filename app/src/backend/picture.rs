@@ -26,6 +26,8 @@ pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PICTURE_SIDE: u32 = 2048;
 /// The Files preview's slot.
 pub const FILES_SURFACE: &str = "files";
+/// The Forge reader's slot.
+pub const FORGE_SURFACE: &str = "forge";
 /// How many of a Markdown document's in-repo pictures the loader fetches, in
 /// document order. ponytail: the rest keep their alt text; page them lazily
 /// if a README ever carries more.
@@ -180,7 +182,7 @@ pub async fn decode_off_thread(bytes: Vec<u8>) -> Result<Picture, String> {
 /// Decode off the runtime and park the result under `surface`, replacing
 /// whatever that surface held. Returns the drawn `(width, height)`.
 pub async fn store_picture(
-    surface: String,
+    surface: &'static str,
     path: String,
     bytes: Vec<u8>,
 ) -> Result<(i64, i64), String> {
@@ -192,11 +194,11 @@ pub async fn store_picture(
 
 /// Park one decoded picture under `surface` as `path`'s, replacing whatever
 /// the surface held. The one writer to the store.
-pub(crate) fn park_picture(surface: String, path: String, picture: Picture) {
+pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture) {
     store()
         .lock()
         .expect("picture store")
-        .insert(surface, (path, picture));
+        .insert(surface.to_owned(), (path, picture));
 }
 
 /// The picture parked under `surface`, only if it is still `path`'s — a slot
@@ -490,13 +492,13 @@ mod tests {
             .build()
             .expect("runtime");
         let dims = runtime
-            .block_on(store_picture("test".into(), "a.png".into(), png(4, 4)))
+            .block_on(store_picture("test", "a.png".into(), png(4, 4)))
             .expect("stored");
         assert_eq!(dims, (4, 4));
         assert!(stored_picture("test", "a.png").is_some());
         assert!(stored_picture("test", "b.png").is_none(), "a stale slot never draws under a new path");
         runtime
-            .block_on(store_picture("test".into(), "b.png".into(), png(2, 2)))
+            .block_on(store_picture("test", "b.png".into(), png(2, 2)))
             .expect("stored");
         assert!(stored_picture("test", "a.png").is_none(), "one slot per surface");
         assert_eq!(stored_picture("test", "b.png").map(|p| p.width), Some(2));

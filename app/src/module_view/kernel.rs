@@ -25,6 +25,8 @@
 //! - `files.get` `{lane, params}` — one `/v1/files/<lane>` read with its
 //!   query-string params; `blob.get` `{digest, limit}` — a blob by hex
 //!   digest, verified against it.
+//! - `picture.load` `{surface, path}` — a duckfs file paged in, decoded and
+//!   parked in a host picture surface's slot; answered with its drawn size.
 //! - `files.stage` `<raw bytes>` / `blob.put` `<raw bytes>` — a duckfs
 //!   chunk or a blob landed on the node, proven with the seated key;
 //!   answered with the digest.
@@ -175,6 +177,7 @@ pub(super) fn answer(
         ("rpc", "stream") => stream_open(guest, id, payload),
         ("files", "get") => spawn(guest, id, payload, files_get),
         ("files", "stage") => spawn_raw(guest, id, payload, files_stage),
+        ("picture", "load") => spawn(guest, id, payload, picture_load),
         ("blob", "get") => spawn(guest, id, payload, blob_get),
         ("blob", "put") => spawn_raw(guest, id, payload, blob_put),
         ("rpc", "live") => {
@@ -521,6 +524,48 @@ fn files_get(
     })
 }
 
+/// `picture.load` `{surface, path}` — the whole duckfs file paged in, decoded
+/// off the runtime and parked in a host picture surface's slot, answered with
+/// the size it will be drawn at. The decode and the widget are the host's (a
+/// tree wire carries no pixels), so a view that wants one names the slot it
+/// left and the file to put in it. The two slots are the ones
+/// [`crate::backend::picture`] draws; anything else is refused rather than
+/// growing the store.
+/// The picture slot a request names, or `None` for anything that is not one
+/// of the two [`crate::backend::picture`] draws — the store never grows a
+/// slot nothing paints.
+fn picture_surface(ask: &serde_json::Value) -> Option<&'static str> {
+    use crate::backend::{FILES_SURFACE, FORGE_SURFACE};
+    match ask["surface"].as_str()? {
+        FILES_SURFACE => Some(FILES_SURFACE),
+        FORGE_SURFACE => Some(FORGE_SURFACE),
+        _ => None,
+    }
+}
+
+fn picture_load(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    use crate::backend::{MAX_PICTURE_BYTES, store_picture};
+    Box::pin(async move {
+        let surface = picture_surface(&ask).ok_or("`picture.load` names no surface")?;
+        let path = ask["path"].as_str().unwrap_or_default().to_owned();
+        let Some(bytes) = crate::backend::files_read_all(&client, &path).await? else {
+            return Err(format!(
+                "picture larger than the {} MiB preview limit",
+                MAX_PICTURE_BYTES >> 20
+            ));
+        };
+        let size = bytes.len();
+        let (width, height) = store_picture(surface, path, bytes)
+            .await
+            .map_err(|reason| format!("{size} binary bytes · did not decode: {reason}"))?;
+        serde_json::to_vec(&serde_json::json!({ "width": width, "height": height }))
+            .map_err(|error| error.to_string())
+    })
+}
+
 fn files_stage(
     client: ducktape_rpc::Client,
     bytes: Vec<u8>,
@@ -721,11 +766,10 @@ fn picture_put(
     ask: serde_json::Value,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
     Box::pin(async move {
-        let surface = ask["surface"].as_str().unwrap_or_default().to_owned();
+        let surface = picture_surface(&ask).ok_or("`picture.put` names no surface")?;
         let path = ask["path"].as_str().unwrap_or_default().to_owned();
-        let named = !surface.is_empty() && !path.is_empty();
-        if !named {
-            return Err("`picture.put` names no surface".into());
+        if path.is_empty() {
+            return Err("`picture.put` names no path".into());
         }
         // Each page is padded base64 in its own right, so the runs are
         // decoded separately and the BYTES joined — concatenating the text

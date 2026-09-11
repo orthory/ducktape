@@ -957,9 +957,10 @@ on copy_message_link(link)
 // cannot check alone — and each kind maps onto navigation the app ALREADY
 // has: the handler a click on the screen itself would reach, handed the
 // link's field through an echo lane (the one way a handler reaches another).
-// A target that needs two steps (a directory, THEN its file) parks a one-shot
-// focus that `fs_listed` consumes. The protocol adds addresses, never
-// navigation.
+// AN ADDRESS IS PUSHED, NOT NAVIGATED: the browsers live in the files and
+// forge views, so the app moves the tab and hands the view the address as a
+// session fact (`fs_route` / `forge_link`, each with a serial so the same
+// address twice lands twice). The protocol adds addresses, never navigation.
 // A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
 // addresses a store this app is not connected to, so it opens nothing and
 // says which network it belongs to. A link with no `?net=` is the hand-typed
@@ -980,8 +981,12 @@ on open_message_link(url)
       flow
         from done link.dispatch
         done -> open_run_panel _
+    // The Files tab opens, and the PATH goes with it — as a SESSION fact,
+    // not a navigation the app performs: the browser is the view's, so the
+    // address the shell resolved is pushed in and the view lands on it.
     DuckKind.files
-      fs_focus_path = link.path
+      fs_route = link.path
+      fs_route_serial = fs_route_serial + 1
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)
@@ -990,7 +995,6 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.files
-      run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
     // THE FORGE ADDRESSES CROSS AS THE URL ITSELF. The forge view is a guest:
     // it holds every forge selection and parses the `duck://forge/...`
     // grammar out of the props it is handed. The host's whole job is to raise
