@@ -182,28 +182,26 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
 /// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
 /// runs no handler at all: only `trim(query) == sent_query` can retire the
 /// plate, and the captured string is the only thing that can carry the
-/// comparison. The Explorer is a module-owned view now: the arm is the
-/// guest's, and the capture is the app's, in the handler that runs the
-/// search on the view's behalf.
+/// comparison. The Explorer is a module-owned view on the kernel contract, so
+/// the capture, the send and the arm are all the guest's.
 #[test]
 fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     let guest = inlined(include_str!(
         "../../../crates/views/explorer/src/ui/app.ice"
     ));
-    let app = inlined(include_str!("../ui/handlers/overlays.ice"));
-    let search = ice_handler_body(&app, "explorer_view_event");
-    // CAPTURED AT THE SEND, AND SENT FROM THE CAPTURE — passing the intent's
-    // text to the call a second time would let the string asked about and the
-    // string spoken for drift apart in a later edit.
+    let submit = ice_handler_body(&guest, "search_submit");
+    // CAPTURED AT THE SEND, AND KEYED ON THE CAPTURE — the search
+    // subscription takes `sent_query` itself, so the string asked about and
+    // the string spoken for cannot drift apart in a later edit.
     assert!(
-        search.contains("explorer_sent_query = event_text(event, \"query\")"),
+        submit.contains("sent_query = trim(query)"),
         "the search must capture the query it sends"
     );
     assert!(
-        search.contains(
-            "run replace lane=workspace_search search_workspace(connected_rpc, explorer_sent_query) -> explorer_results_loaded _"
+        guest.contains(
+            "workspace_search(sent_query, search_serial) when connected && !empty(sent_query)"
         ),
-        "the search must be sent for the captured string itself"
+        "the search must be run for the captured string itself"
     );
     // THE ARM. A flag could never carry this: `searching` is down and the hits
     // are empty for a zero-hit answer no matter what is in the box.
@@ -216,7 +214,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
     // query whose box has been emptied.
     assert!(
-        search.contains("explorer_sent_query = \"\""),
+        ice_handler_body(&guest, "clear_explorer_search").contains("sent_query = \"\""),
         "clearing the box must take the standing answer with it"
     );
 }
@@ -350,13 +348,13 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
 /// authored `.ice` source instead.
 #[test]
 fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
-    // The three surfaces that capture a query. Two app-scope pairs and the
-    // explorer's component-local one; a bare `hits` cannot collide with the
-    // prefixed names, because the match is anchored at the start of the line.
-    const PAIRED: [(&str, &str); 3] = [
+    // The app-scope surfaces that capture a query; a bare `hits` cannot
+    // collide with the prefixed names, because the match is anchored at the
+    // start of the line. A module-owned view keeps its own pair in its own
+    // crate, checked by its own tests.
+    const PAIRED: [(&str, &str); 2] = [
         ("page_search_hits", "page_search_query"),
         ("chat_search_hits", "chat_search_query"),
-        ("explorer_hits", "explorer_sent_query"),
     ];
     let mut walked = 0;
     for (path, source) in ice_sources() {
@@ -387,34 +385,6 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
         "the walk found only {walked} hit-dropping handlers, so it is not \
          reading the sources it claims to"
     );
-}
-
-/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM. The Explorer's
-/// search state is app state (the view is module-owned and sees no endpoint),
-/// so the connect that lands a workspace — a reconnect or a switch — must drop
-/// the standing answer and the search in flight with the ledger it re-bumps,
-/// or a reply issued on one network renders as another's. A tab switch is
-/// not that: it reloads the ledger and leaves the answer standing, as the
-/// retained native screen did.
-#[test]
-fn a_workspace_connect_drops_the_explorer_answer_with_the_ledger() {
-    let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
-    let connect = ice_handler_body(&lifecycle, "workspace_connected");
-    assert!(connect.contains("explorer_generation = explorer_generation + 1"));
-    for line in [
-        "invalidate lane=workspace_search",
-        "explorer_hits = []",
-        "explorer_kinds = []",
-        "explorer_partial = \"\"",
-        "explorer_searching = false",
-        "explorer_sent_query = \"\"",
-    ] {
-        assert!(
-            connect.contains(line),
-            "a connect that leaves the answer standing shows one network's \
-             answer over another's: `{line}`"
-        );
-    }
 }
 
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`

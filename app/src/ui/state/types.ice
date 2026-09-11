@@ -275,14 +275,6 @@ enum NodeIntent
   log_filter
   log_timeline
 
-// what the Explorer view asks of the app: reload the ledger, a clipboard
-// write, a workspace search, or dropping the standing answer
-enum ExplorerIntent
-  refresh
-  copy
-  search
-  clear
-
 // what the Settings view asks of the app: one variant per act the screen
 // offers, each carrying only what the reader typed (a name, a key, a ticket,
 // the key password) — the drafts themselves are the view's
