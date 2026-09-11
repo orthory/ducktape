@@ -19,6 +19,17 @@ use "pages.ice"
 use "rows.ice"
 use "kit.ice"
 
+// WHERE THE COMMENT CARD GOES, read off the document pane's width alone. A
+// wide pane floats it in the margin; a narrower one squeezes the document left
+// to make that margin; below that there is no margin and the card drops
+// full-width into the text, under the block it belongs to. Nothing the kernel
+// holds changes with the placement — the rail, its scope and its drafts are
+// the same in all three.
+enum CommentsMode
+  beside
+  squeeze
+  inline
+
 extern crate::host
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   Subpage(id:str, title:str)
@@ -75,8 +86,15 @@ extern crate::host
   pure forget_draft(drafts:&[str], draft:&str) -> [str]
   pure navigation_link(interaction:bytes) -> str
   pure navigation_comment_line(interaction:bytes) -> i64
-  pure comment_card_offset(anchor_y:f64, viewport_height:f64) -> f64
+  pure comment_card_offset(pane:f64, anchor_y:f64, viewport_height:f64) -> f64
   pure comment_card_height(anchor_y:f64, viewport_height:f64) -> f64
+  pure comments_mode(pane:f64) -> CommentsMode
+  pure document_width(pane:f64, open:bool) -> f64
+  pure comments_card_width(pane:f64) -> f64
+  pure comments_right_anchor(pane:f64) -> f64
+  pure comments_left_inset(pane:f64) -> f64
+  pure comments_reserve(pane:f64, open:bool, anchor_line:i64, card_height:f64) -> EditorReserve
+  pure measured_card_height(current:f64, measured:f64) -> f64
   pure comment_scope_label(blocks:&[PageBlock], scope:&str, page_id:&str, open_threads:i64) -> str
   pure comment_post_target(rows:&[PageCommentThreadRow], thread_id:&str, scope:&str) -> str
   pure scope_groups(rows:[PageCommentThreadRow], scope:&str, page_id:&str) -> [PageCommentGroup]
@@ -105,14 +123,21 @@ extern crate::document_sync
 
 extern crate::editor_view
   PreparedPresentation(reference:bytes, data:bytes, notice:str)
+  EditorReserve(line:i64, height:i64)
   pure presentation_notice(document:&editor, prepared:&PreparedPresentation) -> str
   pure empty_presentation() -> PreparedPresentation
+  pure no_reserve() -> EditorReserve
   editor-highlighter paint(prepared:PreparedPresentation)
-  pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark], focused:bool) -> PreparedPresentation
+  pure document_presentation(document:&editor, menu:MenuState, dark:bool, commented:[i64], marks:[CommentMark], focused:bool, reserve:EditorReserve) -> PreparedPresentation
 
 state
   pointer_y:f64 = 0.0
   comment_anchor_y:f64 = -1.0
+  // The block the open rail anchors to, and the gap its inline card holds open
+  // in the document. Line 0 — the title — is the page-scoped rail's anchor.
+  comment_anchor_line:i64 = 0
+  comments_card_height:f64 = 0.0
+  document_reserve:EditorReserve = no_reserve()
   document_focused = false
   focus_query:i64 = 0
   document_paint:PreparedPresentation = empty_presentation()
@@ -144,6 +169,11 @@ state
   // persisted — a fresh window opens on the default again.
   pages_viewport_width = 1280.0
   pages_viewport_height = 700.0
+  // The document pane — the stack the sensor in `pages.ice` measures, not the
+  // window — because the card is placed against the room the document has.
+  // The default is a WIDE one on purpose: until the sensor has reported, the
+  // card floats in the margin, which is the one placement that moves nothing.
+  pages_pane_width = 1280.0
   sidebar_width = 230.0
   page_menu_open = false
   page_create_open = false
@@ -220,7 +250,7 @@ on session_arrived(item)
   connected = next.connected
   chain = next.chain
   document_dark = next.dark
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
   // A `duck://page/…` link the app was asked to open. The serial moves once
   // per ask, so the same link twice opens the page twice. The register
   // re-keys on `active_page`, so moving it IS the navigation — and the
@@ -277,6 +307,10 @@ on register_arrived(item)
   orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, keep_str(page_moved, block_comment_draft, ""))
   block_comment_draft = keep_str(page_moved, "", block_comment_draft)
   block_comments_open = comments_carry
+  // The gap the card sits in belongs to the card: it goes when the card goes,
+  // and the repaints below are the ones that draw it either way.
+  comment_anchor_line = keep_i64(comments_carry, comment_anchor_line, 0)
+  document_reserve = comments_reserve(pages_pane_width, comments_carry, comment_anchor_line, comments_card_height)
   scope_target = keep_str(comments_carry, scope_target, "")
   scope_pinned = scope_pinned && comments_carry
   reply_thread = keep_str(comments_carry, reply_thread, "")
@@ -312,7 +346,7 @@ on register_arrived(item)
   // The buffer now holds THIS page. Unconditional on purpose: the install is
   // refused only when the decision already found the page unchanged.
   buffer_page = item.active_page
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
   return if !install
   page_saved_text = item.document
   page_refusal = ""
@@ -320,7 +354,7 @@ on register_arrived(item)
   document_menu = initial_menu()
   document_focused = false
   document_error = ""
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on search_arrived(item)
   host_error = item.error
@@ -370,7 +404,7 @@ on save_done(item)
   autosave = "idle"
   return if !untouched
   document = document_editor(item.document)
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on page_autosave_tick
   return if !empty(host_error)
@@ -459,6 +493,11 @@ on use_orphaned_comment_draft(draft)
   scope_target = ""
   scope_pinned = false
   orphaned_comment_drafts = forget_draft(orphaned_comment_drafts, draft)
+  comment_anchor_line = 0
+  let recovered = comments_reserve(pages_pane_width, true, 0, comments_card_height)
+  return if recovered.line == document_reserve.line && recovered.height == document_reserve.height
+  document_reserve = recovered
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on discard_orphaned_comment_draft(draft)
   orphaned_comment_drafts = forget_draft(orphaned_comment_drafts, draft)
@@ -470,6 +509,7 @@ on discard_orphaned_comment_draft(draft)
 // orphan guard, exactly as the card's own × does.
 on toggle_block_comments
   comment_anchor_y = -1.0
+  comment_anchor_line = 0
   return if !empty(host_error)
   return if loading || busy || empty(active_page)
   orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
@@ -480,9 +520,14 @@ on toggle_block_comments
   reply_thread = ""
   reply_draft = ""
   resolved_open = false
+  let toggled_reserve = comments_reserve(pages_pane_width, block_comments_open, 0, comments_card_height)
+  return if toggled_reserve.line == document_reserve.line && toggled_reserve.height == document_reserve.height
+  document_reserve = toggled_reserve
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on close_block_comments
   comment_anchor_y = -1.0
+  comment_anchor_line = 0
   orphaned_comment_drafts = remember_draft(orphaned_comment_drafts, block_comment_draft)
   block_comment_draft = ""
   block_comments_open = false
@@ -491,6 +536,9 @@ on close_block_comments
   reply_thread = ""
   reply_draft = ""
   resolved_open = false
+  return if document_reserve.height == 0
+  document_reserve = no_reserve()
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 // NARROWING NEEDS NO ROUND TRIP: the register answered for the page AND every
 // block on it, so a group header only re-slices the rows already in hand. The
@@ -580,12 +628,12 @@ on document_window_focused
 on document_window_unfocused
   focus_query = focus_query + 1
   document_focused = false
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on document_focus_checked(query, focused)
   return if query != focus_query || focused == document_focused
   document_focused = focused
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on sidebar_resized(dx, _dy)
   sidebar_width = sidebar_width_after_delta(sidebar_width, dx, pages_viewport_width)
@@ -593,6 +641,35 @@ on sidebar_resized(dx, _dy)
 on pages_viewport_changed(width, _height)
   pages_viewport_width = width
   sidebar_width = sidebar_width_after_delta(sidebar_width, 0.0, width)
+
+// THE PANE DECIDES THE PLACEMENT, and the placement decides whether the
+// document owes the card a gap. Both are recomputed on the sensor's own tick,
+// so dragging a window across a threshold moves the card without the rail
+// closing, reloading, or losing what is typed in it.
+//
+// A REPAINT IS THE WHOLE DOCUMENT, so neither this handler nor the one below
+// costs one unless the GAP moved. A sensor reports on every layout the host
+// does and the document behind it can be half a megabyte: repainting it per
+// report spends the guest's tick fuel on a picture identical to the one
+// already on screen, and a large document then traps mid-bootstrap.
+on pages_pane_resized(width, _height)
+  pages_pane_width = width
+  let next = comments_reserve(width, block_comments_open, comment_anchor_line, comments_card_height)
+  return if next.line == document_reserve.line && next.height == document_reserve.height
+  document_reserve = next
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
+
+// The gap is laid out from the card's own measured height, so the card is
+// measured where it is drawn. `measured_card_height` refuses a move under a
+// pixel: the gap must not chase its own occupant.
+on comments_card_measured(_width, height)
+  let measured = measured_card_height(comments_card_height, height)
+  return if measured == comments_card_height
+  comments_card_height = measured
+  let next = comments_reserve(pages_pane_width, block_comments_open, comment_anchor_line, measured)
+  return if next.line == document_reserve.line && next.height == document_reserve.height
+  document_reserve = next
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 on toggle_page_menu
   page_menu_open = !page_menu_open
@@ -605,7 +682,7 @@ on close_page_menu
 on document_committed(next)
   document_history = next.history
   document_menu = next.menu
-  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused)
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
   let comment_line = navigation_comment_line(next.interaction)
   // The refusal describes an edit that was already rolled back; the next
   // keystroke is the reader moving on from it.
@@ -628,6 +705,15 @@ on document_committed(next)
   // line is on screen.
   comment_anchor_y = pointer_y
   block_comments_open = true
+  // …and inline there is no margin to float in, so the line the badge was
+  // pressed on holds the gap open below itself. The repaint above drew the
+  // document without it; this one is the gap, and only an inline placement
+  // that actually moved it pays for a second one.
+  comment_anchor_line = comment_line
+  let opened = comments_reserve(pages_pane_width, true, comment_line, comments_card_height)
+  return if opened.line == document_reserve.line && opened.height == document_reserve.height
+  document_reserve = opened
+  document_paint = document_presentation(document, document_menu, document_dark, document_commented, document_marks, document_focused, document_reserve)
 
 // The sensor is the window measure the sidebar clamp needs, and it keys
 // nothing — `#root/pages/document` is still the editor's path.
@@ -661,8 +747,11 @@ view
           subpages
           orphaned_comment_drafts
           block_comments_open
+          pane_width=pages_pane_width
+          comments_right_anchor=comments_right_anchor(pages_pane_width)
+          comments_left_inset=comments_left_inset(pages_pane_width)
           comments_height=comment_card_height(comment_anchor_y, pages_viewport_height)
-          comments_offset=comment_card_offset(comment_anchor_y, pages_viewport_height)
+          comments_offset=comment_card_offset(pages_pane_width, comment_anchor_y, pages_viewport_height)
           scope_target
           scope_pinned
           // ONE SCOPE DECIDES THE WHOLE CARD — its title, its groups, its
@@ -685,6 +774,8 @@ view
           search_pages_submit -> search_pages_submit
           clear_page_search -> clear_page_search
           resize_sidebar -> sidebar_resized _ _
+          resize_pane -> pages_pane_resized _ _
+          measure_comments_card -> comments_card_measured _ _
           toggle_page_menu -> toggle_page_menu
           close_page_menu -> close_page_menu
           arm_page_delete -> arm_page_delete

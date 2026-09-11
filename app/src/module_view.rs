@@ -5543,6 +5543,243 @@ pub(crate) mod tests {
         )
     }
 
+    /// The node a pages view reads for the placement evidence, canned for this
+    /// thread: a long page — a document that fills the pane at every window
+    /// width the card is measured in — and a real conversation on one of its
+    /// paragraphs, so the card in the picture is a card and not a plate.
+    fn can_a_commented_page() {
+        let blocks = (1..=80).map(|n| {
+            serde_json::json!({
+                "id": format!("alpha-{n}"), "parent": "alpha", "page": "alpha",
+                "kind": "paragraph", "checked": false, "children": [],
+                "text": format!("Paragraph {n}: editable document text.")
+            })
+        });
+        let page = std::iter::once(serde_json::json!({
+            "id": "alpha", "parent": null, "page": "alpha", "kind": "page",
+            "text": "Alpha", "checked": false,
+            "children": (1..=80).map(|n| format!("alpha-{n}")).collect::<Vec<_>>()
+        }))
+        .chain(blocks)
+        .collect::<Vec<_>>();
+        can_reads([
+            (
+                "all",
+                serde_json::json!({ "accounts": [
+                    { "number": 1, "name": "Ada Lovelace", "keys": [] },
+                    { "number": 2, "name": "Bo Chen", "keys": [] }
+                ]}),
+            ),
+            (
+                "list_pages",
+                serde_json::json!({ "pages": {
+                    "pages": [{ "id": "alpha", "title": "Alpha", "parent": null },
+                              { "id": "beta", "title": "Beta", "parent": null }],
+                    "has_more": false, "next_after": null
+                }}),
+            ),
+            (
+                "get_page",
+                serde_json::json!({ "page": { "blocks": page, "next_after": null }}),
+            ),
+            (
+                "threads_for_targets",
+                serde_json::json!({ "threads": [{ "target": "alpha-7", "threads": [
+                    { "id": "t-block", "target": "alpha-7", "opener": "acct:1",
+                      "resolved": false, "comments": [
+                        { "id": "c1", "author": "acct:1",
+                          "text": "This paragraph reads backwards." },
+                        { "id": "c2", "author": "acct:2",
+                          "text": "Agreed — the clause order is inverted." }
+                      ] }
+                ]}]}),
+            ),
+        ]);
+    }
+
+    /// The card answers the DOCUMENT PANE, not the window: it floats in the
+    /// margin while there is one, squeezes the document left to make one while
+    /// the document can still spare it, and below that drops full-width onto
+    /// the document's own text column, in a gap the editor holds open for it.
+    ///
+    /// A float TRANSLATES a laid-out child, so `operate` reports where the card
+    /// was laid out, not where it paints. What is asserted here is therefore
+    /// the layout each placement decides — the widths the document and the card
+    /// are actually given; the float's own program is pinned in the view's
+    /// tests, and the screenshots beside each assertion are where the
+    /// translated card is read.
+    #[test]
+    fn pages_comments_answer_the_pane_they_open_in() {
+        use iced::advanced::renderer::Headless as _;
+        use iced_test::runtime::{UserInterface, user_interface};
+
+        #[derive(Default)]
+        struct Bounds {
+            editor: Option<Rectangle>,
+            card: Option<Rectangle>,
+            chip: Option<Rectangle>,
+        }
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, id: Option<&iced::widget::Id>, bounds: Rectangle) {
+                if id
+                    == Some(&iced::widget::Id::from(
+                        "PagesView/root/pages/comments-card",
+                    ))
+                {
+                    self.card = Some(bounds);
+                }
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn iced::advanced::widget::operation::Focusable,
+            ) {
+                if id == Some(&iced::widget::Id::from("PagesView/root/pages/document")) {
+                    self.editor = Some(bounds);
+                }
+            }
+            fn text(&mut self, _: Option<&iced::widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "Comments" {
+                    self.chip = Some(bounds);
+                }
+            }
+        }
+        let _turn = blocking_connection_turn();
+        can_a_commented_page();
+        let props = pages_facts();
+        let path = staged("pages").expect("actual Pages Wasm is required");
+        let directory =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/comments-float-evidence");
+        std::fs::create_dir_all(&directory).unwrap();
+        // The page list and its grip come off the window before the pane the
+        // card answers to: 1500 - 240 = 1260 beside, 1300 - 240 = 1060
+        // squeezing, 1100 - 240 = 860 inline.
+        let measured = |window: f32| {
+            let mut guest = Guest::load_from("pages", &path).unwrap();
+            let mut renderer = crate::frame_probe::headless_renderer();
+            let size = Size::new(window, 700.0);
+            let mut ui = UserInterface::build(
+                guest.render(),
+                size,
+                user_interface::Cache::default(),
+                &mut renderer,
+            );
+            // The pane and the card are measured by sensors, and their answers
+            // reach the guest as ordinary outputs — so the tree settles over a
+            // few passes, exactly as it does on a real window resize.
+            macro_rules! settle {
+                () => {
+                    for _ in 0..8 {
+                        settle_documents(&mut guest, &props);
+                        ui = UserInterface::build(
+                            guest.render(),
+                            size,
+                            ui.into_cache(),
+                            &mut renderer,
+                        );
+                        let mut outputs = Vec::new();
+                        ui.update(
+                            &[Event::Window(
+                                window::Event::RedrawRequested(Instant::now()),
+                            )],
+                            mouse::Cursor::Unavailable,
+                            &mut renderer,
+                            &mut iced::advanced::clipboard::Null,
+                            &mut outputs,
+                        );
+                        for output in outputs {
+                            guest.deliver(output);
+                        }
+                    }
+                };
+            }
+            settle!();
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            // The reader opens the rail the way she does on a real window: by
+            // pressing the header's own chip.
+            let mut bounds = Bounds::default();
+            ui.operate(&renderer, &mut bounds);
+            let chip = bounds.chip.expect("the header comments chip");
+            let position = iced::Point::new(chip.x + chip.width / 2.0, chip.y + chip.height / 2.0);
+            let mut outputs = Vec::new();
+            ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(position),
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut outputs,
+            );
+            for output in outputs {
+                guest.deliver(output);
+            }
+            settle!();
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            let mut bounds = Bounds::default();
+            ui.operate(&renderer, &mut bounds);
+            ui.draw(
+                &mut renderer,
+                &iced::Theme::Light,
+                &renderer::Style {
+                    text_color: iced::Color::BLACK,
+                },
+                mouse::Cursor::Unavailable,
+            );
+            let frame = renderer.screenshot(Size::new(window as u32, 700), 1.0, iced::Color::WHITE);
+            (
+                bounds.editor.expect("document editor"),
+                bounds.card.expect("comment card"),
+                frame,
+            )
+        };
+
+        // BESIDE: the document keeps its 766 surface, less its 62 of padding,
+        // and the card keeps the fixed rail it has always had.
+        let (beside_editor, beside_card, frame) = measured(1500.0);
+        assert_eq!(beside_editor.width, 704.0);
+        assert_eq!(beside_card.width, 340.0);
+        image::RgbaImage::from_raw(1500, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-beside.png"))
+            .unwrap();
+
+        // SQUEEZE: the surface gives up exactly the card and its two gutters,
+        // and what is left still holds both with a gutter to spare.
+        let (squeeze_editor, squeeze_card, frame) = measured(1300.0);
+        assert_eq!(squeeze_editor.width, 1060.0 - 340.0 - 32.0 - 62.0);
+        assert_eq!(squeeze_card.width, 340.0);
+        assert!(
+            squeeze_editor.width + 62.0 + 32.0 + squeeze_card.width <= 1060.0,
+            "a squeezed document and its card must fit the pane side by side: \
+             {squeeze_editor:?} {squeeze_card:?}"
+        );
+        assert!(
+            squeeze_editor.width < beside_editor.width,
+            "squeezing is what makes the margin the card floats in"
+        );
+        image::RgbaImage::from_raw(1300, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-squeeze.png"))
+            .unwrap();
+
+        // INLINE: the document takes its full width back — nothing is beside
+        // it — and the card is laid out at exactly the text column's width.
+        let (inline_editor, inline_card, frame) = measured(1100.0);
+        assert_eq!(inline_editor.width, 704.0);
+        assert_eq!(inline_card.width, inline_editor.width);
+        image::RgbaImage::from_raw(1100, 700, frame)
+            .unwrap()
+            .save(directory.join("floating-comments-inline.png"))
+            .unwrap();
+    }
+
     /// The forge view draws itself against session facts only; everything
     /// on its screen it reads for itself over the kernel contract.
     fn forge_facts() -> Option<Vec<u8>> {

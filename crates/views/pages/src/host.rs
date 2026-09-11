@@ -1696,8 +1696,264 @@ pub fn toggled(ids: Vec<String>, id: &str) -> Vec<String> {
     ids
 }
 
-pub fn comment_card_offset(anchor_y: f64, viewport_height: f64) -> f64 {
-    // The document starts below the 50px header and 1px separator; the card
-    // has a 16px inset. Keep its 400px body above the bottom inset.
-    (anchor_y - 67.0).clamp(0.0, (viewport_height - 483.0).max(0.0))
+/// The pane geometry the card is placed against, in logical pixels. `max-w`
+/// bounds a box INCLUDING its padding, so `DOCUMENT_SURFACE` is the `max-w` the
+/// document arm carries and `DOCUMENT_PADDING` (pl 22 + pr 40) comes off it
+/// before the editor gets its column.
+const DOCUMENT_SURFACE: f64 = 766.0;
+const DOCUMENT_MINIMUM: f64 = 560.0;
+const DOCUMENT_PADDING: f64 = 62.0;
+const DOCUMENT_LEFT_PADDING: f64 = 22.0;
+const DOCUMENT_TOP_PADDING: f64 = 26.0;
+const COMMENTS_CARD: f64 = 340.0;
+const COMMENTS_GAP: f64 = 16.0;
+
+/// The card floats in the margin while the pane holds the document at full
+/// width plus the card and its two gutters; it squeezes the document left
+/// while the document can give up that width and stay readable; below that
+/// there is no margin to float in and the card drops into the text.
+const BESIDE_FLOOR: f64 = DOCUMENT_SURFACE + COMMENTS_CARD + 2.0 * COMMENTS_GAP;
+const SQUEEZE_FLOOR: f64 = DOCUMENT_MINIMUM + COMMENTS_CARD + 2.0 * COMMENTS_GAP;
+
+/// How the card sits against a document pane this wide. View-local derived
+/// state: nothing the kernel holds changes with it, so a window resize
+/// re-decides it on the next sensor tick with the rail, its scope and its
+/// drafts intact.
+pub(crate) fn comments_mode(pane: f64) -> crate::CommentsMode {
+    if pane >= BESIDE_FLOOR {
+        return crate::CommentsMode::Beside;
+    }
+    if pane >= SQUEEZE_FLOOR {
+        return crate::CommentsMode::Squeeze;
+    }
+    crate::CommentsMode::Inline
+}
+
+/// The document arm's `max-w`. Only Squeeze narrows it, by exactly the card and
+/// the gutter on either side of it, so the text reflows left of the card rather
+/// than under it.
+pub fn document_width(pane: f64, open: bool) -> f64 {
+    if !open {
+        return DOCUMENT_SURFACE;
+    }
+    match comments_mode(pane) {
+        crate::CommentsMode::Beside | crate::CommentsMode::Inline => DOCUMENT_SURFACE,
+        crate::CommentsMode::Squeeze => {
+            (pane - COMMENTS_CARD - 2.0 * COMMENTS_GAP).clamp(DOCUMENT_MINIMUM, DOCUMENT_SURFACE)
+        }
+    }
+}
+
+/// The card's own width: the fixed rail, or the document's text column when it
+/// drops inline under the block it belongs to.
+pub fn comments_card_width(pane: f64) -> f64 {
+    match comments_mode(pane) {
+        crate::CommentsMode::Beside | crate::CommentsMode::Squeeze => COMMENTS_CARD,
+        crate::CommentsMode::Inline => (pane.min(DOCUMENT_SURFACE) - DOCUMENT_PADDING).max(1.0),
+    }
+}
+
+/// Where the card lands sideways. A float's geometry is arithmetic on its own
+/// locals — a view module cannot call into it — so the choice of edge travels
+/// as the WEIGHT on the right-edge term: 1 pins the card's right edge a gutter
+/// inside the pane, 0 drops that term and leaves the inset below to place it.
+pub fn comments_right_anchor(pane: f64) -> f64 {
+    match comments_mode(pane) {
+        crate::CommentsMode::Beside | crate::CommentsMode::Squeeze => 1.0,
+        crate::CommentsMode::Inline => 0.0,
+    }
+}
+
+/// What is added to that term: the gutter the card keeps off the pane's right
+/// edge, or — inline — the document's left padding, which puts the card on the
+/// text column it belongs to.
+pub fn comments_left_inset(pane: f64) -> f64 {
+    match comments_mode(pane) {
+        crate::CommentsMode::Beside | crate::CommentsMode::Squeeze => -COMMENTS_GAP,
+        crate::CommentsMode::Inline => DOCUMENT_LEFT_PADDING,
+    }
+}
+
+/// Line 0 is the page title: 22px of glyph at 1.15 between the 4px block pads
+/// `editor_markdown` gives it. A body line is 14px at 1.65 between the same.
+const TITLE_LINE: f64 = 22.0 * 1.15 + 8.0;
+const BODY_LINE: f64 = 14.0 * 1.65 + 8.0;
+/// The card layer's own top edge, and so the origin every offset below is
+/// measured from: the 50px document header and its 1px separator.
+const LAYER_TOP: f64 = 51.0;
+
+/// How far the card may be pushed down and still keep its 400px body above the
+/// pane's bottom inset.
+fn offset_ceiling(viewport_height: f64) -> f64 {
+    (viewport_height - LAYER_TOP - 400.0 - COMMENTS_GAP).max(COMMENTS_GAP)
+}
+
+pub fn comment_card_offset(pane: f64, anchor_y: f64, viewport_height: f64) -> f64 {
+    let ceiling = offset_ceiling(viewport_height);
+    match comments_mode(pane) {
+        crate::CommentsMode::Beside | crate::CommentsMode::Squeeze => {
+            (anchor_y - LAYER_TOP).clamp(COMMENTS_GAP, ceiling)
+        }
+        crate::CommentsMode::Inline => inline_card_offset(anchor_y).clamp(COMMENTS_GAP, ceiling),
+    }
+}
+
+/// Inline, the card sits in the gap the reserve opened under its line: half a
+/// gutter below that line's bottom edge. With no anchored line the scope is the
+/// whole page and the gap is under the title.
+fn inline_card_offset(anchor_y: f64) -> f64 {
+    let page_scope = anchor_y < 0.0;
+    if page_scope {
+        return DOCUMENT_TOP_PADDING + TITLE_LINE + COMMENTS_GAP / 2.0;
+    }
+    // The margin badge is centred on its line, so the pointer that opened the
+    // card is half a body line above that line's bottom edge.
+    anchor_y - LAYER_TOP + BODY_LINE / 2.0 + COMMENTS_GAP / 2.0
+}
+
+/// The gap the editor opens under the anchored line for an inline card: the
+/// card's measured height plus the gutter below it. Zero in every other mode —
+/// a card floating in the margin displaces nothing.
+pub fn comments_reserve(
+    pane: f64,
+    open: bool,
+    anchor_line: i64,
+    card_height: f64,
+) -> crate::editor_view::EditorReserve {
+    let inline = matches!(comments_mode(pane), crate::CommentsMode::Inline);
+    let height = (card_height + COMMENTS_GAP).round().max(0.0) as i64;
+    match open && inline && card_height > 0.0 {
+        true => crate::editor_view::EditorReserve {
+            line: anchor_line.max(0),
+            height,
+        },
+        false => crate::editor_view::EditorReserve::default(),
+    }
+}
+
+/// The card's measured height, in whole pixels and taken up only when it
+/// actually moved: the gap is laid out from this number, so a sub-pixel
+/// remeasure of the card inside it must not re-open the gap it just measured.
+pub fn measured_card_height(current: f64, measured: f64) -> f64 {
+    let moved = (measured - current).abs() > 1.0;
+    match moved {
+        true => measured.round().max(0.0),
+        false => current,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CommentsMode;
+
+    #[test]
+    fn the_three_placements_are_decided_at_their_own_pane_widths() {
+        // 766 of document + 340 of card + two 16px gutters.
+        assert_eq!(BESIDE_FLOOR, 1138.0);
+        // 560 of document at its narrowest, and the same card and gutters.
+        assert_eq!(SQUEEZE_FLOOR, 932.0);
+        for (pane, mode) in [
+            (f64::MAX, CommentsMode::Beside),
+            (1139.0, CommentsMode::Beside),
+            (1138.0, CommentsMode::Beside),
+            (1137.0, CommentsMode::Squeeze),
+            (933.0, CommentsMode::Squeeze),
+            (932.0, CommentsMode::Squeeze),
+            (931.0, CommentsMode::Inline),
+            (0.0, CommentsMode::Inline),
+        ] {
+            assert_eq!(comments_mode(pane), mode, "pane {pane}");
+        }
+    }
+
+    #[test]
+    fn only_a_squeeze_narrows_the_document_and_it_narrows_by_the_card_and_its_gutters() {
+        // Closed, the document keeps its own width at every pane width.
+        for pane in [400.0, 932.0, 1138.0, 2000.0] {
+            assert_eq!(document_width(pane, false), 766.0, "pane {pane}");
+        }
+        assert_eq!(document_width(1138.0, true), 766.0);
+        assert_eq!(document_width(2000.0, true), 766.0);
+        // Squeeze gives up exactly the card and the two gutters …
+        assert_eq!(document_width(1137.0, true), 1137.0 - 340.0 - 32.0);
+        assert_eq!(document_width(1000.0, true), 628.0);
+        // … and meets the document minimum exactly at the inline floor.
+        assert_eq!(document_width(932.0, true), 560.0);
+        // Inline hands the document its full width back and takes the text
+        // column — the surface's own, or the pane's when the pane is narrower.
+        assert_eq!(document_width(931.0, true), 766.0);
+        assert_eq!(comments_card_width(931.0), 766.0 - 62.0);
+        assert_eq!(comments_card_width(600.0), 600.0 - 62.0);
+        assert_eq!(comments_card_width(2000.0), 340.0);
+        assert_eq!(comments_card_width(932.0), 340.0);
+    }
+
+    #[test]
+    fn the_card_floats_right_beside_the_document_and_onto_its_text_column_inline() {
+        // The float in `pages.ice` computes exactly this.
+        let placed = |pane: f64, viewport_width: f64, original_x: f64, card: f64| {
+            (0.0 + viewport_width - original_x - card) * comments_right_anchor(pane)
+                + comments_left_inset(pane)
+                + original_x
+        };
+        // Beside and Squeeze: the card's right edge lands a gutter inside the
+        // pane's right edge, whatever its natural position was.
+        for pane in [2000.0, 1000.0] {
+            assert_eq!(placed(pane, 900.0, 0.0, 340.0) + 340.0, 900.0 - 16.0);
+        }
+        // Inline: the card lands on the text column, 22 into the surface.
+        assert_eq!(placed(800.0, 900.0, 0.0, 340.0), 22.0);
+    }
+
+    #[test]
+    fn an_inline_card_drops_into_the_gap_under_its_line_and_a_floating_one_onto_the_pointer() {
+        // Beside and Squeeze put the card's top on the pointer that opened it:
+        // 51 of header and separator, measured from the layer's own corner.
+        assert_eq!(comment_card_offset(2000.0, 300.0, 900.0), 249.0);
+        assert_eq!(comment_card_offset(1000.0, 300.0, 900.0), 249.0);
+        // A gutter below the separator at the top, and its body above the
+        // bottom inset at the other end.
+        assert_eq!(comment_card_offset(2000.0, 0.0, 900.0), 16.0);
+        assert_eq!(comment_card_offset(2000.0, 5000.0, 900.0), 433.0);
+        // Inline, half a body line below the pointer plus half a gutter.
+        assert_eq!(
+            comment_card_offset(800.0, 300.0, 900.0),
+            300.0 - 51.0 + BODY_LINE / 2.0 + 8.0
+        );
+        // Page scope: under the title, measured from the surface's top padding.
+        assert_eq!(
+            comment_card_offset(800.0, -1.0, 900.0),
+            26.0 + TITLE_LINE + 8.0
+        );
+    }
+
+    #[test]
+    fn only_an_inline_card_reserves_a_gap_and_only_once_it_has_been_measured() {
+        let reserve = comments_reserve(800.0, true, 7, 210.0);
+        assert_eq!(reserve.line, 7);
+        assert_eq!(reserve.height, 226);
+        // Closed, unmeasured, or floating in the margin: nothing is displaced.
+        for (pane, open, height) in [
+            (800.0, false, 210.0),
+            (800.0, true, 0.0),
+            (1000.0, true, 210.0),
+            (2000.0, true, 210.0),
+        ] {
+            assert_eq!(
+                comments_reserve(pane, open, 7, height),
+                crate::editor_view::EditorReserve::default(),
+                "pane {pane} open {open} height {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remeasured_card_reopens_the_gap_only_when_it_actually_moved() {
+        assert_eq!(measured_card_height(0.0, 210.4), 210.0);
+        assert_eq!(measured_card_height(210.0, 210.6), 210.0);
+        assert_eq!(measured_card_height(210.0, 211.0), 210.0);
+        assert_eq!(measured_card_height(210.0, 211.5), 212.0);
+        assert_eq!(measured_card_height(210.0, 190.0), 190.0);
+    }
 }

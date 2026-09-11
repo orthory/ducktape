@@ -1,6 +1,6 @@
 //! The existing Pages Markdown policy copied into a bounded wire presentation.
 //! The guest computes styles and hit ranges; the host alone lays out and paints.
-use crate::{editor_binding, editor_binding::MenuState, markdown};
+use crate::{editor_binding, editor_binding::MenuState, editor_view::EditorReserve, markdown};
 use iced::advanced::text::Highlighter;
 use std::collections::HashMap;
 use ui_lang_guest::{EditorStateView, wire};
@@ -15,7 +15,32 @@ pub fn paint(
     commented: Vec<i64>,
     focused: bool,
 ) -> EditorPresentation {
-    build(state, menu, dark, commented, focused).unwrap_or_default()
+    build(
+        state,
+        menu,
+        dark,
+        commented,
+        focused,
+        EditorReserve::default(),
+    )
+    .unwrap_or_default()
+}
+
+/// The line's own padding, as the host reads it: the LAST non-zero one of the
+/// line's runs wins, so a reserve has to ride on that same padding or it would
+/// erase the nesting indent the line was already owed.
+fn reserved_padding(
+    runs: &[(std::ops::Range<usize>, markdown::Mark)],
+    dark: bool,
+    height: i64,
+) -> iced::Padding {
+    let mut padding = runs
+        .iter()
+        .map(|(_, mark)| markdown::format(mark, dark).line_padding)
+        .rfind(|padding| *padding != iced::Padding::ZERO)
+        .unwrap_or(iced::Padding::ZERO);
+    padding.bottom += height as f32;
+    padding
 }
 
 pub fn build(
@@ -24,6 +49,7 @@ pub fn build(
     dark: bool,
     commented: Vec<i64>,
     focused: bool,
+    reserve: EditorReserve,
 ) -> Result<EditorPresentation, PresentationError> {
     // Keep one paint pass inside the desktop tick budget. The canonical editor
     // remains complete when rich presentation is too dense to publish at once.
@@ -74,8 +100,18 @@ pub fn build(
                 return Err(PresentationError::Limit);
             }
         }
+        // THE GAP IS LAYOUT, NOT PAINT. An inline comment card is a stack layer
+        // over one editor widget — nothing can be inserted between two of its
+        // lines — so the room it needs is taken as bottom padding on the line
+        // it anchors to, and the card floats into what that opens.
+        let reserved_line = reserve.height > 0 && line as i64 == reserve.line;
+        let padded = match reserved_line {
+            true => reserved_padding(&runs, dark, reserve.height),
+            false => iced::Padding::ZERO,
+        };
+        let last_run = runs.len().saturating_sub(1);
         let mut links = Vec::new();
-        for (range, mark) in runs {
+        for (index, (range, mark)) in runs.into_iter().enumerate() {
             if matches!(mark, markdown::Mark::Body(style) if style.link) {
                 links.push(EditorHit {
                     line: line as u32,
@@ -84,15 +120,29 @@ pub fn build(
                     tag: 2,
                 });
             }
-            let format = match formats.get(&mark) {
-                Some(index) => *index,
+            // The host takes the line's padding from its last run that asks for
+            // one, so the reserve rides on that run alone and every other line
+            // keeps sharing the cached format for its mark.
+            let carries_reserve = reserved_line && index == last_run;
+            let cached = match carries_reserve {
+                true => None,
+                false => formats.get(&mark).copied(),
+            };
+            let format = match cached {
+                Some(index) => index,
                 None => {
                     if result.formats.len() == wire::editor_presentation::MAX_EDITOR_FORMATS {
                         return Err(PresentationError::Limit);
                     }
                     let index = result.formats.len() as u16;
-                    result.formats.push(convert(markdown::format(&mark, dark))?);
-                    formats.insert(mark, index);
+                    let mut format = markdown::format(&mark, dark);
+                    if carries_reserve {
+                        format.line_padding = padded;
+                    }
+                    result.formats.push(convert(format)?);
+                    if !carries_reserve {
+                        formats.insert(mark, index);
+                    }
                     index
                 }
             };

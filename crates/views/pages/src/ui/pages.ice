@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, comments_offset:f64, comments_height:f64, scope_target:str, scope_pinned:bool, scope_label:str, thread_total:i64, comment_groups:[PageCommentGroup], resolved_comment_rows:[PageCommentThreadRow], resolved_open:bool, reply_thread:str, expanded_threads:[str], threads_loading:bool, compose_hint:str, bind block_comment_draft:str, bind reply_draft:str)
+component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, pane_width:f64, comments_right_anchor:f64, comments_left_inset:f64, comments_offset:f64, comments_height:f64, scope_target:str, scope_pinned:bool, scope_label:str, thread_total:i64, comment_groups:[PageCommentGroup], resolved_comment_rows:[PageCommentThreadRow], resolved_open:bool, reply_thread:str, expanded_threads:[str], threads_loading:bool, compose_hint:str, bind block_comment_draft:str, bind reply_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -9,6 +9,8 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
     search_pages_submit()
     clear_page_search()
     resize_sidebar(f64, f64)
+    resize_pane(f64, f64)
+    measure_comments_card(f64, f64)
     toggle_page_menu()
     close_page_menu()
     arm_page_delete()
@@ -387,6 +389,12 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
             w=fill
             h=fill
             clip=true
+          // THE PANE IS WHAT THE CARD IS PLACED AGAINST, not the window: the
+          // page list is the reader's to size and the card has to answer to
+          // what it leaves. First layer, so it measures the stack itself and
+          // paints nothing over the document.
+          sensor #pane-measure show=emit(resize_pane, _, _) resize=emit(resize_pane, _, _)
+            space w=fill h=fill
           if !connected
             if empty(host_error)
               EmptyState
@@ -419,11 +427,17 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
             // the item to content, and a `box align-x=center` cannot centre a
             // `w=fill` child. Only shows above 1040 window width; the pane is
             // narrower than the surface at the console's minimum.
+            //
+            // THE SURFACE GIVES WAY IN ONE PLACE ONLY. `document_width` is 766
+            // at every pane width but one: a pane too narrow to hold the
+            // surface, the card and their gutters, but still wide enough for a
+            // readable document beside the card, hands the card its room here
+            // and the text reflows LEFT of the card instead of under it.
             box
               with
                 w=fill
                 h=fill
-                max-w=766.0
+                max-w=document_width(pane_width, block_comments_open)
                 pl=22.0
                 pr=40.0
                 pt=26.0
@@ -647,16 +661,26 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                 EmptyPlate message="No pages matched that search."
           // A stack layer preserves the document's size and scroll position.
           // Only the card floats above it; no backdrop blocks the rest of the page.
+          //
+          // ONE CARD, THREE PLACEMENTS — all of them expressions of the pane
+          // width, none of them a second copy of the card. Beside and Squeeze
+          // push it against the pane's right edge at the line that opened it;
+          // Inline drops it onto the document's own text column, into the gap
+          // `comments_reserve` holds open under that line.
+          //
+          // THE LAYER IS THE CARD, not a fill-sized sheet over the document.
+          // A stack lays every layer out at its own top-left, so the card's
+          // natural place is the pane's corner and the float carries it from
+          // there — which is also what lets the sensor here measure the CARD.
+          // The inline gap is laid out from that height and nothing else knows
+          // it. The 16px inset the sheet used to supply is in the float
+          // arithmetic now.
           if connected && !empty(active_page) && block_comments_open
-            box
-              with
-                w=fill
-                h=fill
-                p=16.0
-              float x=(viewport_x + viewport_width - original_x - original_width - 16.0) y=comments_offset
+            sensor show=emit(measure_comments_card, _, _) resize=emit(measure_comments_card, _, _)
+              float x=((viewport_x + viewport_width - original_x - original_width) * comments_right_anchor + comments_left_inset) y=comments_offset
                 box #comments-card
                   with
-                    w=340.0
+                    w=comments_card_width(pane_width)
                     h=shrink
                     max-h=comments_height
                     bg=elevated
@@ -825,15 +849,17 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                       // card's scope. A reply has its own box inside its
                       // thread, so this is how a second thread on the same
                       // block is started at all.
-                      // BOUNDED, like the page title in the header: the quote
-                      // is a block's own words and `wrap=none` lays them out
-                      // at their intrinsic width, so without a clipping box a
-                      // long line keeps drawing to the card's edge.
+                      // IT WRAPS, because it is the only line here that quotes
+                      // the reader's own words: a block's text is any length,
+                      // and `wrap=none` cut the quote off at the card's edge
+                      // rather than saying which block the thread opens on.
+                      // Two lines is fine; the clip is the backstop.
                       box w=fill clip=true
                         text compose_hint
                           with
+                            w=fill
                             size=10.5
-                            wrap=none
+                            wrap=word
                             font=code_medium
                             @text-hint
                       row

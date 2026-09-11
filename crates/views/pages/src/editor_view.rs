@@ -4,6 +4,16 @@ use crate::{document_sync::CommentMark, editor_binding::MenuState};
 use ui_lang_guest::{Editor, EditorStateView, wire};
 use wire::editor_presentation::{EditorMargin, EditorPresentation, PresentationError};
 
+/// The gap one line of the document holds open below itself, in whole pixels.
+/// An inline comment card lives in it: the card is a stack layer over the
+/// document, so the space it needs has to come out of the document's own
+/// layout or the card would sit on top of the text it belongs to.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EditorReserve {
+    pub line: i64,
+    pub height: i64,
+}
+
 fn prepare(
     state: EditorStateView<'_>,
     menu: MenuState,
@@ -11,8 +21,9 @@ fn prepare(
     commented: Vec<i64>,
     marks: Vec<CommentMark>,
     focused: bool,
+    reserve: EditorReserve,
 ) -> Result<EditorPresentation, PresentationError> {
-    let mut paint = crate::presentation::build(state, menu, dark, commented, focused)?;
+    let mut paint = crate::presentation::build(state, menu, dark, commented, focused, reserve)?;
     let lines = wire::editor_lines(state.text).count();
     paint.affordances.margin_label = "Open comments".into();
     // Saved anchors can lag unsaved line deletion. The native document also
@@ -42,6 +53,10 @@ pub fn empty_presentation() -> PreparedPresentation {
     PreparedPresentation::default()
 }
 
+pub fn no_reserve() -> EditorReserve {
+    EditorReserve::default()
+}
+
 pub fn document_presentation(
     document: &Editor,
     menu: MenuState,
@@ -49,9 +64,10 @@ pub fn document_presentation(
     commented: Vec<i64>,
     marks: Vec<CommentMark>,
     focused: bool,
+    reserve: EditorReserve,
 ) -> PreparedPresentation {
     let state = document.state_view();
-    let (paint, notice) = match prepare(state, menu, dark, commented, marks, focused) {
+    let (paint, notice) = match prepare(state, menu, dark, commented, marks, focused, reserve) {
         Ok(paint) => (paint, String::new()),
         Err(_) => (EditorPresentation::default(), FORMAT_NOTICE.into()),
     };
