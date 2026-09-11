@@ -957,12 +957,10 @@ on copy_message_link(link)
 // cannot check alone — and each kind maps onto navigation the app ALREADY
 // has: the handler a click on the screen itself would reach, handed the
 // link's field through an echo lane (the one way a handler reaches another).
-// A target that needs two steps (a repo, THEN its item or file) parks a
-// one-shot focus that `forge_repo_loaded` consumes. The protocol adds
-// addresses, never navigation.
-// A DUCKFS ADDRESS IS PUSHED, NOT NAVIGATED: the browser lives in the files
-// view, so the app moves the tab and hands the view the path as a session
-// fact (`fs_route`, with a serial so the same path twice lands twice).
+// AN ADDRESS IS PUSHED, NOT NAVIGATED: the browsers live in the files and
+// forge views, so the app moves the tab and hands the view the address as a
+// session fact (`fs_route` / `forge_link`, each with a serial so the same
+// address twice lands twice). The protocol adds addresses, never navigation.
 // A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
 // addresses a store this app is not connected to, so it opens nothing and
 // says which network it belongs to. A link with no `?net=` is the hand-typed
@@ -997,11 +995,14 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.files
+    // THE FORGE ADDRESSES CROSS AS THE URL ITSELF. The forge view is a guest:
+    // it holds every forge selection and parses the `duck://forge/...`
+    // grammar out of the props it is handed. The host's whole job is to raise
+    // the tab and hand the link over — the tick is what makes two clicks on
+    // the same link two openings.
     DuckKind.forge_repo
-      forge_focus_number = 0
-      forge_focus_path = ""
-      forge_focus_rev = ""
-      forge_focus_seq = 0
+      forge_link = url
+      forge_link_tick = forge_link_tick + 1
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)
@@ -1010,12 +1011,9 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.forge
-      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_item
-      forge_focus_number = link.number
-      forge_focus_path = ""
-      forge_focus_rev = ""
-      forge_focus_seq = link.seq
+      forge_link = url
+      forge_link_tick = forge_link_tick + 1
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)
@@ -1024,12 +1022,9 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.forge
-      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_blob
-      forge_focus_number = 0
-      forge_focus_path = link.path
-      forge_focus_rev = link.rev
-      forge_focus_seq = 0
+      forge_link = url
+      forge_link_tick = forge_link_tick + 1
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)
@@ -1038,7 +1033,6 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.forge
-      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.channel
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony

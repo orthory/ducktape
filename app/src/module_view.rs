@@ -16,7 +16,6 @@
 //! that holds none of them cannot leak one — and a view that traps shows why
 //! in its place instead of taking the window with it.
 
-mod display_budget;
 mod kernel;
 
 pub(crate) mod pages_document;
@@ -455,86 +454,15 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
 
 // ---------- the forge seat ----------
 
-/// The forge view's props as one document: borrowed where the app holds the
-/// fact, folded where the view wants a word or a painted row.
-#[derive(serde::Serialize)]
-struct ForgeProps<'a> {
-    dark: bool,
-    connected: bool,
-    org: &'a str,
-    about: &'a str,
-    tier: &'a str,
-    network_chain_id: &'a str,
-    connected_rpc: &'a str,
-    repos: &'a [crate::backend::ForgeRepo],
-    list_phase: &'static str,
-    open_repo: &'a str,
-    repo_phase: &'static str,
-    branches: &'a [crate::backend::ForgeBranch],
-    tree_branch: &'a str,
-    tab: &'static str,
-    items: &'a [crate::backend::ForgeItem],
-    forge_item_number: i64,
-    item_phase: &'static str,
-    forge_item_kind: &'a str,
-    forge_item_title: &'a str,
-    forge_item_state: &'a str,
-    forge_item_author: &'a str,
-    forge_item_branches: &'a str,
-    forge_item_body: &'a str,
-    forge_item_blocks: &'a [crate::backend::ChatBlock],
-    forge_item_files_changed: i64,
-    forge_item_additions: i64,
-    forge_item_deletions: i64,
-    diff_rows: Vec<crate::backend::DiffLine>,
-    forge_item_diff_truncated: bool,
-    forge_item_merge_oid: &'a str,
-    forge_item_source_oid: &'a str,
-    forge_item_approvals: i64,
-    forge_item_change_requests: i64,
-    forge_item_reviews: &'a [crate::backend::ForgeReview],
-    merge_conflicts: &'a [String],
-    merge_busy: bool,
-    review_verdict: &'static str,
-    review_busy: bool,
-    staged_comments: &'a [crate::backend::ForgeDraftComment],
-    comment_cap_reached: bool,
-    discussion: &'a [crate::backend::ChatMessage],
-    linked_note: &'a [crate::backend::ChatMessage],
-    discussion_clipped: bool,
-    landed_seq: i64,
-    landed_tick: i64,
-    tree_path: &'a str,
-    tree_rev: &'a str,
-    tree_entries: &'a [crate::backend::TreeEntry],
-    tree_born: bool,
-    tree_truncated: bool,
-    tree_phase: &'static str,
-    file_path: &'a str,
-    file_text: &'a str,
-    file_binary: bool,
-    file_truncated: bool,
-    file_picture: bool,
-    file_width: i64,
-    file_height: i64,
-    file_note: &'a str,
-    file_header: &'a str,
-    file_phase: &'static str,
-    drafts_cleared: i64,
-    drafts_scope: &'a str,
-    note_scope: &'a str,
-    note_blocked: bool,
-}
-
-/// The Forge tab: the register the app holds, the repo and item it has
-/// open, the code browse's listing and file, and the discussion, drawn by
-/// the `forge` view. The phases, the tab and the verdict cross as their
-/// enum words; the patch crosses as painted rows; the optional landed note
-/// as a list of at most one. Its intents come back one per act
-/// (`forge_intent`), carrying only what the reader picked or typed.
+/// The Forge tab: the session facts the `forge` view draws itself against,
+/// and nothing else. The repo namespace, one repo's branches and tracker,
+/// the open item with its patch, reviews and discussion, and the code
+/// browse are the VIEW's own reads over the kernel contract. `link` is the
+/// `duck://forge/...` the app's open plane last routed here, counted by
+/// `link_tick` so the same address twice still lands.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
+    reason = "the Ice extern hands the session's facts one by one"
 )]
 pub fn forge_view(
     dark: bool,
@@ -544,215 +472,31 @@ pub fn forge_view(
     tier: &str,
     network_chain_id: &str,
     connected_rpc: &str,
-    repos: &[crate::backend::ForgeRepo],
-    list_phase: crate::ForgePhase,
-    open_repo: &str,
-    repo_phase: crate::ForgePhase,
-    branches: &[crate::backend::ForgeBranch],
-    tree_branch: &str,
-    tab: crate::ForgeTab,
-    items: &[crate::backend::ForgeItem],
-    item_number: i64,
-    item_phase: crate::ForgePhase,
-    item_kind: &str,
-    item_title: &str,
-    item_state: &str,
-    item_author: &str,
-    item_branches: &str,
-    item_body: &str,
-    item_blocks: &[crate::backend::ChatBlock],
-    files_changed: i64,
-    additions: i64,
-    deletions: i64,
-    diff: &str,
-    diff_truncated: bool,
-    merge_oid: &str,
-    source_oid: &str,
-    approvals: i64,
-    change_requests: i64,
-    reviews: &[crate::backend::ForgeReview],
-    merge_conflicts: &[String],
-    merge_busy: bool,
-    review_verdict: crate::ForgeReviewVerdict,
-    review_busy: bool,
-    staged_comments: &[crate::backend::ForgeDraftComment],
-    discussion: &[crate::backend::ChatMessage],
-    linked_note: Option<crate::backend::ChatMessage>,
-    landed_seq: i64,
-    landed_tick: i64,
-    tree_path: &str,
-    tree_rev: &str,
-    tree_entries: &[crate::backend::TreeEntry],
-    tree_born: bool,
-    tree_truncated: bool,
-    tree_phase: crate::ForgeTreePhase,
-    file_path: &str,
-    file_text: &str,
-    file_binary: bool,
-    file_truncated: bool,
-    file_picture: bool,
-    file_width: i64,
-    file_height: i64,
-    file_note: &str,
-    file_header: &str,
-    file_phase: crate::ForgeFilePhase,
-    drafts_cleared: i64,
-    drafts_scope: &str,
-    note_scope: &str,
-    note_blocked: bool,
+    link: &str,
+    link_tick: i64,
 ) -> Element<'static, ModuleViewEvent> {
-    let props = ForgeProps {
-        dark,
-        connected,
-        org,
-        about,
-        tier,
-        network_chain_id,
-        connected_rpc,
-        repos,
-        list_phase: forge_phase_word(list_phase),
-        open_repo,
-        repo_phase: forge_phase_word(repo_phase),
-        branches,
-        tree_branch,
-        tab: match tab {
-            crate::ForgeTab::Code => "code",
-            crate::ForgeTab::Pulls => "pulls",
-            crate::ForgeTab::Issues => "issues",
-        },
-        items,
-        forge_item_number: item_number,
-        item_phase: forge_phase_word(item_phase),
-        forge_item_kind: item_kind,
-        forge_item_title: item_title,
-        forge_item_state: item_state,
-        forge_item_author: item_author,
-        forge_item_branches: item_branches,
-        forge_item_body: item_body,
-        forge_item_blocks: item_blocks,
-        forge_item_files_changed: files_changed,
-        forge_item_additions: additions,
-        forge_item_deletions: deletions,
-        diff_rows: crate::backend::diff_lines(diff),
-        forge_item_diff_truncated: diff_truncated,
-        forge_item_merge_oid: merge_oid,
-        forge_item_source_oid: source_oid,
-        forge_item_approvals: approvals,
-        forge_item_change_requests: change_requests,
-        forge_item_reviews: reviews,
-        merge_conflicts,
-        merge_busy,
-        review_verdict: forge_verdict_word(review_verdict),
-        review_busy,
-        staged_comments,
-        comment_cap_reached: crate::backend::forge_comment_cap_reached(staged_comments),
-        discussion,
-        linked_note: linked_note.as_slice(),
-        discussion_clipped: false,
-        landed_seq,
-        landed_tick,
-        tree_path,
-        tree_rev,
-        tree_entries,
-        tree_born,
-        tree_truncated,
-        tree_phase: match tree_phase {
-            crate::ForgeTreePhase::Loading => "loading",
-            crate::ForgeTreePhase::Ready => "ready",
-            crate::ForgeTreePhase::Failed => "failed",
-        },
-        file_path,
-        file_text,
-        file_binary,
-        file_truncated,
-        file_picture,
-        file_width,
-        file_height,
-        file_note,
-        file_header,
-        file_phase: match file_phase {
-            crate::ForgeFilePhase::Idle => "idle",
-            crate::ForgeFilePhase::Loading => "loading",
-            crate::ForgeFilePhase::Ready => "ready",
-            crate::ForgeFilePhase::Failed => "failed",
-        },
-        drafts_cleared,
-        drafts_scope,
-        note_scope,
-        note_blocked,
-    };
-    module_view(
-        "forge",
-        display_budget::forge(serde_json::to_value(&props).expect("props encode")),
-    )
+    let props = serde_json::json!({
+        "connected": connected,
+        "dark": dark,
+        "org": org,
+        "about": about,
+        "tier": tier,
+        "network_chain_id": network_chain_id,
+        "connected_rpc": connected_rpc,
+        "link": link,
+        "link_tick": link_tick,
+    });
+    module_view("forge", serde_json::to_vec(&props).expect("props encode"))
 }
 
-fn forge_phase_word(phase: crate::ForgePhase) -> &'static str {
-    match phase {
-        crate::ForgePhase::Idle => "idle",
-        crate::ForgePhase::Loading => "loading",
-        crate::ForgePhase::Ready => "ready",
-        crate::ForgePhase::Failed => "failed",
-    }
-}
-
-fn forge_verdict_word(verdict: crate::ForgeReviewVerdict) -> &'static str {
-    match verdict {
-        crate::ForgeReviewVerdict::Comment => "comment",
-        crate::ForgeReviewVerdict::Approve => "approve",
-        crate::ForgeReviewVerdict::RequestChanges => "request_changes",
-    }
-}
-
+/// The two OS doors the forge view asks the app for, plus its host
+/// composer's send. Everything else it does itself.
 pub fn forge_intent(event: &ModuleViewEvent) -> crate::ForgeIntent {
     use crate::ForgeIntent as Intent;
     match event.kind.as_str() {
-        "open_repo" => Intent::OpenRepo,
-        "close_repo" => Intent::CloseRepo,
-        "branch" => Intent::Branch,
-        "tab" => Intent::Tab,
-        "open_item" => Intent::OpenItem,
-        "close_item" => Intent::CloseItem,
-        "merge" => Intent::Merge,
-        "review_pick" => Intent::ReviewPick,
-        "review_submit" => Intent::ReviewSubmit,
-        "comment_stage" => Intent::CommentStage,
-        "comment_drop" => Intent::CommentDrop,
-        "tree" => Intent::Tree,
-        "blob" => Intent::Blob,
         "open_link" => Intent::OpenLink,
         "composer" => Intent::Composer,
         _ => Intent::Copy,
-    }
-}
-
-/// The repo seat a `tab` intent names; a word the screen has no seat for is
-/// the code browse.
-pub fn forge_event_tab(event: &ModuleViewEvent) -> crate::ForgeTab {
-    match event_text(event, "tab").as_str() {
-        "pulls" => crate::ForgeTab::Pulls,
-        "issues" => crate::ForgeTab::Issues,
-        _ => crate::ForgeTab::Code,
-    }
-}
-
-/// The seat an open item belongs to, by its kind: a pull request lights the
-/// Pull requests tab, an issue the Issues tab. A kind the tracker has no seat
-/// for leaves the code browse lit.
-pub fn forge_kind_tab(kind: &str) -> crate::ForgeTab {
-    match kind {
-        "pr" => crate::ForgeTab::Pulls,
-        "issue" => crate::ForgeTab::Issues,
-        _ => crate::ForgeTab::Code,
-    }
-}
-
-/// The verdict a `review_pick` intent names; an unknown word is a comment.
-pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict {
-    match event_text(event, "verdict").as_str() {
-        "approve" => crate::ForgeReviewVerdict::Approve,
-        "request_changes" => crate::ForgeReviewVerdict::RequestChanges,
-        _ => crate::ForgeReviewVerdict::Comment,
     }
 }
 
@@ -1581,24 +1325,10 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "cancel_run",
             "open_run",
         ],
-        "forge" => &[
-            "open_repo",
-            "close_repo",
-            "branch",
-            "tab",
-            "open_item",
-            "close_item",
-            "merge",
-            "review_pick",
-            "review_submit",
-            "comment_stage",
-            "comment_drop",
-            "tree",
-            "blob",
-            "open_link",
-            "copy",
-            "composer",
-        ],
+        // the forge view reads, folds and writes through the kernel: what is
+        // left at the door is the two OS doors. Its discussion composer is a
+        // host surface, so its submit crosses as the surface's own event.
+        "forge" => &["open_link", "copy"],
         // the files view speaks the kernel contract: its reads and writes go
         // through the kernel, and the two events left are the app's own doors
         "files" => &["open_link", "at"],
@@ -3929,7 +3659,7 @@ pub(crate) mod tests {
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
             ("settings", "settings_intent", &[]),
-            ("forge", "forge_intent", &[]),
+            ("forge", "forge_intent", &["composer"]),
             ("pages", "pages_intent", &["edited"]),
             ("chat", "chat_intent", &["composer"]),
         ];
@@ -4776,44 +4506,77 @@ pub(crate) mod tests {
         );
     }
 
-    /// The bundled Forge view through the host: the register, then a repo
-    /// opened from its card as the intent the handler signs — and with the
-    /// item open, the review body leaves as the intent's payload while the
-    /// three reader surfaces are the host's to paint.
+    /// The bundled Forge view through the host on the kernel contract: it
+    /// boots on the offline plate, and once the session says connected it
+    /// reads the repo namespace ITSELF — an `rpc.live` subscription the
+    /// kernel keeps, and an `rpc.query` the kernel refuses here (no node),
+    /// so the refusal is what the screen shows. Its four reader surfaces
+    /// stay the host's to paint. Needs `make views`.
     #[test]
-    fn the_staged_forge_view_boots_takes_the_register_and_opens_a_repo() {
+    fn the_staged_forge_view_boots_and_reads_its_repos_through_the_kernel() {
         let Some(staged) = staged("forge") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
-        guest.redraw(&None);
-        // the whole register as the app encodes it — a literal, since the
-        // document is past `json!`'s recursion limit
-        let props = forge_facts();
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["duckhouse", "core"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        guest.deliver(Output::Activate(button_message(&guest, "Open repo")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "open_repo".into(),
-                detail: r#"{"name":"core"}"#.into(),
-            }]
+        let no_props = None;
+        assert!(
+            !guest.redraw(&no_props),
+            "a booted view with no props is quiet"
         );
+        assert!(
+            texts(&guest).iter().any(|text| text == "Not connected"),
+            "{:?}",
+            texts(&guest)
+        );
+
+        let session = forge_facts();
+        guest.redraw(&session);
+        // one per open slice — the namespace, the repo, the item, the
+        // browse — on the forge plane, plus the item's discussion on the
+        // CHAT plane, which is where a note it draws is committed
+        let planes: std::collections::BTreeSet<&str> = guest
+            .live_subscriptions
+            .iter()
+            .map(|(_, plane)| plane.as_str())
+            .collect();
+        assert_eq!(
+            planes,
+            ["chat", "forge"].into_iter().collect(),
+            "{:?}",
+            guest.live_subscriptions
+        );
+        while guest.redraw(&session) {
+            guest.replies.wait_idle();
+        }
+        let shown = texts(&guest);
+        assert!(
+            shown
+                .iter()
+                .any(|text| text.contains("not connected to a node")),
+            "{shown:?}"
+        );
+        assert!(guest.intents.is_empty(), "{:?}", guest.intents);
+
+        // a block on the forge plane: the live item lands and it reads again
+        let live_id = guest.live_subscriptions[0].0;
+        guest.pending.push(wire::Event::Response {
+            id: live_id,
+            result: Ok(b"{}".to_vec()),
+            done: false,
+        });
+        let ticks = guest.ticks;
+        guest.redraw(&session);
+        assert!(guest.ticks > ticks, "the live item ticked the view");
+
         for surface in ["picture", "forge_markdown", "forge_code", "forge_composer"] {
             assert!(
                 surfaces_of("forge").contains_key(surface),
                 "the host paints the {surface} slot the view leaves"
             );
         }
-        assert!(guest.fault.is_none());
+        assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
     /// A deployment of `module` on the fake node: the staged governance
@@ -7078,32 +6841,14 @@ pub(crate) mod tests {
         )
     }
 
+    /// The forge view draws itself against session facts only; everything
+    /// on its screen it reads for itself over the kernel contract.
     fn forge_facts() -> Option<Vec<u8>> {
         Some(
             br#"{
           "dark": false, "connected": true, "org": "duckhouse", "about": "",
           "tier": "validator", "network_chain_id": "mynet#d0cdf950",
-          "connected_rpc": "http://127.0.0.1:1",
-          "repos": [{"name": "core", "head": "main"}],
-          "list_phase": "ready", "open_repo": "",
-          "repo_phase": "idle", "branches": [], "tree_branch": "", "tab": "code", "items": [],
-          "forge_item_number": 0, "item_phase": "idle", "forge_item_kind": "",
-          "forge_item_title": "", "forge_item_state": "", "forge_item_author": "",
-          "forge_item_branches": "", "forge_item_body": "", "forge_item_blocks": [],
-          "forge_item_files_changed": 0, "forge_item_additions": 0,
-          "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
-          "forge_item_merge_oid": "", "forge_item_source_oid": "",
-          "forge_item_approvals": 0, "forge_item_change_requests": 0,
-          "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
-          "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
-          "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
-          "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
-          "tree_entries": [], "tree_born": false, "tree_truncated": false,
-          "tree_phase": "loading", "file_path": "", "file_text": "",
-          "file_binary": false, "file_truncated": false, "file_picture": false,
-          "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
-          "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
-          "note_scope": "", "note_blocked": true
+          "connected_rpc": "http://127.0.0.1:1", "link": "", "link_tick": 0
         }"#
             .to_vec(),
         )
@@ -7229,128 +6974,6 @@ pub(crate) mod tests {
         Some(encode_chat_props(props, live))
     }
 
-    /// Inspect the guest frame before the host sanitizer, not its already
-    /// sanitized held tree. Resync prevents patch application hiding a loss.
-    fn assert_display_projection_survives_wire(
-        module: &'static str,
-        props: &[u8],
-        expected: &str,
-        actions: &[&str],
-    ) {
-        let path = staged(module).expect("build the actual budget fixture with make views");
-        let mut guest = Guest::load_from(module, &path).expect("actual guest loads");
-        guest.redraw(&None);
-        let supplied = Some(props.to_vec());
-        guest.redraw(&supplied);
-        for action in actions {
-            guest.deliver(Output::Activate(button_message(&guest, action)));
-            guest.redraw(&supplied);
-        }
-        guest.pending.push(wire::Event::Resync);
-        let events = std::mem::take(&mut guest.pending);
-        arm(&mut guest.store);
-        let (bytes,) = guest
-            .tick
-            .call(&mut guest.store, (wire::encode(&events),))
-            .expect("guest full frame");
-        let frame: wire::Frame = wire::decode(&bytes).expect("wire frame");
-        assert!(frame.root.is_some(), "resync emits a full tree");
-        let mut observed = frame.root.clone().unwrap();
-        let supplied: serde_json::Value = serde_json::from_slice(props).unwrap();
-        let omitted = supplied["display_omitted"].as_i64().unwrap();
-        let omitted_text = omitted.to_string();
-        let mut omitted_seen = omitted == 0;
-        let mut expected_seen = false;
-        observed.for_each_mut(&mut |node| {
-            if let wire::Node::Text { key, content, .. } = node {
-                expected_seen |= content.starts_with(expected);
-                omitted_seen |= key.ends_with("/display-omitted") && *content == omitted_text;
-            }
-        });
-        assert!(
-            expected_seen,
-            "{module}: expected actual projected content {expected:?}"
-        );
-        assert!(
-            omitted_seen,
-            "{module}: omitted row count is not rendered as a number"
-        );
-        let mut sanitized = frame.clone();
-        wire::sanitize(&mut sanitized).expect("valid production editor document");
-        assert_eq!(
-            frame.root, sanitized.root,
-            "{module}: sanitizer changed the production projection"
-        );
-    }
-
-    #[test]
-    fn forge_display_projection_bounds_body_diff_and_newest_notes_together() {
-        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
-        facts["open_repo"] = "core".into();
-        facts["forge_item_number"] = 7.into();
-        facts["item_phase"] = "ready".into();
-        facts["forge_item_kind"] = "pr".into();
-        facts["forge_item_state"] = "open".into();
-        facts["forge_item_source_oid"] = "source-oid".into();
-        facts["forge_item_body"] = "body".repeat(16_000).into();
-        facts["forge_item_blocks"] =
-            serde_json::to_value(crate::backend::paragraph_blocks(&format!(
-                "**{}**\n\n{}",
-                "rich body ".repeat(3_000),
-                "plain body ".repeat(3_000)
-            )))
-            .unwrap();
-        facts["discussion"] = (1..=40)
-            .map(|n| {
-                let body = format!("latest-{n} {}", "한글".repeat(400));
-                serde_json::to_value(crate::backend::ChatMessage {
-                    blocks: crate::backend::paragraph_blocks(&body),
-                    body,
-                    ..first_light_at(n)
-                })
-                .unwrap()
-            })
-            .collect::<Vec<_>>()
-            .into();
-        facts["diff_rows"] = serde_json::to_value(crate::backend::diff_lines(&format!(
-            "--- a/main\n+++ b/main\n@@ -1 +1 @@\n-{}\n+{}\n",
-            "old".repeat(10_000),
-            "new".repeat(10_000)
-        )))
-        .unwrap();
-        facts["staged_comments"] = (0..64).map(|n| serde_json::json!({"anchor": format!("a{n}{}", "x".repeat(12_000)), "path": "main", "line": "1", "side": "new", "body": "comment".repeat(2_000)})).collect::<Vec<_>>().into();
-        facts["merge_conflicts"] = vec!["conflict-path".repeat(8_000)].into();
-        let bytes = display_budget::forge(facts);
-        let projected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            projected["discussion"].as_array().unwrap().last().unwrap()["seq"],
-            40
-        );
-        assert_eq!(projected["has_staged_comments"], true);
-        assert_display_projection_survives_wire("forge", &bytes, "latest-40", &[]);
-        assert!(projected["display_omitted"].as_i64().unwrap() > 0);
-        assert!(projected["staged_comments"].as_array().unwrap().is_empty());
-        assert!(projected["merge_conflicts"].as_array().unwrap().is_empty());
-        let path = staged("forge").expect("actual forge wasm");
-        let mut guest = Guest::load_from("forge", &path).unwrap();
-        guest.redraw(&None);
-        let props = Some(bytes);
-        guest.redraw(&props);
-        assert!(
-            texts(&guest)
-                .iter()
-                .any(|text| text.starts_with("Merge conflicts —"))
-        );
-        guest.deliver(Output::Activate(button_message(&guest, "Submit review")));
-        guest.redraw(&props);
-        assert!(
-            guest
-                .intents
-                .iter()
-                .any(|event| event.kind == "review_submit")
-        );
-    }
-
     /// A busy room's whole hot window through the real wire: the newest
     /// message must still read, and the clipped older ones are offered as
     /// history.
@@ -7393,62 +7016,6 @@ pub(crate) mod tests {
         assert!(
             props_text.contains(r#""has_older_history":true"#),
             "the clip is history"
-        );
-        assert!(guest.fault.is_none());
-    }
-
-    /// The forge discussion has the chat stream's shape: 40 notes of 2 KB
-    /// are past the frame's text budget, and the newest note — drawn last —
-    /// must still read; the landing note above the list stays whole.
-    #[test]
-    fn the_newest_discussion_note_still_reads_through_the_wire() {
-        let Some(staged) = staged("forge") else {
-            return;
-        };
-        const ROWS: i64 = 40;
-        let notes: Vec<_> = (1..=ROWS)
-            .map(|seq| {
-                let body = format!("n{seq} {}", "x".repeat(2_000));
-                crate::backend::ChatMessage {
-                    blocks: crate::backend::paragraph_blocks(&body),
-                    body,
-                    ..first_light_at(seq)
-                }
-            })
-            .collect();
-        let landing = crate::backend::ChatMessage {
-            body: "the note a link landed on".into(),
-            blocks: crate::backend::paragraph_blocks("the note a link landed on"),
-            ..first_light_at(1_000)
-        };
-        let mut facts: serde_json::Value = serde_json::from_slice(&forge_facts().unwrap()).unwrap();
-        facts["open_repo"] = "core".into();
-        facts["forge_item_number"] = 7.into();
-        facts["item_phase"] = "ready".into();
-        facts["discussion"] = serde_json::to_value(&notes).unwrap();
-        facts["linked_note"] = serde_json::to_value([&landing]).unwrap();
-        let props = Some(display_budget::forge(facts));
-        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        let newest = format!("n{ROWS} ");
-        assert!(
-            shown.iter().any(|text| text.starts_with(&newest)),
-            "the newest note is blank (fault {:?}): last texts {:?}",
-            guest.fault,
-            shown
-                .iter()
-                .rev()
-                .take(6)
-                .map(|text| &text[..text.len().min(24)])
-                .collect::<Vec<_>>()
-        );
-        assert!(shown.iter().any(|text| text == "the note a link landed on"));
-        assert!(
-            shown
-                .iter()
-                .any(|text| text == "Older comments are not shown.")
         );
         assert!(guest.fault.is_none());
     }
@@ -7798,7 +7365,9 @@ pub(crate) mod tests {
             "files" => (files_facts(), "README.md"),
             "pages" => (pages_facts(), "Alpha"),
             "chat" => (chat_facts(), "first light"),
-            _ => (forge_facts(), "core"),
+            // forge reads its whole screen off the node; what the session
+            // alone paints is the network it is reading
+            _ => (forge_facts(), "duckhouse"),
         }
     }
 
@@ -7884,9 +7453,14 @@ pub(crate) mod tests {
                 );
                 let ticks = guest.ticks;
                 // the first redraw routes the staged requests without another
-                // tick, and the view is quiet after it
-                assert!(!guest.redraw(&None), "{module}");
+                // tick; a view that reads through the kernel then has those
+                // reads in flight, and is quiet once they land
+                let busy = guest.redraw(&None);
                 assert_eq!(guest.ticks, ticks, "{module}");
+                if busy {
+                    settle_documents(guest, &None);
+                }
+                assert!(guest.settled(), "{module}: {:?}", guest.fault);
                 assert!(
                     guest.props_subscription.is_some(),
                     "{module}: the restored view asked for its props again"
@@ -8578,86 +8152,155 @@ pub(crate) mod tests {
         }
     }
 
-    /// With an item open the Forge view leaves the note composer to the
-    /// host: a note typed in the host's composer and sent leaves as the
-    /// `composer` intent with its body, and the typing itself never
-    /// reaches the guest.
+    /// The three doors the Forge view needed and the kernel did not have,
+    /// driven on the kernel's own runtime. None of them names a module:
+    /// `picture.put` stores decoded bytes under whatever surface the view
+    /// asks for (the pages are decoded one by one — each is padded base64
+    /// in its own right), and `host.roster` seats the mention roster for
+    /// whatever composer scope the view built. A door that is handed
+    /// nothing refuses rather than storing an empty slot.
     #[test]
-    fn the_staged_forge_view_hears_a_note_typed_in_the_hosts_composer() {
-        use crate::composer_surface::testing::{Interaction, interact};
-        use crate::editor::{ComposerEvent, RichAction};
+    fn the_kernel_stores_a_picture_and_seats_a_composer_roster() {
         let Some(staged) = staged("forge") else {
             return;
         };
         let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            br#"{
-              "dark": false, "connected": true, "org": "duckhouse", "about": "",
-              "tier": "validator", "network_chain_id": "mynet#d0cdf950",
-              "connected_rpc": "http://127.0.0.1:1",
-              "repos": [{"name": "core", "head": "main"}],
-              "list_phase": "ready", "open_repo": "core",
-              "repo_phase": "ready", "branches": [{"name": "main", "head": "1111"}], "tree_branch": "main", "tab": "issues", "items": [],
-              "forge_item_number": 7, "item_phase": "ready", "forge_item_kind": "issue",
-              "forge_item_title": "Bound every list", "forge_item_state": "open",
-              "forge_item_author": "duck", "forge_item_branches": "", "forge_item_body": "",
-              "forge_item_blocks": [], "forge_item_files_changed": 0, "forge_item_additions": 0,
-              "forge_item_deletions": 0, "diff_rows": [], "forge_item_diff_truncated": false,
-              "forge_item_merge_oid": "", "forge_item_source_oid": "",
-              "forge_item_approvals": 0, "forge_item_change_requests": 0,
-              "forge_item_reviews": [], "merge_conflicts": [], "has_merge_conflicts": false, "merge_busy": false,
-              "review_verdict": "comment", "review_busy": false, "staged_comments": [], "has_staged_comments": false,
-              "comment_cap_reached": false, "discussion": [], "linked_note": [], "discussion_clipped": false, "display_omitted": 0, "display_shortened": false, "display_unavailable": false,
-              "landed_seq": 0, "landed_tick": 0, "tree_path": "", "tree_rev": "",
-              "tree_entries": [], "tree_born": false, "tree_truncated": false,
-              "tree_phase": "loading", "file_path": "", "file_text": "",
-              "file_binary": false, "file_truncated": false, "file_picture": false,
-              "file_width": 0, "file_height": 0, "file_note": "", "file_header": "",
-              "file_phase": "idle", "drafts_cleared": 0, "drafts_scope": "",
-              "note_scope": "forge:core:7", "note_blocked": false
-            }"#
-            .to_vec(),
-        );
-        guest.redraw(&props);
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            3,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode");
+        let png = png.into_inner();
+        // two pages, each padded on its own, exactly as the guest sends them
+        let (head, tail) = png.split_at(png.len() / 2);
+        let put = serde_json::json!({
+            "surface": "forge", "path": "docs/logo.png",
+            "pages": [
+                crate::backend::base64_encode(head),
+                crate::backend::base64_encode(tail),
+            ],
+        });
+        assert!(kernel::answer(
+            &mut guest,
+            "picture",
+            "put",
+            7,
+            &serde_json::to_vec(&put).expect("encodes")
+        ));
+        guest.replies.wait_idle();
+        let mut landed = Vec::new();
+        guest.replies.drain_into(&mut landed);
+        let [wire::Event::Response { id, result, .. }] = landed.as_slice() else {
+            panic!("one answer, got {landed:?}");
+        };
+        assert_eq!(*id, 7);
+        let stored: serde_json::Value =
+            serde_json::from_slice(result.as_ref().expect("stored")).expect("dimensions");
+        assert_eq!(stored, serde_json::json!({ "width": 4, "height": 3 }));
         assert!(
-            surface_names(&guest).contains(&"forge_composer".to_owned()),
-            "the open item leaves the note composer slot: {:?}",
-            surface_names(&guest)
+            crate::backend::stored_picture("forge", "docs/logo.png").is_some(),
+            "the surface holds the picture the view put there"
         );
 
-        // typed in the host's composer, on the item's own document
-        let scope = "forge:core:7";
-        for glyph in ['h', 'i'] {
-            let typed = interact(
-                scope,
-                "note",
-                false,
-                false,
-                Interaction::Editor(ComposerEvent::Apply(RichAction::Edit(
-                    iced::widget::text_editor::Action::Edit(
-                        iced::widget::text_editor::Edit::Insert(glyph),
-                    ),
-                ))),
-            );
-            assert!(typed.is_none(), "an edit stays in the host");
-        }
-        let sent = interact(
-            scope,
-            "note",
-            false,
-            false,
-            Interaction::Editor(ComposerEvent::Submit),
-        )
-        .expect("a send publishes");
+        // a put that names no surface stores nothing
+        assert!(kernel::answer(&mut guest, "picture", "put", 8, b"{}"));
+        guest.replies.wait_idle();
+        let mut landed = Vec::new();
+        guest.replies.drain_into(&mut landed);
+        let [wire::Event::Response { result, .. }] = landed.as_slice() else {
+            panic!("one answer, got {landed:?}");
+        };
+        assert!(result.is_err(), "{result:?}");
+
+        // the composer roster is seated synchronously, under the scope the
+        // view built
+        let scope = "http://127.0.0.1:1\u{1f}forge:core:7";
+        let roster = serde_json::json!({
+            "scope": scope,
+            "members": [{ "key": "aa", "label": "Mallard" }],
+        });
+        assert!(kernel::answer(
+            &mut guest,
+            "host",
+            "roster",
+            9,
+            &serde_json::to_vec(&roster).expect("encodes")
+        ));
+        assert_eq!(
+            crate::composer_surface::testing::roster_of(scope),
+            ["Mallard"],
+            "the composer completes an `@` against what the view read"
+        );
+        assert!(kernel::answer(&mut guest, "host", "roster", 10, b"{}"));
+        // a synchronous door answers into the guest's own pending queue
+        assert!(
+            guest.pending.iter().any(|event| matches!(
+                event,
+                wire::Event::Response { id: 9, result: Ok(_), .. }
+            )),
+            "the seated roster is answered: {:?}",
+            guest.pending
+        );
+        assert!(
+            guest.pending.iter().any(|event| matches!(
+                event,
+                wire::Event::Response { id: 10, result: Err(_), .. }
+            )),
+            "a roster with no scope is refused: {:?}",
+            guest.pending
+        );
+    }
+
+    /// The Forge view leaves its discussion note composer to the host, the
+    /// way Chat does: a send in that surface crosses as the `composer`
+    /// intent carrying the scope it was typed under and its body, and the
+    /// typing itself never reaches the guest. The scope the view builds is
+    /// `<endpoint>\u{1f}<channel>`, which is what the app recovers the item's
+    /// channel from.
+    #[test]
+    fn the_staged_forge_view_hears_a_note_typed_in_the_hosts_composer() {
+        let Some(staged) = staged("forge") else {
+            return;
+        };
+        let mut guest = Guest::load_from("forge", &staged).expect("the view loads");
+        assert!(guest.surfaces.contains_key("forge_composer"));
+        guest.redraw(&None);
         guest.deliver(Output::Surface {
             handler: None,
-            value: sent,
+            value: wire::SurfaceValue::Record {
+                name: "composer".into(),
+                fields: vec![
+                    (
+                        "scope".into(),
+                        wire::SurfaceValue::Str(
+                            "http://127.0.0.1:1\u{1f}forge:core:7".into(),
+                        ),
+                    ),
+                    ("kind".into(), wire::SurfaceValue::Str("note".into())),
+                    ("body".into(), wire::SurfaceValue::Str("hi".into())),
+                    ("id".into(), wire::SurfaceValue::Str("note-1".into())),
+                ],
+            },
         });
         assert!(guest.pending.is_empty(), "the words never reach the guest");
         assert_eq!(guest.intents.len(), 1);
         assert_eq!(guest.intents[0].kind, "composer");
         assert!(guest.intents[0].detail.contains(r#""body":"hi""#));
+        assert_eq!(
+            crate::backend::scope_channel(
+                serde_json::from_str::<serde_json::Value>(&guest.intents[0].detail)
+                    .expect("the intent decodes")["scope"]
+                    .as_str()
+                    .unwrap_or_default(),
+                "http://127.0.0.1:1"
+            ),
+            "forge:core:7",
+            "the app recovers the item's channel from the scope alone"
+        );
         assert!(guest.fault.is_none());
     }
 
