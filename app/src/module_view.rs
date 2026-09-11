@@ -6586,8 +6586,8 @@ pub(crate) mod tests {
                 &mut outputs,
             );
             let after = capture(&mut ui, &mut renderer);
-            let region = |pixels: &[u8], x: usize, width: usize| -> Vec<u8> {
-                (150..500)
+            let region = |pixels: &[u8], x: usize, y: usize, width: usize, height: usize| -> Vec<u8> {
+                (y..y + height)
                     .flat_map(|y| {
                         pixels[(y * 1100 + x) * 4..(y * 1100 + x + width) * 4]
                             .iter()
@@ -6596,12 +6596,12 @@ pub(crate) mod tests {
                     .collect()
             };
             assert!(
-                region(&before, editor.x as usize + 10, 220)
-                    != region(&after, editor.x as usize + 10, 220),
+                region(&before, editor.x as usize + 10, 150, 220, 350)
+                    != region(&after, editor.x as usize + 10, 150, 220, 350),
                 "wheel outside the card must scroll the document"
             );
             assert!(
-                region(&before, 800, 250) == region(&after, 800, 250),
+                region(&before, 800, card.y as usize + 5, 250, card.height as usize - 10) == region(&after, 800, card.y as usize + 5, 250, card.height as usize - 10),
                 "scrolling the document must not scroll the card"
             );
             let directory =
@@ -6610,6 +6610,33 @@ pub(crate) mod tests {
             image::RgbaImage::from_raw(1100, 700, after)
                 .unwrap()
                 .save(directory.join("floating-comments.png"))
+                .unwrap();
+            facts["active_thread"] = "thread-b".into();
+            facts["active_thread_anchor"] = "“Paragraph 7”".into();
+            facts["comments"] = serde_json::json!([{
+                "id": "reply-b", "ordinal": 1, "author": "Reader",
+                "meta": "just now", "text": "Only this thread is shown here."
+            }]);
+            let props = Some(serde_json::to_vec(&facts).unwrap());
+            settle_documents(&mut guest, &props);
+            ui = UserInterface::build(guest.render(), size, ui.into_cache(), &mut renderer);
+            ui.update(
+                &[],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Vec::new(),
+            );
+            ui.operate(&renderer, &mut bounds);
+            assert_eq!(bounds.editor, closed_bounds);
+            assert!(
+                bounds.card.unwrap().height < 400.0,
+                "individual threads fit their content within a bounded card"
+            );
+            let frame = capture(&mut ui, &mut renderer);
+            image::RgbaImage::from_raw(1100, 700, frame)
+                .unwrap()
+                .save(directory.join("individual-comment.png"))
                 .unwrap();
         }
     }
