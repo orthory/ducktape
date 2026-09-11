@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
+component PagesScreen(host_error:str, page_link:str, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -124,7 +124,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
             h=fill
           col w=fill gap=2.0
             for page in pages
-              PageButton page=page selected=(page.id == active_page)
+              PageButton page=page selected=(page.id == active_page) frozen=!empty(host_error)
                 forward
                   choose_page
     box
@@ -135,6 +135,11 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
       space w=1.0 h=1.0
     row w=fill h=fill
       col w=fill h=fill
+        if !empty(host_error)
+          box w=fill p=12.0 bg=danger_bg
+            col w=fill gap=4.0
+              text "Pages could not load" size=13.0 @text-danger
+              text host_error size=12.0 @text-danger
         // The 50px document header bar: the page title and the one
         // always-on trust signal the surface carries.
         if connected && !empty(active_page)
@@ -181,7 +186,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                   with
                     label="Search pages"
                     hint="Search pages…"
-                    disabled=(!connected || page_searching)
+                    disabled=(!empty(host_error) || !connected || page_searching)
                     submit=emit(search_pages_submit)
                     w=190.0
                     p=6.2
@@ -201,6 +206,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 if !empty(trim(page_search_draft)) || !empty(page_search_hits)
                   button -> emit(clear_page_search)
                     with
+                      disabled=!empty(host_error)
                       label="Clear page search"
                       w=28.0
                       h=28.0
@@ -262,7 +268,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                 button -> emit(copy_to_clipboard, page_link, "Page link copied")
                   with
                     label="Copy page link"
-                    disabled=empty(active_page)
+                    disabled=(!empty(host_error) || empty(active_page))
                     w=28.0
                     h=28.0
                     p=0.0
@@ -364,11 +370,14 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
             h=fill
             clip=true
           if !connected
-            EmptyState
-              with
-                title="Not connected"
-                description="Click the network name in the titlebar to pick or reconnect a network."
-          if connected && !loading && empty(active_page)
+            if empty(host_error)
+              EmptyState
+                with
+                  title="Not connected"
+                  description="Click the network name in the titlebar to pick or reconnect a network."
+          if empty(host_error) && connected && loading && empty(active_page)
+            EmptyState title="Loading pages…" description="Waiting for the page list."
+          if empty(host_error) && connected && !loading && empty(active_page)
             EmptyState title="No page selected" description="Create a page from the sidebar."
           if connected && !empty(active_page)
             // NO outer scroll: the editor owns a FINITE viewport and scrolls
@@ -490,6 +499,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                     for child in subpages
                       button -> emit(choose_page, child.id)
                         with
+                          disabled=!empty(host_error)
                           label="Open subpage"
                           description=child.title
                           w=fill
@@ -569,7 +579,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                     h=fill
                   col w=fill gap=1.0
                     for hit in page_search_hits
-                      PageSearchResult hit=hit
+                      PageSearchResult hit=hit frozen=!empty(host_error)
                         forward
                           open_page_search_hit
           // NOTHING MATCHED — A STACK LAYER, NOT A ROW IN THE DOCUMENT COLUMN,
@@ -729,7 +739,7 @@ component PagesScreen(page_link:str, pages:[PageItem], page_create_open:bool, lo
                           align-x=center
                           @text-muted
                     for comment_row in comment_rows
-                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor
+                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
                         forward
                           open_block_comment_thread
                     if threads_has_more
