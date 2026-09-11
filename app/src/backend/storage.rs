@@ -246,8 +246,8 @@ async fn files_picture(
             truncated: false,
             binary: false,
             picture: true,
-            width: i64::from(width),
-            height: i64::from(height),
+            width,
+            height,
         }),
         Err(reason) => Ok(binary_preview(
             generation,

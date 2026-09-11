@@ -461,6 +461,10 @@ pub fn settings_event_tab(event: &ModuleViewEvent) -> crate::ShellTab {
 /// browse are the VIEW's own reads over the kernel contract. `link` is the
 /// `duck://forge/...` the app's open plane last routed here, counted by
 /// `link_tick` so the same address twice still lands.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Ice extern hands the session's facts one by one"
+)]
 pub fn forge_view(
     dark: bool,
     connected: bool,
