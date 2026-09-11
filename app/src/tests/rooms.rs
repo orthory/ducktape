@@ -38,7 +38,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         movers,
         [
             "channel_created",
-            "chat_hit_loaded",
             "chat_updated",
             "choose_channel",
             "choose_dm",
@@ -52,13 +51,13 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
          abandons an in-flight history page, then update this list"
     );
 
-    // And the launches genuinely carry the clear — a mover list alone would pass
-    // with every clear deleted.
+    // And the launches genuinely carry the landing seq — a mover list alone
+    // would pass with every reset deleted, and a stale `chat_land_seq` opens
+    // the next room in the middle of its scrollback.
     for launch in [
         "choose_channel",
         "choose_dm",
         "open_chat_search_hit",
-        "create_channel_submit",
         "reconnect",
         "network_entered",
     ] {
@@ -70,8 +69,9 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             .next()
             .expect("handler body");
         assert!(
-            body.contains("history_loading = false"),
-            "{launch} abandons a history request and must release the flag"
+            body.lines()
+                .any(|line| line.trim_start().starts_with("chat_land_seq = ")),
+            "{launch} moves the reader and must say where the view opens"
         );
     }
 
@@ -223,10 +223,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     app.active_channel = dm.clone();
 
     // a search hit jumps to an ordinary room…
-    let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
-        "general",
-        vec![message(7, "an old message", false)],
-    )));
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data("general")));
     assert!(
         app.active_dm_peer.is_empty(),
         "the peer does not follow the reader into #general"
@@ -234,10 +231,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 
     // …and a landing inside the DM itself keeps him
     app.active_dm_peer = peer.into();
-    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
-        &dm,
-        vec![message(1, "hey", false)],
-    )));
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(&dm)));
     assert_eq!(app.active_dm_peer, peer, "this room IS his DM");
 
     // the resync is the landing with no launch behind it — it moves the room
@@ -245,7 +239,6 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
-        vec![message(9, "in the room she was moved to", false)],
     )));
     assert!(app.active_dm_peer.is_empty());
 
@@ -259,7 +252,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     app.active_channel = "general".into();
     let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
         chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general", Vec::new())
+        ..live_refresh(app.hydration_generation, "general")
     }));
     assert_eq!(
         app.active_dm_peer, peer,
@@ -276,7 +269,6 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "general",
-        Vec::new(),
     )));
     assert_eq!(
         app.active_dm_peer, peer,
@@ -289,10 +281,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     // field, which is the point of there being only one derivation.
     app.dm_peers[0].channel_id = String::new();
     app.active_dm_peer = peer.into();
-    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
-        &dm,
-        vec![message(1, "hey", false)],
-    )));
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(&dm)));
     assert!(app.active_dm_peer.is_empty());
 }
 
@@ -339,10 +328,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.connected_rpc = "http://node-a".into();
     app.rpc = "http://node-b".into();
     app.password = "device-key-password".into();
-    app.selected_message_seq = 1;
-    app.message_action = MessageAction::Editing;
-    app.message_edit_draft = "node a edit".into();
-    app.active_thread_seq = 1;
+    app.chat_edit_seq = 1;
+    app.chat_edit_rev = 2;
+    app.chat_land_seq = 9;
     // The page a `duck://page/…` address asked for is the one pages fact the
     // app still holds — and it named the network being left.
     app.page_route = "node-a-page".into();
@@ -362,10 +350,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
 
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");
-    assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.message_action, MessageAction::Toolbar);
-    assert!(app.message_edit_draft.is_empty());
-    assert_eq!(app.active_thread_seq, 0);
+    assert_eq!(app.chat_edit_seq, 0);
+    assert_eq!(app.chat_edit_rev, 0);
+    assert_eq!(app.chat_land_seq, 0);
     assert!(app.page_route.is_empty());
     // NODE B'S ROOM IS NODE B'S. Same channel id, other endpoint, other
     // instance — and node A's words are still under node A's key, which is
@@ -400,93 +387,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
 }
 
-/// A CLAIM ON THE CARET USED TO HAVE TO DIE WHEN THE CARET LEFT.
-/// `composer_focus` stood in for widget focus the app cannot read, and every
-/// handler that moved the caret owed it a retire — a rule enforced from here,
-/// three mechanical clauses plus a pinned set for the two they could not
-/// name. The discriminant is gone with the descent: a formatting chord is
-/// claimed by the widget that HAS the caret (`RichTextEditor::on_chord`,
-/// ducktape-ui#711) and marks that instance's own content, so nothing has to
-/// guess which composer is focused and nothing can guess wrong.
-/// OPENING THE CHANNEL DRAWER IS NOT A REQUEST TO CLOSE THE THREAD.
-/// `toggle_channel_settings` cleared `active_thread_seq`, the thread's messages
-/// and `reply_editor` on the way in, so a part-typed reply was gone and closing
-/// the drawer gave back an empty one. The main composer's draft survives the
-/// same trip, which is the app's own standard — `reconnect` parks it
-/// deliberately rather than letting a transition eat it.
-///
-/// A NOTE ON HOW THIS WAS FOUND, because the first account of it was wrong.
-/// The live drive that "reproduced" it had clicked (1408, 164) — which with the
-/// rail open is the RAIL's own `×`, not the channel header's `⋯` (that moves to
-/// 1077 when the rail narrows the column). `close_thread` discarding a reply is
-/// by design. The defect is real on the drawer's path and this test is what
-/// proves it: restoring the teardown fails the first assertion below. The fix
-/// was then driven correctly — drawer opened at 1077, Escape, reply intact.
-///
-/// The teardown was never what hid the rail: the screen draws it under
-/// `if active_thread_seq > 0 && !channel_settings_open`. `close_thread` remains
-/// the one route that discards a reply, because that one is a request to.
-#[test]
-fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.loading = false;
-    app.shell_tab = ShellTab::Chat;
-    app.active_channel = "general".into();
-    app.active_thread_seq = 7;
-    app.thread_messages = vec![message(7, "the root", false)];
-    let rail = reply_composer_scope(&app);
-    type_into(&rail, "half a reply");
-
-    let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
-    assert!(app.channel_settings_open, "the drawer opened");
-    assert_eq!(
-        composer_text(&rail),
-        "half a reply",
-        "the drawer does not discard a reply in progress"
-    );
-    assert_eq!(app.active_thread_seq, 7, "and it does not close the thread");
-    assert_eq!(
-        app.thread_messages.len(),
-        1,
-        "nor throw away the thread it was reading"
-    );
-
-    // Closing it gives the rail back exactly as it was.
-    let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
-    assert!(!app.channel_settings_open);
-    assert_eq!(composer_text(&rail), "half a reply");
-    assert_eq!(app.active_thread_seq, 7);
-
-    // The screen is what hides the rail while the drawer is up — the handler
-    // never needed to.
-    let screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(
-        screen.contains("if active_thread_seq > 0 && !channel_settings_open"),
-        "the rail is drawn under the drawer's own gate"
-    );
-    let chat = inlined(include_str!("../ui/handlers/chat.ice"));
-    let arm = chat
-        .split_once("on toggle_channel_settings")
-        .expect("the handler")
-        .1
-        .split_once("\non ")
-        .expect("it ends")
-        .0;
-    // Statements, not prose: the comment above this handler NAMES the
-    // teardown it no longer does, and a substring check over the arm would
-    // read that as the teardown itself. Third time tonight.
-    let statements: Vec<&str> = arm
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with("//"))
-        .collect();
-    assert!(
-        !statements.contains(&"active_thread_seq = 0"),
-        "the drawer must not tear the rail down"
-    );
-}
-
 #[test]
 fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does_not() {
     let channel = |id: &str, head: i64| backend::ChatChannel {
@@ -516,25 +416,15 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
     let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
     assert_eq!(app.active_channel, "random");
     assert_eq!(app.unread_boundary, 30);
-    assert!(app.messages.is_empty());
     app.loading = false;
-    let mut switched = chat_data(
-        "random",
-        vec![
-            message(31, "a", false),
-            message(40, "b", false),
-            message(50, "c", false),
-        ],
-    );
+    let mut switched = chat_data("random");
     switched.channels = vec![channel("general", 100), channel("random", 50)];
     switched.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(switched));
     assert_eq!(app.active_channel, "random");
+    // the boundary is what the view divides on; where the divider lands is
+    // its own fold over the rows it read
     assert_eq!(app.unread_boundary, 30);
-    assert_eq!(
-        backend::first_unread_seq(app.messages.clone(), app.unread_boundary),
-        31
-    );
     assert!(
         !app.rooms
             .iter()
@@ -549,12 +439,11 @@ fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does
     )));
     assert_eq!(app.active_channel, "random");
     assert_eq!(app.unread_boundary, 30);
-    assert_eq!(app.messages.len(), 4);
 
     // Arriving at a caught-up channel shows no divider (boundary 0).
     app.channel_reads =
         backend::mark_channel_read(app.channel_reads.clone(), "general".into(), 100);
-    let mut caught_up = chat_data("general", vec![message(100, "x", false)]);
+    let mut caught_up = chat_data("general");
     caught_up.channels = vec![channel("general", 100), channel("random", 60)];
     caught_up.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(caught_up));
@@ -584,20 +473,18 @@ fn a_burst_of_channel_clicks_lands_on_the_last_one_and_drops_the_replies_it_pass
     assert_ne!(app.chat_generation, for_b);
 
     // One refreshed row is the whole channel list a window loader answers with.
-    let mut late_b = chat_data("b", vec![message(20, "from b", false)]);
+    let mut late_b = chat_data("b");
     late_b.channels = vec![room("b", 20)];
     late_b.generation = for_b;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(late_b));
     assert_eq!(app.active_channel, "c", "b's reply must not take the pane");
-    assert!(app.messages.is_empty());
     assert!(app.loading, "c is still in flight — the plate stays up");
 
-    let mut for_c = chat_data("c", vec![message(30, "from c", false)]);
+    let mut for_c = chat_data("c");
     for_c.channels = vec![room("c", 30)];
     for_c.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(for_c));
     assert_eq!(app.active_channel, "c");
-    assert_eq!(app.messages.len(), 1);
     assert!(!app.loading);
 }
 
@@ -642,7 +529,7 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
             .any(|row| row.channel.id == "eng" && row.unread)
     );
 
-    let mut landed = chat_data("random", vec![message(20, "from random", false)]);
+    let mut landed = chat_data("random");
     landed.channels = vec![room("random", 20)];
     landed.generation = switch;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
@@ -707,7 +594,7 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
     );
 
     // the resync answers off a snapshot taken before either of them
-    let mut landed = live_refresh(app.hydration_generation, "general", Vec::new());
+    let mut landed = live_refresh(app.hydration_generation, "general");
     landed.channels = vec![room("general", 10), room("eng", 40)];
     let _ = app.__update(__DucktapeMessage::LiveResynced(landed));
 
@@ -743,7 +630,6 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     app.active_channel = "general".into();
     app.channels = vec![room("general", 10), room("eng", 40)];
     app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
-    app.messages = vec![message(10, "the last thing she read", false)];
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
@@ -751,11 +637,6 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
         message(11, "while she was away", false),
     )));
 
-    assert_eq!(
-        app.messages.len(),
-        2,
-        "the row folds in either way — it is on screen when she returns"
-    );
     assert!(
         app.rooms
             .iter()
@@ -771,14 +652,9 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     // survived roughly one keystroke without this.
     let plane_only = backend::LiveRefresh {
         chat_loaded: false,
-        ..live_refresh(app.hydration_generation, "general", Vec::new())
+        ..live_refresh(app.hydration_generation, "general")
     };
     let _ = app.__update(__DucktapeMessage::LiveResynced(plane_only));
-    assert_eq!(
-        app.messages.len(),
-        2,
-        "a resync that carried no chat leaves the window alone"
-    );
     assert!(
         app.rooms
             .iter()
@@ -788,8 +664,9 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
     assert_eq!(
-        app.unread_marker_seq, 11,
-        "coming back freezes the divider on what arrived while she was gone"
+        app.unread_boundary, 10,
+        "coming back freezes the boundary on what she had already read, so the \
+         view divides above what arrived while she was gone"
     );
     assert!(
         !app.rooms
@@ -801,7 +678,7 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     // a tab round trip with nothing new must not throw the divider away
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Files));
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(app.unread_marker_seq, 11);
+    assert_eq!(app.unread_boundary, 10);
 }
 
 /// A SUPERSEDED SWITCH'S FAILURE STAYS WITH IT. Nothing serializes the room
@@ -847,7 +724,6 @@ fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands(
     app.settings_user_key = "me".into();
     app.active_channel = "a".into();
     app.channels = vec![room("a", 10), room("b", 20)];
-    app.messages = vec![message(9, "older", false), message(10, "newest", false)];
     app.channel_members = vec![backend::ChatMember {
         key: "me".into(),
         label: "me".into(),
@@ -855,16 +731,11 @@ fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands(
 
     let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
     assert_eq!(app.active_channel, "b");
-    assert!(
-        app.messages.is_empty(),
-        "the old room's rows leave immediately"
-    );
-    assert!(app.channel_members.is_empty(), "so does its member roll");
-    assert!(
-        !app.has_older_history,
-        "there is no page cursor before the load"
-    );
-    assert!(app.loading, "the selected room is fetching one root window");
+    // The ROWS are the view's — it re-reads them off the index the moment its
+    // room key moves. What the app drops on the click is the room facts that
+    // would otherwise wear the last room's badges.
+    assert!(app.channel_members.is_empty(), "its member roll leaves");
+    assert!(app.loading, "the selected room is fetching its record"); 
     assert!(app.post_refusal.is_empty());
 }
 
@@ -892,7 +763,6 @@ fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
         label: "Someone else".into(),
     }];
     app.post_refusal = "channel_archived".into();
-    app.messages = vec![message(10, "in the room she leaves", false)];
     app.dm_peers = vec![backend::DmPeer {
         key: "peer".into(),
         name: "Peer".into(),
@@ -913,16 +783,12 @@ fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
     assert!(app.loading, "this peer has never been read");
 
     // A re-open follows the same no-window-cache path as every channel switch.
-    let mut landed = chat_data(&dm, vec![message(30, "from the peer", false)]);
+    let mut landed = chat_data(&dm);
     landed.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
     let _ = app.__update(__DucktapeMessage::ChooseChannel("locked".into()));
     let _ = app.__update(__DucktapeMessage::ChooseDm("peer".into()));
-    assert!(
-        app.messages.is_empty(),
-        "the stale DM window is not restored"
-    );
-    assert!(app.loading, "the DM's root window is fetched again");
+    assert!(app.loading, "the DM's record is fetched again");
 }
 
 /// A SEARCH HIT PAINTS THE ROOM IT IS JUMPING TO, NOT THE ROOM IT LEFT.
@@ -943,13 +809,12 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
     app.active_channel_name = "general".into();
     app.active_channel_archived = true;
     app.channels = vec![room("general", 10), room("design", 40)];
-    app.messages = vec![message(10, "in general", false)];
     app.channel_members = vec![backend::ChatMember {
         key: "me".into(),
         label: "me".into(),
     }];
 
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("design".into(), 7, 7));
+    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("design".into(), 7));
     assert_eq!(
         app.active_channel, "design",
         "the sidebar moves on the click"
@@ -958,7 +823,10 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
     assert!(!app.active_channel_archived, "not general's badge");
     assert!(app.channel_members.is_empty(), "nor general's roll");
     assert!(app.post_refusal.is_empty());
-    assert!(app.messages.is_empty(), "general's rows leave with general");
+    assert_eq!(
+        app.chat_land_seq, 7,
+        "and the seq the hit named is what the view opens its window around"
+    );
     assert!(
         app.loading,
         "so the skeleton draws for the room being entered"
@@ -1043,9 +911,7 @@ fn unread_indicators_are_wired_client_local_only() {
     }
     let live = inlined(include_str!("../backend/live.rs"));
     assert!(
-        lifecycle.contains(
-            "history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary"
-        )
+        lifecycle.contains("history_view, shell_tab == ShellTab.chat, active_channel_name")
     );
     assert!(live.contains("let reads_live_tail = !history_view && chat_visible"));
     assert!(live.contains("if reads_live_tail"));

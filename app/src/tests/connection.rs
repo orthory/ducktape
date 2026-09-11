@@ -130,86 +130,6 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     );
 }
 
-/// CHAT'S FLOAT MAY NOT OUTLIVE THE QUERY IN THE BOX — and only its zero-hit
-/// arm retires that way. The message field is enter-to-submit and two-way
-/// bound, so a keystroke runs no handler and `done` went on standing over a
-/// string the node never saw: "No messages match" kept asserting about a query
-/// nobody had sent. Hit ROWS are a different thing — they are what the reader
-/// is typing toward — so they stand until a new query is sent or the box is
-/// cleared, exactly as the pages hits float does.
-#[test]
-fn the_chat_float_stands_only_for_the_query_it_was_sent() {
-    // Draft -> submit -> answer: the state a standing float reads.
-    let answered = |draft: &str, hits: Vec<backend::ChatSearchHit>| {
-        let (mut app, _) = Ducktape::__boot();
-        app.connected = true;
-        app.loading = false;
-        // A DRAFT IS NOT A QUERY: the draft is the view's own, and typing
-        // alone runs nothing and captures nothing.
-        assert!(app.chat_search_query.is_empty());
-        let _ = app.__update(__DucktapeMessage::SearchChatSubmit(draft.into()));
-        assert_eq!(app.chat_search_phase, SearchPhase::Searching);
-        assert_eq!(
-            app.chat_search_query, "zzz",
-            "the submit captures the TRIMMED string it sent"
-        );
-        let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
-            backend::ChatSearchData { hits },
-        ));
-        assert_eq!(app.chat_search_phase, SearchPhase::Done);
-        app
-    };
-
-    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY — the view retires it
-    // the moment the draft walks away from `search_query`, with no handler
-    // run.
-    let empty = answered("  zzz  ", Vec::new());
-    assert!(empty.chat_search_hits.is_empty());
-    assert_eq!(empty.chat_search_query, "zzz");
-
-    // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
-    // keystroke, and the float's gate says so on its own `!empty(search_hits)`
-    // term.
-    let rows = answered("zzz", vec![stale_chat_hit()]);
-    assert_eq!(rows.chat_search_hits.len(), 1);
-
-    // A FAILED search never ran, so nothing may stand for it.
-    let mut failed = answered("zzz", Vec::new());
-    let _ = failed.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
-        message: "node refused".into(),
-        committed: false,
-    }));
-    assert_eq!(failed.chat_search_phase, SearchPhase::Idle);
-    assert!(failed.chat_search_query.is_empty());
-    assert_eq!(failed.error, "node refused");
-
-    // AND EVERY DISMISSAL TAKES THE QUERY WITH THE HITS, or the next answer
-    // inherits a string that was never sent for it.
-    for leaving in [
-        __DucktapeMessage::ClearChatSearch,
-        __DucktapeMessage::ChooseChannel("next".into()),
-        __DucktapeMessage::ChooseDm("peer".into()),
-    ] {
-        let mut app = answered("zzz", vec![stale_chat_hit()]);
-        let _ = app.__update(leaving);
-        assert!(
-            app.chat_search_query.is_empty(),
-            "a dismissal must not leave a query standing"
-        );
-    }
-
-    // THE GATE. The float stands while the search is out, while hits are in
-    // hand, or while the box still holds the string the answer speaks for —
-    // and for no other reason, so a zero-hit answer cannot outlive its query.
-    let chat = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
-    assert!(
-        chat.contains(
-            "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
-        ),
-        "the results float must be gated on the query it was sent for"
-    );
-}
-
 /// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
 /// own copy of the same conjunct arm, and a fourth surface would have grown a
 /// fourth; the arithmetic lives in one place now, and the three arms call it.
@@ -249,81 +169,6 @@ fn one_predicate_decides_whether_a_search_answer_still_stands() {
             "every search surface decides through the shared predicate: `{call}`"
         );
     }
-}
-
-/// THE PAIRING IS WALKED, NOT ENUMERATED. An answer and the query it speaks
-/// for are one fact in two fields, so a handler that drops the hits and leaves
-/// the query behind arms the next reply to render an answer nobody asked for —
-/// and the navigation test that checks today's handlers cannot see the
-/// navigation handler added next year. This reads every `on` block in every
-/// authored `.ice` source instead.
-#[test]
-fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
-    // The app-scope surfaces that capture a query; a bare `hits` cannot
-    // collide with the prefixed names, because the match is anchored at the
-    // start of the line. A module-owned view keeps its own pair in its own
-    // crate, checked by its own tests.
-    const PAIRED: [(&str, &str); 1] = [("chat_search_hits", "chat_search_query")];
-    let mut walked = 0;
-    for (path, source) in ice_sources() {
-        for (handler, body) in ice_handlers(&source) {
-            for (hits, query) in PAIRED {
-                // A DROP, not a write: `x = next.hits` is an answer landing.
-                // `keep_` is a conditional drop.
-                let drops = body.lines().any(|line| {
-                    let line = line.trim();
-                    line.starts_with(&format!("{hits} = "))
-                        && (line.ends_with("= []") || line.contains("= keep_"))
-                });
-                if !drops {
-                    continue;
-                }
-                walked += 1;
-                assert!(
-                    body.lines()
-                        .any(|line| line.trim().starts_with(&format!("{query} = "))),
-                    "`on {handler}` in {path} drops `{hits}` and leaves `{query}` \
-                     standing — the plate would speak for a query nobody sent"
-                );
-            }
-        }
-    }
-    assert!(
-        walked >= 8,
-        "the walk found only {walked} hit-dropping handlers, so it is not \
-         reading the sources it claims to"
-    );
-}
-
-/// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
-/// lands you somewhere new exactly the way the pickers do, and must take the
-/// hits and the standing answer with it (the phase back to idle), or the
-/// results float — the one that actually occludes the room you just landed in
-/// — travels along.
-///
-/// This is a DISMISSAL POLICY, not a truth requirement: the search passes an
-/// empty scope and is workspace-wide, so the answer would still be true where
-/// you landed. The reason to drop it is that it is in the way.
-#[test]
-fn the_navigation_resets_take_the_hits_and_the_answer() {
-    // A CREATE LANDS YOU IN THE NEW CHANNEL — the same dismissal
-    // `choose_channel` and `choose_dm` already perform: the lane invalidate
-    // dropped any reply in flight, so nothing else would ever move the phase
-    // again, and the phase goes idle with the hits.
-    let (mut created, _) = Ducktape::__boot();
-    created.loading = false;
-    created.chat_search_hits = vec![stale_chat_hit()];
-    created.chat_search_phase = SearchPhase::Searching;
-    let _ = created.__update(__DucktapeMessage::ChannelCreated(chat_data(
-        "fresh",
-        Vec::new(),
-    )));
-    assert!(created.chat_search_hits.is_empty());
-    assert_eq!(
-        created.chat_search_phase,
-        SearchPhase::Idle,
-        "the invalidated lane drops the reply; the reset must move the phase"
-    );
 }
 
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
@@ -782,39 +627,6 @@ fn a_failed_connect_retries_instead_of_giving_up() {
             "{path} brought back the shared failure arm"
         );
     }
-}
-
-/// A SEARCH THAT ERRORED IS NOT A SEARCH THAT FOUND NOTHING. `search_chat_submit`
-/// empties `chat_search_hits` on its way out, so a phase left non-idle by the
-/// failure route floats "No messages match" — a confident zero-result card beside
-/// an error banner saying the request never landed. One discriminant makes that
-/// state unrepresentable: the float reads `SearchPhase`, so the failure arm
-/// returns it to `Idle` instead of claiming a completed empty result.
-#[test]
-fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
-    let (mut app, _) = Ducktape::__boot();
-    app.loading = false;
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
-    assert_eq!(app.chat_search_phase, SearchPhase::Searching);
-
-    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
-        message: "rpc unreachable".into(),
-        committed: false,
-    }));
-    assert_eq!(
-        app.chat_search_phase,
-        SearchPhase::Idle,
-        "the float has nothing honest to say about a search that never ran"
-    );
-    assert!(app.chat_search_hits.is_empty());
-    assert_eq!(app.error, "rpc unreachable");
-
-    // And the empty result IS still reachable — "done" with no hits is the miss.
-    let _ = app.__update(__DucktapeMessage::SearchChatSubmit("ledger".into()));
-    let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
-        backend::ChatSearchData { hits: Vec::new() },
-    ));
-    assert_eq!(app.chat_search_phase, SearchPhase::Done);
 }
 
 /// THE ZERO-HIT SEARCH CARD MUST STAY DISMISSABLE. The Clear-search × used to

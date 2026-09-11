@@ -72,7 +72,19 @@ pub struct PageSearchHit {
     pub text: String,
 }
 
-/// One comment thread on the open page.
+/// One comment of a thread.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PageComment {
+    pub id: String,
+    pub ordinal: i64,
+    pub author: String,
+    pub meta: String,
+    pub text: String,
+}
+
+/// One comment thread on the open page, WITH its whole conversation: the node
+/// answers threads and comments in one query, so the card draws every thread
+/// expanded and never asks per thread.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PageCommentThread {
     pub id: String,
@@ -81,6 +93,7 @@ pub struct PageCommentThread {
     pub meta: String,
     pub resolved: bool,
     pub comment_count: i64,
+    pub comments: Vec<PageComment>,
 }
 
 /// A thread with the label of the block it anchors on.
@@ -90,14 +103,14 @@ pub struct PageCommentThreadRow {
     pub anchor: String,
 }
 
-/// One comment of the open thread.
+/// The open threads sharing one anchor, under the quote that names it. In page
+/// scope the card lists a group per commented block; in block scope there is
+/// only ever the one.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
-pub struct PageComment {
-    pub id: String,
-    pub ordinal: i64,
-    pub author: String,
-    pub meta: String,
-    pub text: String,
+pub struct PageCommentGroup {
+    pub target: String,
+    pub anchor: String,
+    pub threads: Vec<PageCommentThread>,
 }
 
 // ---------- the session ----------
@@ -230,6 +243,8 @@ pub struct RegisterItem {
     /// plan is diffed against.
     pub document: String,
     pub comment_rows: Vec<PageCommentThreadRow>,
+    /// The page's OUTSTANDING threads — what the header chip counts. A
+    /// resolved thread is filed away, so it is not what the page carries.
     pub thread_total: i64,
     pub commented_hits: Vec<String>,
     pub error: String,
@@ -304,7 +319,7 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         true => Names::default(),
         false => read_names().await,
     };
-    let comment_rows = threads
+    let comment_rows: Vec<PageCommentThreadRow> = threads
         .iter()
         .map(|thread| PageCommentThreadRow {
             anchor: document_sync::comment_anchor_label(
@@ -316,7 +331,7 @@ async fn read_register(requested: &str) -> Result<RegisterItem, String> {
         })
         .collect();
     Ok(RegisterItem {
-        thread_total: count_i64(threads.len()),
+        thread_total: open_thread_count(&comment_rows),
         pages,
         active_page,
         active_page_title,
@@ -518,12 +533,17 @@ fn commented_targets(page_id: &str, threads: &[Value]) -> Vec<String> {
     targets
 }
 
+/// THE GROUPED READ ALREADY ANSWERED THE WHOLE CONVERSATION, so a thread
+/// carries its own comments and the card never asks per thread: every open
+/// thread is drawn expanded off this one read.
 fn comment_thread(thread: &Value, names: &Names) -> PageCommentThread {
-    let live = rows(&thread["comments"])
+    let comments: Vec<PageComment> = rows(&thread["comments"])
         .iter()
         .filter(|comment| !comment["deleted"].as_bool().unwrap_or(false))
-        .count();
-    let comment_count = count_i64(live);
+        .enumerate()
+        .map(|(index, comment)| page_comment(index + 1, comment, names))
+        .collect();
+    let comment_count = count_i64(comments.len());
     let count_label = match comment_count {
         1 => "1 comment".to_string(),
         count => format!("{count} comments"),
@@ -539,6 +559,7 @@ fn comment_thread(thread: &Value, names: &Names) -> PageCommentThread {
         },
         resolved,
         comment_count,
+        comments,
     }
 }
 
@@ -636,66 +657,6 @@ fn short_label(id: &str) -> String {
     label
 }
 
-// ---------- the open thread ----------
-
-/// One item of the open thread's subscription: its comments, or why not.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ThreadItem {
-    pub thread_id: String,
-    pub comments: Vec<PageComment>,
-    pub resolved: bool,
-    pub error: String,
-}
-
-/// The open thread's comments, re-read on every pages block.
-pub fn thread(thread_id: String, target: String, serial: i64) -> iced::Subscription<ThreadItem> {
-    iced::Subscription::run_with((thread_id, target, serial), |key| {
-        let open = (key.0.clone(), key.1.clone());
-        let live = host::subscribe("rpc.live", b"pages");
-        let first = load_thread(open.clone());
-        stream::once(first).chain(live.then(move |_| load_thread(open.clone())))
-    })
-}
-
-async fn load_thread((thread_id, target): (String, String)) -> ThreadItem {
-    match read_thread(&thread_id, &target).await {
-        Ok(item) => item,
-        Err(error) => ThreadItem {
-            thread_id,
-            error,
-            ..ThreadItem::default()
-        },
-    }
-}
-
-async fn read_thread(thread_id: &str, target: &str) -> Result<ThreadItem, String> {
-    let reply = view(json!({ "get_thread": { "thread_id": thread_id } })).await?;
-    let thread = &reply["thread"];
-    if thread.is_null() {
-        return Err("the comment thread was not found".into());
-    }
-    // THE THREAD'S OWN ANCHOR, not the page: a thread an earlier build
-    // anchored on a block is listed under the page but belongs to the block,
-    // and reading it against the wrong target would answer somebody else's
-    // discussion.
-    let anchored_here = text_of(&thread["target"]) == target;
-    if !anchored_here {
-        return Err("the node returned comments for another block".into());
-    }
-    let names = read_names().await;
-    let comments = rows(&thread["comments"])
-        .iter()
-        .filter(|comment| !comment["deleted"].as_bool().unwrap_or(false))
-        .enumerate()
-        .map(|(index, comment)| page_comment(index + 1, comment, &names))
-        .collect();
-    Ok(ThreadItem {
-        thread_id: text_of(&thread["id"]),
-        resolved: thread["resolved"].as_bool().unwrap_or(false),
-        comments,
-        error: String::new(),
-    })
-}
 
 fn page_comment(ordinal: usize, comment: &Value, names: &Names) -> PageComment {
     let ordinal = count_i64(ordinal);
@@ -827,8 +788,6 @@ fn block_kind_wire(kind: &str) -> Result<&'static str, String> {
 pub struct ActItem {
     /// The page a create landed on; empty for every other act.
     pub page: String,
-    /// The thread a comment landed on; empty for every other act.
-    pub thread: String,
     pub error: String,
 }
 
@@ -975,7 +934,6 @@ async fn create_page(title: String) -> Result<ActItem, String> {
     submit(json!({ "create_page": { "page_id": page_id, "title": title, "blocks": [] } })).await?;
     Ok(ActItem {
         page: page_id,
-        thread: String::new(),
         error: String::new(),
     })
 }
@@ -1025,11 +983,7 @@ async fn post_comment(
         "text": text,
     } }))
     .await?;
-    Ok(ActItem {
-        page: String::new(),
-        thread: thread_id,
-        error: String::new(),
-    })
+    Ok(ActItem::default())
 }
 
 /// `ResolveThread` — flip the open thread's resolved flag.
@@ -1417,8 +1371,80 @@ pub fn page_display_title(pages: &[PageItem], id: &str, current: &str) -> String
 }
 
 /// The composer's caption: where a NEW comment will anchor.
-pub fn compose_hint_of(blocks: &[PageBlock], target: &str, page_id: &str) -> String {
-    document_sync::comment_compose_hint(blocks, target, page_id)
+pub fn compose_hint_of(blocks: &[PageBlock], scope: &str, page_id: &str) -> String {
+    document_sync::comment_compose_hint(blocks, scope, page_id)
+}
+
+/// The card's own title, naming the scope it is showing.
+pub fn comment_scope_label(
+    blocks: &[PageBlock],
+    scope: &str,
+    page_id: &str,
+    open_threads: i64,
+) -> String {
+    document_sync::comment_scope_label(blocks, scope, page_id, open_threads)
+}
+
+/// WHERE A COMMENT LANDS. An empty `thread_id` is the card's new-thread
+/// composer and anchors on the scope it is showing; a thread id is a reply and
+/// MUST anchor on that thread's own target — the node validates the pair, so a
+/// block-anchored thread replied to with the page id is refused. A thread id
+/// the list does not carry (a stale card) answers `""`, which the submit
+/// refuses rather than posting somewhere else.
+pub fn comment_post_target(
+    rows: &[PageCommentThreadRow],
+    thread_id: &str,
+    scope: &str,
+) -> String {
+    if thread_id.is_empty() {
+        return scope.to_owned();
+    }
+    rows.iter()
+        .map(|row| &row.thread)
+        .find(|thread| thread.id == thread_id)
+        .map(|thread| thread.target.clone())
+        .unwrap_or_default()
+}
+
+/// THE CHIP COUNTS WHAT IS OUTSTANDING. A resolved thread is filed away
+/// behind its own toggle, so it is not what the page is carrying.
+pub fn open_thread_count(rows: &[PageCommentThreadRow]) -> i64 {
+    count_i64(rows.iter().filter(|row| !row.thread.resolved).count())
+}
+
+/// The rows the card's scope admits: one block's when narrowed, the page's
+/// whole conversation otherwise.
+fn scoped_rows(rows: Vec<PageCommentThreadRow>, scope: &str) -> Vec<PageCommentThreadRow> {
+    if scope.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|row| row.thread.target == scope)
+        .collect()
+}
+
+/// The card's open threads: the scope's slice, grouped under the block each
+/// anchors to. ONE FUNCTION, so the scope cannot be applied to the groups and
+/// not to the settled list beside them.
+pub fn scope_groups(
+    rows: Vec<PageCommentThreadRow>,
+    scope: &str,
+    page_id: &str,
+) -> Vec<PageCommentGroup> {
+    comment_groups(scoped_rows(rows, scope), page_id)
+}
+
+/// The card's settled threads, behind the `Resolved · N` toggle at its foot.
+pub fn scope_resolved(rows: Vec<PageCommentThreadRow>, scope: &str) -> Vec<PageCommentThreadRow> {
+    resolved_rows(scoped_rows(rows, scope))
+}
+
+/// View-local fold state kept or dropped with the card that owns it.
+pub fn kept_ids(keep: bool, ids: Vec<String>) -> Vec<String> {
+    match keep {
+        true => ids,
+        false => Vec::new(),
+    }
 }
 
 /// The margin badges: one per commented block, carrying its thread count.
@@ -1432,11 +1458,6 @@ pub fn comment_marks(
 /// The document lines wearing a commented block's wash.
 pub fn commented_lines(blocks: &[PageBlock], hits: &[String]) -> Vec<i64> {
     document_sync::commented_lines(blocks, hits)
-}
-
-/// Where a thread anchors, in the reader's own words.
-pub fn anchor_label(blocks: &[PageBlock], target: &str, page_id: &str) -> String {
-    document_sync::comment_anchor_label(blocks, target, page_id)
 }
 
 /// The block a caret line sits in — the target a NEW comment anchors on. The
@@ -1520,12 +1541,6 @@ pub fn baseline_at_submitted_title(canonical: &str, submitted: &str) -> String {
     }
 }
 
-/// The draft after a seed the screen pushed itself: the seed when it moved,
-/// the reader's own text otherwise.
-pub fn seeded(moved: bool, seed: &str, draft: &str) -> String {
-    if moved { seed } else { draft }.to_owned()
-}
-
 /// A draft abandoned on a page the reader is leaving, kept so it can be
 /// offered back. An empty draft is nothing to keep, and a draft already held
 /// is not kept twice.
@@ -1569,15 +1584,116 @@ fn decode_navigation(interaction: &[u8]) -> crate::document_sync::Navigation {
     ui_lang_guest::wire::decode(interaction).unwrap_or_default()
 }
 
-/// The floating comment card's height: capped beside an anchored thread, the
-/// whole pane when the rail is the reader's own full-height list.
-pub fn comment_card_height(thread: &str, anchor_y: f64, viewport_height: f64) -> f64 {
+/// A card the reader opened AT A LINE stays near that line, so it is bounded;
+/// the header chip's card is the page's whole conversation and takes the room.
+pub fn comment_card_height(anchor_y: f64, viewport_height: f64) -> f64 {
     let available = (viewport_height - 83.0).max(0.0);
-    if !thread.is_empty() || anchor_y >= 0.0 {
-        available.min(400.0)
-    } else {
-        available
+    match anchor_y >= 0.0 {
+        true => available.min(400.0),
+        false => available,
     }
+}
+
+/// Replies a thread card keeps visible before it folds the rest away. Three
+/// is the Docs threshold: enough to read the shape of a conversation, few
+/// enough that one long thread cannot push every other one off the card.
+const VISIBLE_REPLIES: usize = 3;
+
+/// The words the thread was opened with — the body the card draws under its
+/// author, above the replies. A thread whose every comment was deleted keeps
+/// its row and says so rather than drawing a blank card.
+pub fn opener_text(thread: &PageCommentThread) -> String {
+    match thread.comments.first() {
+        Some(opener) => opener.text.clone(),
+        None => "This comment was deleted.".into(),
+    }
+}
+
+/// The replies under it, held to [`VISIBLE_REPLIES`] until the reader asks.
+pub fn thread_replies(thread: &PageCommentThread, expanded: bool) -> Vec<PageComment> {
+    let replies = thread.comments.iter().skip(1);
+    match expanded {
+        true => replies.cloned().collect(),
+        false => replies.take(VISIBLE_REPLIES).cloned().collect(),
+    }
+}
+
+/// What the fold's own button says, or `""` when there is nothing to fold.
+pub fn reply_toggle_label(thread: &PageCommentThread, expanded: bool) -> String {
+    let hidden = thread.comments.len().saturating_sub(1 + VISIBLE_REPLIES);
+    if hidden == 0 {
+        return String::new();
+    }
+    match expanded {
+        true => "Fewer replies".into(),
+        false => format!("{hidden} more replies"),
+    }
+}
+
+/// The open threads in the card's scope, grouped under the block they anchor
+/// to in the order the document met them — the page's own threads first, since
+/// the grouped query asks for the page before any of its blocks.
+fn comment_groups(rows: Vec<PageCommentThreadRow>, page_id: &str) -> Vec<PageCommentGroup> {
+    let mut groups: Vec<PageCommentGroup> = Vec::new();
+    for row in rows.into_iter().filter(|row| !row.thread.resolved) {
+        let anchors_to_page = row.thread.target == page_id || row.thread.target.is_empty();
+        let target = row.thread.target.clone();
+        match groups.iter_mut().find(|group| group.target == target) {
+            Some(group) => group.threads.push(row.thread),
+            None => groups.push(PageCommentGroup {
+                target,
+                anchor: match anchors_to_page {
+                    true => "This page".into(),
+                    false => row.anchor,
+                },
+                threads: vec![row.thread],
+            }),
+        }
+    }
+    groups
+}
+
+/// The settled threads, kept out of the list and behind their own toggle.
+fn resolved_rows(rows: Vec<PageCommentThreadRow>) -> Vec<PageCommentThreadRow> {
+    rows.into_iter().filter(|row| row.thread.resolved).collect()
+}
+
+pub fn resolved_label(rows: &[PageCommentThreadRow]) -> String {
+    format!(
+        "Resolved · {}",
+        rows.iter().filter(|row| row.thread.resolved).count()
+    )
+}
+
+/// What an empty scope says, naming the scope rather than the whole document.
+pub fn empty_scope_label(scope: &str) -> String {
+    match scope.is_empty() {
+        true => "No comments on this page yet".into(),
+        false => "No comments on this block yet".into(),
+    }
+}
+
+/// The reply box follows the thread the reader picked, and a second press on
+/// the same thread puts it away.
+pub fn reply_thread_after_press(current: &str, pressed: &str) -> String {
+    match current == pressed {
+        true => String::new(),
+        false => pressed.to_owned(),
+    }
+}
+
+/// View-local fold state, as a set of thread ids.
+pub fn expanded(ids: &[String], id: &str) -> bool {
+    ids.iter().any(|held| held == id)
+}
+
+pub fn toggled(ids: Vec<String>, id: &str) -> Vec<String> {
+    if ids.iter().any(|held| held == id) {
+        return ids.into_iter().filter(|held| held != id).collect();
+    }
+    let mut ids = ids;
+    ids.push(id.to_owned());
+    ids
 }
 
 pub fn comment_card_offset(anchor_y: f64, viewport_height: f64) -> f64 {

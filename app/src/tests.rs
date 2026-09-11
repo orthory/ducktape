@@ -15,7 +15,6 @@ mod sends;
 mod settings;
 mod shell;
 mod stream;
-mod threads;
 mod window_lifecycle;
 
 /// EVERY SCREEN BODY, as one string. These are the slot bodies that used to
@@ -176,13 +175,14 @@ fn composer_scope(app: &Ducktape) -> String {
     backend::composer_scope(&app.connected_rpc, &app.active_channel)
 }
 
-/// The rail composer of the thread the app is in.
-fn reply_composer_scope(app: &Ducktape) -> String {
-    backend::thread_scope(
-        &app.connected_rpc,
-        &app.active_channel,
-        app.active_thread_seq,
-    )
+/// The thread a rail test replies into. The rail is the VIEW's now, so the
+/// thread a reply belongs to reaches the app only in the scope the body was
+/// written in — there is no `active_thread_seq` on this side any more.
+const RAIL_THREAD_SEQ: i64 = 7;
+
+/// The rail composer of `thread_seq` in the room the app is in.
+fn reply_composer_scope(app: &Ducktape, thread_seq: i64) -> String {
+    backend::thread_scope(&app.connected_rpc, &app.active_channel, thread_seq)
 }
 
 /// One editor action on a scope's document — the same route a real
@@ -273,9 +273,10 @@ fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
     let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
     let scope = match kind {
         ComposerKind::Message => composer_scope(app),
-        ComposerKind::Reply => reply_composer_scope(app),
-        ComposerKind::Edit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.selected_message_seq),
-        ComposerKind::ThreadEdit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.thread_selected_seq),
+        ComposerKind::Reply => reply_composer_scope(app, RAIL_THREAD_SEQ),
+        ComposerKind::Edit | ComposerKind::ThreadEdit => {
+            backend::edit_scope(&app.connected_rpc, &app.active_channel, app.chat_edit_seq)
+        }
     };
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         kind,
@@ -355,14 +356,11 @@ fn default_ice_color(name: &str) -> iced::Color {
 fn live_refresh(
     generation: i64,
     active_channel: &str,
-    messages: Vec<backend::ChatMessage>,
 ) -> backend::LiveRefresh {
     backend::LiveRefresh {
         generation,
         chat_loaded: true,
         channels: Vec::new(),
-        messages,
-        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
@@ -386,25 +384,16 @@ fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate
     }
 }
 
-fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backend::ChatData {
+fn chat_data(active_channel: &str) -> backend::ChatData {
     backend::ChatData {
         generation: 0,
         channels: Vec::new(),
-        messages,
-        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
-        selected_message_seq: 0,
-        selected_message_rev: 0,
-        selected_message_body: String::new(),
-        active_thread_seq: 0,
-        thread_target_seq: 0,
-        thread_messages: Vec::new(),
-        thread_has_more: false,
     }
 }
 
@@ -438,8 +427,6 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         status: "current".into(),
         height: 1,
         channels: Vec::new(),
-        messages: Vec::new(),
-        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
@@ -486,19 +473,6 @@ fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
         physical_key: iced::keyboard::key::Physical::Code(code),
         location: iced::keyboard::Location::Standard,
         modifiers: iced::keyboard::Modifiers::COMMAND,
-        text: None,
-        repeat: false,
-    }
-}
-
-/// The press the escape ladder answers, as the subscription delivers it.
-fn escape_press() -> __IceKeyPress {
-    __IceKeyPress {
-        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-        modified_key: iced::keyboard::Key::Unidentified,
-        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::empty(),
         text: None,
         repeat: false,
     }

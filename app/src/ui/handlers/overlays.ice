@@ -115,7 +115,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open)
+  let escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open)
   // THE COMPOSER'S FORMATTING CHORDS ARE NOT HERE ANY MORE. They land at the
   // widget that has the caret — `RichTextEditor::on_chord` (ducktape-ui#711)
   // is offered exactly the presses the bubble contract releases — so the
@@ -127,15 +127,6 @@ on global_key_pressed(event)
   return if empty(escape_key) && palette_key == "none"
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
-  thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
-  thread_selected_rev = keep_i64(escape_key == "thread_menu", 0, thread_selected_rev)
-  thread_message_action = close_message_action(escape_key == "thread_menu", thread_message_action)
-  thread_edit_draft = keep_str(escape_key == "thread_menu", "", thread_edit_draft)
-  selected_message_seq = keep_i64(escape_key == "message_menu", 0, selected_message_seq)
-  selected_message_rev = keep_i64(escape_key == "message_menu", 0, selected_message_rev)
-  message_action = close_message_action(escape_key == "message_menu", message_action)
-  message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
-  channel_settings_open = channel_settings_open && escape_key != "channel_settings"
   return if palette_key == "none"
   return if palette_key == "open" && !connected
   invalidate lane=palette_search

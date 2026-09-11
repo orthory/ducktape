@@ -351,27 +351,19 @@ async fn collect_ready_chat_updates(
 /// The complete chat-owned result of one live batch. Ice crosses the extern
 /// boundary once with each list, then assigns the result fields; no delta in
 /// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
+/// THE CHAT TAB'S TIMELINE IS NOT IN HERE. The Chat tab is a module-owned
+/// view on the kernel contract: it re-reads its own room on the same block
+/// this fold runs for. What the app still folds is what OTHER screens read off
+/// the same deltas — the channel list and read cursors the sidebar, the bell
+/// and the tray paint from, the active room's roster the composers complete
+/// mentions against.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatLiveFold {
-    pub messages_changed: bool,
-    pub thread_messages_changed: bool,
-    pub has_older_history: bool,
-    pub selected_message_seq: i64,
-    pub selected_message_rev: i64,
-    pub message_action: crate::MessageAction,
-    pub message_edit_draft: String,
-    pub thread_selected_seq: i64,
-    pub thread_selected_rev: i64,
-    pub thread_message_action: crate::MessageAction,
-    pub thread_edit_draft: String,
     pub channels: Vec<ChatChannel>,
-    pub messages: Vec<ChatMessage>,
-    pub thread_messages: Vec<ChatMessage>,
     pub channel_members: Vec<ChatMember>,
     pub channel_reads: Vec<ChannelRead>,
     pub rooms: Vec<ChatSidebarRow>,
     pub dm_rows: Vec<DmSidebarRow>,
-    pub unread_marker_seq: i64,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
@@ -383,33 +375,9 @@ pub struct ChatLiveFold {
 
 struct ChatFoldState {
     channels: Vec<ChatChannel>,
-    messages: Vec<ChatMessage>,
-    thread_messages: Vec<ChatMessage>,
     channel_members: Vec<ChatMember>,
     active_channel: String,
-    active_thread_seq: i64,
-    history_view: bool,
-    messages_changed: bool,
-    thread_messages_changed: bool,
     refresh_chat: bool,
-}
-
-fn pending_row_matches(messages: &[ChatMessage], id: &str) -> bool {
-    messages
-        .iter()
-        .any(|message| message.pending && message.id == id)
-}
-
-fn contains_committed_seq(messages: &[ChatMessage], seq: i64) -> bool {
-    messages
-        .iter()
-        .any(|message| !message.pending && message.seq == seq)
-}
-
-fn accepts_edit(messages: &[ChatMessage], seq: i64, rev: i64) -> bool {
-    messages.iter().any(|message| {
-        !message.pending && message.seq == seq && !message.deleted && message.rev < rev
-    })
 }
 
 fn fold_channel_created(state: &mut ChatFoldState, channel: ChatChannel) {
@@ -426,116 +394,13 @@ fn fold_channel_archived(state: &mut ChatFoldState, channel_id: String, archived
         chat::client::archive_channel(std::mem::take(&mut state.channels), &channel_id, archived);
 }
 
-fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
+/// A post moves the room's head, which is the whole of what the app reads off
+/// a message now: the unread mark, the sidebar order and the bell all count
+/// heads. The MESSAGE is the chat view's, and it re-reads the room on the same
+/// block this fold runs for.
+fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
     state.channels =
         chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
-    let is_active_channel = channel_id == state.active_channel;
-    let settles_pending = is_active_channel && pending_row_matches(&state.messages, &message.id);
-    let folds_active_window = is_active_channel && (!state.history_view || settles_pending);
-    if folds_active_window {
-        let inserts_committed = !contains_committed_seq(&state.messages, seq);
-        state.messages_changed |= settles_pending || inserts_committed;
-        state.messages = chat::client::merge_posted_message(
-            std::mem::take(&mut state.messages),
-            message.clone(),
-        );
-    }
-}
-
-fn fold_reply(
-    state: &mut ChatFoldState,
-    channel_id: String,
-    seq: i64,
-    root_seq: i64,
-    message: ChatMessage,
-) {
-    state.channels =
-        chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
-    let is_active_channel = channel_id == state.active_channel;
-    let settles_pending =
-        is_active_channel && pending_row_matches(&state.thread_messages, &message.id);
-    let folds_active_window = is_active_channel && (!state.history_view || settles_pending);
-    if folds_active_window {
-        let updates_root = contains_committed_seq(&state.messages, root_seq);
-        state.messages_changed |= updates_root;
-        state.messages =
-            chat::client::bump_reply_summary(std::mem::take(&mut state.messages), root_seq);
-    }
-    let updates_open_thread = is_active_channel && root_seq == state.active_thread_seq;
-    if updates_open_thread {
-        state.thread_messages_changed = true;
-        let thread =
-            chat::client::bump_reply_summary(std::mem::take(&mut state.thread_messages), root_seq);
-        state.thread_messages = chat::client::merge_thread_reply(thread, message);
-    }
-}
-
-fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
-    let folds_active_window = channel_id == state.active_channel && !state.history_view;
-    if folds_active_window {
-        state.messages_changed |= accepts_edit(&state.messages, seq, message.rev);
-        state.messages =
-            chat::client::merge_message_edit(std::mem::take(&mut state.messages), seq, &message);
-    }
-    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
-    if updates_open_thread {
-        state.thread_messages_changed |= accepts_edit(&state.thread_messages, seq, message.rev);
-        state.thread_messages = chat::client::merge_message_edit(
-            std::mem::take(&mut state.thread_messages),
-            seq,
-            &message,
-        );
-    }
-}
-
-fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
-    let folds_active_window = channel_id == state.active_channel && !state.history_view;
-    if folds_active_window {
-        state.messages_changed |= contains_committed_seq(&state.messages, seq);
-        state.messages = chat::client::tombstone_message(std::mem::take(&mut state.messages), seq);
-    }
-    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
-    if updates_open_thread {
-        state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
-        state.thread_messages =
-            chat::client::tombstone_message(std::mem::take(&mut state.thread_messages), seq);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fold_reaction(
-    state: &mut ChatFoldState,
-    channel_id: String,
-    seq: i64,
-    emoji: String,
-    added: bool,
-    reactor: String,
-    by_me: bool,
-) {
-    let folds_active_window = channel_id == state.active_channel && !state.history_view;
-    if folds_active_window {
-        state.messages_changed |= contains_committed_seq(&state.messages, seq);
-        state.messages = chat::client::merge_message_reaction(
-            std::mem::take(&mut state.messages),
-            seq,
-            &emoji,
-            added,
-            &reactor,
-            by_me,
-        );
-    }
-    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
-    if updates_open_thread {
-        state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
-        state.thread_messages = chat::client::merge_message_reaction(
-            std::mem::take(&mut state.thread_messages),
-            seq,
-            &emoji,
-            added,
-            &reactor,
-            by_me,
-        );
-    }
 }
 
 fn fold_membership(state: &mut ChatFoldState, channel_id: String, added: bool, member: ChatMember) {
@@ -567,43 +432,21 @@ fn fold_channel_updated(state: &mut ChatFoldState, channel_id: String, channel: 
 pub fn fold_live_chat(
     deltas: Vec<ChatDelta>,
     channels: Vec<ChatChannel>,
-    messages: Vec<ChatMessage>,
-    thread_messages: Vec<ChatMessage>,
     channel_members: Vec<ChatMember>,
     mut channel_reads: Vec<ChannelRead>,
     dm_peers: Vec<DmPeer>,
     me: String,
     active_channel: String,
-    active_thread_seq: i64,
     history_view: bool,
     chat_visible: bool,
-    has_older_history: bool,
-    unread_boundary: i64,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
     mut active_channel_members_only: bool,
-    selected_message_seq: i64,
-    selected_message_rev: i64,
-    message_action: crate::MessageAction,
-    message_edit_draft: String,
-    thread_selected_seq: i64,
-    thread_selected_rev: i64,
-    thread_message_action: crate::MessageAction,
-    thread_edit_draft: String,
 ) -> ChatLiveFold {
-    // Read before the timeline moves into the fold: the floor it ends on is
-    // compared against this to see whether the render window evicted history.
-    let floor_before = oldest_committed_seq(&messages);
     let mut state = ChatFoldState {
         channels,
-        messages,
-        thread_messages,
         channel_members,
         active_channel,
-        active_thread_seq,
-        history_view,
-        messages_changed: false,
-        thread_messages_changed: false,
         refresh_chat: false,
     };
     for delta in deltas {
@@ -619,28 +462,20 @@ pub fn fold_live_chat(
             ChatDelta::Posted {
                 channel_id,
                 seq,
-                message,
-            } => fold_posted(&mut state, channel_id, seq, message),
+                message: _,
+            } => fold_posted(&mut state, channel_id, seq),
             ChatDelta::Reply {
                 channel_id,
                 seq,
-                root_seq,
-                message,
-            } => fold_reply(&mut state, channel_id, seq, root_seq, message),
-            ChatDelta::Edited {
-                channel_id,
-                seq,
-                message,
-            } => fold_edited(&mut state, channel_id, seq, message),
-            ChatDelta::Deleted { channel_id, seq } => fold_deleted(&mut state, channel_id, seq),
-            ChatDelta::Reaction {
-                channel_id,
-                seq,
-                emoji,
-                added,
-                reactor,
-                by_me,
-            } => fold_reaction(&mut state, channel_id, seq, emoji, added, reactor, by_me),
+                root_seq: _,
+                message: _,
+            } => fold_posted(&mut state, channel_id, seq),
+            // A ROW CHANGING IN PLACE MOVES NOTHING THE APP HOLDS. An edit, a
+            // delete and a reaction all leave the room's head where it was, and
+            // the only reader of a message body is the chat view — which reads
+            // its own room on this very block. Routed and dropped, so a new
+            // delta still has to be named here.
+            ChatDelta::Edited { .. } | ChatDelta::Deleted { .. } | ChatDelta::Reaction { .. } => {}
             ChatDelta::Membership {
                 channel_id,
                 added,
@@ -657,13 +492,8 @@ pub fn fold_live_chat(
     }
     let ChatFoldState {
         channels,
-        messages,
-        thread_messages,
         channel_members,
         active_channel,
-        history_view,
-        messages_changed,
-        thread_messages_changed,
         refresh_chat,
         ..
     } = state;
@@ -699,68 +529,14 @@ pub fn fold_live_chat(
             }),
         }
     }
-    let unread_marker_seq = if unread_boundary <= 0 {
-        0
-    } else {
-        messages
-            .iter()
-            .find(|message| message.seq > unread_boundary)
-            .map_or(0, |message| message.seq)
-    };
     let rooms = chat_sidebar_rooms(channels.clone(), dm_peers.clone(), channel_reads.clone());
     let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
-
-    // THE SERVER OWNS THIS FLAG; THE FOLD MAY ONLY RAISE IT.
-    //
-    // It used to be recomputed here as "the oldest loaded root has seq > 1",
-    // which is a guess and a wrong one: thread replies consume root sequences
-    // without becoming roots, so a channel's very first message routinely sits
-    // at seq 40 and "Load older messages" stood over the true beginning of every
-    // busy room forever. What a live fold DOES know is whether it pushed the
-    // floor up — `bounded_chat_window` evicts from the oldest edge to hold the
-    // render window — and rows this window dropped are older history by
-    // definition, whatever the page load last said.
-    //
-    // A window that held no committed row has no floor to lose: the first live
-    // arrival in an empty room raises the floor from 0 to its own seq, which is
-    // growth, not eviction.
-    let window_had_a_floor = floor_before > 0;
-    let evicted_the_floor = window_had_a_floor && oldest_committed_seq(&messages) > floor_before;
-    let has_older_history = has_older_history || evicted_the_floor;
-    let selection = message_selection_after_window_ref(
-        &messages,
-        selected_message_seq,
-        selected_message_rev,
-        message_action,
-        message_edit_draft,
-    );
-    let thread_selection = message_selection_after_window_ref(
-        &thread_messages,
-        thread_selected_seq,
-        thread_selected_rev,
-        thread_message_action,
-        thread_edit_draft,
-    );
     ChatLiveFold {
-        messages_changed,
-        thread_messages_changed,
-        has_older_history,
-        selected_message_seq: selection.seq,
-        selected_message_rev: selection.rev,
-        message_action: selection.action,
-        message_edit_draft: selection.draft,
-        thread_selected_seq: thread_selection.seq,
-        thread_selected_rev: thread_selection.rev,
-        thread_message_action: thread_selection.action,
-        thread_edit_draft: thread_selection.draft,
         channels,
-        messages,
-        thread_messages,
         channel_members,
         channel_reads,
         rooms,
         dm_rows,
-        unread_marker_seq,
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,
@@ -949,8 +725,6 @@ pub struct LiveRefresh {
     pub generation: i64,
     pub chat_loaded: bool,
     pub channels: Vec<ChatChannel>,
-    pub messages: Vec<ChatMessage>,
-    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
@@ -982,8 +756,6 @@ pub async fn live_resync_load(
             generation,
             chat_loaded: false,
             channels: Vec::new(),
-            messages: Vec::new(),
-            has_older_history: false,
             active_channel: String::new(),
             active_channel_name: String::new(),
             active_channel_archived: false,
@@ -998,8 +770,6 @@ pub async fn live_resync_load(
             load_chat_data(&rpc, (!channel_id.is_empty()).then_some(channel_id.as_str())).await?;
         refresh.chat_loaded = true;
         refresh.channels = chat.channels;
-        refresh.messages = chat.messages;
-        refresh.has_older_history = chat.has_older_history;
         refresh.active_channel = chat.active_channel;
         refresh.active_channel_name = chat.active_channel_name;
         refresh.active_channel_archived = chat.active_channel_archived;
@@ -1056,88 +826,6 @@ pub fn keep_channels(
     upsert_channel_rows(current, next)
 }
 
-/// The oldest COMMITTED root's seq, or 0 for a window holding none. Pending
-/// sends carry a negative seq and answer for nothing — the same rule
-/// `oldest_committed` states in `load.rs`.
-fn oldest_committed_seq(rows: &[ChatMessage]) -> i64 {
-    rows.iter()
-        .find(|row| !row.pending && row.seq > 0)
-        .map_or(0, |row| row.seq)
-}
-
-/// The committed `seq` range of a timeline window, or `None` when it holds no
-/// committed row at all. Pending sends carry `seq == -1` and answer for nothing
-/// (the same rule `oldest_committed` states in `load.rs`).
-fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
-    let mut seqs = rows
-        .iter()
-        .filter(|row| !row.pending && row.seq > 0)
-        .map(|row| row.seq);
-    let first = seqs.next()?;
-    Some(seqs.fold((first, first), |(oldest, newest), seq| {
-        (oldest.min(seq), newest.max(seq))
-    }))
-}
-
-/// FOLD THE RESYNC'S PAGE ONTO THE WINDOW ON SCREEN — do not replace it.
-///
-/// [`load_chat_data`] answers with the latest root-index page no matter how
-/// far back the reader has paged, so assigning it back threw away every
-/// "Load older" page she had
-/// loaded — and, the scrollable staying mounted at `anchor-y=end`, clamped her
-/// offset onto the top of the suddenly-short window. The trigger is ordinary: a
-/// huddle join/leave in the room on screen, a websocket reconnect, a chat op the
-/// delta path cannot fold, or any of the three chat failure resyncs.
-///
-/// So the tail path merges with [`merge_message_send_result`] — union by `seq`
-/// with the canonical row winning on `rev`, pending rows re-appended at the
-/// tail — and regroups, because the retained rows and the canonical page each
-/// carry the author runs of their own page and the seam between them would
-/// otherwise draw a duplicate (or swallow a) run header.
-///
-/// A SPLICE THAT DOES NOT TOUCH REPLACES INSTEAD, and the fresh page wins.
-/// Merging two windows that do not overlap leaves a HOLE in the middle that
-/// nothing can ever page in: "Load older" walks back from `oldest_message_seq`,
-/// which is now the far-back end, so it steps past the gap forever
-/// (`handlers/chat.ice` states the same hazard for the search window). This is
-/// what `ModuleEvent::Lagged` can produce: the missed ops are never replayed,
-/// so the canonical page can start past the newest row on screen. One
-/// overlapping `seq` is the whole test — thread replies leave gaps in the root
-/// sequence, so "the pages abut" is not `+1`. A paged window that still
-/// overlaps the canonical tail remains continuous and keeps the rows the
-/// reader loaded.
-pub fn resynced_messages(
-    loaded: bool,
-    chain_moved: bool,
-    next: Vec<ChatMessage>,
-    current: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-) -> Vec<ChatMessage> {
-    // the plane-only resync, which is most of them: no chat came back, so the
-    // window on screen IS the answer and the merge below is never paid for.
-    if !loaded {
-        return current;
-    }
-    // ACROSS A NETWORK NOTHING MERGES — see `keep_channels`. The rows on screen
-    // were read from a chain this node is no longer on; a `seq` that overlaps
-    // one in the new network's room is a coincidence, not continuity.
-    if chain_moved {
-        return next;
-    }
-    let pages_overlap = match (committed_seq_span(&next), committed_seq_span(&current)) {
-        (Some((oldest_canonical, _)), Some((_, newest_held))) => oldest_canonical <= newest_held,
-        _ => false,
-    };
-    let splice_is_continuous = pages_overlap;
-    if !splice_is_continuous {
-        return merge_pending_messages(next, current, current_channel, next_channel);
-    }
-    let mut merged = merge_message_send_result(next, current, current_channel, next_channel);
-    mark_message_groups(&mut merged);
-    bounded_chat_window(merged)
-}
-
 pub fn keep_members(
     loaded: bool,
     next: Vec<ChatMember>,
@@ -1147,7 +835,7 @@ pub fn keep_members(
 }
 
 /// Everything a chat load says about the huddle — the one rule, in one place,
-/// for the five folds that used to spell it out in four lines each.
+/// for the folds that used to spell it out in four lines each.
 ///
 /// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
 /// THE HUDDLE'S. The huddle window follows you onto every other room and
@@ -1236,67 +924,8 @@ pub async fn load_channel_window(
 ) -> Result<ChatData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let mut chat = load_channel_window_data(&rpc, &channel_id, MessageWindow::Tail).await?;
+        let mut chat = load_channel_window_data(&rpc, &channel_id).await?;
         chat.generation = generation;
-        Ok(chat)
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// Same generation-carrying failure as [`load_channel_window`], same reason.
-pub async fn load_chat_hit(
-    rpc: String,
-    channel_id: String,
-    root_seq: i64,
-    target_seq: i64,
-    generation: i64,
-) -> Result<ChatData, HydrationError> {
-    async {
-        let root_seq = positive_sequence(root_seq)?;
-        let target_seq = positive_sequence(target_seq)?;
-        let rpc = rpc_client(&rpc)?;
-        // A URI names only its target seq. Resolve its committed thread before
-        // loading the root-only channel window; a reply is not a root itself.
-        // Search results already carry both addresses and keep their parallel read.
-        let root_is_unresolved = root_seq == target_seq;
-        let (root_seq, mut chat, reply) = if root_is_unresolved {
-            let target = load_message_at(&rpc, &channel_id, target_seq).await?;
-            let root_seq = target.thread.unwrap_or(target.seq);
-            let chat = load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq))
-                .await?;
-            (root_seq, chat, target.thread.map(|_| target))
-        } else {
-            let (chat, reply) = tokio::try_join!(
-                load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
-                load_message_at(&rpc, &channel_id, target_seq)
-            )?;
-            (root_seq, chat, Some(reply))
-        };
-        let root = chat
-            .messages
-            .iter()
-            .find(|message| message.seq == number_i64(root_seq))
-            .cloned()
-            .ok_or_else(|| "message was not found".to_string())?;
-        chat.generation = generation;
-        chat.selected_message_seq = root.seq;
-        chat.selected_message_rev = root.rev;
-        chat.selected_message_body.clone_from(&root.body);
-        let Some(reply) = reply else {
-            return Ok(chat);
-        };
-        if reply.thread != Some(root_seq) {
-            return Err("search result does not belong to the selected thread".into());
-        }
-        let thread = load_target_thread_data(&rpc, &channel_id, root_seq, target_seq).await?;
-        chat.active_thread_seq = root.seq;
-        chat.thread_target_seq = thread.target_seq;
-        chat.thread_messages = thread.messages;
-        chat.thread_has_more = thread.has_more;
         Ok(chat)
     }
     .await
@@ -1338,15 +967,6 @@ fn landed_on_channel(
     data.active_channel_members_only = members_only;
     data.huddle_roster = Vec::new();
     data.channel_members = members;
-    data.messages = Vec::new();
-    data.has_older_history = false;
-    data.selected_message_seq = 0;
-    data.selected_message_rev = 0;
-    data.selected_message_body = String::new();
-    data.active_thread_seq = 0;
-    data.thread_target_seq = 0;
-    data.thread_messages = Vec::new();
-    data.thread_has_more = false;
     data
 }
 
@@ -1650,27 +1270,4 @@ pub fn post_gate(
         return "members_only".into();
     }
     String::new()
-}
-
-/// THE BANNER A REFUSED REACTION LEAVES BEHIND — and, on a live channel, the
-/// banner already on screen, returned untouched.
-///
-/// The reaction handlers refuse an archived channel because the module does
-/// (`check_post_policy`, reached through `reaction_target`), and until now they
-/// refused in silence: no `error`, no state change, no visible difference from
-/// a reaction that landed. The surface cannot carry that refusal instead — the
-/// quiet message rows are `lazy` on ONE dependency, so `active_channel_archived`
-/// never reaches the chips or the one-tap bar, and every row keeps its full
-/// hover/press ramp. So the refusal has to speak.
-///
-/// It carries the banner through rather than clearing it because Ice handlers
-/// are straight-line — a `return if` guard, never a branch — so the refusing
-/// write happens on the live path too. Opening the ♡ picker is a read: it must
-/// not wipe a failed send the reader has not read yet. The three mutations
-/// clear the banner on their own line, where they always did.
-pub fn reaction_refusal(archived: bool, banner: String) -> String {
-    match archived {
-        true => "This channel is archived — reactions are closed. Unarchive it from Channel details to react here again.".into(),
-        false => banner,
-    }
 }

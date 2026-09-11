@@ -9,24 +9,20 @@ extern crate::backend
   ChatSpan(mention:str, mention_link:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, edit_body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
-  MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
-  CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
-  pure thread_page_cursor(messages:&[ChatMessage], has_more:bool) -> i64
-  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_has_more:bool)
+  ChatData(generation:i64, channels:[ChatChannel], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
+  PendingSend(id:str, body:str, thread_seq:i64)
+  pure send_pending(sends:[PendingSend], id:str, body:str, thread_seq:i64) -> [PendingSend]
+  pure send_settled(sends:[PendingSend], id:&str) -> [PendingSend]
+  pure send_failed(sends:[PendingSend], id:&str, committed:bool) -> [PendingSend]
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta()
-  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
-  ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_seq:i64, has_more:bool)
-  ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_seq:i64, has_more:bool)
-  LiveThreadData(channel_id:str, root_seq:i64, messages:[ChatMessage])
-  HistoryPageData(channel_id:str, messages:[ChatMessage], has_more:bool)
+  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
-  ChatSearchData(hits:[ChatSearchHit])
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageSearchData(hits:[PageSearchHit])
   PaletteSearchData(chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember])
   BellItem(seq:i64, change_seq:i64, source:str, reason:str, kind:str, actor:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellPresentation(seq:i64, title:str, detail:str, target:BellTarget, object:str, number:i64, anchor:str)
@@ -50,7 +46,7 @@ extern crate::backend
   load_bell(rpc:str, expected_account:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, expected_account:str, up_to_seq:i64) -> BellDelta ! AppError
   LiveUpdate(kind:LiveKind, status:str, height:i64, module:str, load_chat:bool, debounce:bool, chat:[ChatDelta], bell:BellDelta)
-  ChatLiveFold(messages_changed:bool, thread_messages_changed:bool, has_older_history:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str, channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], unread_marker_seq:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, refresh_chat:bool)
+  ChatLiveFold(channels:[ChatChannel], channel_members:[ChatMember], channel_reads:[ChannelRead], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, post_refusal:str, refresh_chat:bool)
   AppError(message:str, committed:bool)
   LiveActivity(label:str, done:bool)
   LiveAgentRow(channel_id:str, anchor_seq:i64, thread_root:i64, run_id:str, dispatch_id:str, agent:str, status:str, activity:[LiveActivity], answer_preview:str)
@@ -63,35 +59,14 @@ extern crate::backend
   pure icon(name:&str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
-  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, has_older_history:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
+  pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, history_view:bool, chat_visible:bool, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool) -> ChatLiveFold
   live_resync_load(rpc:str, channel_id:str, load_chat:bool, debounce:bool, generation:i64, attempt:i64) -> LiveRefresh ! HydrationError
-  load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
   sync fresh_operation_id(prefix:str) -> str
-  sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
-  sync optimistic_thread_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
-  pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
-  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
-  pure merge_landing_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
-  pure merge_thread_refresh(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
-  pure resynced_messages(loaded:bool, chain_moved:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
-  pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
-  pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
-  pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
-  pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  pure oldest_message_seq(messages:[ChatMessage]) -> i64
-  pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
-  pure message_selection_after_window(messages:[ChatMessage], seq:i64, rev:i64, action:MessageAction, draft:str) -> MessageSelection
-  // THE COPY RANGE. Addressed by the seqs at its two ends because history
-  // prepends — an index is stale the moment an older page merges in.
-  pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
-  pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
-  pure copy_range_text(messages:&[ChatMessage], anchor:i64, head:i64) -> str
-  pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
-  pure copy_range_label(count:i64) -> str
-  pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
-  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface) -> CopyRange
-  pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
+  // Chat's message/thread menus still place themselves this way; the name is
+  // the pages block menu it was written for, which no longer exists.
+  pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
+  pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
   join_network(blob:secret) -> WorkspaceInit ! AppError
@@ -171,9 +146,8 @@ extern crate::backend
   pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool) -> str
-  pure close_message_action(close:bool, current:MessageAction) -> MessageAction
+  pure topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool) -> str
+  pure escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool) -> str
   // The command modifier held, off the modifier stream: the cheap half that
   // arms the quit route. It asks `command()` — the SAME modifier the chord
   // below asks for — because a route armed on one modifier and a chord judged
@@ -287,11 +261,6 @@ extern crate::backend
   pure mutation_failure_phase(committed:bool) -> MutationPhase
   pure mutation_phase_after_recovery(current:MutationPhase) -> MutationPhase
   pure message_seq_after_failure(current:i64, phase:MutationPhase, committed:bool) -> i64
-  pure message_text_after_failure(current:str, phase:MutationPhase, committed:bool) -> str
-  pure message_action_after_failure(current:MessageAction, phase:MutationPhase, committed:bool) -> MessageAction
-  pure refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
-  pure refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
-  pure refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
   pure channel_last_read(reads:[ChannelRead], channel:str) -> i64
   pure channel_head_seq(channels:[ChatChannel], channel:str) -> i64
   pure mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
@@ -315,6 +284,7 @@ extern crate::backend
   pure composer_scope(endpoint:&str, channel_id:&str) -> str
   pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
   pure edit_scope(endpoint:&str, channel_id:&str, seq:i64) -> str
+  pure scope_thread_seq(scope:&str) -> i64
   pure keep_channels(loaded:bool, chain_moved:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   pure chain_moved(held:str, live:str) -> bool
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
@@ -326,24 +296,12 @@ extern crate::backend
   pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
   pure initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   pure frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
-  pure first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
-  pure thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
-  pure thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
-  pure retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
-  pure thread_root_seed(messages:[ChatMessage], thread:[ChatMessage], seq:i64) -> [ChatMessage]
-  pure reaction_palette() -> [str]
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
   // with the generation of the switch they belong to, so `chat_load_failed` can
   // drop a failure the reader has already clicked past. `committed` is what
   // `AppError` adds and a switch has nothing to commit.
   load_channel_window(rpc:str, channel_id:str, generation:i64) -> ChatData ! HydrationError
-  load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ChatData ! HydrationError
   create_channel(rpc:str, password:str, name:str, members_only:bool, generation:i64) -> ChatData ! AppError
-  rename_channel(rpc:str, password:str, channel_id:str, name:str) -> bool ! AppError
-  archive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
-  unarchive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
-  add_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
-  remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   // Every chat load's whole answer about the huddle — including the answer
@@ -359,23 +317,15 @@ extern crate::backend
   pure no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
-  pure reaction_refusal(archived:bool, banner:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
-  load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, generation:i64) -> ThreadLoadData ! HydrationError
-  load_thread_page(rpc:str, channel_id:str, root_seq:i64, after_reply_seq:i64, generation:i64) -> ThreadPageData ! HydrationError
-  refresh_live_thread(rpc:str, channel_id:str, root_seq:i64) -> LiveThreadData ! AppError
   send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
   edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
-  delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
-  add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
-  remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   cancel_agent_run(rpc:str, password:str, run_id:str) -> bool ! AppError
   stream chat_live_agents(rpc:str, chain_id:str, generation:i64, signer_key:str) -> LiveAgentNotice
   pure live_agents_stale(notice:&LiveAgentNotice, rpc:&str, chain_id:&str, generation:i64, signer_key:&str) -> bool
   // Test seam: Ice reads extern structs but cannot construct one, so a scenario
   // that needs a run already on screen has no other way to seat one.
   pure live_agent_row(channel_id:str, anchor_seq:i64, run_id:str, agent:str, status:str) -> LiveAgentRow
-  search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   open_external_url(url:str) -> bool ! AppError
   pure count_label(count:i64) -> str
   search_pages(rpc:str, page_id:str, text:str) -> PageSearchData ! AppError

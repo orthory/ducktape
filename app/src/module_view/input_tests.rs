@@ -26,17 +26,21 @@ fn bounds(ui: &mut Ui, renderer: &iced::Renderer, text: &str) -> Option<Rectangl
     op.found
 }
 
-fn seated(action: &str) -> Arc<Mutex<Mounted>> {
+/// A chat view with its room on screen, driven by PRESSES to whatever the
+/// host contract under test needs open: the selection, the menus and the
+/// thread are the view's own state now, and the only door into them is the
+/// one the reader uses.
+fn seated(opened: &[&str]) -> Arc<Mutex<Mounted>> {
+    tests::can_the_chat_room();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/views/chat_view.wasm");
     let mut guest = Guest::load_from("chat", &path).expect("build current chat view first");
+    let props = tests::chat_facts();
     guest.redraw(&None);
-    let mut props: serde_json::Value =
-        serde_json::from_slice(&tests::chat_facts().unwrap()).unwrap();
-    props["selected_message_seq"] = 1.into();
-    props["selected_message_rev"] = 1.into();
-    props["message_action"] = action.into();
-    let props = Some(serde_json::to_vec(&props).unwrap());
-    guest.redraw(&props);
+    settle(&mut guest, &props);
+    for label in opened {
+        guest.deliver(Output::Activate(tests::button_message(&guest, label)));
+        settle(&mut guest, &props);
+    }
     assert!(guest.fault.is_none());
     Arc::new(Mutex::new(Mounted {
         slot: Slot::Ready(Box::new(guest)),
@@ -49,6 +53,17 @@ fn seated(action: &str) -> Arc<Mutex<Mounted>> {
         replacement: Replacement::Preserve,
         retry: None,
     }))
+}
+
+/// Redraws until the view has nothing left in flight: a read answers, the
+/// answer opens the next read, and the room is on screen when they stop.
+fn settle(guest: &mut Guest, props: &Option<Vec<u8>>) {
+    for _ in 0..32 {
+        if !guest.redraw(props) {
+            return;
+        }
+    }
+    panic!("the view never settled (fault {:?})", guest.fault);
 }
 
 fn view(mounted: &Arc<Mutex<Mounted>>) -> Element<'static, ModuleViewEvent> {
@@ -68,11 +83,26 @@ fn view(mounted: &Arc<Mutex<Mounted>>) -> Element<'static, ModuleViewEvent> {
 #[test]
 fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
     let mut renderer = crate::frame_probe::headless_renderer();
-    for (action, label, expected) in [
-        ("more", "Add reaction", "message_reactions"),
-        ("reactions", "🦆", "reaction_submit"),
+    // What a press on the overlay must leave behind: the menu's own entry
+    // opens the next menu, and the emoji in THAT one signs the reaction. Both
+    // are the view's, so the proof is its next frame — the app is only the
+    // road the press takes.
+    let picker_open: fn(&Guest) -> bool =
+        |guest| tests::texts(guest).iter().any(|text| text == "🦆");
+    // the tapped emoji is a chip with a count on the row it was tapped from,
+    // drawn before the block that carries it
+    let reaction_chipped: fn(&Guest) -> bool =
+        |guest| tests::texts(guest).windows(2).any(|pair| pair == ["🦆", "1"]);
+    for (action, opened, label, proof) in [
+        (
+            "more",
+            &["More message actions"][..],
+            "Add reaction",
+            picker_open,
+        ),
+        ("reactions", &["Manage reactions"][..], "🦆", reaction_chipped),
     ] {
-        let mounted = seated(action);
+        let mounted = seated(opened);
         {
             let mut locked = mounted.lock().unwrap();
             let Slot::Ready(guest) = &mut locked.slot else {
@@ -177,9 +207,14 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
             &mut clipboard::Null,
             &mut messages,
         );
+        let locked = mounted.lock().unwrap();
+        let Slot::Ready(guest) = &locked.slot else {
+            unreachable!()
+        };
         assert!(
-            messages.iter().any(|event| event.kind == expected),
-            "{messages:?}"
+            proof(guest),
+            "the {action} overlay's press never landed: {:?}",
+            tests::texts(guest)
         );
     }
 }
@@ -187,7 +222,7 @@ fn chat_native_overlays_are_visible_and_route_menu_and_emoji_presses() {
 #[test]
 fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance() {
     let renderer = crate::frame_probe::headless_renderer();
-    let mounted = seated("more");
+    let mounted = seated(&["More message actions"]);
     let mut content = view(&mounted);
     let mut tree = Tree::new(content.as_widget());
     let size = Size::new(1200.0, 800.0);
@@ -254,21 +289,8 @@ fn a_retained_overlay_cannot_send_a_press_to_a_replacement_instance() {
 #[test]
 fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
     let mut renderer = crate::frame_probe::headless_renderer();
-    let mounted = seated("toolbar");
-    {
-        let mut locked = mounted.lock().unwrap();
-        let mut props: serde_json::Value =
-            serde_json::from_slice(locked.props.as_ref().unwrap()).unwrap();
-        props["active_thread_seq"] = 1.into();
-        props["selected_message_seq"] = 0.into();
-        props["thread_messages"] = props["messages"].clone();
-        let props = Some(serde_json::to_vec(&props).unwrap());
-        let Slot::Ready(guest) = &mut locked.slot else {
-            unreachable!()
-        };
-        guest.redraw(&props);
-        locked.props = props;
-    }
+    // the rail opens the way the reader opens it, and reads its own thread
+    let mounted = seated(&["Open thread"]);
     let width = || {
         fn find(node: &wire::Node) -> Option<f32> {
             if let wire::Node::Container {
@@ -454,7 +476,7 @@ fn a_native_pointer_drag_resizes_the_thread_and_release_ends_it() {
 
 #[test]
 fn opted_in_mouse_moves_are_local_coalesced_and_keep_button_order() {
-    let mounted = seated("toolbar");
+    let mounted = seated(&[]);
     let mut locked = mounted.lock().unwrap();
     let Slot::Ready(guest) = &mut locked.slot else {
         unreachable!()

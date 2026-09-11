@@ -170,7 +170,7 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
-    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7, 7));
+    let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7));
     assert!(!app.palette_open);
     assert_eq!(app.shell_tab, ShellTab::Chat);
 }
@@ -1211,43 +1211,6 @@ fn the_explorer_marks_the_block_row_whose_detail_is_open() {
     );
 }
 
-/// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
-///
-/// Channel details unmounts the rail — `if active_thread_seq > 0 &&
-/// !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
-/// flag on the way in, so opening a thread action and then the drawer is a
-/// mouse-reachable state where the ladder's first rung named a menu nobody
-/// could see: the press wiped a half-typed `thread_edit_draft` and left the
-/// drawer standing. Same rule as the tab scoping, one level down — a rung
-/// answers only while its surface is mounted.
-#[test]
-fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Chat;
-    app.active_channel = "general".into();
-    app.thread_selected_seq = 7;
-    app.thread_message_action = MessageAction::Editing;
-    app.thread_edit_draft = "half typed".into();
-    app.channel_settings_open = true;
-
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert!(
-        !app.channel_settings_open,
-        "the first Escape closes the drawer the reader is looking at"
-    );
-    assert_eq!(
-        app.thread_edit_draft, "half typed",
-        "and leaves the unmounted rail's draft where she left it"
-    );
-    assert_eq!(app.thread_message_action, MessageAction::Editing);
-
-    // With the drawer down the rail is mounted again, and its rung answers.
-    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
-    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
-    assert_eq!(app.thread_edit_draft, "");
-}
-
 /// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
 ///
 /// #1132 scoped every per-tab rung in `topmost_overlay` by reading
@@ -1346,9 +1309,12 @@ fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
         .1;
     let (signature, body) = ladder.split_once(") -> String {").expect("the ladder");
     let body = body.split_once("\n}\n").expect("the ladder ends").0;
+    // Split on the COMMA, not the line: a signature short enough to fit on one
+    // line is the shape a ladder with no per-tab rung left naturally takes, and
+    // a line-wise read sees only its first parameter.
     let layers: Vec<&str> = signature
-        .lines()
-        .filter_map(|line| line.trim().split_once(':'))
+        .split(',')
+        .filter_map(|parameter| parameter.trim().split_once(':'))
         .map(|(name, _)| name)
         .collect();
     let guards: Vec<(&str, &str)> = body
@@ -1435,68 +1401,37 @@ fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
     }
 }
 
-/// A TAB MOVE RETIRES THE MENUS THE TAB IT LEFT OWNED.
+/// A TAB MOVE RETIRES WHAT THE TAB IT LEFT PUT ON SCREEN — and after the view
+/// migration that is exactly one thing: the hydration banner.
 ///
-/// Nothing did: `select_shell_tab` left every menu flag set, which is the whole
-/// reason the escape ladder has to be scoped tab by tab (#1132). The scoping
-/// stays — a rung must not answer for a surface that is not on screen, however
-/// the flag got there — and this is the other half of it: an armed delete
-/// confirm that survives a tab round trip is a mouse click away from deleting
-/// the page the reader forgot she armed, and a ⋯ menu is not state anyone
-/// expects to come back to.
+/// The menu flags this rule was written for (#1132's chat ⋯ menus, the pages
+/// armed delete) left with their screens: each one is now guest state that the
+/// guest retires itself, which is why `select_shell_tab` no longer asks whether
+/// the tab actually moved. The banner cannot follow them — it is the KERNEL's
+/// own report that a load failed, so it is cleared here, ABOVE both early
+/// returns. Leaving it up after a navigation tells the reader the pane she just
+/// opened is broken, a lie the banner has no way to walk back: it is dismissed
+/// by hand or not at all.
 #[test]
-fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
+fn a_tab_move_retires_the_banner_of_the_screen_it_left() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.shell_tab = ShellTab::Chat;
-    app.selected_message_seq = 4;
-    app.selected_message_rev = 2;
-    app.message_action = MessageAction::More;
-    app.message_edit_draft = "half typed".into();
-    app.thread_selected_seq = 7;
-    app.thread_selected_rev = 1;
-    app.thread_message_action = MessageAction::Editing;
-    app.thread_edit_draft = "half typed too".into();
+    app.error = "the room would not load".into();
 
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
 
-    assert_eq!(app.message_action, MessageAction::Toolbar);
-    assert_eq!(app.message_edit_draft, "");
-    assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
-    assert_eq!(app.thread_edit_draft, "");
-    assert_eq!(app.thread_selected_seq, 0);
-    assert_eq!(app.thread_selected_rev, 0);
+    assert_eq!(app.error, "", "a banner never rides a tab move");
+    assert_eq!(app.shell_tab, ShellTab::Node);
 
-    // The disconnected path returns before the generation bumps, and retires
-    // the same set — the clear sits above both early returns, like `error`.
+    // The chat/pages return and the disconnected return each skip the
+    // generation bumps below, and neither may keep a stale banner alive.
     let (mut app, _) = Ducktape::__boot();
     app.shell_tab = ShellTab::Pages;
-    app.message_action = MessageAction::More;
+    app.error = "the page would not load".into();
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert_eq!(app.error, "");
     assert_eq!(app.shell_tab, ShellTab::Chat);
-
-    // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
-    // from the seat that is already active, and Settings' rows emit their own
-    // tab while the reader is on it — so an unconditional retire is one click
-    // from destroying an inline edit on the screen she never left.
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.shell_tab = ShellTab::Chat;
-    app.selected_message_seq = 4;
-    app.selected_message_rev = 2;
-    app.message_action = MessageAction::Editing;
-    app.message_edit_draft = "still typing".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
-    assert_eq!(
-        app.message_edit_draft, "still typing",
-        "clicking the tab you are on retires nothing"
-    );
-    assert_eq!(app.message_action, MessageAction::Editing);
-    assert_eq!(app.selected_message_seq, 4);
-    assert_eq!(app.selected_message_rev, 2);
 }
 
 /// THE FIVE IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only

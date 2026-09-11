@@ -5,7 +5,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use iced::futures::StreamExt as _;
 
 use super::*;
-use crate::{MessageAction, ShellTab};
+use crate::ShellTab;
 
 mod docs;
 

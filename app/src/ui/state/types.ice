@@ -148,7 +148,6 @@ enum WelcomeDoor
   create
   login
 
-
 // The duck:// module table's verdict on a clicked or embedded link
 // (`resolve_duck_link`): which existing navigation it maps onto. `unknown` is
 // a malformed/unknown ref; `web` is an http(s) URL for the OS opener;
@@ -221,55 +220,32 @@ enum SettingsIntent
   dark
   notifications
 
-// What the pages view still asks of the app: the two OS doors. Everything
-// else it reads and signs itself through the kernel contract.
+// WHAT THE PAGES VIEW STILL ASKS OF THE APP. The Pages tab reads its own
+// workspace and signs its own writes over the kernel contract, so what is left
+// here are the two OS doors: the clipboard, and the ONE open plane a
+// `duck://` address in a document goes through.
 enum PagesIntent
   open_link
   copy
-// what the Chat view asks of the app: one variant per act the screen offers,
-// each carrying only what the reader chose or typed — the drafts are the view's
+// WHAT THE CHAT VIEW STILL ASKS OF THE APP. The Chat tab reads its own room
+// and signs its own writes over the kernel contract, so what is left here is
+// what another plane of the app steers or owns: the room the whole app is in,
+// the huddle, an OS door (a link, the clipboard), a run in flight, the seed
+// for the edit composer — and `composer`, which is the host surface's submit
+// rather than an intent the view chose to send.
 enum ChatIntent
-  search
-  clear_search
   open_hit
   toggle_create
   choose_channel
   choose_dm
-  toggle_settings
   show_huddle
   leave_huddle
   join_huddle
-  load_history
   scrolled
   open_link
   copy
   copy_link
-  add_reaction
-  remove_reaction
-  open_thread
-  message_actions
-  message_reactions
   begin_edit
-  arm_delete
-  clear_selection
-  press
-  clear_range
-  copy_range
-  reaction_submit
-  delete
-  rename
-  archive
-  unarchive
-  add_member
-  remove_member
-  close_thread
-  thread_actions
-  thread_reactions
-  thread_begin_edit
-  thread_arm_delete
-  thread_clear_selection
-  thread_delete
-  load_thread
   cancel_run
   open_run
   composer

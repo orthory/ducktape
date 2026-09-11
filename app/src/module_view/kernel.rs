@@ -101,10 +101,26 @@ impl Replies {
         pending.append(&mut events);
     }
 
-    /// Whether a query or a submit is still on its way: the widget keeps
-    /// polling until none is.
+    /// Whether a query or a submit is still on its way.
     pub(super) fn any_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    /// WHETHER THE VIEW IS STILL OWED A FRAME, which is the in-flight count
+    /// AND the answers already lying here. The two are one fact to a caller
+    /// and reading only the count loses a race it loses often: a request is
+    /// spawned inside a redraw, and a node that answers before that redraw
+    /// returns has already given the count back — leaving an answer nobody
+    /// is coming back for. The widget then stops polling and the view sits
+    /// on "Loading…" until an unrelated event wakes it; a test's pump
+    /// returns and reads a screen that never got its rows.
+    ///
+    /// Under the events lock, because that is the lock [`Replies::settled`]
+    /// takes to give a count back: with it held, empty and zero together
+    /// mean nothing can arrive that no one is waiting for.
+    pub(super) fn answer_owed(&self) -> bool {
+        let events = self.events.lock().expect("kernel replies");
+        !events.is_empty() || self.in_flight.load(Ordering::SeqCst) > 0
     }
 
     /// Blocks until nothing is in flight.
@@ -1152,6 +1168,36 @@ mod tests {
             }]
         );
         assert!(!replies.any_in_flight());
+    }
+
+    /// AN ANSWER THAT BEAT THE REDRAW THAT ASKED FOR IT IS STILL OWED A
+    /// FRAME. The in-flight count is given back the moment the answer is
+    /// written, so a node quick enough to answer inside the redraw leaves
+    /// the count at zero with the answer undrained — and a caller reading
+    /// only the count walks away from it, which is a view stuck on
+    /// "Loading…" until something unrelated wakes it.
+    #[test]
+    fn an_answer_already_written_is_owed_a_frame_with_nothing_in_flight() {
+        let replies = std::sync::Arc::new(Replies::default());
+        assert!(!replies.answer_owed(), "nothing asked, nothing owed");
+
+        replies.in_flight.fetch_add(1, Ordering::SeqCst);
+        let running = replies.clone();
+        // port 1 is nothing's: the refusal is composed without a node, which
+        // is what makes this answer land inside the caller's own redraw
+        let client = ducktape_rpc::Client::new("http://127.0.0.1:1").expect("a client");
+        runtime().spawn(async move {
+            let result = admin(client, serde_json::json!({"route": "/etc/passwd"})).await;
+            running.deliver(3, result);
+        });
+        replies.wait_idle();
+
+        assert!(!replies.any_in_flight(), "the count came back");
+        assert!(replies.answer_owed(), "and the answer is still here");
+        let mut landed = Vec::new();
+        replies.drain_into(&mut landed);
+        assert_eq!(landed.len(), 1);
+        assert!(!replies.answer_owed(), "drained, and nothing is owed");
     }
 
     /// A subscription the view abandons is aborted mid-wait — a socket

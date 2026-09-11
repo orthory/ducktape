@@ -79,12 +79,6 @@ fn reference(state: EditorStateView<'_>) -> Vec<u8> {
     ))
 }
 
-/// The line the caret sits on: the anchor a new comment takes when no margin
-/// badge named one.
-pub fn cursor_line(document: &Editor) -> i64 {
-    i64::from(document.cursor().position.line)
-}
-
 pub fn presentation_notice(document: &Editor, prepared: &PreparedPresentation) -> String {
     if prepared.reference != reference(document.state_view()) && !prepared.data.is_empty() {
         return FORMAT_NOTICE.into();

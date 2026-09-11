@@ -133,7 +133,7 @@ async fn a_failed_title_lookup_keeps_the_page_hits_it_could_not_name() {
     // already takes in `titled_page_hits`.
     assert_eq!(data.hits[0].page_title, "Untitled");
 }
-/// the chat lane's, for the same reason: both lanes answer the same rows
+
 /// A WRITE'S OWN RELOAD WAITS FOR THE FOLD THAT CARRIES IT. `submit_frame`
 /// answers ACCEPTANCE; the pages read model is folded behind the block loop,
 /// so the reload `create_page`/`delete_page` fire immediately afterwards used

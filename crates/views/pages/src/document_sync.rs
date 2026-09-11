@@ -576,11 +576,38 @@ pub fn comment_anchor_label(blocks: &[PageBlock], target: &str, page_id: &str) -
 }
 
 /// The composer's own caption: where a NEW comment will anchor.
-pub fn comment_compose_hint(blocks: &[PageBlock], target: &str, page_id: &str) -> String {
+/// THE COMPOSER AT THE CARD'S FOOT ALWAYS OPENS A NEW THREAD on the scope the
+/// card is showing — never a reply, which has its own box inside its thread.
+/// `scope` is a block id, or empty (or the page's own id) for the page.
+pub fn comment_compose_hint(blocks: &[PageBlock], scope: &str, page_id: &str) -> String {
+    if is_page_scope(scope, page_id) {
+        return "Comment on this page".into();
+    }
     format!(
         "New comment on {}",
-        anchor_label(&comment_anchor_labels(blocks), target, page_id)
+        anchor_label(&comment_anchor_labels(blocks), scope, page_id)
     )
+}
+
+/// The card's own title: the block it is scoped to, quoted, or the page with
+/// the number of open threads on it.
+pub fn comment_scope_label(
+    blocks: &[PageBlock],
+    scope: &str,
+    page_id: &str,
+    open_threads: i64,
+) -> String {
+    if !is_page_scope(scope, page_id) {
+        return anchor_label(&comment_anchor_labels(blocks), scope, page_id);
+    }
+    match open_threads {
+        1 => "This page · 1 thread".into(),
+        count => format!("This page · {count} threads"),
+    }
+}
+
+fn is_page_scope(scope: &str, page_id: &str) -> bool {
+    scope.is_empty() || scope == page_id
 }
 
 fn comment_anchor_labels(blocks: &[PageBlock]) -> BTreeMap<String, String> {

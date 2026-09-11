@@ -197,7 +197,9 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("\non ")
         .unwrap()
         .0;
-    assert!(activate.contains("sent = send_begin_edit(seq, body, rev)"));
+    assert!(activate.contains(
+        "sent = send_begin_edit(edit_scope(endpoint, active_channel, seq), seed, seq, rev)"
+    ));
     // Editing uses the same native token-aware composer as new messages.
     // Keep both edit seats named and labelled for host routing/accessibility.
     for (kind, id) in [("edit", "#message-edit"), ("thread_edit", "#thread-edit")] {
@@ -1734,7 +1736,7 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
         })
         .collect();
     assert!(
-        list_taking.len() > 50,
+        list_taking.len() > 30,
         "the extern sweep found the declarations, not an empty file"
     );
 

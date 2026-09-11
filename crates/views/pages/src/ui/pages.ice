@@ -1,7 +1,7 @@
 // One document editor owns title line 0 and the Markdown body. The caller
 // supplies its document slot and handles navigation/save intents. Subpage blocks
 // have no Markdown spelling and stay separate navigation below the body.
-component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, comments_offset:f64, comments_height:f64, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, compose_hint:str, bind block_comment_draft:str)
+component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_menu_open:bool, pages:[PageItem], page_create_open:bool, loading:bool, busy:bool, connected:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, comments_offset:f64, comments_height:f64, scope_target:str, scope_pinned:bool, scope_label:str, thread_total:i64, comment_groups:[PageCommentGroup], resolved_comment_rows:[PageCommentThreadRow], resolved_open:bool, reply_thread:str, expanded_threads:[str], threads_loading:bool, compose_hint:str, bind block_comment_draft:str, bind reply_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -19,9 +19,13 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
     discard_orphaned_comment_draft(str)
     toggle_block_comments()
     close_block_comments()
-    open_block_comment_thread(str, str)
-    resolve_thread_submit(bool)
-    close_block_comment_thread()
+    narrow_comment_scope(str)
+    widen_comment_scope()
+    resolve_thread_submit(str, bool)
+    select_reply_thread(str)
+    toggle_thread_replies(str)
+    toggle_resolved_comments()
+    post_thread_reply(str)
     post_block_comment_submit()
     copy_to_clipboard(str, str)
   row w=fill h=fill
@@ -664,6 +668,11 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                     border-w=1.0
                     clip=true
                   col w=fill h=shrink
+                    // THE HEADER NAMES THE SCOPE, not the surface: the block's
+                    // opening quoted, or the page and how many threads are
+                    // still open on it. A card opened from a margin badge IS
+                    // that block's, so it offers no way out to the page — the
+                    // page was never what the badge pointed at.
                     box
                       with
                         w=fill
@@ -674,13 +683,24 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         with
                           w=fill
                           h=shrink
-                          gap=18.0
+                          gap=8.0
                           align=center
-                        text keep_str(!empty(active_thread), "Comment thread", "Comments")
-                          with
-                            size=13.0
-                            @text-fg
-                        space w=fill
+                        box w=fill clip=true
+                          text scope_label
+                            with
+                              size=13.0
+                              wrap=none
+                              @text-fg
+                        if !scope_pinned && !empty(scope_target)
+                          button "← This page" -> emit(widen_comment_scope)
+                            with
+                              label="All comments on this page"
+                              disabled=(busy)
+                              p=4.0
+                              @secondary_action text-11px leading-snug font-medium
+                            active bg=transparent text=muted r=6.0
+                            hovered bg=fg/9 text=fg
+                            pressed bg=fg/14
                         button -> emit(close_block_comments)
                           with
                             label="Close comments"
@@ -715,79 +735,103 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         h=shrink
                         p=12.0
                         gap=6.0
-                      if threads_loading || comments_loading
+                      if threads_loading
                         text "Loading comments…" size=12.5 @text-muted
-                      if empty(active_thread)
-                        box w=fill h=shrink max-h=(comments_height - 150.0)
-                          scroll
-                            with
-                              dir=vertical
-                              w=fill
-                              h=shrink
-                            col w=fill gap=1.0
-                              if empty(comment_rows) && !threads_loading
-                                text "No comments yet"
+                      // EVERY THREAD EXPANDED, oldest first — the card IS the
+                      // conversation, and there is nothing to drill into.
+                      // Settled threads sit under one toggle at the foot of
+                      // the list rather than among the live ones.
+                      box w=fill h=shrink max-h=(comments_height - 150.0)
+                        scroll
+                          with
+                            dir=vertical
+                            w=fill
+                            h=shrink
+                          col w=fill gap=8.0
+                            if empty(comment_groups) && empty(resolved_comment_rows) && !threads_loading
+                              text empty_scope_label(scope_target)
+                                with
+                                  w=fill
+                                  size=12.5
+                                  align-x=center
+                                  @text-muted
+                            for comment_group in comment_groups
+                              col w=fill gap=6.0
+                                // The quote is the way IN to a block's own
+                                // scope; in block scope there is one group
+                                // and the header above already names it.
+                                if empty(scope_target) && comment_group.target != active_page
+                                  button -> emit(narrow_comment_scope, comment_group.target)
+                                    with
+                                      label="Comments on this block"
+                                      description=comment_group.anchor
+                                      disabled=(busy)
+                                      w=fill
+                                      p=4.0
+                                      @ghost_action
+                                    text comment_group.anchor
+                                      with
+                                        w=fill
+                                        size=10.5
+                                        wrap=none
+                                        font=code_medium
+                                        @text-hint
+                                    active bg=transparent text=hint border=transparent border-w=1.0 r=6.0
+                                    hovered bg=fg/6 text=fg
+                                    pressed bg=fg/10 text=fg
+                                if empty(scope_target) && comment_group.target == active_page
+                                  text comment_group.anchor
+                                    with
+                                      w=fill
+                                      size=10.5
+                                      wrap=none
+                                      font=code_medium
+                                      @text-hint
+                                for group_thread in comment_group.threads
+                                  PageCommentThreadCard thread=group_thread replying=(reply_thread == group_thread.id) expanded=expanded(expanded_threads, group_thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
+                                    forward
+                                      resolve_thread_submit
+                                      select_reply_thread
+                                      toggle_thread_replies
+                                      post_thread_reply
+                            if !empty(resolved_comment_rows)
+                              button -> emit(toggle_resolved_comments)
+                                with
+                                  label="Resolved threads"
+                                  expanded=resolved_open
+                                  disabled=(busy)
+                                  w=fill
+                                  p=4.0
+                                  @ghost_action
+                                text resolved_label(resolved_comment_rows)
                                   with
                                     w=fill
-                                    size=12.5
-                                    align-x=center
+                                    size=11.0
+                                    wrap=none
+                                    font=medium
                                     @text-muted
-                              for comment_row in comment_rows
-                                PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor frozen=!empty(host_error)
+                                active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+                                hovered bg=fg/6 text=fg
+                                pressed bg=fg/10 text=fg
+                            if resolved_open
+                              for resolved_row in resolved_comment_rows
+                                PageCommentThreadCard thread=resolved_row.thread replying=false expanded=expanded(expanded_threads, resolved_row.thread.id) busy=busy frozen=!empty(host_error) reply_draft<->reply_draft
                                   forward
-                                    open_block_comment_thread
-                      if !empty(active_thread)
-                        row
-                          with
-                            w=fill
-                            gap=5.0
-                            align=center
-                          button "← All comments" -> emit(close_block_comment_thread)
-                            with
-                              disabled=(comments_loading || busy)
-                              p=4.0
-                              @secondary_action text-11px leading-snug font-medium
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/9 text=fg
-                            pressed bg=fg/14
-                          text active_thread_anchor
-                            with
-                              w=fill
-                              size=10.5
-                              wrap=none
-                              font=code_medium
-                              @text-hint
-                          if !thread_resolved
-                            button "Resolve" -> emit(resolve_thread_submit, true)
-                              with
-                                disabled=(busy)
-                                p=4.0
-                                @secondary_action text-11px leading-snug font-medium
-                              active bg=transparent text=muted r=6.0
-                              hovered bg=fg/9 text=fg
-                              pressed bg=fg/14
-                          if thread_resolved
-                            button "Reopen" -> emit(resolve_thread_submit, false)
-                              with
-                                disabled=(busy)
-                                p=4.0
-                                @secondary_action text-11px leading-snug font-medium
-                              active bg=transparent text=muted r=6.0
-                              hovered bg=fg/9 text=fg
-                              pressed bg=fg/14
-                        box w=fill h=shrink max-h=(comments_height - 150.0)
-                          scroll
-                            with
-                              dir=vertical
-                              w=fill
-                              h=shrink
-                            col w=fill gap=1.0
-                              for page_comment in comments
-                                PageCommentCard comment=page_comment
-                      if empty(active_thread)
+                                    resolve_thread_submit
+                                    select_reply_thread
+                                    toggle_thread_replies
+                                    post_thread_reply
+                      // THE ONE COMPOSER THAT ALWAYS OPENS A NEW THREAD on the
+                      // card's scope. A reply has its own box inside its
+                      // thread, so this is how a second thread on the same
+                      // block is started at all.
+                      // BOUNDED, like the page title in the header: the quote
+                      // is a block's own words and `wrap=none` lays them out
+                      // at their intrinsic width, so without a clipping box a
+                      // long line keeps drawing to the card's edge.
+                      box w=fill clip=true
                         text compose_hint
                           with
-                            w=fill
                             size=10.5
                             wrap=none
                             font=code_medium
@@ -800,8 +844,8 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                         input "" #page-comment(active_page) <-> block_comment_draft
                           with
                             label="New page comment"
-                            hint=keep_str(!empty(active_thread), "Reply…", "Add a comment…")
-                            disabled=(busy || threads_loading || comments_loading)
+                            hint="Start a thread…"
+                            disabled=(busy || threads_loading)
                             submit=emit(post_block_comment_submit)
                             w=fill
                             p=6.2
@@ -814,7 +858,7 @@ component PagesScreen(host_error:str, page_link:str, sidebar_width:f64, page_men
                           disabled value=muted
                         button "Post" #post -> emit(post_block_comment_submit)
                           with
-                            disabled=(busy || empty(trim(block_comment_draft)) || threads_loading || comments_loading)
+                            disabled=(busy || empty(trim(block_comment_draft)) || threads_loading)
                             p=5.0
                             @primary_action
           // THE ACTIONS MENU, hanging under the header's `⋯`. It is an

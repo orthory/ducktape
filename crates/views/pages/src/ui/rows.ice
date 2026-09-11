@@ -125,35 +125,36 @@ component PageSearchResult(hit:PageSearchHit, frozen:bool)
     hovered bg=fg/6 text=fg border=fg/8
     pressed bg=fg/10 text=fg border=fg/12
 
-// COMMENT CARDS — `border:1px solid #ece9e1;background:#fff;border-radius:11px;
-// padding:11px 12px` with a 22px principal plate, the author at 600 12px and
-// the body at 12px/1.55 (Liquid Glass:944-953).
+// ONE THREAD, WHOLE — `border:1px solid #ece9e1;background:#fff;
+// border-radius:11px;padding:12px` with a 22px principal plate, the author at
+// 600 12px and the body at 12px/1.55 (Liquid Glass:944-953). The opening
+// comment sits at the top with the thread's one action; its replies are
+// indented under a hairline, the tail folded away past three.
 //
 // TWO PARTS OF THE ARTIFACT CARD ARE NOT DRAWN, because nothing on the wire
 // carries them and a plausible one would be a lie:
 //   * the AGENT badge and the square plate — `PageComment`/`PageCommentThread`
 //     carry a display name. Account authorship alone does not identify the
 //     account's control mode, so this projection uses the person plate.
-//   * the relative timestamp and the anchor quote. NOT because the wire lacks
-//     them — `ThreadRow` carries both `anchor` and `created_at`
-//     (crates/modules/apps/pages/src/index.rs) — but because
-//     `page_comment_thread` (backend.rs) drops the pair before the boundary.
-//     Carrying them through is a projection change, not a view change; until
-//     then the right-hand slot shows the ordinal the record does have
-//     (`#3`, `#3 · edited`) rather than an invented age.
-component PageCommentThreadButton(thread:PageCommentThread, anchor:str, frozen:bool)
+//   * the relative timestamp. `ThreadRow.created_at` is a block HEIGHT on a
+//     validator network and unix millis on a single-writer noded, so it is not
+//     a wall clock and "2h ago" off it would be invented. The right-hand slot
+//     shows the ordinal the record does have (`#3`, `#3 · edited`).
+component PageCommentThreadCard(thread:PageCommentThread, replying:bool, expanded:bool, busy:bool, frozen:bool, bind reply_draft:str)
   emits
-    open_block_comment_thread(str, str)
-  button -> emit(open_block_comment_thread, thread.id, thread.target)
+    resolve_thread_submit(str, bool)
+    select_reply_thread(str)
+    toggle_thread_replies(str)
+    post_thread_reply(str)
+  box
     with
-      disabled=frozen
-      label=thread.author
-      description=thread.meta
       w=fill
-      @ghost_action
-      @px-12px
-      @py-11px
-    col w=fill gap=7.0
+      p=12.0
+      bg=surface
+      border=card_line
+      border-w=1.0
+      r=11.0
+    col w=fill gap=8.0
       row
         with
           w=fill
@@ -166,75 +167,147 @@ component PageCommentThreadButton(thread:PageCommentThread, anchor:str, frozen:b
             ink=9.0
         text thread.author
           with
-            w=fill
             size=12.0
             wrap=none
             font=display
             @text-primary
-        text "›"
-          with
-            size=13.0
-            wrap=none
-            @text-label
-      // WHERE it anchors — the one thing the old rail never told you.
-      text anchor
-        with
-          w=fill
-          size=10.5
-          wrap=none
-          font=code_medium
-          @text-hint
-      text thread.meta
-        with
-          w=fill
-          size=12.0
-          line-h=1.55
-          wrap=word
-          @text-accent_fg
-    active bg=surface text=fg border=card_line border-w=1.0 r=11.0
-    hovered bg=card_wash_hover text=fg border=control_line
-    pressed bg=card_wash text=fg border=control_line
-
-component PageCommentCard(comment:PageComment)
-  box
-    with
-      w=fill
-      pl=12.0
-      pr=12.0
-      pt=11.0
-      pb=11.0
-      bg=surface
-      border=card_line
-      border-w=1.0
-      r=11.0
-    col w=fill gap=7.0
-      row
-        with
-          w=fill
-          gap=8.0
-          align=center
-        PersonAvatar
-          with
-            initials=initials_of(comment.author)
-            plate=22.0
-            ink=9.0
-        text comment.author
-          with
-            w=fill
-            size=12.0
-            wrap=none
-            font=display
-            @text-primary
-        text comment.meta
+        text thread.meta
           with
             size=10.5
             wrap=none
             font=code_medium
             @text-label
-      text comment.text
+        space w=fill
+        // ONE ACTION PER THREAD, and it is the one that settles it.
+        if !thread.resolved
+          button "Resolve" -> emit(resolve_thread_submit, thread.id, true)
+            with
+              label="Resolve thread"
+              disabled=(busy || frozen)
+              p=4.0
+              @secondary_action text-11px leading-snug font-medium
+            active bg=transparent text=muted r=6.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+        if thread.resolved
+          button "Reopen" -> emit(resolve_thread_submit, thread.id, false)
+            with
+              label="Reopen thread"
+              disabled=(busy || frozen)
+              p=4.0
+              @secondary_action text-11px leading-snug font-medium
+            active bg=transparent text=muted r=6.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+      text opener_text(thread)
         with
           w=fill
           size=12.0
           line-h=1.55
           wrap=word
           @text-accent_fg
+      // THE REPLIES, indented behind a hairline so the thread reads as one
+      // conversation rather than a stack of equal cards.
+      if !empty(thread_replies(thread, expanded))
+        row
+          with
+            w=fill
+            gap=12.0
+            pl=17.0
+          box
+            with
+              w=1.0
+              h=fill
+              bg=separator
+            space w=1.0 h=1.0
+          col w=fill gap=8.0
+            for reply in thread_replies(thread, expanded)
+              col w=fill gap=5.0
+                row
+                  with
+                    w=fill
+                    gap=8.0
+                    align=center
+                  PersonAvatar
+                    with
+                      initials=initials_of(reply.author)
+                      plate=22.0
+                      ink=9.0
+                  text reply.author
+                    with
+                      w=fill
+                      size=12.0
+                      wrap=none
+                      font=display
+                      @text-primary
+                  text reply.meta
+                    with
+                      size=10.5
+                      wrap=none
+                      font=code_medium
+                      @text-label
+                text reply.text
+                  with
+                    w=fill
+                    size=12.0
+                    line-h=1.55
+                    wrap=word
+                    @text-accent_fg
+      if !empty(reply_toggle_label(thread, expanded))
+        button -> emit(toggle_thread_replies, thread.id)
+          with
+            label="Show every reply"
+            expanded=expanded
+            disabled=frozen
+            p=4.0
+            @secondary_action
+          text reply_toggle_label(thread, expanded)
+            with
+              size=11.0
+              wrap=none
+              font=medium
+              @text-muted
+          active bg=transparent text=muted r=6.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+      // THE COMPOSE TARGET IS ALWAYS VISIBLE: a resting "Reply…" line that
+      // becomes the field when pressed. One draft at a time, so only the
+      // picked thread carries a live box.
+      if !thread.resolved && !replying
+        button "Reply…" #reply-on(thread.id) -> emit(select_reply_thread, thread.id)
+          with
+            label="Reply to this thread"
+            disabled=(busy || frozen)
+            w=fill
+            p=6.2
+            @ghost_action text-13px leading-snug
+          active bg=transparent text=muted border=fg/8 border-w=1.0 r=7.0
+          hovered bg=fg/4 text=fg border=fg/11
+          pressed bg=fg/8 text=fg border=fg/11
+      if !thread.resolved && replying
+        row
+          with
+            w=fill
+            gap=5.0
+            align=center
+          input "" #thread-reply(thread.id) <-> reply_draft
+            with
+              label="Reply"
+              hint="Reply…"
+              disabled=(busy || frozen)
+              submit=emit(post_thread_reply, thread.id)
+              w=fill
+              p=6.2
+              text-size=13.0
+              line-h=1.2
+              @control
+            active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+            hovered bg=fg/4 border=fg/11
+            focused bg=fg/4 border=ring
+            disabled value=muted
+          button "Post" -> emit(post_thread_reply, thread.id)
+            with
+              label="Post reply"
+              disabled=(busy || frozen || empty(trim(reply_draft)))
+              p=5.0
+              @primary_action

@@ -84,32 +84,18 @@ fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
 /// it would otherwise move. Every keyboard route that ignores this list routes
 /// a key at the screen BEHIND the layer the reader is looking at.
 ///
-/// EVERY PER-TAB RUNG IS SCOPED TO THE TAB THAT MOUNTS ITS SURFACE, because no
-/// tab switch clears any of this state — `select_shell_tab` leaves every one
-/// of these flags set. A flag left set on the tab you came from
-/// names a layer that is no longer on screen: Escape then "closes" an
-/// invisible menu while the visible screen swallows the press, and the scroll
-/// reader refuses to move a pane nothing is actually covering. Which scope a
-/// rung gets is read off the slot layout in `components/shell.ice`, not
-/// guessed: `slot chat` / `slot forge` sit inside `match tab`, so their menus
-/// are per-tab mounts, while `slot palette` and `slot bell` sit OUTSIDE it —
-/// the palette, the bell and the create modal ride every tab and stay global
-/// on purpose.
+/// NO PER-TAB RUNG IS LEFT, so the ladder takes no tab. The chat tab's menus,
+/// drawer and rail belong to the chat view (`crates/views/chat`); the pages
+/// tab's armed delete, block menu and comments card belong to the pages view
+/// (`crates/views/pages`); the forge's switchers are the host's own pick lists.
+/// Each guest paints its own scrim and dismisses its own layers — a key the
+/// kernel contract carries no door for. What is enumerated here is what rides
+/// EVERY tab, which is why `slot palette` and `slot bell` sit OUTSIDE the
+/// `match tab` in `components/shell.ice`.
 //
-// One argument per layer, plus the tab that scopes them: the Ice extern
-// surface is flat, and the reading must see every layer at once to name the
-// topmost. Scoping lives HERE rather than in the call sites' argument lists —
-// a conjunction per caller is one guard per rung to forget.
-pub fn topmost_overlay(
-    shell_tab: crate::ShellTab,
-    palette_open: bool,
-    bell_open: bool,
-    channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
-) -> String {
-    let on_chat = shell_tab == crate::ShellTab::Chat;
+// One argument per layer: the Ice extern surface is flat, and the reading must
+// see every layer at once to name the topmost.
+pub fn topmost_overlay(palette_open: bool, bell_open: bool, channel_create_open: bool) -> String {
     if palette_open {
         return "palette".into();
     }
@@ -119,32 +105,10 @@ pub fn topmost_overlay(
     if channel_create_open {
         return "channel_create".into();
     }
-    // THE DRAWER UNMOUNTS THE THREAD RAIL — `if active_thread_seq > 0 &&
-    // !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
-    // flag on the way in, so the same rule the tab scoping states one level up
-    // applies here: a rung answers only while its surface is mounted. Without
-    // the term, opening a thread action and then Channel details was a
-    // mouse-reachable state where the first Escape wiped a half-typed
-    // `thread_edit_draft` and left the drawer standing. It cannot be expressed
-    // by moving one rung in the ladder's total order — the stream's own menu
-    // really does float over the drawer and must stay above it.
-    if on_chat && !channel_settings_open && thread_message_action != crate::MessageAction::Toolbar {
-        return "thread_menu".into();
-    }
-    if on_chat && message_action != crate::MessageAction::Toolbar {
-        return "message_menu".into();
-    }
-    // BELOW the stream's message menu, which floats over the drawer. The drawer
-    // had no rung at all: it shipped with an `×` and no keyboard exit while
-    // every other overlay in the app answered Escape. Measured on the running
-    // app — Escape over an open Channel details changed exactly zero pixels.
-    if on_chat && channel_settings_open {
-        return "channel_settings".into();
-    }
-    // THE PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the keyboard
-    // inside its tab and answers Escape itself, armed delete included — the
-    // guest paints the scrim, so the guest owns the exit. Nothing about those
-    // screens is reachable from this ladder any more.
+    // THE CHAT, PAGES AND FILES LAYERS ARE THEIR VIEWS' OWN. Each holds the
+    // keyboard inside its tab and answers Escape itself — the chat menus and
+    // drawer, the pages armed delete, the comments card. The guest paints the
+    // scrim, so the guest owns the exit.
     //
     // The forge's repository and branch switchers are the host's own pick
     // lists: the host dismisses their menus itself, so they hold no rung.
@@ -152,37 +116,21 @@ pub fn topmost_overlay(
 }
 
 /// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own. Menus, popovers, the create modal, the bell and
-/// the channel drawer close; the thread and comments rails keep their explicit
-/// × — closing one from a global key would also have to adjudicate its
-/// half-typed drafts. The drawer carries no such debt: its only opener
-/// re-seeds the name draft from the live channel name on every open, so its
-/// rung leaks nothing the × doesn't.
-#[allow(clippy::too_many_arguments)]
+/// rung Escape does not own: an open palette swallows the key itself. What is
+/// left after the views took their own layers is the palette, the bell and the
+/// create modal, all three of which ride every tab.
 pub fn escape_target(
     logical: iced::keyboard::Key,
-    shell_tab: crate::ShellTab,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    thread_message_action: crate::MessageAction,
-    message_action: crate::MessageAction,
-    channel_settings_open: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
     let not_escape = logical != Key::Named(Named::Escape);
     if not_escape {
         return String::new();
     }
-    let topmost = topmost_overlay(
-        shell_tab,
-        palette_open,
-        bell_open,
-        channel_create_open,
-        thread_message_action,
-        message_action,
-        channel_settings_open,
-    );
+    let topmost = topmost_overlay(palette_open, bell_open, channel_create_open);
     // `palette_key_action` owns the palette's keys — an open palette swallows
     // Escape, so the ladder yields rather than naming a rung.
     let palette_owns_it = topmost == "palette";
@@ -190,14 +138,6 @@ pub fn escape_target(
         return String::new();
     }
     topmost
-}
-
-pub fn close_message_action(close: bool, current: crate::MessageAction) -> crate::MessageAction {
-    if close {
-        crate::MessageAction::Toolbar
-    } else {
-        current
-    }
 }
 
 /// True when the live connection is in a state the shell should banner:

@@ -73,14 +73,14 @@ extern crate::module_view
   // intent; the two composers are host surfaces (`chat_composer`), whose
   // submit arrives as the `composer` intent. `chat_composer_unsent` hands a
   // refused or failed body back to the composer it came from.
-  component chat_view(dark:bool, endpoint:&str, network_name:&str, network_chain_id:&str, status:&str, block_height:i64, search_phase:SearchPhase, search_query:&str, search_hits:&[ChatSearchHit], rooms:&[ChatSidebarRow], dm_rows:&[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:&str, active_dm_peer:&str, active_dm:&DmPeer, active_channel_name:&str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:&[ChatMember], post_refusal:&str, huddle_joined:bool, huddle_channel:&str, huddle_channel_name:&str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:&[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, channel_settings_open:bool, active_thread_seq:i64, thread_target_seq:i64, thread_messages:&[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface, sent_serial:i64, live_agents:&[LiveAgentRow]) -> ModuleViewEvent
+  component chat_view(dark:bool, connected:bool, endpoint:&str, network_name:&str, network_chain_id:&str, status:&str, block_height:i64, account_number:&str, user_key:&str, names_serial:i64, rooms:&[ChatSidebarRow], dm_rows:&[DmSidebarRow], channel_create_open:bool, active_channel:&str, active_dm_peer:&str, active_dm:&DmPeer, land_seq:i64, unread_boundary:i64, mutation_phase:MutationPhase, loading:bool, huddle_joined:bool, huddle_channel:&str, huddle_channel_name:&str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, shift_held:bool, copy_chord_serial:i64, sent_serial:i64, pending_sends:&[PendingSend], live_agents:&[LiveAgentRow]) -> ModuleViewEvent
   pure chat_intent(event:&ModuleViewEvent) -> ChatIntent
-  pure chat_event_surface(event:&ModuleViewEvent) -> CopySurface
   pure chat_event_kind(event:&ModuleViewEvent) -> ComposerKind
   pure event_int(event:&ModuleViewEvent, field:&str) -> i64
   pure event_num(event:&ModuleViewEvent, field:&str) -> f64
   sync chat_composer_unsent(scope:&str, text:&str, committed:bool) -> bool
-  sync chat_composer_edit(scope:&str, messages:&[ChatMessage], seq:i64, rev:i64) -> bool
+  // the body the view says this row edits from, into the host's editor
+  sync chat_composer_seed(scope:&str, body:&str) -> bool
   // the room's roster for the composers over it: what `@` may complete to,
   // by the same rule the send resolves
   sync chat_composer_roster(scope:&str, members:&[ChatMember]) -> bool
