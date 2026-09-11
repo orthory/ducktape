@@ -1168,11 +1168,6 @@ view
                         size=12.5
                         @text-fg
                         @font-semibold
-                    text "The capability tag this agent's runs are dispatched on — a node announcing it runs them."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
                     if can_edit
                       pick capability_options(capabilities, or_empty(draft_capability)) draft_capability #agent-capability -> pick_capability_option _
                         with
@@ -1193,11 +1188,6 @@ view
                         size=12.5
                         @text-fg
                         @font-semibold
-                    text "Always-loaded skills are the agent's persona; on-demand skills are indexed and read when a task needs them. A pinned snapshot freezes the source; unpinned follows the committed head."
-                      with
-                        w=fill
-                        size=11.0
-                        @text-caption
                     for skill in draft_skills
                       row w=fill gap=6.0 align=center
                         col w=fill gap=2.0

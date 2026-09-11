@@ -167,19 +167,6 @@ component CrumbBar(path:str, meta:str)
                 wrap=none
                 font=code
                 @text-hint
-        space w=fill
-        // duckfs write authority, stated in full rather than per-path, in the
-        // terms check_authority actually uses (crates/duckfs/core/src/paths.rs).
-        // The owner segment is an ACTOR string — a module id for a module, and
-        // `ext:<key>` for the person writing from this app — so a member does
-        // own a home tree. Both roots reject a write on their own. A path
-        // prefix test is not expressible here, and one honest rule beats a
-        // guessed branch.
-        text "writes · /home/<owner>/** by that owner · /shared/** by any member · roots not writable"
-          with
-            size=10.5
-            wrap=none
-            @text-meta
     box
       with
         w=fill
