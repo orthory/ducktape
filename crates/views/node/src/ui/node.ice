@@ -857,3 +857,103 @@ component ModulePendingPlate(entry:ModuleRow)
               wrap=none
               font=code_medium
               @text-fg
+
+// --------------------------------------------------------------- THE LOG RING
+//
+// The node's own ring, drawn HERE rather than by the host: `rpc.stream` on the
+// `logs` topic hands this view every frame, and the timeline it folds them
+// into is this view's own state (`host::push_logs`). The wire carries text and
+// not a virtual list, so `host::visible_log` hands this component a BOUNDED
+// tail of the filtered lines and nothing here paginates.
+//
+// `anchor-y=end` with `auto=true` is the live-tail rule the chat timeline
+// uses: the offset is measured from the end, and content that grows while the
+// reader sits there follows.
+component LogConsole(lines:[LogRow], note:str)
+  box #root
+    with
+      w=fill
+      h=420.0
+      p=13.0
+      bg=elevated
+      border=separator
+      border-w=1.0
+      r=11.0
+    col w=fill h=fill gap=8.0
+      row w=fill gap=8.0 align=center
+        text "NODE LOG"
+          with
+            size=10.0
+            wrap=none
+            font=code_semibold
+            @text-label
+        space w=fill
+        text count_label(len(lines))
+          with
+            size=10.0
+            wrap=none
+            font=code
+            @text-muted
+      if !empty(note)
+        text note size=12.0 font=code @text-muted
+      scroll #node-log-lines
+        with
+          dir=vertical
+          w=fill
+          h=fill
+          anchor-y=end
+          auto=true
+        col w=fill gap=1.0
+          for line in lines
+            LogLine line=line
+
+component LogLine(line:LogRow)
+  row #root
+    with
+      w=fill
+      gap=6.0
+      align=start
+    text line.time
+      with
+        w=170.0
+        size=11.0
+        wrap=none
+        font=code
+        @text-muted
+    LogLevel level=line.level
+    text line.message
+      with
+        w=fill
+        size=11.0
+        font=code
+        @text-fg
+
+// ERROR and WARN are the two a reader is scanning for, so they wear a colour;
+// everything else is the column's own muted face. A level the node did not
+// spell is an empty cell, not a fabricated one.
+component LogLevel(level:str)
+  col #root
+    if level == "ERROR"
+      text level
+        with
+          w=48.0
+          size=11.0
+          wrap=none
+          font=code_semibold
+          @text-danger
+    if level == "WARN"
+      text level
+        with
+          w=48.0
+          size=11.0
+          wrap=none
+          font=code_semibold
+          @text-warning
+    if level != "ERROR" && level != "WARN"
+      text level
+        with
+          w=48.0
+          size=11.0
+          wrap=none
+          font=code
+          @text-muted

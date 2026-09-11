@@ -49,21 +49,16 @@ fn no_seat_prints_a_checkpoint_beside_the_live_head() {
     );
 }
 
-/// TWO STREAMS, TWO SURFACES, NEITHER BLANKING THE OTHER.
+/// THE STATUS PUSH MOVES EVERY FACT IT CARRIES.
 ///
-/// The two topics now ride separate sockets with separate gates, so a status
-/// push must not touch the peers table and a peers push must not touch the
-/// consensus facts. Under the old merged stream that was enforced by
-/// `answered` flags; now it is enforced by there being nothing to confuse.
+/// Status is the one node reading the app still holds — the titlebar draws it
+/// on every tab — and a field the handler forgets stays frozen at its
+/// connect-time value for as long as the console is open. The peers sample is
+/// the Node view's own read now, off `rpc.peers`.
 #[test]
-fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
+fn a_pushed_status_moves_every_fact_it_carries() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
-    app.node_peers = vec![backend::PeerRow {
-        key: "aa".into(),
-        role: "validator".into(),
-        live: true,
-    }];
 
     let _ = app.__update(__DucktapeMessage::NodeStatusPushed(backend::NodeFacts {
         public_key: "node-key".into(),
@@ -104,33 +99,6 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     assert_eq!(app.node_sync_retries, 2);
     assert_eq!(app.node_sync_failures, 1);
     assert_eq!(app.node_sync_last_error, "peer hung up");
-    assert_eq!(
-        app.node_peers.len(),
-        1,
-        "a status push must not empty the peers table"
-    );
-
-    let _ = app.__update(__DucktapeMessage::NodePeersPushed(backend::PeersData {
-        generation: -1,
-        peers: vec![
-            backend::PeerRow {
-                key: "aa".into(),
-                role: "validator".into(),
-                live: true,
-            },
-            backend::PeerRow {
-                key: "bb".into(),
-                role: "resident".into(),
-                live: false,
-            },
-        ],
-    }));
-    assert_eq!(app.node_peers.len(), 2, "the peers push landed");
-    assert_eq!(
-        app.node_phase, "syncing",
-        "a peers push must not blank the node's phase"
-    );
-    assert_eq!(app.node_sync_applied, 412);
 }
 
 /// THE EXPLORER DRAWS THE LIVE REGISTER, NOT ITS OWN NEWEST ROW.
@@ -159,9 +127,10 @@ fn the_explorer_is_handed_the_live_head_and_the_phase() {
     );
 }
 
-/// STATUS EVERYWHERE, PEERS ONLY WHERE IT IS DRAWN — pinned as sets, because a
-/// `contains` is satisfied by a commented-out line and equally by a SECOND,
-/// wrongly-gated subscription sitting beside the right one.
+/// STATUS EVERYWHERE, AND IT IS THE ONLY NODE STREAM THE APP HOLDS — pinned
+/// as a set, because a `contains` is satisfied by a commented-out line and
+/// equally by a SECOND, wrongly-gated subscription sitting beside the right
+/// one.
 #[test]
 fn the_node_streams_carry_the_gates_their_costs_require() {
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
@@ -176,25 +145,16 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
         "status is a cell read and a fact about the node, so it rides every tab"
     );
 
-    let peers: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run node_peers_live("))
-        .collect();
-    assert_eq!(
-        peers,
-        [
-            "run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _"
-        ],
-        "every peers sample encodes the whole metrics registry; this gate is the budget"
-    );
-
-    assert!(lifecycle.contains(
-        "from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, \"\", node_peers_generation)\n      try request -> done request\n      done -> peers_load_selected _"
-    ));
-    assert!(lifecycle.contains(
-        "on peers_load_selected(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != node_peers_generation\n  let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview\n  return if obsolete_request || unmounted\n  run replace lane=peers_load load_peers(request.rpc, request.generation)"
-    ));
+    // THE PEERS SAMPLE AND THE LOG RING ARE THE NODE VIEW'S OWN READS. Each
+    // peers sample encodes the node's whole metrics registry, so the gate that
+    // is the budget is the guest's `when` on its own overview — and the app
+    // holding a second one here would pay that cost twice.
+    for gone in ["node_peers_live(", "node_logs(", "load_peers(", "load_modules("] {
+        assert!(
+            !lifecycle.contains(gone),
+            "{gone} is the node view's own read through the kernel now"
+        );
+    }
     assert_no_polling(&lifecycle);
 }
 
@@ -294,13 +254,13 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
 /// This has already happened twice in two different readers: `roster.rs`
 /// carries the scar in a comment, and Settings' PEERS table shipped with all
 /// three wrong names. The app cannot depend on `noded` to pin the contract with
-/// a type, so it is pinned here instead — one rule over every reader at once.
+/// a type, so it is pinned here instead — one rule over every reader the app
+/// still holds. The Node view reads `/v1/peers` through the kernel now and
+/// carries the same guard over its own source (`crates/views/node/tests`).
 #[test]
 fn peer_readers_use_the_names_the_node_serves() {
-    const READERS: [(&str, &str); 2] = [
-        ("backend/node.rs", include_str!("../backend/node.rs")),
-        ("backend/roster.rs", include_str!("../backend/roster.rs")),
-    ];
+    const READERS: [(&str, &str); 1] =
+        [("backend/roster.rs", include_str!("../backend/roster.rs"))];
     for (name, source) in READERS {
         for wrong in ["peer[\"key\"]", "peer[\"live\"]", "peer[\"height\"]"] {
             assert!(
@@ -412,7 +372,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     for (selected, generation) in [
         ("members_load_selected", "members_generation"),
         ("settings_load_selected", "settings_generation"),
-        ("peers_load_selected", "node_peers_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
     ] {
@@ -425,26 +384,23 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         );
     }
 
-    for (selected, unmounted) in [
-        ("settings_load_selected", "shell_tab != ShellTab.settings"),
-        (
-            "peers_load_selected",
-            "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
-        ),
-    ] {
-        let handler = lifecycle
-            .split_once(&format!("on {selected}(request)"))
-            .unwrap_or_else(|| panic!("missing selected handler {selected}"))
-            .1
-            .split("\non ")
-            .next()
-            .expect("selected handler body");
-        assert!(
-            handler.contains(&format!("let unmounted = {unmounted}")),
-            "{selected}: tab-owned selector lacks its current-mount guard: {unmounted}"
-        );
-        assert!(handler.contains("return if obsolete_request || unmounted"));
-    }
+    // Settings is the one selector left that is owned by a single tab: every
+    // other screen reads through the kernel now, so a load that outlives the
+    // tab it was asked for has no other selector to guard.
+    let selected = "settings_load_selected";
+    let unmounted = "shell_tab != ShellTab.settings";
+    let handler = lifecycle
+        .split_once(&format!("on {selected}(request)"))
+        .unwrap_or_else(|| panic!("missing selected handler {selected}"))
+        .1
+        .split("\non ")
+        .next()
+        .expect("selected handler body");
+    assert!(
+        handler.contains(&format!("let unmounted = {unmounted}")),
+        "{selected}: tab-owned selector lacks its current-mount guard: {unmounted}"
+    );
+    assert!(handler.contains("return if obsolete_request || unmounted"));
 }
 
 /// THE GATE'S OTHER HALF IS THE BUMP. `settings_loaded` is dropped when its
