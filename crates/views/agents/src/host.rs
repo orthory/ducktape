@@ -26,20 +26,6 @@ pub struct AgentSkill {
     pub always: bool,
 }
 
-/// The resource grant, list by list. Every list is a set the editor adds to
-/// and removes from; the budget is the concurrent peer-call ceiling.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentCaps {
-    pub forge_read: Vec<String>,
-    pub forge_push: Vec<String>,
-    pub duckfs_read: Vec<String>,
-    pub duckfs_write: Vec<String>,
-    pub tools: Vec<String>,
-    pub secrets: Vec<String>,
-    pub pages_write: Vec<String>,
-    pub subagent_budget: i64,
-}
-
 /// One registered agent — the whole record the desktop app read, with its
 /// live-run fact and its controller.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +39,6 @@ pub struct AgentRow {
     /// the controller's account number, decimal
     pub controller: String,
     pub live: bool,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -163,8 +147,6 @@ pub struct AgentsProps {
     pub live: LiveRun,
     /// every capability tag a node on the network announces
     pub capabilities: Vec<String>,
-    /// the action vocabulary a grant draws from
-    pub actions: Vec<String>,
     /// the signing account's number, decimal; "" when the app has none
     pub account: String,
     /// bumped by the app on every committed agent write
@@ -254,20 +236,6 @@ pub fn empty_run() -> RunRow {
     RunRow::default()
 }
 
-/// How many grants a record carries: every cap list, and the budget once
-/// when it admits anyone.
-pub fn cap_count(caps: &AgentCaps) -> i64 {
-    let count = caps.forge_read.len()
-        + caps.forge_push.len()
-        + caps.duckfs_read.len()
-        + caps.duckfs_write.len()
-        + caps.tools.len()
-        + caps.secrets.len()
-        + caps.pages_write.len()
-        + usize::from(caps.subagent_budget > 0);
-    count_i64(count)
-}
-
 pub fn count_i64(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
@@ -288,95 +256,6 @@ pub fn editable(connected: bool, account: &str, controller: &str) -> bool {
 
 pub fn has(list: &[String], item: &str) -> bool {
     list.iter().any(|entry| entry == item)
-}
-
-/// `list` with `item` present or absent as `on` says, kept sorted and
-/// deduped — the shape the registry canonicalizes to anyway.
-pub fn with_flag(list: &[String], item: &str, on: bool) -> Vec<String> {
-    if on {
-        with_entry(list, item)
-    } else {
-        without(list, item)
-    }
-}
-
-/// `list` plus `entry`, trimmed; an empty entry adds nothing.
-pub fn with_entry(list: &[String], entry: &str) -> Vec<String> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return list.to_vec();
-    }
-    let mut next = list.to_vec();
-    next.push(entry.to_owned());
-    next.sort();
-    next.dedup();
-    next
-}
-
-pub fn without(list: &[String], entry: &str) -> Vec<String> {
-    list.iter().filter(|item| *item != entry).cloned().collect()
-}
-
-/// The cap lists, named the way the record names them, for the editor's
-/// "add a grant" kind picker.
-pub const CAP_KINDS: [&str; 7] = [
-    "forge_read",
-    "forge_push",
-    "duckfs_read",
-    "duckfs_write",
-    "tools",
-    "secrets",
-    "pages_write",
-];
-
-pub fn cap_kinds() -> Vec<String> {
-    CAP_KINDS.iter().map(|kind| (*kind).to_owned()).collect()
-}
-
-fn cap_list_mut<'a>(caps: &'a mut AgentCaps, kind: &str) -> Option<&'a mut Vec<String>> {
-    match kind {
-        "forge_read" => Some(&mut caps.forge_read),
-        "forge_push" => Some(&mut caps.forge_push),
-        "duckfs_read" => Some(&mut caps.duckfs_read),
-        "duckfs_write" => Some(&mut caps.duckfs_write),
-        "tools" => Some(&mut caps.tools),
-        "secrets" => Some(&mut caps.secrets),
-        "pages_write" => Some(&mut caps.pages_write),
-        _ => None,
-    }
-}
-
-/// `caps` with `entry` added to the `kind` list.
-pub fn caps_with(caps: &AgentCaps, kind: &str, entry: &str) -> AgentCaps {
-    let mut next = caps.clone();
-    if let Some(list) = cap_list_mut(&mut next, kind) {
-        *list = with_entry(list, entry);
-    }
-    next
-}
-
-/// `caps` with `entry` removed from the `kind` list.
-pub fn caps_without(caps: &AgentCaps, kind: &str, entry: &str) -> AgentCaps {
-    let mut next = caps.clone();
-    if let Some(list) = cap_list_mut(&mut next, kind) {
-        *list = without(list, entry);
-    }
-    next
-}
-
-/// `caps` with the budget the reader typed; text that is not a whole number
-/// reads as no budget.
-pub fn caps_with_budget(caps: &AgentCaps, text: &str) -> AgentCaps {
-    let mut next = caps.clone();
-    next.subagent_budget = text.trim().parse().unwrap_or(0);
-    next
-}
-
-pub fn budget_text(budget: i64) -> String {
-    if budget == 0 {
-        return String::new();
-    }
-    budget.to_string()
 }
 
 /// `skills` with the skill named `name` set to these fields — replaced in
@@ -466,20 +345,14 @@ pub fn skill_count(skills: &[AgentSkill]) -> i64 {
     count_i64(skills.len())
 }
 
-/// The empty grant: the record's default, and the New form's start.
-pub fn empty_caps() -> AgentCaps {
-    AgentCaps::default()
-}
-
 /// What the pane on screen IS, stated where a reader lands rather than
 /// discovered by using it.
 pub fn pane_note(pane: &str) -> String {
     match pane {
         "runs" => "",
         _ => {
-            "The registry records who may act, what they may do, and under whose grant — every \
-             entry here is on chain. The acting itself is recorded separately, as each agent's \
-             runs."
+            "The registry records who may act and as which account — every entry here is on \
+             chain. The acting itself is recorded separately, as each agent's runs."
         }
     }
     .to_owned()
@@ -491,10 +364,6 @@ pub fn or_empty(value: &Option<String>) -> String {
 
 pub fn pick_list(condition: bool, then: &[String], or: &[String]) -> Vec<String> {
     if condition { then } else { or }.to_vec()
-}
-
-pub fn pick_caps(condition: bool, then: &AgentCaps, or: &AgentCaps) -> AgentCaps {
-    if condition { then } else { or }.clone()
 }
 
 pub fn pick_skills(condition: bool, then: &[AgentSkill], or: &[AgentSkill]) -> Vec<AgentSkill> {
@@ -548,8 +417,6 @@ pub struct Draft {
     pub agent_id: String,
     pub display_name: String,
     pub capability: String,
-    pub allowed_actions: Vec<String>,
-    pub caps: AgentCaps,
     pub skills: Vec<AgentSkill>,
 }
 
@@ -589,43 +456,20 @@ pub fn status(agent_id: &str, paused: bool) -> bool {
     )
 }
 
-fn draft(
-    agent_id: &str,
-    display_name: &str,
-    capability: &str,
-    allowed_actions: &[String],
-    caps: &AgentCaps,
-    skills: &[AgentSkill],
-) -> Draft {
+fn draft(agent_id: &str, display_name: &str, capability: &str, skills: &[AgentSkill]) -> Draft {
     Draft {
         agent_id: agent_id.trim().to_owned(),
         display_name: display_name.trim().to_owned(),
         capability: capability.trim().to_owned(),
-        allowed_actions: allowed_actions.to_vec(),
-        caps: caps.clone(),
         skills: skills.to_vec(),
     }
 }
 
 /// Rewrite the record under `agent_id` with the draft.
-pub fn save(
-    agent_id: &str,
-    display_name: &str,
-    capability: &str,
-    allowed_actions: &[String],
-    caps: &AgentCaps,
-    skills: &[AgentSkill],
-) -> bool {
+pub fn save(agent_id: &str, display_name: &str, capability: &str, skills: &[AgentSkill]) -> bool {
     notify(
         "agents.save",
-        &draft(
-            agent_id,
-            display_name,
-            capability,
-            allowed_actions,
-            caps,
-            skills,
-        ),
+        &draft(agent_id, display_name, capability, skills),
     )
 }
 
@@ -634,20 +478,11 @@ pub fn register(
     agent_id: &str,
     display_name: &str,
     capability: &str,
-    allowed_actions: &[String],
-    caps: &AgentCaps,
     skills: &[AgentSkill],
 ) -> bool {
     notify(
         "agents.register",
-        &draft(
-            agent_id,
-            display_name,
-            capability,
-            allowed_actions,
-            caps,
-            skills,
-        ),
+        &draft(agent_id, display_name, capability, skills),
     )
 }
 

@@ -13,13 +13,12 @@ use "kit.ice"
 
 extern crate::host
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  DocTab(id:str, title:str, active:bool)
   Subpage(id:str, title:str)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
   PageCommentThread(id:str, target:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
-  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, doc_tabs:[DocTab], subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
+  PagesProps(comment_marks:[CommentMark], document_source:bytes, document_error:str, commented_lines:[i64], dark:bool, connected:bool, loading:bool, busy:bool, page_link:str, pages:[PageItem], page_create_open:bool, active_page:str, active_page_title:str, active_page_parent:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, autosave:str, page_refusal:str, subpages:[Subpage], orphaned_comment_drafts:[str], block_comments_open:bool, thread_total:i64, comment_rows:[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:str, thread_resolved:bool, active_thread_anchor:str, comments:[PageComment], comments_loading:bool, comments_has_more:bool, compose_hint:str, seed_rev:i64, page_seed:str, comment_seed:str)
   PropsItem(next:PagesProps, error:str)
   subscription props() -> PropsItem
   pure edited(source:bytes, reference:bytes, navigation:bytes) -> bool
@@ -32,7 +31,6 @@ extern crate::host
   pure arm_delete() -> bool
   pure disarm_delete() -> bool
   pure delete(comment_draft:&str) -> bool
-  pure close_tab(id:&str) -> bool
   pure open_hit(page_id:&str, block_id:&str, comment_draft:&str) -> bool
   pure use_draft(draft:&str, comment_draft:&str) -> bool
   pure discard_draft(draft:&str) -> bool
@@ -108,7 +106,6 @@ state
   page_delete_armed = false
   autosave = "idle"
   page_refusal = ""
-  doc_tabs:[DocTab] = []
   subpages:[Subpage] = []
   orphaned_comment_drafts:[str] = []
   block_comments_open = false
@@ -191,7 +188,6 @@ on props_arrived(item)
   page_delete_armed = next.page_delete_armed
   autosave = next.autosave
   page_refusal = next.page_refusal
-  doc_tabs = next.doc_tabs
   subpages = next.subpages
   orphaned_comment_drafts = next.orphaned_comment_drafts
   block_comments_open = next.block_comments_open
@@ -256,9 +252,6 @@ on disarm_page_delete
 
 on delete_page_submit
   sent = delete(block_comment_draft)
-
-on close_doc_tab(id)
-  sent = close_tab(id)
 
 on open_page_search_hit(page_id, block_id)
   return if loading || busy
@@ -350,7 +343,6 @@ view
         page_delete_armed
         autosave
         page_refusal
-        doc_tabs
         subpages
         orphaned_comment_drafts
         block_comments_open
@@ -374,7 +366,6 @@ view
         arm_page_delete -> arm_page_delete
         disarm_page_delete -> disarm_page_delete
         delete_page_submit -> delete_page_submit
-        close_doc_tab -> close_doc_tab _
         open_page_search_hit -> open_page_search_hit _ _
         use_orphaned_comment_draft -> use_orphaned_comment_draft _
         discard_orphaned_comment_draft -> discard_orphaned_comment_draft _

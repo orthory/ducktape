@@ -107,7 +107,9 @@ fn revoking_a_program_rejects_its_waiting_tool_request_without_a_write() {
             )
             .await;
         network.drain().await;
-        let request = network.action(&runs::action_request_id(&run_id, "revoked")).await;
+        let request = network
+            .action(&runs::action_request_id(&run_id, "revoked"))
+            .await;
         assert!(
             matches!(request.status, runs::ActionStatus::Rejected { .. }),
             "{request:?}"
@@ -312,7 +314,7 @@ fn an_applied_target_stays_applied_when_authority_is_revoked_before_completion()
 }
 
 #[test]
-fn manual_requests_preserve_the_authenticated_humans_control_and_turn_deduplication() {
+fn manual_requests_deduplicate_one_turn_and_any_member_may_cancel_it() {
     block_on(async {
         let mut network = Network::new().await;
         network.provision().await;
@@ -359,27 +361,6 @@ fn manual_requests_preserve_the_authenticated_humans_control_and_turn_deduplicat
             2,
             "one mention run and one requested run"
         );
-        let denied = network
-            .host
-            .submit_at(
-                host::BlockContext {
-                    height: network.height + 1,
-                    consensus_time: network.height + 1,
-                    origin: sdk::Origin::External(vec![4; 32]),
-                },
-                msg(
-                    "runs",
-                    &runs::RunsMsg::CancelRun {
-                        run_id: manual_id.clone(),
-                    },
-                ),
-            )
-            .await;
-        assert!(
-            denied.is_err(),
-            "a different human cannot claim requester authority"
-        );
-        network.height += 1;
         network
             .submit(
                 sdk::Origin::External(vec![7; 32]),
@@ -405,9 +386,11 @@ fn manual_requests_preserve_the_authenticated_humans_control_and_turn_deduplicat
                 ),
             )
             .await;
+        // a different member cancels the run: requesting it granted the
+        // caller no exclusive control over it.
         network
             .submit(
-                caller,
+                sdk::Origin::External(vec![4; 32]),
                 msg(
                     "runs",
                     &runs::RunsMsg::CancelRun {
@@ -595,7 +578,9 @@ fn a_same_node_retry_fences_queued_work_and_gives_new_actions_distinct_ids() {
             "{old:?}"
         );
         assert!(network.task("old-attempt").await.is_none());
-        let fresh = network.action(&runs::action_request_id(&run, "new-attempt")).await;
+        let fresh = network
+            .action(&runs::action_request_id(&run, "new-attempt"))
+            .await;
         assert!(
             matches!(
                 fresh.status,

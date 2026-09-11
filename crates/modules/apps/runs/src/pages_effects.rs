@@ -1,14 +1,12 @@
-//! Prepare page annotations under the model's grant. Invalid or stale page
-//! effects produce diagnostics while other valid result facets can proceed.
-//! The account's program later executes each prepared message, and pages stamps
-//! the actual account actor under its normal write gate.
-
-use crate::CapRequest;
+//! Prepare page annotations. Invalid or stale page effects produce diagnostics
+//! while other valid result facets can proceed. The account's program later
+//! executes each prepared message, and pages stamps the actual account actor
+//! under its normal write gate.
 
 use super::action_requests::Prepared;
 use super::catalog::{ContentPart, Operation, PageAnchor};
-use super::response::{ReplyPosts, allows};
-use super::{Ctx, Lane, ModelRecord, Msg, PendingState, ReplyDestination, RunsModule};
+use super::response::ReplyPosts;
+use super::{Ctx, Lane, Msg, PendingState, ReplyDestination, RunsModule};
 use pages::{
     BlockKind, NewBlock, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
     encode_query as pages_encode_query,
@@ -92,20 +90,12 @@ impl RunsModule {
         if !operations.iter().any(Operation::is_pages) {
             return;
         }
-        let skip = |what: &str| format!("run {run_id} pages action skipped: {what}");
-        let agent = match self.agent_for_run(&*ctx, entry).await {
-            Ok(Some(a)) => a,
-            _ => {
-                self.note(ctx, skip("agent not registered"));
-                return;
-            }
-        };
         for (index, operation) in operations.iter().enumerate() {
             if !operation.is_pages() {
                 continue;
             }
             match self
-                .pages_operation_msg(&*ctx, &agent, entry, run_id, &lane.slot(index), operation, posts)
+                .pages_operation_msg(&*ctx, entry, run_id, &lane.slot(index), operation, posts)
                 .await
             {
                 Ok(prepared) => self.emit_prepared(ctx, prepared),
@@ -118,21 +108,15 @@ impl RunsModule {
     }
 
     /// one pages operation as an emit-ready follow-up, or the reason it must
-    /// not be emitted. gate order: grant → target resolution → cap → payload →
-    /// freshness probes.
+    /// not be emitted. order: target resolution → payload → freshness probes.
     ///
     /// THE ONE pages gate. the settle path degrades an `Err` here to a
     /// breadcrumb (a page annotation is garnish, never worth failing a delivery
     /// over); the session lane returns it to the submitter as an error. same
     /// verdict, two failure policies — never two verdicts.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "run_id + slot derive the deterministic ids; posts is the same-block reservation ledger"
-    )]
     pub(super) async fn pages_operation_msg(
         &self,
         ctx: &dyn Ctx,
-        agent: &ModelRecord,
         entry: &PendingState,
         run_id: &str,
         slot: &str,
@@ -156,9 +140,6 @@ impl RunsModule {
             }
             Operation::PagesSetChecked { block_id, checked } => {
                 let name = operation.name();
-                if !allows(agent, name) {
-                    return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
-                }
                 let pages = self
                     .pages
                     .as_deref()
@@ -169,7 +150,6 @@ impl RunsModule {
                 if resolved.kind != pages::BlockKind::Todo {
                     return Err(format!("block {block_id} is not a todo"));
                 }
-                self.check_pages_write(agent, &resolved.page)?;
                 Ok(Prepared::new(
                     Msg {
                         target: pages.to_string(),
@@ -184,15 +164,11 @@ impl RunsModule {
             }
             Operation::PagesPost { title, content } => {
                 let name = operation.name();
-                if !allows(agent, name) {
-                    return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
-                }
                 let pages = self
                     .pages
                     .as_deref()
                     .ok_or("no pages module is configured")?;
                 let page_id = page_post_id(run_id, slot);
-                self.check_pages_write(agent, &page_id)?;
                 let title = title.trim();
                 if title.is_empty() {
                     return Err(format!("{name} requires a non-empty title"));
@@ -255,18 +231,6 @@ impl RunsModule {
         }
         posts.pages_created += 1;
         Ok(())
-    }
-
-    /// the D3 cap gate: pages_write is page-id scoped with `"*"` allowed.
-    pub(super) fn check_pages_write(&self, agent: &ModelRecord, page: &str) -> Result<(), String> {
-        if agent.permits(&CapRequest::PagesWrite(page)) {
-            Ok(())
-        } else {
-            Err(format!(
-                "agent {} lacks pages_write for {page}",
-                agent.agent_id
-            ))
-        }
     }
 
     /// resolve a target/block id against committed pages state. `Err` == the

@@ -1,4 +1,4 @@
-//! An agent run anchored to a chat message, shown live under its anchor
+//! An agent run anchored to a chat message, shown live in its thread
 //! while it runs. The chain carries only the anchor and the committed reply;
 //! the progress rides the node's `run-output:<dispatch>` topic, folded here
 //! into a bounded row of status, activity titles and an answer preview. A row
@@ -70,8 +70,8 @@ pub struct LiveAgentRow {
     pub answer_preview: String,
 }
 
-/// The chat stream's cut of a run in flight: enough to say a run is working
-/// under its anchor, whose it is, and which run to open for its progress —
+/// The chat view's cut of a run in flight: enough to show its status in
+/// its thread, whose it is, and which run to open for its progress —
 /// never the progress itself, which the run panel draws. What the row knows
 /// beyond this stays out of the timeline's frame budget.
 #[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
@@ -776,8 +776,8 @@ async fn watch_live_output(
             };
             // A PENDING RUN DOES NOT NAME ITS PROVIDER (`PendingRun` carries
             // the agent and the anchor, not the worker), and the parse only
-            // branches on the provider for Claude's `{"type":"result"}` line —
-            // every other shape, Codex's included, is read the same way. So
+            // branches on the provider for Claude message/result events —
+            // Codex item events are read independently of that argument. So
             // this reads one more line than a Codex run would emit and loses
             // nothing; it is not a claim about which worker took the run.
             if let Some(event) = provider_output_event("claude", line, id) {

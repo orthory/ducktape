@@ -3,15 +3,15 @@
 //!
 //! everything here runs inside the delivery block and follows the NO-FAIL
 //! rule (R4): every missing precondition — malformed sink, unwired forge,
-//! missing agent, missing `ForgePush` cap, unborn branch, unreadable tracker
-//! state — degrades to a [`RunsModule::note`] breadcrumb and never aborts.
+//! missing agent, unborn branch, unreadable tracker state — degrades to a
+//! [`RunsModule::note`] breadcrumb and never aborts.
 //! reads are COMMITTED forge state via ctx queries with local serde MIRRORS
 //! of forge's wire types (`forge` stays a DEV-ONLY dependency; conformance
 //! tests pin every mirror against the real forge codec).
 
 use crate::action_requests::{Prepared, ReceiptMeta};
 use crate::catalog::Operation;
-use crate::{ACTION_FORGE_OPEN_PR, CapRequest, PendingState, PrRef, ReplyBlock};
+use crate::{OP_FORGE_OPEN_PR, PendingState, PrRef, ReplyBlock};
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
@@ -264,7 +264,7 @@ impl RunsModule {
             return None;
         }
         let forge = self
-            .forge_proposal_gate(ctx, run_id, entry, "pr sink", repo)
+            .forge_proposal_gate(ctx, run_id, entry, "pr sink")
             .await?;
         // The workspace receipt is the host-authored publication
         // boundary. A requested PR sink, response prose, and even a
@@ -421,13 +421,13 @@ impl RunsModule {
                 self.note(
                     ctx,
                     format!(
-                        "run {run_id} {ACTION_FORGE_OPEN_PR} skipped: the run's committed sink already proposes {source_branch}"
+                        "run {run_id} {OP_FORGE_OPEN_PR} skipped: the run's committed sink already proposes {source_branch}"
                     ),
                 );
                 continue;
             }
             let Some(forge) = self
-                .forge_proposal_gate(ctx, run_id, entry, ACTION_FORGE_OPEN_PR, repo)
+                .forge_proposal_gate(ctx, run_id, entry, OP_FORGE_OPEN_PR)
                 .await
             else {
                 continue;
@@ -440,7 +440,7 @@ impl RunsModule {
                 body: derive_pr_body(body, run_id, receipt, executing_node),
             };
             let meta = ReceiptMeta {
-                operation: ACTION_FORGE_OPEN_PR.into(),
+                operation: OP_FORGE_OPEN_PR.into(),
                 result: serde_json::json!({
                     "repo": repo,
                     "source_branch": source_branch,
@@ -449,24 +449,22 @@ impl RunsModule {
                 invocation: None,
             };
             let opened = self
-                .propose_pr(ctx, run_id, ACTION_FORGE_OPEN_PR, &forge, proposal, meta)
+                .propose_pr(ctx, run_id, OP_FORGE_OPEN_PR, &forge, proposal, meta)
                 .await;
             linked = linked.or(opened);
         }
         linked
     }
 
-    /// the gates every PR proposal shares: a forge wired, the agent still
-    /// registered, and its `forge_push` cap on `repo` — the same D3 cap that
-    /// admits the push itself, never a KNOWN_ACTIONS grant. Answers the forge
-    /// target, or notes under `label` why the proposal degrades.
+    /// the gates every PR proposal shares: a forge wired and the agent still
+    /// registered. Answers the forge target, or notes under `label` why the
+    /// proposal degrades.
     async fn forge_proposal_gate(
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
         entry: &PendingState,
         label: &str,
-        repo: &str,
     ) -> Option<ModuleId> {
         let Some(forge) = self.forge.clone() else {
             self.note(
@@ -475,20 +473,11 @@ impl RunsModule {
             );
             return None;
         };
-        let agent = match self.agent_for_run(&*ctx, entry).await {
-            Ok(Some(agent)) => agent,
-            _ => {
-                self.note(
-                    ctx,
-                    format!("run {run_id} {label} skipped: agent not registered"),
-                );
-                return None;
-            }
-        };
-        if !agent.permits(&CapRequest::ForgePush(repo)) {
+        let registered = matches!(self.agent_record(&*ctx, &entry.agent_id).await, Ok(Some(_)));
+        if !registered {
             self.note(
                 ctx,
-                format!("run {run_id} {label} skipped: agent lacks forge_push for {repo}"),
+                format!("run {run_id} {label} skipped: agent not registered"),
             );
             return None;
         }

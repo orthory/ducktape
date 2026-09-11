@@ -19,10 +19,9 @@
 # user; the separate demo wallet signs and owns the gateway routes.
 #
 # The model user (ChiefDuck) is the network's resident maintainer: a real
-# agent on the `claude` capability, granted every action the platform knows,
-# forge read and push on `ducktape` and on a seeded `playground` repo, every
-# page, and the shared skill library — with its persona curated as an
-# always-loaded skill (ops/chiefduck/SKILL.md). The two seeded @mentions (one
+# agent on the `claude` capability, acting as its program account (which may
+# submit whatever a member may, to any module), with its persona curated as
+# an always-loaded skill (ops/chiefduck/SKILL.md). The two seeded @mentions (one
 # in #general, one on a playground issue) run once `make dev` has installed
 # the claude CLI into the workspace and the compute service announces it:
 # a chat reply, and a pull request opened from a microVM.
@@ -298,18 +297,16 @@ MODEL_ACCOUNT=$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\
   if(matches.length!==1) throw new Error(`expected exactly one ${process.argv[1]} program account`);
   process.stdout.write(String(matches[0].number));
 ' "$AGENT_NAME") || die "cannot resolve the model account"
-# The grant is everything: every action the runs module knows now or later
-# ("*"), forge read and push on every repository (the playground seeded below,
-# the dogfood mirror `make dev` pushes — `ops/dogfood-forge.sh`, repo
-# `ducktape` — and any registered after), every page, and the whole of duckfs.
-# Narrowing it is a registry edit in the Agents tab, not a re-seed.
+# The record is the program account, the capability and the persona skill:
+# the agent acts as that account, which may submit whatever a member may to
+# any module — every repository (the playground seeded below, the dogfood
+# mirror `make dev` pushes — `ops/dogfood-forge.sh`, repo `ducktape` — and
+# any registered after), every page, and the whole of duckfs.
 PLAYGROUND="playground"
 REGISTER=$(bun -e 'process.stdout.write(JSON.stringify({configure_model:{operation:{register_model:{
   account:Number(process.argv[1]),agent_id:process.argv[2],display_name:process.argv[3],capability:"claude",
-  allowed_actions:["*"],
-  caps:{forge_read:["*"],forge_push:["*"],pages_write:["*"],duckfs_read:["/"],duckfs_write:["/"]},
   skills:[{name:process.argv[2],source_prefix:`/shared/skills/${process.argv[2]}`,load:"always"}]
-}}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME" "$PLAYGROUND") || die "invalid registration"
+}}}}))' "$MODEL_ACCOUNT" "$AGENT_ID" "$AGENT_NAME") || die "invalid registration"
 submit runs "$REGISTER"
 MENTION=$(bun -e 'process.stdout.write(JSON.stringify({post_message:{channel_id:"general",message_id:"g4",blocks:[{paragraph:[{text:`@${process.argv[2]} introduce yourself: what can you do on this network?`,marks:[{mention:{account:Number(process.argv[1])}}]}]}],thread:null}}))' "$MODEL_ACCOUNT" "$AGENT_ID")
 submit chat "$MENTION"

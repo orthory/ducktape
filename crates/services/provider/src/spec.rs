@@ -720,12 +720,7 @@ impl CapabilitySpec {
         // AFTER isolation: `config-home:` is only meaningful when the spec asked
         // for a fresh config home, so the check needs the parsed block.
         let context = parse_context(raw.context, &isolation, origin)?;
-        let source = parse_source(
-            raw.source,
-            &raw.detect.bin,
-            &raw.detect.companions,
-            origin,
-        )?;
+        let source = parse_source(raw.source, &raw.detect.bin, &raw.detect.companions, origin)?;
         Ok((
             Self {
                 tag,
@@ -871,8 +866,7 @@ format = "text"
         // executor names.
         let specs = builtin_specs();
         assert!(!specs.is_empty(), "the crate ships built-in specs");
-        let tags: std::collections::BTreeSet<&str> =
-            specs.iter().map(|s| s.tag.as_str()).collect();
+        let tags: std::collections::BTreeSet<&str> = specs.iter().map(|s| s.tag.as_str()).collect();
         assert_eq!(tags.len(), specs.len(), "embedded tags are unique");
     }
 
@@ -918,7 +912,12 @@ base = "https://releases.example/feed/"
                 base: "https://releases.example/feed".into()
             })
         );
-        assert_eq!(CapabilitySpec::parse(&spec_toml("none"), "t").unwrap().source, None);
+        assert_eq!(
+            CapabilitySpec::parse(&spec_toml("none"), "t")
+                .unwrap()
+                .source,
+            None
+        );
 
         let refused = [
             (
@@ -1024,7 +1023,11 @@ base = "https://releases.example/feed/"
             (r#"tag = "ok""#, r#"tag = "OK""#, "invalid characters"),
             (r#"tag = "ok""#, r#"tag = """#, "non-empty"),
             (r#"prompt = "stdin""#, r#"prompt = "argv""#, "not supported"),
-            (r#"format = "text""#, r#"format = "yaml""#, "not a known parser"),
+            (
+                r#"format = "text""#,
+                r#"format = "yaml""#,
+                "not a known parser",
+            ),
         ] {
             let broken = base.replace(needle, replacement);
             let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
@@ -1032,14 +1035,27 @@ base = "https://releases.example/feed/"
         }
 
         let long_tag = spec_toml(&"x".repeat(65));
-        assert!(CapabilitySpec::parse(&long_tag, "t").unwrap_err().contains("64 bytes"));
+        assert!(
+            CapabilitySpec::parse(&long_tag, "t")
+                .unwrap_err()
+                .contains("64 bytes")
+        );
 
-        let bad_timeout = base.replace(r#"prompt = "stdin""#, "prompt = \"stdin\"\ntimeout_secs = 0");
-        assert!(CapabilitySpec::parse(&bad_timeout, "t").unwrap_err().contains("timeout_secs"));
+        let bad_timeout = base.replace(
+            r#"prompt = "stdin""#,
+            "prompt = \"stdin\"\ntimeout_secs = 0",
+        );
+        assert!(
+            CapabilitySpec::parse(&bad_timeout, "t")
+                .unwrap_err()
+                .contains("timeout_secs")
+        );
 
         // the hard ceiling rides the same table: absent = 36, out of range = refused.
         assert_eq!(
-            CapabilitySpec::parse(&base, "t").unwrap().hard_timeout_factor,
+            CapabilitySpec::parse(&base, "t")
+                .unwrap()
+                .hard_timeout_factor,
             36,
             "absent hard_timeout_factor defaults"
         );
@@ -1047,14 +1063,22 @@ base = "https://releases.example/feed/"
             r#"prompt = "stdin""#,
             "prompt = \"stdin\"\nhard_timeout_factor = 12",
         );
-        assert_eq!(CapabilitySpec::parse(&tuned, "t").unwrap().hard_timeout_factor, 12);
+        assert_eq!(
+            CapabilitySpec::parse(&tuned, "t")
+                .unwrap()
+                .hard_timeout_factor,
+            12
+        );
         for bad in ["0", "1001"] {
             let broken = base.replace(
                 r#"prompt = "stdin""#,
                 &format!("prompt = \"stdin\"\nhard_timeout_factor = {bad}"),
             );
             let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
-            assert!(err.contains("hard_timeout_factor"), "wanted the field named in {err:?}");
+            assert!(
+                err.contains("hard_timeout_factor"),
+                "wanted the field named in {err:?}"
+            );
         }
     }
 
@@ -1134,7 +1158,10 @@ base = "https://releases.example/feed/"
             spec_toml("ok")
         );
         let spec = CapabilitySpec::parse(&valid, "t").unwrap();
-        assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(
+            spec.isolation.config_home_env.as_deref(),
+            Some("CODEX_HOME")
+        );
         assert_eq!(spec.isolation.broker, Some(BrokerKind::CodexResponses));
 
         // the Anthropic broker is a distinct closed-set member (Claude Code).

@@ -74,9 +74,8 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     assert_eq!(failed.error, "node refused");
 
     // AN EMPTY QUERY GATES THE REPLY HANDLERS: no search is standing, so a
-    // reply the dismissal could not invalidate (`close_doc_tab` rides a
-    // decision no lane invalidate can) is dropped on arrival instead of
-    // resurrecting the float and clobbering `error`.
+    // reply the dismissal could not invalidate is dropped on arrival instead
+    // of resurrecting the float and clobbering `error`.
     let (mut dismissed, _) = Ducktape::__boot();
     dismissed.error = "standing error".into();
     let _ = dismissed.__update(__DucktapeMessage::PageSearchLoaded(
@@ -364,7 +363,7 @@ fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
         for (handler, body) in ice_handlers(&source) {
             for (hits, query) in PAIRED {
                 // A DROP, not a write: `x = next.hits` is an answer landing.
-                // `keep_` is the conditional drop `close_doc_tab` rides.
+                // `keep_` is a conditional drop.
                 let drops = body.lines().any(|line| {
                     let line = line.trim();
                     line.starts_with(&format!("{hits} = "))
@@ -419,8 +418,7 @@ fn a_workspace_connect_drops_the_explorer_answer_with_the_ledger() {
 }
 
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
-/// and `pages_mutated` land you somewhere new exactly the way the pickers do,
-/// and `close_doc_tab` does when — and only when — it closes the ACTIVE tab;
+/// and `pages_mutated` land you somewhere new exactly the way the pickers do;
 /// each must take the hits and the standing answer with it (pages: the query;
 /// chat: the phase back to idle), or the results float — the one that actually
 /// occludes the room or page you just landed in — travels along.
@@ -429,7 +427,7 @@ fn a_workspace_connect_drops_the_explorer_answer_with_the_ledger() {
 /// empty scope and are workspace-wide, so the answer would still be true where
 /// you landed. The reason to drop it is that it is in the way.
 #[test]
-fn the_three_navigation_resets_take_the_hits_and_the_answer() {
+fn the_navigation_resets_take_the_hits_and_the_answer() {
     let pages_mutated = || {
         __DucktapeMessage::PagesMutated(backend::PagesData {
             pages: Vec::new(),
@@ -473,43 +471,6 @@ fn the_three_navigation_resets_take_the_hits_and_the_answer() {
         !mutated.page_searching,
         "the invalidated lane drops the reply; the reset must lower the flag"
     );
-
-    // CLOSING THE ACTIVE TAB LANDS YOU ELSEWHERE — a navigation, so it resets.
-    let (mut active, _) = Ducktape::__boot();
-    active.loading = false;
-    active.doc_tabs = vec!["open".into(), "other".into()];
-    active.active_page = "open".into();
-    active.page_search_query = "zzz".into();
-    active.page_search_hits = vec![stale_page_hit()];
-    active.page_searching = true;
-    let _ = active.__update(__DucktapeMessage::CloseDocTab("open".into()));
-    assert_eq!(active.active_page, "other");
-    assert!(active.page_search_query.is_empty());
-    assert!(active.page_search_hits.is_empty());
-    assert!(!active.page_searching);
-
-    // CLOSING A BACKGROUND TAB DOES NOT. `next_doc_tab` returns `active`
-    // unchanged when the closed tab is not the active one, and an
-    // unconditional reset here would dismiss a truthful plate the user is
-    // still reading. The reset rides that same decision.
-    let (mut background, _) = Ducktape::__boot();
-    background.loading = false;
-    background.doc_tabs = vec!["open".into(), "other".into()];
-    background.active_page = "other".into();
-    background.page_search_query = "zzz".into();
-    background.page_search_hits = vec![stale_page_hit()];
-    background.page_searching = true;
-    let _ = background.__update(__DucktapeMessage::CloseDocTab("open".into()));
-    assert_eq!(background.active_page, "other");
-    assert!(
-        background.page_searching,
-        "the reply still lands and lowers it — the query it answers is standing"
-    );
-    assert_eq!(
-        background.page_search_query, "zzz",
-        "closing a background tab navigates nowhere and must not dismiss the answer"
-    );
-    assert_eq!(background.page_search_hits.len(), 1);
 }
 
 /// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
@@ -687,8 +648,8 @@ fn connect_reports_the_cause_instead_of_guessing_at_it() {
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
     /// Settings (which owns connection repair and stays useful with the node
-    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages,
-    /// Forge and Shell are module-owned views now and not in this inventory;
+    /// down), Node (which owns the daemon diagnostics), Chat, Files, Pages
+    /// and Forge are module-owned views now and not in this inventory;
     /// every native data screen answers.
     const EXEMPT: [&str; 0] = [];
 

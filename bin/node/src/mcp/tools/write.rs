@@ -1,11 +1,12 @@
 //! The one write entry point. `ducktape_action` carries a catalog envelope —
 //! an operation name, an optional target, an input — and the caller's
 //! `request_id` through this run's scoped host endpoint. Runs decodes the
-//! envelope against the schemas it owns, validates the session, lease and model
-//! grant, and the account's program executes the prepared target message; the
-//! endpoint waits for the committed receipt before returning it. The private
-//! session signer stays on the host, and this binary interprets nothing: adding
-//! an operation to the runs catalog needs no change here.
+//! envelope against the schemas it owns, validates the session and lease, and
+//! the account's program executes the prepared target message; the endpoint
+//! waits for the committed receipt before returning it. The private session
+//! signer stays on the host, and this binary interprets nothing: adding an
+//! operation to the runs catalog needs no change here, and the `submit`
+//! operation carries any module's own message without one.
 
 use serde_json::{Value, json};
 
@@ -22,13 +23,18 @@ pub(super) fn tools() -> Vec<Tool> {
                       of the catalog ducktape_actions lists (reply, react, unreact, \
                       chat.post_message, tasks.create, tasks.update_status, pages.comment, \
                       pages.set_checked, pages.post, jobs.comment, duckfs.write_text, \
-                      agent.call); target and input follow that entry's schemas — reply, react \
-                      and unreact take no target and act on the message this run was called \
-                      from. request_id is your idempotency key within this run: the same id \
-                      with the same bytes returns the same receipt, the same id with different \
-                      bytes is refused. Ducktape validates the grant and caps on every \
-                      validator and returns the committed receipt; a refusal names what you \
-                      lack and does not become allowed on retry.",
+                      collaboration.send, collaboration.acknowledge, agent.call, submit); \
+                      target and input follow that entry's schemas — \
+                      reply, react and unreact take no target and act on the message this run \
+                      was called from. submit carries ANY module's own message: target is \
+                      {\"module\": id} and input is the message exactly as that module's wire \
+                      spells it (an object with exactly one key, or a bare string), so \
+                      whatever a member may submit to a module, you may. request_id is your \
+                      idempotency key within this run: the same id with the same bytes returns \
+                      the same receipt, the same id with different bytes is refused. Ducktape \
+                      validates the message on every validator and returns the committed \
+                      receipt; a refusal is the target module's own words about what it could \
+                      not accept.",
         schema: action_schema,
         handler: action,
     }]
@@ -47,8 +53,8 @@ fn action_schema() -> Value {
                 "description": "The destination the operation acts on, per its catalog target schema. Omit for operations that take none.",
             },
             "input": {
-                "type": "object",
-                "description": "The operation's input, per its catalog input schema.",
+                "type": ["object", "string"],
+                "description": "The operation's input, per its catalog input schema; for submit, the module's own message (an object with one key, or a bare string).",
             },
             "request_id": {
                 "type": "string",
@@ -74,10 +80,10 @@ fn envelope(args: &Value) -> Result<ActionEnvelope> {
         }
     };
     let input = match args.get("input") {
-        Some(input @ Value::Object(_)) => input.clone(),
+        Some(input @ (Value::Object(_) | Value::String(_))) => input.clone(),
         _ => {
             return Err(NodeError::Rejected(
-                "this tool needs an object \"input\" argument".into(),
+                "this tool needs an object or string \"input\" argument".into(),
             ));
         }
     };
@@ -117,6 +123,15 @@ mod tests {
         .unwrap();
         assert_eq!(unknown.target, None);
         assert_eq!(unknown.input, json!({"anything": true}));
+        // a bare string is a module message too (a unit variant on its wire).
+        let bare = envelope(&json!({
+            "operation": runs::OP_SUBMIT,
+            "target": {"module": "runs"},
+            "input": "pending_runs",
+            "request_id": "r3",
+        }))
+        .unwrap();
+        assert_eq!(bare.input, json!("pending_runs"));
     }
 
     #[test]
@@ -135,7 +150,11 @@ mod tests {
                 "{args} -> {error:?}"
             );
         }
-        let error = action(&Run::from_env(), &json!({"operation": "reply", "input": {}})).unwrap_err();
+        let error = action(
+            &Run::from_env(),
+            &json!({"operation": "reply", "input": {}}),
+        )
+        .unwrap_err();
         assert!(matches!(&error, NodeError::Rejected(m) if m.contains("request_id")));
     }
 

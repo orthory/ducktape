@@ -23,15 +23,14 @@ The app's own state — its preferences, its log, its forge mirrors — lives in
 the platform's application directories (`~/.config`, `~/.local/state` and
 `~/.cache` on Linux, `~/Library/Application Support`, `~/Library/Logs` and
 `~/Library/Caches` on macOS; an `XDG_*` variable wins on either), never under
-the home. Set `DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app
-binary nor on `PATH`.
+the home.
 
 ## Module-owned views
 
 The Approvals, Members, Agents, Node, Explorer, Settings, Chat, Files,
-Pages, Forge and Shell tabs are not native: each is an Ice application under `crates/views`
+Pages and Forge tabs are not native: each is an Ice application under `crates/views`
 (`governance`, `members`, `agents`, `node`, `explorer`, `settings`, `chat`, `files`,
-`pages`, `forge`, `shell`) compiled
+`pages`, `forge`) compiled
 for the `tree` target and wrapped as an `ice:view` component that the app
 loads from a file at runtime (`src/module_view.rs`).
 `make views` builds every view under `crates/views` and stages it as
@@ -74,10 +73,6 @@ notifications cannot overwrite it. Presentation that exceeds its bounds uses a
 plain editor with a visible notice, retaining all text and history. Page, search
 and comment drafts leave with the act that reads them; the app hands one back
 only by moving `seed_rev`.
-The Shell view goes further: its
-composer, its terminal and its answer Markdown are host surfaces, so a task's
-words never cross the wire — the host's composer raises the `send` intent
-itself.
 A view may also hand data to a
 host surface that reads it: Forge's code browse leaves slots for the
 decoded picture, the document-aware Markdown reader and the highlighted

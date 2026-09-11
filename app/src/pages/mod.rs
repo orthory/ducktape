@@ -41,8 +41,9 @@ pub fn commented_lines(blocks: &[crate::backend::PageBlock], targets: &[String])
     lines
 }
 
-/// Where a comment thread anchors, in the reader's own words: the line number
-/// and a snippet of the block it marks, or the page itself.
+/// Where a comment thread anchors, in the reader's own words: the opening of
+/// the block it marks, quoted, or the page itself. No line number — the
+/// editor draws none, so "line 3" named nothing the reader could find.
 /// The composer's own caption: where a NEW comment will anchor.
 pub fn comment_compose_hint(
     blocks: &[crate::backend::PageBlock],
@@ -94,9 +95,9 @@ fn comment_anchor_labels(blocks: &[crate::backend::PageBlock]) -> BTreeMap<Strin
         .collect();
     sync::line_spans(blocks)
         .into_iter()
-        .map(|(id, start, _)| {
+        .map(|(id, _, _)| {
             let text = text_by_id.get(id.as_str()).copied().unwrap_or_default();
-            (id, format!("line {start} · {}", anchor_snippet(text)))
+            (id, format!("“{}”", anchor_snippet(text)))
         })
         .collect()
 }
@@ -135,7 +136,7 @@ pub fn comment_marks(blocks: &[crate::backend::PageBlock], hits: &[String]) -> V
 mod tests {
     use super::*;
     #[test]
-    fn comment_anchors_read_as_lines_and_wash_every_line_of_the_block() {
+    fn comment_anchors_quote_the_block_and_wash_every_line_of_it() {
         let block = |kind: &str, text: &str| crate::backend::PageBlock {
             key: 0,
             id: text.into(),
@@ -154,7 +155,7 @@ mod tests {
         );
         assert_eq!(
             comment_anchor_label(blocks.clone(), "para".into(), "page-id".into()),
-            "line 1 · para"
+            "“para”"
         );
         assert_eq!(
             comment_anchor_label(blocks.clone(), "gone".into(), "page-id".into()),
