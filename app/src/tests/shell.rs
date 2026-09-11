@@ -1546,29 +1546,26 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     assert_eq!(app.selected_message_rev, 2);
 }
 
-/// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
-/// handler that re-reads the account for them, and it tells the Settings view
-/// — which holds the drafts — that every draft an op consumed is spent: a
-/// ticket left on screen after its device joined is a stale blob that looks
-/// like a secret, and a create draft after the account exists is a second
-/// Create waiting to be refused.
+/// THE FIVE IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
+/// handler that re-reads the account for them, and it frees the card and
+/// drops the ticket: one left on screen after its device joined is a stale
+/// blob that looks like a secret. Which DRAFTS the op spent is the Settings
+/// view's own reading of the facts that moved — the kernel holds none of
+/// them.
 #[test]
-fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
+fn a_committed_identity_op_rereads_the_account_and_frees_the_card() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.account_busy = true;
     app.account_ticket = "{}".into();
     let before = app.account_generation;
-    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountChanged(true));
 
     assert!(!app.account_busy, "the op is over");
     assert_eq!(app.account_generation, before + 1, "the account is re-read");
     assert!(app.account_ticket.is_empty());
-    assert_eq!(app.settings_drafts_cleared, cleared + 1);
-    assert_eq!(app.settings_drafts_scope, "account");
 }
 
 /// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
@@ -1655,15 +1652,14 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
     }
 }
 
-/// A MINTED TICKET COMMITS NOTHING: it is shown to copy, the inputs that
-/// produced it clear, and the account is NOT re-read — the other device's
-/// join is what moves it.
+/// A MINTED TICKET COMMITS NOTHING: it is shown to copy, and the account is
+/// NOT re-read — the other device's join is what moves it. The ticket itself
+/// is the session fact the view spends its key drafts on.
 #[test]
-fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
+fn a_minted_ticket_is_shown_without_a_reread() {
     let (mut app, _) = Ducktape::__boot();
     app.account_busy = true;
     let before = app.account_generation;
-    let cleared = app.settings_drafts_cleared;
 
     let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
         r#"{"add_key":{}}"#.into(),
@@ -1671,11 +1667,6 @@ fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
 
     assert!(!app.account_busy);
     assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
-    assert_eq!(app.settings_drafts_cleared, cleared + 1);
-    assert_eq!(
-        app.settings_drafts_scope, "keys",
-        "the key and its label are spent; nothing else is"
-    );
     assert_eq!(app.account_generation, before, "minting re-reads nothing");
 }
 

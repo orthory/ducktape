@@ -126,8 +126,6 @@ fn bell_page_navigation_cannot_outlive_its_connection_or_account() {
                     number: "5".into(),
                     name: "Bob".into(),
                     bio: String::new(),
-                    keys: 1,
-                    key_rows: vec![],
                 }));
             }
             _ => {}

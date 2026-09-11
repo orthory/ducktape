@@ -248,7 +248,7 @@ view
         // signing seat as a flag, never the password — and every act comes
         // back as an intent the handler signs. The drafts are the view's.
         settings:
-          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
+          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, settings_user_key, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, account_number, account_exists, account_busy, account_ticket) #settings -> settings_view_event _
         // The Explorer is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
         // facts go in — the live head and the sync line among them, because
         // they are the titlebar's own readings and a second source would

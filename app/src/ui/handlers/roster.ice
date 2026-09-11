@@ -23,35 +23,29 @@ on account_loaded(next)
   account_number = next.number
   account_name = next.name
   account_bio = next.bio
-  account_keys = next.keys
-  account_key_rows = next.key_rows
   run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation next.number _ | bell_failed connect_generation next.number _
 
 on account_failed(cause)
   return if cause.generation != account_generation
 
 // THE SETTINGS VIEW SENT THE OP (`settings_view_event`, handlers/node.ice);
-// what lands here is its answer. A committed op tells the view which drafts
-// it consumed — the rename its name, a mint the key pair, a re-read every
-// draft the card offers — so the view clears those and only those.
+// what lands here is its answer. The op frees the card and the account is
+// re-read; which drafts it spent is the view's own reading of the facts that
+// moved — a name that came back is a rename that landed.
 on account_renamed(_result)
-  account_renaming = false
-  settings_drafts_cleared = settings_drafts_cleared + 1
-  settings_drafts_scope = "name"
+  account_busy = false
   account_generation = account_generation + 1
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 
 on account_rename_failed(cause)
-  account_renaming = false
+  account_busy = false
   error = cause.message
 
-// Minting commits nothing: the ticket is shown to copy, the drafts it
-// consumed clear, and the account is re-read only when the OTHER device joins.
+// Minting commits nothing: the ticket is shown to copy, and the account is
+// re-read only when the OTHER device joins.
 on account_ticket_minted(ticket)
   account_busy = false
   account_ticket = ticket
-  settings_drafts_cleared = settings_drafts_cleared + 1
-  settings_drafts_scope = "keys"
 
 // `done` is `account_changed`'s body inlined (a handler cannot call a
 // handler): the account picture moved, so it is re-read under a fresh
@@ -67,8 +61,6 @@ on account_ceremony_stepped(next)
       account_ceremony_phase = ""
       account_ceremony_qr = ""
       account_busy = false
-      settings_drafts_cleared = settings_drafts_cleared + 1
-      settings_drafts_scope = "label"
       account_generation = account_generation + 1
       run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     CeremonyPhase.failed
@@ -82,9 +74,9 @@ on account_ceremony_stepped(next)
       error = ""
 
 // Every committed identity op lands here: the account picture moved, so it
-// is re-read under a fresh generation, and every draft the card offers goes
-// with it — a ticket left on screen after its device joined is a stale blob
-// that looks like a secret.
+// is re-read under a fresh generation, and the ticket goes with it — one
+// left on screen after its device joined is a stale blob that looks like a
+// secret.
 on account_changed(_result)
   account_ceremony_phase = ""
   account_ceremony_qr = ""
@@ -92,8 +84,6 @@ on account_changed(_result)
   account_ceremony_left = ""
   account_busy = false
   account_ticket = ""
-  settings_drafts_cleared = settings_drafts_cleared + 1
-  settings_drafts_scope = "account"
   account_generation = account_generation + 1
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
 

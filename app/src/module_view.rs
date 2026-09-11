@@ -327,15 +327,26 @@ pub fn explorer_view(
 
 // ---------- the settings seat ----------
 
-/// The Settings tab: this device's preferences, the account and its keys, the
-/// signing seat and the workspace's lifecycle, drawn by the `settings` view.
-/// The roster folds to the readings the card shows, the mutation phase to
-/// the two flags the buttons gate on, and the password to whether the seat is
-/// held — the password itself never crosses. Its intents come back one per
-/// act (`settings_intent`), carrying only what the reader typed.
+/// The Settings tab, drawn by the `settings` view over the KERNEL CONTRACT.
+///
+/// What crosses is SESSION facts: the colour mode, whether there is a
+/// connection and what the titlebar calls it (so the screen and the titlebar
+/// cannot disagree), whether the signing seat is held, and the state of the
+/// wallet/account machinery that is the kernel's alone — the keystore's
+/// reading, a browser ceremony in flight, the ticket one minted, and the
+/// account this device belongs to, which the rail, the bell and the agents
+/// view all read too. The password and the key bytes never cross; the seated
+/// key's PUBLIC half does, because the view resolves its own account by it.
+///
+/// What does NOT cross is what the view reads for itself: this node's
+/// standing on the network and the account's key associations.
+///
+/// Its intents come back one per act (`settings_intent`), carrying only what
+/// the reader typed — creating an account, minting a ticket, registering a
+/// passkey, unlocking and locking the seat are operations the kernel signs.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
+    reason = "the Ice extern hands the session's facts one by one"
 )]
 pub fn settings_view(
     dark: bool,
@@ -346,6 +357,7 @@ pub fn settings_view(
     appearance: crate::Appearance,
     desktop_notifications: bool,
     password: &str,
+    seat_key: &str,
     account_name: &str,
     network_name: &str,
     connected_rpc: &str,
@@ -355,17 +367,10 @@ pub fn settings_view(
     account_ceremony_left: &str,
     settings_key_state: &str,
     settings_key_path: &str,
-    members_rows: &[crate::backend::MemberRow],
-    members_answered: bool,
     account_number: &str,
-    account_renaming: bool,
     account_exists: bool,
-    account_keys: i64,
-    account_key_rows: &[crate::backend::AccountKeyRow],
     account_busy: bool,
     account_ticket: &str,
-    drafts_cleared: i64,
-    drafts_scope: &str,
 ) -> Element<'static, ModuleViewEvent> {
     let appearance = match appearance {
         crate::Appearance::System => "system",
@@ -382,6 +387,7 @@ pub fn settings_view(
         "appearance": appearance,
         "desktop_notifications": desktop_notifications,
         "unlocked": !password.is_empty(),
+        "seat_key": seat_key,
         "account_name": account_name,
         "network_name": network_name,
         "connected_rpc": connected_rpc,
@@ -391,19 +397,10 @@ pub fn settings_view(
         "account_ceremony_left": account_ceremony_left,
         "settings_key_state": settings_key_state,
         "settings_key_path": settings_key_path,
-        "tier": crate::backend::member_tier(members_rows),
-        "admin": crate::backend::members_is_admin(members_rows),
-        "members_line": crate::backend::members_summary(connected, members_rows),
-        "members_answered": members_answered,
         "account_number": account_number,
-        "account_renaming": account_renaming,
         "account_exists": account_exists,
-        "account_keys": account_keys,
-        "account_key_rows": account_key_rows,
         "account_busy": account_busy,
         "account_ticket": account_ticket,
-        "drafts_cleared": drafts_cleared,
-        "drafts_scope": drafts_scope,
     });
     module_view(
         "settings",
@@ -4300,33 +4297,37 @@ pub(crate) mod tests {
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
     }
 
-    /// The bundled Settings view through the host: the facts, then a
-    /// rename that leaves as an intent carrying the trimmed name — and the
-    /// password crosses in as a flag only.
+    /// The bundled Settings view through the host, on the KERNEL CONTRACT:
+    /// session facts go in — the seat as a FLAG and its PUBLIC key, never the
+    /// password — the view subscribes to its own reads (this node's standing
+    /// and the seat's key associations, both refused here with no node), and
+    /// the one thing that leaves is an intent the kernel would sign.
     #[test]
     fn the_staged_settings_view_boots_takes_the_facts_and_sends_a_rename() {
         let Some(staged) = staged("settings") else {
             return;
         };
+        // the kernel answers off the app's connection: none here
+        let _turn = blocking_connection_turn();
         let mut guest = Guest::load_from("settings", &staged).expect("the view loads");
         guest.redraw(&None);
+        assert!(
+            guest.props_subscription.is_some(),
+            "the view subscribes to its session"
+        );
         let props = Some(
             serde_json::to_vec(&serde_json::json!({
                 "dark": false, "connected": true, "loading": false, "status": "Connected",
                 "busy": false, "recovering": false, "appearance": "system",
                 "desktop_notifications": true, "unlocked": true,
+                "seat_key": "ab12cd34",
                 "account_name": "duck", "network_name": "testnet",
                 "connected_rpc": "http://127.0.0.1:1",
                 "account_ceremony_phase": "", "account_ceremony_qr": "",
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
-                "tier": "validator", "admin": true,
-                "members_line": "3 humans · 1 agent", "members_answered": true,
-                "account_number": "42", "account_renaming": false, "account_exists": true,
-                "account_keys": 2,
-                "account_key_rows": [{"scheme": "ed25519", "pubkey": "ab12cd34", "label": "laptop"}],
-                "account_busy": false, "account_ticket": "",
-                "drafts_cleared": 0, "drafts_scope": ""
+                "account_number": "42", "account_exists": true,
+                "account_busy": false, "account_ticket": ""
             }))
             .expect("props encode"),
         );
