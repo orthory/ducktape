@@ -1104,8 +1104,21 @@ async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
     ws.cleanup().await;
 }
 
+/// the pushed history from the pin up: one line per commit, `author\0committer\0subject`,
+/// oldest first.
+fn pushed_history(bare: &Path, base: &str) -> Vec<String> {
+    let range = format!("{base}..refs/heads/{BRANCH}");
+    git_stdout(
+        bare,
+        &["log", "--reverse", "--format=%an%x00%cn%x00%s", &range],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
 #[tokio::test]
-async fn an_agent_commit_cannot_spoof_git_identity_and_get_rewritten() {
+async fn a_spoofed_identity_costs_the_history_not_the_work() {
     let bed = bed();
     let bare = bed.snapshot_bare();
     let ws = bed
@@ -1128,9 +1141,88 @@ async fn an_agent_commit_cannot_spoof_git_identity_and_get_rewritten() {
         ],
     )
     .unwrap();
-    let err = ws.commit("agent run s1:0", None).await.unwrap_err();
-    assert!(err.contains("agent author and node committer"), "{err}");
-    assert_eq!(ref_oid(&bare, BRANCH), None, "unsafe history never pushes");
+
+    let receipt = ws
+        .commit("agent run s1:0", None)
+        .await
+        .expect("commit+push");
+    let output = receipt.output_commit.expect("capture commit");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(output.as_str()));
+    assert_eq!(
+        pushed_history(&bare, &bed.head),
+        [format!(
+            "{AGENT_DISPLAY_NAME}\0{NODE_IDENT}\0Fix the flaky gate"
+        )],
+        "the attacker's commit is gone; the node's capture is the only one"
+    );
+    assert_eq!(
+        git_stdout(&bare, &["show", &format!("{output}:safe.txt")]),
+        "must survive"
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_identity_trailer_costs_the_history_not_the_work() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .await
+        .provision(&bed.spec("s1:0", &bed.head, false))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let author_email = format!("{}@agents.duck", attribution_email_local_part(AGENT));
+    let committer_email = format!("{NODE_IDENT}@nodes.duck");
+    let identity = [
+        ("GIT_AUTHOR_NAME", AGENT_DISPLAY_NAME),
+        ("GIT_AUTHOR_EMAIL", author_email.as_str()),
+        ("GIT_COMMITTER_NAME", NODE_IDENT),
+        ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
+    ];
+    std::fs::write(dir.join("first.txt"), "first\n").unwrap();
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    run_git(&dir, &["commit", "-m", "Keep this commit"], &identity).unwrap();
+    std::fs::write(dir.join("second.txt"), "second\n").unwrap();
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    run_git(
+        &dir,
+        &[
+            "commit",
+            "-m",
+            "Redesign the card\n\nCo-Authored-By: Someone <someone@example.com>",
+        ],
+        &identity,
+    )
+    .unwrap();
+    std::fs::write(dir.join("third.txt"), "uncommitted\n").unwrap();
+
+    let receipt = ws
+        .commit("agent run s1:0", None)
+        .await
+        .expect("commit+push");
+    let output = receipt.output_commit.expect("capture commit");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(output.as_str()));
+    assert_eq!(
+        pushed_history(&bare, &bed.head),
+        [format!(
+            "{AGENT_DISPLAY_NAME}\0{NODE_IDENT}\0Fix the flaky gate"
+        )],
+        "one refused commit drops the whole agent history, kept commits included"
+    );
+    let body = git_stdout(&bare, &["log", "-1", "--format=%B", &output]);
+    assert!(!body.contains("Co-Authored-By"), "{body}");
+    for (file, content) in [
+        ("first.txt", "first"),
+        ("second.txt", "second"),
+        ("third.txt", "uncommitted"),
+    ] {
+        assert_eq!(
+            git_stdout(&bare, &["show", &format!("{output}:{file}")]),
+            content
+        );
+    }
     ws.cleanup().await;
 }
 

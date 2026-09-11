@@ -28,7 +28,13 @@ Two things are easy to get wrong:
 already materialized on disk — read and edit it with your ordinary file tools, \
 not with the files.* read operations. In a Forge checkout, use ordinary git \
 freely: commits you create are preserved, and any uncommitted tree left at the \
-end is captured with the commit message from your final response. The files.* \
+end is captured in one commit titled after the Forge item. Identity is the \
+node's: your environment already names you as author and the node as \
+committer. A commit of yours with another author or committer, or whose \
+message carries a `*-by:` trailer (Co-Authored-By, Signed-off-by) or an \
+author/committer/from line, costs your commit history but not your work: \
+every commit you made is dropped and the final tree is pushed as that one \
+item-titled commit. The files.* \
 operations read the SHARED filesystem, which is a different thing and mostly \
 outside your checkout.
 
