@@ -910,10 +910,10 @@ fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
 
 /// A PLANE'S OP REFETCHES THAT PLANE AND NO OTHER.
 ///
-/// These five modules feed surfaces that were correct only at connect and at
-/// tab-switch time: a validator joining, a proposal being voted, a device being
-/// renamed, an agent registering, a file being committed — none of it reached a
-/// console already looking at the page that shows it.
+/// These modules feed surfaces that were correct only at connect and at
+/// tab-switch time: a validator joining, a device being renamed, a file being
+/// committed — none of it reached a console already looking at the page that
+/// shows it.
 ///
 /// The generation counters ARE the assertion: each is the refetch's own guard,
 /// so one moving means exactly that plane was asked for, and the others holding
@@ -934,9 +934,8 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
         }));
     };
 
-    let (members, agents, account, dm, fs) = (
+    let (members, account, dm, fs) = (
         app.members_generation,
-        app.agents_generation,
         app.account_generation,
         app.dm_peers_generation,
         app.fs_generation,
@@ -960,21 +959,11 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
     assert_eq!(app.account_generation, account + 1);
     assert_eq!(app.dm_peers_generation, dm + 1);
 
+    // the agents pair — `agent` for the register, `runs` for the liveness —
+    // is the agents VIEW's to re-read, through the kernel's `rpc.live`; no
+    // app reading moves for either
     plane(&mut app, "agent");
-    assert_eq!(
-        app.agents_generation,
-        agents + 1,
-        "identity refreshes model controller names"
-    );
-
-    // Model configuration and active runs share the runs plane. Generic
-    // program changes do not change the model roster.
     plane(&mut app, "runs");
-    assert_eq!(
-        app.agents_generation,
-        agents + 2,
-        "runs owns model configuration and liveness"
-    );
     assert_eq!(app.account_generation, account + 1, "and nothing else");
 
     plane(&mut app, "files");

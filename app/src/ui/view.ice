@@ -119,7 +119,7 @@ view
           bell_sev=bell_worst_severity(bell_items)
           approvals=gov_open
           account=account_name
-          agent_live=any_agent_active(agents_rows)
+          agent_live=agents_live
           tier=member_tier(members_rows)
           answered=members_answered
           root_hash=node_root_hash
@@ -216,10 +216,12 @@ view
         members:
           extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
-          // the register whole, with the editor's pick lists and the signing
-          // account; every write comes back as an intent the roster handler
-          // signs
-          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
+          // Agents is a VIEW ON THE KERNEL CONTRACT: session facts go in —
+          // the signing account and the run another tab opened for the
+          // reader — and the view reads its own register and signs its own
+          // writes through `op.submit`. What comes back is its working
+          // count, a registration, and two navigations.
+          extern agents_view(dark, connected, account_number, agents_open_run, agents_opened) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
         // the code browse's listing and file, and the discussion go in as
         // props; every act comes back as an intent the handler signs. The

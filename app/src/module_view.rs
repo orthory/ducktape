@@ -119,106 +119,42 @@ pub fn members_view(
     module_view("members", serde_json::to_vec(&props).expect("props encode"))
 }
 
-/// The Agents tab: the register as the app has it, drawn by the `agents`
-/// view — every record whole, the capability tags the network announces,
-/// the action vocabulary, and the signing account (`account`, its decimal
-/// number) so the view offers the editor to a record's controller; beside
-/// it the run tracker, every run off the runs journal, the journal of the
-/// one the reader opened (`open_run`, its dispatch id) with the chips of
-/// every place it touched, and that run's live progress while it works.
-/// Its intents come back as `status` (`agent_id`, `paused`), `save` and
-/// `register` (both the whole draft record as JSON, `AgentDraft`),
-/// `open_run` (`dispatch_id`, "" to close) and `open_link` (`url`, a chip's
-/// duck:// address for the open plane).
-/// Every committed write bumps `committed`, which tells the view its drafts
-/// were consumed.
-#[allow(clippy::too_many_arguments)]
+/// The Agents tab, drawn by the `agents` view over the KERNEL CONTRACT:
+/// the app pushes session facts only — connected, dark, the signing
+/// account (`account`, its decimal number) and the run another tab opened
+/// for the reader (`open_run`, its dispatch id; `opened` counts the doors)
+/// — and the view reads the register, the run tracker and one run's
+/// journal for itself through `rpc.query` / `rpc.view`, re-reading on
+/// every `rpc.live` hit for the `runs` and `identity` planes. A pause or a
+/// save leaves as `op.submit`, signed here with the seated key.
+///
+/// What still comes back as an intent: `badge` (how many of its agents are
+/// working — the rail's pulse), `register` (a new agent, whose program
+/// account only the app can provision), `open_run` (`dispatch_id`, "" to
+/// close) and `open_link` (`url`, a chip's duck:// address).
 pub fn agents_view(
     dark: bool,
     connected: bool,
-    answered: bool,
     account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
     open_run: &str,
     opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
 ) -> Element<'static, ModuleViewEvent> {
-    module_view(
-        "agents",
-        agents_props(
-            dark,
-            connected,
-            answered,
-            account,
-            committed,
-            rows,
-            runs,
-            open_run,
-            opened,
-            journal,
-            live,
-            capabilities,
-        ),
-    )
-}
-
-/// The exact bytes [`agents_view`] pushes — named so a test can assert what
-/// this app SENDS rather than a shape it wrote out by hand beside it.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agents_props(
-    dark: bool,
-    connected: bool,
-    answered: bool,
-    account: &str,
-    committed: i64,
-    rows: &[crate::backend::AgentRow],
-    runs: &[crate::backend::RunRow],
-    open_run: &str,
-    opened: i64,
-    journal: &crate::backend::RunJournal,
-    live: &crate::backend::LiveRun,
-    capabilities: &[String],
-) -> Vec<u8> {
-    // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
-    // guest draws nothing with, and `link`/`account`/`op` are the fence the app
-    // installs an answer by — a guest cannot check them and has no reason to
-    // see which operation number it is looking at. The reading's error is the
-    // app's banner, not a field the guest re-renders.
-    const APP_ONLY: [&str; 4] = ["rpc", "link", "account", "op"];
-    let mut book = serde_json::to_value(journal).expect("the run journal encodes");
-    if let Some(book) = book.as_object_mut() {
-        for app_only in APP_ONLY.iter().chain(["error"].iter()) {
-            book.remove(*app_only);
-        }
-    }
     let props = serde_json::json!({
-        "rows": rows,
-        "runs": runs,
+        "account": account,
         "open_run": open_run,
         "opened": opened,
-        "journal": book,
-        "live": live,
-        "capabilities": capabilities,
-        "account": account,
-        "committed": committed,
         "connected": connected,
-        "answered": answered,
         "dark": dark,
     });
-    serde_json::to_vec(&props).expect("props encode")
+    module_view("agents", serde_json::to_vec(&props).expect("props encode"))
 }
 
 pub fn agents_intent(event: &ModuleViewEvent) -> crate::AgentsIntent {
     match event.kind.as_str() {
-        "save" => crate::AgentsIntent::Save,
         "register" => crate::AgentsIntent::Register,
         "open_run" => crate::AgentsIntent::OpenRun,
         "open_link" => crate::AgentsIntent::OpenLink,
-        _ => crate::AgentsIntent::Status,
+        _ => crate::AgentsIntent::Badge,
     }
 }
 
@@ -1646,13 +1582,11 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         "governance" => &[],
         // members speaks it too; `copy` is the clipboard door, not a write
         "members" => &["copy"],
-        "agents" => &[
-            "status",
-            "save",
-            "register",
-            "open_run",
-            "open_link",
-        ],
+        // the agents view speaks the kernel contract: its pause and its save
+        // are `op.submit`. `register` stays an intent because it provisions a
+        // program account before it registers, and `open_run`/`open_link`
+        // navigate other tabs.
+        "agents" => &["register", "open_run", "open_link"],
         "node" => &["copy", "tab", "log_filter"],
         // the explorer view reads and searches through the kernel: the only
         // thing it asks the app for is the clipboard
@@ -2556,6 +2490,9 @@ struct Guest {
     /// The guest's `rpc.live` subscriptions, each with the plane it named:
     /// told on every block that moves that plane.
     live_subscriptions: Vec<(u64, String)>,
+    /// The guest's `rpc.stream` subscriptions, each holding the node socket
+    /// the kernel opened for it: retired with the cancel, and with the guest.
+    streams: Vec<(u64, kernel::NodeStream)>,
     /// The trap that ended the view, if one did. A faulted guest never ticks again.
     fault: Option<String>,
     /// The assets the deployment shipped beside this view, for the host
@@ -3225,6 +3162,7 @@ impl Guest {
             intents: Vec::new(),
             replies: Arc::default(),
             live_subscriptions: Vec::new(),
+            streams: Vec::new(),
             fault: None,
             assets: Arc::default(),
             hash: None,
@@ -3356,6 +3294,9 @@ impl Guest {
                 self.props_subscription = None;
             }
             self.live_subscriptions.retain(|(live, _)| *live != id);
+            // dropping the stream aborts it: the node socket goes with the
+            // subscription the view abandoned
+            self.streams.retain(|(stream, _)| *stream != id);
         }
         self.fault.is_none()
             && (self.frame.busy
@@ -4031,16 +3972,8 @@ pub(crate) mod tests {
     fn only_declared_intents_are_routed() {
         assert!(intents_of("governance").is_empty());
         assert_eq!(intents_of("members"), ["copy"]);
-        assert_eq!(
-            intents_of("agents"),
-            [
-                "status",
-                "save",
-                "register",
-                "open_run",
-                "open_link",
-            ]
-        );
+        // the agents view signs its own pause and save through `op.submit`
+        assert_eq!(intents_of("agents"), ["register", "open_run", "open_link"]);
         let chat = intents_of("chat");
         assert_eq!(chat.len(), 43);
         assert!(!chat.contains(&"edit"));
@@ -4399,150 +4332,6 @@ pub(crate) mod tests {
         guest.redraw(&session);
         assert!(guest.ticks > ticks, "the live item ticked the view");
         assert!(guest.fault.is_none(), "{:?}", guest.fault);
-    }
-
-    /// The bundled Agents view through the host: offline plate, then the
-    /// register; nothing leaves it until a reader edits a record.
-    #[test]
-    fn the_staged_agents_view_boots_and_takes_the_register() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        guest.redraw(&None);
-        assert!(
-            texts(&guest).iter().any(|text| text == "Not connected"),
-            "{:?}",
-            texts(&guest)
-        );
-        // the props the app ENCODES, not a hand-written shape beside the
-        // encoder: a field the encoder dropped, or the guest stopped taking,
-        // fails here
-        let skill = |name: &str, always: bool| crate::backend::AgentSkill {
-            name: name.into(),
-            source_prefix: format!("/shared/skills/{name}"),
-            source_snapshot: String::new(),
-            always,
-        };
-        let reviewer = crate::backend::AgentRow {
-            id: "reviewer-bot".into(),
-            name: "Reviewer Bot".into(),
-            initials: "RB".into(),
-            capability: "review".into(),
-            status: "paused".into(),
-            owner_handle: "eddy".into(),
-            controller: "7".into(),
-            live: false,
-            skills: vec![
-                skill("review", true),
-                skill("style", false),
-                skill("tests", false),
-            ],
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "",
-            0,
-            &[reviewer],
-            &[],
-            "",
-            0,
-            &crate::backend::RunJournal::default(),
-            &crate::backend::LiveRun::default(),
-            &["claude".into(), "review".into()],
-        ));
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["1 agent · 0 working", "Reviewer Bot", "PAUSED", "eddy"] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert!(guest.intents.is_empty());
-        assert!(guest.fault.is_none());
-    }
-
-    #[test]
-    fn the_staged_agents_view_renders_semantic_actions_and_opens_the_exact_target() {
-        let Some(staged) = staged("agents") else {
-            return;
-        };
-        let mut guest = Guest::load_from("agents", &staged).expect("the view loads");
-        let run = crate::backend::RunRow {
-            run_id: "machine-run-hash".into(),
-            dispatch_id: "machine-dispatch-hash".into(),
-            agent_id: "reviewer".into(),
-            agent_name: "Reviewer".into(),
-            origin: "#Engineering · Message 42".into(),
-            state: "running".into(),
-            dispatched: "h 1".into(),
-            settled: String::new(),
-            attempt: 1,
-            holder: String::new(),
-            actions: 1,
-            degraded: false,
-            reason: String::new(),
-            output_ref: String::new(),
-            pr_number: 0,
-        };
-        let target = crate::backend::RunLink {
-            relation: "target".into(),
-            kind: "chat".into(),
-            label: "#Engineering · Eddy: Bound and scroll".into(),
-            url: "duck://channel/room?net=a1b2c3d4#42".into(),
-        };
-        let journal = crate::backend::RunJournal {
-            dispatch_id: run.dispatch_id.clone(),
-            entries: vec![crate::backend::JournalEntry {
-                height: "h 2".into(),
-                kind: "action".into(),
-                summary: "React 👀".into(),
-                status: "Completed".into(),
-                targets: vec![target.clone()],
-            }],
-            ..Default::default()
-        };
-        let props = Some(agents_props(
-            false,
-            true,
-            true,
-            "7",
-            0,
-            &[],
-            std::slice::from_ref(&run),
-            &run.dispatch_id,
-            1,
-            &journal,
-            &crate::backend::LiveRun::default(),
-            &[],
-        ));
-        guest.redraw(&None);
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in ["React 👀", "Completed", &target.label] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected}"
-            );
-        }
-        assert!(
-            !shown
-                .iter()
-                .any(|text| text.contains("machine-dispatch-hash"))
-        );
-        assert!(guest.fault.is_none());
-        guest.deliver(Output::Activate(button_message(&guest, &target.label)));
-        guest.redraw(&props);
-        let intent = guest.intents.last().expect("target navigation");
-        assert_eq!(intent.kind, "open_link");
-        assert!(matches!(agents_intent(intent), crate::AgentsIntent::OpenLink));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&intent.detail).unwrap()["url"],
-            target.url
-        );
     }
 
     /// Every host surface in the guest's tree, by name.
