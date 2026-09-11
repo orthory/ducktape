@@ -48,6 +48,30 @@ pub(crate) async fn seated_write(
     submit_raw_frame(rpc, target, frame).await
 }
 
+/// A data-plane signer over the key ALREADY SEATED, or the locked refusal:
+/// the kernel's reader queries and raw-bytes writes for a module view, which
+/// carries no password of its own.
+pub(crate) async fn seated_data_plane_signer(
+    rpc: &RpcClient,
+) -> Result<ducktape_rpc::WriteAuth, String> {
+    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+    let key = {
+        let session = SIGNER.lock().await;
+        let Some(signer) = session.as_ref() else {
+            return Err("the local user key is locked; enter its password".into());
+        };
+        signer.key.clone()
+    };
+    Ok(std::sync::Arc::new(
+        move |method: &str, path: &str, body: &[u8]| {
+            ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        },
+    ))
+}
+
 /// Submit a frame signed ELSEWHERE — by a passkey or a wallet in the browser
 /// (`authpage`), never this device's key — through the same funnel, so the
 /// block it lands in is noted for the reads that follow.
@@ -496,95 +520,14 @@ pub async fn save_appearance(mode: crate::Appearance) -> bool {
 }
 
 /// The prefs key a network's per-network readings (`networks[<key>]`: its
-/// doc tabs, its last-used stamp) sit under: the chain id when the endpoint
-/// is served by a workspace on this device — the one name that survives a
-/// port change — else the canonical endpoint of a remote.
+/// last-used stamp) sit under: the chain id when the endpoint is served by a
+/// workspace on this device — the one name that survives a port change —
+/// else the canonical endpoint of a remote.
 pub(crate) fn network_key(rpc: &str) -> String {
     match workspace_at(rpc) {
         Some((chain_id, _)) => chain_id,
         None => canonical_endpoint(rpc.to_string()),
     }
-}
-
-/// This network's persisted doc tabs (open page ids, in open order).
-pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
-    let prefs = read_prefs();
-    prefs["networks"][network_key(&rpc)]["doc_tabs"]
-        .as_array()
-        .map(|tabs| {
-            tabs.iter()
-                .filter_map(|tab| tab.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Persist this network's doc tabs. Best-effort: a failed write only costs
-/// tab restoration on the next boot.
-pub async fn save_doc_tabs(rpc: String, tabs: Vec<String>) -> bool {
-    let mut prefs = read_prefs();
-    prefs["networks"][network_key(&rpc)]["doc_tabs"] = serde_json::json!(tabs);
-    write_prefs(&prefs)
-}
-
-/// Add a page to the doc-tab strip (idempotent, keeps open order).
-pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    if page_id.is_empty() || tabs.contains(&page_id) {
-        return tabs;
-    }
-    tabs.push(page_id);
-    tabs
-}
-
-/// Close one tab.
-pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
-    tabs.retain(|tab| *tab != page_id);
-    tabs
-}
-
-/// One rendered doc tab.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct DocTab {
-    pub id: String,
-    pub title: String,
-    pub active: bool,
-}
-
-/// The rendered tab strip: open tabs that still exist, titled from the page
-/// list, the active one flagged.
-pub fn doc_tab_rows(tabs: &[String], pages: &[PageItem], active: &str) -> Vec<DocTab> {
-    tabs.iter()
-        .filter_map(|tab| {
-            let page = pages.iter().find(|page| page.id == *tab)?;
-            Some(DocTab {
-                title: page.title.clone(),
-                active: tab == active,
-                id: tab.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Drop tabs whose page is gone. `doc_tab_rows` already resolves every tab
-/// against the live page list when it draws, so a dead id is invisible in the
-/// bar — but the PERSISTED list kept them forever, and Settings counts that
-/// list: `Open page tabs 11` beside a bar showing two. Pruning where the pages
-/// land keeps the stored list and its count honest.
-pub fn doc_tabs_pruned(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
-}
-
-/// The tab to activate after closing one: the last remaining tab, or empty.
-pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
-    if closed != active {
-        return active;
-    }
-    tabs.into_iter()
-        .rev()
-        .find(|tab| *tab != closed)
-        .unwrap_or_default()
 }
 
 /// WHERE A NETWORK'S WALLETS LIVE ON THIS DEVICE. A wallet is an identity ON
@@ -689,19 +632,6 @@ pub(crate) fn env_user_key() -> Option<PathBuf> {
     keystore::wallet::env_user_key()
 }
 
-pub(crate) fn ducktape_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("DUCKTAPE_BIN") {
-        return path.into();
-    }
-    if let Ok(current) = std::env::current_exe()
-        && let Some(sibling) = current.parent().map(|parent| parent.join("ducktape"))
-        && sibling.is_file()
-    {
-        return sibling;
-    }
-    PathBuf::from("ducktape")
-}
-
 pub(crate) fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() || value.len() > limit || value.chars().any(|character| character == '\0') {
@@ -766,19 +696,6 @@ pub(crate) fn user_error(message: String) -> String {
     let key_unreadable = message.contains("local user key") || message.contains("wallet name");
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
-    }
-    // The only surviving subprocess is the agent pty — keys, signing, run
-    // scheduling, invite minting and joining a network all happen in this
-    // process now — so this branch matches the ONE sentence that path writes
-    // (`start_agent_terminal`), and names no tool it did not start. Matching
-    // `DUCKTAPE_BIN` instead, as this did, matched nothing at all: every
-    // message that used to carry the variable's name was deleted along with
-    // the subprocess that produced it.
-    let helper_cannot_start = message.contains("could not start the ducktape");
-    if helper_cannot_start {
-        return "Ducktape's helper program could not start. Check the ducktape install in \
-                Settings."
-            .into();
     }
     let node_slow = message.contains("timed out");
     if node_slow {
@@ -846,25 +763,8 @@ mod tests {
         );
     }
 
-    /// The install sentence must be REACHABLE, and it is the one thing this
-    /// function still says about a subprocess. The app has exactly one left —
-    /// the agent pty — and matching on the variable name `DUCKTAPE_BIN`, as
-    /// this branch did, matched nothing: every message carrying it was deleted
-    /// with the subprocess that wrote it.
-    #[test]
-    fn a_helper_that_cannot_start_names_no_particular_tool() {
-        assert_eq!(
-            user_error(
-                "could not start the ducktape agent terminal: Could not start Claude · raw \
-                 session: No such file or directory (os error 2)"
-                    .into()
-            ),
-            "Ducktape's helper program could not start. Check the ducktape install in Settings."
-        );
-    }
-
-    /// A node that went quiet is not the same event as a helper that would not
-    /// start, and both are reached only after the key causes above them.
+    /// A node that went quiet has its own sentence, reached only after the key
+    /// causes above it.
     #[test]
     fn a_slow_node_keeps_its_own_sentence() {
         assert_eq!(

@@ -1,25 +1,25 @@
 use std::collections::BTreeMap;
 
-use crate::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use crate::MAX_DUCKFS_WRITE_TEXT_BYTES;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
+use super::action_requests::Prepared;
+use super::catalog::Operation;
 use super::facets::{
     WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of,
 };
-use super::action_requests::Prepared;
-use super::catalog::Operation;
 use super::{
     AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult,
     DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error, FilesChange, FilesContent,
     FilesMsg, FilesQuery, FilesReply, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES, MAX_REPLY_BLOCKS_BYTES,
-    MAX_THREAD_REPLIES, ModelRecord, Msg, Origin, PendingState, ReplyBlock, ReplyDestination,
-    ResultEvent, RunOrigin, RunsModule, TaskMsg, TaskQuery, TaskReply, TaskStatus,
-    chat_decode_reply, chat_encode_msg, chat_encode_query, content_blocks, dispatch_encode_msg,
-    dispatch_id_for, files_decode_reply, files_encode_msg, files_encode_query, reply_message_id,
-    tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
+    MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ReplyDestination, ResultEvent,
+    RunOrigin, RunsModule, TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply,
+    chat_encode_msg, chat_encode_query, content_blocks, dispatch_encode_msg, dispatch_id_for,
+    files_decode_reply, files_encode_msg, files_encode_query, reply_message_id, tasks_decode_reply,
+    tasks_encode_msg, tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
@@ -283,28 +283,16 @@ fn reported_state(name: &str) -> Option<collaboration::DeliveryState> {
     }
 }
 
-/// whether the registry granted this agent an action name.
-pub(super) fn allows(agent: &ModelRecord, action: &str) -> bool {
-    agent.allows(action)
-}
-
-/// the admission half of an `agent.call`: the caller's cap, the callee is not
-/// itself, and the bounded instruction. `execute_delegation` re-checks these
-/// under the program origin with the live registry; refusing here answers the
-/// submitter instead of burning a program call to be told the same thing.
+/// the admission half of an `agent.call`: the callee is not the caller, and
+/// the instruction is bounded. `execute_delegation` re-checks these under the
+/// program origin with the live registry; refusing here answers the submitter
+/// instead of burning a program call to be told the same thing.
 fn validate_agent_call(
-    caller: &ModelRecord,
     entry: &PendingState,
     agent_id: &str,
     instruction: &str,
     skills: &[String],
 ) -> Result<(), String> {
-    if caller.caps.subagent_budget == 0 {
-        return Err(format!(
-            "agent {} has no subagent budget (caps.subagent_budget)",
-            caller.agent_id
-        ));
-    }
     if agent_id == entry.agent_id {
         return Err("an agent cannot call itself".into());
     }
@@ -490,8 +478,8 @@ impl RunsModule {
             &mut posts,
         )
         .await;
-        self.emit_duckfs_effects(ctx, run_id, entry, &operations)
-            .await;
+        self.emit_duckfs_effects(ctx, run_id, &operations).await;
+        self.emit_submit_effects(ctx, &operations);
         // a callee's reply blocks return to its caller, never to the chat.
         self.emit_response(
             ctx,
@@ -674,15 +662,16 @@ impl RunsModule {
         // computed once here, shared by the PR-body breadcrumb and the ring.
         let executing_node = self.executing_node(&*ctx, run_id).await;
         // the pages effects lane: applied here at the run boundary like every
-        // other effect, but probe-guarded and cap-gated per action — a bad
-        // pages action degrades to a breadcrumb, the run still delivers. the
-        // duckfs write lane is the same shape: a stale per-path base degrades
-        // alone, it never costs the response its reply or its other actions.
+        // other effect, but probe-guarded per action — a bad pages action
+        // degrades to a breadcrumb, the run still delivers. the duckfs write
+        // lane is the same shape: a stale per-path base degrades alone, it
+        // never costs the response its reply or its other actions. a submit
+        // is emitted verbatim; its module's verdict is its receipt.
         let mut posts = ReplyPosts::default();
         self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &operations, &mut posts)
             .await;
-        self.emit_duckfs_effects(ctx, run_id, entry, &operations)
-            .await;
+        self.emit_duckfs_effects(ctx, run_id, &operations).await;
+        self.emit_submit_effects(ctx, &operations);
         self.emit_module_updates(ctx, run_id, entry, &result, &operations);
         self.emit_response(
             ctx,
@@ -762,8 +751,8 @@ impl RunsModule {
 
     /// deterministic response validation — THE safety boundary (design §5).
     /// the response is data until every check here passes; only then do its
-    /// follow-ups exist. beyond grants and caps, this probes everything the
-    /// emitted follow-ups could make chat or tasks REJECT (which would abort
+    /// follow-ups exist. it probes everything the emitted follow-ups could
+    /// make chat or tasks REJECT (which would abort
     /// the delivery block — the no-fail rule): a squatted reply message id, a
     /// full thread, a duplicate, over-cap, or unknown task id.
     ///
@@ -788,10 +777,10 @@ impl RunsModule {
         lane: Lane,
         response: AgentResponse,
     ) -> Result<Validated, String> {
-        let agent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+        let registered = self.agent_for_run(ctx, entry).await?.is_some();
+        if !registered {
+            return Err(format!("agent is not registered: {}", entry.agent_id));
+        }
         if response.reply_blocks.is_empty() && response.actions.is_empty() {
             return Err("response carries neither reply blocks nor actions".into());
         }
@@ -838,7 +827,7 @@ impl RunsModule {
         // at apply, and the block aborts — forever (the mailbox re-injects it).
         // counted in EMISSION order: the run's own reply first, then the
         // actions by index, exactly as `emit_response` emits them.
-        // Cache the requester's standing per channel; it cannot change mid-pass.
+        // Cache the account's chat standing per channel; it cannot change mid-pass.
         let mut posts = ReplyPosts::default();
 
         if !response.reply_blocks.is_empty() {
@@ -885,12 +874,6 @@ impl RunsModule {
             if operation.is_pages() || operation.is_duckfs() {
                 continue;
             }
-            let missing_grant = operation
-                .fixed_grant()
-                .filter(|name| !allows(&agent, name));
-            if let Some(name) = missing_grant {
-                return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
-            }
             let slot = lane.slot(index);
             match operation {
                 Operation::ModulesUpdate(update) => {
@@ -912,19 +895,10 @@ impl RunsModule {
                     title,
                     body,
                 } => {
-                    // the same authority the push spent: the repo's forge_push
-                    // cap, on the run's OWN final response — a callee's result
+                    // on the run's OWN final response only — a callee's result
                     // returns to its caller and proposes nothing on the forge.
                     if matches!(lane, Lane::DelegatedSettle) {
-                        return Err(
-                            "forge.open_pr requires the run's own final response".into(),
-                        );
-                    }
-                    if !agent.permits(&CapRequest::ForgePush(repo)) {
-                        return Err(format!(
-                            "agent {} lacks forge_push for {repo}",
-                            entry.agent_id
-                        ));
+                        return Err("forge.open_pr requires the run's own final response".into());
                     }
                     sink::validate_pr_proposal(source_branch, target_branch, title, body)?;
                     let first_proposal_of_branch =
@@ -1018,7 +992,10 @@ impl RunsModule {
                     agent_id,
                     instruction,
                     skills,
-                } => validate_agent_call(&agent, entry, agent_id, instruction, skills)?,
+                } => validate_agent_call(entry, agent_id, instruction, skills)?,
+                // carried verbatim: the target module is the only judge of a
+                // submit, and its verdict is the receipt's outcome.
+                Operation::Submit { .. } => {}
                 // the composable half only. WHO may act as this participant is
                 // not decided here and cannot be: the binding is judged against
                 // the `Origin::Program(account)` the effect arrives under, which
@@ -1056,11 +1033,11 @@ impl RunsModule {
         }
         self.probe_channel_exists(ctx, post.channel_id).await?;
         let may_post = self
-            .requester_may_post(ctx, entry, post.channel_id, &mut posts.standing)
+            .account_may_post(ctx, entry, post.channel_id, &mut posts.standing)
             .await?;
         if !may_post {
             return Err(format!(
-                "the run's requester may not post to channel: {}",
+                "the agent's account may not post to channel: {}",
                 post.channel_id
             ));
         }
@@ -1190,23 +1167,6 @@ impl RunsModule {
                 entry.reply_destination()?
             }
         };
-        let agent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        let source_chat_reply = matches!(resolved, ReplyDestination::Chat { .. }) && !explicit;
-        let action = if source_chat_reply {
-            crate::ACTION_CHAT_POST
-        } else {
-            resolved.required_action()
-        };
-        let permitted = allows(&agent, action);
-        if !permitted {
-            return Err(format!(
-                "agent {} is not allowed to {action}",
-                entry.agent_id
-            ));
-        }
         let text = to_page_comment_text(blocks);
         let empty_text = text.trim().is_empty();
         if empty_text {
@@ -1224,12 +1184,13 @@ impl RunsModule {
         // `reply` and reports where it landed; an explicit destination is its
         // own operation and reports that operation's coordinates.
         let operation = if explicit {
-            resolved.required_action()
+            resolved.operation()
         } else {
             crate::OP_REPLY
         };
         let destination_json = serde_json::to_value(&resolved).expect("destinations serialize");
-        let source_result = |id: &str| serde_json::json!({"destination": destination_json, "id": id});
+        let source_result =
+            |id: &str| serde_json::json!({"destination": destination_json, "id": id});
         match resolved {
             ReplyDestination::Chat { channel_id, thread } => {
                 let message_id = match slot {
@@ -1273,16 +1234,7 @@ impl RunsModule {
                 let thread_slot = if explicit { slot } else { "reply" };
                 let thread_id = super::pages_effects::page_thread_id(run_id, thread_slot);
                 let (message, target, comment_id) = self
-                    .page_reply_msg(
-                        ctx,
-                        &agent,
-                        run_id,
-                        slot,
-                        &thread_id,
-                        Some(&target),
-                        text,
-                        posts,
-                    )
+                    .page_reply_msg(ctx, run_id, slot, &thread_id, Some(&target), text, posts)
                     .await?;
                 let result = if explicit {
                     serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
@@ -1293,7 +1245,7 @@ impl RunsModule {
             }
             ReplyDestination::PageThread { thread_id } => {
                 let (message, target, comment_id) = self
-                    .page_reply_msg(ctx, &agent, run_id, slot, &thread_id, None, text, posts)
+                    .page_reply_msg(ctx, run_id, slot, &thread_id, None, text, posts)
                     .await?;
                 let result = if explicit {
                     serde_json::json!({"target": target, "thread_id": thread_id, "comment_id": comment_id})
@@ -1323,7 +1275,6 @@ impl RunsModule {
     async fn page_reply_msg(
         &self,
         ctx: &dyn Ctx,
-        agent: &ModelRecord,
         run_id: &str,
         slot: &str,
         thread_id: &str,
@@ -1400,8 +1351,7 @@ impl RunsModule {
         if full_thread {
             return Err("pages comment thread is full".into());
         }
-        let block = self.page_block(ctx, pages, &target).await?;
-        self.check_pages_write(agent, &block.page)?;
+        self.page_block(ctx, pages, &target).await?;
         let bytes = ctx
             .query(
                 pages,
@@ -1487,10 +1437,10 @@ impl RunsModule {
         Ok((message, comment_id))
     }
 
-    /// Both the model user and an explicit external requester must retain
-    /// posting access to a tool action's destination. Targets independently
-    /// apply their normal Program account gate when the action actually runs.
-    async fn requester_may_post(
+    /// chat's own verdict on the model account posting to a channel — the
+    /// probe that keeps an emitted post from being rejected at apply. chat
+    /// judges the same account again when the program's call actually runs.
+    async fn account_may_post(
         &self,
         ctx: &dyn Ctx,
         entry: &PendingState,
@@ -1515,22 +1465,15 @@ impl RunsModule {
         else {
             return Err("unexpected chat access reply".into());
         };
-        let requester_allowed = match &entry.requester {
-            RunOrigin::External(key) => {
-                !key.is_empty() && self.may_post(ctx, key, channel_id).await?
-            }
-            RunOrigin::Program(_) | RunOrigin::Module(_) | RunOrigin::System => true,
-        };
-        let may_post = access.may_post && requester_allowed;
-        known.insert(channel_id.to_string(), may_post);
-        Ok(may_post)
+        known.insert(channel_id.to_string(), access.may_post);
+        Ok(access.may_post)
     }
 
     /// prove a channel EXISTS before an agent speaks into it — chat rejects a
     /// post to an unknown channel, and on the settle path that rejection would
     /// abort the delivery block. existence ONLY: chat admits a module/agent
-    /// author into any channel it holds, which is exactly why the standing gate
-    /// ([`RunsModule::requester_may_post`]) has to run beside this probe.
+    /// author into any channel it holds, which is exactly why the standing
+    /// probe ([`RunsModule::account_may_post`]) has to run beside this one.
     async fn probe_channel_exists(&self, ctx: &dyn Ctx, channel_id: &str) -> Result<(), String> {
         let reply = ctx
             .query(
@@ -1609,14 +1552,12 @@ impl RunsModule {
     }
 
     /// ONE duckfs.write_text operation as an emit-ready follow-up, or the
-    /// reason it must not be emitted: gate order grant -> shape/cap/permission
-    /// -> the per-path base probe. `Err` degrades to a breadcrumb on the settle
-    /// path and returns to the submitter on the session lane; same verdict,
-    /// two failure policies.
+    /// reason it must not be emitted: shape first, then the per-path base
+    /// probe. `Err` degrades to a breadcrumb on the settle path and returns to
+    /// the submitter on the session lane; same verdict, two failure policies.
     pub(super) async fn duckfs_write_msg(
         &self,
         ctx: &dyn Ctx,
-        agent: &ModelRecord,
         operation: &Operation,
     ) -> Result<Prepared, String> {
         let Operation::DuckfsWriteText {
@@ -1628,10 +1569,7 @@ impl RunsModule {
             unreachable!("only the duckfs operation reaches this lane");
         };
         let name = operation.name();
-        if !allows(agent, name) {
-            return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
-        }
-        validate_duckfs_text_write(agent, path, text)?;
+        validate_duckfs_text_write(path, text)?;
         let files = self
             .files
             .as_ref()
@@ -1669,25 +1607,16 @@ impl RunsModule {
         &self,
         ctx: &mut dyn Ctx,
         run_id: &str,
-        entry: &PendingState,
         operations: &[Operation],
     ) {
         if !operations.iter().any(Operation::is_duckfs) {
             return;
         }
-        let skip = |what: &str| format!("run {run_id} duckfs.write_text action skipped: {what}");
-        let agent = match self.agent_for_run(&*ctx, entry).await {
-            Ok(Some(a)) => a,
-            _ => {
-                self.note(ctx, skip("agent not registered"));
-                return;
-            }
-        };
         for (index, operation) in operations.iter().enumerate() {
             if !operation.is_duckfs() {
                 continue;
             }
-            match self.duckfs_write_msg(&*ctx, &agent, operation).await {
+            match self.duckfs_write_msg(&*ctx, operation).await {
                 Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(
                     ctx,
@@ -1701,8 +1630,8 @@ impl RunsModule {
     /// same message id as a success reply would use, so the one-reply-per-run
     /// dedup holds and a redelivered result (entry already pruned) can never
     /// double-post. anything that keeps the post from being valid by
-    /// construction (job run, unregistered agent, missing chat.post grant,
-    /// squatted id, full thread) degrades to the pre-existing breadcrumb-only
+    /// construction (job run, unregistered agent, squatted id, full thread)
+    /// degrades to the pre-existing breadcrumb-only
     /// silence — never an error on this no-fail arm.
     async fn emit_failure_reply(
         &self,
@@ -1817,7 +1746,10 @@ impl RunsModule {
                 Ok(prepared) => self.emit_prepared(ctx, prepared),
                 Err(why) => self.note(
                     ctx,
-                    format!("run {run_id} {} action {index} skipped: {why}", operation.name()),
+                    format!(
+                        "run {run_id} {} action {index} skipped: {why}",
+                        operation.name()
+                    ),
                 ),
             }
         }
@@ -1825,9 +1757,9 @@ impl RunsModule {
 
     /// A reaction on the message this run was called on, as the chat op the
     /// program executes, or the reason it cannot be prepared. The reaction is
-    /// held to the same standing as a source reply: a chat source, the
-    /// `chat.post` grant, and a requester who may post there. The emoji is
-    /// bounded by chat's own rule so the follow-up is never rejected at apply.
+    /// held to the same standing as a source reply: a chat source and chat's
+    /// own post standing for the account. The emoji is bounded by chat's own
+    /// rule so the follow-up is never rejected at apply.
     async fn reaction_msg(
         &self,
         ctx: &dyn Ctx,
@@ -1845,17 +1777,6 @@ impl RunsModule {
                 operation.name()
             ));
         };
-        let agent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        if !allows(&agent, crate::ACTION_CHAT_POST) {
-            return Err(format!(
-                "agent {} is not allowed to {}",
-                entry.agent_id,
-                crate::ACTION_CHAT_POST
-            ));
-        }
         if emoji.is_empty() {
             return Err(format!("{} requires an emoji", operation.name()));
         }
@@ -1868,11 +1789,11 @@ impl RunsModule {
         }
         self.probe_channel_exists(ctx, &channel_id).await?;
         let may_post = self
-            .requester_may_post(ctx, entry, &channel_id, &mut posts.standing)
+            .account_may_post(ctx, entry, &channel_id, &mut posts.standing)
             .await?;
         if !may_post {
             return Err(format!(
-                "the run's requester may not post to channel: {channel_id}"
+                "the agent's account may not post to channel: {channel_id}"
             ));
         }
         let seq = entry.anchor_seq;
@@ -1966,9 +1887,7 @@ impl RunsModule {
                 ))
             }
             Operation::TasksCreate { task_id, title } => {
-                let task_id = task_id
-                    .clone()
-                    .unwrap_or_else(|| task_id_for(run_id, slot));
+                let task_id = task_id.clone().unwrap_or_else(|| task_id_for(run_id, slot));
                 Ok(Prepared::new(
                     Msg {
                         target: self.task_target(),
@@ -1986,8 +1905,8 @@ impl RunsModule {
                 ))
             }
             Operation::TasksUpdateStatus { task_id, status } => {
-                let status_value = task_status(status)
-                    .ok_or_else(|| format!("unknown task status: {status}"))?;
+                let status_value =
+                    task_status(status).ok_or_else(|| format!("unknown task status: {status}"))?;
                 Ok(Prepared::new(
                     Msg {
                         target: self.task_target(),
@@ -2008,9 +1927,43 @@ impl RunsModule {
             | Operation::ForgeOpenPr { .. }
             | Operation::CollaborationSend { .. }
             | Operation::CollaborationAcknowledge { .. }
-            | Operation::AgentCall { .. } => {
+            | Operation::AgentCall { .. }
+            | Operation::Submit { .. } => {
                 unreachable!("only conversational operations reach this lane")
             }
+        }
+    }
+
+    /// A submit as the exact message the account's program will execute: the
+    /// module the target names, and the message's own JSON bytes — what a
+    /// member submitting the same message would put on the wire. Nothing is
+    /// probed: the module's verdict is the receipt's outcome.
+    pub(super) fn submit_msg(&self, operation: &Operation) -> Prepared {
+        let Operation::Submit { module, message } = operation else {
+            unreachable!("{} is not a submit", operation.name());
+        };
+        let name =
+            super::catalog::message_name(message).expect("a decoded submit names its message");
+        Prepared::new(
+            Msg {
+                target: module.clone(),
+                payload: sdk::wire::encode(message),
+            },
+            operation.name(),
+            serde_json::json!({"module": module, "message": name}),
+        )
+    }
+
+    /// apply the submits of a validated response — its own lane beside the
+    /// pages and duckfs lanes: each one is emitted verbatim, and the target
+    /// module's outcome lands in its receipt. never errors, never fails the
+    /// run.
+    pub(super) fn emit_submit_effects(&self, ctx: &mut dyn Ctx, operations: &[Operation]) {
+        for operation in operations {
+            if !matches!(operation, Operation::Submit { .. }) {
+                continue;
+            }
+            self.emit_prepared(ctx, self.submit_msg(operation));
         }
     }
 
@@ -2021,8 +1974,8 @@ impl RunsModule {
     /// actor field — collaboration reads the acting principal off
     /// `Origin::Program(account)`, and admits the op only if the participant's
     /// OWNER bound that account to that conversation under a live credential.
-    /// So the model's grant and the human's binding must BOTH hold: this
-    /// module can withhold the action, and it can never confer it.
+    /// So the human's binding is what holds: this module composes the
+    /// action, and it can never confer it.
     pub(super) fn collaboration_msg(&self, operation: &Operation) -> Result<Prepared, String> {
         let Some(target) = self.collaboration.clone() else {
             return Err(format!(
@@ -2046,8 +1999,8 @@ impl RunsModule {
                 reply_to,
                 task,
             } => {
-                let kind = message_kind(kind)
-                    .ok_or_else(|| format!("unknown message kind: {kind}"))?;
+                let kind =
+                    message_kind(kind).ok_or_else(|| format!("unknown message kind: {kind}"))?;
                 Ok(Prepared::new(
                     Msg {
                         target,
@@ -2125,18 +2078,12 @@ pub(super) fn task_id_for(run_id: &str, slot: &str) -> String {
     format!("agent/{}/task/{slot}", dispatch_id_for(run_id))
 }
 
-fn validate_duckfs_text_write(agent: &ModelRecord, path: &str, text: &str) -> Result<(), String> {
+fn validate_duckfs_text_write(path: &str, text: &str) -> Result<(), String> {
     canonical_duckfs_path(path)?;
     if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
         return Err(format!(
             "duckfs.write_text content is {} bytes; the cap is {MAX_DUCKFS_WRITE_TEXT_BYTES}",
             text.len()
-        ));
-    }
-    if !agent.permits(&CapRequest::DuckfsWrite(path)) {
-        return Err(format!(
-            "agent {} may not write duckfs path {path}",
-            agent.agent_id
         ));
     }
     Ok(())
@@ -2145,50 +2092,20 @@ fn validate_duckfs_text_write(agent: &ModelRecord, path: &str, text: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModelStatus, ResourceCaps};
-
-    fn agent_with_write(prefix: &str) -> ModelRecord {
-        ModelRecord {
-            account: 2,
-            agent_id: "bot".into(),
-            owner: RunOrigin::System,
-            display_name: "Bot".into(),
-            capability: "codex".into(),
-            allowed_actions: vec![crate::ACTION_DUCKFS_WRITE_TEXT.into()],
-            status: ModelStatus::Active,
-            role: crate::ModelRole::General,
-            created_at: 0,
-            updated_at: 0,
-            recipe_hash: Vec::new(),
-            caps: ResourceCaps {
-                duckfs_write: vec![prefix.into()],
-                ..Default::default()
-            },
-            skills: Vec::new(),
-        }
-    }
 
     #[test]
-    fn duckfs_text_write_validation_is_path_size_and_cap_gated() {
-        let agent = agent_with_write("/shared/agents/qa-fixer");
+    fn duckfs_text_write_validation_is_path_and_size_gated() {
         validate_duckfs_text_write(
-            &agent,
             "/shared/agents/qa-fixer/self-improvement/SKILL.md",
             "lesson",
         )
-        .expect("granted path");
+        .expect("an absolute path within the cap");
 
-        let sibling =
-            validate_duckfs_text_write(&agent, "/shared/agents/qa-fixer-policy/SKILL.md", "lesson")
-                .unwrap_err();
-        assert!(sibling.contains("may not write duckfs path"), "{sibling}");
-
-        let relative = validate_duckfs_text_write(&agent, "shared/out.txt", "lesson").unwrap_err();
+        let relative = validate_duckfs_text_write("shared/out.txt", "lesson").unwrap_err();
         assert!(relative.contains("path must be absolute"), "{relative}");
 
         let too_large = "x".repeat(MAX_DUCKFS_WRITE_TEXT_BYTES + 1);
         let oversized = validate_duckfs_text_write(
-            &agent,
             "/shared/agents/qa-fixer/self-improvement/SKILL.md",
             &too_large,
         )

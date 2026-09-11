@@ -182,7 +182,6 @@ view
                         @text-fg
                     button "Dismiss" -> dismiss_error
                       with
-                        h=26.0
                         p=5.0
                         @ghost_action
                       active bg=transparent text=muted r=7.0
@@ -194,14 +193,12 @@ view
         // are host surfaces the view leaves slots for (module_view.rs).
         chat:
           extern chat_view(dark, connected_rpc, network_name, network_chain_id, status, block_height, chat_search_phase, chat_search_query, chat_search_hits, rooms, dm_rows, channel_create_open, connected, loading, mutation_phase, active_channel, active_dm_peer, active_dm, active_channel_name, active_channel_archived, active_channel_members_only, channel_members, post_refusal, huddle_joined, huddle_channel, huddle_channel_name, huddle_joined_at, huddle_now, call_muted, messages, has_older_history, history_view, chat_at_tail, history_loading, unread_boundary, unread_marker_seq, selected_message_seq, selected_message_rev, message_action, channel_settings_open, active_thread_seq, thread_target_seq, thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_has_more, thread_next_reply_seq, thread_loading, copy_anchor_seq, copy_head_seq, copy_surface, chat_sent_serial, live_agents) #chat -> chat_view_event _
-        shell:
-          extern shell_view(dark, connected, shell_surface, shell_setup_open, shell_identity_options, shell_identity, shell_provider, shell_credential, shell_host_node_options, shell_host_node, shell_credentials_loading, shell_terminal, shell_terminal_running, shell_terminal_busy, shell_terminal_title, shell_terminal_error, shell_chat_entries, shell_chat_activity, shell_chat_busy, shell_chat_status, shell_chat_detail, shell_chat_live, shell_chat_saga, shell_detached_saga) #shell -> shell_view_event _
 
         // Pages is a MODULE-OWNED VIEW: the sidebar, the header, the tab
         // strip and the comments rail go in as props; the document is the
         // app's editor, painted into the view's slot by the host.
         pages:
-          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, doc_tabs, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
+          extern pages_view(dark, connected, loading, mutation_phase, network_chain_id, pages, page_create_open, page_draft, block_comment_draft, pages_seed_rev, active_page, active_page_title, active_page_parent, page_searching, page_search_hits, page_search_query, page_delete_armed, block_autosave_status, page_refusal, blocks, commented_block_hits, caret_comment_target, active_thread_anchor, orphaned_comment_drafts, page_text, buffer_page, block_comments_open, block_comment_thread_total, block_comment_threads, block_comment_rows, block_comment_threads_loading, block_comment_threads_has_more, active_block_comment_thread, block_thread_comments, block_thread_comments_loading, block_thread_comments_has_more) #pages -> pages_view_event _
 
         // Files is a MODULE-OWNED VIEW: the listing, the preview, the
         // history and the write refusal go in as props; every navigation
@@ -222,7 +219,7 @@ view
           // the register whole, with the editor's pick lists and the signing
           // account; every write comes back as an intent the roster handler
           // signs
-          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities, agents_actions) #agents -> agents_view_event _
+          extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
         // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
         // the code browse's listing and file, and the discussion go in as
         // props; every act comes back as an intent the handler signs. The
@@ -246,7 +243,7 @@ view
         // signing seat as a flag, never the password — and every act comes
         // back as an intent the handler signs. The drafts are the view's.
         settings:
-          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, settings_open_tabs, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
+          extern settings_view(dark, connected, loading, status, mutation_phase, appearance, desktop_notifications, password, account_name, network_name, connected_rpc, account_ceremony_phase, account_ceremony_qr, account_ceremony_detail, account_ceremony_left, settings_key_state, settings_key_path, members_rows, members_answered, account_number, account_renaming, account_exists, account_keys, account_key_rows, account_busy, account_ticket, settings_drafts_cleared, settings_drafts_scope) #settings -> settings_view_event _
         // The Explorer is a MODULE-OWNED VIEW: the ledger and the answer to
         // the last search go in as props; a refresh, a search, its clearing
         // and a copy come back as intents the handler acts on.
@@ -346,9 +343,8 @@ view
                         button "Mark all read" #mark-bell-read -> mark_bell_read_submit
                           with
                             disabled=(bell_unread <= 0 || bell_marking)
-                            h=22.0
                             p=4.0
-                            @ghost_action
+                            @ghost_action text-11px leading-snug font-medium
                           active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                           hovered bg=elevated text=brand
                           pressed bg=subtle text=brand

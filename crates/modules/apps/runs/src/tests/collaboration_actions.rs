@@ -1,14 +1,14 @@
 //! the two `collaboration.*` operations: what runs composes, and — more to the
 //! point — what it deliberately does NOT decide.
 //!
-//! runs holds ONE half of the authority: the model's committed grant. The other
-//! half lives in `collaboration`, which judges the binding against the
+//! runs composes the message and authorizes nothing: the authority lives in
+//! `collaboration`, which judges the binding against the
 //! `Origin::Program(account)` the effect actually arrives under. That is why
 //! both operations are live-lane only: the settle path emits as
 //! `Origin::Module("runs")`, and no module speaks for a participant.
 
 use super::*;
-use crate::{ACTION_COLLABORATION_ACKNOWLEDGE, ACTION_COLLABORATION_SEND};
+use crate::{OP_COLLABORATION_ACKNOWLEDGE, OP_COLLABORATION_SEND};
 use collaboration::{CollaborationMsg, DeliveryState, MessageKind};
 
 /// the network this test module is composed on — every emitted request is
@@ -19,7 +19,7 @@ const SESSION_KEY: [u8; 32] = [0xcd; 32];
 
 fn send(sequence: u64) -> ActionEnvelope {
     envelope(
-        ACTION_COLLABORATION_SEND,
+        OP_COLLABORATION_SEND,
         Some(serde_json::json!({
             "conversation_id": "review",
             "participant_id": "alice",
@@ -37,16 +37,16 @@ fn send(sequence: u64) -> ActionEnvelope {
 
 fn acknowledge(state: &str) -> ActionEnvelope {
     envelope(
-        ACTION_COLLABORATION_ACKNOWLEDGE,
+        OP_COLLABORATION_ACKNOWLEDGE,
         Some(serde_json::json!({"conversation_id": "review"})),
         serde_json::json!({"credential": 7, "seq": 4, "state": state}),
     )
 }
 
-/// a live run for a model granted `actions`, on a module wired to the
-/// collaboration plane and bound to [`NETWORK`].
-fn live_run(actions: &[&str]) -> (RunsModule, Registry, String) {
-    let registry = registry(&[("bot", actions)]);
+/// a live run for "bot", on a module wired to the collaboration plane and
+/// bound to [`NETWORK`].
+fn live_run() -> (RunsModule, Registry, String) {
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry)
         .with_collaboration_module("collaboration")
         .with_chain_id(NETWORK);
@@ -86,8 +86,8 @@ fn act(run_id: &str, action: ActionEnvelope) -> Msg {
 }
 
 #[test]
-fn a_granted_send_prepares_one_network_bound_message_naming_no_actor() {
-    let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_SEND]);
+fn a_send_prepares_one_network_bound_message_naming_no_actor() {
+    let (mut m, registry, run_id) = live_run();
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     exec(&mut m, &mut ctx, &act(&run_id, send(3))).unwrap();
 
@@ -118,7 +118,7 @@ fn a_granted_send_prepares_one_network_bound_message_naming_no_actor() {
 
 #[test]
 fn a_task_update_preserves_the_typed_attempt_reference() {
-    let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_SEND]);
+    let (mut m, registry, run_id) = live_run();
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     let mut action = send(3);
     action.input["kind"] = serde_json::json!("task_update");
@@ -140,9 +140,14 @@ fn a_task_update_preserves_the_typed_attempt_reference() {
 
 #[test]
 fn an_acknowledge_reports_a_state_under_the_binding_credential() {
-    let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_ACKNOWLEDGE]);
+    let (mut m, registry, run_id) = live_run();
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
-    exec(&mut m, &mut ctx, &act(&run_id, acknowledge("adapter_accepted"))).unwrap();
+    exec(
+        &mut m,
+        &mut ctx,
+        &act(&run_id, acknowledge("adapter_accepted")),
+    )
+    .unwrap();
 
     let msgs = ctx.collaboration_msgs();
     assert_eq!(msgs.len(), 1);
@@ -165,24 +170,10 @@ fn an_acknowledge_reports_a_state_under_the_binding_credential() {
 }
 
 #[test]
-fn an_ungranted_model_sends_nothing() {
-    // runs' half of the intersection. The binding could be perfect and this
-    // still emits nothing, because the model was never granted the action.
-    let (mut m, registry, run_id) = live_run(&[ACTION_CHAT_POST]);
-    let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
-    let err = exec(&mut m, &mut ctx, &act(&run_id, send(3))).unwrap_err();
-    assert!(
-        matches!(&err, Error::Module(reason) if reason.contains("is not allowed to collaboration.send")),
-        "{err:?}"
-    );
-    assert!(ctx.collaboration_msgs().is_empty());
-}
-
-#[test]
 fn the_states_a_service_may_report_exclude_the_networks_own_facts() {
     // `stored` is the admission fact and `expired` the deadline's: a bound
     // service claiming either would be reporting on the network's behalf.
-    let (mut m, registry, run_id) = live_run(&[ACTION_COLLABORATION_ACKNOWLEDGE]);
+    let (mut m, registry, run_id) = live_run();
     for state in ["stored", "expired", "delivered"] {
         let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
         let err = exec(&mut m, &mut ctx, &act(&run_id, acknowledge(state))).unwrap_err();
@@ -198,7 +189,7 @@ fn the_states_a_service_may_report_exclude_the_networks_own_facts() {
 fn an_unwired_collaboration_plane_refuses_rather_than_degrades() {
     // an unsent message must never look sent: with no collaboration module
     // there is nowhere for the effect to go, so the action fails loudly.
-    let registry = registry(&[("bot", &[ACTION_COLLABORATION_SEND])]);
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry).with_chain_id(NETWORK);
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -233,14 +224,7 @@ fn the_settle_lane_admits_neither_operation() {
     // emitting bytes nobody will accept.
     for action in [send(3), acknowledge("queued")] {
         let name = action.operation.clone();
-        let registry = registry(&[(
-            "bot",
-            &[
-                ACTION_CHAT_POST,
-                ACTION_COLLABORATION_SEND,
-                ACTION_COLLABORATION_ACKNOWLEDGE,
-            ],
-        )]);
+        let registry = registry(&["bot"]);
         let mut m = configured(&registry)
             .with_collaboration_module("collaboration")
             .with_chain_id(NETWORK);

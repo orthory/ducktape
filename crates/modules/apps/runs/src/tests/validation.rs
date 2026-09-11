@@ -1,75 +1,8 @@
 use super::*;
 
 #[test]
-fn responses_beyond_the_agents_grants_fail_the_run() {
-    // an agent granted ONLY chat.post must not create tasks...
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-    let mut ctx = CaptureCtx::new()
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(response(
-                &["look what i did"],
-                vec![create_task("t1", "sneaky")],
-            )),
-        ),
-    )
-    .unwrap();
-    assert!(
-        ctx.task_msgs().is_empty(),
-        "a disallowed action emits no task writes"
-    );
-    // the agent holds chat.post, so the failure surfaces as the ⚠ reply.
-    let posts = ctx.chat_msgs();
-    assert_eq!(posts.len(), 1);
-    let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
-        panic!("expected a post");
-    };
-    assert_eq!(
-        *blocks,
-        vec![Block::paragraph(format!(
-            "⚠ BOT failed: agent bot is not allowed to {ACTION_TASKS_CREATE}"
-        ))]
-    );
-    commit(&mut m);
-    assert_eq!(get_pending(&m, &run_id), None);
-
-    // ...and an agent granted only tasks.create must not post replies —
-    // and without chat.post the failure CANNOT surface in chat either:
-    // the old breadcrumb-only silence holds.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
-    let mut ctx = CaptureCtx::new()
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(&run_id, Ok(response(&["hello"], vec![]))),
-    )
-    .unwrap();
-    assert!(ctx.msgs.is_empty());
-    let breadcrumbs: Vec<String> = ctx
-        .events
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
-        .collect();
-    assert!(
-        breadcrumbs.iter().any(|b| b.contains(ACTION_CHAT_POST)),
-        "the failure names the missing grant: {breadcrumbs:?}"
-    );
-    commit(&mut m);
-    assert_eq!(get_pending(&m, &run_id), None);
-}
-
-#[test]
 fn task_actions_without_a_configured_tasks_module_fail_the_run() {
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])]);
+    let registry = registry(&["bot"]);
     let mut m = RunsModule::new(
         "runs",
         "chat",
@@ -93,13 +26,7 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(response(
-                &["ok"],
-                vec![create_task("t1", "x")],
-            )),
-        ),
+        &result_event(&run_id, Ok(response(&["ok"], vec![create_task("t1", "x")]))),
     )
     .unwrap();
     assert!(ctx.task_msgs().is_empty(), "no task write may escape");
@@ -122,14 +49,7 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
 /// instead of failing the whole run (#1664).
 #[test]
 fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, crate::ACTION_DUCKFS_WRITE_TEXT])]);
-    registry
-        .get_mut("bot")
-        .unwrap()
-        .caps
-        .duckfs_write
-        .push("/shared/agents/qa-fixer".into());
-
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry).with_files_module("files");
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -152,7 +72,11 @@ fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
             &run_id,
             Ok(response(
                 &["ok"],
-                vec![duckfs_write_text("/shared/agents/qa-fixer/self-improvement/SKILL.md", "lesson", None)],
+                vec![duckfs_write_text(
+                    "/shared/agents/qa-fixer/self-improvement/SKILL.md",
+                    "lesson",
+                    None,
+                )],
             )),
         ),
     )
@@ -189,14 +113,7 @@ fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
 /// the settle path never fails the whole run over it.
 #[test]
 fn duckfs_write_text_with_a_stale_base_degrades_without_failing_the_run() {
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, crate::ACTION_DUCKFS_WRITE_TEXT])]);
-    registry
-        .get_mut("bot")
-        .unwrap()
-        .caps
-        .duckfs_write
-        .push("/shared/agents/qa-fixer".into());
-
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry).with_files_module("files");
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
@@ -244,7 +161,7 @@ fn duckfs_write_text_with_a_stale_base_degrades_without_failing_the_run() {
 
 #[test]
 fn a_squatted_reply_message_id_fails_the_run_instead_of_the_block() {
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let (mut m, registry, run_id) = awaiting_run();
     // someone posted a message whose id IS the run's reply id.
     let mut squatted = transcript(2);
     squatted[1].head.message_id = reply_message_id(&run_id);
@@ -271,7 +188,7 @@ fn a_squatted_reply_message_id_fails_the_run_instead_of_the_block() {
 
 #[test]
 fn a_full_thread_fails_the_run_instead_of_the_block() {
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry);
     // the anchor replies to a root that has hit the reply cap.
     let mut root = message(1, "root");
@@ -316,7 +233,7 @@ fn a_reply_and_a_post_message_into_one_near_full_thread_refuse_the_overflow() {
     // applies the first (4096) and REJECTS the second, which aborts the delivery
     // block; the mailbox re-injects it and it aborts again, forever. the
     // overflowing post must be refused at validation instead.
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE])]);
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry);
     // one reply short of the cap: room for EXACTLY one more post.
     let mut root = message(1, "root");
@@ -377,7 +294,7 @@ fn two_post_messages_into_one_near_full_thread_refuse_the_second() {
     // the counter must see the FIRST staged post when it probes the second.
     // the anchor is unthreaded here, so the run's own reply consumes nothing —
     // the two actions alone race for the thread's last free slot.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let (mut m, registry, run_id) = awaiting_run();
     let mut nearly_full = transcript(2);
     nearly_full[0].head.reply_count = MAX_THREAD_REPLIES as u64 - 1;
     let post = |text: &str| post_message("general", text, Some(1));
@@ -413,7 +330,7 @@ fn two_post_messages_into_one_near_full_thread_refuse_the_second() {
 fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry() {
     // the anchor is a thread reply, so the failure reply must join the
     // same thread a success reply would have.
-    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry);
     let mut thread_transcript = transcript(1);
     thread_transcript.push(message_in(
@@ -484,37 +401,6 @@ fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry
 }
 
 #[test]
-fn a_failure_reply_requires_the_chat_post_grant() {
-    // without chat.post the pre-existing silence holds: breadcrumbs only,
-    // never a post the validator could not have proven postable.
-    let (mut m, registry, run_id) = awaiting_run(&[]);
-    let mut ctx = CaptureCtx::new()
-        .at(20)
-        .with_dispatch_origin()
-        .with_registry(&registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(&run_id, Err("timed out".into())),
-    )
-    .unwrap();
-    assert!(ctx.msgs.is_empty(), "no grant, no failure post");
-    let breadcrumbs: Vec<String> = ctx
-        .events
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
-        .collect();
-    assert!(
-        breadcrumbs
-            .iter()
-            .any(|b| b.contains("failure not surfaced") && b.contains(ACTION_CHAT_POST)),
-        "the silence leaves its reason as a breadcrumb: {breadcrumbs:?}"
-    );
-    commit(&mut m);
-    assert_eq!(get_pending(&m, &run_id), None, "the entry still pruned");
-}
-
-#[test]
 fn failure_excerpts_are_single_line_and_bounded() {
     assert_eq!(
         failure_excerpt("line one\n\n  line two\tend"),
@@ -528,14 +414,13 @@ fn failure_excerpts_are_single_line_and_bounded() {
 }
 
 #[test]
-fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
-    // the request-time gate covers the run's OWN channel; the action names its
-    // own. chat admits a module/agent author everywhere, so the requester's
-    // standing in the TARGET channel is the only thing between an agent and
-    // every members-only channel on the network.
+fn a_post_into_a_channel_the_agents_account_cannot_post_to_fails_the_run() {
+    // the post leaves under the run's program account, so chat's own standing
+    // for that account in the TARGET channel decides whether it lands — the
+    // validator asks first so the block never carries a post chat refuses.
     let post = |channel: &str| post_message(channel, "hello", None);
-    // the run's requester is the engaging poster, user(1).
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    // the capture board answers an account probe as user 9.
+    let (mut m, registry, run_id) = awaiting_run();
     let board = |member: u8| {
         CaptureCtx::new()
             .at(8)
@@ -556,7 +441,7 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
     assert!(
         ctx.notes()
             .iter()
-            .any(|n| n.contains("requester may not post to channel")),
+            .any(|n| n.contains("the agent's account may not post to channel")),
         "{:?}",
         ctx.notes()
     );
@@ -566,8 +451,8 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
     commit(&mut m);
     assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
 
-    // the same post, by a requester who IS a member, lands.
-    let (mut m, _registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    // the same post, by an account that IS a member, lands.
+    let (mut m, _registry, run_id) = awaiting_run();
     let mut ctx = board(9);
     exec(
         &mut m,
@@ -577,5 +462,53 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
     .unwrap();
     assert_eq!(ctx.chat_msgs().len(), 2, "the reply and the post");
     commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
+}
+
+/// the settle lane's submit lane (`RunsModule::emit_submit_effects`): a final
+/// response may carry any module's own message, and it goes out verbatim
+/// beside the reply. the module's verdict is its own — runs probes nothing,
+/// and the run's outcome is the accepted result either way.
+#[test]
+fn a_final_response_submits_any_module_message_verbatim_beside_the_reply() {
+    let registry = registry(&["bot"]);
+    let mut m = configured(&registry);
+    request_post(&mut m, &registry, 2, &[]);
+    commit(&mut m);
+    let run_id = run_id_for("general", 2, "bot");
+
+    let message = serde_json::json!({
+        "open_issue": {"repo": "playground", "title": "Flaky gate", "body": ""}
+    });
+    let submit = envelope(
+        crate::OP_SUBMIT,
+        Some(serde_json::json!({"module": "forge"})),
+        message.clone(),
+    );
+    let mut ctx = CaptureCtx::new()
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(response(&["filed"], vec![submit]))),
+    )
+    .unwrap();
+
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the reply must deliver beside the submit"
+    );
+    let to_forge: Vec<&Msg> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+    assert_eq!(to_forge.len(), 1, "{:?}", ctx.msgs);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&to_forge[0].payload).unwrap(),
+        message,
+        "the module message is carried verbatim"
+    );
+    commit(&mut m);
+    assert_eq!(get_pending(&m, &run_id), None);
     assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
 }

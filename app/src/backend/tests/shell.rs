@@ -8,7 +8,6 @@ fn the_rail_seats_collaboration_and_node_operations_separately() {
         ids,
         [
             ShellTab::Chat,
-            ShellTab::Shell,
             ShellTab::Pages,
             ShellTab::Forge,
             ShellTab::Agents,

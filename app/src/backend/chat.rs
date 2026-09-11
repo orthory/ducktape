@@ -412,30 +412,12 @@ pub async fn leave_huddle(
     .await
 }
 
-/// WHO A SEND'S `@handles` MAY REACH: the network's ACCOUNT DIRECTORY unioned
-/// with this room's explicit roster.
-///
-/// The roster alone was the whole answer, and the UI resets it to `[]` for
-/// every open-policy channel (only a members-only room ever loads one) — so
-/// `@orthory` in `#general`, the room everybody actually writes in, parsed as
-/// plain text and minted no `Mark::Mention` for the module to fan out. The
-/// directory is a person's name wherever they can be read.
-///
-/// The directory as last read, not a read of its own: a send happens in a room
-/// that has been loaded, and every chat load and every identity op rewrites it
-/// (`refresh_names`). A query here would put an identity round trip in front of
-/// every message a person sends.
-fn mention_candidates(members: &[ChatMember]) -> MentionCandidates {
-    MentionCandidates::new(&names(), members)
-}
-
 pub async fn send_message(
     rpc: String,
     password: String,
     channel_id: String,
     message_id: String,
     body: String,
-    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -452,7 +434,7 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
+                blocks: ::chat::client::parse_message(&body),
                 thread: None,
             }),
             password,
@@ -580,7 +562,6 @@ pub async fn send_reply(
     root_seq: i64,
     message_id: String,
     body: String,
-    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -597,7 +578,7 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
+                blocks: ::chat::client::parse_message(&body),
                 thread: Some(root_seq),
             }),
             password,
@@ -628,7 +609,6 @@ pub async fn edit_message(
     seq: i64,
     base_rev: i64,
     body: String,
-    members: Vec<ChatMember>,
 ) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
@@ -642,7 +622,7 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
+                blocks: ::chat::client::parse_message(&body),
                 base_rev: Some(base_rev),
             }),
             password,
@@ -782,7 +762,7 @@ pub async fn search_chat(
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
                     author: author_display(&hit.author, facts.names()),
-                    text: hit.text,
+                    text: ::chat::client::draft_mentions(&hit.text, facts.names()).0,
                 })
                 .collect(),
         })

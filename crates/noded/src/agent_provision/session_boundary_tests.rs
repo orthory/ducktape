@@ -39,7 +39,7 @@ use dispatch::DispatchModule;
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
-use runs::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, ModelMsg};
+use runs::ModelMsg;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
@@ -230,9 +230,7 @@ async fn mention_run(host: &mut Host) -> Event {
                     agent_id: AGENT.into(),
                     display_name: "Quackbot".into(),
                     capability: CAPABILITY.into(),
-                    allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
                     recipe_hash: None,
-                    caps: None,
                     skills: None,
                 },
             }),

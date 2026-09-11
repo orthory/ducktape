@@ -664,8 +664,6 @@ async fn execute(
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
-        // the committed library grant, straight through to the assembler.
-        library_readable: plan.library_readable,
     };
     // (a)+(b) materialize OUTSIDE storage. A late blocking result releases the
     // provider slot, but keeps this attempt's resource admission until cleanup.
@@ -2292,7 +2290,6 @@ format = "text"
                 {"name":"persona","source_prefix":"/shared/skills/persona","always": true},
                 {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32), "always": false}
             ],
-            "library_readable": false,
             "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
@@ -2367,11 +2364,9 @@ format = "text"
                 "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
-                "branch_born": false,
-                "forge_push": true
+                "branch_born": false
             },
             "skills": [],
-            "library_readable": false,
             "result_contract": {
                 "ducktape_runner_result": 1,
                 "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}
@@ -3128,7 +3123,6 @@ format = "text"
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
-                forge_push: true,
             }
         );
     }

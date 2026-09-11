@@ -146,7 +146,6 @@ pub fn agents_view(
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
-    actions: &[String],
 ) -> Element<'static, ModuleViewEvent> {
     module_view(
         "agents",
@@ -163,7 +162,6 @@ pub fn agents_view(
             journal,
             live,
             capabilities,
-            actions,
         ),
     )
 }
@@ -184,7 +182,6 @@ pub(crate) fn agents_props(
     journal: &crate::backend::RunJournal,
     live: &crate::backend::LiveRun,
     capabilities: &[String],
-    actions: &[String],
 ) -> Vec<u8> {
     // THE APP'S OWN BOOKKEEPING STAYS IN THE APP. `rpc` is an endpoint the
     // guest draws nothing with, and `link`/`account`/`op` are the fence the app
@@ -206,7 +203,6 @@ pub(crate) fn agents_props(
         "journal": book,
         "live": live,
         "capabilities": capabilities,
-        "actions": actions,
         "account": account,
         "committed": committed,
         "connected": connected,
@@ -450,7 +446,6 @@ pub fn settings_view(
     account_ceremony_left: &str,
     settings_key_state: &str,
     settings_key_path: &str,
-    settings_open_tabs: i64,
     members_rows: &[crate::backend::MemberRow],
     members_answered: bool,
     account_number: &str,
@@ -487,7 +482,6 @@ pub fn settings_view(
         "account_ceremony_left": account_ceremony_left,
         "settings_key_state": settings_key_state,
         "settings_key_path": settings_key_path,
-        "settings_open_tabs": settings_open_tabs,
         "tier": crate::backend::member_tier(members_rows),
         "admin": crate::backend::members_is_admin(members_rows),
         "members_line": crate::backend::members_summary(connected, members_rows),
@@ -534,7 +528,6 @@ pub fn settings_intent(event: &ModuleViewEvent) -> crate::SettingsIntent {
         "ceremony_cancel" => Intent::CeremonyCancel,
         "wallet" => Intent::Wallet,
         "login" => Intent::Login,
-        "clear_tabs" => Intent::ClearTabs,
         "light" => Intent::Light,
         "dark" => Intent::Dark,
         "notifications" => Intent::Notifications,
@@ -853,143 +846,6 @@ pub fn forge_event_verdict(event: &ModuleViewEvent) -> crate::ForgeReviewVerdict
     }
 }
 
-// ---------- the shell seat ----------
-
-/// The Shell tab: the app's agent picks, the terminal it holds and the run
-/// it is watching, drawn by the `shell` view. The provider's wording — the
-/// header line, the grant note, the terminal note, the blurbs — is folded
-/// here, so the view names no provider; the terminal session is parked for
-/// the `agent_terminal_surface` slot. Intents come back as `surface`,
-/// `setup`, `identity`, `host_node`, `refresh`, `terminal_start`,
-/// `terminal_stop`, `reset`, `detach`, `reopen`, `discard`, `open_link`,
-/// and — from the host's own composer surface — `send` (`body`).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the Ice extern hands the screen's facts one by one"
-)]
-pub fn shell_view(
-    dark: bool,
-    connected: bool,
-    surface: crate::ShellSurface,
-    setup_open: bool,
-    identity_options: &[String],
-    identity: &str,
-    provider: &str,
-    credential: &str,
-    host_node_options: &[String],
-    host_node: &str,
-    credentials_loading: bool,
-    terminal: &crate::backend::AgentTerminalSession,
-    terminal_running: bool,
-    terminal_busy: bool,
-    terminal_title: &str,
-    terminal_error: &str,
-    entries: &[crate::backend::AgentChatEntry],
-    activity: &[crate::backend::AgentActivity],
-    chat_busy: bool,
-    chat_status: &str,
-    chat_detail: &str,
-    live: &str,
-    saga_id: &str,
-    detached_saga: &str,
-) -> Element<'static, ModuleViewEvent> {
-    use crate::backend as b;
-    *shell_terminal().lock().expect("shell terminal") = Some(terminal.clone());
-    let entries: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "id": entry.id,
-                "role": entry.role,
-                "body": entry.body,
-                "provider_label": b::agent_provider_label(&entry.provider),
-                "provider_initial": b::agent_provider_initial(&entry.provider),
-                "status": entry.status,
-                "run_label": b::agent_run_label(&entry.saga_id),
-                "steps": entry.steps,
-                "steps_label": entry.steps_label,
-            })
-        })
-        .collect();
-    let props = serde_json::json!({
-        "dark": dark,
-        "connected": connected,
-        "surface": match surface {
-            crate::ShellSurface::Tasks => "tasks",
-            crate::ShellSurface::Terminal => "terminal",
-        },
-        "setup_open": setup_open,
-        "identity_options": identity_options,
-        "identity": identity,
-        "provider_initial": b::agent_provider_initial(provider),
-        "credential": credential,
-        "host_node_options": host_node_options,
-        "host_node": host_node,
-        "credentials_loading": credentials_loading,
-        "terminal_running": terminal_running,
-        "terminal_busy": terminal_busy,
-        "terminal_title": terminal_title,
-        "terminal_error": terminal_error,
-        "entries": entries,
-        "activity": activity,
-        "chat_busy": chat_busy,
-        "chat_status": chat_status,
-        "chat_detail": chat_detail,
-        "live": live,
-        "saga_id": saga_id,
-        "detached_saga": detached_saga,
-        "run_line": b::agent_run_line(identity, host_node),
-        "grant_note": b::agent_host_grant_note(host_node, credential),
-        "terminal_note": b::agent_terminal_note(provider, credential),
-        "composer_hint": b::agent_composer_hint(provider),
-        "task_blurb": b::agent_task_blurb(host_node),
-        "register_hint": b::agent_register_hint(provider),
-    });
-    module_view("shell", serde_json::to_vec(&props).expect("props encode"))
-}
-
-pub fn shell_intent(event: &ModuleViewEvent) -> crate::ShellIntent {
-    use crate::ShellIntent as Intent;
-    match event.kind.as_str() {
-        "surface" => Intent::Surface,
-        "setup" => Intent::Setup,
-        "identity" => Intent::Identity,
-        "host_node" => Intent::HostNode,
-        "refresh" => Intent::Refresh,
-        "terminal_start" => Intent::TerminalStart,
-        "terminal_stop" => Intent::TerminalStop,
-        "send" => Intent::Send,
-        "reset" => Intent::Reset,
-        "detach" => Intent::Detach,
-        "reopen" => Intent::Reopen,
-        "discard" => Intent::Discard,
-        _ => Intent::OpenLink,
-    }
-}
-
-/// The surface a `surface` intent names; a word the screen has no surface
-/// for is the tasks.
-pub fn shell_event_surface(event: &ModuleViewEvent) -> crate::ShellSurface {
-    match event_text(event, "surface").as_str() {
-        "terminal" => crate::ShellSurface::Terminal,
-        _ => crate::ShellSurface::Tasks,
-    }
-}
-
-/// Empties the host-side shell composer.
-pub fn shell_composer_clear() -> bool {
-    crate::shell_composer::clear();
-    true
-}
-
-/// The terminal session behind the shell view's slot: the one the app
-/// last drew the tab with. One per process, like the view it belongs to.
-fn shell_terminal() -> &'static Mutex<Option<crate::backend::AgentTerminalSession>> {
-    static TERMINAL: OnceLock<Mutex<Option<crate::backend::AgentTerminalSession>>> =
-        OnceLock::new();
-    TERMINAL.get_or_init(Mutex::default)
-}
-
 // ---------- the pages seat ----------
 
 /// Pages supplies metadata and a stable source identity. Document bytes use
@@ -1018,7 +874,6 @@ pub fn pages_view(
     page_delete_armed: bool,
     autosave: crate::AutosaveStatus,
     page_refusal: &str,
-    doc_tabs: &[String],
     blocks: &[crate::backend::PageBlock],
     commented_block_hits: &[String],
     caret_comment_target: &str,
@@ -1082,7 +937,6 @@ pub fn pages_view(
         "page_delete_armed": page_delete_armed,
         "autosave": autosave,
         "page_refusal": page_refusal,
-        "doc_tabs": crate::backend::doc_tab_rows(doc_tabs, pages, active_page),
         "subpages": subpages,
         "orphaned_comment_drafts": orphaned_comment_drafts,
         "block_comments_open": block_comments_open,
@@ -1115,7 +969,6 @@ pub fn pages_intent(event: &ModuleViewEvent) -> crate::PagesIntent {
         "arm_delete" => Intent::ArmDelete,
         "disarm_delete" => Intent::DisarmDelete,
         "delete" => Intent::Delete,
-        "close_tab" => Intent::CloseTab,
         "open_hit" => Intent::OpenHit,
         "use_draft" => Intent::UseDraft,
         "discard_draft" => Intent::DiscardDraft,
@@ -1503,7 +1356,6 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "clear_range" => Intent::ClearRange,
         "copy_range" => Intent::CopyRange,
         "reaction_submit" => Intent::ReactionSubmit,
-        "edit" => Intent::Edit,
         "delete" => Intent::Delete,
         "rename" => Intent::Rename,
         "archive" => Intent::Archive,
@@ -1516,7 +1368,6 @@ pub fn chat_intent(event: &ModuleViewEvent) -> crate::ChatIntent {
         "thread_begin_edit" => Intent::ThreadBeginEdit,
         "thread_arm_delete" => Intent::ThreadArmDelete,
         "thread_clear_selection" => Intent::ThreadClearSelection,
-        "thread_edit" => Intent::ThreadEdit,
         "thread_delete" => Intent::ThreadDelete,
         "load_thread" => Intent::LoadThread,
         "cancel_run" => Intent::CancelRun,
@@ -1540,6 +1391,8 @@ pub fn chat_event_surface(event: &ModuleViewEvent) -> crate::CopySurface {
 pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
     match event_text(event, "kind").as_str() {
         "reply" => crate::ComposerKind::Reply,
+        "edit" => crate::ComposerKind::Edit,
+        "thread_edit" => crate::ComposerKind::ThreadEdit,
         _ => crate::ComposerKind::Message,
     }
 }
@@ -1547,6 +1400,24 @@ pub fn chat_event_kind(event: &ModuleViewEvent) -> crate::ComposerKind {
 /// A refused or failed body, handed back to the composer it was written in.
 pub fn chat_composer_unsent(scope: &str, text: &str, committed: bool) -> bool {
     crate::composer_surface::unsent(scope, text, committed);
+    true
+}
+
+/// Seed the native edit composer from canonical blocks, never copy text.
+pub fn chat_composer_edit(
+    scope: &str,
+    messages: &[crate::backend::ChatMessage],
+    seq: i64,
+    rev: i64,
+) -> bool {
+    let Some(message) = messages.iter().find(|message| message.seq == seq) else {
+        return false;
+    };
+    let editable = !message.deleted && !message.pending && message.rev == rev;
+    if !editable {
+        return false;
+    }
+    crate::composer_surface::seed(scope, &message.edit_body);
     true
 }
 
@@ -1682,29 +1553,6 @@ fn node_timeline() -> &'static Mutex<NodeTimeline> {
 /// activated link goes back to the guest's own handler as a string.
 fn surfaces_of(module: &str) -> Surfaces {
     let mut surfaces = Surfaces::default();
-    // the shell view's three: the terminal for the session the app parked,
-    // the answer Markdown (a link it opens goes back to the guest's
-    // handler), and the composer, whose submit is the app's `send` intent
-    if module == "shell" {
-        surfaces.insert(
-            "agent_terminal_surface".into(),
-            Arc::new(|_key: &str, _args: &[wire::SurfaceValue]| {
-                let session = shell_terminal().lock().expect("shell terminal").clone();
-                let Some(session) = session else {
-                    return widget::Space::new().into();
-                };
-                crate::backend::agent_terminal_surface(&session).map(|()| wire::SurfaceValue::Unit)
-            }),
-        );
-        surfaces.insert(
-            "agent_markdown".into(),
-            Arc::new(|_key: &str, args: &[wire::SurfaceValue]| {
-                crate::backend::agent_markdown(surface_str(args, 0), surface_bool(args, 1))
-                    .map(wire::SurfaceValue::Str)
-            }),
-        );
-        surfaces.insert("shell_composer".into(), crate::shell_composer::provider());
-    }
     if module == "chat" {
         surfaces.insert("chat_composer".into(), crate::composer_surface::provider());
     }
@@ -1833,22 +1681,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
         ],
         "node" => &["copy", "tab", "log_filter"],
         "explorer" => &["refresh", "copy", "search", "clear"],
-        // `send` is deliberately NOT here: a send crosses only from the
-        // host's own composer surface (`deliver`), never as a guest request.
-        "shell" => &[
-            "surface",
-            "setup",
-            "identity",
-            "host_node",
-            "refresh",
-            "terminal_start",
-            "terminal_stop",
-            "reset",
-            "detach",
-            "reopen",
-            "discard",
-            "open_link",
-        ],
         "chat" => &[
             "search",
             "clear_search",
@@ -1877,7 +1709,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "clear_range",
             "copy_range",
             "reaction_submit",
-            "edit",
             "delete",
             "rename",
             "archive",
@@ -1890,7 +1721,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "thread_begin_edit",
             "thread_arm_delete",
             "thread_clear_selection",
-            "thread_edit",
             "thread_delete",
             "load_thread",
             "cancel_run",
@@ -1945,7 +1775,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "wallet",
             "login",
             "copy",
-            "clear_tabs",
             "light",
             "dark",
             "notifications",
@@ -1959,7 +1788,6 @@ fn intents_of(module: &str) -> &'static [&'static str] {
             "arm_delete",
             "disarm_delete",
             "delete",
-            "close_tab",
             "open_hit",
             "use_draft",
             "discard_draft",
@@ -3464,11 +3292,9 @@ impl Guest {
             value,
         } = output
         {
-            // the shell composer's submit carries its body; the other
+            // the chat composer's submit carries its body; the other
             // unrouted surfaces only say that something happened
-            if self.module == "shell" {
-                self.intents.extend(crate::shell_composer::intent(&value));
-            } else if self.module == "chat" || self.module == "forge" {
+            if self.module == "chat" || self.module == "forge" {
                 self.intents.extend(crate::composer_surface::intent(&value));
             } else {
                 self.intents.push(ModuleViewEvent {
@@ -4246,7 +4072,9 @@ pub(crate) mod tests {
             ]
         );
         let chat = intents_of("chat");
-        assert_eq!(chat.len(), 45);
+        assert_eq!(chat.len(), 43);
+        assert!(!chat.contains(&"edit"));
+        assert!(!chat.contains(&"thread_edit"));
         assert!(chat.contains(&"choose_channel"));
         assert!(
             chat.contains(&"cancel_run"),
@@ -4271,13 +4099,12 @@ pub(crate) mod tests {
         let (source, _tests) = include_str!("module_view.rs")
             .split_once("\npub(crate) mod tests {")
             .expect("the tests module");
-        let other_route_only: [(&str, &str, &[&str]); 9] = [
+        let other_route_only: [(&str, &str, &[&str]); 8] = [
             ("agents", "agents_intent", &[]),
             ("node", "node_intent", &["log_timeline"]),
             ("explorer", "explorer_intent", &[]),
             ("settings", "settings_intent", &[]),
             ("forge", "forge_intent", &[]),
-            ("shell", "shell_intent", &["send"]),
             ("pages", "pages_intent", &["edited"]),
             ("chat", "chat_intent", &["composer"]),
             ("files", "files_intent", &[]),
@@ -4637,12 +4464,6 @@ pub(crate) mod tests {
             owner_handle: "eddy".into(),
             controller: "7".into(),
             live: false,
-            allowed_actions: vec!["chat.post".into()],
-            caps: crate::backend::AgentCaps {
-                forge_read: vec!["ducktape".into()],
-                pages_write: vec!["*".into()],
-                ..Default::default()
-            },
             skills: vec![
                 skill("review", true),
                 skill("style", false),
@@ -4662,7 +4483,6 @@ pub(crate) mod tests {
             &crate::backend::RunJournal::default(),
             &crate::backend::LiveRun::default(),
             &["claude".into(), "review".into()],
-            &["chat.post".into(), "tasks.create".into()],
         ));
         guest.redraw(&props);
         let shown = texts(&guest);
@@ -4728,7 +4548,6 @@ pub(crate) mod tests {
             1,
             &journal,
             &crate::backend::LiveRun::default(),
-            &[],
             &[],
         ));
         guest.redraw(&None);
@@ -5099,7 +4918,7 @@ pub(crate) mod tests {
                 "account_ceremony_phase": "", "account_ceremony_qr": "",
                 "account_ceremony_detail": "", "account_ceremony_left": "",
                 "settings_key_state": "sealed", "settings_key_path": "/keys/user.key",
-                "settings_open_tabs": 2, "tier": "validator", "admin": true,
+                "tier": "validator", "admin": true,
                 "members_line": "3 humans · 1 agent", "members_answered": true,
                 "account_number": "42", "account_renaming": false, "account_exists": true,
                 "account_keys": 2,
@@ -5477,73 +5296,6 @@ pub(crate) mod tests {
             !guest.assets.contains_key("a.svg"),
             "A's late answer landed"
         );
-    }
-
-    /// The bundled Shell view through the host: the facts, the welcome
-    /// for a picked credential, the three host slots, a surface switch as
-    /// an intent — and a send, which only the host's composer can raise.
-    #[test]
-    fn the_staged_shell_view_boots_takes_the_facts_and_leaves_the_composer_to_the_host() {
-        let Some(staged) = staged("shell") else {
-            return;
-        };
-        let mut guest = Guest::load_from("shell", &staged).expect("the view loads");
-        guest.redraw(&None);
-        let props = Some(
-            serde_json::to_vec(&serde_json::json!({
-                "dark": false, "connected": true, "surface": "tasks", "setup_open": false,
-                "identity_options": ["team-codex · Codex"], "identity": "team-codex · Codex",
-                "provider_initial": "C", "credential": "team-codex",
-                "host_node_options": ["This node"], "host_node": "This node",
-                "credentials_loading": false, "terminal_running": false,
-                "terminal_busy": false, "terminal_title": "", "terminal_error": "",
-                "entries": [], "activity": [], "chat_busy": false, "chat_status": "",
-                "chat_detail": "", "live": "", "saga_id": "", "detached_saga": "",
-                "run_line": "team-codex · Codex · This node", "grant_note": "",
-                "terminal_note": "A sandboxed Codex session.", "composer_hint": "Message Codex…",
-                "task_blurb": "Each message runs an agent in a sandbox on this node.",
-                "register_hint": "Register one with `ducktape user cred add codex`"
-            }))
-            .expect("props encode"),
-        );
-        guest.redraw(&props);
-        let shown = texts(&guest);
-        for expected in [
-            "Shell",
-            "What should the agent do?",
-            "team-codex · Codex · This node",
-        ] {
-            assert!(
-                shown.iter().any(|text| text == expected),
-                "missing {expected:?} in {shown:?}"
-            );
-        }
-        assert_eq!(surface_names(&guest), ["shell_composer"]);
-        assert!(guest.surfaces.contains_key("shell_composer"));
-        assert!(guest.surfaces.contains_key("agent_terminal_surface"));
-        assert!(guest.surfaces.contains_key("agent_markdown"));
-        guest.deliver(Output::Activate(button_message(&guest, "Terminal")));
-        guest.redraw(&props);
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "surface".into(),
-                detail: r#"{"surface":"terminal"}"#.into(),
-            }]
-        );
-        // the composer's submit is the host's intent, not a guest request
-        guest.deliver(Output::Surface {
-            handler: None,
-            value: wire::SurfaceValue::Str("ship it".into()),
-        });
-        assert_eq!(
-            std::mem::take(&mut guest.intents),
-            [ModuleViewEvent {
-                kind: "send".into(),
-                detail: r#"{"body":"ship it"}"#.into(),
-            }]
-        );
-        assert!(guest.fault.is_none());
     }
 
     /// The bundled Forge view through the host: the register, then a repo
@@ -7538,7 +7290,6 @@ pub(crate) mod tests {
                 "active_page_title": "Alpha", "active_page_parent": "",
                 "page_searching": false, "page_search_hits": [], "page_search_query": "",
                 "page_delete_armed": false, "autosave": "saved", "page_refusal": "",
-                "doc_tabs": [{"id": "alpha", "title": "Alpha", "active": true}],
                 "subpages": [], "orphaned_comment_drafts": [],
                 "block_comments_open": false, "thread_total": 0, "comment_rows": [],
                 "threads_loading": false, "threads_has_more": false, "active_thread": "",
@@ -8089,15 +7840,22 @@ pub(crate) mod tests {
         [first_light_at(1), first_light_at(2)]
     }
 
-    /// A RUN IN FLIGHT, THROUGH THE REAL WIRE. The hint draws under the message
-    /// that summoned it, and the NEXT reading of the same run repaints it: only
-    /// `live_agents` moves between the two frames, so this is the test that
-    /// fails if the timeline memo keys on the messages alone (`host::Timeline`)
-    /// — the hint would sit on "Starting" for the whole run. The hint is a
-    /// hint: the run's activity and its answer preview belong to the run
-    /// panel and never enter the stream.
+    fn chat_run_thread_facts(
+        room: &'static str,
+        messages: &[crate::backend::ChatMessage],
+        thread: &[crate::backend::ChatMessage],
+        live: &[crate::backend::LiveAgentRow],
+    ) -> Option<Vec<u8>> {
+        let bytes = chat_facts_in(room, messages, thread, live)?;
+        let mut props: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        props["active_thread_seq"] = 2.into();
+        Some(serde_json::to_vec(&props).unwrap())
+    }
+
+    /// Run status repaints in its thread through the real host/guest wire.
+    /// Full activity and answer previews remain in the run panel.
     #[test]
-    fn a_run_in_flight_draws_under_its_anchor_and_repaints_as_it_works() {
+    fn a_run_in_flight_draws_in_its_thread_and_repaints_as_it_works() {
         let Some(staged) = staged("chat") else {
             return;
         };
@@ -8106,6 +7864,12 @@ pub(crate) mod tests {
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
         guest.redraw(&chat_facts_in(
+            "channel-a", &messages, &[], std::slice::from_ref(&starting),
+        ));
+        assert!(button_shown(&guest, "Chief Duck · View thread"));
+        assert!(!button_shown(&guest, "Stop"));
+        assert!(!texts(&guest).iter().any(|text| text == "Starting"));
+        guest.redraw(&chat_run_thread_facts(
             "channel-a",
             &messages,
             &[],
@@ -8135,7 +7899,7 @@ pub(crate) mod tests {
             answer_preview: "the files crate builds clean".into(),
             ..starting
         };
-        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &[working]));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &[working]));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -8176,7 +7940,7 @@ pub(crate) mod tests {
         };
         let messages = anchored_pair();
         let live = live_run("channel-a", "Chief Duck", "Reading the repo");
-        let facts = chat_facts_in("channel-a", &messages, &[], std::slice::from_ref(&live));
+        let facts = chat_run_thread_facts("channel-a", &messages, &[], std::slice::from_ref(&live));
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
         guest.redraw(&facts);
@@ -8210,7 +7974,7 @@ pub(crate) mod tests {
         reply.author = "Chief Duck".into();
         reply.avatar_kind = "agent".into();
         let settled = [messages[0].clone(), messages[1].clone(), reply];
-        guest.redraw(&chat_facts_in("channel-a", &settled, &[], &[]));
+        guest.redraw(&chat_run_thread_facts("channel-a", &settled, &[], &[]));
         let shown = texts(&guest);
         assert!(
             !button_shown(&guest, "Stop"),
@@ -8244,7 +8008,7 @@ pub(crate) mod tests {
         ];
 
         let here = String::from_utf8(
-            chat_facts_in("channel-a", &messages, &[], &reading).expect("props encode"),
+            chat_run_thread_facts("channel-a", &messages, &[], &reading).expect("props encode"),
         )
         .unwrap();
         assert!(here.contains("Chief Duck"), "this room's run is missing");
@@ -8254,7 +8018,7 @@ pub(crate) mod tests {
         );
 
         let there = String::from_utf8(
-            chat_facts_in("channel-b", &messages, &[], &reading).expect("props encode"),
+            chat_run_thread_facts("channel-b", &messages, &[], &reading).expect("props encode"),
         )
         .unwrap();
         assert!(there.contains("Ops Duck"), "that room's run is missing");
@@ -8268,7 +8032,7 @@ pub(crate) mod tests {
         };
         let mut guest = Guest::load_from("chat", &staged).expect("the view loads");
         guest.redraw(&None);
-        guest.redraw(&chat_facts_in("channel-a", &messages, &[], &reading));
+        guest.redraw(&chat_run_thread_facts("channel-a", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Reading the repo"),
@@ -8280,7 +8044,7 @@ pub(crate) mod tests {
             "{shown:?}"
         );
         // the same reading, the other room on screen
-        guest.redraw(&chat_facts_in("channel-b", &messages, &[], &reading));
+        guest.redraw(&chat_run_thread_facts("channel-b", &messages, &[], &reading));
         let shown = texts(&guest);
         assert!(
             shown.iter().any(|text| text == "Draining the queue"),

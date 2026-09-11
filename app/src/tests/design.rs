@@ -197,7 +197,17 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         .split_once("\non ")
         .unwrap()
         .0;
-    assert!(activate.contains("task widget focus #chat/message-edit"));
+    assert!(activate.contains("sent = send_begin_edit(seq, body, rev)"));
+    // Editing uses the same native token-aware composer as new messages.
+    // Keep both edit seats named and labelled for host routing/accessibility.
+    for (kind, id) in [("edit", "#message-edit"), ("thread_edit", "#thread-edit")] {
+        let seat = chat
+            .lines()
+            .find(|line| line.contains("extern chat_composer(") && line.ends_with(id))
+            .expect("the native edit composer has its own seat");
+        assert!(seat.contains(&format!("\"{kind}\", true, \"Edit message\"")));
+        assert!(!chat.contains(&format!("input \"\" {id}")));
+    }
 }
 
 #[test]
@@ -277,7 +287,6 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("../ui/handlers/lifecycle.ice"),
         include_str!("../ui/handlers/chat.ice"),
         include_str!("../ui/handlers/pages.ice"),
-        include_str!("../ui/handlers/shell.ice"),
     ));
     for gradient in ["linear(", "radial(", "conic("] {
         assert!(!ui.contains(gradient), "{gradient}");
@@ -431,15 +440,28 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(settings.contains("emit(switch_network)"));
     assert!(settings.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
     assert!(chat_screen.contains("if active_thread_seq > 0 && !channel_settings_open"));
-    // Both chat composers wear the SAME plate — and now they wear the same
-    // SOURCE: the one `chat_composer` host surface (`composer_surface.rs`)
-    // seated twice by the view, so the chrome cannot drift between the
-    // stream and the rail by editing one.
-    assert_eq!(
-        chat_screen.matches("extern chat_composer(").count(),
-        2,
-        "the stream and the rail are the two seats of that one plate"
-    );
+    // New messages, replies, and both edit seats share the native composer
+    // plate, including its identity-preserving token editor.
+    let composer_seats: Vec<_> = chat_screen
+        .lines()
+        .filter(|line| line.contains("extern chat_composer("))
+        .collect();
+    assert_eq!(composer_seats.len(), 4);
+    for (kind, id) in [
+        ("message", "#composer"),
+        ("reply", "#reply_composer"),
+        ("edit", "#message-edit"),
+        ("thread_edit", "#thread-edit"),
+    ] {
+        assert_eq!(
+            composer_seats
+                .iter()
+                .filter(|line| { line.contains(&format!("\"{kind}\",")) && line.ends_with(id) })
+                .count(),
+            1,
+            "one shared composer seat for {kind}",
+        );
+    }
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
     let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
@@ -457,25 +479,53 @@ fn shell_uses_canonical_glass_and_opaque_content() {
 #[test]
 fn compact_controls_share_a_single_geometry_and_type_scale() {
     assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
-    // The composer geometry moved into the `rich_composer` extern args
-    // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
-    // Both chat composers share ONE call now — the `chat_composer` host
-    // surface — and the forge note keeps its own compact geometry on the
-    // screen.
+    // The native adapter owns the editor geometry and type scale for every
+    // composer seat; callers supply state, not another size configuration.
     let chat_composer = include_str!("../composer_surface.rs");
+    let editor = include_str!("../editor.rs");
     assert_eq!(
-        chat_composer
-            .matches("44.0,\n            150.0,\n            10.0,")
-            .count(),
+        chat_composer.matches("let editor = rich_composer(").count(),
         1
     );
+    for setting in [
+        "const COMPOSER_SIZE: f32 = 13.5;",
+        "const COMPOSER_LINE_HEIGHT: f32 = 1.3;",
+        ".min_height(44.0)",
+        ".max_height(150.0)",
+        ".padding(10.0)",
+    ] {
+        assert!(editor.contains(setting), "{setting}");
+    }
     // the forge note is the same composer, as the host surface the view
     // leaves a slot for — compact, over the item's channel
     assert!(inlined(include_str!("../../../crates/views/forge/src/ui/forge.ice")).contains(
         "extern forge_composer(note_scope, \"note\", true, \"Write a note…\", note_blocked, false,"
     ));
-    assert!(chat_composer.contains("widget::text(\"Send\")"));
-    assert!(chat_composer.contains(".height(if self.compact { 28 } else { 29 })"));
+    let send = chat_composer
+        .split_once("let send = widget::button(")
+        .unwrap()
+        .1
+        .split_once("let mut tail = ")
+        .unwrap()
+        .0;
+    assert!(send.contains("widget::text(label).size(12.5)"));
+    assert!(send.contains(".padding(if self.compact { [6, 11] } else { [7, 12] })"));
+    assert!(
+        !send.contains(".height("),
+        "text and padding determine action height"
+    );
+    assert!(chat_composer.contains("\"Save\""));
+    assert!(chat_composer.contains("\"Send\""));
+    let chat_components = inlined(include_str!(
+        "../../../crates/views/chat/src/ui/components.ice"
+    ));
+    for action in chat_components
+        .lines()
+        .filter(|line| line.contains("button \"View run\""))
+    {
+        assert!(!action.contains(" h="), "{action}");
+        assert!(action.contains("text-11px"), "{action}");
+    }
     let chat_screen = inlined(include_str!("../../../crates/views/chat/src/ui/chat.ice"));
     assert!(
         SCREENS
@@ -812,11 +862,6 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
             .contains("bg=danger_bg border=danger_line")
     );
     assert!(chat_screen.contains("bg=danger_dot"));
-    // the live dots moved to the `shell` view with its screen
-    assert!(
-        inlined(include_str!("../../../crates/views/shell/src/ui/shell.ice"))
-            .contains("bg=success_dot")
-    );
     // the semantic status plate is the kit's, so every screen that reports
     // a good outcome paints the same three tokens.
     assert!(kit.contains("bg=success_bg border=success_line border-w=1.0"));
@@ -1317,9 +1362,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "../../crates/views/files/src/ui/files.ice",
         "../../crates/views/files/src/ui/browser.ice",
         "../../crates/views/files/src/ui/kit.ice",
-        "../../crates/views/shell/src/ui/app.ice",
-        "../../crates/views/shell/src/ui/shell.ice",
-        "../../crates/views/shell/src/ui/kit.ice",
         "ui/screens/overlays.ice",
         "../../crates/views/pages/src/ui/app.ice",
         "../../crates/views/pages/src/ui/pages.ice",
@@ -1367,7 +1409,6 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "../../crates/views/chat/src/ui/components.ice",
             "../../crates/views/chat/src/ui/dm.ice",
             "../../crates/views/files/src/ui/browser.ice",
-            "../../crates/views/shell/src/ui/shell.ice",
             "../../crates/views/pages/src/ui/rows.ice",
         ],
         "every surface that marks a current row reads `selected_row`"

@@ -1,7 +1,7 @@
 use super::{
-    Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunAuthorityView, RunsModule, RunsQuery,
-    RunsReply, SiblingReadBudget, StateRoot, StateSyncHandle, committed_root, decode_query,
-    dispatch_id_for, encode_reply,
+    Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery, RunsReply,
+    SiblingReadBudget, StateRoot, StateSyncHandle, committed_root, decode_query, dispatch_id_for,
+    encode_reply,
 };
 
 #[derive(Clone, Copy)]
@@ -117,7 +117,7 @@ impl RunsModule {
             };
             self.stage_action_request(
                 &entry,
-                format!("result/{}/{index}", super::dispatch_id_for(&entry.run_id)),
+                format!("result/{}/{index}", dispatch_id_for(&entry.run_id)),
                 super::action_requests::RequestScope::Result,
                 prepared,
             )
@@ -212,9 +212,9 @@ impl Module for RunsModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
-            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(
-                crate::catalog(filter.as_deref()),
-            ))),
+            RunsQuery::Catalog { filter } => Ok(encode_reply(&RunsReply::Catalog(crate::catalog(
+                filter.as_deref(),
+            )))),
             RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
                 self.next_module_update().await?,
             ))),
@@ -269,16 +269,6 @@ impl Module for RunsModule {
                     .map(|state| state.view.clone())
                     .collect();
                 Ok(encode_reply(&RunsReply::Delegations(delegations)))
-            }
-            RunsQuery::RunAuthority { run_id } => {
-                let view = self.pending_entry(&dispatch_id_for(&run_id)).map(|entry| {
-                    Box::new(RunAuthorityView {
-                        run_id: entry.run_id.clone(),
-                        agent_id: entry.agent_id.clone(),
-                        authority: entry.authority.clone(),
-                    })
-                });
-                Ok(encode_reply(&RunsReply::RunAuthority(view)))
             }
         }
     }

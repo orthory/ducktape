@@ -147,6 +147,7 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
+        edit_body: body.into(),
         body: body.into(),
         blocks: backend::paragraph_blocks(body),
         pending: false,
@@ -277,6 +278,8 @@ fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
     let scope = match kind {
         ComposerKind::Message => composer_scope(app),
         ComposerKind::Reply => reply_composer_scope(app),
+        ComposerKind::Edit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.selected_message_seq),
+        ComposerKind::ThreadEdit => backend::edit_scope(&app.connected_rpc, &app.active_channel, app.thread_selected_seq),
     };
     let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
         kind,
@@ -552,7 +555,6 @@ fn reading_alpha() -> Ducktape {
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.pages = vec![page_item("alpha", "Alpha"), page_item("beta", "Beta")];
-    app.doc_tabs = vec!["alpha".into(), "beta".into()];
     app.active_page = "alpha".into();
     app.active_page_title = "Alpha".into();
     app.active_page_parent = "Root".into();

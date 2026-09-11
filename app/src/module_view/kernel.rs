@@ -13,6 +13,15 @@
 //!   ([`live_hit`], any module — an audited view is trusted to read what
 //!   it names), or `block` for every block ([`block_hit`]), so the view
 //!   re-reads what moved.
+//! - `rpc.query_as_reader` `{target, query}` — the query AS THE SEATED
+//!   KEY'S HOLDER (`/v1/query/reader`), for a module that serves protected
+//!   content to its reader; refused while the key is locked.
+//! - `files.get` `{lane, params}` — one `/v1/files/<lane>` read with its
+//!   query-string params; `blob.get` `{digest, limit}` — a blob by hex
+//!   digest, verified against it.
+//! - `files.stage` `<raw bytes>` / `blob.put` `<raw bytes>` — a duckfs
+//!   chunk or a blob landed on the node, proven with the seated key;
+//!   answered with the digest.
 //! - `op.submit` `{target, payload}` — one module op, signed with the
 //!   SEATED key and submitted; answered with the block height. The view
 //!   never carries a password, an endpoint or a key.
@@ -30,6 +39,8 @@ use super::{Guest, ModuleViewEvent, Slot, wire};
 
 /// The most blocks one `rpc.blocks` may ask for.
 const MAX_BLOCKS: usize = 1_000;
+/// The most a `blob.get` may pull: a frame's worth, as the loader's own cap.
+const MAX_BLOB_BYTES: usize = 16 << 20;
 
 /// The kernel's answers to a view's requests, written off-thread and
 /// drained into the guest's pending events at its next redraw.
@@ -113,6 +124,11 @@ pub(super) fn answer(
         ("rpc", "blocks") => spawn(guest, id, payload, blocks),
         ("rpc", "status") => spawn(guest, id, b"{}", status),
         ("rpc", "peers") => spawn(guest, id, b"{}", peers),
+        ("rpc", "query_as_reader") => spawn(guest, id, payload, query_as_reader),
+        ("files", "get") => spawn(guest, id, payload, files_get),
+        ("files", "stage") => spawn_raw(guest, id, payload, files_stage),
+        ("blob", "get") => spawn(guest, id, payload, blob_get),
+        ("blob", "put") => spawn_raw(guest, id, payload, blob_put),
         ("rpc", "live") => {
             let plane = std::str::from_utf8(payload).unwrap_or_default().trim();
             let named = plane == BLOCK_PLANE || workspace_config::validate_module_id(plane).is_ok();
@@ -172,6 +188,134 @@ fn spawn(guest: &mut Guest, id: u64, payload: &[u8], call: Call) {
         let result = call(client, ask).await;
         replies.deliver(id, result);
     });
+}
+
+type RawCall = fn(
+    ducktape_rpc::Client,
+    Vec<u8>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+
+/// [`spawn`] for a request whose payload is the bytes themselves.
+fn spawn_raw(guest: &mut Guest, id: u64, payload: &[u8], call: RawCall) {
+    let client = super::connection()
+        .lock()
+        .expect("views rpc")
+        .client
+        .clone();
+    let Some(client) = client else {
+        guest.refuse(id, "not connected to a node".into());
+        return;
+    };
+    let bytes = payload.to_vec();
+    let replies = guest.replies.clone();
+    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    runtime().spawn(async move {
+        let result = call(client, bytes).await;
+        replies.deliver(id, result);
+    });
+}
+
+fn query_as_reader(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let target = target_of(&ask)?;
+        let signer = crate::backend::seated_data_plane_signer(&client).await?;
+        let reply: serde_json::Value = client
+            .with_write_auth(signer)
+            .query_as_reader(&target, &ask["query"])
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn files_get(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let lane = ask["lane"].as_str().unwrap_or_default();
+        let lane_named = !lane.is_empty()
+            && lane
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !lane_named {
+            return Err("`files.get` names no lane".into());
+        }
+        let params: Vec<(String, String)> = ask["params"]
+            .as_object()
+            .map(|params| {
+                params
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = match value {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let params: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let reply = client
+            .files_get(lane, &params)
+            .await
+            .map_err(|error| error.to_string())?;
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn files_stage(
+    client: ducktape_rpc::Client,
+    bytes: Vec<u8>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let signer = crate::backend::seated_data_plane_signer(&client).await?;
+        let digest = client
+            .with_write_auth(signer)
+            .files_stage(bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(digest.into_bytes())
+    })
+}
+
+fn blob_put(
+    client: ducktape_rpc::Client,
+    bytes: Vec<u8>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let signer = crate::backend::seated_data_plane_signer(&client).await?;
+        let digest = client
+            .with_write_auth(signer)
+            .put_blob(bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(digest.into_bytes())
+    })
+}
+
+fn blob_get(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let digest = crate::backend::hex_decode(ask["digest"].as_str().unwrap_or_default())?;
+        let digest: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| "`blob.get` digest is not 32 bytes".to_owned())?;
+        let limit = ask["limit"].as_u64().unwrap_or(0) as usize;
+        client
+            .get_blob(&digest, limit.clamp(1, MAX_BLOB_BYTES))
+            .await
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn target_of(ask: &serde_json::Value) -> Result<String, String> {

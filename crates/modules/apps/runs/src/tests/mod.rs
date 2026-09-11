@@ -3,7 +3,7 @@ use crate::facets::{WireSink, decode_run_result};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
-use crate::{ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS};
+use crate::{OP_CHAT_POST_MESSAGE, OP_TASKS_CREATE, OP_TASKS_UPDATE_STATUS};
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
 use base64::Engine as _;
 use chat::{Channel, MessageHead, Party, decode_msg as chat_decode_msg};
@@ -795,28 +795,26 @@ fn user(byte: u8) -> Origin {
     Origin::External(vec![byte; 32])
 }
 
-fn record(agent_id: &str, actions: &[&str]) -> ModelRecord {
+fn record(agent_id: &str) -> ModelRecord {
     ModelRecord {
         account: 2,
         agent_id: agent_id.into(),
         owner: RunOrigin::External(vec![9; 32]),
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
-        allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         status: ModelStatus::Active,
         role: crate::ModelRole::General,
         created_at: 0,
         updated_at: 0,
         recipe_hash: Vec::new(),
-        caps: crate::ResourceCaps::default(),
         skills: Vec::new(),
     }
 }
 
-fn registry(agents: &[(&str, &[&str])]) -> Registry {
+fn registry(agents: &[&str]) -> Registry {
     agents
         .iter()
-        .map(|(id, actions)| ((*id).to_string(), record(id, actions)))
+        .map(|id| ((*id).to_string(), record(id)))
         .collect()
 }
 
@@ -1025,11 +1023,9 @@ fn forge_pr(number: u64, title: &str, body: &str, src: &str, tgt: &str) -> forge
     forge_item_detail(number, forge::ItemKind::Pr, title, body, Some((src, tgt)))
 }
 
-/// a registry whose one agent "bot" holds the forge_read cap on "app".
-fn forge_read_registry() -> Registry {
-    let mut r = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    r.get_mut("bot").unwrap().caps.forge_read = vec!["app".into()];
-    r
+/// a registry holding the one agent "bot".
+fn bot_registry() -> Registry {
+    registry(&["bot"])
 }
 
 /// the forge-lane module: forge + files + pages wired (the production wiring).
@@ -1193,18 +1189,18 @@ fn response_json(reply: &[&str], actions: Vec<ActionEnvelope>) -> Vec<u8> {
     })
 }
 
-/// a committed module holding one pending run for "bot" (granted
-/// `actions`) at general/2, plus the registry and the run id.
-fn awaiting_run(actions: &[&str]) -> (RunsModule, Registry, String) {
-    let registry = registry(&[("bot", actions)]);
+/// a committed module holding one pending run for "bot" at general/2, plus
+/// the registry and the run id.
+fn awaiting_run() -> (RunsModule, Registry, String) {
+    let registry = registry(&["bot"]);
     let mut m = configured(&registry);
     request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     (m, registry, run_id_for("general", 2, "bot"))
 }
-/// the canned registry for the jobs lane: "duck" with task grants.
+/// the canned registry for the jobs lane: "duck".
 fn job_registry() -> Registry {
-    registry(&[("duck", &[ACTION_TASKS_CREATE, crate::ACTION_JOBS_COMMENT])])
+    registry(&["duck"])
 }
 fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaView {
     saga::SagaView {
@@ -1273,12 +1269,12 @@ fn post_message(
     if let Some(root) = thread {
         target["thread"] = root.into();
     }
-    envelope(ACTION_CHAT_POST_MESSAGE, Some(target), text_content(text))
+    envelope(OP_CHAT_POST_MESSAGE, Some(target), text_content(text))
 }
 
 fn page_comment(target: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
     envelope(
-        crate::ACTION_PAGES_COMMENT,
+        crate::OP_PAGES_COMMENT,
         Some(serde_json::json!({"target": target.into()})),
         text_content(text),
     )
@@ -1286,7 +1282,7 @@ fn page_comment(target: impl Into<String>, text: impl Into<String>) -> ActionEnv
 
 fn page_thread_comment(thread_id: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
     envelope(
-        crate::ACTION_PAGES_COMMENT,
+        crate::OP_PAGES_COMMENT,
         Some(serde_json::json!({"thread_id": thread_id.into()})),
         text_content(text),
     )
@@ -1294,7 +1290,7 @@ fn page_thread_comment(thread_id: impl Into<String>, text: impl Into<String>) ->
 
 fn page_post(title: impl Into<String>, content: serde_json::Value) -> ActionEnvelope {
     envelope(
-        crate::ACTION_PAGES_POST,
+        crate::OP_PAGES_POST,
         None,
         serde_json::json!({"title": title.into(), "content": content}),
     )
@@ -1302,7 +1298,7 @@ fn page_post(title: impl Into<String>, content: serde_json::Value) -> ActionEnve
 
 fn set_page_checked(block_id: impl Into<String>, checked: bool) -> ActionEnvelope {
     envelope(
-        crate::ACTION_PAGES_SET_CHECKED,
+        crate::OP_PAGES_SET_CHECKED,
         Some(serde_json::json!({"block_id": block_id.into()})),
         serde_json::json!({"checked": checked}),
     )
@@ -1310,7 +1306,7 @@ fn set_page_checked(block_id: impl Into<String>, checked: bool) -> ActionEnvelop
 
 fn job_comment(job_id: impl Into<String>, text: impl Into<String>) -> ActionEnvelope {
     envelope(
-        crate::ACTION_JOBS_COMMENT,
+        crate::OP_JOBS_COMMENT,
         Some(serde_json::json!({"job_id": job_id.into()})),
         text_content(text),
     )
@@ -1318,7 +1314,7 @@ fn job_comment(job_id: impl Into<String>, text: impl Into<String>) -> ActionEnve
 
 fn create_task(task_id: impl Into<String>, title: impl Into<String>) -> ActionEnvelope {
     envelope(
-        ACTION_TASKS_CREATE,
+        OP_TASKS_CREATE,
         None,
         serde_json::json!({"task_id": task_id.into(), "title": title.into()}),
     )
@@ -1326,7 +1322,7 @@ fn create_task(task_id: impl Into<String>, title: impl Into<String>) -> ActionEn
 
 fn update_task_status(task_id: impl Into<String>, status: impl Into<String>) -> ActionEnvelope {
     envelope(
-        ACTION_TASKS_UPDATE_STATUS,
+        OP_TASKS_UPDATE_STATUS,
         Some(serde_json::json!({"task_id": task_id.into()})),
         serde_json::json!({"status": status.into()}),
     )
@@ -1342,7 +1338,7 @@ fn duckfs_write_text(
         input["base_snapshot"] = base.into();
     }
     envelope(
-        crate::ACTION_DUCKFS_WRITE_TEXT,
+        crate::OP_DUCKFS_WRITE_TEXT,
         Some(serde_json::json!({"path": path.into()})),
         input,
     )
@@ -1356,9 +1352,15 @@ fn agent_call(agent_id: impl Into<String>, instruction: impl Into<String>) -> Ac
     )
 }
 
-fn forge_open_pr(repo: &str, source: &str, target: &str, title: &str, body: &str) -> ActionEnvelope {
+fn forge_open_pr(
+    repo: &str,
+    source: &str,
+    target: &str,
+    title: &str,
+    body: &str,
+) -> ActionEnvelope {
     envelope(
-        crate::ACTION_FORGE_OPEN_PR,
+        crate::OP_FORGE_OPEN_PR,
         Some(serde_json::json!({"repo": repo})),
         serde_json::json!({
             "source_branch": source,

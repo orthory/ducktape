@@ -23,7 +23,7 @@ extern crate::module_view
   // reads the roster off the node and signs its writes through `op.submit`;
   // the one event back is the clipboard intent
   component members_view(dark:bool, connected:bool, admin:bool) -> ModuleViewEvent
-  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str], actions:&[str]) -> ModuleViewEvent
+  component agents_view(dark:bool, connected:bool, answered:bool, account:&str, committed:i64, rows:&[AgentRow], runs:&[RunRow], open_run:&str, opened:i64, journal:&RunJournal, live:&LiveRun, capabilities:&[str]) -> ModuleViewEvent
   pure agents_intent(event:&ModuleViewEvent) -> AgentsIntent
   pure event_text(event:&ModuleViewEvent, field:&str) -> str
   pure event_flag(event:&ModuleViewEvent, field:&str) -> bool
@@ -35,22 +35,14 @@ extern crate::module_view
   pure node_log_timeline_drain(state:NodeLogTimelineState) -> NodeLogTimelineState
   component explorer_view(dark:bool, connected:bool, loading:bool, blocks:&[ExplorerBlock], ops:&[ExplorerOp], head:i64, sync_line:&str, hits:&[ExplorerHit], kinds:&[KindCount], partial:&str, searching:bool, sent_query:&str) -> ModuleViewEvent
   pure explorer_intent(event:&ModuleViewEvent) -> ExplorerIntent
-  component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, settings_open_tabs:i64, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
+  component settings_view(dark:bool, connected:bool, loading:bool, status:&str, mutation_phase:MutationPhase, appearance:Appearance, desktop_notifications:bool, password:&str, account_name:&str, network_name:&str, connected_rpc:&str, account_ceremony_phase:&str, account_ceremony_qr:&str, account_ceremony_detail:&str, account_ceremony_left:&str, settings_key_state:&str, settings_key_path:&str, members_rows:&[MemberRow], members_answered:bool, account_number:&str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:&[AccountKeyRow], account_busy:bool, account_ticket:&str, drafts_cleared:i64, drafts_scope:&str) -> ModuleViewEvent
   pure settings_intent(event:&ModuleViewEvent) -> SettingsIntent
   component files_view(dark:bool, connected:bool, path:&str, listed:bool, entries:&[FsEntry], loading:bool, preview_path:&str, preview_entry:&FsEntry, delete_target:&str, diff_from:&str, diff:&[FsDiffEntry], history:&[FsSnapshot], preview_truncated:bool, preview_binary:bool, preview_picture:bool, preview_width:i64, preview_height:i64, preview_text:&str, write_refusal:&str, writes:i64, rpc:&str, chain:&str, connection:i64, preview_base:&str, save_reply:&FsSaveHistory) -> ModuleViewEvent
   pure files_intent(event:&ModuleViewEvent) -> FilesIntent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
-  // the Shell tab: the app's agent picks and the run it is watching, drawn
-  // by the `shell` view; the composer, the terminal and the answer Markdown
-  // are host surfaces, and a send arrives as the `send` intent
-  component shell_view(dark:bool, connected:bool, surface:ShellSurface, setup_open:bool, identity_options:&[str], identity:&str, provider:&str, credential:&str, host_node_options:&[str], host_node:&str, credentials_loading:bool, terminal:&AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:&str, terminal_error:&str, entries:&[AgentChatEntry], activity:&[AgentActivity], chat_busy:bool, chat_status:&str, chat_detail:&str, live:&str, saga_id:&str, detached_saga:&str) -> ModuleViewEvent
-  pure shell_intent(event:&ModuleViewEvent) -> ShellIntent
-  pure shell_event_surface(event:&ModuleViewEvent) -> ShellSurface
-  // empties the host-side composer (a new chat, a workspace reset)
-  sync shell_composer_clear() -> bool
   // The guest owns the document editor. The app supplies a bounded source
   // stream and reconciles accepted edits with persistence and navigation.
-  component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, doc_tabs:&[str], blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_text:&str, buffer_page:&str, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent
+  component pages_view(dark:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, network_chain_id:&str, pages:&[PageItem], page_create_open:bool, page_draft:&str, block_comment_draft:&str, seed_rev:i64, active_page:&str, active_page_title:&str, active_page_parent:&str, page_searching:bool, page_search_hits:&[PageSearchHit], page_search_query:&str, page_delete_armed:bool, autosave:AutosaveStatus, page_refusal:&str, blocks:&[PageBlock], commented_block_hits:&[str], caret_comment_target:&str, active_thread_anchor:&str, orphaned_comment_drafts:&[str], page_text:&str, buffer_page:&str, block_comments_open:bool, thread_total:i64, threads:&[PageCommentThread], comment_rows:&[PageCommentThreadRow], threads_loading:bool, threads_has_more:bool, active_thread:&str, comments:&[PageComment], comments_loading:bool, comments_has_more:bool) -> ModuleViewEvent
   pure pages_intent(event:&ModuleViewEvent) -> PagesIntent
   // The Forge tab: the register the app holds and the item it has open,
   // the code browse's listing and file, and the discussion — whose note
@@ -74,6 +66,7 @@ extern crate::module_view
   pure event_int(event:&ModuleViewEvent, field:&str) -> i64
   pure event_num(event:&ModuleViewEvent, field:&str) -> f64
   sync chat_composer_unsent(scope:&str, text:&str, committed:bool) -> bool
+  sync chat_composer_edit(scope:&str, messages:&[ChatMessage], seq:i64, rev:i64) -> bool
   // the room's roster for the composers over it: what `@` may complete to,
   // by the same rule the send resolves
   sync chat_composer_roster(scope:&str, members:&[ChatMember]) -> bool
