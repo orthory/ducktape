@@ -1,14 +1,20 @@
-//! The facts the host pushes are what the screen shows; every act leaves as
-//! an intent carrying what the reader typed, and a committed op the host
-//! reports consumes only the drafts it read.
+//! The view driven natively through the wire, on the KERNEL CONTRACT: the
+//! kernel pushes session facts, the view reads this node's standing and the
+//! seat's key associations for itself (`rpc.status` / `rpc.query`, re-read on
+//! every `rpc.live` hit), and every act leaves as an intent the kernel signs
+//! — the password crosses out and never back.
 
-use settings_view::host::{AccountKeyRow, KeyAdd, Name, SettingsProps, Tab, Unlock};
+use std::collections::BTreeMap;
+
+use settings_view::host::{KeyAdd, Name, Session, Tab, Unlock};
 use settings_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, submit, texts, type_into};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{answer, has_text, item, press, submit, texts, type_into};
+use ui_lang_guest::wire::{ButtonContent, Frame, Node, Request};
 
-fn facts() -> SettingsProps {
-    SettingsProps {
+const SEAT: &str = "8c4fa211";
+
+fn facts() -> Session {
+    Session {
         dark: false,
         connected: true,
         loading: false,
@@ -18,7 +24,10 @@ fn facts() -> SettingsProps {
         appearance: "system".into(),
         desktop_notifications: true,
         unlocked: true,
+        seat_key: SEAT.into(),
         account_name: "duck".into(),
+        account_number: "42".into(),
+        account_exists: true,
         network_name: "testnet".into(),
         connected_rpc: "http://127.0.0.1:1".into(),
         account_ceremony_phase: String::new(),
@@ -27,82 +36,254 @@ fn facts() -> SettingsProps {
         account_ceremony_left: String::new(),
         settings_key_state: "sealed".into(),
         settings_key_path: "/keys/user.key".into(),
-        tier: "validator".into(),
-        admin: true,
-        members_line: "3 humans · 1 agent".into(),
-        members_answered: true,
-        account_number: "42".into(),
-        account_renaming: false,
-        account_exists: true,
-        account_keys: 2,
-        account_key_rows: vec![AccountKeyRow {
-            scheme: "ed25519".into(),
-            pubkey: "ab12cd34".into(),
-            label: "laptop".into(),
-        }],
         account_busy: false,
         account_ticket: String::new(),
-        drafts_cleared: 0,
-        drafts_scope: String::new(),
     }
 }
 
-fn encoded(props: &SettingsProps) -> Vec<u8> {
-    serde_json::to_vec(props).expect("props encode")
+fn encoded(session: &Session) -> Vec<u8> {
+    serde_json::to_vec(session).expect("session encodes")
 }
 
-/// Boot and push the facts; returns the subscription id and the frame.
-fn shown(props: &SettingsProps) -> (u64, Frame) {
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
+}
+
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
+}
+
+/// Whether the button named `name` — by key, label or its own words, the
+/// three ways `press` finds one — is in the tree with no press to send.
+fn button_disabled(frame: &Frame, name: &str) -> bool {
+    let mut root = frame.root.clone().expect("a tree");
+    let mut disabled = None;
+    root.for_each_mut(&mut |node| {
+        let Node::Button {
+            key,
+            content,
+            label,
+            on_press,
+            ..
+        } = node
+        else {
+            return;
+        };
+        let named = key == name
+            || label.as_deref() == Some(name)
+            || matches!(content, ButtonContent::Label(words) if words == name);
+        if named {
+            disabled = Some(on_press.is_none());
+        }
+    });
+    disabled.expect("the button is in the tree")
+}
+
+// ---------- what a node would answer ----------
+
+/// This device IS the chain's one validator, so the card reads `validator`.
+fn status() -> Vec<u8> {
+    serde_json::json!({ "public_key": SEAT })
+        .to_string()
+        .into_bytes()
+}
+
+fn seats(name: &str, keys: &[[u8; 4]]) -> Vec<u8> {
+    serde_json::json!({ name: keys })
+        .to_string()
+        .into_bytes()
+}
+
+fn agents() -> Vec<u8> {
+    serde_json::json!({ "model": { "agents": [{ "id": "a" }] } })
+        .to_string()
+        .into_bytes()
+}
+
+/// The identity module's `Account(Some)` reply for the seat's account.
+fn account(keys: usize) -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = [
+        serde_json::json!({
+            "scheme": "ed25519", "pubkey": [0x8c, 0x4f, 0xa2, 0x11], "label": "laptop"
+        }),
+        serde_json::json!({
+            "scheme": "secp256r1", "pubkey": [0xff, 0x00], "label": "phone"
+        }),
+    ]
+    .into_iter()
+    .take(keys)
+    .collect();
+    serde_json::json!({ "account": { "number": 42, "keys": rows } })
+        .to_string()
+        .into_bytes()
+}
+
+/// The reply a node would give this read, or `None` when the request is not
+/// a read at all (a live subscription, an intent, a badge).
+fn canned(request: &Request, keys: usize) -> Option<Vec<u8>> {
+    if request.kind == "rpc.status" {
+        return Some(status());
+    }
+    if request.kind != "rpc.query" {
+        return None;
+    }
+    let ask: serde_json::Value = serde_json::from_slice(&request.payload).expect("a query decodes");
+    let target = ask["target"].as_str().expect("a target");
+    let validators = ask["query"] == serde_json::json!("validators");
+    match (target, validators) {
+        ("valset", true) => Some(seats("validators", &[[0x8c, 0x4f, 0xa2, 0x11]])),
+        ("valset", false) => Some(seats("residents", &[[1, 2, 3, 4], [5, 6, 7, 8]])),
+        ("runs", _) => Some(agents()),
+        ("identity", _) => Some(account(keys)),
+        _ => panic!("unexpected query target {target}"),
+    }
+}
+
+/// Answer every read the view has outstanding until it asks for nothing
+/// more, recording the `rpc.live` planes it subscribed to on the way.
+fn settle(mut frame: Frame, planes: &mut BTreeMap<String, u64>, keys: usize) -> Frame {
+    loop {
+        for request in &frame.requests {
+            if request.kind == "rpc.live" {
+                let plane = String::from_utf8(request.payload.clone()).expect("a plane name");
+                planes.insert(plane, request.id);
+            }
+        }
+        let answers: Vec<_> = frame
+            .requests
+            .iter()
+            .filter_map(|request| canned(request, keys).map(|reply| answer(request.id, &reply)))
+            .collect();
+        if answers.is_empty() {
+            return frame;
+        }
+        frame = tick_native(answers);
+    }
+}
+
+/// Boots, pushes the session, and answers every read it starts: the settled
+/// frame, the session subscription, and the live planes it watches.
+fn connected(session: &Session, keys: usize) -> (Frame, u64, BTreeMap<String, u64>) {
     boot_native();
     let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests[0].kind, "settings.props");
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &encoded(props))]);
-    (subscription, frame)
+    assert_eq!(
+        kinds(&frame.requests),
+        ["settings.props"],
+        "only the session at boot: {:?}",
+        frame.requests
+    );
+    let props = request(&frame, "settings.props").id;
+    let mut planes = BTreeMap::new();
+    let frame = settle(
+        tick_native(vec![item(props, &encoded(session))]),
+        &mut planes,
+        keys,
+    );
+    (frame, props, planes)
 }
 
-fn one_intent(frame: &Frame) -> &ui_lang_guest::wire::Request {
+fn one_intent(frame: &Frame) -> &Request {
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
     };
     intent
 }
 
+// ---------- the reads ----------
+
+/// Connected, the view reads its own standing and its own key rows: the
+/// valset and the runs registry through `rpc.query`, this node's key off
+/// `rpc.status`, and the account the seat belongs to off `identity`. Every
+/// one of them folds onto the screen.
 #[test]
-fn the_facts_the_host_pushes_are_what_the_screen_shows_and_a_link_leaves_as_a_tab() {
-    let (_, frame) = shown(&facts());
-    for expected in ["Settings", "Theme"] {
+fn a_connected_view_reads_its_own_standing_and_key_rows() {
+    let (frame, _, planes) = connected(&facts(), 2);
+    assert_eq!(
+        planes.keys().collect::<Vec<_>>(),
+        ["identity", "valset"],
+        "one live plane per read: {planes:?}"
+    );
+
+    let frame = tick_native(press(&frame, "Network"));
+    assert!(
+        has_text(&frame, "3 humans · 1 agent"),
+        "the headcount is folded off the valset: {:?}",
+        texts(&frame)
+    );
+
+    let frame = tick_native(press(&frame, "Account"));
+    for expected in ["validator", "laptop", "8c4fa211", "phone", "ff00"] {
         assert!(
             has_text(&frame, expected),
             "missing {expected:?} in {:?}",
             texts(&frame)
         );
     }
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-    let frame = tick_native(press(&frame, "Network"));
+}
+
+/// A view with no connection reads nothing — the session is the only thing
+/// it is waiting on.
+#[test]
+fn an_unconnected_view_asks_the_kernel_for_nothing() {
+    let offline = Session {
+        connected: false,
+        status: "Connecting…".into(),
+        ..facts()
+    };
+    boot_native();
+    let frame = tick_native(Vec::new());
+    let props = request(&frame, "settings.props").id;
+    let frame = tick_native(vec![item(props, &encoded(&offline))]);
     assert!(
-        has_text(&frame, "3 humans · 1 agent"),
-        "{:?}",
-        texts(&frame)
-    );
-    let frame = tick_native(press(&frame, "manage"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "settings.tab");
-    assert_eq!(
-        serde_json::from_slice::<Tab>(&intent.payload).expect("decodes"),
-        Tab {
-            tab: "members".into()
-        }
+        frame.requests.is_empty(),
+        "nothing to read with no node: {:?}",
+        frame.requests
     );
 }
 
+/// A valset block re-reads the standing; an identity block re-reads the key
+/// rows. Neither costs the other a query.
+#[test]
+fn a_block_on_a_plane_reads_only_that_plane_again() {
+    let (_, _, planes) = connected(&facts(), 2);
+
+    let frame = tick_native(vec![item(planes["valset"], b"{}")]);
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.status"],
+        "the standing read starts at this node's key: {:?}",
+        frame.requests
+    );
+
+    let frame = tick_native(vec![item(planes["identity"], b"{}")]);
+    let query = request(&frame, "rpc.query");
+    let ask: serde_json::Value = serde_json::from_slice(&query.payload).expect("decodes");
+    assert_eq!(ask["target"], "identity");
+    assert_eq!(
+        ask["query"]["of_key"]["key"],
+        serde_json::json!([0x8c, 0x4f, 0xa2, 0x11]),
+        "the seat's PUBLIC key is what resolves the account"
+    );
+}
+
+// ---------- the acts ----------
+
+/// The seat's password leaves as an `unlock` intent and never comes back:
+/// what the kernel pushes is the FLAG.
 #[test]
 fn the_password_leaves_only_as_an_unlock_and_never_comes_back() {
-    let locked = SettingsProps {
+    let locked = Session {
         unlocked: false,
         ..facts()
     };
-    let (subscription, frame) = shown(&locked);
+    let (frame, props, _) = connected(&locked, 2);
     let frame = tick_native(press(&frame, "Security"));
     let frame = tick_native(type_into(&frame, "unlock signing…", "hunter2"));
     assert!(frame.requests.is_empty(), "typing runs no handler");
@@ -115,8 +296,7 @@ fn the_password_leaves_only_as_an_unlock_and_never_comes_back() {
             password: "hunter2".into()
         }
     );
-    // the seat crosses back as a flag, never as the password
-    let frame = tick_native(vec![item(subscription, &encoded(&facts()))]);
+    let frame = tick_native(vec![item(props, &encoded(&facts()))]);
     assert!(
         has_text(&frame, "Signing unlocked for this session."),
         "{:?}",
@@ -125,9 +305,12 @@ fn the_password_leaves_only_as_an_unlock_and_never_comes_back() {
     assert!(!has_text(&frame, "hunter2"));
 }
 
+/// A rename leaves as the intent carrying the TRIMMED name, and the draft is
+/// spent when the account carries that name back — the kernel signs the op,
+/// so the account it reports IS the acknowledgement. Nothing else is spent.
 #[test]
-fn a_committed_op_consumes_only_the_drafts_it_read() {
-    let (subscription, frame) = shown(&facts());
+fn a_rename_is_spent_when_the_account_carries_its_name_back() {
+    let (frame, props, _) = connected(&facts(), 2);
     let frame = tick_native(press(&frame, "Account"));
     let frame = tick_native(type_into(&frame, "rename account…", "  mallard  "));
     let frame = tick_native(type_into(&frame, "paste its ed25519 key (hex)…", "ff00"));
@@ -140,13 +323,20 @@ fn a_committed_op_consumes_only_the_drafts_it_read() {
             name: "mallard".into()
         }
     );
-    // the rename landed: the name draft goes, the pasted key stays …
-    let renamed = SettingsProps {
-        drafts_cleared: 1,
-        drafts_scope: "name".into(),
+
+    // the same name pushed back spends the name draft …
+    let renamed = Session {
+        account_name: "mallard".into(),
         ..facts()
     };
-    let frame = tick_native(vec![item(subscription, &encoded(&renamed))]);
+    let frame = tick_native(vec![item(props, &encoded(&renamed))]);
+    assert!(
+        button_disabled(&frame, "Rename"),
+        "an empty name draft offers no rename: {:?}",
+        texts(&frame)
+    );
+
+    // … and only it: the pasted key still mints
     let frame = tick_native(press(&frame, "Mint ticket"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "settings.key_add");
@@ -157,8 +347,65 @@ fn a_committed_op_consumes_only_the_drafts_it_read() {
             label: String::new()
         }
     );
-    // … and the same report pushed again consumes nothing more
-    let frame = tick_native(vec![item(subscription, &encoded(&renamed))]);
+}
+
+/// A minted ticket is the answer to the key that was pasted: the ticket the
+/// kernel reports spends the key and its label, and nothing else.
+#[test]
+fn a_minted_ticket_spends_the_key_it_was_minted_for() {
+    let (frame, props, _) = connected(&facts(), 2);
+    let frame = tick_native(press(&frame, "Account"));
+    let frame = tick_native(type_into(&frame, "paste its ed25519 key (hex)…", "ff00"));
     let frame = tick_native(press(&frame, "Mint ticket"));
     assert_eq!(one_intent(&frame).kind, "settings.key_add");
+
+    let minted = Session {
+        account_ticket: r#"{"add_key":{}}"#.into(),
+        ..facts()
+    };
+    let frame = tick_native(vec![item(props, &encoded(&minted))]);
+    assert!(
+        button_disabled(&frame, "Mint ticket"),
+        "an empty key draft mints nothing: {:?}",
+        texts(&frame)
+    );
+}
+
+/// THE LAST KEY IS NEVER OFFERED FOR REMOVAL — consensus refuses it ("cannot
+/// remove the last key of an account"), and the rows the view reads are what
+/// say how many are left.
+#[test]
+fn the_last_key_is_never_offered_for_removal() {
+    let (frame, _, _) = connected(&facts(), 1);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(
+        button_disabled(&frame, "Remove"),
+        "one association is the last one: {:?}",
+        texts(&frame)
+    );
+
+    let (frame, _, _) = connected(&facts(), 2);
+    let frame = tick_native(press(&frame, "Account"));
+    assert!(
+        !button_disabled(&frame, "Remove"),
+        "two associations, one is removable: {:?}",
+        texts(&frame)
+    );
+}
+
+/// The rail tabs the settings cards link to leave as the one `tab` intent —
+/// the view never opens another tab itself.
+#[test]
+fn a_link_to_another_tab_leaves_as_an_intent() {
+    let (frame, _, _) = connected(&facts(), 2);
+    let frame = tick_native(press(&frame, "Network"));
+    let frame = tick_native(press(&frame, "manage"));
+    let intent = one_intent(&frame);
+    assert_eq!(intent.kind, "settings.tab");
+    assert_eq!(
+        serde_json::from_slice::<Tab>(&intent.payload).expect("decodes"),
+        Tab {
+            tab: "members".into()
+        }
+    );
 }

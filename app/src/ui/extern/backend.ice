@@ -227,7 +227,6 @@ extern crate::backend
   pure files_write_gate(dir:str, me:str) -> str
   files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure plural(count:i64, one:&str, many:&str) -> str
   pure reading_pair(left:&str, right:&str) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
@@ -249,8 +248,7 @@ extern crate::backend
   pure optional_number(value:i64?) -> str
   pure sync_label(phase:&str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
-  AccountKeyRow(scheme:str, pubkey:str, label:str, added_at:i64)
-  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64, key_rows:[AccountKeyRow])
+  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   // the welcome step's two probes, before any console exists: the chain a
   // picked network names (every key consent is chain-scoped), and a test

@@ -637,8 +637,10 @@ async fn newest_program_account(
 }
 
 /// The local account picture: whether the local user key belongs to an
-/// account, and that account's public face. `number` is the decimal account
-/// number — "" when there is none.
+/// account, and that account's public face — what the rail, the bell, the
+/// titlebar and the agents view all read. `number` is the decimal account
+/// number — "" when there is none. The key ASSOCIATIONS are not here: the
+/// settings view reads those for itself through the kernel.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AccountData {
     pub generation: i64,
@@ -646,8 +648,6 @@ pub struct AccountData {
     pub number: String,
     pub name: String,
     pub bio: String,
-    pub keys: i64,
-    pub key_rows: Vec<AccountKeyRow>,
 }
 
 impl AccountData {
@@ -658,36 +658,7 @@ impl AccountData {
             number: String::new(),
             name: String::new(),
             bio: String::new(),
-            keys: 0,
-            key_rows: Vec::new(),
         }
-    }
-}
-
-/// One key association as the settings card lists it: the scheme token the
-/// CLI prints, the hex key, the label ("" when none) and the admission time.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct AccountKeyRow {
-    pub scheme: String,
-    pub pubkey: String,
-    pub label: String,
-    pub added_at: i64,
-}
-
-fn key_row(key: identity::KeyView) -> AccountKeyRow {
-    AccountKeyRow {
-        scheme: scheme_token(key.scheme).to_string(),
-        pubkey: hex_encode(&key.pubkey),
-        label: key.label.unwrap_or_default(),
-        added_at: i64::try_from(key.added_at).unwrap_or(i64::MAX),
-    }
-}
-
-fn scheme_token(scheme: identity::KeyScheme) -> &'static str {
-    match scheme {
-        identity::KeyScheme::Ed25519 => "ed25519",
-        identity::KeyScheme::Secp256k1 => "secp256k1",
-        identity::KeyScheme::Secp256r1 => "secp256r1",
     }
 }
 
@@ -719,8 +690,6 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             number: account.number.to_string(),
             name: account.name,
             bio: account.bio.unwrap_or_default(),
-            keys: count_i64(account.keys.len()),
-            key_rows: account.keys.into_iter().map(key_row).collect(),
         })
     }
     .await
