@@ -410,11 +410,6 @@ on network_entered
   invalidate lane=block_threads
   invalidate lane=block_comments
   invalidate lane=live_resync
-  invalidate lane=forge_load
-  invalidate lane=forge_live
-  invalidate lane=forge_repo
-  invalidate lane=forge_item
-  invalidate lane=forge_discussion
   invalidate lane=files_preview
   invalidate lane=page_autosave
   wall_now = current_wall_seconds()
@@ -529,40 +524,11 @@ on network_entered
   palette_chat_hits = []
   palette_page_hits = []
   palette_search_phase = SearchPhase.idle
-  // Forge's open repo, tracker item, code reading and drafts all name
-  // the network being left. The new endpoint may even have the same repo/item
-  // names, so identity strings cannot make any of these safe to retain.
-  forge_generation = forge_generation + 1
-  forge_list_phase = ForgePhase.idle
-  forge_repos = []
-  forge_repo = ""
-  forge_repo_phase = ForgePhase.idle
-  forge_tree_branch = ""
-  forge_branches = []
-  forge_items = []
-  forge_item_number = 0
-  forge_item_phase = ForgePhase.idle
-  forge_item_diff = ""
-  forge_item_channel = ""
-  forge_comment_staged = []
-  forge_drafts_cleared = forge_drafts_cleared + 1
-  forge_drafts_scope = "item"
-  forge_tree_path = ""
-  forge_tree_rev = ""
-  forge_tree_entries = []
-  forge_tree_born = false
-  forge_tree_truncated = false
-  forge_tree_phase = ForgeTreePhase.loading
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_note = ""
-  forge_opened_dir = ""
-  forge_opened_rev = ""
-  forge_file_phase = ForgeFilePhase.idle
-  forge_merge_conflicts = []
-  forge_discussion = []
-  forge_discussion_members = []
-  forge_discussion_pending = ""
+  // The forge view holds its own screen and re-reads it when the endpoint
+  // moves; what the app clears is the link it last routed there, which names
+  // the network being left.
+  forge_note_pending = ""
+  forge_link = ""
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the

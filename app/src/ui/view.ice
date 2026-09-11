@@ -214,13 +214,15 @@ view
           // account; every write comes back as an intent the roster handler
           // signs
           extern agents_view(dark, connected, agents_answered, account_number, agents_committed, agents_rows, agents_runs, agents_open_run, agents_opened, agents_journal, live_run_for(live_agents, agents_open_run), agents_capabilities) #agents -> agents_view_event _
-        // Forge is a MODULE-OWNED VIEW: the register, the open repo and item,
-        // the code browse's listing and file, and the discussion go in as
-        // props; every act comes back as an intent the handler signs. The
-        // note composer is a host surface the view leaves a slot for — the
-        // chat composer over the item's channel — so its words stay here.
+        // Forge is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session facts
+        // go in — the network's name and chain id, the endpoint, and the
+        // `duck://forge/...` the open plane routed here — and the view reads
+        // its repos, tracker, patches, reviews, discussion and code browse
+        // itself, writing through `op.submit`. What comes back is a
+        // clipboard write, a link to open, or a note written in the host
+        // composer it docked over the item's own channel.
         forge:
-          extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_repos, forge_list_phase, forge_repo, forge_repo_phase, forge_branches, forge_tree_branch(forge_branches, forge_tree_branch, forge_tree_rev), forge_tab, forge_items, forge_item_number, forge_item_phase, forge_item_kind, forge_item_title, forge_item_state, forge_item_author, forge_item_branches, forge_item_body, forge_item_blocks, forge_item_files_changed, forge_item_additions, forge_item_deletions, forge_item_diff, forge_item_diff_truncated, forge_item_merge_oid, forge_item_source_oid, forge_item_approvals, forge_item_change_requests, forge_item_reviews, forge_merge_conflicts, forge_merge_busy, forge_review_verdict, forge_review_busy, forge_comment_staged, forge_discussion, forge_linked_note, forge_landed_seq, forge_landed_tick, forge_tree_path, forge_tree_rev, forge_tree_entries, forge_tree_born, forge_tree_truncated, forge_tree_phase, forge_file_path, forge_file_text, forge_file_binary, forge_file_truncated, forge_file_picture, forge_file_width, forge_file_height, forge_file_note, forge_file_header(forge_opened_dir, forge_opened_rev, forge_tree_path, forge_tree_rev, forge_file_path), forge_file_phase, forge_drafts_cleared, forge_drafts_scope, composer_scope(connected_rpc, forge_item_channel), (loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending))) #forge -> forge_view_event _
+          extern forge_view(dark, connected, network_name, account_bio, member_tier(members_rows), network_chain_id, connected_rpc, forge_link, forge_link_tick) #forge -> forge_view_event _
         // Approvals is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
         // facts go in, the view reads its own register and writes through
         // `op.submit` (signed with the seated key), and the one event back

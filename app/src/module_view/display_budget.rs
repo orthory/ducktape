@@ -63,34 +63,6 @@ fn shorten_record(value: &mut Value) -> bool {
     }
 }
 
-/// The production Forge encoder. The landing note and newest discussion get
-/// first claim around the item body, then the other lists. Omitted rows are counted.
-pub(super) fn forge(mut props: Value) -> Vec<u8> {
-    props["has_staged_comments"] = props["staged_comments"]
-        .as_array()
-        .is_some_and(|rows| !rows.is_empty())
-        .into();
-    props["has_merge_conflicts"] = props["merge_conflicts"]
-        .as_array()
-        .is_some_and(|rows| !rows.is_empty())
-        .into();
-    let arrays = [
-        "linked_note",
-        "forge_item_blocks",
-        "discussion",
-        "diff_rows",
-        "staged_comments",
-        "forge_item_reviews",
-        "repos",
-        "items",
-        "branches",
-        "merge_conflicts",
-        "tree_entries",
-    ];
-    project(&mut props, &arrays, &["forge_item_body"], "file_text");
-    serde_json::to_vec(&props).expect("forge props encode")
-}
-
 /// The read remains the edit seed. Only its separate preview crosses as a
 /// rendered Surface argument, and display clipping never changes read status.
 pub(super) fn files(mut props: Value) -> Vec<u8> {
@@ -134,37 +106,20 @@ fn project(props: &mut Value, arrays: &[&str], source_fields: &[&str], preview: 
     let mut shortened = prefix(&mut text, left.saturating_sub(64) / 8);
     left = left.saturating_sub(charge(&text));
     props[preview] = text;
-    for (key, mut rows) in pending {
-        let newest = key == "discussion";
-        if newest {
-            rows.reverse();
-        }
+    for (key, rows) in pending {
         let mut kept = Vec::new();
-        // An item body must leave a share for the newest discussion below it.
-        let mut section_left = if key == "forge_item_blocks" {
-            left / 2
-        } else {
-            left
-        };
         let mut exhausted = false;
         for mut row in rows {
             let cut = shorten_record(&mut row);
             let cost = charge(&row);
-            if exhausted || cost > section_left {
+            if exhausted || cost > left {
                 omitted = omitted.saturating_add(1);
                 exhausted = true;
-                if newest {
-                    props["discussion_clipped"] = true.into();
-                }
             } else {
                 left -= cost;
-                section_left -= cost;
                 shortened |= cut;
                 kept.push(row);
             }
-        }
-        if newest {
-            kept.reverse();
         }
         props[key] = kept.into();
     }
@@ -194,22 +149,20 @@ mod tests {
         assert!(result["preview_display_text"].as_str().unwrap().len() < source.len());
     }
 
+    /// A listing that outruns the budget keeps its head and counts the rest.
     #[test]
-    fn counted_omissions_keep_the_newest_contiguous_tail() {
+    fn counted_omissions_keep_what_fits_and_count_the_rest() {
         let rows: Vec<_> = (0..100)
-            .map(|n| json!({"id": n, "body": "note".repeat(700)}))
+            .map(|n| json!({"key": n, "text": "note".repeat(700)}))
             .collect();
         let result: Value =
-            serde_json::from_slice(&forge(json!({"discussion": rows, "file_text": ""}))).unwrap();
-        let kept = result["discussion"].as_array().unwrap();
-        assert_eq!(kept.last().unwrap()["id"], 99);
-        let first = kept.first().unwrap()["id"].as_i64().unwrap();
-        assert_eq!(result["display_omitted"], first);
-        assert!(first > 0);
-        assert_eq!(result["discussion_clipped"], true);
-        for (offset, row) in kept.iter().enumerate() {
-            assert_eq!(row["id"], first + offset as i64);
-        }
+            serde_json::from_slice(&files(json!({"entries": rows, "preview_text": ""}))).unwrap();
+        let kept = result["entries"].as_array().unwrap();
+        assert_eq!(kept.first().unwrap()["key"], 0);
+        let omitted = result["display_omitted"].as_i64().unwrap();
+        assert!(omitted > 0);
+        assert_eq!(kept.len() as i64 + omitted, 100);
+        assert_eq!(result["display_shortened"], true);
     }
 
     #[test]

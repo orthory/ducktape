@@ -237,7 +237,7 @@ async fn files_picture(
         return Ok(binary_preview(generation, path, note));
     };
     let size = bytes.len();
-    match store_picture(FILES_SURFACE, path.clone(), bytes).await {
+    match store_picture(FILES_SURFACE.to_owned(), path.clone(), bytes).await {
         Ok((width, height)) => Ok(FsPreview {
             base_snapshot: String::new(),
             generation,

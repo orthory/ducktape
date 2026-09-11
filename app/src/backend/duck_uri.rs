@@ -415,26 +415,6 @@ pub async fn duck_echo_f64(value: f64) -> Result<f64, AppError> {
     Ok(value)
 }
 
-/// Which second step a forge deep link still owes once its repo is open.
-pub fn forge_focus_kind(number: i64, path: String) -> crate::ForgeFocus {
-    let item = number > 0;
-    let blob = !path.is_empty();
-    match (item, blob) {
-        (true, _) => crate::ForgeFocus::Item,
-        (false, true) => crate::ForgeFocus::Blob,
-        (false, false) => crate::ForgeFocus::Idle,
-    }
-}
-
-/// The Discussion note a `#seq` deep link landed on, if it is in the loaded
-/// discussion — drawn once above the list by the forge item page.
-pub fn linked_note(discussion: Vec<super::ChatMessage>, focus: i64) -> Option<super::ChatMessage> {
-    if focus <= 0 {
-        return None;
-    }
-    discussion.into_iter().find(|note| note.seq == focus)
-}
-
 use super::AppError;
 
 #[cfg(test)]
@@ -734,18 +714,6 @@ mod tests {
         assert!(
             foreign_network_error("aaaaaaaa".into(), String::new()).contains("no network"),
             "an unconnected app still names where it is"
-        );
-    }
-
-    #[test]
-    fn the_second_forge_step_is_the_item_else_the_blob_else_nothing() {
-        assert_eq!(forge_focus_kind(0, String::new()), crate::ForgeFocus::Idle);
-        assert_eq!(forge_focus_kind(7, String::new()), crate::ForgeFocus::Item);
-        assert_eq!(forge_focus_kind(0, "a.png".into()), crate::ForgeFocus::Blob);
-        assert_eq!(
-            forge_focus_kind(7, "a.png".into()),
-            crate::ForgeFocus::Item,
-            "a number wins"
         );
     }
 }

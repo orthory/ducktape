@@ -26,8 +26,6 @@ pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PICTURE_SIDE: u32 = 2048;
 /// The Files preview's slot.
 pub const FILES_SURFACE: &str = "files";
-/// The forge reader's slot.
-pub const FORGE_SURFACE: &str = "forge";
 /// How many of a Markdown document's in-repo pictures the loader fetches, in
 /// document order. ponytail: the rest keep their alt text; page them lazily
 /// if a README ever carries more.
@@ -164,9 +162,11 @@ fn decode_raster(bytes: &[u8]) -> Result<Picture, String> {
     })
 }
 
-/// surface → (path, picture). One slot per surface.
-fn store() -> &'static Mutex<HashMap<&'static str, (String, Picture)>> {
-    static STORE: OnceLock<Mutex<HashMap<&'static str, (String, Picture)>>> = OnceLock::new();
+/// surface → (path, picture). One slot per surface. The surface is a
+/// runtime name because the view that parks a picture names it over the
+/// kernel's `picture.put` door, not from a constant in this binary.
+fn store() -> &'static Mutex<HashMap<String, (String, Picture)>> {
+    static STORE: OnceLock<Mutex<HashMap<String, (String, Picture)>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -180,19 +180,19 @@ pub async fn decode_off_thread(bytes: Vec<u8>) -> Result<Picture, String> {
 /// Decode off the runtime and park the result under `surface`, replacing
 /// whatever that surface held. Returns the drawn `(width, height)`.
 pub async fn store_picture(
-    surface: &'static str,
+    surface: String,
     path: String,
     bytes: Vec<u8>,
-) -> Result<(u32, u32), String> {
+) -> Result<(i64, i64), String> {
     let decoded = decode_off_thread(bytes).await?;
-    let dimensions = (decoded.width, decoded.height);
+    let dimensions = (i64::from(decoded.width), i64::from(decoded.height));
     park_picture(surface, path, decoded);
     Ok(dimensions)
 }
 
 /// Park one decoded picture under `surface` as `path`'s, replacing whatever
 /// the surface held. The one writer to the store.
-pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture) {
+pub(crate) fn park_picture(surface: String, path: String, picture: Picture) {
     store()
         .lock()
         .expect("picture store")
@@ -490,13 +490,13 @@ mod tests {
             .build()
             .expect("runtime");
         let dims = runtime
-            .block_on(store_picture("test", "a.png".into(), png(4, 4)))
+            .block_on(store_picture("test".into(), "a.png".into(), png(4, 4)))
             .expect("stored");
         assert_eq!(dims, (4, 4));
         assert!(stored_picture("test", "a.png").is_some());
         assert!(stored_picture("test", "b.png").is_none(), "a stale slot never draws under a new path");
         runtime
-            .block_on(store_picture("test", "b.png".into(), png(2, 2)))
+            .block_on(store_picture("test".into(), "b.png".into(), png(2, 2)))
             .expect("stored");
         assert!(stored_picture("test", "a.png").is_none(), "one slot per surface");
         assert_eq!(stored_picture("test", "b.png").map(|p| p.width), Some(2));

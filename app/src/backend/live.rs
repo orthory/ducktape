@@ -1,6 +1,5 @@
 use super::*;
 use ::chat;
-use ::forge;
 use identity::{AccountView, IdentityQuery, IdentityReply};
 
 /// One UI publication may carry at most this many consecutive chat deltas.
@@ -377,7 +376,6 @@ pub struct ChatLiveFold {
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
     pub post_refusal: String,
-    pub forge_discussion: Vec<ChatMessage>,
     /// A huddle roster change in the active channel needs the canonical roster
     /// read that a delta cannot derive.
     pub refresh_chat: bool,
@@ -388,10 +386,8 @@ struct ChatFoldState {
     messages: Vec<ChatMessage>,
     thread_messages: Vec<ChatMessage>,
     channel_members: Vec<ChatMember>,
-    forge_discussion: Vec<ChatMessage>,
     active_channel: String,
     active_thread_seq: i64,
-    forge_item_channel: String,
     history_view: bool,
     messages_changed: bool,
     thread_messages_changed: bool,
@@ -444,13 +440,6 @@ fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64, message:
             message.clone(),
         );
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_posted_message(
-            std::mem::take(&mut state.forge_discussion),
-            message,
-        );
-    }
 }
 
 fn fold_reply(
@@ -479,11 +468,6 @@ fn fold_reply(
             chat::client::bump_reply_summary(std::mem::take(&mut state.thread_messages), root_seq);
         state.thread_messages = chat::client::merge_thread_reply(thread, message);
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion =
-            chat::client::bump_reply_summary(std::mem::take(&mut state.forge_discussion), root_seq);
-    }
 }
 
 fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
@@ -502,14 +486,6 @@ fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message:
             &message,
         );
     }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_message_edit(
-            std::mem::take(&mut state.forge_discussion),
-            seq,
-            &message,
-        );
-    }
 }
 
 fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
@@ -523,11 +499,6 @@ fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
         state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
         state.thread_messages =
             chat::client::tombstone_message(std::mem::take(&mut state.thread_messages), seq);
-    }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion =
-            chat::client::tombstone_message(std::mem::take(&mut state.forge_discussion), seq);
     }
 }
 
@@ -558,17 +529,6 @@ fn fold_reaction(
         state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
         state.thread_messages = chat::client::merge_message_reaction(
             std::mem::take(&mut state.thread_messages),
-            seq,
-            &emoji,
-            added,
-            &reactor,
-            by_me,
-        );
-    }
-    let updates_forge_discussion = channel_id == state.forge_item_channel;
-    if updates_forge_discussion {
-        state.forge_discussion = chat::client::merge_message_reaction(
-            std::mem::take(&mut state.forge_discussion),
             seq,
             &emoji,
             added,
@@ -622,8 +582,6 @@ pub fn fold_live_chat(
     mut active_channel_name: String,
     mut active_channel_archived: bool,
     mut active_channel_members_only: bool,
-    forge_discussion: Vec<ChatMessage>,
-    forge_item_channel: String,
     selected_message_seq: i64,
     selected_message_rev: i64,
     message_action: crate::MessageAction,
@@ -641,10 +599,8 @@ pub fn fold_live_chat(
         messages,
         thread_messages,
         channel_members,
-        forge_discussion,
         active_channel,
         active_thread_seq,
-        forge_item_channel,
         history_view,
         messages_changed: false,
         thread_messages_changed: false,
@@ -704,7 +660,6 @@ pub fn fold_live_chat(
         messages,
         thread_messages,
         channel_members,
-        forge_discussion,
         active_channel,
         history_view,
         messages_changed,
@@ -810,7 +765,6 @@ pub fn fold_live_chat(
         active_channel_archived,
         active_channel_members_only,
         post_refusal,
-        forge_discussion,
         refresh_chat,
     }
 }
@@ -900,7 +854,6 @@ pub(crate) async fn folded_update(
                 chat: vec![delta],
                 pages: PagesDelta::default(),
                 bell: BellDelta::default(),
-                forge: ForgeRefresh::default(),
                 permit: LivePermit::default(),
             })
         }
@@ -930,7 +883,6 @@ pub(crate) async fn folded_update(
                     chat: Vec::new(),
                     pages: PagesDelta::default(),
                     bell,
-                    forge: ForgeRefresh::default(),
                     permit: LivePermit::default(),
                 }),
                 Ok(None) => None,
@@ -960,30 +912,10 @@ pub(crate) async fn folded_update(
                     chat: Vec::new(),
                     pages: delta,
                     bell: BellDelta::default(),
-                    forge: ForgeRefresh::default(),
                     permit: LivePermit::default(),
                 })
             }
             Err(_) => Some(live_resync("pages", height)),
-        },
-        "forge" => match forge::client::refresh_from_op(&payload) {
-            Ok(refresh) => Some(LiveUpdate {
-                kind: crate::LiveKind::Forge,
-                status: format!("Live · block {height}"),
-                height,
-                module: "forge".into(),
-                load_chat: false,
-                load_pages: false,
-                // pushes arrive in bursts (one op per ref batch, then the
-                // tracker follow-ups) — coalesce the reloads like pages does.
-                debounce: true,
-                chat: Vec::new(),
-                pages: PagesDelta::default(),
-                bell: BellDelta::default(),
-                forge: refresh,
-                permit: LivePermit::default(),
-            }),
-            Err(_) => Some(live_resync("forge", height)),
         },
         // THE RELOAD PLANES. No client fold exists for these modules and none
         // is worth writing: a validator set changes when someone joins, a
@@ -997,7 +929,10 @@ pub(crate) async fn folded_update(
         // nothing at all on a block that does not touch them.
         //
         // Model configuration and run activity both refresh the Agents view.
-        "valset" | "governance" | "identity" | "agent" | "runs" | "files" => {
+        // `forge` is here because the app holds no forge state at all: the
+        // plane arm is what tells a module view's `rpc.live` subscription,
+        // and the forge view re-reads exactly what it has open.
+        "valset" | "governance" | "identity" | "agent" | "runs" | "files" | "forge" => {
             Some(live_plane(module, height))
         }
         _ => None,
@@ -1572,14 +1507,6 @@ pub fn keep_folded_block_texts(
 
 pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
     if loaded { next } else { current }.to_owned()
-}
-
-pub fn keep_forge_phase(
-    loaded: bool,
-    next: crate::ForgePhase,
-    current: crate::ForgePhase,
-) -> crate::ForgePhase {
-    if loaded { next } else { current }
 }
 
 pub fn keep_bool(loaded: bool, next: bool, current: bool) -> bool {
