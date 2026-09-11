@@ -6,7 +6,9 @@ ice=$1
 shift
 repo=$(pwd -P)
 cargo_home=$(cd "${CARGO_HOME:-$HOME/.cargo}" && pwd -P)
-rustup_home=$(cd "${RUSTUP_HOME:-$HOME/.rustup}" && pwd -P)
+# A toolchain installed without rustup (the agent guest's /opt/rust) has no
+# rustup home; its sysroot is the prefix rust's own paths live under.
+rustup_home=$(cd "${RUSTUP_HOME:-$HOME/.rustup}" 2>/dev/null && pwd -P || rustc --print sysroot)
 view_target=${CARGO_TARGET_DIR:-$repo/target}
 mkdir -p "$view_target"
 view_target=$(cd "$view_target" && pwd -P)
