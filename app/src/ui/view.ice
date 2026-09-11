@@ -206,7 +206,7 @@ view
         // the rows on hand describe the path in the crumb (`listed`) is
         // computed here, once.
         files:
-          extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes, connected_rpc, network_chain_id, connect_generation, fs_preview_base, fs_save_reply) #files -> files_view_event _
+          extern files_view(dark, connected, network_chain_id) #files -> files_view_event _
         members:
           extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
         agents:

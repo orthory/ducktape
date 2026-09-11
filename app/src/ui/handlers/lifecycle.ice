@@ -45,13 +45,6 @@ on desktop_notifications_saved(_written)
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering)
-  fs_generation = fs_generation + 1
-  fs_preview_path = ""
-  fs_preview_entry = no_fs_entry()
-  fs_preview_text = ""
-  fs_preview_base = ""
-  fs_write_pending = ""
-  fs_loading = false
   invalidate lane=account_ceremony
   invalidate lane=account_desktop_ceremony
   account_busy = account_busy && empty(account_ceremony_phase)
@@ -70,7 +63,6 @@ on reconnect
   invalidate lane=block_threads
   invalidate lane=block_comments
   invalidate lane=live_resync
-  invalidate lane=files_preview
   invalidate lane=page_autosave
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   hydration_generation = hydration_generation + 1
@@ -256,7 +248,6 @@ on workspace_connected(next)
   explorer_partial = ""
   explorer_searching = false
   explorer_sent_query = ""
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   agents_generation = agents_generation + 1
   // A DRAWN READING SURVIVES A SWITCH UNLESS SOMETHING DROPS IT. The scope
@@ -277,7 +268,6 @@ on workspace_connected(next)
     run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
     run replace lane=bell_load load_bell(connected_rpc, account_number) -> bell_loaded connect_generation account_number _ | bell_failed connect_generation account_number _
     run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
-    run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     flow
@@ -394,7 +384,6 @@ on live_updated(next)
       account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
       dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
       agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
-      fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
       parallel
         flow
           from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
@@ -419,10 +408,6 @@ on live_updated(next)
           from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
           try request -> done request
           done -> agents_load_selected _
-        flow
-          from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-          try request -> done request
-          done -> files_list_selected _
     LiveKind.resync
       return if !next.load_chat && !next.load_pages && !forge_live_hit(next.kind, next.module)
       hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
@@ -784,7 +769,6 @@ on select_shell_tab(next)
   thread_message_action = close_message_action(moved, thread_message_action)
   thread_edit_draft = keep_str(moved, "", thread_edit_draft)
   page_delete_armed = page_delete_armed && !moved
-  fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
@@ -795,7 +779,6 @@ on select_shell_tab(next)
   return if !connected
   return if shell_tab == ShellTab.chat || shell_tab == ShellTab.pages
   explorer_generation = explorer_generation + 1
-  fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
   // `run replace lane=agents_load` aborts work still running on the lane, but
@@ -821,7 +804,6 @@ on select_shell_tab(next)
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == ShellTab.explorer
-  fs_loading = shell_tab == ShellTab.files
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
@@ -830,14 +812,6 @@ on select_shell_tab(next)
       from done load_request(shell_tab == ShellTab.explorer, connected_rpc, "", explorer_generation)
       try request -> done request
       done -> explorer_load_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-      try request -> done request
-      done -> files_list_selected _
-    flow
-      from done load_request(shell_tab == ShellTab.files, connected_rpc, "", fs_generation)
-      try request -> done request
-      done -> files_history_selected _
     flow
       from done load_request(tab_reads_plane(shell_tab, "members"), connected_rpc, "", members_generation)
       try request -> done request
@@ -872,18 +846,6 @@ on explorer_load_selected(request)
   let unmounted = shell_tab != ShellTab.explorer
   return if obsolete_request || unmounted
   run replace lane=explorer_load load_explorer(request.rpc, request.generation) -> explorer_loaded _ | explorer_failed _
-
-on files_list_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_list files_ls(request.rpc, request.key, request.generation) -> fs_listed _ | fs_failed _
-
-on files_history_selected(request)
-  let obsolete_request = request.rpc != connected_rpc || request.generation != fs_generation
-  let unmounted = shell_tab != ShellTab.files
-  return if obsolete_request || unmounted
-  run replace lane=files_history files_history(request.rpc, request.generation) -> fs_history_loaded _ | fs_failed _
 
 on members_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != members_generation
@@ -984,7 +946,7 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target)) -> global_key_pressed _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed)) -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows: a close just unregisters the slot (below).
   // The process leaves only when someone says so — the tray's Quit, or ⌘Q.

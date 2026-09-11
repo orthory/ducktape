@@ -1,27 +1,6 @@
 state
-  // `fs_path` is requested immediately; `fs_listed_path` names the rows that
-  // have actually landed, so navigation never presents stale rows as current.
-  fs_path = "/shared"
-  fs_listed_path = ""
-  fs_entries:[FsEntry] = []
-  fs_generation:i64 = 0
-  fs_loading = false
-  fs_preview_path = ""
-  fs_preview_entry:FsEntry = no_fs_entry()
-  fs_preview_text = ""
-  fs_preview_base = ""
-  fs_write_pending = ""
-  fs_save_reply:FsSaveHistory = no_fs_save_reply()
-  fs_preview_truncated = false
-  fs_preview_binary = false
-  fs_preview_picture = false
-  fs_preview_width:i64 = 0
-  fs_preview_height:i64 = 0
-  // A `duck://files` deep link's file, opened once its directory is listed.
-  fs_focus_path = ""
-  fs_history:[FsSnapshot] = []
-  fs_delete_target = ""
-  // one per committed write: the view clears the name draft it consumed
-  fs_writes:i64 = 0
-  fs_diff_from = ""
-  fs_diff:[FsDiffEntry] = []
+  // Where a file DROPPED on the window lands: the directory the files view
+  // last said it was standing in. The browser's own path, listing, preview,
+  // history and drafts are the view's — the app holds none of them.
+  fs_drop_dir = "/shared"
+  fs_dropping = false

@@ -570,7 +570,6 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "run every open_external_url(url)",
         "-> open_page_search_hit(_, link.block)",
         "-> open_run_panel _",
-        "-> fs_open_dir _",
         "-> forge_open_repo _",
         "-> choose_channel _",
         "-> open_chat_search_hit(_, link.seq, link.seq)",
@@ -584,6 +583,22 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         !open.contains("run replace"),
         "the open plane owns no lane of its own"
+    );
+    // THE FILES ARM MOVES THE TAB AND NOTHING ELSE. The browser's directory
+    // is the files VIEW's own state, and the kernel contract has no way for
+    // the app to hand a mounted view the route it was opened with, so a
+    // duckfs address lands on the tab rather than on the file.
+    let files_arm = open
+        .split_once("DuckKind.files\n")
+        .expect("the files arm")
+        .1
+        .split_once("    DuckKind.")
+        .expect("the next arm follows")
+        .0;
+    assert!(files_arm.contains("shell_tab = ShellTab.files"));
+    assert!(
+        !files_arm.contains("link.path"),
+        "a files address names no navigation the view would have to take"
     );
     // A CHAT ADDRESS LANDS ON THE CHAT TAB. `choose_channel` is the sidebar's
     // own click and moves no tab, so the channel arm moves it first; the

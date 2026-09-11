@@ -980,8 +980,11 @@ on open_message_link(url)
       flow
         from done link.dispatch
         done -> open_run_panel _
+    // The Files tab opens; the PATH inside it does not. The browser's
+    // directory is the files view's own state now, and the kernel contract
+    // has no way for the app to hand a mounted view the route it was opened
+    // with — until it does, a duckfs link lands on the tab, not the file.
     DuckKind.files
-      fs_focus_path = link.path
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)
@@ -990,7 +993,6 @@ on open_message_link(url)
       account_ceremony_detail = ""
       account_ceremony_left = ""
       shell_tab = ShellTab.files
-      run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
     DuckKind.forge_repo
       forge_focus_number = 0
       forge_focus_path = ""
