@@ -1,70 +1,129 @@
-//! The roster the host pushes is what the screen shows; a row opens its
-//! record, and the record's writes leave as intents.
+//! The view driven natively through the wire: the kernel pushes session
+//! facts, the view reads the roster itself through `rpc.status`,
+//! `rpc.peers` and `rpc.query`, re-reads it on every `rpc.live` hit for the
+//! valset plane, and a press leaves as `op.submit` carrying the module
+//! message — or, for the clipboard, as the one intent left.
 
-use members_view::host::{AgentStatus, Copy, MemberRow, MembersProps, Propose};
+use members_view::host::{Copy, Session};
 use members_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, press, texts};
-use ui_lang_guest::wire::Frame;
+use ui_lang_guest::testing::{answer, has_text, item, press, refuse, texts};
+use ui_lang_guest::wire::{Frame, Request};
 
-fn member(key: &str, label: &str, role: &str, is_this_node: bool) -> MemberRow {
-    MemberRow {
-        key: key.into(),
-        label: label.into(),
-        role: role.into(),
-        is_this_node,
-        is_agent: role == "agent",
-        model: if role == "agent" {
-            "review".into()
-        } else {
-            String::new()
-        },
-        live: true,
-    }
+/// This node's key, as the node reports it and the valset lists it.
+const THIS_NODE: &str = "01020304";
+/// The resident's key: a live peer, and the ballot's subject.
+const RESIDENT: &str = "05060708";
+/// The height the roster is read at — the ballot's proposal id carries it.
+const HEIGHT: i64 = 42;
+
+fn boot() -> Frame {
+    boot_native();
+    tick_native(Vec::new())
 }
 
-fn roster(rows: Vec<MemberRow>, admin: bool) -> Vec<u8> {
-    serde_json::to_vec(&MembersProps {
-        rows,
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
+}
+
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
+}
+
+fn session(connected: bool, admin: bool) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected,
         admin,
-        connected: true,
-        answered: true,
         dark: false,
     })
-    .expect("props encode")
+    .expect("session encodes")
 }
 
-fn three() -> Vec<MemberRow> {
-    vec![
-        member("val-1", "Ada", "validator", true),
-        member("res-1", "Bo", "resident", false),
-        member("reviewer-bot", "Reviewer Bot", "agent", false),
-    ]
+fn json(value: serde_json::Value) -> Vec<u8> {
+    value.to_string().into_bytes()
 }
 
-/// Boot, push `rows`, and open the record for `label`.
-fn opened(rows: Vec<MemberRow>, admin: bool, label: &str) -> Frame {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests[0].kind, "members.props");
-    assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &roster(rows, admin))]);
+/// Boots, connects, and answers the whole roster read: the frame with the
+/// roster on screen, and the id of the live subscription.
+fn connected_roster(admin: bool) -> (Frame, u64) {
+    let frame = boot();
+    let session_id = request(&frame, "members.props").id;
+    let frame = tick_native(vec![item(session_id, &session(true, admin))]);
+    let live = request(&frame, "rpc.live").id;
+
+    let status = request(&frame, "rpc.status").id;
+    let frame = tick_native(vec![answer(
+        status,
+        &json(serde_json::json!({ "public_key": THIS_NODE, "height": HEIGHT })),
+    )]);
+
+    let peers = request(&frame, "rpc.peers").id;
+    let frame = tick_native(vec![answer(
+        peers,
+        &json(serde_json::json!({ "peers": [{ "connected": true, "peer": RESIDENT }] })),
+    )]);
+
+    let validators = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(
+        validators,
+        &json(serde_json::json!({ "validators": [[1, 2, 3, 4]] })),
+    )]);
+
+    let residents = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(
+        residents,
+        &json(serde_json::json!({ "residents": [[5, 6, 7, 8]] })),
+    )]);
+
+    let agents = request(&frame, "rpc.query").id;
+    let frame = tick_native(vec![answer(
+        agents,
+        &json(serde_json::json!({ "model": { "agents": [{
+            "agent_id": "reviewer-bot",
+            "display_name": "Reviewer Bot",
+            "capability": "review",
+            "status": "active"
+        }]}})),
+    )]);
+    (frame, live)
+}
+
+/// Boots connected, then opens the record for `label`.
+fn opened(admin: bool, label: &str) -> Frame {
+    let (frame, _) = connected_roster(admin);
     assert!(has_text(&frame, label), "{:?}", texts(&frame));
     tick_native(press(&frame, label))
 }
 
+/// At boot the view asks for the session only; connected, it reads the
+/// roster itself — the node's key marks this node, the peer sample marks
+/// who is live, and the runs register adds the machines.
 #[test]
-fn the_roster_the_host_pushes_is_what_the_screen_shows_and_the_strip_filters_it() {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &roster(three(), true))]);
+fn a_connected_view_reads_its_own_roster() {
+    let frame = boot();
+    assert_eq!(
+        kinds(&frame.requests),
+        ["members.props"],
+        "only the session at boot: {:?}",
+        frame.requests
+    );
+    assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
+
+    let (frame, _live) = connected_roster(true);
     for expected in [
         "2 humans · 1 agent",
-        "Ada",
+        THIS_NODE,
         "this node",
+        RESIDENT,
         "VALIDATOR",
         "RESIDENT",
+        "Reviewer Bot",
         "AGENT",
     ] {
         assert!(
@@ -73,21 +132,36 @@ fn the_roster_the_host_pushes_is_what_the_screen_shows_and_the_strip_filters_it(
             texts(&frame)
         );
     }
+    assert!(
+        frame.requests.is_empty(),
+        "a folded roster asks the kernel for nothing more: {:?}",
+        frame.requests
+    );
+
     let frame = tick_native(press(&frame, "Show agents only"));
     assert!(has_text(&frame, "Reviewer Bot"), "{:?}", texts(&frame));
-    assert!(!has_text(&frame, "Ada"), "{:?}", texts(&frame));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+    assert!(!has_text(&frame, THIS_NODE), "{:?}", texts(&frame));
 }
 
+/// A valset block re-reads the roster through the live subscription.
+#[test]
+fn a_live_hit_reads_the_roster_again() {
+    let (_, live) = connected_roster(true);
+    let frame = tick_native(vec![item(live, b"{}")]);
+    assert_eq!(
+        kinds(&frame.requests),
+        ["rpc.status"],
+        "{:?}",
+        frame.requests
+    );
+}
+
+/// This node's record offers its key, which leaves as the clipboard intent
+/// — the one door the kernel has not opened.
 #[test]
 fn this_nodes_record_offers_its_key_which_leaves_as_a_copy() {
-    let frame = opened(three(), true, "Ada");
+    let frame = opened(true, THIS_NODE);
     assert!(has_text(&frame, "public key"), "{:?}", texts(&frame));
-    assert!(
-        !has_text(&frame, "Remove from the validator set"),
-        "{:?}",
-        texts(&frame)
-    );
     let frame = tick_native(press(&frame, "Copy this node's key"));
     let [intent] = frame.requests.as_slice() else {
         panic!("one intent, got {:?}", frame.requests);
@@ -96,48 +170,67 @@ fn this_nodes_record_offers_its_key_which_leaves_as_a_copy() {
     assert_eq!(
         serde_json::from_slice::<Copy>(&intent.payload).expect("decodes"),
         Copy {
-            text: "val-1".into(),
+            text: THIS_NODE.into(),
             label: "Node key copied".into()
         }
     );
 }
 
+/// An agent's pause leaves as `op.submit` carrying the runs message, and
+/// the record waits for the kernel's answer before it offers another.
 #[test]
-fn an_agents_record_pauses_it_by_registry_id() {
-    let frame = opened(three(), true, "Reviewer Bot");
+fn a_pause_leaves_as_a_signed_runs_op() {
+    let frame = opened(true, "Reviewer Bot");
     assert!(has_text(&frame, "agent id"), "{:?}", texts(&frame));
-    assert!(has_text(&frame, "active"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "Pause agent"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
+    let [submit] = frame.requests.as_slice() else {
+        panic!("one op after Pause, got {:?}", frame.requests);
     };
-    assert_eq!(intent.kind, "members.agent_status");
+    assert_eq!(submit.kind, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<AgentStatus>(&intent.payload).expect("decodes"),
-        AgentStatus {
-            agent_id: "reviewer-bot".into(),
-            paused: true
-        }
+        op,
+        serde_json::json!({
+            "target": "runs",
+            "payload": { "configure_model": {
+                "operation": { "pause_model": { "agent_id": "reviewer-bot" } }
+            }}
+        })
+    );
+
+    let frame = tick_native(vec![refuse(submit.id, "the local user key is locked")]);
+    assert!(
+        has_text(&frame, "the local user key is locked"),
+        "{:?}",
+        texts(&frame)
     );
 }
 
+/// An admin opens a ballot over a resident: `op.submit` carrying the
+/// governance proposal, its id minted from the height the roster was read
+/// at. A non-admin reads the rule instead.
 #[test]
 fn an_admin_opens_a_ballot_over_a_resident_and_a_non_admin_reads_the_rule() {
-    let frame = opened(three(), true, "Bo");
+    let frame = opened(true, RESIDENT);
     let frame = tick_native(press(&frame, "Promote to validator"));
-    let [intent] = frame.requests.as_slice() else {
-        panic!("one intent, got {:?}", frame.requests);
+    let [submit] = frame.requests.as_slice() else {
+        panic!("one op after the ballot, got {:?}", frame.requests);
     };
-    assert_eq!(intent.kind, "members.propose");
+    assert_eq!(submit.kind, "op.submit");
+    let op: serde_json::Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<Propose>(&intent.payload).expect("decodes"),
-        Propose {
-            action: "add_validator".into(),
-            key: "res-1".into()
-        }
+        op,
+        serde_json::json!({
+            "target": "governance",
+            "payload": { "propose": {
+                "proposal_id": format!("proposal-{HEIGHT}-{RESIDENT}"),
+                "action": { "add_validator": { "key": [5, 6, 7, 8] } },
+                "voting_period": 1_000_000
+            }}
+        })
     );
 
-    let frame = opened(three(), false, "Bo");
+    let frame = opened(false, RESIDENT);
     assert!(
         !has_text(&frame, "Promote to validator"),
         "{:?}",

@@ -5,8 +5,6 @@ state
   members_generation:i64 = 0
   // the Approvals tab badge, as the governance view last reported it
   gov_open:i64 = 0
-  // the membership ballot the Members view opened, while its write is out
-  gov_voting = ""
   agents_rows:[AgentRow] = []
   agents_generation:i64 = 0
   // the run tracker: every run the journal lists, the run the reader has
