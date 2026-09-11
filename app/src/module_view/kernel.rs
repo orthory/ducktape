@@ -19,6 +19,8 @@
 //! - `files.get` `{lane, params}` — one `/v1/files/<lane>` read with its
 //!   query-string params; `blob.get` `{digest, limit}` — a blob by hex
 //!   digest, verified against it.
+//! - `picture.load` `{surface, path}` — a duckfs file paged in, decoded and
+//!   parked in a host picture surface's slot; answered with its drawn size.
 //! - `files.stage` `<raw bytes>` / `blob.put` `<raw bytes>` — a duckfs
 //!   chunk or a blob landed on the node, proven with the seated key;
 //!   answered with the digest.
@@ -127,6 +129,7 @@ pub(super) fn answer(
         ("rpc", "query_as_reader") => spawn(guest, id, payload, query_as_reader),
         ("files", "get") => spawn(guest, id, payload, files_get),
         ("files", "stage") => spawn_raw(guest, id, payload, files_stage),
+        ("picture", "load") => spawn(guest, id, payload, picture_load),
         ("blob", "get") => spawn(guest, id, payload, blob_get),
         ("blob", "put") => spawn_raw(guest, id, payload, blob_put),
         ("rpc", "live") => {
@@ -268,6 +271,40 @@ fn files_get(
             .await
             .map_err(|error| error.to_string())?;
         serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+/// `picture.load` `{surface, path}` — the whole duckfs file paged in, decoded
+/// off the runtime and parked in a host picture surface's slot, answered with
+/// the size it will be drawn at. The decode and the widget are the host's (a
+/// tree wire carries no pixels), so a view that wants one names the slot it
+/// left and the file to put in it. The two slots are the ones
+/// [`crate::backend::picture`] draws; anything else is refused rather than
+/// growing the store.
+fn picture_load(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    use crate::backend::{FILES_SURFACE, FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    Box::pin(async move {
+        let surface = match ask["surface"].as_str() {
+            Some(FILES_SURFACE) => FILES_SURFACE,
+            Some(FORGE_SURFACE) => FORGE_SURFACE,
+            _ => return Err("`picture.load` names no surface".into()),
+        };
+        let path = ask["path"].as_str().unwrap_or_default().to_owned();
+        let Some(bytes) = crate::backend::files_read_all(&client, &path).await? else {
+            return Err(format!(
+                "picture larger than the {} MiB preview limit",
+                MAX_PICTURE_BYTES >> 20
+            ));
+        };
+        let size = bytes.len();
+        let (width, height) = store_picture(surface, path, bytes)
+            .await
+            .map_err(|reason| format!("{size} binary bytes · did not decode: {reason}"))?;
+        serde_json::to_vec(&serde_json::json!({ "width": width, "height": height }))
+            .map_err(|error| error.to_string())
     })
 }
 
