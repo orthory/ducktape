@@ -1,142 +1,157 @@
-//! The register the host pushes is what the screen shows; a record opens as
-//! an editor for its controller and as a reading for everyone else, and the
-//! only things that leave are the writes the reader asked for.
+//! The view driven natively through the wire: the kernel pushes the session
+//! facts, the view reads the register, the run tracker and one run's journal
+//! for itself through `rpc.query` / `rpc.view`, re-reads them on every
+//! `rpc.live` hit, and a pause or a save leaves as `op.submit`. Only the
+//! three navigation-and-provisioning intents still leave as notifications.
 
-use agents_view::host::{
-    AgentRow, AgentSkill, AgentsProps, Draft, JournalEntry, LiveActivity, LiveRun, OpenLink,
-    OpenRun, RunJournal, RunLink, RunRow, Status,
-};
+use agents_view::host::{Draft, OpenLink, OpenRun, Session};
 use agents_view::{boot_native, tick_native};
-use ui_lang_guest::testing::{has_text, item, pick, press, texts, toggle, type_into};
-use ui_lang_guest::wire::{Frame, Node, Request};
+use serde_json::{Value, json};
+use ui_lang_guest::testing::{
+    answer, has_text, item, pick, press, texts, toggle, type_into,
+};
+use ui_lang_guest::wire::{Event, Frame, Node, Request};
 
 /// Inputs are found by placeholder and pick lists by key.
 const AGENT_ID_HINT: &str = "a-dns-label, e.g. chiefduck";
 const CAPABILITY_PICK: &str = "AgentsView/root/editor/agent-capability";
 
-fn agent(name: &str, status: &str, live: bool) -> AgentRow {
-    AgentRow {
-        id: name.to_lowercase().replace(' ', "-"),
-        name: name.into(),
-        initials: "RB".into(),
-        capability: "review".into(),
-        status: status.into(),
-        owner_handle: "eddy".into(),
-        controller: "7".into(),
-        live,
-        skills: vec![
-            AgentSkill {
-                name: "review".into(),
-                source_prefix: "/shared/skills/review".into(),
-                source_snapshot: String::new(),
-                always: true,
-            },
-            AgentSkill {
-                name: "style".into(),
-                source_prefix: "/shared/skills/style".into(),
-                source_snapshot: String::new(),
-                always: false,
-            },
-            AgentSkill {
-                name: "tests".into(),
-                source_prefix: "/shared/skills/tests".into(),
-                source_snapshot: String::new(),
-                always: false,
-            },
-        ],
-    }
-}
+/// The signing account; `42` is the agent's program account it controls.
+const CONTROLLER: u64 = 7;
 
-fn run(run_id: &str, agent: &str, state: &str) -> RunRow {
-    RunRow {
-        run_id: run_id.into(),
-        dispatch_id: format!("dispatch-of-{}", run_id.replace('\x1f', "-")),
-        agent_id: agent.to_lowercase(),
-        agent_name: agent.into(),
-        origin: "#general · msg 12".into(),
-        state: state.into(),
-        dispatched: "h 84,912".into(),
-        settled: String::new(),
-        attempt: 0,
-        holder: "ab12cd34ef56ab12…".into(),
-        actions: 2,
-        degraded: false,
-        reason: String::new(),
-        output_ref: String::new(),
-        pr_number: 0,
-    }
-}
+// ---------- what the node answers ----------
 
-fn register(rows: Vec<AgentRow>, account: &str, committed: i64) -> Vec<u8> {
-    register_with_runs(
-        rows,
-        Vec::new(),
-        "",
-        0,
-        RunJournal::default(),
-        account,
-        committed,
-    )
-}
-
-fn register_with_runs(
-    rows: Vec<AgentRow>,
-    runs: Vec<RunRow>,
-    open_run: &str,
-    opened: i64,
-    journal: RunJournal,
-    account: &str,
-    committed: i64,
-) -> Vec<u8> {
-    register_with_live(
-        rows,
-        runs,
-        open_run,
-        opened,
-        journal,
-        LiveRun::default(),
-        account,
-        committed,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn register_with_live(
-    rows: Vec<AgentRow>,
-    runs: Vec<RunRow>,
-    open_run: &str,
-    opened: i64,
-    journal: RunJournal,
-    live: LiveRun,
-    account: &str,
-    committed: i64,
-) -> Vec<u8> {
-    serde_json::to_vec(&AgentsProps {
-        rows,
-        runs,
-        open_run: open_run.into(),
-        opened,
-        journal,
-        live,
-        capabilities: vec!["claude".into(), "codex".into()],
-        account: account.into(),
-        committed,
-        connected: true,
-        answered: true,
-        dark: false,
+fn skill(name: &str, always: bool) -> Value {
+    json!({
+        "name": name,
+        "source_prefix": format!("/shared/skills/{name}"),
+        "source_snapshot": null,
+        "load": if always { "always" } else { "on_demand" },
     })
-    .expect("props encode")
 }
 
-/// Boot, subscribe, and push the register as `account`.
-fn booted(rows: Vec<AgentRow>, account: &str) -> (u64, Frame) {
+fn model(id: &str, name: &str, status: &str) -> Value {
+    json!({
+        "agent_id": id,
+        "display_name": name,
+        "account": 42,
+        "capability": "review",
+        "status": status,
+        "skills": [skill("review", true), skill("style", false), skill("tests", false)],
+    })
+}
+
+fn accounts() -> Value {
+    json!({ "accounts": [
+        { "number": CONTROLLER, "name": "eddy", "control": "keys", "keys": [] },
+        { "number": 42, "name": "", "control": { "program": { "controller": CONTROLLER } }, "keys": [] },
+    ]})
+}
+
+fn running_run() -> Value {
+    json!({
+        "run_id": "run-live",
+        "dispatch_id": "dispatch-live",
+        "agent_id": "reviewer-bot",
+        "channel_id": "general",
+        "anchor_seq": 12,
+        "origin": { "kind": "chat_message", "channel_id": "general", "seq": 12 },
+        "dispatched": { "height": 84912 },
+        "state": { "running": { "attempt": 1, "holder": "ab12cd34ef56ab12cd34" } },
+        "actions": 2,
+        "places": [],
+    })
+}
+
+fn failed_run() -> Value {
+    json!({
+        "run_id": "run-gone",
+        "dispatch_id": "dispatch-gone",
+        "agent_id": "reviewer-bot",
+        "channel_id": "general",
+        "anchor_seq": 9,
+        "origin": { "kind": "chat_message", "channel_id": "general", "seq": 9 },
+        "dispatched": { "height": 84912 },
+        "state": { "settled": {
+            "outcome": "execution_failed",
+            "at": { "height": 84920 },
+            "executing_node": "ab12cd34ef56ab12cd34",
+            "degraded": false,
+            "reason": "worker exploded",
+            "output_ref": null,
+        }},
+        "actions": 0,
+        "places": [
+            { "kind": "page", "page_id": "p-9", "title": "Release notes" },
+            { "kind": "file", "path": "/src/main.rs" },
+        ],
+    })
+}
+
+/// The journal of `dispatch-gone`: two plain facts and the page it touched.
+fn run_detail() -> Value {
+    json!({ "run": {
+        "run": failed_run(),
+        "journal": [
+            { "height": 84912, "fact": { "dispatched": {
+                "agent_id": "reviewer-bot", "channel_id": "general", "anchor_seq": 9,
+            }}},
+            { "height": 84920, "fact": { "settled": {
+                "outcome": "execution_failed", "degraded": false, "reason": "worker exploded",
+            }}},
+        ],
+    }})
+}
+
+/// Every read this view makes, answered the way the modules serve them. A
+/// read with no row here is left pending, which is what makes the request
+/// assertions below exact.
+fn reply_for(request: &Request) -> Option<Value> {
+    let body: Value = serde_json::from_slice(&request.payload).ok()?;
+    let target = body["target"].as_str().unwrap_or_default();
+    let query = &body["query"];
+    let named = |key: &str| query[key].is_object();
+    match (request.kind.as_str(), target) {
+        ("rpc.status", _) => Some(json!({ "chain_id": "duck-1#a1b2c3d4" })),
+        ("rpc.query", "identity") => Some(accounts()),
+        ("rpc.query", "capability") => Some(json!({ "all": [[[1, 2], ["claude", "codex"]]] })),
+        ("rpc.query", "runs") if named("model") => Some(json!({ "model": { "agents": [
+            model("reviewer-bot", "Reviewer Bot", "active"),
+            model("scribe", "Scribe", "paused"),
+        ]}})),
+        ("rpc.query", "runs") if query == "pending_runs" => {
+            Some(json!({ "pending_runs": [{ "agent_id": "reviewer-bot" }] }))
+        }
+        ("rpc.view", "runs") if named("recent") => {
+            Some(json!({ "runs": [running_run(), failed_run()] }))
+        }
+        ("rpc.view", "runs") if named("run") => Some(run_detail()),
+        ("rpc.view", "chat") if named("channel") => Some(json!({ "channel": { "name": "general" } })),
+        ("rpc.view", "chat") if named("messages_around") => Some(json!({ "messages": [] })),
+        _ => None,
+    }
+}
+
+// ---------- driving it ----------
+
+fn boot() -> Frame {
     boot_native();
-    let frame = tick_native(Vec::new());
-    assert_eq!(frame.requests.len(), 1, "{:?}", frame.requests);
-    assert_eq!(frame.requests[0].kind, "agents.props");
-    let subscription = frame.requests[0].id;
-    let frame = tick_native(vec![item(subscription, &register(rows, account, 0))]);
-    (subscription, frame)
+    tick_native(Vec::new())
+}
+
+fn kinds(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.kind.as_str())
+        .collect()
+}
+
+fn request<'a>(frame: &'a Frame, kind: &str) -> &'a Request {
+    frame
+        .requests
+        .iter()
+        .find(|request| request.kind == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` request in {:?}", frame.requests))
 }
 
 fn one_intent(frame: &Frame) -> &Request {
@@ -144,6 +159,65 @@ fn one_intent(frame: &Frame) -> &Request {
         panic!("one intent, got {:?}", frame.requests);
     };
     intent
+}
+
+fn session(account: &str, open_run: &str, opened: i64) -> Vec<u8> {
+    serde_json::to_vec(&Session {
+        connected: true,
+        dark: false,
+        account: account.into(),
+        open_run: open_run.into(),
+        opened,
+    })
+    .expect("the session encodes")
+}
+
+/// Answers every read the table knows until none is left, and reports every
+/// request that went unanswered on the way — the live subscriptions and the
+/// intents.
+fn settle(mut frame: Frame) -> (Frame, Vec<Request>) {
+    let mut left = Vec::new();
+    for _ in 0..64 {
+        let mut events: Vec<Event> = Vec::new();
+        for request in &frame.requests {
+            match reply_for(request) {
+                Some(reply) => events.push(answer(request.id, reply.to_string().as_bytes())),
+                None => left.push(request.clone()),
+            }
+        }
+        if events.is_empty() {
+            return (frame, left);
+        }
+        frame = tick_native(events);
+    }
+    panic!("the view never stopped reading");
+}
+
+/// Boots and answers nothing: the id of the session subscription, the
+/// view's one door for what the kernel knows.
+fn booted() -> u64 {
+    request(&boot(), "agents.props").id
+}
+
+/// Pushes the session and answers every read it starts.
+fn connect(props: u64, account: &str, open_run: &str, opened: i64) -> (Frame, Vec<Request>) {
+    settle(tick_native(vec![item(
+        props,
+        &session(account, open_run, opened),
+    )]))
+}
+
+/// Boots, connects as `account` with no run open, and answers the whole
+/// register read: the screen, and every request the reads left behind.
+fn registered(account: &str) -> (Frame, Vec<Request>) {
+    connect(booted(), account, "", 0)
+}
+
+fn live_ids(left: &[Request]) -> Vec<u64> {
+    left.iter()
+        .filter(|request| request.kind == "rpc.live")
+        .map(|request| request.id)
+        .collect()
 }
 
 /// Whether a button with this accessible name is on the frame. A chip's
@@ -157,133 +231,20 @@ fn frame_has_button(frame: &Frame, name: &str) -> bool {
     frame.root.as_ref().is_some_and(|root| walk(root, name))
 }
 
-fn node_ending<'a>(frame: &'a Frame, suffix: &str) -> &'a Node {
-    fn find<'a>(node: &'a Node, suffix: &str) -> Option<&'a Node> {
-        if node.key().is_some_and(|key| key.ends_with(suffix)) {
-            return Some(node);
-        }
-        node.children().iter().find_map(|child| find(child, suffix))
-    }
-    find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
-}
+// ---------- the register ----------
 
+/// At boot the view asks for the session only; connected, it reads the
+/// register, the identity directory, the pending runs, the tracker and the
+/// announced executors itself, and the fold is the whole screen.
 #[test]
-fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
-    use ui_lang_guest::wire::{Event, Length, mouse};
-    let (subscription, _) = booted(vec![], "7");
-    let mut running = run("peer", "Claude", "running");
-    running.dispatch_id = "32a29e72a8fc5b673f196f93ab63a18b8cef8f47f94ceac9c1bb7c1".into();
-    let target = RunLink {
-        relation: "target".into(),
-        kind: "chat".into(),
-        label: "#Engineering · Eddy: Bound and scroll the branch selector".into(),
-        url: "duck://channel/engineering?net=a1b2c3d4#12".into(),
-    };
-    let journal = RunJournal {
-        dispatch_id: running.dispatch_id.clone(),
-        entries: vec![JournalEntry {
-            height: "h 123".into(),
-            kind: "action".into(),
-            summary: "React 👀".into(),
-            status: "Completed".into(),
-            targets: vec![target.clone()],
-        }],
-        links: vec![RunLink {
-            relation: "from".into(),
-            kind: "chat".into(),
-            label: "Bound and scroll the branch selector without overflowing the button".into(),
-            url: "duck://channel/general/12".into(),
-        }],
-    };
-    let frame = tick_native(vec![item(
-        subscription,
-        &register_with_runs(
-            vec![],
-            vec![running.clone()],
-            &running.dispatch_id,
-            1,
-            journal,
-            "7",
-            0,
-        ),
-    )]);
-    assert!(has_text(&frame, "React 👀"));
-    assert!(has_text(&frame, "Completed"));
-    assert!(has_text(&frame, &target.label));
-    assert!(!has_text(&frame, &running.dispatch_id));
-    fn check_place(node: &Node) -> bool {
-        if let Node::Button {
-            label: Some(label),
-            width,
-            height,
-            ..
-        } = node
-            && label.starts_with("Bound and scroll")
-        {
-            assert_eq!(*width, Some(Length::Fill));
-            assert_eq!(*height, None, "a wrapped title grows its button");
-            return true;
-        }
-        node.children().iter().any(check_place)
-    }
-    assert!(check_place(frame.root.as_ref().unwrap()));
-    let frame = tick_native(press(&frame, &target.label));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.open_link");
+fn a_connected_view_reads_its_own_register() {
+    let frame = boot();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&intent.payload).unwrap()["url"],
-        target.url
+        kinds(&frame.requests),
+        ["agents.props"],
+        "only the session at boot: {:?}",
+        frame.requests
     );
-    let frame = tick_native(press(&frame, "Run details"));
-    assert!(has_text(&frame, &running.dispatch_id));
-    let width = |frame: &Frame| match node_ending(frame, "/journal") {
-        Node::Container {
-            width: Some(Length::Fixed(width)),
-            ..
-        } => *width,
-        node => panic!("fixed journal width: {node:?}"),
-    };
-    assert_eq!(width(&frame), 400.0);
-    let Node::ResizeHandle {
-        on_drag: Some(handler),
-        cursor,
-        ..
-    } = node_ending(&frame, "/journal-resize")
-    else {
-        panic!("resize handle")
-    };
-    assert_eq!(*cursor, Some(mouse::Cursor::ResizingHorizontally));
-    let frame = tick_native(vec![Event::Drag {
-        handler: *handler,
-        dx: -80.0,
-        dy: 0.0,
-    }]);
-    assert_eq!(width(&frame), 480.0);
-    let frame = tick_native(vec![
-        Event::Mouse {
-            event: mouse::Event::ButtonReleased(mouse::Button::Left),
-            captured: true,
-        },
-        Event::Mouse {
-            event: mouse::Event::CursorMoved { x: 500.0, y: 30.0 },
-            captured: true,
-        },
-    ]);
-    assert_eq!(width(&frame), 480.0);
-    assert_eq!(
-        agents_view::host::journal_width_after_delta(480.0, 900.0, 900.0),
-        570.0
-    );
-    assert_eq!(
-        agents_view::host::journal_width_after_delta(480.0, -900.0, 900.0),
-        280.0
-    );
-}
-
-#[test]
-fn the_register_the_host_pushes_is_what_the_screen_shows() {
-    boot_native();
-    let frame = tick_native(Vec::new());
     assert!(has_text(&frame, "Not connected"), "{:?}", texts(&frame));
     assert!(
         texts(&frame)
@@ -293,16 +254,10 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
         texts(&frame)
     );
 
-    let (_, frame) = booted(
-        vec![
-            agent("Reviewer", "active", true),
-            agent("Scribe", "paused", false),
-        ],
-        "",
-    );
+    let (frame, left) = registered("");
     for expected in [
         "2 agents · 1 working",
-        "Reviewer",
+        "Reviewer Bot",
         "review",
         "ACTIVE",
         "PAUSED",
@@ -319,12 +274,29 @@ fn the_register_the_host_pushes_is_what_the_screen_shows() {
     assert!(!has_text(&frame, "Not connected"), "{:?}", texts(&frame));
     // no account on this device: nothing to register a new agent under
     assert!(!has_text(&frame, "New agent"), "{:?}", texts(&frame));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
+    // the two planes an agent record is folded from, plus the working count
+    assert_eq!(live_ids(&left).len(), 2, "{left:?}");
+    let badge = left
+        .iter()
+        .find(|request| request.kind == "host.badge")
+        .expect("the working count reaches the rail");
+    assert_eq!(badge.payload, b"1");
 }
+
+/// A block on either plane reads the register again — nothing else.
+#[test]
+fn a_live_hit_reads_the_register_again() {
+    let (_, left) = registered("7");
+    let live = live_ids(&left);
+    let frame = tick_native(vec![item(live[0], b"{}")]);
+    assert_eq!(kinds(&frame.requests), ["rpc.query"], "{:?}", frame.requests);
+}
+
+// ---------- the record ----------
 
 #[test]
 fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
-    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+    let (frame, _) = registered("7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
     for expected in ["Identity", "Executor", "Skills", "review", "style"] {
         assert!(
@@ -353,18 +325,26 @@ fn the_controller_edits_the_whole_record_and_saves_it_in_one_write() {
     );
 
     let frame = tick_native(press(&frame, "Save agent"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.save");
-    let draft: Draft = serde_json::from_slice(&intent.payload).expect("decodes");
-    assert_eq!(draft.agent_id, "reviewer-bot");
-    assert_eq!(draft.display_name, "Reviewer Bot");
-    assert_eq!(draft.capability, "claude");
-    assert!(draft.skills.iter().filter(|skill| skill.always).count() == 2);
+    let submit = one_intent(&frame);
+    assert_eq!(submit.kind, "op.submit");
+    let op: Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
+    assert_eq!(op["target"], "runs");
+    let update = &op["payload"]["configure_model"]["operation"]["update_model"];
+    assert_eq!(update["agent_id"], "reviewer-bot");
+    assert_eq!(update["display_name"], "Reviewer Bot");
+    assert_eq!(update["capability"], "claude");
+    let always = update["skills"]
+        .as_array()
+        .expect("the skills ride the op")
+        .iter()
+        .filter(|skill| skill["load"] == "always")
+        .count();
+    assert_eq!(always, 2, "{update}");
 }
 
 #[test]
 fn a_reader_who_is_not_the_controller_gets_the_record_read_only() {
-    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "9");
+    let (frame, _) = registered("9");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
     assert!(
         has_text(
@@ -383,24 +363,26 @@ fn a_reader_who_is_not_the_controller_gets_the_record_read_only() {
 }
 
 #[test]
-fn the_controller_pauses_a_record_by_registry_id() {
-    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+fn the_controller_pauses_a_record_with_a_signed_op() {
+    let (frame, _) = registered("7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
     let frame = tick_native(press(&frame, "Pause agent"));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.status");
+    let submit = one_intent(&frame);
+    assert_eq!(submit.kind, "op.submit");
+    let op: Value = serde_json::from_slice(&submit.payload).expect("an op decodes");
     assert_eq!(
-        serde_json::from_slice::<Status>(&intent.payload).expect("decodes"),
-        Status {
-            agent_id: "reviewer-bot".into(),
-            paused: true
-        }
+        op,
+        json!({ "target": "runs", "payload": { "configure_model": { "operation": {
+            "pause_model": { "agent_id": "reviewer-bot" }
+        }}}})
     );
 }
 
+/// A registration is the one write that is still the app's: the agent's
+/// program account has to be provisioned before the record can name it.
 #[test]
 fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
-    let (_, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+    let (frame, _) = registered("7");
     let frame = tick_native(press(&frame, "Runs"));
     assert!(has_text(&frame, "New agent"), "{:?}", texts(&frame));
     let frame = tick_native(press(&frame, "New agent"));
@@ -432,78 +414,57 @@ fn a_new_agent_registers_from_the_form_once_its_id_is_a_label() {
     assert_eq!(draft.display_name, "ChiefDuck");
     assert_eq!(draft.capability, "claude");
     // a skill named without a prefix lands in the shared library
-    assert_eq!(
-        draft.skills,
-        [AgentSkill {
-            name: "chiefduck".into(),
-            source_prefix: "/shared/skills/chiefduck".into(),
-            source_snapshot: String::new(),
-            always: true,
-        }]
-    );
+    let [only] = draft.skills.as_slice() else {
+        panic!("one skill, got {:?}", draft.skills);
+    };
+    assert_eq!(only.name, "chiefduck");
+    assert_eq!(only.source_prefix, "/shared/skills/chiefduck");
+    assert!(only.always);
 }
 
+/// A write the kernel answered re-seeds the open record from its fresh row:
+/// the drafts the write carried are spent.
 #[test]
 fn a_committed_write_reseeds_the_open_record_from_its_fresh_row() {
-    let (subscription, frame) = booted(vec![agent("Reviewer Bot", "active", false)], "7");
+    let (frame, left) = registered("7");
     let frame = tick_native(press(&frame, "Reviewer Bot"));
-    let _ = tick_native(press(&frame, "Load always"));
-
-    // the app committed a write and re-read the register: the row now names
-    // the agent differently, and the drafts follow the row, not the reader
-    let mut renamed = agent("Reviewer Bot", "paused", false);
-    renamed.name = "Renamed Bot".into();
-    let frame = tick_native(vec![item(subscription, &register(vec![renamed], "7", 1))]);
+    let frame = tick_native(press(&frame, "Load always"));
     let frame = tick_native(press(&frame, "Save agent"));
-    let draft: Draft = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
-    assert_eq!(draft.display_name, "Renamed Bot");
-    assert_eq!(
-        draft.skills.iter().filter(|skill| skill.always).count(),
-        1,
-        "the unsaved persona flip was consumed"
-    );
+    let submit = one_intent(&frame).id;
+
+    // the kernel answers the op, and the block it landed in re-reads the
+    // register: the row is the truth, the unsaved flip is gone
+    let _ = tick_native(vec![answer(submit, b"{}")]);
+    let (frame, _) = settle(tick_native(vec![item(live_ids(&left)[0], b"{}")]));
+    let frame = tick_native(press(&frame, "Save agent"));
+    let op: Value = serde_json::from_slice(&one_intent(&frame).payload).expect("decodes");
+    let skills = op["payload"]["configure_model"]["operation"]["update_model"]["skills"]
+        .as_array()
+        .expect("the skills ride the op")
+        .iter()
+        .filter(|skill| skill["load"] == "always")
+        .count();
+    assert_eq!(skills, 1, "the unsaved persona flip was consumed");
 }
 
+// ---------- the tracker ----------
+
+/// The tracker lists every run the journal names, and opening one asks the
+/// app to put it on — the app owns which run is open, because a chat hint, a
+/// bell or a `duck://run` link opens one from another tab.
 #[test]
 fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    let subscription = frame.requests[0].id;
-    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
-    let mut failed = run("chat\x1fgeneral\x1f9\x1freviewer", "Reviewer", "failed");
-    failed.reason = "worker exploded".into();
-    failed.settled = "h 84,920".into();
-    let frame = tick_native(vec![item(
-        subscription,
-        &register_with_runs(
-            vec![agent("Reviewer", "active", true)],
-            vec![running.clone(), failed.clone()],
-            "",
-            0,
-            RunJournal::default(),
-            "7",
-            0,
-        ),
-    )]);
+    let (frame, _) = registered("7");
     // the registry is the first panel; the tracker is one press away
-    assert!(has_text(&frame, "New agent"));
-    assert!(!has_text(&frame, "Messages"));
     assert!(
-        !has_text(&frame, "#general · msg 12"),
+        !has_text(&frame, "#general · Message 12"),
         "{:?}",
         texts(&frame)
     );
     let frame = tick_native(press(&frame, "Runs"));
-    assert!(has_text(&frame, "New agent"));
-    assert!(!has_text(&frame, "Messages"));
-    assert!(
-        !texts(&frame)
-            .iter()
-            .any(|text| text.starts_with("A run is a dispatch"))
-    );
     for expected in [
         "2 runs · 1 in flight",
-        "#general · msg 12",
+        "#general · Message 12",
         "running",
         "failed",
         "h 84,912",
@@ -516,15 +477,14 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     }
     assert!(frame.requests.is_empty(), "{:?}", frame.requests);
 
-    // opening a run asks the app for its journal, by the run's address
-    let frame = tick_native(press(&frame, &failed.run_id));
-    let intent = one_intent(&frame);
-    assert_eq!(intent.kind, "agents.open_run");
+    let frame = tick_native(press(&frame, "run-gone"));
+    let intent = request(&frame, "agents.open_run");
     assert_eq!(
         serde_json::from_slice::<OpenRun>(&intent.payload).expect("decodes"),
         OpenRun {
-            dispatch_id: failed.dispatch_id.clone()
-        }
+            dispatch_id: "dispatch-gone".into()
+        },
+        "the other tabs follow the reader's press"
     );
     assert!(
         has_text(&frame, "Reading the journal…"),
@@ -533,49 +493,21 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
     );
     assert!(has_text(&frame, "worker exploded"), "{:?}", texts(&frame));
 
-    // the journal lands under the open run's address and reads fact by fact
-    let journal = RunJournal {
-        dispatch_id: failed.dispatch_id.clone(),
-        links: Vec::new(),
-        entries: vec![
-            JournalEntry {
-                height: "h 84,912".into(),
-                kind: "dispatched".into(),
-                summary: "for reviewer from #general · msg 9".into(),
-                ..JournalEntry::default()
-            },
-            JournalEntry {
-                height: "h 84,920".into(),
-                kind: "settled".into(),
-                summary: "failed: worker exploded".into(),
-                ..JournalEntry::default()
-            },
-        ],
-    };
-    let frame = tick_native(vec![item(
-        subscription,
-        &register_with_runs(
-            vec![agent("Reviewer", "active", true)],
-            vec![running, failed.clone()],
-            &failed.dispatch_id,
-            1,
-            journal,
-            "7",
-            0,
-        ),
-    )]);
+    // the journal is this view's own read, on the same cadence as the
+    // register — the press does not wait on the app
+    let (frame, _) = settle(frame);
     assert!(
         !has_text(&frame, "Reading the journal…"),
         "{:?}",
         texts(&frame)
     );
     assert!(
-        has_text(&frame, "for reviewer from #general · msg 9"),
+        has_text(&frame, "for reviewer-bot from Message 9"),
         "{:?}",
         texts(&frame)
     );
     assert!(
-        has_text(&frame, "failed: worker exploded"),
+        has_text(&frame, "failed · worker exploded"),
         "{:?}",
         texts(&frame)
     );
@@ -590,150 +522,18 @@ fn the_runs_panel_lists_every_run_and_opens_one_journal_at_a_time() {
             dispatch_id: String::new()
         }
     );
-    assert!(
-        !has_text(&frame, "for reviewer from #general · msg 9"),
-        "{:?}",
-        texts(&frame)
-    );
 }
 
-/// THE APP OWNS WHICH RUN IS OPEN. A chat hint, a bell or a duck://run link
-/// opens a run from another tab, so the register's `open_run` opens the
-/// tracker here without a press, whichever panel the reader was on — and the
-/// panel it opens is keyed by the run's address, which is also the key its
-/// journal and live reading carry. The run stays open while the reader looks
-/// at another panel, and a second door onto that same run lands them on the
-/// tracker again: the landing follows the door count, not the run's name.
+/// The journal's places draw as chips: one with an address opens through
+/// the app's open plane, one the protocol cannot address yet is a label.
 #[test]
-fn the_register_opens_the_run_the_app_names() {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    let subscription = frame.requests[0].id;
-    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
-    let opened_by_the_app = |opened: i64| {
-        item(
-            subscription,
-            &register_with_runs(
-                vec![agent("Reviewer", "active", true)],
-                vec![running.clone()],
-                &running.dispatch_id,
-                opened,
-                RunJournal::default(),
-                "7",
-                0,
-            ),
-        )
-    };
-    let frame = tick_native(vec![opened_by_the_app(1)]);
-    assert!(
-        has_text(&frame, "Reading the journal…"),
-        "the tracker is landed on without a press: {:?}",
-        texts(&frame)
-    );
-    assert!(has_text(&frame, "Details"));
-    assert!(!has_text(&frame, &running.dispatch_id));
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-
-    // the reader looks at the registry; the run stays open behind it
-    let frame = tick_native(press(&frame, "Registry"));
-    assert!(
-        !has_text(&frame, "Reading the journal…"),
-        "{:?}",
-        texts(&frame)
-    );
-    let frame = tick_native(vec![opened_by_the_app(1)]);
-    assert!(
-        !has_text(&frame, "Reading the journal…"),
-        "the register alone moves no panel: {:?}",
-        texts(&frame)
-    );
-
-    // the same run, through another door: the tracker again
-    let frame = tick_native(vec![opened_by_the_app(2)]);
-    assert!(
-        has_text(&frame, "Reading the journal…"),
-        "a door onto the open run lands on the tracker: {:?}",
-        texts(&frame)
-    );
-    assert!(frame.requests.is_empty(), "{:?}", frame.requests);
-}
-
-/// THE RUN AS IT RUNS, AND EVERYTHING IT TOUCHED. The live reading draws in
-/// the panel — the chat stream only hints — and the journal's places draw as
-/// chips: a chip with an address opens it through the app's open plane, a
-/// place the protocol cannot address yet is a label alone.
-#[test]
-fn the_open_run_draws_its_progress_and_its_places_as_chips() {
-    boot_native();
-    let frame = tick_native(Vec::new());
-    let subscription = frame.requests[0].id;
-    let running = run("chat\x1fgeneral\x1f12\x1freviewer", "Reviewer", "running");
-    let journal = RunJournal {
-        dispatch_id: running.dispatch_id.clone(),
-        entries: vec![JournalEntry {
-            height: "h 84,912".into(),
-            kind: "dispatched".into(),
-            summary: "for reviewer from #general · msg 12".into(),
-            ..JournalEntry::default()
-        }],
-        links: vec![
-            RunLink {
-                relation: "from".into(),
-                kind: "chat".into(),
-                label: "#general · msg 12".into(),
-                url: "duck://channel/general/12?net=duck-1".into(),
-            },
-            RunLink {
-                relation: "touched".into(),
-                kind: "page".into(),
-                label: "Release notes".into(),
-                url: "duck://page/p-9?net=duck-1".into(),
-            },
-            RunLink {
-                relation: "touched".into(),
-                kind: "task".into(),
-                label: "task t-4".into(),
-                url: String::new(),
-            },
-        ],
-    };
-    let live = LiveRun {
-        present: true,
-        status: "Reading the repo".into(),
-        activity: vec![
-            LiveActivity {
-                label: "Command: cargo test".into(),
-                done: true,
-            },
-            LiveActivity {
-                label: "Reasoning".into(),
-                done: false,
-            },
-        ],
-        answer_preview: "The notes are drafted".into(),
-    };
-    let frame = tick_native(vec![item(
-        subscription,
-        &register_with_live(
-            vec![agent("Reviewer", "active", true)],
-            vec![running.clone()],
-            &running.dispatch_id,
-            1,
-            journal,
-            live,
-            "7",
-            0,
-        ),
-    )]);
+fn the_open_run_draws_its_places_as_chips() {
+    let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
     for expected in [
-        "Reading the repo",
-        "Command: cargo test",
-        "Reasoning",
-        "The notes are drafted",
         "Relevant",
-        "#general · msg 12",
+        "#general · message 9 unavailable",
         "Release notes",
-        "task t-4",
+        "/src/main.rs",
     ] {
         assert!(
             has_text(&frame, expected),
@@ -741,20 +541,170 @@ fn the_open_run_draws_its_progress_and_its_places_as_chips() {
             texts(&frame)
         );
     }
-    // a chip with an address is a link the app's open plane follows
+    // a place the protocol cannot address yet is drawn, never offered
+    assert!(
+        !frame_has_button(&frame, "/src/main.rs"),
+        "an unaddressed place was offered as a link: {:?}",
+        texts(&frame)
+    );
+
     let frame = tick_native(press(&frame, "Release notes"));
     let intent = one_intent(&frame);
     assert_eq!(intent.kind, "agents.open_link");
     assert_eq!(
         serde_json::from_slice::<OpenLink>(&intent.payload).expect("decodes"),
         OpenLink {
-            url: "duck://page/p-9?net=duck-1".into()
+            // the chain's digest, never its whole id
+            url: "duck://page/p-9?net=a1b2c3d4".into()
         }
     );
-    // a place without an address is drawn, not offered
+}
+
+/// The journal pane's width is the reader's, and a receipt's identifiers
+/// stay behind the disclosure.
+#[test]
+fn journal_drag_and_receipt_disclosure_keep_identifiers_out_of_the_summary() {
+    use ui_lang_guest::wire::{Length, mouse};
+    let (frame, _) = connect(booted(), "7", "dispatch-gone", 1);
+    assert!(!has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
+    let frame = tick_native(press(&frame, "Run details"));
+    assert!(has_text(&frame, "dispatch-gone"), "{:?}", texts(&frame));
+
+    let node_ending = |frame: &Frame, suffix: &str| -> Node {
+        fn find(node: &Node, suffix: &str) -> Option<Node> {
+            if node.key().is_some_and(|key| key.ends_with(suffix)) {
+                return Some(node.clone());
+            }
+            node.children().iter().find_map(|child| find(child, suffix))
+        }
+        find(frame.root.as_ref().unwrap(), suffix).expect("node exists")
+    };
+    let width = |frame: &Frame| match node_ending(frame, "/journal") {
+        Node::Container {
+            width: Some(Length::Fixed(width)),
+            ..
+        } => width,
+        node => panic!("fixed journal width: {node:?}"),
+    };
+    assert_eq!(width(&frame), 400.0);
+    let Node::ResizeHandle {
+        on_drag: Some(handler),
+        cursor,
+        ..
+    } = node_ending(&frame, "/journal-resize")
+    else {
+        panic!("resize handle")
+    };
+    assert_eq!(cursor, Some(mouse::Cursor::ResizingHorizontally));
+    let frame = tick_native(vec![Event::Drag {
+        handler,
+        dx: -80.0,
+        dy: 0.0,
+    }]);
+    assert_eq!(width(&frame), 480.0);
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, 900.0, 900.0),
+        570.0
+    );
+    assert_eq!(
+        agents_view::host::journal_width_after_delta(480.0, -900.0, 900.0),
+        280.0
+    );
+}
+
+/// THE RUN AS IT RUNS. The open run's progress is the node's own output
+/// stream for that dispatch, opened through `rpc.stream` and folded HERE:
+/// the tool it is using, the steps it took, the answer forming. A run the
+/// stream says nothing about draws no panel at all, and what reaches the
+/// screen is a tool's NAME, never its arguments or its output.
+#[test]
+fn the_open_run_draws_the_node_output_as_it_arrives() {
+    let (frame, left) = connect(booted(), "7", "dispatch-gone", 1);
+    let opened = left
+        .iter()
+        .find(|request| request.kind == "rpc.stream")
+        .expect("the view opens the open run's output stream");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&opened.payload).expect("decodes"),
+        json!({
+            "topic": "run-output:dispatch-gone",
+            "params": {"run": "dispatch-gone"},
+        }),
+        "the topic is the run's, and the upgrade names the run it asks for"
+    );
     assert!(
-        !frame_has_button(&frame, "task t-4"),
-        "an unaddressed place was offered as a link: {:?}",
+        !has_text(&frame, "Using Bash"),
+        "a run with no output draws no panel: {:?}",
+        texts(&frame)
+    );
+
+    let line = |body: Value| {
+        item(
+            opened.id,
+            json!({"topic": "run-output:dispatch-gone", "item": {"line": body.to_string()}})
+                .to_string()
+                .as_bytes(),
+        )
+    };
+    let frame = tick_native(vec![line(json!({
+        "type": "assistant",
+        "message": {"content": [{
+            "type": "tool_use",
+            "name": "Bash",
+            "input": {"command": "cat /etc/shadow"},
+        }]},
+    }))]);
+    assert!(has_text(&frame, "Using Bash"), "{:?}", texts(&frame));
+    assert!(
+        !texts(&frame)
+            .iter()
+            .any(|text| text.contains("/etc/shadow")),
+        "a tool's arguments never reach the screen: {:?}",
+        texts(&frame)
+    );
+
+    // a step, with the detail its label carries
+    let frame = tick_native(vec![line(json!({
+        "type": "item.completed",
+        "item": {"type": "command_execution", "command": "cargo test"},
+    }))]);
+    assert!(
+        has_text(&frame, "Command: cargo test"),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // and the answer as it forms
+    let frame = tick_native(vec![line(json!({
+        "type": "result",
+        "result": "the register is green",
+    }))]);
+    for expected in ["Answering", "the register is green", "Command: cargo test"] {
+        assert!(
+            has_text(&frame, expected),
+            "missing {expected:?} in {:?}",
+            texts(&frame)
+        );
+    }
+
+    // a frame for another topic is not this run's
+    let frame = tick_native(vec![item(
+        opened.id,
+        json!({"topic": "run-output:someone-else", "item": {"line": "{\"type\":\"result\",\"result\":\"not ours\"}"}})
+            .to_string()
+            .as_bytes(),
+    )]);
+    assert!(
+        !has_text(&frame, "not ours"),
+        "{:?}",
+        texts(&frame)
+    );
+
+    // closing the run takes the panel with it
+    let frame = tick_native(press(&frame, "Close journal"));
+    assert!(
+        !has_text(&frame, "the register is green"),
+        "{:?}",
         texts(&frame)
     );
 }
