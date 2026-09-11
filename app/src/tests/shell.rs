@@ -374,7 +374,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("settings_load_selected", "settings_generation"),
         ("account_load_selected", "account_generation"),
         ("dm_peers_load_selected", "dm_peers_generation"),
-        ("forge_load_selected", "forge_generation"),
     ] {
         let guarded = format!(
             "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}"
@@ -385,23 +384,23 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         );
     }
 
-    for (selected, unmounted) in [
-        ("settings_load_selected", "shell_tab != ShellTab.settings"),
-        ("forge_load_selected", "shell_tab != ShellTab.forge"),
-    ] {
-        let handler = lifecycle
-            .split_once(&format!("on {selected}(request)"))
-            .unwrap_or_else(|| panic!("missing selected handler {selected}"))
-            .1
-            .split("\non ")
-            .next()
-            .expect("selected handler body");
-        assert!(
-            handler.contains(&format!("let unmounted = {unmounted}")),
-            "{selected}: tab-owned selector lacks its current-mount guard: {unmounted}"
-        );
-        assert!(handler.contains("return if obsolete_request || unmounted"));
-    }
+    // Settings is the one selector left that is owned by a single tab: every
+    // other screen reads through the kernel now, so a load that outlives the
+    // tab it was asked for has no other selector to guard.
+    let selected = "settings_load_selected";
+    let unmounted = "shell_tab != ShellTab.settings";
+    let handler = lifecycle
+        .split_once(&format!("on {selected}(request)"))
+        .unwrap_or_else(|| panic!("missing selected handler {selected}"))
+        .1
+        .split("\non ")
+        .next()
+        .expect("selected handler body");
+    assert!(
+        handler.contains(&format!("let unmounted = {unmounted}")),
+        "{selected}: tab-owned selector lacks its current-mount guard: {unmounted}"
+    );
+    assert!(handler.contains("return if obsolete_request || unmounted"));
 }
 
 /// THE GATE'S OTHER HALF IS THE BUMP. `settings_loaded` is dropped when its

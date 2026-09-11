@@ -433,6 +433,23 @@ pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     format!("{endpoint}\u{1f}{channel_id}")
 }
 
+/// The channel a composer scope names, or "" when the scope belongs to
+/// another endpoint. The forge view builds its note composer's scope itself
+/// ([`composer_scope`] over the item's channel), so the app reads the
+/// channel back out of the scope a send arrives with rather than
+/// remembering which item is open — a note written before the reader
+/// switched networks addresses a store this endpoint does not hold, and
+/// goes back to its own box.
+pub fn scope_channel(scope: &str, endpoint: &str) -> String {
+    let Some((wrote_at, channel)) = scope.split_once('\u{1f}') else {
+        return String::new();
+    };
+    match wrote_at == endpoint {
+        true => channel.to_owned(),
+        false => String::new(),
+    }
+}
+
 /// Whether a submitted body may be posted, decided ONCE at delivery from
 /// state that may have moved since the composer's frame drew its gate.
 ///
@@ -1056,5 +1073,13 @@ pub fn copy_range_label(count: i64) -> String {
     match count {
         1 => "1 message selected".to_owned(),
         count => format!("{count} messages selected"),
+    }
+}
+
+/// A forward page cursor is the last loaded reply, only when more exist.
+pub fn thread_page_cursor(messages: &[ChatMessage], has_more: bool) -> i64 {
+    match has_more {
+        true => messages.last().map_or(0, |message| message.seq),
+        false => 0,
     }
 }

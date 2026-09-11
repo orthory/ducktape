@@ -38,8 +38,23 @@
 //!   exactly as the `ducktape node` verbs sign theirs; answered with the
 //!   node's own reply text, or its refusal. The kernel names no route —
 //!   the node's operator gate decides what this key may ask for.
+//! - `git.merge` `{target, repo, ours, theirs, message}` — the merge commit
+//!   a git-backed module's wire demands the CLIENT compute, built with
+//!   libgit2 against a bare mirror of the node's `/<target>/<repo>` remote
+//!   and landed as a pack under the seated key; answered `{merge_oid,
+//!   pack_digest}`, or `{conflicts}` and nothing written. No wasm guest can
+//!   do this: it is a git implementation plus a second transport.
+//! - `picture.put` `{surface, path, pages}` — base64 pages decoded, joined
+//!   and parked as the picture the `picture` surface draws under `surface`;
+//!   answered `{width, height}`. `picture.inline` `{doc, source, base, net}`
+//!   — the pictures a Markdown `source` embeds, resolved against the
+//!   document's own `duck://` address and parked under `doc` for the
+//!   document surface. Both are the app's decoder and its one outbound
+//!   picture gate, which a view has neither of.
 //! - `host.badge` `<count>` — the tab badge, handed to the app as the
-//!   `badge` event with `{"count": N}` in its detail.
+//!   `badge` event with `{"count": N}` in its detail; `host.roster`
+//!   `{scope, members}` — the mention vocabulary of the host composer a
+//!   view docked over `scope`.
 //!
 //! A query and a submit go to the node off the window thread, on the
 //! kernel's own runtime, and their answers wait in [`Replies`] for the
@@ -180,6 +195,16 @@ pub(super) fn answer(
         }
         ("op", "submit") => spawn(guest, id, payload, submit),
         ("rpc", "admin") => spawn(guest, id, payload, admin),
+        ("git", "merge") => spawn(guest, id, payload, git_merge),
+        ("picture", "put") => spawn_host(guest, id, payload, picture_put),
+        ("picture", "inline") => spawn(guest, id, payload, picture_inline),
+        ("host", "roster") => match host_roster(payload) {
+            Some((scope, members)) => {
+                crate::composer_surface::roster(&scope, &members);
+                guest.reply(id, Ok(Vec::new()));
+            }
+            None => guest.refuse(id, "`host.roster` names no scope".into()),
+        },
         ("host", "badge") => {
             let count = std::str::from_utf8(payload)
                 .ok()
@@ -228,6 +253,30 @@ fn spawn(guest: &mut Guest, id: u64, payload: &[u8], call: Call) {
     replies.in_flight.fetch_add(1, Ordering::SeqCst);
     runtime().spawn(async move {
         let result = call(client, ask).await;
+        replies.deliver(id, result);
+    });
+}
+
+type HostCall = fn(
+    serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>;
+
+/// [`spawn`] for a door the NODE is not part of — the app's own picture
+/// store. It takes no client, so it answers whether or not the app has a
+/// connection: refusing one of these while offline would be a lie about
+/// where the work happens.
+fn spawn_host(guest: &mut Guest, id: u64, payload: &[u8], call: HostCall) {
+    let ask: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(ask) => ask,
+        Err(error) => {
+            guest.refuse(id, format!("request is not JSON: {error}"));
+            return;
+        }
+    };
+    let replies = guest.replies.clone();
+    replies.in_flight.fetch_add(1, Ordering::SeqCst);
+    runtime().spawn(async move {
+        let result = call(ask).await;
         replies.deliver(id, result);
     });
 }
@@ -488,17 +537,25 @@ fn files_get(
 /// left and the file to put in it. The two slots are the ones
 /// [`crate::backend::picture`] draws; anything else is refused rather than
 /// growing the store.
+/// The picture slot a request names, or `None` for anything that is not one
+/// of the two [`crate::backend::picture`] draws — the store never grows a
+/// slot nothing paints.
+fn picture_surface(ask: &serde_json::Value) -> Option<&'static str> {
+    use crate::backend::{FILES_SURFACE, FORGE_SURFACE};
+    match ask["surface"].as_str()? {
+        FILES_SURFACE => Some(FILES_SURFACE),
+        FORGE_SURFACE => Some(FORGE_SURFACE),
+        _ => None,
+    }
+}
+
 fn picture_load(
     client: ducktape_rpc::Client,
     ask: serde_json::Value,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
-    use crate::backend::{FILES_SURFACE, FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    use crate::backend::{MAX_PICTURE_BYTES, store_picture};
     Box::pin(async move {
-        let surface = match ask["surface"].as_str() {
-            Some(FILES_SURFACE) => FILES_SURFACE,
-            Some(FORGE_SURFACE) => FORGE_SURFACE,
-            _ => return Err("`picture.load` names no surface".into()),
-        };
+        let surface = picture_surface(&ask).ok_or("`picture.load` names no surface")?;
         let path = ask["path"].as_str().unwrap_or_default().to_owned();
         let Some(bytes) = crate::backend::files_read_all(&client, &path).await? else {
             return Err(format!(
@@ -702,6 +759,112 @@ fn admin(
             true => Ok(text.into_bytes()),
             false => Err(format!("{route} rejected ({code}): {text}")),
         }
+    })
+}
+
+/// Who a view's host composer may complete an `@` to: one scope's members,
+/// as the VIEW read them. The kernel keeps no roster of its own — the list
+/// is the guest's, parked where the composer surface finds it.
+fn host_roster(payload: &[u8]) -> Option<(String, Vec<crate::backend::ChatMember>)> {
+    let ask: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let scope = ask["scope"].as_str().filter(|scope| !scope.is_empty())?;
+    let members = ask["members"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| crate::backend::ChatMember {
+                    key: row["key"].as_str().unwrap_or_default().to_owned(),
+                    label: row["label"].as_str().unwrap_or_default().to_owned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((scope.to_owned(), members))
+}
+
+/// The merge commit a git-backed module's wire demands the CLIENT compute:
+/// built against a bare mirror of the node's `/<target>/<repo>` smart-HTTP
+/// remote, its minimal pack landed in the blob store under the seated key.
+/// A conflict writes NOTHING and answers with the paths.
+fn git_merge(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let target = target_of(&ask)?;
+        let repo = ask["repo"].as_str().unwrap_or_default().to_owned();
+        let ours = ask["ours"].as_str().unwrap_or_default().to_owned();
+        let theirs = ask["theirs"].as_str().unwrap_or_default().to_owned();
+        let message = ask["message"].as_str().unwrap_or_default().to_owned();
+        let pinned = !ours.is_empty() && !theirs.is_empty();
+        if !pinned {
+            return Err("`git.merge` names no commits to merge".into());
+        }
+        let endpoint = client.origin().to_owned();
+        let build = tokio::task::spawn_blocking(move || {
+            crate::backend::build_git_merge(&endpoint, &target, &repo, &ours, &theirs, &message)
+        })
+        .await
+        .map_err(|error| format!("merge build task failed: {error}"))??;
+        let (merge_oid, pack) = match build {
+            crate::backend::MergeBuild::Conflicts(paths) => {
+                let reply = serde_json::json!({ "conflicts": paths });
+                return serde_json::to_vec(&reply).map_err(|error| error.to_string());
+            }
+            crate::backend::MergeBuild::Clean { merge_oid, pack } => (merge_oid, pack),
+        };
+        // The pack lands under the person's own signature, the same key the
+        // op the view submits over it is signed with.
+        let signer = crate::backend::seated_data_plane_signer(&client).await?;
+        let pack_digest = client
+            .with_write_auth(signer)
+            .put_blob(pack)
+            .await
+            .map_err(|error| error.to_string())?
+            .to_lowercase();
+        let reply = serde_json::json!({ "merge_oid": merge_oid, "pack_digest": pack_digest });
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn picture_put(
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let surface = picture_surface(&ask).ok_or("`picture.put` names no surface")?;
+        let path = ask["path"].as_str().unwrap_or_default().to_owned();
+        if path.is_empty() {
+            return Err("`picture.put` names no path".into());
+        }
+        // Each page is padded base64 in its own right, so the runs are
+        // decoded separately and the BYTES joined — concatenating the text
+        // would re-frame the stream at the first page boundary.
+        let mut bytes = Vec::new();
+        for page in ask["pages"].as_array().cloned().unwrap_or_default() {
+            let page = crate::backend::base64_decode(page.as_str().unwrap_or_default())
+                .ok_or_else(|| "`picture.put` page is not valid base64".to_owned())?;
+            bytes.extend_from_slice(&page);
+        }
+        let (width, height) = crate::backend::store_picture(surface, path, bytes).await?;
+        let reply = serde_json::json!({ "width": width, "height": height });
+        serde_json::to_vec(&reply).map_err(|error| error.to_string())
+    })
+}
+
+fn picture_inline(
+    client: ducktape_rpc::Client,
+    ask: serde_json::Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>> {
+    Box::pin(async move {
+        let doc = ask["doc"].as_str().unwrap_or_default().to_owned();
+        let source = ask["source"].as_str().unwrap_or_default().to_owned();
+        let base = ask["base"].as_str().unwrap_or_default().to_owned();
+        let net = ask["net"].as_str().unwrap_or_default().to_owned();
+        if doc.is_empty() {
+            return Err("`picture.inline` names no document".into());
+        }
+        crate::backend::load_inline_pictures(&client, doc, &source, base, net).await;
+        Ok(Vec::new())
     })
 }
 

@@ -2,433 +2,31 @@ use super::*;
 use ::forge;
 use std::net::IpAddr;
 
-/// One forge repo row: the module's committed name and head.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct ForgeRepo {
-    pub name: String,
-    pub head: String,
-}
-
-/// One born branch of the open repo: its short name at the exact commit
-/// its head stood on when the repo slice was read.
-#[derive(Clone, Debug, Default, Hash, PartialEq, serde::Serialize)]
-pub struct ForgeBranch {
-    pub name: String,
-    pub head: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeData {
-    pub generation: i64,
-    pub repos: Vec<ForgeRepo>,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeRepoData {
-    pub generation: i64,
-    pub repo: String,
-    pub branches: Vec<ForgeBranch>,
-    pub items: Vec<ForgeItem>,
-}
-
-/// One item in full — the module-owned view model plus the loader's scope.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ForgeItemData {
-    pub generation: i64,
-    pub repo: String,
-    pub number: i64,
-    pub title: String,
-    pub state: String,
-    pub kind: String,
-    pub body: String,
-    /// the body through the chat tokenizer — links included.
-    pub blocks: Vec<ChatBlock>,
-    pub author_name: String,
-    pub branches: String,
-    pub channel_id: String,
-    pub source_branch: String,
-    pub source_oid: String,
-    pub target_oid: String,
-    pub merge_oid: String,
-    pub diff: String,
-    pub diff_truncated: bool,
-    pub files_changed: i64,
-    pub additions: i64,
-    pub deletions: i64,
-    pub reviews: Vec<ForgeReview>,
-    pub approvals: i64,
-    pub change_requests: i64,
-}
-
-async fn list_forge_repos(rpc: &str) -> Result<Vec<serde_json::Value>, String> {
-    let client = rpc_client(rpc)?;
-    let reply: serde_json::Value = client
-        .query("forge", &serde_json::json!("list_repos"))
-        .await?;
-    Ok(reply["repos"].as_array().cloned().unwrap_or_default())
-}
-
-fn listed_forge_repo(repo: &serde_json::Value) -> (String, String) {
-    (
-        repo["name"].as_str().unwrap_or_default().to_string(),
-        repo["head"].as_str().unwrap_or("(unborn)").to_string(),
-    )
-}
-
-/// The repo namespace with committed heads.
-pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
-    async {
-        let repos = list_forge_repos(&rpc)
-            .await?
-            .into_iter()
-            .map(|repo| {
-                let (name, head) = listed_forge_repo(&repo);
-                ForgeRepo {
-                    name,
-                    head: short_digest(&head),
-                }
-            })
-            .collect();
-        Ok(ForgeData { generation, repos })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// One repo's branches and tracker items.
-pub async fn load_forge_repo(
-    rpc: String,
-    repo: String,
-    generation: i64,
-) -> Result<ForgeRepoData, HydrationError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        // Branches and tracker summaries are independent committed reads. The
-        // repo seat needs both, but neither is a reason to queue behind the
-        // other on the node's query lane.
-        let refs_query = serde_json::json!({ "list_refs": { "repo": &repo } });
-        let items_query = serde_json::json!({ "list_items": { "repo": &repo } });
-        let (refs, items): (serde_json::Value, serde_json::Value) = tokio::try_join!(
-            rpc.query("forge", &refs_query),
-            rpc.query("forge", &items_query)
-        )?;
-        let heads: Vec<forge::RefHead> =
-            serde_json::from_value(refs["refs"].clone()).map_err(|error| error.to_string())?;
-        let branches = heads
-            .into_iter()
-            .map(|head| ForgeBranch {
-                name: head.name,
-                head: head.head,
-            })
-            .collect();
-        let summaries: Vec<forge::ItemSummary> =
-            serde_json::from_value(items["items"].clone()).map_err(|error| error.to_string())?;
-        Ok(ForgeRepoData {
-            generation,
-            repo,
-            branches,
-            items: forge::client::item_rows(&summaries, &names()),
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// One item in full, with the PR patch when there is one.
-pub async fn load_forge_item(
-    rpc: String,
-    repo: String,
-    number: i64,
-    generation: i64,
-) -> Result<ForgeItemData, HydrationError> {
-    async {
-        let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
-        let rpc = rpc_client(&rpc)?;
-        let reply: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "get_item": { "repo": repo, "number": number } }),
-            )
-            .await?;
-        let item = &reply["item"];
-        if item.is_null() {
-            return Err("item was not found".to_string());
-        }
-        let detail: forge::ItemDetail =
-            serde_json::from_value(item.clone()).map_err(|error| error.to_string())?;
-        // the wire's snake_case kind — the shipped `== "pull"` check never
-        // matched it, so PR patches silently failed to load.
-        let is_pr = detail.summary.kind == forge::ItemKind::Pr;
-        let diff: Option<forge::PrDiff> = match is_pr {
-            false => None,
-            true => rpc
-                .query::<_, serde_json::Value>(
-                    "forge",
-                    &serde_json::json!({ "pr_diff": { "repo": repo, "number": number } }),
-                )
-                .await
-                .ok()
-                .and_then(|reply| serde_json::from_value(reply["pr_diff"].clone()).ok()),
-        };
-        let view = forge::client::item_view(&detail, diff.as_ref(), &names());
-        let branches = match view.source_branch.is_empty() {
-            true => String::new(),
-            false => format!("{} → {}", view.source_branch, view.target_branch),
-        };
-        Ok(ForgeItemData {
-            generation,
-            repo,
-            number: view.number,
-            title: view.title,
-            state: view.state,
-            kind: view.kind,
-            body: view.body,
-            blocks: view.blocks,
-            author_name: view.author_name,
-            branches,
-            channel_id: view.channel_id,
-            source_branch: view.source_branch,
-            source_oid: view.source_oid,
-            target_oid: view.target_oid,
-            merge_oid: view.merge_oid,
-            diff: view.diff,
-            diff_truncated: view.diff_truncated,
-            files_changed: view.files_changed,
-            additions: view.additions,
-            deletions: view.deletions,
-            reviews: view.reviews,
-            approvals: view.approvals,
-            change_requests: view.change_requests,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// One forge item's discussion — the hidden `forge:<repo>:<n>` chat channel
-/// rendered through the exact same rows the chat pane uses.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeDiscussionData {
-    pub channel_id: String,
-    pub messages: Vec<ChatMessage>,
-    /// the channel's members — the composer's mention vocabulary.
-    pub members: Vec<ChatMember>,
-}
-
-/// Hydrate one item's discussion channel: the message window off the channel
-/// record's head plus the mention vocabulary.
-pub async fn load_forge_discussion(
-    rpc: String,
-    channel_id: String,
-) -> Result<ForgeDiscussionData, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        let names = names();
-        let (message_page, members) = tokio::try_join!(
-            load_messages(&rpc, &channel_id),
-            load_channel_members(&rpc, &channel_id, &names)
-        )?;
-        Ok(ForgeDiscussionData {
-            channel_id,
-            messages: message_page.messages,
-            members,
-        })
-    }
-    .await
-    .map_err(app_error)
-}
-
-/// Submit a batched review on a PR, pinned to the source head the reviewer
-/// saw. Approvals stay advisory — the wire never gates the merge.
-// The eighth argument is the staged comments, and they cannot be split off into
-// their own call: a review and its line comments are ONE transaction on the
-// wire. `Tracker::submit_review` carries the same allow for the same reason.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_forge_review(
-    rpc: String,
-    password: String,
-    repo: String,
-    number: i64,
-    verdict: crate::ForgeReviewVerdict,
-    body: String,
-    commit_oid: String,
-    comments: Vec<ForgeDraftComment>,
-) -> Result<bool, AppError> {
-    async {
-        let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
-        let verdict = match verdict {
-            crate::ForgeReviewVerdict::Comment => forge::ReviewVerdict::Comment,
-            crate::ForgeReviewVerdict::Approve => forge::ReviewVerdict::Approve,
-            crate::ForgeReviewVerdict::RequestChanges => forge::ReviewVerdict::RequestChanges,
-        };
-        let body = bounded_exact_text(body, "review body", forge::MAX_BODY_BYTES)?;
-        let comments = review_comments(comments)?;
-        if commit_oid.is_empty() {
-            return Err("the pull request diff has not loaded yet".to_string());
-        }
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "forge",
-            forge::encode_msg(&forge::ForgeMsg::SubmitReview {
-                repo,
-                number,
-                verdict,
-                body,
-                commit_oid,
-                comments,
-            }),
-            password,
-        )
-        .await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}
-
-/// The staged drafts, re-checked at the wire and turned into the module's own
-/// `ReviewComment`. `stage_forge_comment` already refuses an unusable draft, so
-/// nothing here should ever fire — but this is the boundary where a bad anchor
-/// would become a committed record, and a rejection with a reason beats a
-/// comment silently landing on line 0 of nothing.
-pub(crate) fn review_comments(
-    comments: Vec<ForgeDraftComment>,
-) -> Result<Vec<forge::ReviewComment>, String> {
-    comments
-        .into_iter()
-        .map(|draft| {
-            let line = draft
-                .line
-                .parse::<u32>()
-                .map_err(|_| format!("comment anchor {:?} has no line number", draft.anchor))?;
-            let side = match draft.side.as_str() {
-                "new" => forge::DiffSide::New,
-                "old" => forge::DiffSide::Old,
-                other => return Err(format!("unknown diff side {other:?}")),
-            };
-            Ok(forge::ReviewComment {
-                path: bounded_exact_text(draft.path, "comment path", forge::MAX_PATH_BYTES)?,
-                line,
-                side,
-                body: bounded_exact_text(
-                    draft.body,
-                    "comment body",
-                    forge::MAX_REVIEW_COMMENT_BYTES,
-                )?,
-            })
-        })
-        .collect()
-}
-
-/// The merge box's outcome: either the CAS'd merge landed, or the merge
-/// conflicted locally and NOTHING was submitted.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeMergeOutcome {
-    pub merged: bool,
-    pub merge_oid: String,
-    pub conflicts: Vec<String>,
-}
-
-/// Merge an open PR the way the wire demands it: the merge commit is
-/// CLIENT-COMPUTED. Build it against a local bare mirror of the node's
-/// `/forge/{repo}` smart-HTTP remote, land the minimal pack in the node-local
-/// blob store, then submit the double-CAS'd `MergePr`.
-pub async fn merge_forge_pr(
-    rpc: String,
-    password: String,
-    repo: String,
-    number: i64,
-    source_branch: String,
-    expected_source_oid: String,
-    prev_target_oid: String,
-) -> Result<ForgeMergeOutcome, AppError> {
-    let outcome = async {
-        let item = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
-        if expected_source_oid.is_empty() || prev_target_oid.is_empty() {
-            return Err("the pull request diff has not loaded yet".to_string());
-        }
-        let message = format!("Merge pull request #{item} from {source_branch}");
-        let build = {
-            let endpoint = rpc.clone();
-            let repo = repo.clone();
-            let ours = prev_target_oid.clone();
-            let theirs = expected_source_oid.clone();
-            tokio::task::spawn_blocking(move || {
-                build_forge_merge(&endpoint, &repo, &ours, &theirs, &message)
-            })
-            .await
-            .map_err(|error| format!("merge build task failed: {error}"))??
-        };
-        let (merge_oid, pack) = match build {
-            MergeBuild::Conflicts(paths) => {
-                return Ok(ForgeMergeOutcome {
-                    merged: false,
-                    merge_oid: String::new(),
-                    conflicts: paths,
-                });
-            }
-            MergeBuild::Clean { merge_oid, pack } => (merge_oid, pack),
-        };
-        let client = rpc_client(&rpc)?;
-        // The pack lands in the blob store under the person's own signature,
-        // the same key the `MergePr` frame below is signed with.
-        let blobs = client
-            .clone()
-            .with_write_auth(data_plane_signer(&client, password.clone()).await?);
-        let pack_digest = blobs.put_blob(pack).await?.to_lowercase();
-        signed_write(
-            &client,
-            "forge",
-            forge::encode_msg(&forge::ForgeMsg::MergePr {
-                repo: repo.clone(),
-                number: item,
-                prev_target_oid,
-                expected_source_oid,
-                merge_oid: merge_oid.clone(),
-                pack_digest,
-            }),
-            password,
-        )
-        .await?;
-        Ok(ForgeMergeOutcome {
-            merged: true,
-            merge_oid,
-            conflicts: Vec::new(),
-        })
-    }
-    .await;
-    outcome.map_err(app_error)
-}
-
 /// The local half of the client-computed merge.
-pub(crate) enum MergeBuild {
+pub enum MergeBuild {
     Clean { merge_oid: String, pack: Vec<u8> },
     Conflicts(Vec<String>),
 }
 
 /// Build the merge commit for `theirs` (source head) into `ours` (target
 /// head) without touching the mirror: a throwaway bare repo whose odb reads
-/// the mirror's objects through a disk alternate, exactly the shape the
-/// decommissioned desktop shipped. Returns the new oid plus the MINIMAL pack —
-/// only objects reachable from the merge but from NEITHER parent.
-fn build_forge_merge(
+/// the mirror's objects through a disk alternate. Returns the new oid plus
+/// the MINIMAL pack — only objects reachable from the merge but from
+/// NEITHER parent.
+///
+/// This is the `git.merge` kernel door's whole body, and it is a host
+/// capability rather than a module's reading: a git implementation plus a
+/// second transport, neither of which a wasm view has. `module` names the
+/// git-backed module whose smart-HTTP route the mirror is fetched from.
+pub fn build_git_merge(
     endpoint: &str,
+    module: &str,
     repo: &str,
     ours: &str,
     theirs: &str,
     message: &str,
 ) -> Result<MergeBuild, String> {
-    let mirror = sync_forge_mirror(endpoint, repo)?;
+    let mirror = sync_git_mirror(endpoint, module, repo)?;
     let ours_oid = git2::Oid::from_str(ours).map_err(git_err)?;
     let theirs_oid = git2::Oid::from_str(theirs).map_err(git_err)?;
     merge_against_mirror(&mirror, ours_oid, theirs_oid, message)
@@ -524,35 +122,48 @@ fn forge_mirror_lock(dir: &Path) -> Result<Arc<Mutex<()>>, String> {
         .clone())
 }
 
-fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, String> {
-    let dir = forge_mirror_dir(endpoint, repo)?;
+fn sync_git_mirror(
+    endpoint: &str,
+    module: &str,
+    repo: &str,
+) -> Result<git2::Repository, String> {
+    let dir = git_mirror_dir(endpoint, module, repo)?;
     let lock = forge_mirror_lock(&dir)?;
     let _guard = lock
         .lock()
-        .map_err(|_| format!("forge mirror lock is poisoned for {repo:?}"))?;
+        .map_err(|_| format!("git mirror lock is poisoned for {repo:?}"))?;
     std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("create forge mirror dir {}: {error}", dir.display()))?;
+        .map_err(|error| format!("create git mirror dir {}: {error}", dir.display()))?;
     let mirror = match git2::Repository::open_bare(&dir) {
         Ok(existing) => existing,
         Err(_) => git2::Repository::init_bare(&dir).map_err(git_err)?,
     };
     {
         let mut remote = mirror
-            .remote_anonymous(&format!("{}/forge/{repo}", endpoint.trim_end_matches('/')))
+            .remote_anonymous(&format!(
+                "{}/{module}/{repo}",
+                endpoint.trim_end_matches('/')
+            ))
             .map_err(git_err)?;
         remote
             .fetch(&["+refs/heads/*:refs/heads/*"], None, None)
-            .map_err(|error| format!("fetch forge remote for {repo:?}: {error}"))?;
+            .map_err(|error| format!("fetch git remote for {repo:?}: {error}"))?;
     }
     Ok(mirror)
 }
 
-/// `<app cache>/forge-remote/<endpoint-slug>/<repo>` — a rebuildable mirror,
-/// so it lives in the app's cache directory ([`super::app_dirs::cache_dir`]),
-/// never under the ducktape home.
-fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
-    if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
-        return Err(format!("invalid forge repo name {repo:?}"));
+/// `<app cache>/git-remote/<endpoint-slug>/<module>/<repo>` — a rebuildable
+/// mirror, so it lives in the app's cache directory
+/// ([`super::app_dirs::cache_dir`]), never under the ducktape home.
+fn git_mirror_dir(endpoint: &str, module: &str, repo: &str) -> Result<PathBuf, String> {
+    let named = |segment: &str| {
+        !segment.is_empty()
+            && !segment.contains('/')
+            && !segment.contains('\\')
+            && !segment.starts_with('.')
+    };
+    if !named(repo) || !named(module) {
+        return Err(format!("invalid git repo name {module:?}/{repo:?}"));
     }
     let root = super::app_dirs::cache_dir()?;
     let slug: String = endpoint
@@ -562,7 +173,7 @@ fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
             false => '-',
         })
         .collect();
-    Ok(root.join("forge-remote").join(slug).join(repo))
+    Ok(root.join("git-remote").join(slug).join(module).join(repo))
 }
 
 fn git_err(error: git2::Error) -> String {
@@ -597,171 +208,6 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// One entry of a repo's tree at one revision. `kind` is `dir` | `file`.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct TreeEntry {
-    pub name: String,
-    /// The full path from the repo root, so a row navigates without the view
-    /// having to re-join it against the current directory.
-    pub path: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeTreeData {
-    pub repo: String,
-    pub rev: String,
-    pub path: String,
-    /// Whether the repo has at least one branch. An empty `entries` list can
-    /// also be a real empty commit, so the view must not infer "unborn" from
-    /// the list alone.
-    pub born: bool,
-    pub entries: Vec<TreeEntry>,
-    pub truncated: bool,
-}
-
-/// One file's contents at one revision, in the shape the preview pane reads.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlobView {
-    pub repo: String,
-    pub rev: String,
-    pub path: String,
-    pub text: String,
-    pub truncated: bool,
-    pub binary: bool,
-    pub lines: i64,
-    /// The blob is a decoded picture in the forge surface's slot
-    /// (`picture.rs`), drawn at `width` × `height`; `text` is empty.
-    pub picture: bool,
-    pub width: i64,
-    pub height: i64,
-}
-
-pub(crate) fn tree_data(
-    reply: serde_json::Value,
-    repo: String,
-    path: String,
-) -> Result<ForgeTreeData, String> {
-    let tree = reply
-        .get("tree")
-        .filter(|tree| !tree.is_null())
-        .ok_or_else(|| "the repository tree was not found".to_string())?;
-    let tree: forge::TreeReply =
-        serde_json::from_value(tree.clone()).map_err(|error| error.to_string())?;
-    let entries = tree
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let kind = match entry.kind {
-                forge::TreeEntryKind::Dir => "dir",
-                forge::TreeEntryKind::File => "file",
-            };
-            TreeEntry {
-                name: entry.name,
-                path: entry.path,
-                kind: kind.into(),
-            }
-        })
-        .collect();
-    Ok(ForgeTreeData {
-        repo,
-        rev: tree.rev,
-        path,
-        born: tree.born,
-        entries,
-        truncated: tree.truncated,
-    })
-}
-
-pub(crate) fn blob_view(reply: serde_json::Value, repo: String) -> Result<BlobView, String> {
-    let blob = reply
-        .get("blob")
-        .filter(|blob| !blob.is_null())
-        .ok_or_else(|| "the requested file was not found".to_string())?;
-    let blob: forge::BlobReply =
-        serde_json::from_value(blob.clone()).map_err(|error| error.to_string())?;
-    let lines = match blob.binary {
-        true => 0,
-        false => count_i64(blob.text.lines().count()),
-    };
-    Ok(BlobView {
-        repo,
-        rev: blob.rev,
-        path: blob.path,
-        text: blob.text,
-        truncated: blob.truncated,
-        binary: blob.binary,
-        lines,
-        picture: false,
-        width: 0,
-        height: 0,
-    })
-}
-
-/// List one repo directory at one pinned revision on the node. Opening Code
-/// transfers only this bounded listing; the merge-only mirror stays cold.
-pub async fn forge_tree(
-    rpc: String,
-    repo: String,
-    rev: String,
-    path: String,
-) -> Result<ForgeTreeData, AppError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let query = serde_json::json!({ "tree": {
-            "repo": &repo,
-            "rev": &rev,
-            "path": &path,
-        }});
-        let reply = client.query("forge", &query).await?;
-        tree_data(reply, repo, path)
-    }
-    .await
-    .map_err(app_error)
-}
-
-/// Read one file at the tree's exact revision on the node: a picture (by
-/// path — `picture_path`) pages its bytes through `blob_bytes` and decodes
-/// into the forge surface's slot; anything else is the bounded text preview.
-pub async fn forge_blob(
-    rpc: String,
-    repo: String,
-    rev: String,
-    path: String,
-    net: String,
-) -> Result<BlobView, AppError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        match super::picture::picture_path(path.clone()) {
-            true => forge_picture(&client, repo, rev, path).await,
-            false => forge_text(&client, repo, rev, path, &net).await,
-        }
-    }
-    .await
-    .map_err(app_error)
-}
-
-async fn forge_text(
-    client: &RpcClient,
-    repo: String,
-    rev: String,
-    path: String,
-    net: &str,
-) -> Result<BlobView, String> {
-    let query = serde_json::json!({ "blob": {
-        "repo": &repo,
-        "rev": &rev,
-        "path": &path,
-    }});
-    let reply = client.query("forge", &query).await?;
-    let view = blob_view(reply, repo)?;
-    let illustrated = markdown_path(&view.path) && !view.binary;
-    if illustrated {
-        load_inline_pictures(client, &view, net).await;
-    }
-    Ok(view)
 }
 
 /// Page one blob's bytes in through `blob_bytes` (1 MiB pages to eof).
@@ -812,56 +258,23 @@ async fn forge_blob_bytes(
     }
 }
 
-/// A picture blob: page it in, decode it off the runtime, park the handle.
-/// A refused or over-cap object and a body that does not decode all land on
-/// the binary plate with the reason as its line, never a failed load.
-async fn forge_picture(
-    client: &RpcClient,
-    repo: String,
-    rev: String,
-    path: String,
-) -> Result<BlobView, String> {
-    use super::picture::{FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
-    let (rev, bytes) = forge_blob_bytes(client, &repo, &rev, &path).await?;
-    let Some(bytes) = bytes else {
-        let note = format!(
-            "This picture is larger than the {} MiB preview limit.",
-            MAX_PICTURE_BYTES >> 20
-        );
-        return Ok(binary_blob(repo, rev, path, note));
-    };
-    match store_picture(FORGE_SURFACE, path.clone(), bytes).await {
-        Ok((width, height)) => Ok(BlobView {
-            repo,
-            rev,
-            path,
-            text: String::new(),
-            truncated: false,
-            binary: false,
-            lines: 0,
-            picture: true,
-            width: i64::from(width),
-            height: i64::from(height),
-        }),
-        Err(reason) => Ok(binary_blob(
-            repo,
-            rev,
-            path,
-            format!("This picture did not decode: {reason}."),
-        )),
-    }
-}
-
 /// Fetch the pictures a Markdown blob embeds and park them under the
 /// document, keyed by the image URL as written, for `forge_markdown`'s
 /// viewer. Best effort, in document order, the first `MAX_INLINE_PICTURES`:
 /// an image that does not resolve, fetch or decode simply keeps its alt text.
 /// ponytail: fetched before the text lands, so a README with eight large
 /// pictures shows late; split into its own lane if that is ever felt.
-async fn load_inline_pictures(client: &RpcClient, view: &BlobView, net: &str) {
+pub async fn load_inline_pictures(
+    client: &RpcClient,
+    doc: String,
+    source: &str,
+    base: String,
+    net: String,
+) {
     use super::picture::{MAX_INLINE_PICTURES, decode_off_thread, park_inline_pictures};
+    let anchor = super::duck_uri::resolve_duck_link(base, net.clone());
     let mut wanted: Vec<String> = Vec::new();
-    for item in iced::widget::markdown::parse(&view.text) {
+    for item in iced::widget::markdown::parse(source) {
         let iced::widget::markdown::Item::Image { url, .. } = item else {
             continue;
         };
@@ -874,17 +287,21 @@ async fn load_inline_pictures(client: &RpcClient, view: &BlobView, net: &str) {
     // Side by side, not one after another: a web picture answers on a remote
     // host's clock, and eight of them in a row would stack eight timeouts in
     // front of the README.
-    let fetches = wanted.into_iter().map(|url| async move {
-        let bytes = inline_picture_bytes(client, view, &url, net).await?;
-        let picture = decode_off_thread(bytes).await.ok()?;
-        Some((url, picture))
+    let fetches = wanted.into_iter().map(|url| {
+        let anchor = &anchor;
+        let net = net.clone();
+        async move {
+            let bytes = inline_picture_bytes(client, anchor, &url, &net).await?;
+            let picture = decode_off_thread(bytes).await.ok()?;
+            Some((url, picture))
+        }
     });
     let pictures = iced::futures::future::join_all(fetches)
         .await
         .into_iter()
         .flatten()
         .collect();
-    park_inline_pictures(view.path.clone(), pictures);
+    park_inline_pictures(doc, pictures);
 }
 
 /// Where an image URL's bytes live, by the duck:// module table: a
@@ -899,7 +316,7 @@ async fn load_inline_pictures(client: &RpcClient, view: &BlobView, net: &str) {
 /// it draws nothing rather than this network's object of the same name.
 async fn inline_picture_bytes(
     client: &RpcClient,
-    view: &BlobView,
+    anchor: &super::duck_uri::DuckLink,
     url: &str,
     net: &str,
 ) -> Option<Vec<u8>> {
@@ -916,8 +333,8 @@ async fn inline_picture_bytes(
             .ok()
             .flatten(),
         DuckKind::Unknown => {
-            let path = resolve_repo_path(&view.path, url)?;
-            forge_blob_bytes(client, &view.repo, &view.rev, &path)
+            let path = resolve_repo_path(&anchor.path, url)?;
+            forge_blob_bytes(client, &anchor.repo, &anchor.rev, &path)
                 .await
                 .ok()
                 .and_then(|(_, bytes)| bytes)
@@ -1072,154 +489,6 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
     }
 }
 
-/// The binary plate with `note` as its line — why the reader shows no
-/// preview, in the reader's words.
-fn binary_blob(repo: String, rev: String, path: String, note: String) -> BlobView {
-    BlobView {
-        repo,
-        rev,
-        path,
-        text: note,
-        truncated: false,
-        binary: true,
-        lines: 0,
-        picture: false,
-        width: 0,
-        height: 0,
-    }
-}
-
-/// True when one live update invalidates forge state: a folded forge op, a
-/// forge replay the stream could not fold (`resync`), or the stream (re)
-/// subscribing (`ready` — anything may have landed while it was down).
-pub fn forge_live_hit(kind: crate::LiveKind, module: String) -> bool {
-    match kind {
-        crate::LiveKind::Forge | crate::LiveKind::Ready => true,
-        crate::LiveKind::Resync => module == "forge",
-        crate::LiveKind::Retry
-        | crate::LiveKind::Tip
-        | crate::LiveKind::Chat
-        | crate::LiveKind::Bell
-        | crate::LiveKind::Pages
-        | crate::LiveKind::Plane => false,
-    }
-}
-
-/// One scoped forge catch-up, flag-selected per slice like [`LiveRefresh`]:
-/// the repo list reloads only while the forge surface is open; the open repo's
-/// slice and the open item reload when the op's scope reaches them.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeLiveData {
-    pub generation: i64,
-    pub repos_loaded: bool,
-    pub repos: Vec<ForgeRepo>,
-    pub repo_loaded: bool,
-    pub branches: Vec<ForgeBranch>,
-    pub items: Vec<ForgeItem>,
-    pub item_loaded: bool,
-    pub item: ForgeItemData,
-}
-
-/// Reload the forge slices one committed op (or an unfoldable replay)
-/// invalidated. A non-hit update no-ops with every flag false (the handler's
-/// keeps leave state untouched); an empty op scope means the scope is
-/// unknown — reload every open slice.
-///
-/// `forge_open` is the repo LIST's surface gate. That one load is the only
-/// unscoped slice here, and no other tab draws it. The repo and item slices
-/// keep running off-tab on purpose: they are already scoped to what the forge
-/// pane has open, and
-/// dropping them would hand a stale PR back on the return trip (the tab-switch
-/// handler's `load_forge` refills the list, and nothing else).
-// Eight arguments, and none of them can be folded away: this is one Ice extern
-// and every argument is a separate piece of handler state the `run` reads at
-// the call site. Grouping them into a struct would mean a new Ice type declared
-// for one call.
-#[allow(clippy::too_many_arguments)]
-pub async fn forge_live_refresh(
-    rpc: String,
-    open_repo: String,
-    open_item: i64,
-    kind: crate::LiveKind,
-    module: String,
-    refresh: ForgeRefresh,
-    forge_open: bool,
-    generation: i64,
-) -> Result<ForgeLiveData, HydrationError> {
-    let noop = ForgeLiveData {
-        generation,
-        repos_loaded: false,
-        repos: Vec::new(),
-        repo_loaded: false,
-        branches: Vec::new(),
-        items: Vec::new(),
-        item_loaded: false,
-        item: ForgeItemData {
-            generation,
-            ..ForgeItemData::default()
-        },
-    };
-    if !forge_live_hit(kind, module) {
-        return Ok(noop);
-    }
-    let scope_unknown = refresh.repo.is_empty();
-    let repo_hit = !open_repo.is_empty() && (scope_unknown || refresh.repo == open_repo);
-    let item_hit = repo_hit
-        && open_item > 0
-        && (scope_unknown || refresh.number == open_item || refresh.refs_moved);
-    let repos = match forge_open {
-        false => None,
-        true => Some(load_forge(rpc.clone(), generation).await?),
-    };
-    let repo_slice = match repo_hit {
-        false => None,
-        true => Some(load_forge_repo(rpc.clone(), open_repo.clone(), generation).await?),
-    };
-    let item_slice = match item_hit {
-        false => None,
-        true => Some(load_forge_item(rpc, open_repo, open_item, generation).await?),
-    };
-    Ok(ForgeLiveData {
-        repos_loaded: repos.is_some(),
-        repos: repos.map(|data| data.repos).unwrap_or_default(),
-        repo_loaded: repo_slice.is_some(),
-        branches: repo_slice
-            .as_ref()
-            .map(|slice| slice.branches.clone())
-            .unwrap_or_default(),
-        items: repo_slice.map(|slice| slice.items).unwrap_or_default(),
-        item_loaded: item_slice.is_some(),
-        item: item_slice.unwrap_or(noop.item),
-        ..noop
-    })
-}
-
-/// The PR stats line: `3 files · +12 −4`.
-/// One rendered line of a unified patch. `kind` is `file` | `hunk` | `add` |
-/// `del` | `ctx` — the gutters, the sign column and the row tint all key on it.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
-pub struct DiffLine {
-    /// Session-stable identity for keyed rendering.
-    pub key: i64,
-    pub kind: String,
-    pub old_no: String,
-    pub new_no: String,
-    pub sign: String,
-    pub text: String,
-    /// The file this row belongs to, carried from the patch's own `+++ b/…`
-    /// header. `forge_item_diff` is the WHOLE multi-file patch as one string,
-    /// so a row cannot say which file it is from without this — and
-    /// `ReviewComment` anchors on `(path, line, side)`, so a comment cannot be
-    /// authored from a row that does not know its own path.
-    ///
-    /// Empty on `file` and `hunk` rows, and on a deletion's `/dev/null` side:
-    /// those are not commentable positions.
-    pub path: String,
-    /// Which side of the diff this row addresses — `new` for an addition or a
-    /// context line, `old` for a deletion, empty for a non-code row. Mirrors
-    /// `forge::DiffSide`, as a string because that is what crosses into `.ice`.
-    pub side: String,
-}
 
 /// The forge code reader's row metrics. One place on purpose: the shape lint
 /// in `app/src/tests.rs` pins these against `DiffRow`'s Ice metrics so the
@@ -2250,450 +1519,3 @@ impl<'a, Message: 'a> From<SelectRich<'a, Message>> for iced::Element<'a, Messag
     }
 }
 
-/// Whether a tree path names a Markdown document the reader renders as a
-/// document rather than line-numbers. Extension-based on purpose: the wire's
-/// `binary` flag only separates text from bytes, and forge carries no
-/// language field — the path is the one discriminator the app holds.
-pub fn markdown_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".md") || lower.ends_with(".markdown")
-}
-
-pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
-    // A patch line has no durable id. Reusing content/occurrence across two
-    // patch revisions can move focus to an identical line's comment button,
-    // while line-number keys can move it to unrelated content. Namespace the
-    // whole row set by the exact patch: unchanged rebuilds retain identity;
-    // any patch edit deliberately drops row state instead of transferring it.
-    use std::hash::{Hash as _, Hasher as _};
-
-    let mut patch_hasher = std::hash::DefaultHasher::new();
-    diff.hash(&mut patch_hasher);
-    let patch_key = patch_hasher.finish() as i64;
-    let mut rows = Vec::new();
-    let mut old_no = 0i64;
-    let mut new_no = 0i64;
-    // The path every following code row is anchored to, taken from the patch's
-    // own `+++ b/…` header. A comment cannot be authored from a row that does
-    // not know its file, and `forge_item_diff` is the whole multi-file patch as
-    // one string, so this is the only place the association exists.
-    let mut path = String::new();
-    // What the open hunk still owes on each side.
-    //
-    // A hunk header DECLARES how many lines its body covers, and while either
-    // side is still owed one, every line is body content — never a header.
-    // That budget is the ONLY thing separating a real `+++ b/<path>` header
-    // from a source line reading `++ x`, which a patch writes as `+++ x`.
-    // Without it, adding such a line silently re-anchored every row after it
-    // to a path that does not exist, and a comment written below it would be
-    // submitted against that path.
-    let mut old_left = 0i64;
-    let mut new_left = 0i64;
-    for line in diff.lines() {
-        let inside_hunk_body = old_left > 0 || new_left > 0;
-        if !inside_hunk_body {
-            if let Some(target) = added_side_path(line) {
-                path = target;
-                rows.push(marker_row(line));
-                continue;
-            }
-            if is_file_header(line) {
-                rows.push(marker_row(line));
-                continue;
-            }
-            if let Some(span) = hunk_span(line) {
-                old_no = span.old_start;
-                new_no = span.new_start;
-                old_left = span.old_len;
-                new_left = span.new_len;
-                rows.push(diff_row(
-                    "hunk",
-                    String::new(),
-                    String::new(),
-                    "",
-                    line,
-                    "",
-                    "",
-                ));
-                continue;
-            }
-        }
-        // `\ No newline at end of file` is a note ABOUT the previous line. It
-        // holds no position on either side, so it consumes neither a line
-        // number nor the hunk's budget — counting it would end the hunk one
-        // line early and re-open header detection inside the body.
-        if line.starts_with('\\') {
-            rows.push(marker_row(line));
-            continue;
-        }
-        match line.chars().next() {
-            Some('+') => {
-                rows.push(diff_row(
-                    "add",
-                    String::new(),
-                    new_no.to_string(),
-                    "+",
-                    &line[1..],
-                    &path,
-                    "new",
-                ));
-                new_no += 1;
-                new_left -= 1;
-            }
-            Some('-') => {
-                rows.push(diff_row(
-                    "del",
-                    old_no.to_string(),
-                    String::new(),
-                    "-",
-                    &line[1..],
-                    &path,
-                    "old",
-                ));
-                old_no += 1;
-                old_left -= 1;
-            }
-            _ => {
-                let text = line.strip_prefix(' ').unwrap_or(line);
-                rows.push(diff_row(
-                    "ctx",
-                    old_no.to_string(),
-                    new_no.to_string(),
-                    "",
-                    text,
-                    &path,
-                    "new",
-                ));
-                old_no += 1;
-                new_no += 1;
-                old_left -= 1;
-                new_left -= 1;
-            }
-        }
-    }
-    for (index, row) in rows.iter_mut().enumerate() {
-        row.key = patch_key.wrapping_add(count_i64(index));
-    }
-    rows
-}
-
-/// The non-code rows: a file header, and the `\ No newline` note. Neither is a
-/// commentable position, so both carry an empty path and side.
-fn marker_row(line: &str) -> DiffLine {
-    diff_row("file", String::new(), String::new(), "", line, "", "")
-}
-
-fn is_file_header(line: &str) -> bool {
-    line.starts_with("diff ")
-        || line.starts_with("--- ")
-        || line.starts_with("index ")
-        || line.starts_with("new file")
-        || line.starts_with("deleted file")
-}
-
-/// The head-side path a `+++ b/<path>` header names, or `None` for any other
-/// line. A pure deletion writes `+++ /dev/null`, which names no file on the
-/// head side and yields an empty path — its rows are then uncommentable, which
-/// is correct: there is no head line to anchor to.
-fn added_side_path(line: &str) -> Option<String> {
-    let target = line.strip_prefix("+++ ")?;
-    if target == "/dev/null" {
-        return Some(String::new());
-    }
-    // git writes `b/<path>`; a patch produced without prefixes writes the path
-    // bare, so strip the marker only when it is there.
-    Some(target.strip_prefix("b/").unwrap_or(target).to_string())
-}
-
-fn diff_row(
-    kind: &str,
-    old_no: String,
-    new_no: String,
-    sign: &str,
-    text: &str,
-    path: &str,
-    side: &str,
-) -> DiffLine {
-    DiffLine {
-        key: 0,
-        kind: kind.into(),
-        old_no,
-        new_no,
-        path: path.into(),
-        side: side.into(),
-        sign: sign.into(),
-        text: text.to_string(),
-    }
-}
-
-/// One line comment staged for a review that has not been submitted yet.
-///
-/// `anchor` is display-ready (`src/main.rs:14 (new)`) exactly as
-/// `ReviewCommentRow.anchor` is on the read side, so the view never re-derives
-/// diff vocabulary — and it doubles as the row's IDENTITY. Restaging a line
-/// replaces the comment there instead of stacking a second one on one position,
-/// which is the only sane reading of clicking the same gutter twice.
-#[derive(Clone, Debug, Hash, PartialEq, Default, serde::Serialize)]
-pub struct ForgeDraftComment {
-    pub anchor: String,
-    pub path: String,
-    /// The anchored line number, as the string the gutter already renders.
-    /// Parsed back to `u32` at the wire.
-    pub line: String,
-    /// `new` | `old` — mirrors `forge::DiffSide`.
-    pub side: String,
-    pub body: String,
-}
-
-/// Stage one line comment, or replace the one already on that line.
-///
-/// Returns `staged` UNCHANGED when the anchor or body is not usable — an empty
-/// path (a deleted file's rows), a blank body, a line number that is not a
-/// positive `u32`, or a full list. The composer disables its own submit at the
-/// cap via `forge_comment_cap_reached`, so a user never reaches the silent
-/// arm; this is the invariant behind that, not the message that carries it.
-pub fn stage_forge_comment(
-    staged: Vec<ForgeDraftComment>,
-    path: String,
-    line: String,
-    side: String,
-    body: String,
-) -> Vec<ForgeDraftComment> {
-    let anchored = !path.is_empty() && line.parse::<u32>().is_ok_and(|no| no > 0);
-    let sided = side == "new" || side == "old";
-    let usable_body = !body.trim().is_empty() && body.len() <= forge::MAX_REVIEW_COMMENT_BYTES;
-    if !anchored || !sided || !usable_body || path.len() > forge::MAX_PATH_BYTES {
-        return staged;
-    }
-    let comment = ForgeDraftComment {
-        anchor: format!("{path}:{line} ({side})"),
-        path,
-        line,
-        side,
-        body,
-    };
-    let mut staged = staged;
-    match staged.iter().position(|row| row.anchor == comment.anchor) {
-        Some(at) => staged[at] = comment,
-        None if staged.len() < forge::MAX_REVIEW_COMMENTS => staged.push(comment),
-        None => {}
-    }
-    staged
-}
-
-/// Drop the comment staged at one anchor. A miss leaves the list alone.
-pub fn drop_forge_comment(
-    staged: Vec<ForgeDraftComment>,
-    anchor: String,
-) -> Vec<ForgeDraftComment> {
-    let mut staged = staged;
-    staged.retain(|row| row.anchor != anchor);
-    staged
-}
-
-/// The staged list is at the module's per-review cap, so the composer must
-/// refuse to take another. The literal lives HERE and nowhere in `.ice`, so the
-/// gate and the module's own limit cannot drift apart.
-pub fn forge_comment_cap_reached(staged: &[ForgeDraftComment]) -> bool {
-    staged.len() >= forge::MAX_REVIEW_COMMENTS
-}
-
-/// The directory a committed path sits in, in the forge tree's own spelling:
-/// the repository root is `""` (what `forge_tree` is asked for and echoes
-/// back), never `/` — that is duckfs's root (`fs_parent`), and a tree reply
-/// for `/` would not match the `""` the browser waits on.
-pub fn forge_parent(path: String) -> String {
-    match path.rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => String::new(),
-    }
-}
-
-/// The reader header's path, gated on the directory AND revision the file
-/// was opened under: a preview opened in another directory or an older
-/// commit was retired by that move, so the header must not keep naming it.
-/// (Another repository is another component instance — the call site keys
-/// on the repo, so cross-repo staleness cannot arise.)
-pub fn forge_file_header(
-    opened_dir: &str,
-    opened_rev: &str,
-    dir: &str,
-    rev: &str,
-    path: &str,
-) -> String {
-    let same_place = opened_dir == dir;
-    let same_commit = opened_rev == rev;
-    if same_place && same_commit {
-        path.to_owned()
-    } else {
-        String::new()
-    }
-}
-
-/// A staged comment outlives the diff it was written against when a live
-/// refresh moves the PR's source head.
-///
-/// It CANNOT be carried across: the anchor is `(path, line, side)` into a
-/// specific patch, and the review would be submitted pinning the NEW head — so
-/// a comment about a line the author read would land on whatever now occupies
-/// that number, and `outdated` would read false because the pin matches. The
-/// module has no position tracking across a moved branch by design; dropping is
-/// the only reading that cannot publish a false claim.
-/// The PR's source head moved under the open item: a refresh that landed the
-/// item with another head than the one on screen. What was written against
-/// the old diff — the staged comments here, the line comment in the view —
-/// goes with it.
-pub fn forge_branch_moved(loaded: bool, next_oid: &str, current_oid: &str) -> bool {
-    let moved = !next_oid.is_empty() && !current_oid.is_empty() && next_oid != current_oid;
-    loaded && moved
-}
-
-/// The staged comments, or none once the branch has moved under them.
-pub fn keep_staged_comments(
-    loaded: bool,
-    next_oid: String,
-    current_oid: String,
-    staged: Vec<ForgeDraftComment>,
-) -> Vec<ForgeDraftComment> {
-    if forge_branch_moved(loaded, &next_oid, &current_oid) {
-        return Vec::new();
-    }
-    staged
-}
-
-/// Discarded work is never silent. This says WHY the staged comments vanished,
-/// and only when there were some to lose — a refresh that moved the branch
-/// while nothing was staged is not an error and reports none.
-pub fn staged_comment_drop_note(
-    loaded: bool,
-    next_oid: String,
-    current_oid: String,
-    staged: Vec<ForgeDraftComment>,
-    error: String,
-) -> String {
-    let lost = !staged.is_empty() && forge_branch_moved(loaded, &next_oid, &current_oid);
-    if !lost {
-        return error;
-    }
-    "The branch moved while comments were staged. They anchored to lines in the old diff, so they were discarded rather than posted against the new one.".into()
-}
-
-/// A hunk header's two starting line numbers and the two line counts its body
-/// covers. The counts are what bound the body — see `diff_lines`.
-struct HunkSpan {
-    old_start: i64,
-    new_start: i64,
-    old_len: i64,
-    new_len: i64,
-}
-
-/// `@@ -138,9 +138,12 @@ …` → the starts and the lengths. A range written
-/// without a comma covers exactly one line (`@@ -1 +1 @@`).
-fn hunk_span(line: &str) -> Option<HunkSpan> {
-    let body = line.strip_prefix("@@ ")?;
-    let (ranges, _) = body.split_once(" @@")?;
-    let (old, new) = ranges.split_once(' ')?;
-    let range = |range: &str| -> Option<(i64, i64)> {
-        let digits = range.trim_start_matches(['-', '+']);
-        let (start, len) = match digits.split_once(',') {
-            Some((start, len)) => (start, len.parse().ok()?),
-            None => (digits, 1),
-        };
-        Some((start.parse().ok()?, len))
-    };
-    let (old_start, old_len) = range(old)?;
-    let (new_start, new_len) = range(new)?;
-    Some(HunkSpan {
-        old_start,
-        new_start,
-        old_len,
-        new_len,
-    })
-}
-
-// There is NO forge write gate, and this file used to invent one. `MergePr`,
-// `SubmitReview` and the tracker verbs each check only `author_from_origin`
-// (crates/modules/apps/forge/src/lib.rs) — any user key may merge, and this
-// node's valset seat is not even the axis the write is signed on. A refusal
-// plate over an action the chain accepts is worse than no plate.
-
-pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
-    format!("{files} files · +{additions} −{deletions}")
-}
-
-pub fn keep_forge_repos(
-    loaded: bool,
-    next: Vec<ForgeRepo>,
-    current: Vec<ForgeRepo>,
-) -> Vec<ForgeRepo> {
-    if loaded { next } else { current }
-}
-
-pub fn keep_branches(
-    loaded: bool,
-    next: Vec<ForgeBranch>,
-    current: Vec<ForgeBranch>,
-) -> Vec<ForgeBranch> {
-    if loaded { next } else { current }
-}
-
-/// The commit a branch's head stood on when the repo slice was read, or
-/// empty for a name the slice does not hold: a pick of a branch that was
-/// deleted under the open menu asks for nothing.
-pub fn forge_branch_head(branches: &[ForgeBranch], name: &str) -> String {
-    branches
-        .iter()
-        .find(|branch| branch.name == name)
-        .map(|branch| branch.head.clone())
-        .unwrap_or_default()
-}
-
-/// The branch the code browse's pinned commit is the head of. The picked
-/// branch wins while it still stands there, then `dev`, then `main`, then
-/// the first branch at that commit; empty when none does, which is the
-/// truthful reading of a browse pinned to a commit a branch has since
-/// moved past or to a deep link's own `@rev`.
-pub fn forge_tree_branch(branches: &[ForgeBranch], picked: &str, rev: &str) -> String {
-    if rev.is_empty() {
-        return String::new();
-    }
-    let standing_at_rev = |name: &str| {
-        branches
-            .iter()
-            .any(|branch| branch.name == name && branch.head == rev)
-    };
-    let preferred = [picked, "dev", "main"]
-        .into_iter()
-        .find(|name| standing_at_rev(name));
-    let first_at_rev = || {
-        branches
-            .iter()
-            .find(|branch| branch.head == rev)
-            .map(|branch| branch.name.as_str())
-    };
-    preferred.or_else(first_at_rev).unwrap_or_default().to_owned()
-}
-
-pub fn keep_forge_items(
-    loaded: bool,
-    next: Vec<ForgeItem>,
-    current: Vec<ForgeItem>,
-) -> Vec<ForgeItem> {
-    if loaded { next } else { current }
-}
-
-pub fn keep_forge_reviews(
-    loaded: bool,
-    next: Vec<ForgeReview>,
-    current: Vec<ForgeReview>,
-) -> Vec<ForgeReview> {
-    if loaded { next } else { current }
-}
-
-pub fn keep_chat_blocks(
-    loaded: bool,
-    next: Vec<ChatBlock>,
-    current: Vec<ChatBlock>,
-) -> Vec<ChatBlock> {
-    if loaded { next } else { current }
-}

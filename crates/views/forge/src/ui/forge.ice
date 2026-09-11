@@ -13,7 +13,7 @@
 // is the path only while the reader still stands where the file was
 // opened (same directory, same commit) — empty retires the preview.
 
-component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
+component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_phase:str, branches:[ForgeBranch], tree_branch:str, tab:str, items:[ForgeItem], forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, diff_rows:[DiffLine], forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], has_merge_conflicts:bool, merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], has_staged_comments:bool, comment_cap_reached:bool, discussion:[ChatMessage], linked_note:[ChatMessage], discussion_clipped:bool, note_scope:str, note_blocked:bool, tree_path:str, tree_rev:str, tree_entries:[TreeEntry], tree_born:bool, tree_truncated:bool, tree_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, file_picture:bool, file_width:i64, file_height:i64, file_note:str, file_header:str, file_phase:str, connected:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -89,7 +89,7 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
           // "appears here once it is created" and naming no way to create one
           // is a dead end, so the plate carries the command with this
           // workspace's own endpoint already in it.
-          if empty(repos) && list_phase == "ready" && display_omitted == 0
+          if empty(repos) && list_phase == "ready"
             box
               with
                 w=fill
@@ -516,7 +516,7 @@ component ForgeScreen(display_omitted:i64, org:str, about:str, tier:str, network
               if forge_item_kind == "pr"
                 col w=fill gap=9.0
                   GroupLabel label="REVIEWS"
-                  if empty(forge_item_reviews) && display_omitted == 0
+                  if empty(forge_item_reviews)
                     text "No reviews yet." size=12.5 @text-caption
                   for review in forge_item_reviews
                     ReviewCard review=review

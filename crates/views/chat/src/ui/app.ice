@@ -125,6 +125,7 @@ extern crate::host
   pure live_thread_label(agent:&str) -> str
   pure run_in_thread(live:&LiveRunHint, active_thread_seq:i64) -> bool
   pure copy_range_label(count:i64) -> str
+  pure message_target_key(messages:&[ChatMessage], target:i64, changed:bool) -> i64
   pure thread_width_after_delta(width:f64, delta:f64, viewport:f64) -> f64
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
@@ -186,6 +187,8 @@ state
   channel_settings_open = false
   active_thread_seq = 0
   thread_target_seq = 0
+  thread_reveal_key = 0
+  stream_reveal_key = 0
   thread_messages:[ChatMessage] = []
   live_agents:[LiveRunHint] = []
   timeline:Timeline = timeline_of([], [])
@@ -231,6 +234,10 @@ on props_arrived(item)
   host_error = item.error
   return if !empty(item.error)
   let next = item.next
+  let thread_changed = next.endpoint != endpoint || next.active_channel != active_channel || next.active_thread_seq != active_thread_seq || next.thread_target_seq != thread_target_seq
+  thread_reveal_key = message_target_key(next.thread_messages, next.thread_target_seq, thread_changed)
+  let stream_changed = next.history_view && !next.loading && (next.endpoint != endpoint || next.active_channel != active_channel || !history_view || loading)
+  stream_reveal_key = message_target_key(next.messages, next.selected_message_seq, stream_changed)
   let sent_now = next.sent_serial != sent_serial
   sent_serial = next.sent_serial
   endpoint = next.endpoint
@@ -296,12 +303,32 @@ on props_arrived(item)
       active_palette = AppTheme.app
       flow
         from done sent_now
-        done -> snap_stream _
+        done -> position_streams _
     Tone.dark
       active_palette = AppTheme.app_dark
       flow
         from done sent_now
-        done -> snap_stream _
+        done -> position_streams _
+
+on position_streams(sent_now)
+  parallel
+    flow
+      from done sent_now
+      done -> snap_stream _
+    flow
+      from done thread_reveal_key
+      done -> reveal_thread _
+    flow
+      from done stream_reveal_key
+      done -> reveal_stream _
+
+on reveal_stream(target_key)
+  return if target_key <= 0
+  task widget scroll-to-key #chat/message-stream target_key
+
+on reveal_thread(target_key)
+  return if target_key <= 0
+  task widget scroll-to-key #chat/thread-pane/thread-stream target_key
 
 on snap_stream(moved)
   return if !moved

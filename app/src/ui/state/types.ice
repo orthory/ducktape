@@ -7,7 +7,6 @@ enum LiveKind
   chat
   bell
   pages
-  forge
   plane
   resync
 
@@ -175,12 +174,6 @@ enum DuckKind
   run
   account
 
-// The second step a forge deep link still owes once its repo is open.
-enum ForgeFocus
-  idle
-  item
-  blob
-
 enum ShellTab
   chat
   pages
@@ -193,47 +186,10 @@ enum ShellTab
   governance
   settings
 
-enum ForgeTab
-  code
-  pulls
-  issues
-
-enum ForgeReviewVerdict
-  comment
-  approve
-  request_changes
-
-// The code browse's two reads — the directory listing and the file — as the
-// app tracks them for the Forge view.
-enum ForgeTreePhase
-  loading
-  ready
-  failed
-
-enum ForgeFilePhase
-  idle
-  loading
-  ready
-  failed
-
-// what the Forge view asks of the app: one variant per act the screen
-// offers, each carrying only what the reader picked or typed (a repo, an
-// item, a directory or file, a review body, a line comment) — the review
-// and comment drafts themselves are the view's
+// what the Forge view still asks of the app: the two OS doors no view
+// holds, and the send of a note written in the host composer docked under
+// it. Every other act on that screen is the view's own read or `op.submit`.
 enum ForgeIntent
-  open_repo
-  close_repo
-  branch
-  tab
-  open_item
-  close_item
-  merge
-  review_pick
-  review_submit
-  comment_stage
-  comment_drop
-  tree
-  blob
   open_link
   copy
   composer
