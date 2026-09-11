@@ -23,11 +23,17 @@ use "browser.ice"
 use "files.ice"
 use "kit.ice"
 
+// which palette the app's `dark` names — a handler branches on an enum only,
+// and the session handler has work to do after the branch
+enum Tone
+  light
+  dark
+
 extern crate::host
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsDiffEntry(path:str, kind:str)
-  Session(connected:bool, dark:bool, chain:str)
+  Session(connected:bool, dark:bool, chain:str, route:str, route_serial:i64)
   SessionItem(next:Session, error:str)
   ListingItem(entries:[FsEntry], directories:[FsEntry], history:[FsSnapshot], omitted:i64, error:str)
   PreviewItem(path:str, base:str, text:str, display_text:str, clipped:bool, truncated:bool, binary:bool, picture:bool, width:i64, height:i64, error:str)
@@ -42,6 +48,7 @@ extern crate::host
   // every write's outcome, as the kernel answers it
   subscription acts() -> ActItem
   pure generation_after(was_connected:bool, connected:bool, generation:i64) -> i64
+  pure tone_of(dark:bool) -> Tone
   sync make_dir(dir:&str, name:&str) -> bool
   sync make_file(dir:&str, name:&str) -> bool
   sync delete_object(path:&str) -> bool
@@ -75,6 +82,8 @@ state
   chain = ""
   // moves when the session comes up and after every write: the reads restart
   generation:i64 = 0
+  // the last `duck://files/...` push this view has landed on
+  route_serial:i64 = 0
   path = "/shared"
   // `listed` says the rows on hand describe `path`
   listed = false
@@ -141,9 +150,54 @@ on session_arrived(item)
   connected = next.connected
   chain = next.chain
   dark = next.dark
-  active_palette = AppTheme.app
-  return if !next.dark
-  active_palette = AppTheme.app_dark
+  // A duck:// LINK LANDS ON THE FILE. The shell resolved the address and
+  // moved the tab; the path itself is a session fact, and the SERIAL — not
+  // the path — says a push happened, so the same file twice opens twice.
+  // It rides the palette match because a handler branches nowhere else.
+  let routed = next.route_serial != route_serial && !empty(next.route)
+  route_serial = next.route_serial
+  let landing = keep_str(routed, next.route, "")
+  match tone_of(next.dark)
+    Tone.light
+      active_palette = AppTheme.app
+      flow
+        from done landing
+        done -> route_to _
+    Tone.dark
+      active_palette = AppTheme.app_dark
+      flow
+        from done landing
+        done -> route_to _
+
+// WHERE THE LINK SENT THE READER. The address names a FILE: its directory is
+// what the browser lists, the file itself is what the preview reads, and
+// everything the old path had on screen goes with it.
+on route_to(target)
+  return if empty(target)
+  notice = ""
+  // the same address twice is the same two keys, so the generation is what
+  // makes the second push read again instead of sitting on cleared state
+  generation = generation + 1
+  path = fs_parent(target)
+  listed = false
+  entries = []
+  directories = []
+  omitted = 0
+  diff_from = ""
+  diff = []
+  diff_omitted = 0
+  preview_path = target
+  preview_entry = no_fs_entry()
+  preview_base = ""
+  preview_text = ""
+  preview_display_text = ""
+  preview_clipped = false
+  preview_truncated = false
+  preview_binary = false
+  preview_picture = false
+  preview_width = 0
+  preview_height = 0
+  sent = at(path)
 
 on listing_arrived(item)
   notice = keep_str(!empty(item.error), item.error, notice)

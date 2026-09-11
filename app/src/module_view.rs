@@ -1412,11 +1412,25 @@ pub fn chat_composer_roster(scope: &str, members: &[crate::backend::ChatMember])
 /// for a link the Markdown reader activated, and `at` naming the directory a
 /// file dropped on the window lands in. The picture viewer, the highlighted
 /// reader and the Markdown document are host surfaces (`surfaces_of("files")`).
-pub fn files_view(dark: bool, connected: bool, chain: &str) -> Element<'static, ModuleViewEvent> {
+///
+/// `route` is the one navigation fact that cannot be the view's: a
+/// `duck://files/<path>` link is resolved by the shell's link plane, which
+/// also moves the tab, so the address arrives as a SESSION fact like any
+/// other. `route_serial` counts the pushes, which is what makes the same path
+/// twice a second navigation rather than a value that never changed.
+pub fn files_view(
+    dark: bool,
+    connected: bool,
+    chain: &str,
+    route: &str,
+    route_serial: i64,
+) -> Element<'static, ModuleViewEvent> {
     let props = serde_json::json!({
         "connected": connected,
         "dark": dark,
         "chain": chain,
+        "route": route,
+        "route_serial": route_serial,
     });
     module_view("files", serde_json::to_vec(&props).expect("files props encode"))
 }
@@ -5366,7 +5380,8 @@ pub(crate) mod tests {
     fn files_facts() -> Option<Vec<u8>> {
         Some(
             serde_json::to_vec(&serde_json::json!({
-                "connected": true, "dark": false, "chain": "chain-a"
+                "connected": true, "dark": false, "chain": "chain-a",
+                "route": "", "route_serial": 0
             }))
             .expect("props encode"),
         )

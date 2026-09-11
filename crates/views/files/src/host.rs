@@ -63,12 +63,27 @@ pub struct FsDiffEntry {
 // ---------- the session ----------
 
 /// The session facts the kernel pushes, one item per change. `chain` is the
-/// network an unsaved draft belongs to: a draft parks when it moves.
+/// network an unsaved draft belongs to: a draft parks when it moves. `route`
+/// is where a `duck://files/...` link sent the reader — the shell resolves the
+/// address and moves the tab, so the path arrives here rather than being
+/// navigated to — and `route_serial` counts those pushes, because the same
+/// path twice has to land twice and the path alone would not have changed.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub connected: bool,
     pub dark: bool,
     pub chain: String,
+    pub route: String,
+    pub route_serial: i64,
+}
+
+/// Which palette the app's `dark` names. A handler branches on an enum only,
+/// and [`Session`]'s route work has to happen after that branch.
+pub(crate) fn tone_of(dark: bool) -> crate::Tone {
+    match dark {
+        true => crate::Tone::Dark,
+        false => crate::Tone::Light,
+    }
 }
 
 /// One item of the session subscription: the facts, or why not.

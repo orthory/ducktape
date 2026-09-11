@@ -960,9 +960,9 @@ on copy_message_link(link)
 // A target that needs two steps (a repo, THEN its item or file) parks a
 // one-shot focus that `forge_repo_loaded` consumes. The protocol adds
 // addresses, never navigation.
-// A DUCKFS ADDRESS MOVES THE TAB AND NOTHING ELSE: the browser's directory
-// is the files view's own state, and the kernel contract has no way for the
-// app to hand a mounted view the route it was opened with.
+// A DUCKFS ADDRESS IS PUSHED, NOT NAVIGATED: the browser lives in the files
+// view, so the app moves the tab and hands the view the path as a session
+// fact (`fs_route`, with a serial so the same path twice lands twice).
 // A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
 // addresses a store this app is not connected to, so it opens nothing and
 // says which network it belongs to. A link with no `?net=` is the hand-typed
@@ -983,11 +983,12 @@ on open_message_link(url)
       flow
         from done link.dispatch
         done -> open_run_panel _
-    // The Files tab opens; the PATH inside it does not. The browser's
-    // directory is the files view's own state now, and the kernel contract
-    // has no way for the app to hand a mounted view the route it was opened
-    // with — until it does, a duckfs link lands on the tab, not the file.
+    // The Files tab opens, and the PATH goes with it — as a SESSION fact,
+    // not a navigation the app performs: the browser is the view's, so the
+    // address the shell resolved is pushed in and the view lands on it.
     DuckKind.files
+      fs_route = link.path
+      fs_route_serial = fs_route_serial + 1
       invalidate lane=account_ceremony
       invalidate lane=account_desktop_ceremony
       account_busy = account_busy && empty(account_ceremony_phase)

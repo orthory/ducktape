@@ -584,10 +584,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         !open.contains("run replace"),
         "the open plane owns no lane of its own"
     );
-    // THE FILES ARM MOVES THE TAB AND NOTHING ELSE. The browser's directory
-    // is the files VIEW's own state, and the kernel contract has no way for
-    // the app to hand a mounted view the route it was opened with, so a
-    // duckfs address lands on the tab rather than on the file.
+    // THE FILES ARM PUSHES THE PATH, it does not navigate to it. The browser
+    // lives in the files VIEW, so the app moves the tab and hands the address
+    // over as a session fact — with a serial, because the same path twice has
+    // to land twice and the path alone would not have changed.
     let files_arm = open
         .split_once("DuckKind.files\n")
         .expect("the files arm")
@@ -596,9 +596,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         .expect("the next arm follows")
         .0;
     assert!(files_arm.contains("shell_tab = ShellTab.files"));
+    assert!(files_arm.contains("fs_route = link.path"));
     assert!(
-        !files_arm.contains("link.path"),
-        "a files address names no navigation the view would have to take"
+        files_arm.contains("fs_route_serial = fs_route_serial + 1"),
+        "the same duckfs address twice must navigate twice"
     );
     // A CHAT ADDRESS LANDS ON THE CHAT TAB. `choose_channel` is the sidebar's
     // own click and moves no tab, so the channel arm moves it first; the

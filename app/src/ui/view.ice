@@ -207,7 +207,7 @@ view
         // itself. The pictures, the highlighted reader and the Markdown
         // document are the app's surfaces, painted into the slots it leaves.
         files:
-          extern files_view(dark, connected, network_chain_id) #files -> files_view_event _
+          extern files_view(dark, connected, network_chain_id, fs_route, fs_route_serial) #files -> files_view_event _
         // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
         // facts go in, the view reads the roster off the node itself and
         // writes through `op.submit` (signed with the seated key). The

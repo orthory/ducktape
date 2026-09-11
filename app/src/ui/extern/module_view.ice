@@ -44,7 +44,7 @@ extern crate::module_view
   // and writes duckfs through the kernel (`files.get`, `op.submit`), and the
   // events back are the app's own doors — a link to open, and the directory
   // a dropped file lands in.
-  component files_view(dark:bool, connected:bool, chain:&str) -> ModuleViewEvent
+  component files_view(dark:bool, connected:bool, chain:&str, route:&str, route_serial:i64) -> ModuleViewEvent
   pure settings_event_tab(event:&ModuleViewEvent) -> ShellTab
   // The guest owns the document editor. The app supplies a bounded source
   // stream and reconciles accepted edits with persistence and navigation.

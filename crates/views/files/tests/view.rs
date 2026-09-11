@@ -43,10 +43,18 @@ fn files_get<'a>(frame: &'a Frame, lane: &str) -> (&'a Request, serde_json::Valu
 }
 
 fn session(connected: bool) -> Vec<u8> {
+    routed_session(connected, "", 0)
+}
+
+/// The session with a `duck://files/...` push on it: the path the shell
+/// resolved, and the serial that says a push happened.
+fn routed_session(connected: bool, route: &str, route_serial: i64) -> Vec<u8> {
     serde_json::to_vec(&Session {
         connected,
         dark: false,
         chain: "chain-a".into(),
+        route: route.into(),
+        route_serial,
     })
     .expect("session encodes")
 }
@@ -179,6 +187,61 @@ fn a_directory_opens_as_its_own_read_and_the_old_rows_go_silent() {
         ),
         "{:?}",
         texts(&frame)
+    );
+}
+
+/// A `duck://files/<path>` link is a SESSION fact, not a navigation the app
+/// performs: the shell resolves the address and moves the tab, and the view
+/// lands on the file — its directory listed, the file itself previewed. The
+/// serial is what says a push happened, so the SAME path pushed again
+/// navigates again instead of reading as an unchanged value.
+#[test]
+fn a_duck_link_lands_the_view_on_the_file_it_names() {
+    let (frame, held) = connected_with_listing();
+    let frame = with_preview(&frame, "# README");
+    assert!(has_text(&frame, "/shared/README.md"), "{:?}", texts(&frame));
+
+    // the push: a file in another directory
+    let frame = tick_native(vec![item(
+        held.session,
+        &routed_session(true, "/shared/docs/plan.md", 1),
+    )]);
+    assert_eq!(
+        files_get(&frame, "ls").1["path"],
+        "/shared/docs",
+        "the address's directory is what the browser lists"
+    );
+    assert_eq!(
+        request(&frame, "files.at").payload,
+        br#"{"path":"/shared/docs"}"#,
+        "the window's drop door follows the reader"
+    );
+    assert!(
+        !has_text(&frame, "/shared/README.md"),
+        "the object panel kept the file the reader left: {:?}",
+        texts(&frame)
+    );
+    let head = files_get(&frame, "refs").0.id;
+    let frame = tick_native(vec![answer(head, &refs())]);
+    assert_eq!(
+        files_get(&frame, "read").1["path"],
+        "/shared/docs/plan.md",
+        "the file the address named is what the preview reads"
+    );
+    let page = files_get(&frame, "read").0.id;
+    tick_native(vec![answer(page, &read("the plan"))]);
+
+    // the SAME path again, on a new serial: the two subscription keys have
+    // not moved, so only the generation can make this land a second time
+    let frame = tick_native(vec![item(
+        held.session,
+        &routed_session(true, "/shared/docs/plan.md", 2),
+    )]);
+    assert_eq!(files_get(&frame, "ls").1["path"], "/shared/docs");
+    assert_eq!(
+        files_get(&frame, "refs").1,
+        serde_json::json!({}),
+        "the same address twice reads the file again"
     );
 }
 
@@ -338,6 +401,8 @@ fn a_parked_draft_keeps_its_bytes_and_never_retargets() {
             connected: true,
             dark: false,
             chain: "chain-b".into(),
+            route: String::new(),
+            route_serial: 0,
         })
         .unwrap(),
     )]);
