@@ -268,14 +268,6 @@ enum NodeIntent
   log_filter
   log_timeline
 
-// what the Explorer view asks of the app: reload the ledger, a clipboard
-// write, a workspace search, or dropping the standing answer
-enum ExplorerIntent
-  refresh
-  copy
-  search
-  clear
-
 // what the Files view asks of the app: one variant per act the browser
 // offers, from a navigation to a write
 enum FilesIntent

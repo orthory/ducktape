@@ -2234,17 +2234,6 @@ async fn recent_runs(client: &RpcClient) -> Result<Vec<runs::index::RunView>, St
     Ok(runs)
 }
 
-/// The tracker's rows, for the workspace search: agents named by id.
-pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let runs = recent_runs(&client).await?;
-        Ok(run_rows(&client, runs, &BTreeMap::new()).await)
-    }
-    .await
-    .map_err(app_error)
-}
-
 /// The journal of one run, fact by fact, in the scope it was read in. An empty
 /// id is the reader closing the journal: nothing is read and the empty journal
 /// comes back at once.
