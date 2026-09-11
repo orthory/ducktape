@@ -88,6 +88,34 @@ pub fn page_comment_thread_rows(
         .collect()
 }
 
+/// Prefer the selected thread, then an unresolved thread, within one anchor.
+pub fn comment_thread_for_target(
+    threads: Vec<crate::backend::PageCommentThread>,
+    target: String,
+    selected: String,
+) -> String {
+    let mut matching = threads.iter().filter(|thread| thread.target == target);
+    matching
+        .clone()
+        .find(|thread| thread.id == selected)
+        .or_else(|| matching.clone().find(|thread| !thread.resolved))
+        .or_else(|| matching.next())
+        .map(|thread| thread.id.clone())
+        .unwrap_or_default()
+}
+
+pub fn comment_rows_for_target(
+    rows: Vec<PageCommentThreadRow>,
+    target: String,
+) -> Vec<PageCommentThreadRow> {
+    if target.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|row| row.thread.target == target)
+        .collect()
+}
+
 fn comment_anchor_labels(blocks: &[crate::backend::PageBlock]) -> BTreeMap<String, String> {
     let text_by_id: BTreeMap<&str, &str> = blocks
         .iter()

@@ -312,37 +312,3 @@ pub fn member_tier(rows: &[MemberRow]) -> String {
         .map_or_else(|| "guest".into(), |row| row.role.clone())
 }
 
-/// Open a membership proposal. The app could vote and settle but never OPEN
-/// one; `action` is `add_validator` | `add_resident` | `remove_validator`.
-pub async fn governance_propose(
-    rpc: String,
-    password: String,
-    action: String,
-    target_key: String,
-) -> Result<bool, AppError> {
-    async {
-        let key = public_key(&target_key, "member public key")?;
-        let action = match action.as_str() {
-            "add_validator" => governance::GovAction::AddValidator { key },
-            "add_resident" => governance::GovAction::AddResident { key },
-            "remove_validator" => governance::GovAction::RemoveValidator { key },
-            other => return Err(format!("unknown membership action `{other}`")),
-        };
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "governance",
-            governance::encode_msg(&governance::GovMsg::Propose {
-                proposal_id: fresh_id("proposal"),
-                action,
-                voting_period: GOVERNANCE_VOTING_PERIOD,
-            }),
-            password,
-        )
-        .await
-    }
-    .await
-    .map_err(app_error)?;
-    Ok(true)
-}
-

@@ -165,3 +165,16 @@ fn menu_lifecycle_rejects_hidden_picks_and_turns_only_offered_blocks() {
     );
     assert!(closed.current(&before).is_none());
 }
+
+#[test]
+fn a_block_offers_comment_without_editing_the_document() {
+    let document = doc("Title\nA paragraph", 1, 0);
+    let mut menu = menu::Menu::default();
+    menu.block(&document, 1);
+    let view = menu.current(&document).unwrap();
+    assert_eq!(view.line, Some(1));
+    assert!(view.items.contains(&("comment", "Comment")));
+    let (decision, closed) = menu.pick(&document, "comment");
+    assert!(matches!(decision, EditorDecision::Noop));
+    assert!(!closed.is_open());
+}

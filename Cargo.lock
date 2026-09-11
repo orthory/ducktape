@@ -3495,7 +3495,6 @@ dependencies = [
  "gateway",
  "gethostname",
  "git2",
- "governance",
  "iced",
  "iced_test",
  "identity",

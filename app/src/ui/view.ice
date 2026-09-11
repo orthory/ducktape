@@ -207,8 +207,14 @@ view
         // computed here, once.
         files:
           extern files_view(dark, connected, fs_path, fs_listed_path == fs_path, fs_entries, fs_loading, fs_preview_path, fs_preview_entry, fs_delete_target, fs_diff_from, fs_diff, fs_history, fs_preview_truncated, fs_preview_binary, fs_preview_picture, fs_preview_width, fs_preview_height, fs_preview_text, files_write_gate(fs_path, settings_user_key), fs_writes, connected_rpc, network_chain_id, connect_generation, fs_preview_base, fs_save_reply) #files -> files_view_event _
+        // Members is a MODULE-OWNED VIEW on the KERNEL CONTRACT: session
+        // facts go in, the view reads the roster off the node itself and
+        // writes through `op.submit` (signed with the seated key). The
+        // app's own `members_rows` stays — it is the SESSION fact of who
+        // this node is on this network, which the rail, the forge gate and
+        // the approvals gate all read.
         members:
-          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
+          extern members_view(dark, connected, members_is_admin(members_rows)) #members -> members_view_event _
         agents:
           // the register whole, with the editor's pick lists and the signing
           // account; every write comes back as an intent the roster handler
